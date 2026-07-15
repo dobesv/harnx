@@ -159,6 +159,9 @@ pub struct McpClient {
     /// and emits an exit notice. Aborted and replaced on each (re)connect so a
     /// stale task from a prior connection cannot linger past teardown.
     child_wait_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
+    /// PID of the currently-running child process. Captured at spawn and
+    /// cleared when the child exits. Surfaced by `.mcp info` for diagnostics.
+    pid: Arc<RwLock<Option<u32>>>,
 }
 
 #[derive(Clone)]
@@ -254,6 +257,7 @@ impl McpClient {
             stderr_buffer: new_stderr_buffer(),
             last_notice: Arc::new(RwLock::new(None)),
             child_wait_task: RwLock::new(None),
+            pid: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -267,11 +271,44 @@ impl McpClient {
         self.config.hooks.as_ref()
     }
 
+    /// Name of the package this server belongs to, if it came from an installed
+    /// package. Used to resolve `HARNX_PACKAGE_DIR` for the server's hooks.
+    pub fn package(&self) -> Option<&str> {
+        self.config.package.as_deref()
+    }
+
+    /// Full resolved server configuration (command, args, env, roots, hooks).
+    /// Surfaced by `.mcp info` for diagnostics.
+    pub fn config(&self) -> &McpServerConfig {
+        &self.config
+    }
+
+    /// PID of the running child process, or `None` when not connected.
+    pub fn pid(&self) -> Option<u32> {
+        *self.pid.read()
+    }
+
+    /// Human-readable connection status for diagnostics.
+    pub fn status_label(&self) -> &'static str {
+        if self.is_connected() {
+            "connected"
+        } else if self.connection_failed() {
+            "failed"
+        } else {
+            "idle"
+        }
+    }
+
+    /// The effective roots (config roots plus any injected cwd/extra roots).
+    pub fn live_roots(&self) -> Vec<String> {
+        self.roots.read().clone()
+    }
+
     pub fn is_connected(&self) -> bool {
         *self.connected.read()
     }
 
-    fn connection_failed(&self) -> bool {
+    pub fn connection_failed(&self) -> bool {
         *self.connection_failed.read()
     }
 
@@ -324,6 +361,9 @@ impl McpClient {
             .ok_or_else(|| anyhow!("MCP server '{}' stdout not piped", self.name))?;
         let stderr = child.stderr().take();
 
+        // Record the child PID for diagnostics; cleared by the wait task on exit.
+        *self.pid.write() = child.id();
+
         // Spawn a background task that waits for the child and emits an exit
         // notice. It shares the client's `last_notice` dedup state so exit and
         // reconnect notices are deduplicated together. Any wait task from a
@@ -331,8 +371,11 @@ impl McpClient {
         let name_for_wait = self.name.clone();
         let stderr_buffer_for_wait = self.stderr_buffer.clone();
         let dedup_state = self.last_notice.clone();
+        let pid_for_wait = self.pid.clone();
         let wait_handle = tokio::spawn(async move {
-            if let Ok(status) = child.wait().await {
+            let wait_result = child.wait().await;
+            *pid_for_wait.write() = None;
+            if let Ok(status) = wait_result {
                 #[cfg(unix)]
                 let (code, signal) = {
                     use std::os::unix::process::ExitStatusExt;
@@ -1323,6 +1366,13 @@ impl McpManager {
 
     pub fn get_client(&self, server_name: &str) -> Option<Arc<McpClient>> {
         self.clients.read().get(server_name).cloned()
+    }
+
+    /// Sorted list of registered (display) server names. For diagnostics.
+    pub fn server_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.clients.read().keys().cloned().collect();
+        names.sort();
+        names
     }
 
     pub fn initialize(&self, configs: Vec<McpServerConfig>) {

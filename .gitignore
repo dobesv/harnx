@@ -3,6 +3,7 @@
 **/target-local
 /tmp
 /.env
-*.log*.snap.new
+*.log
+*.snap.new
 target-local/
 .pnpm-store/

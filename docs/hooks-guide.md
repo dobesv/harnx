@@ -138,6 +138,29 @@ NEW_INPUT=$(echo "$TOOL_INPUT" | jq --arg cmd "$NEW_COMMAND" '.command = $cmd')
 echo "{\"hookSpecificOutput\": {\"toolInput\": $NEW_INPUT}}"
 ```
 
+### Hook Process Environment: `$HARNX_PACKAGE_DIR`
+
+Every hook command (both `claude-command` and `claude-command-persistent`) runs
+through a shell, and Harnx injects one extra environment variable:
+
+| Variable | Value |
+|---|---|
+| `HARNX_PACKAGE_DIR` | The directory of the package that owns the hook, when the hook is defined by a packaged MCP server (`<config>/packages/<name>/`). For hooks defined outside a package (the global `config.yaml`, or an MCP server under `<config>/mcp_servers/`), it falls back to the config directory (`~/.config/harnx` by default). |
+
+This lets a package bundle helper scripts alongside its config and reference
+them without hardcoding an absolute path. For example, a packaged MCP server can
+ship `packages/<name>/hooks/jira-auth-hook.py` and invoke it from a hook:
+
+```yaml
+    command: >-
+      harnx-proxy-auth --hook $HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py
+```
+
+Because the command runs through a shell, `$HARNX_PACKAGE_DIR` (along with `~`
+and other `$VARS`) is expanded before the hook binary sees it. Note this
+expansion applies to the hook `command` only — an MCP server's own `command`
+and `args` are spawned directly and are **not** shell-expanded.
+
 ## 7. Permissions
 
 The `permissionDecision` field controls whether a tool is allowed to run.
@@ -170,6 +193,58 @@ Persistent hooks (`type: claude-command-persistent`) use a JSONL-based protocol 
 ```
 
 The hook process must read one line from `stdin`, process it, and write exactly one line to `stdout`. The `id` must match the request.
+
+
+### Startup Message for Proxy-style Persistent Hooks
+
+Some persistent hooks use an extended JSONL handshake before normal request/response traffic begins. After the hook prints `READY`, the caller may send one startup message shaped like:
+
+```json
+{"id": "startup-1", "event": "startup", "vars": {"temp_file_root": "/tmp/harnx-123", "proxy_port": 8443}}
+```
+
+`vars` uses same safe request-vars block later per-request messages can carry. For `harnx-proxy-auth`, this includes values such as:
+
+- `temp_file_root`: per-run writable temp directory the hook can populate before sandboxed command starts
+- `proxy_port`: local proxy port, available because startup message is sent after proxy listener is ready
+
+Hook should respond with normal single-line JSON object using same `id`. It may include an `env` object:
+
+```json
+{"id": "startup-1", "env": {"ACLI_CONFIG_DIR": "/tmp/harnx-123/acli"}}
+```
+
+Only string values from `env` are kept. Caller merges them into sandboxed command environment with this precedence:
+
+1. `tool_input.env`
+2. `--env` jaq scripts
+3. hook startup `env`
+4. proxy defaults such as `HTTPS_PROXY` and CA-bundle variables
+
+This lets startup hook fill gaps without overriding explicit tool-call env or jaq-derived env. Startup hook can also write files directly under `temp_file_root` before command starts.
+
+### Backwards Compatibility
+
+Startup message is optional extension. Older hooks that ignore `event: "startup"`, or reply without an `env` field, still work: caller treats missing/unknown startup env as empty and continues with normal per-request traffic. Keeping lazy per-request initialization paths in hook code remains valid defensive fallback.
+### Surfacing Notices to the UI
+
+A persistent hook can push a message to the active interface (TUI/CLI/serve) at
+any time by writing a **standalone** JSONL line — one that carries **no `id`**,
+so it is not treated as a response:
+
+```json
+{"notice": {"level": "error", "message": "Atlassian auth unavailable — Jira calls will fail"}}
+```
+
+`level` is `error`, `warning`, or `info` (default `warning`). Harnx emits it as
+a user-visible `Notice`. This is the recommended way for a live hook to report
+an internal problem (it keeps running and answering requests). `harnx-proxy-auth`
+forwards `notice` lines emitted by its exec sub-hooks, so a nested hook (e.g.
+`jira-auth-hook.py`) can surface errors up the chain.
+
+If a persistent hook process instead **exits unexpectedly** (bad flag, crash),
+Harnx automatically emits an Error notice containing the tail of its captured
+stderr — so a dead hook is never silent.
 
 ## 10. Examples
 
@@ -320,6 +395,35 @@ Filter should return the same object, optionally with:
 
 Multiple `--hook` flags are combined as a pipe: `hook1 | hook2 | ...`.
 
+#### Executable (script) hooks and the `vars` block
+
+A `--hook` argument that is a path to an executable (or an inline shebang
+script) runs as a resident process speaking the JSONL protocol: it reads one
+request object per line from `stdin` (each carrying a correlation `id`) and
+writes one response line per `id`. In addition to `method`/`host`/`path`/
+`headers`, each request includes a **`vars`** object with the resolved,
+non-secret context that jq hooks reference as jaq variables:
+
+```json
+{
+  "id": "evt-42",
+  "vars": {
+    "fake_uuid_key": "…", "fake_base64_key": "…", "fake_url_base64_key": "…",
+    "fake_hex_key": "…", "fake_email": "…",
+    "temp_file_root": "/tmp/harnx-fs-XXXXXX"
+  },
+  "method": "GET", "host": "api.example.com", "path": "/", "headers": {}
+}
+```
+
+`temp_file_root` is populated only when `--fs` is passed (proxy-auth's
+per-instance temp dir). Real secrets are **not** placed in `vars` — an
+executable hook already inherits proxy-auth's process environment, so it reads
+real tokens directly from its own `os.environ` (or equivalent). Keeping secrets
+out of the request payload avoids duplicating them into a surface that could be
+logged. Use `vars.temp_file_root` when a hook needs to write files into the same
+directory that a sibling `--env`/`--fs` exposes to the sandbox.
+
 Examples:
 
 ```sh
@@ -438,9 +542,13 @@ The same command applies to other `acli` products: replace `jira` with `confluen
 
 > **Synthetic Config:** `acli` inside the sandbox uses a synthetic `jira_config.yaml` generated by the proxy in a private temporary directory. It does **not** require access to your host `~/.config/acli/` directory, which can remain isolated from the sandbox.
 
+> **`acli jira auth status` reports "Unauthorized" inside the sandbox — this is expected.** That command performs a **local** check: it decrypts and validates the token stored in the config, and never makes a network request. Inside the sandbox the stored token is the *sentinel* (the real token deliberately never enters the sandbox), so the local validation fails. Actual Jira operations — `acli jira workitem view`, `project list`, etc. — still work, because those make network calls that the proxy authenticates on the wire by swapping the sentinel for the real token. Judge success by whether data commands work, not by `auth status`.
+
 #### Step 2 — Configure the proxy hook
 
-Add the following to your `config.yaml`. The proxy will self-source credentials from your host OS keyring using `--load-exec`. It injects a synthetic `jira_config.yaml` containing a sentinel token into the sandbox via `--fs`, and the `--hook` filter replaces that sentinel with the real token in outbound requests.
+Add the following to your `config.yaml`. The bundled `jira-auth-hook.py` does all the work: it reads your host `acli` profile, sources the real token from the OS keyring, writes a synthetic `jira_config.yaml` — holding only a sentinel token, written as a YAML `!!binary` scalar so `acli` accepts it — into the proxy's per-run temp dir, and replaces the sentinel with the real token on outbound `api.atlassian.com` / site requests. The `--fs`/`--env` lines allocate that temp dir and point `ACLI_CONFIG_DIR` at it.
+
+The hook ships with the `harnx` **pantheon** and **coding** packages at `~/.config/harnx/packages/<pkg>/hooks/jira-auth-hook.py` (swap `pantheon` below for `coding` if that's the package you use). For a standalone `harnx-sandbox-run` install, see the download-and-verify step in [sandbox-run.md](./sandbox-run.md).
 
 No manual environment variables are required as long as you have logged in with an **API token** (Step 1) on your host — OAuth (`--web`) is not supported.
 
@@ -452,26 +560,14 @@ hooks:
     matcher: "bash_exec|bash_spawn"
     command: >-
       harnx-proxy-auth
-      --load-yaml acli_cfg=~/.config/acli/jira_config.yaml
-      --load-exec 'atlassian_token=p=$(sed -n "s/^current_profile:[[:space:]]*\"\?\([^\"]*\)\"\?[[:space:]]*$/\1/p" ~/.config/acli/jira_config.yaml); test -n "$p" && secret-tool lookup service acli username "jira:$p"'
-      --fs '$acli_cfg.current_profile as $cp |
-          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-          if $p and $atlassian_token then
-            . + { "acli/jira_config.yaml": ({ version: 1, current_profile: $cp,
-              profiles: [{ site: $p.site, cloud_id: $p.cloud_id, account_id: $p.account_id, auth_type: "api_token",
-                token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }] } | tojson) }
-          end'
-      --env '$acli_cfg.current_profile as $cp |
-          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-          if $p and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end'
-      --hook '$acli_cfg.current_profile as $cp |
-          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-          if $p and $atlassian_token and (.host == "api.atlassian.com" or .host == $p.site)
-          then .headers.authorization = basic($p.email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end'
+      --fs '{"harnx-fs-acli/acli/.keep": ""}'
+      --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
+      --hook ~/.config/harnx/packages/pantheon/hooks/jira-auth-hook.py
 ```
 
-> **macOS users:** Change the `--load-exec` command for `atlassian_token` to use `security find-generic-password -s acli -a "jira:$p" -w`.
-> **Security note:** The proxy matches only the site in your active `acli` profile (plus `api.atlassian.com`), preventing credentials from being accidentally forwarded to other Atlassian tenants.
+The hook sources the token from the platform keyring automatically (`secret-tool` on Linux, `security find-generic-password` on macOS); set `HARNX_JIRA_TOKEN_CMD` to use a different secret store.
+
+> **Security note:** The hook injects the token only for the site in your active `acli` profile (plus `api.atlassian.com`), preventing credentials from being accidentally forwarded to other Atlassian tenants.
 
 You can combine Atlassian and GitHub auth in a single `harnx-proxy-auth` invocation:
 
@@ -487,22 +583,9 @@ hooks:
       --hook 'if (.host == "api.github.com") and (.headers.authorization == "Bearer ghs_\($fake_base64_key)")
           then .headers.authorization = bearer(env.GITHUB_TOKEN // env.GH_TOKEN)
           else . end'
-      --load-yaml acli_cfg=~/.config/acli/jira_config.yaml
-      --load-exec 'atlassian_token=p=$(sed -n "s/^current_profile:[[:space:]]*\"\?\([^\"]*\)\"\?[[:space:]]*$/\1/p" ~/.config/acli/jira_config.yaml); test -n "$p" && secret-tool lookup service acli username "jira:$p"'
-      --fs '$acli_cfg.current_profile as $cp |
-          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-          if $p and $atlassian_token then
-            . + { "acli/jira_config.yaml": ({ version: 1, current_profile: $cp,
-              profiles: [{ site: $p.site, cloud_id: $p.cloud_id, account_id: $p.account_id, auth_type: "api_token",
-                token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }] } | tojson) }
-          end'
-      --env '$acli_cfg.current_profile as $cp |
-          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-          if $p and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end'
-      --hook '$acli_cfg.current_profile as $cp |
-          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-          if $p and $atlassian_token and (.host == "api.atlassian.com" or .host == $p.site)
-          then .headers.authorization = basic($p.email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end'
+      --fs '{"harnx-fs-acli/acli/.keep": ""}'
+      --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
+      --hook ~/.config/harnx/packages/pantheon/hooks/jira-auth-hook.py
 ```
 
 ### Injected Environment Variables

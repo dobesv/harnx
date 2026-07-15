@@ -44,6 +44,35 @@ test('happy path: picker flow to chat with slash-named agent', async ({ page }) 
   await expect(page).toHaveScreenshot('happy-path.png');
 });
 
+test('composer: no scrollbar until max-height, resets after send', async ({ page }) => {
+  await page.goto('/?scenario=happy');
+  await page.locator('.grid-item').filter({ hasText: 'coding/coder' }).click();
+  await page.locator('.new-chat-button').click();
+
+  const input = page.locator('.aui-composer-input');
+
+  // A few lines: textarea has grown but is still under the 50vh cap, so the
+  // scrollbar must stay hidden (the phantom-scrollbar bug being fixed).
+  await input.fill('line 1\nline 2\nline 3');
+  await expect(input).toHaveCSS('overflow-y', 'hidden');
+  const grownHeight = await input.evaluate((el) => (el as HTMLTextAreaElement).clientHeight);
+
+  // Enough lines to exceed max-height (50vh of a 720px viewport = 360px).
+  // The height is capped and the scrollbar becomes functional (overflow auto).
+  await input.fill(Array.from({ length: 60 }, (_, i) => `row ${i}`).join('\n'));
+  await expect(input).toHaveCSS('overflow-y', 'auto');
+  const cappedHeight = await input.evaluate((el) => (el as HTMLTextAreaElement).clientHeight);
+  expect(cappedHeight).toBeLessThanOrEqual(360);
+  expect(cappedHeight).toBeGreaterThan(grownHeight);
+
+  // After sending, the composer collapses back to single-line, no scrollbar.
+  await page.locator('.aui-composer-send').click();
+  await expect(input).toHaveCSS('overflow-y', 'hidden');
+  await expect
+    .poll(async () => input.evaluate((el) => (el as HTMLTextAreaElement).clientHeight))
+    .toBeLessThan(cappedHeight);
+});
+
 test('agents-fetch error', async ({ page }) => {
   await page.goto('/?scenario=agentsFail');
 

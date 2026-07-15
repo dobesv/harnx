@@ -7,7 +7,7 @@
 use crate::agent_config::AgentConfig;
 use crate::crypto::sha256;
 use crate::message::{ImageUrl, MessageContent, MessageContentPart, MessageContentToolCalls};
-use crate::tool::ToolResult;
+use crate::tool::{ToolDeclaration, ToolResult};
 
 use std::collections::HashMap;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -26,6 +26,7 @@ pub struct Input {
     pub attachment_refs: Vec<String>,
     pub data_urls: HashMap<String, String>,
     pub tool_calls: Option<MessageContentToolCalls>,
+    pub resolved_tools: Option<Vec<ToolDeclaration>>,
     pub agent: AgentConfig,
     pub rag_name: Option<String>,
     pub with_session: bool,
@@ -69,11 +70,12 @@ impl Input {
             attachment_refs: Vec::new(),
             data_urls: HashMap::new(),
             tool_calls: None,
+            resolved_tools: None,
             agent,
             rag_name: None,
             with_session: false,
             with_agent: false,
-            inject_system_prompt: false,
+            inject_system_prompt: true,
             injected_user_text: None,
             skip_user_log_append: false,
             preferred_assistant_message_id: None,

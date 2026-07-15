@@ -120,6 +120,27 @@ impl JaqVars {
             .and_then(Value::as_str)
     }
 
+    /// The subset of vars that is safe to hand to exec hooks over the JSONL
+    /// protocol: the generated sentinels, `temp_file_root`, and `proxy_port`.
+    /// Deliberately EXCLUDES `--load-*` values, which can carry real secrets
+    /// (e.g. a token fetched via `--load-exec`) that must never enter a hook's
+    /// request payload or its logs.
+    pub fn safe_request_vars(&self) -> Value {
+        let safe = |name: &str| {
+            SENTINEL_VAR_NAMES.contains(&name)
+                || name == TEMP_FILE_ROOT_VAR_NAME
+                || name == PROXY_PORT_VAR_NAME
+        };
+        let map = self
+            .names
+            .iter()
+            .zip(self.values.iter())
+            .filter(|(name, _)| safe(name.as_str()))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        Value::Object(map)
+    }
+
     pub(crate) fn runtime_vars(&self) -> Result<Vars<json::Val>> {
         let values = self
             .values
@@ -355,6 +376,32 @@ mod tests {
 
     fn sentinel_vars() -> JaqVars {
         vars_with_loaded(Vec::new())
+    }
+
+    #[test]
+    fn safe_request_vars_forwards_sentinels_not_loaded_secrets() {
+        let vars = JaqVars::new_from_values(
+            &test_sentinels(),
+            "/tmp/harnx-fs-abc123".to_owned(),
+            None,
+            vec![("secret_token".to_owned(), json!("s3cr3t"))],
+        )
+        .expect("vars build");
+
+        let obj = vars.safe_request_vars();
+        let map = obj.as_object().expect("safe vars is an object");
+
+        assert_eq!(
+            map.get("temp_file_root").and_then(|v| v.as_str()),
+            Some("/tmp/harnx-fs-abc123")
+        );
+        assert_eq!(
+            map.get("fake_email").and_then(|v| v.as_str()),
+            Some("fake@example.com")
+        );
+        // A `--load-*` value can be a real secret; it must never be forwarded to
+        // exec hooks over the request protocol.
+        assert!(map.get("secret_token").is_none());
     }
 
     #[test]

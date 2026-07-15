@@ -125,7 +125,7 @@ toolsets:
 # One resident hook handles whole acli workaround once: read host jira_config.yaml,
 # select profile matching current_profile, fetch real token from host keyring, write
 # private synthetic acli config with sentinel token, set ACLI_CONFIG_DIR, and swap in
-# real Authorization header only for api.atlassian.com / active site host.
+# real Authorization header for *.atlassian.com gateway hosts (api./as./...) and the active site host.
 #
 # hooks:
 #   entries:
@@ -134,8 +134,16 @@ toolsets:
 #     matcher: "bash_exec|bash_spawn"
 #     command: >-
 #       harnx-proxy-auth
+#       --fs '{"harnx-fs-acli/acli/.keep": ""}'
 #       --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
 #       --hook ./example_config/jira-auth-hook.py
+#
+# NOTE: ACLI_CONFIG_DIR must resolve to the SAME directory jira-auth-hook.py
+# writes into. Both sides key off $temp_file_root — proxy-auth's per-run temp
+# dir, which is unique per instance and auto-deleted on exit. --fs allocates it
+# (and creates the folder); --env hands the path to the sandbox; and proxy-auth
+# sends the same $temp_file_root to the hook in each request's `vars`, so the
+# hook writes its config there. ($temp_file_root is empty UNLESS --fs is passed.)
 #
 # Example: GCP auth injection for Node ADC / BigQuery-style clients
 # Resident hook injects metadata endpoints into sandbox env, so Google client libs

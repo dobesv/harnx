@@ -321,6 +321,7 @@ async fn remote_thin_session(
 pub struct RemoteTranscriptState {
     pub compressed_messages: Vec<harnx_core::message::Message>,
     pub messages: Vec<harnx_core::message::Message>,
+    pub compaction_summary: Option<String>,
 }
 
 fn renumber_remote_messages_for_window(
@@ -420,6 +421,7 @@ pub async fn load_remote_transcript_for_render(
         return Ok(RemoteTranscriptState {
             compressed_messages: vec![],
             messages: vec![],
+            compaction_summary: None,
         });
     }
 
@@ -445,6 +447,7 @@ pub async fn load_remote_transcript_for_render(
     Ok(RemoteTranscriptState {
         compressed_messages: session.compressed_messages,
         messages: session.messages,
+        compaction_summary: session.compaction_summary,
     })
 }
 

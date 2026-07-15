@@ -1,16 +1,55 @@
-use crate::{HookOutcome, HookPayload, HookResult, HookResultControl};
+use crate::{HookConfig, HookOutcome, HookPayload, HookResult, HookResultControl};
 
 use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-pub async fn execute_command_hook(
-    payload: &HookPayload,
-    command: &str,
-    timeout_secs: Option<u64>,
-) -> HookOutcome {
+/// Env var injected into every hook process, pointing at the directory of the
+/// package that owns the hook — or the config dir when the hook is not owned by
+/// a package. Lets bundled hook scripts be referenced package-relative, e.g.
+/// `$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py`.
+pub const HARNX_PACKAGE_DIR_ENV: &str = "HARNX_PACKAGE_DIR";
+
+/// A hook command plus the parameters needed to spawn it. Bundling these keeps
+/// the spawn/dispatch signatures within the argument budget and centralizes how
+/// `HARNX_PACKAGE_DIR` is derived.
+#[derive(Debug, Clone)]
+pub struct HookCommand {
+    pub command: String,
+    pub timeout: Option<u64>,
+    pub package_dir: Option<PathBuf>,
+}
+
+impl From<&HookConfig> for HookCommand {
+    fn from(hook: &HookConfig) -> Self {
+        Self {
+            command: hook.command.clone(),
+            timeout: hook.timeout,
+            package_dir: hook.package_dir.clone(),
+        }
+    }
+}
+
+/// Build the base shell `Command` for a hook, with `HARNX_PACKAGE_DIR` injected
+/// (the owning package dir, or the config dir when not owned by a package).
+/// Callers add stdio and working directory as needed.
+pub(crate) fn base_hook_command(command: &str, package_dir: Option<&Path>) -> Command {
+    let package_dir = package_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(harnx_core::config_paths::config_dir);
+    let mut cmd = Command::new(default_shell());
+    cmd.arg(default_shell_arg())
+        .arg(command)
+        .env(HARNX_PACKAGE_DIR_ENV, package_dir);
+    cmd
+}
+
+pub async fn execute_command_hook(payload: &HookPayload, hook: &HookCommand) -> HookOutcome {
+    let command = hook.command.as_str();
+    let timeout_secs = hook.timeout;
     let event_name = payload.hook_event.event_name();
     debug!(
         "Dispatching hook for event '{}': command='{}'",
@@ -18,12 +57,7 @@ pub async fn execute_command_hook(
     );
     let started_at = std::time::Instant::now();
 
-    let shell = default_shell();
-    let shell_arg = default_shell_arg();
-
-    let mut child = match Command::new(&shell)
-        .arg(shell_arg)
-        .arg(command)
+    let mut child = match base_hook_command(command, hook.package_dir.as_deref())
         .current_dir(&payload.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -185,12 +219,20 @@ pub(crate) fn default_shell_arg() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_command_hook, parse_success_output};
+    use super::{execute_command_hook, parse_success_output, HookCommand};
     use crate::{HookEvent, HookPayload, HookResultControl};
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn hc(command: &str, timeout: Option<u64>, package_dir: Option<&Path>) -> HookCommand {
+        HookCommand {
+            command: command.to_string(),
+            timeout,
+            package_dir: package_dir.map(Path::to_path_buf),
+        }
+    }
 
     fn test_payload(cwd: &Path) -> HookPayload {
         HookPayload {
@@ -270,7 +312,8 @@ mod tests {
         let cwd = temp_test_dir("echo-hook");
         let payload = test_payload(&cwd);
 
-        let outcome = execute_command_hook(&payload, success_json_command(), Some(5)).await;
+        let outcome =
+            execute_command_hook(&payload, &hc(success_json_command(), Some(5), None)).await;
 
         assert!(matches!(outcome.control, HookResultControl::Continue));
         assert!(outcome.result.additional_context.is_none());
@@ -282,7 +325,8 @@ mod tests {
         let cwd = temp_test_dir("plain-text");
         let payload = test_payload(&cwd);
 
-        let outcome = execute_command_hook(&payload, plain_text_command(), Some(5)).await;
+        let outcome =
+            execute_command_hook(&payload, &hc(plain_text_command(), Some(5), None)).await;
 
         assert!(matches!(outcome.control, HookResultControl::Continue));
         assert_eq!(
@@ -296,7 +340,7 @@ mod tests {
         let cwd = temp_test_dir("exit-2");
         let payload = test_payload(&cwd);
 
-        let outcome = execute_command_hook(&payload, exit_2_command(), Some(5)).await;
+        let outcome = execute_command_hook(&payload, &hc(exit_2_command(), Some(5), None)).await;
 
         match outcome.control {
             HookResultControl::Block { reason } => assert_eq!(reason, "blocked"),
@@ -311,7 +355,7 @@ mod tests {
         let payload = test_payload(&cwd);
         let start = tokio::time::Instant::now();
 
-        let outcome = execute_command_hook(&payload, timeout_command(), Some(1)).await;
+        let outcome = execute_command_hook(&payload, &hc(timeout_command(), Some(1), None)).await;
 
         assert!(matches!(outcome.control, HookResultControl::Continue));
         assert!(start.elapsed() < Duration::from_secs(2));
@@ -322,9 +366,47 @@ mod tests {
         let cwd = temp_test_dir("not-found");
         let payload = test_payload(&cwd);
 
-        let outcome = execute_command_hook(&payload, command_not_found(), Some(5)).await;
+        let outcome = execute_command_hook(&payload, &hc(command_not_found(), Some(5), None)).await;
 
         assert!(matches!(outcome.control, HookResultControl::Continue));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_executor_injects_package_dir_env() {
+        let cwd = temp_test_dir("pkgdir-env");
+        let payload = test_payload(&cwd);
+        let pkg = temp_test_dir("pkgdir-value");
+
+        let outcome = execute_command_hook(
+            &payload,
+            &hc("printf '%s' \"$HARNX_PACKAGE_DIR\"", Some(5), Some(&pkg)),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.result.additional_context.as_deref(),
+            Some(pkg.to_string_lossy().as_ref())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_executor_package_dir_env_falls_back_to_config_dir() {
+        let cwd = temp_test_dir("pkgdir-fallback");
+        let payload = test_payload(&cwd);
+
+        let outcome = execute_command_hook(
+            &payload,
+            &hc("printf '%s' \"$HARNX_PACKAGE_DIR\"", Some(5), None),
+        )
+        .await;
+
+        let expected = harnx_core::config_paths::config_dir();
+        assert_eq!(
+            outcome.result.additional_context.as_deref(),
+            Some(expected.to_string_lossy().as_ref())
+        );
     }
 
     #[test]

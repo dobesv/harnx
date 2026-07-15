@@ -38,7 +38,7 @@ use crate::utils::AbortSignal;
 /// `call_with_retry_and_fallback`.
 pub type AgentCallFn = Arc<
     dyn for<'a> Fn(
-            &'a Input,
+            &'a mut Input,
             &'a GlobalConfig,
             AbortSignal,
         ) -> Pin<
@@ -337,7 +337,7 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
 
         // LLM call (with retry + fallback).
         let llm_result = if let Some(ref call_fn) = ctx.call_fn {
-            call_fn(&input, config, abort_signal.clone()).await
+            call_fn(&mut input, config, abort_signal.clone()).await
         } else {
             // Use the default call function, which respects config.stream:
             // streaming (call_chat_completions_streaming) when enabled, or
@@ -346,7 +346,7 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
             // matters for ACP server mode where stdout is the JSON-RPC
             // transport. The old hardcoded call_chat_completions(inp, true, ...)
             // always printed to stdout, corrupting the ACP connection.
-            call_with_retry_and_fallback(&input, config, abort_signal.clone()).await
+            call_with_retry_and_fallback(&mut input, config, abort_signal.clone()).await
         };
 
         let (output, thought, tool_calls, usage) = match llm_result {

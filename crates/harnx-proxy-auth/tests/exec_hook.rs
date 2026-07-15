@@ -166,6 +166,36 @@ async fn spawns_once_and_reuses_process() {
 }
 
 #[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_carries_safe_vars_to_hook() {
+    let script = r#"#!/usr/bin/env python3
+import json
+import sys
+print("READY", flush=True)
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    req = json.loads(raw)
+    req.setdefault("headers", {})
+    req["headers"]["x-temp-root"] = req.get("vars", {}).get("temp_file_root", "MISSING")
+    print(json.dumps(req), flush=True)
+"#;
+    let process = ExecHookProcess::spawn_inline(script, 1)
+        .unwrap()
+        .with_request_vars(std::sync::Arc::new(json!({
+            "temp_file_root": "/tmp/harnx-fs-test",
+            "fake_hex_key": "deadbeef",
+        })));
+
+    let out = process
+        .transform(json!({"method":"GET","host":"example.com","path":"/","headers":{}}))
+        .await;
+
+    assert_eq!(out["headers"]["x-temp-root"], "/tmp/harnx-fs-test");
+}
+
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn correlates_concurrent_requests_by_id() {
     let process =

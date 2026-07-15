@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Result};
 use serde_json::{Map, Value};
@@ -55,6 +56,9 @@ pub fn build_stages(
     exec_timeout_secs: u64,
 ) -> Result<Vec<Stage>> {
     ensure_hook_platform_support(hooks)?;
+    // The safe subset of vars (sentinels + temp_file_root) is attached to every
+    // exec-hook request so exec hooks get the same context jq hooks resolve.
+    let request_vars = Arc::new(vars.safe_request_vars());
     hooks
         .iter()
         .map(|hook| match stage_kind(hook) {
@@ -64,15 +68,15 @@ pub fn build_stages(
             }),
             HookStageKind::ExecInline => {
                 let script = hook_script_source(hook)?;
-                Ok(Stage::Exec(Arc::new(ExecHookProcess::spawn_inline(
-                    script,
-                    exec_timeout_secs,
-                )?)))
+                Ok(Stage::Exec(Arc::new(
+                    ExecHookProcess::spawn_inline(script, exec_timeout_secs)?
+                        .with_request_vars(request_vars.clone()),
+                )))
             }
-            HookStageKind::ExecFile => Ok(Stage::Exec(Arc::new(ExecHookProcess::spawn_path(
-                PathBuf::from(hook),
-                exec_timeout_secs,
-            )?))),
+            HookStageKind::ExecFile => Ok(Stage::Exec(Arc::new(
+                ExecHookProcess::spawn_path(PathBuf::from(hook), exec_timeout_secs)?
+                    .with_request_vars(request_vars.clone()),
+            ))),
         })
         .collect()
 }
@@ -92,6 +96,18 @@ pub struct TransformPipeline {
 impl TransformPipeline {
     pub fn new(stages: Vec<Stage>) -> Self {
         Self { stages }
+    }
+
+    pub async fn run_startup(&self, vars: Value, timeout: Duration) -> Map<String, Value> {
+        let mut merged = Map::new();
+        for stage in &self.stages {
+            if let Stage::Exec(process) = stage {
+                for (key, value) in process.startup(vars.clone(), timeout).await {
+                    merged.entry(key).or_insert(value);
+                }
+            }
+        }
+        merged
     }
 
     pub async fn apply(&self, req_json: Value) -> Value {
@@ -143,6 +159,8 @@ mod tests {
     use crate::sentinel::Sentinels;
     use serde_json::json;
     use std::sync::Arc;
+    #[cfg(unix)]
+    use std::time::Duration;
     #[cfg(unix)]
     use tempfile::NamedTempFile;
 
@@ -323,8 +341,13 @@ while IFS= read -r line; do printf '%s
 
     #[cfg(unix)]
     fn python_exec_script(mode: &str) -> String {
+        let startup_env = match mode {
+            "startup-first" => r#"{"STAGE": "earlier", "UNIQUE_FIRST": "present"}"#,
+            "startup-second" => r#"{"STAGE": "later", "UNIQUE_SECOND": "present"}"#,
+            _ => r#"{"STAGE": "shared", "UNIQUE_DEFAULT": "present"}"#,
+        };
         format!(
-            "#!/usr/bin/env python3\nimport json, sys, time\nprint(\"READY\", flush=True)\nfor line in sys.stdin:\n    line = line.strip()\n    if not line:\n        continue\n    msg = json.loads(line)\n    req_id = msg.pop(\"id\")\n    if \"{mode}\" == \"timeout\":\n        time.sleep(2.0)\n    else:\n        msg.setdefault(\"headers\", {{}})[\"x-exec\"] = \"ok\"\n        msg[\"path\"] = msg.get(\"path\", \"\") + \"-exec\"\n        time.sleep(0.1)\n    msg[\"id\"] = req_id\n    print(json.dumps(msg), flush=True)\n"
+            "#!/usr/bin/env python3\nimport json, sys, time\nprint(\"READY\", flush=True)\nfor line in sys.stdin:\n    line = line.strip()\n    if not line:\n        continue\n    msg = json.loads(line)\n    req_id = msg.pop(\"id\")\n    if msg.get(\"event\") == \"startup\":\n        if \"{mode}\" == \"startup-timeout\":\n            time.sleep(2.0)\n            continue\n        env = json.loads(r'''{startup_env}''')\n        print(json.dumps({{\"id\": req_id, \"env\": env}}), flush=True)\n        continue\n    if \"{mode}\" == \"timeout\":\n        time.sleep(2.0)\n    else:\n        msg.setdefault(\"headers\", {{}})[\"x-exec\"] = \"ok\"\n        msg[\"path\"] = msg.get(\"path\", \"\") + \"-exec\"\n        time.sleep(0.1)\n    msg[\"id\"] = req_id\n    print(json.dumps(msg), flush=True)\n"
         )
     }
 
@@ -418,13 +441,36 @@ while IFS= read -r line; do printf '%s
         ]);
 
         let result = pipeline.apply(input).await;
-
         assert_eq!(result["path"], "/slow");
         assert_eq!(result["headers"]["x-before-timeout"], "set");
         assert_eq!(result["headers"]["x-after-timeout"], "still-ran");
         assert!(result["headers"].get("x-exec").is_none());
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_startup_merges_exec_env_with_earlier_stage_precedence() {
+        let vars = test_vars();
+        let pipeline = TransformPipeline::new(vec![
+            jaq_stage(r#".headers["x-ignore"] = "jaq""#, &vars),
+            Stage::Exec(Arc::new(
+                ExecHookProcess::spawn_inline(&python_exec_script("startup-first"), 1).unwrap(),
+            )),
+            Stage::Exec(Arc::new(
+                ExecHookProcess::spawn_inline(&python_exec_script("startup-second"), 1).unwrap(),
+            )),
+            jaq_stage(r#".headers["x-ignore-2"] = "jaq""#, &vars),
+        ]);
+
+        let env = pipeline
+            .run_startup(json!({"proxy_port": 1234}), Duration::from_secs(1))
+            .await;
+
+        assert_eq!(env["STAGE"], "earlier");
+        assert_eq!(env["UNIQUE_FIRST"], "present");
+        assert_eq!(env["UNIQUE_SECOND"], "present");
+        assert_eq!(env.len(), 3);
+    }
     #[tokio::test]
     async fn respond_stage_short_circuits_later_stages() {
         let vars = test_vars();

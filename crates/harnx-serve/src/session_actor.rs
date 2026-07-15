@@ -2,13 +2,10 @@
 
 use crate::ag_ui::AgUiSink;
 use ag_ui_core::{
-    event::{
-        BaseEvent, Event, RunErrorEvent, RunFinishedEvent, RunStartedEvent, TextMessageEndEvent,
-        TextMessageStartEvent,
-    },
+    event::{BaseEvent, Event, RunErrorEvent, RunFinishedEvent, RunStartedEvent},
     types::{
         ids::{MessageId, RunId, ThreadId},
-        message::{Message as AgUiMessage, Role},
+        message::Message as AgUiMessage,
     },
 };
 use chrono::{DateTime, Utc};
@@ -229,7 +226,7 @@ struct ActiveRun {
 struct RunFinished {
     run_id: RunId,
     result: anyhow::Result<()>,
-    message_id: MessageId,
+    sink: Arc<BroadcastEventSender>,
     thread_id: ThreadId,
     attachment_refs: Vec<String>,
 }
@@ -476,12 +473,7 @@ impl SessionActor {
         self.refresh_history_snapshot();
         match &done.result {
             Ok(()) => {
-                let _ = self
-                    .broadcast_tx
-                    .send(Event::TextMessageEnd(TextMessageEndEvent {
-                        base: base_event(),
-                        message_id: done.message_id.clone(),
-                    }));
+                done.sink.sink.close_text_segment();
                 let _ = self.broadcast_tx.send(Event::RunFinished(RunFinishedEvent {
                     base: base_event(),
                     thread_id: done.thread_id.clone(),
@@ -500,12 +492,7 @@ impl SessionActor {
                         let result = serde_json::json!({
                             "outcome": pending.metadata.clone()
                         });
-                        let _ =
-                            self.broadcast_tx
-                                .send(Event::TextMessageEnd(TextMessageEndEvent {
-                                    base: base_event(),
-                                    message_id: done.message_id.clone(),
-                                }));
+                        done.sink.sink.close_text_segment();
                         let _ = self.broadcast_tx.send(Event::RunFinished(RunFinishedEvent {
                             base: base_event(),
                             thread_id: done.thread_id,
@@ -520,7 +507,11 @@ impl SessionActor {
                         return;
                     }
                 }
-                // Non-tool-interrupt error
+                // Non-tool-interrupt error (failure or cancellation). Close any
+                // open text segment first so a client that was mid-stream when the
+                // run failed doesn't stay stuck in a "streaming"/typing state with
+                // an orphaned TEXT_MESSAGE_START.
+                done.sink.sink.close_text_segment();
                 let _ = self.broadcast_tx.send(Event::RunError(RunErrorEvent {
                     base: base_event(),
                     message: err.to_string(),
@@ -585,7 +576,6 @@ impl SessionActor {
             .set_tui_confirm_tool_use(Some(confirm_override));
         let run_id = RunId::random();
         let thread_id = derive_thread_id(&self.key.session);
-        let message_id = MessageId::random();
         let started_at = Utc::now();
         let abort_signal = create_abort_signal();
         let (inject_tx, inject_rx) = mpsc::channel(COMMAND_BUFFER);
@@ -595,13 +585,6 @@ impl SessionActor {
             thread_id: thread_id.clone(),
             run_id: run_id.clone(),
         }));
-        let _ = self
-            .broadcast_tx
-            .send(Event::TextMessageStart(TextMessageStartEvent {
-                base: base_event(),
-                message_id: message_id.clone(),
-                role: Role::Assistant,
-            }));
 
         let loop_ctx = build_loop_ctx(
             prompt_config.clone(),
@@ -617,16 +600,16 @@ impl SessionActor {
         let done_tx = self.run_done_tx.clone();
         let run_id_for_task = run_id.clone();
         let thread_id_for_task = thread_id.clone();
-        let message_id_for_task = message_id.clone();
         let session_event_context =
             SessionEventContext::new(self.actor_config.base_config.clone(), self.key.clone());
+        let sink = Arc::new(BroadcastEventSender::new(
+            event_tx,
+            MessageId::random(),
+            session_event_context,
+        ));
+        let sink_for_task = sink.clone();
         let task = tokio::spawn(async move {
-            let sink = Arc::new(BroadcastEventSender::new(
-                event_tx,
-                message_id_for_task.clone(),
-                session_event_context,
-            ));
-            let loop_result = with_agent_event_sink(sink, async {
+            let loop_result = with_agent_event_sink(sink_for_task.clone(), async {
                 Box::pin(run_agent_loop(&loop_ctx, input)).await
             })
             .await;
@@ -634,7 +617,7 @@ impl SessionActor {
                 .send(RunFinished {
                     run_id: run_id_for_task,
                     result: loop_result,
-                    message_id: message_id_for_task,
+                    sink: sink_for_task,
                     thread_id: thread_id_for_task,
                     attachment_refs: options.attachment_refs.clone(),
                 })
@@ -854,7 +837,6 @@ impl SessionActor {
 
         let run_id = RunId::random();
         let thread_id = derive_thread_id(&self.key.session);
-        let message_id = MessageId::random();
         let started_at = Utc::now();
         let abort_signal = create_abort_signal();
 
@@ -863,13 +845,6 @@ impl SessionActor {
             thread_id: thread_id.clone(),
             run_id: run_id.clone(),
         }));
-        let _ = self
-            .broadcast_tx
-            .send(Event::TextMessageStart(TextMessageStartEvent {
-                base: base_event(),
-                message_id: message_id.clone(),
-                role: Role::Assistant,
-            }));
 
         let loop_ctx = build_loop_ctx(
             prompt_config.clone(),
@@ -889,16 +864,16 @@ impl SessionActor {
         let done_tx = self.run_done_tx.clone();
         let run_id_for_task = run_id.clone();
         let thread_id_for_task = thread_id.clone();
-        let message_id_for_task = message_id.clone();
         let session_event_context =
             SessionEventContext::new(self.actor_config.base_config.clone(), self.key.clone());
+        let sink = Arc::new(BroadcastEventSender::new(
+            event_tx,
+            MessageId::random(),
+            session_event_context,
+        ));
+        let sink_for_task = sink.clone();
         let task = tokio::spawn(async move {
-            let sink = Arc::new(BroadcastEventSender::new(
-                event_tx,
-                message_id_for_task.clone(),
-                session_event_context,
-            ));
-            let loop_result = with_agent_event_sink(sink, async {
+            let loop_result = with_agent_event_sink(sink_for_task.clone(), async {
                 continue_agent_loop_from_tool_round(
                     &loop_ctx,
                     input,
@@ -920,7 +895,7 @@ impl SessionActor {
                 .send(RunFinished {
                     run_id: run_id_for_task,
                     result: loop_result,
-                    message_id: message_id_for_task,
+                    sink: sink_for_task,
                     thread_id: thread_id_for_task,
                     attachment_refs: options.attachment_refs.clone(),
                 })
@@ -1069,7 +1044,12 @@ pub(crate) fn load_base_config_for_tests() -> Config {
 mod tests {
     use super::*;
     use crate::test_support::TestConfigSandbox;
-    use harnx_core::{message::Message, tool::ToolCall};
+    use anyhow::anyhow;
+    use harnx_core::{
+        event::{AgentEvent, ContentBlock, ModelEvent},
+        message::Message,
+        tool::ToolCall,
+    };
     use serde_json::json;
     use std::{
         fs,
@@ -1801,6 +1781,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_actor_interrupt_closes_text_segment_before_run_finished() {
+        let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent_with_front_matter(
+            "plain",
+            "model: openai:gpt-4o\nuse_tools: harnx_agent_session_history_read\nhooks:\n  entries:\n    - event: PreToolUse\n      matcher: ^harnx_agent_session_history_read$\n      type: claude-command\n      command: |\n        printf '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"approval needed\"}}'",
+            "You are plain.",
+        );
+
+        let call_fn: AgentCallFn = Arc::new(move |_input, _config, _abort| {
+            Box::pin(async move {
+                harnx_core::sink::emit_agent_event(AgentEvent::Model(ModelEvent::MessageChunk {
+                    blocks: vec![ContentBlock::Text("partial text".to_string())],
+                }));
+                Ok((
+                    "approval needed".to_string(),
+                    None,
+                    vec![ToolCall::new(
+                        "harnx_agent_session_history_read".to_string(),
+                        json!({}),
+                        Some("call-interrupt-close".to_string()),
+                        None,
+                    )],
+                    harnx_runtime::client::CompletionTokenUsage::default(),
+                ))
+            })
+        });
+
+        let registry = registry_with_call_fn(call_fn);
+        let handle = registry.get_or_spawn(key("plain", "interrupt-close-text"));
+        let mut sub = subscribe(&handle).await.events;
+
+        let run_id = match prompt(&handle, "interrupt after text").await {
+            PromptResult::Accepted { run_id } => run_id,
+            other => panic!("expected Accepted, got {other:?}"),
+        };
+
+        let mut event_types = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Ok(event) = sub.recv().await {
+                let event_type = match &event {
+                    Event::RunStarted(started) if started.run_id.to_string() == run_id => {
+                        Some("RUN_STARTED")
+                    }
+                    Event::TextMessageContent(_) => Some("TEXT_MESSAGE_CONTENT"),
+                    Event::TextMessageEnd(_) => Some("TEXT_MESSAGE_END"),
+                    Event::RunFinished(finished) if finished.run_id.to_string() == run_id => {
+                        Some("RUN_FINISHED")
+                    }
+                    _ => None,
+                };
+                if let Some(event_type) = event_type {
+                    event_types.push(event_type);
+                    if event_type == "RUN_FINISHED" {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for run finished");
+
+        let text_end_index = event_types
+            .iter()
+            .position(|event| *event == "TEXT_MESSAGE_END")
+            .expect("expected text segment end before interruption finish");
+        let run_finished_index = event_types
+            .iter()
+            .position(|event| *event == "RUN_FINISHED")
+            .expect("expected run finished event");
+        assert!(
+            text_end_index < run_finished_index,
+            "TEXT_MESSAGE_END must precede RUN_FINISHED: {event_types:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_actor_error_closes_text_segment_before_run_error() {
+        let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+
+        let call_fn: AgentCallFn = Arc::new(move |_input, _config, _abort| {
+            Box::pin(async move {
+                harnx_core::sink::emit_agent_event(AgentEvent::Model(ModelEvent::MessageChunk {
+                    blocks: vec![ContentBlock::Text("partial text".to_string())],
+                }));
+                Err(anyhow!("plain failure after text"))
+            })
+        });
+
+        let registry = registry_with_call_fn(call_fn);
+        let handle = registry.get_or_spawn(key("plain", "error-close-text"));
+        let mut sub = subscribe(&handle).await.events;
+
+        let run_id = match prompt(&handle, "error after text").await {
+            PromptResult::Accepted { run_id } => run_id,
+            other => panic!("expected Accepted, got {other:?}"),
+        };
+
+        let mut event_types = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Ok(event) = sub.recv().await {
+                let event_type = match &event {
+                    Event::RunStarted(started) if started.run_id.to_string() == run_id => {
+                        Some("RUN_STARTED")
+                    }
+                    Event::TextMessageContent(_) => Some("TEXT_MESSAGE_CONTENT"),
+                    Event::TextMessageEnd(_) => Some("TEXT_MESSAGE_END"),
+                    Event::RunError(_) => Some("RUN_ERROR"),
+                    _ => None,
+                };
+                if let Some(event_type) = event_type {
+                    event_types.push(event_type);
+                    if event_type == "RUN_ERROR" {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for run error");
+
+        let text_end_index = event_types
+            .iter()
+            .position(|event| *event == "TEXT_MESSAGE_END")
+            .expect("expected text segment end before run error");
+        let run_error_index = event_types
+            .iter()
+            .position(|event| *event == "RUN_ERROR")
+            .expect("expected run error event");
+        assert!(
+            text_end_index < run_error_index,
+            "TEXT_MESSAGE_END must precede RUN_ERROR: {event_types:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn session_actor_resume_preserves_full_tool_round() {
         let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
         let sandbox = TestConfigSandbox::new();
@@ -1956,7 +2074,7 @@ mod tests {
             Some(&serde_json::json!({
                 "content": [{
                     "type": "text",
-                    "text": "[{\"seq\":0,\"type\":\"header\",\"text\":\"model: openai:gpt-4o\"},{\"seq\":1,\"type\":\"message\",\"text\":\"You are plain.\",\"role\":\"system\"},{\"seq\":2,\"type\":\"message\",\"text\":\"batch interrupt\",\"role\":\"user\"},{\"seq\":3,\"type\":\"tool_calls\",\"text\":\"batch approval needed\\nharnx_agent_session_history_read({})\\nharnx_agent_session_history_read({})\",\"tool_names\":[\"harnx_agent_session_history_read\",\"harnx_agent_session_history_read\"]}]"
+                    "text": "[{\"seq\":0,\"type\":\"header\",\"text\":\"model: openai:gpt-4o\"},{\"seq\":1,\"type\":\"message\",\"text\":\"batch interrupt\",\"role\":\"user\"},{\"seq\":2,\"type\":\"tool_calls\",\"text\":\"batch approval needed\\nharnx_agent_session_history_read({})\\nharnx_agent_session_history_read({})\",\"tool_names\":[\"harnx_agent_session_history_read\",\"harnx_agent_session_history_read\"]}]"
                 }]
             })),
             "auto-approved call should execute normally"

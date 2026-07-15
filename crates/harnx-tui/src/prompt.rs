@@ -62,14 +62,13 @@ impl Tui {
         let call_fn: harnx_runtime::AgentCallFn = {
             let config = ctx.config.clone();
             Arc::new(
-                move |input: &harnx_runtime::config::Input,
+                move |input: &mut harnx_runtime::config::Input,
                       _config: &harnx_runtime::config::GlobalConfig,
                       abort: harnx_runtime::utils::AbortSignal| {
-                    let input = input.clone();
                     let config = config.clone();
                     Box::pin(async move {
                         harnx_runtime::client::retry::call_with_retry_and_fallback_custom(
-                            &input,
+                            input,
                             &config,
                             abort,
                             |inp, client, cfg, abort_signal| {
@@ -231,7 +230,7 @@ impl Tui {
     }
 
     async fn call_chat_completions_streaming_tui(
-        input: &Input,
+        input: &mut Input,
         client: &dyn harnx_runtime::client::Client,
         config: &GlobalConfig,
         abort_signal: AbortSignal,

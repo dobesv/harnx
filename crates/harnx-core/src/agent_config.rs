@@ -7,7 +7,7 @@ use crate::hooks::HooksConfig;
 use crate::model::Model;
 use crate::retry_config::RetryConfig;
 use crate::system_vars::render_template;
-use crate::tool::Tools;
+use crate::tool::{ToolDeclaration, Tools};
 
 use anyhow::Result;
 use fancy_regex::Regex;
@@ -34,6 +34,26 @@ video-game-development-insights"#;
 pub const CREATE_TITLE_AGENT_NAME: &str = "%create-title%";
 
 pub type AgentVariables = IndexMap<String, String>;
+
+/// Collect flat `[KEY, VALUE, KEY, VALUE, ...]` CLI pairs (as produced by the
+/// `--agent-variable` / `-x` flag) into `AgentVariables`. Returns `None` for an
+/// empty input so callers can leave `config.agent_variables` unset. Errors when
+/// the values don't form complete key/value pairs.
+pub fn collect_agent_variables(values: &[String]) -> Result<Option<AgentVariables>> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        values.len().is_multiple_of(2),
+        "agent_variable values must be key/value pairs"
+    );
+    Ok(Some(
+        values
+            .chunks(2)
+            .map(|v| (v[0].to_string(), v[1].to_string()))
+            .collect(),
+    ))
+}
 
 static RE_METADATA: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)\A-{3,}\s*(.*?)\s*-{3,}\s*(.*)").unwrap());
@@ -403,8 +423,7 @@ impl AgentConfig {
     }
 
     pub fn interpolated_instructions(&self) -> anyhow::Result<String> {
-        let template = self.instructions.as_deref().unwrap_or(&self.prompt);
-        render_template(template, self)
+        self.system_text()
     }
 
     pub fn variables(&self) -> &AgentVariables {
@@ -443,8 +462,16 @@ impl AgentConfig {
     /// `Config::tool_declarations_for_use_tools`). Appending an unfiltered
     /// text list duplicated those definitions and leaked tools from other
     /// packages into the prompt.
+    pub fn instructions_template(&self) -> &str {
+        self.instructions.as_deref().unwrap_or(&self.prompt)
+    }
+
     pub fn system_text(&self) -> anyhow::Result<String> {
-        self.interpolated_instructions()
+        render_template(self.instructions_template(), self, None)
+    }
+
+    pub fn system_text_with_tools(&self, tools: &[ToolDeclaration]) -> anyhow::Result<String> {
+        render_template(self.instructions_template(), self, Some(tools))
     }
 
     /// Build the messages for a one-shot LLM call using this agent's prompt and
@@ -456,7 +483,8 @@ impl AgentConfig {
         input: &crate::input::Input,
     ) -> anyhow::Result<Vec<crate::message::Message>> {
         use crate::message::{Message, MessageContent, MessageRole};
-        let prompt = self.interpolated_instructions()?;
+        let prompt =
+            self.system_text_with_tools(input.resolved_tools.as_deref().unwrap_or_default())?;
         let content = input.message_content();
         let mut messages = vec![];
         if !prompt.is_empty() {
@@ -478,7 +506,8 @@ impl AgentConfig {
     /// Render the prompt + input markdown for the echo-mode (`.echo`) command.
     /// Companion of `build_messages`.
     pub fn echo_messages(&self, input: &crate::input::Input) -> anyhow::Result<String> {
-        let prompt = self.interpolated_instructions()?;
+        let prompt =
+            self.system_text_with_tools(input.resolved_tools.as_deref().unwrap_or_default())?;
         let input_markdown = input.render();
 
         if prompt.is_empty() {
@@ -621,6 +650,31 @@ fn serialize_frontmatter(frontmatter: &AgentFrontMatter) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collect_agent_variables_empty_is_none() {
+        assert!(collect_agent_variables(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn collect_agent_variables_builds_map() {
+        let values = vec![
+            "cloud_env".to_string(),
+            "true".to_string(),
+            "debug".to_string(),
+            "false".to_string(),
+        ];
+        let vars = collect_agent_variables(&values).unwrap().unwrap();
+        assert_eq!(vars.get("cloud_env").map(String::as_str), Some("true"));
+        assert_eq!(vars.get("debug").map(String::as_str), Some("false"));
+        assert_eq!(vars.len(), 2);
+    }
+
+    #[test]
+    fn collect_agent_variables_rejects_odd_pairs() {
+        let values = vec!["lonely_key".to_string()];
+        assert!(collect_agent_variables(&values).is_err());
+    }
 
     #[test]
     fn compaction_knobs_parse_from_frontmatter() {
@@ -775,6 +829,60 @@ You are a compaction agent.\n";
             msg.contains("Template error"),
             "expected error message to contain 'Template error', got: {msg:?}"
         );
+    }
+
+    #[test]
+    fn system_text_with_tools_renders_tool_names_in_jinja() {
+        use crate::tool::ToolDeclaration;
+
+        let agent = AgentConfig::from_prompt(
+            "Tools: {% for t in tools %}{{ t.name }}{% if not loop.last %}, {% endif %}{% endfor %}",
+        );
+        let tools = vec![
+            ToolDeclaration {
+                name: "fs_read".to_string(),
+                description: "Read files".to_string(),
+                parameters: Default::default(),
+                mcp_tool_name: None,
+                mcp_server_name: None,
+                call_template: None,
+                result_template: None,
+                idempotent_hint: None,
+                read_only_hint: None,
+            },
+            ToolDeclaration {
+                name: "bash_exec".to_string(),
+                description: "Run shell commands".to_string(),
+                parameters: Default::default(),
+                mcp_tool_name: None,
+                mcp_server_name: None,
+                call_template: None,
+                result_template: None,
+                idempotent_hint: None,
+                read_only_hint: None,
+            },
+        ];
+
+        let rendered = agent.system_text_with_tools(&tools).unwrap();
+
+        assert!(rendered.contains("fs_read"), "rendered prompt: {rendered}");
+        assert!(
+            rendered.contains("bash_exec"),
+            "rendered prompt: {rendered}"
+        );
+    }
+
+    #[test]
+    fn interpolated_instructions_renders_current_model_id_after_model_change() {
+        let mut agent = AgentConfig::from_prompt("Model={{ agent.model }}");
+        agent.set_model_id(Some("openai:gpt-4o-mini".to_string()));
+
+        let first = agent.interpolated_instructions().unwrap();
+        assert_eq!(first, "Model=openai:gpt-4o-mini");
+
+        agent.set_model_id(Some("anthropic:claude-3-7-sonnet".to_string()));
+        let second = agent.interpolated_instructions().unwrap();
+        assert_eq!(second, "Model=anthropic:claude-3-7-sonnet");
     }
 
     #[test]

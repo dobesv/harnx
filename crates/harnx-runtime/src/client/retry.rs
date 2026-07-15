@@ -48,6 +48,7 @@ fn build_turn_context(config: &GlobalConfig) -> TurnContext {
         // `harnx_client::init_client`; in tests it short-circuits to the
         // installed `MockClient`.
         init_client_fn: Arc::new(super::init_client),
+        select_model_fn: Arc::new(|input, model| input.agent.set_model(model.clone())),
     }
 }
 
@@ -57,7 +58,7 @@ fn build_turn_context(config: &GlobalConfig) -> TurnContext {
 /// For each model, retries up to `retry_config.attempts` times on retryable errors.
 /// On exhaustion or auth errors, sets a cooldown on the model and moves to the next.
 pub async fn call_with_retry_and_fallback(
-    input: &Input,
+    input: &mut Input,
     config: &GlobalConfig,
     abort_signal: AbortSignal,
 ) -> Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)> {
@@ -78,13 +79,13 @@ pub async fn call_with_retry_and_fallback(
 /// loop takes a 3-arg closure `(input, client, abort)` and this wrapper
 /// adapts by capturing `config` in the forwarded closure.
 pub async fn call_with_retry_and_fallback_custom<F>(
-    input: &Input,
+    input: &mut Input,
     config: &GlobalConfig,
     abort_signal: AbortSignal,
     call_fn: F,
 ) -> Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)>
 where
-    F: for<'a> Fn(&'a Input, &'a dyn Client, &'a GlobalConfig, AbortSignal) -> CallFuture<'a>
+    F: for<'a> Fn(&'a mut Input, &'a dyn Client, &'a GlobalConfig, AbortSignal) -> CallFuture<'a>
         + Send
         + Sync
         + 'static,
@@ -115,7 +116,7 @@ where
 }
 
 async fn default_call_fn(
-    input: &Input,
+    input: &mut Input,
     client: &dyn Client,
     config: &GlobalConfig,
     abort_signal: AbortSignal,
@@ -162,7 +163,7 @@ mod tests {
     /// Arc-clone HRTB-friendly adapter pattern as
     /// [`call_with_retry_and_fallback_custom`].
     async fn try_model_with_retries(
-        input: &Input,
+        input: &mut Input,
         client: &dyn Client,
         config: &GlobalConfig,
         retry_config: &RetryConfig,
@@ -212,7 +213,7 @@ mod tests {
         let _guard = TestStateGuard::new(Some(mock)).await;
 
         let config = make_config();
-        let input = make_input(&config);
+        let mut input = make_input(&config);
         let abort = create_abort_signal();
 
         let client = crate::config::input::create_client(&input, &config).unwrap();
@@ -222,7 +223,8 @@ mod tests {
             max_delay_ms: 100,
         };
         let result =
-            try_model_with_retries(&input, client.as_ref(), &config, &retry_config, abort).await;
+            try_model_with_retries(&mut input, client.as_ref(), &config, &retry_config, abort)
+                .await;
         assert!(
             result.is_ok(),
             "Expected success after retries, got: {:?}",
@@ -244,7 +246,7 @@ mod tests {
         let _guard = TestStateGuard::new(Some(mock)).await;
 
         let config = make_config();
-        let input = make_input(&config);
+        let mut input = make_input(&config);
         let abort = create_abort_signal();
 
         let client = crate::config::input::create_client(&input, &config).unwrap();
@@ -254,7 +256,8 @@ mod tests {
             max_delay_ms: 100,
         };
         let result =
-            try_model_with_retries(&input, client.as_ref(), &config, &retry_config, abort).await;
+            try_model_with_retries(&mut input, client.as_ref(), &config, &retry_config, abort)
+                .await;
         assert!(result.is_err());
 
         let err = result.unwrap_err();
@@ -296,7 +299,7 @@ mod tests {
         let _guard = TestStateGuard::new(Some(mock)).await;
 
         let config = make_config();
-        let input = make_input(&config);
+        let mut input = make_input(&config);
         let abort = create_abort_signal();
 
         let client = crate::config::input::create_client(&input, &config).unwrap();
@@ -306,7 +309,8 @@ mod tests {
             max_delay_ms: 100,
         };
         let result =
-            try_model_with_retries(&input, client.as_ref(), &config, &retry_config, abort).await;
+            try_model_with_retries(&mut input, client.as_ref(), &config, &retry_config, abort)
+                .await;
         assert!(
             result.is_err(),
             "Expected error after all retries exhausted"
@@ -334,7 +338,7 @@ mod tests {
         let _guard = TestStateGuard::new(Some(mock)).await;
 
         let config = make_config();
-        let input = make_input(&config);
+        let mut input = make_input(&config);
         let abort = create_abort_signal();
 
         let client = crate::config::input::create_client(&input, &config).unwrap();
@@ -344,7 +348,8 @@ mod tests {
             max_delay_ms: 100,
         };
         let result =
-            try_model_with_retries(&input, client.as_ref(), &config, &retry_config, abort).await;
+            try_model_with_retries(&mut input, client.as_ref(), &config, &retry_config, abort)
+                .await;
         assert!(result.is_err());
 
         let err = result.unwrap_err();
@@ -422,12 +427,12 @@ mod tests {
         let _guard = TestStateGuard::new(Some(mock)).await;
 
         let config = make_config();
-        let input = make_input(&config);
+        let mut input = make_input(&config);
         let abort = create_abort_signal();
         let client = crate::config::input::create_client(&input, &config).unwrap();
 
         let result = try_model_with_retries(
-            &input,
+            &mut input,
             client.as_ref(),
             &config,
             &retry_after_test_config(),
@@ -465,12 +470,12 @@ mod tests {
         let _guard = TestStateGuard::new(Some(mock.clone())).await;
 
         let config = make_config();
-        let input = make_input(&config);
+        let mut input = make_input(&config);
         let abort = create_abort_signal();
         let client = crate::config::input::create_client(&input, &config).unwrap();
 
         let result = try_model_with_retries(
-            &input,
+            &mut input,
             client.as_ref(),
             &config,
             &retry_after_test_config(),
@@ -521,10 +526,11 @@ mod tests {
             .set_model_fallbacks(vec!["nonexistent-client:bogus-model".to_string()]);
 
         let abort = create_abort_signal();
-        let result = call_with_retry_and_fallback_custom(&input, &config, abort, |i, c, cfg, a| {
-            Box::pin(default_call_fn(i, c, cfg, a))
-        })
-        .await;
+        let result =
+            call_with_retry_and_fallback_custom(&mut input, &config, abort, |i, c, cfg, a| {
+                Box::pin(default_call_fn(i, c, cfg, a))
+            })
+            .await;
 
         assert!(
             result.is_err(),

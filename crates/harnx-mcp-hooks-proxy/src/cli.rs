@@ -119,6 +119,7 @@ fn parse_hook_tokens(event: &str, flag: &str, tokens: Vec<String>) -> Result<Hoo
         status_message: None,
         async_hook,
         hook_type,
+        package_dir: None,
     })
 }
 

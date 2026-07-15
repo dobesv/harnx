@@ -65,7 +65,7 @@ pub use dispatch::{
     dispatch_hooks_with_managers,
 };
 #[allow(unused_imports)]
-pub use executor::execute_command_hook;
+pub use executor::{execute_command_hook, HookCommand};
 pub use harnx_core::hooks::*;
 pub use matcher::CompiledMatcher;
 #[allow(unused_imports)]

@@ -1,6 +1,6 @@
 use harnx_core::input::Input;
 
-use crate::{executor::execute_command_hook, HookPayload, HookResult};
+use crate::{executor::execute_command_hook, HookCommand, HookPayload, HookResult};
 
 use tokio::sync::mpsc;
 
@@ -21,10 +21,10 @@ impl AsyncHookManager {
         Self { sender, receiver }
     }
 
-    pub fn spawn_hook(&self, payload: HookPayload, command: String, timeout: Option<u64>) {
+    pub fn spawn_hook(&self, payload: HookPayload, hook: HookCommand) {
         let sender = self.sender.clone();
         tokio::spawn(async move {
-            let outcome = execute_command_hook(&payload, &command, timeout).await;
+            let outcome = execute_command_hook(&payload, &hook).await;
             let _ = sender.send(outcome.result);
         });
     }
@@ -109,7 +109,7 @@ pub fn inject_pending_async_context(input: &mut Input, pending_async_context: &m
 #[cfg(test)]
 mod tests {
     use super::AsyncHookManager;
-    use crate::{HookEvent, HookPayload};
+    use crate::{HookCommand, HookEvent, HookPayload};
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -155,7 +155,14 @@ mod tests {
         let payload = test_payload(&cwd);
         let mut manager = AsyncHookManager::new();
 
-        manager.spawn_hook(payload, echo_command().to_string(), Some(5));
+        manager.spawn_hook(
+            payload,
+            HookCommand {
+                command: echo_command().to_string(),
+                timeout: Some(5),
+                package_dir: None,
+            },
+        );
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let drained = loop {

@@ -29,6 +29,7 @@ use crate::config::{
     render_session_dump, Config, GlobalConfig, Input, WorkingMode,
 };
 use crate::tui::{TranscriptItem, Tui};
+use harnx_core::agent_config::collect_agent_variables;
 use harnx_core::event::{AgentEvent, AgentSource, NoticeEvent};
 use harnx_hooks::{
     dispatch_hooks_with_count_and_manager, dispatch_hooks_with_managers, drain_async_results,
@@ -191,6 +192,7 @@ async fn run_worker_command(worker_args: &WorkerArgs) -> Result<()> {
     let config = Arc::new(RwLock::new(
         Config::init(WorkingMode::Cmd, true, vec![]).await?,
     ));
+    config.write().agent_variables = collect_agent_variables(&worker_args.agent_variable)?;
     let worker_id = worker_args
         .worker_id
         .clone()
@@ -285,14 +287,7 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
             }
             Some(Some(s)) => Some(s.as_str()),
         };
-        if !cli.agent_variable.is_empty() {
-            config.write().agent_variables = Some(
-                cli.agent_variable
-                    .chunks(2)
-                    .map(|v| (v[0].to_string(), v[1].to_string()))
-                    .collect(),
-            );
-        }
+        config.write().agent_variables = collect_agent_variables(&cli.agent_variable)?;
 
         let ret = Config::use_agent(&config, agent, session, abort_signal.clone()).await;
         config.write().agent_variables = None;
@@ -743,7 +738,7 @@ async fn start_directive_inner(
         HookResultControl::Continue => {}
     }
     let (output, thought, tool_calls, usage) =
-        match call_with_retry_and_fallback(&input, config, abort_signal.clone()).await {
+        match call_with_retry_and_fallback(&mut input, config, abort_signal.clone()).await {
             Ok(result) => result,
             Err(err) => {
                 let event = HookEvent::StopFailure {

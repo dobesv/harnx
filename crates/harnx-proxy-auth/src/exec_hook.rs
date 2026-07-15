@@ -1,8 +1,6 @@
 #[cfg(not(unix))]
 use anyhow::{anyhow, Result};
-#[cfg(unix)]
-use serde_json::Map;
-use serde_json::Value;
+use serde_json::{Map, Value};
 #[cfg(not(unix))]
 use std::path::PathBuf;
 
@@ -10,7 +8,7 @@ use std::path::PathBuf;
 mod imp {
     use anyhow::{anyhow, bail, Context, Result};
     use serde::{Deserialize, Serialize};
-    use serde_json::Value;
+    use serde_json::{Map, Value};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{
@@ -33,8 +31,19 @@ mod imp {
     #[derive(Serialize)]
     struct JsonlRequest {
         id: String,
+        /// Safe resolved vars (sentinels + temp_file_root) so exec hooks have
+        /// the same context jq hooks resolve. Omitted when empty.
+        #[serde(skip_serializing_if = "Value::is_null")]
+        vars: Value,
         #[serde(flatten)]
         req: Value,
+    }
+
+    #[derive(Serialize)]
+    struct StartupRequest {
+        id: String,
+        event: &'static str,
+        vars: Value,
     }
 
     #[derive(Deserialize)]
@@ -44,9 +53,40 @@ mod imp {
         req: Value,
     }
 
+    /// Process one line of an exec hook's stdout. A standalone
+    /// `{"notice": {...}}` line bubbles up to harnx (returns `false`); otherwise
+    /// the line is a transform response and resolves its pending request
+    /// (returns `true`).
+    async fn resolve_exec_line(trimmed: &str, pending: &PendingMap) -> bool {
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            if let Some(notice) = crate::notice::parse_notice_line(&value) {
+                crate::notice::send(&notice.level, &notice.message);
+                return false;
+            }
+        }
+        match serde_json::from_str::<JsonlResponse>(trimmed) {
+            Ok(response) => {
+                let mut map = pending.lock().await;
+                if let Some(sender) = map.remove(&response.id) {
+                    let _ = sender.send(response.req);
+                } else {
+                    warn!(
+                        "Exec hook returned response for unknown request id `{}`",
+                        response.id
+                    );
+                }
+            }
+            Err(err) => {
+                warn!("Failed to parse exec hook response: {err}");
+            }
+        }
+        true
+    }
+
     pub struct ExecHookProcess {
         source: ExecSource,
         timeout: Duration,
+        request_vars: Arc<Value>,
         state: Mutex<Option<ProcessRuntime>>,
     }
 
@@ -75,6 +115,7 @@ mod imp {
             Ok(Self {
                 source: ExecSource::Inline(Arc::new(script.to_owned())),
                 timeout: Duration::from_secs(timeout_secs),
+                request_vars: Arc::new(Value::Null),
                 state: Mutex::new(None),
             })
         }
@@ -84,8 +125,16 @@ mod imp {
             Ok(Self {
                 source: ExecSource::Path(path),
                 timeout: Duration::from_secs(timeout_secs),
+                request_vars: Arc::new(Value::Null),
                 state: Mutex::new(None),
             })
+        }
+
+        /// Attach the safe resolved vars (sentinels + `temp_file_root`) that get
+        /// sent to the hook on every request. Defaults to none.
+        pub fn with_request_vars(mut self, request_vars: Arc<Value>) -> Self {
+            self.request_vars = request_vars;
+            self
         }
 
         pub async fn transform(&self, req: Value) -> Value {
@@ -101,6 +150,7 @@ mod imp {
             let id = format!("evt-{}", EVENT_COUNTER.fetch_add(1, Ordering::Relaxed));
             let request = JsonlRequest {
                 id: id.clone(),
+                vars: (*self.request_vars).clone(),
                 req,
             };
 
@@ -113,6 +163,61 @@ mod imp {
             };
             line.push('\n');
 
+            let response = match self
+                .exchange_line(runtime, id.clone(), line, self.timeout)
+                .await
+            {
+                Ok(response) => response,
+                Err(()) => return original,
+            };
+
+            let mut response = response;
+            if let Value::Object(ref mut obj) = response {
+                obj.remove("id");
+            }
+            super::merge_hook_response(&original, response)
+        }
+
+        pub async fn startup(&self, vars: Value, timeout: Duration) -> Map<String, Value> {
+            let runtime = match self.ensure_runtime().await {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    warn!("Exec hook spawn failed during startup: {err}");
+                    return Map::new();
+                }
+            };
+
+            let id = format!("evt-{}", EVENT_COUNTER.fetch_add(1, Ordering::Relaxed));
+            let request = StartupRequest {
+                id: id.clone(),
+                event: "startup",
+                vars,
+            };
+
+            let mut line = match serde_json::to_string(&request) {
+                Ok(line) => line,
+                Err(err) => {
+                    warn!("Exec hook startup request serialization failed: {err}");
+                    return Map::new();
+                }
+            };
+            line.push('\n');
+
+            let response = match self.exchange_line(runtime, id.clone(), line, timeout).await {
+                Ok(response) => response,
+                Err(()) => return Map::new(),
+            };
+
+            extract_startup_env(&id, response)
+        }
+
+        async fn exchange_line(
+            &self,
+            runtime: RuntimeHandle,
+            id: String,
+            line: String,
+            timeout: Duration,
+        ) -> Result<Value, ()> {
             let (tx, rx) = oneshot::channel();
             runtime.pending.lock().await.insert(id.clone(), tx);
 
@@ -130,7 +235,7 @@ mod imp {
                     runtime.pending.lock().await.remove(&id);
                     warn!("Exec hook write failed for `{id}`: {err}");
                     self.mark_dead().await;
-                    return original;
+                    return Err(());
                 }
                 Err(_) => {
                     runtime.pending.lock().await.remove(&id);
@@ -139,27 +244,22 @@ mod imp {
                         self.timeout
                     );
                     self.mark_dead().await;
-                    return original;
+                    return Err(());
                 }
             }
 
-            match tokio::time::timeout(self.timeout, rx).await {
-                Ok(Ok(mut response)) => {
-                    if let Value::Object(ref mut obj) = response {
-                        obj.remove("id");
-                    }
-                    super::merge_hook_response(&original, response)
-                }
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(Ok(response)) => Ok(response),
                 Ok(Err(_)) => {
                     runtime.pending.lock().await.remove(&id);
                     warn!("Exec hook exited before replying to `{id}`");
                     self.mark_dead().await;
-                    original
+                    Err(())
                 }
                 Err(_) => {
                     runtime.pending.lock().await.remove(&id);
-                    warn!("Exec hook timed out for `{id}` after {:?}", self.timeout);
-                    original
+                    warn!("Exec hook timed out for `{id}` after {:?}", timeout);
+                    Err(())
                 }
             }
         }
@@ -186,6 +286,30 @@ mod imp {
                 runtime.pending.lock().await.clear();
             }
         }
+    }
+
+    pub(crate) fn extract_startup_env(id: &str, response: Value) -> Map<String, Value> {
+        let Value::Object(mut response_obj) = response else {
+            warn!("Exec hook startup response for `{id}` was not an object");
+            return Map::new();
+        };
+
+        let Some(env_value) = response_obj.remove("env") else {
+            return Map::new();
+        };
+
+        let Value::Object(env_obj) = env_value else {
+            warn!("Exec hook startup response for `{id}` had non-object `env`");
+            return Map::new();
+        };
+
+        let mut env = Map::new();
+        for (key, value) in env_obj {
+            if matches!(value, Value::String(_)) {
+                env.insert(key, value);
+            }
+        }
+        env
     }
 
     fn validate_exec_path(path: &Path) -> Result<()> {
@@ -277,22 +401,8 @@ mod imp {
                                 continue;
                             }
 
-                            match serde_json::from_str::<JsonlResponse>(trimmed) {
-                                Ok(response) => {
-                                    waiting_for_first_payload = false;
-                                    let mut map = reader_pending.lock().await;
-                                    if let Some(sender) = map.remove(&response.id) {
-                                        let _ = sender.send(response.req);
-                                    } else {
-                                        warn!(
-                                            "Exec hook returned response for unknown request id `{}`",
-                                            response.id
-                                        );
-                                    }
-                                }
-                                Err(err) => {
-                                    warn!("Failed to parse exec hook response before READY: {err}");
-                                }
+                            if resolve_exec_line(trimmed, &reader_pending).await {
+                                waiting_for_first_payload = false;
                             }
                             continue;
                         }
@@ -323,22 +433,8 @@ mod imp {
                             continue;
                         }
 
-                        match serde_json::from_str::<JsonlResponse>(trimmed) {
-                            Ok(response) => {
-                                waiting_for_first_payload = false;
-                                let mut map = reader_pending.lock().await;
-                                if let Some(sender) = map.remove(&response.id) {
-                                    let _ = sender.send(response.req);
-                                } else {
-                                    warn!(
-                                        "Exec hook returned response for unknown request id `{}`",
-                                        response.id
-                                    );
-                                }
-                            }
-                            Err(err) => {
-                                warn!("Failed to parse exec hook response: {err}");
-                            }
+                        if resolve_exec_line(trimmed, &reader_pending).await {
+                            waiting_for_first_payload = false;
                         }
                     }
                     Ok(None) => {
@@ -410,6 +506,14 @@ impl ExecHookProcess {
     pub async fn transform(&self, req: Value) -> Value {
         req
     }
+
+    pub async fn startup(&self, _vars: Value, _timeout: std::time::Duration) -> Map<String, Value> {
+        Map::new()
+    }
+
+    pub fn with_request_vars(self, _request_vars: std::sync::Arc<Value>) -> Self {
+        self
+    }
 }
 
 #[cfg(unix)]
@@ -468,9 +572,80 @@ fn merge_headers(original_headers: &mut Map<String, Value>, response_headers: Ma
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::merge_hook_response;
+    use super::*;
     use serde_json::json;
 
+    #[cfg(unix)]
+    fn python_startup_script(mode: &str) -> String {
+        format!(
+            "#!/usr/bin/env python3\nimport json, sys, time\nprint(\"READY\", flush=True)\nfor line in sys.stdin:\n    line = line.strip()\n    if not line:\n        continue\n    msg = json.loads(line)\n    req_id = msg[\"id\"]\n    if msg.get(\"event\") == \"startup\":\n        if \"{mode}\" == \"timeout\":\n            time.sleep(2.0)\n            continue\n        print(json.dumps({{\"id\": req_id, \"env\": {{\"K\": \"v\"}}}}), flush=True)\n        continue\n    msg[\"id\"] = req_id\n    print(json.dumps(msg), flush=True)\n"
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_returns_env_map_from_hook_response() {
+        let process = ExecHookProcess::spawn_inline(&python_startup_script("success"), 1).unwrap();
+
+        let env = process
+            .startup(
+                json!({"proxy_port": 1234}),
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+
+        assert_eq!(
+            env,
+            serde_json::Map::from_iter([(String::from("K"), json!("v"))])
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_timeout_returns_empty_map() {
+        let process = ExecHookProcess::spawn_inline(&python_startup_script("timeout"), 1).unwrap();
+
+        let env = process
+            .startup(
+                json!({"proxy_port": 1234}),
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+
+        assert!(env.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_startup_env_keeps_only_string_values() {
+        let env = imp::extract_startup_env(
+            "evt-1",
+            json!({"env": {"KEEP": "ok", "DROP_NUM": 5, "DROP_BOOL": true}}),
+        );
+
+        assert_eq!(
+            env,
+            serde_json::Map::from_iter([(String::from("KEEP"), json!("ok"))])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_startup_env_returns_empty_when_env_missing() {
+        let env = imp::extract_startup_env("evt-1", json!({"id": "evt-1"}));
+
+        assert!(env.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_startup_env_returns_empty_when_env_is_not_object() {
+        let env = imp::extract_startup_env("evt-1", json!({"env": ["bad"]}));
+
+        assert!(env.is_empty());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn sparse_exec_response_merges_with_original_request() {
         let original = json!({
@@ -491,6 +666,7 @@ mod tests {
         assert_eq!(merged["headers"]["x"], "1");
     }
 
+    #[cfg(unix)]
     #[test]
     fn respond_exec_response_bypasses_merge() {
         let original = json!({
@@ -506,6 +682,7 @@ mod tests {
         assert_eq!(merged, response);
     }
 
+    #[cfg(unix)]
     #[test]
     fn header_null_removes_existing_key() {
         let original = json!({
@@ -524,11 +701,9 @@ mod tests {
         assert_eq!(merged["headers"]["accept"], "application/json");
     }
 
+    #[cfg(unix)]
     #[test]
     fn mixed_case_hook_header_key_is_lowercased_and_replaces_original() {
-        // request_json lowercases incoming header names; a script that emits a
-        // mixed-case key must still patch the (lowercase) original, not create
-        // a duplicate entry.
         let original = json!({
             "method": "GET",
             "host": "bigquery.googleapis.com",
@@ -541,7 +716,6 @@ mod tests {
 
         let headers = merged["headers"].as_object().expect("headers object");
         assert_eq!(headers["authorization"], "Bearer new");
-        // No stray mixed-case duplicate key.
         assert!(headers.get("Authorization").is_none());
         assert_eq!(headers.len(), 1);
     }
