@@ -16,7 +16,15 @@ SENTINEL_TOKEN_BLOB = (
     "MGZiM2EzYTRhMWY="
 )
 TOKEN_CMD_ENV = "HARNX_JIRA_TOKEN_CMD"
-DEFAULT_TOKEN_CMD = 'secret-tool lookup service acli username {profile_arg}'
+# Per-platform token lookup. macOS stores the acli token in the login keychain
+# (service "acli", account "jira:<profile>"); Linux uses libsecret via
+# secret-tool. Override either with HARNX_JIRA_TOKEN_CMD.
+LINUX_TOKEN_CMD = "secret-tool lookup service acli username {profile_arg}"
+MACOS_TOKEN_CMD = "security find-generic-password -s acli -a {profile_arg} -w"
+
+
+def default_token_cmd():
+    return MACOS_TOKEN_CMD if sys.platform == "darwin" else LINUX_TOKEN_CMD
 HOST_CONFIG_ENV_NAMES = ["ACLI_HOST_CONFIG", "HARNX_JIRA_HOST_CONFIG"]
 DEFAULT_HOST_CONFIG = "~/.config/acli/jira_config.yaml"
 TEMP_ROOT_ENV_NAMES = ["HARNX_JIRA_TEMP_ROOT", "TEMP_FILE_ROOT", "TMPDIR", "TMP", "TEMP"]
@@ -281,10 +289,16 @@ def resolve_temp_root():
 
 def lookup_token(current_profile):
     custom = os.environ.get(TOKEN_CMD_ENV)
-    token_cmd = custom or DEFAULT_TOKEN_CMD.format(
+    token_cmd = custom or default_token_cmd().format(
         profile_arg=shlex.quote(f"jira:{current_profile}")
     )
-    log(f"token lookup via {'HARNX_JIRA_TOKEN_CMD' if custom else 'secret-tool'}: {token_cmd!r}")
+    if custom:
+        source = "HARNX_JIRA_TOKEN_CMD"
+    elif sys.platform == "darwin":
+        source = "macOS keychain"
+    else:
+        source = "secret-tool"
+    log(f"token lookup via {source}: {token_cmd!r}")
     try:
         completed = subprocess.run(
             token_cmd,
@@ -325,7 +339,13 @@ def write_synthetic_config(current_profile, profile, temp_root):
             f"      account_id: {profile.get('account_id', '')}",
             f"      email: {email}",
             "      auth_type: api_token",
-            f"      token: {SENTINEL_TOKEN_BLOB}",
+            # acli stores the token as an encrypted SecretStore blob that it
+            # expects as a YAML `!!binary` scalar: the YAML parser base64-decodes
+            # it before acli decrypts. Writing it as a plain string makes acli
+            # fail to decrypt and abort ("failed to retrieve authenticated
+            # status") BEFORE it ever calls api.atlassian.com — so the proxy's
+            # on-the-wire token swap never runs. Must stay `!!binary`.
+            f"      token: !!binary {SENTINEL_TOKEN_BLOB}",
             "",
         ]
     )
