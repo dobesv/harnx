@@ -109,9 +109,11 @@ fn seed_compressed_session(config: &GlobalConfig) {
     guard.session = Some(session);
 }
 
-/// Like `seed_compressed_session`, but the active window begins with a
-/// `System` compaction summary message (as produced by `compress_keeping_recent`),
-/// so the compaction marker carries a non-empty `summary_text`.
+/// Like `seed_compressed_session`, but carries a compaction summary on the
+/// runtime `compaction_summary` field (as produced by `compress_keeping_recent`),
+/// so the compaction marker carries a non-empty `summary_text`. The active
+/// window contains only preserved conversation turns — no synthetic `System`
+/// summary message.
 fn seed_compressed_session_with_summary(config: &GlobalConfig) {
     let mut guard = config.write();
     let mut session =
@@ -128,20 +130,12 @@ fn seed_compressed_session_with_summary(config: &GlobalConfig) {
             1,
         ),
     ];
-    session.messages = vec![
-        make_compacted_message(
-            harnx_core::message::MessageRole::System,
-            harnx_core::message::MessageContent::Text(
-                "Prior conversation summary line".to_string(),
-            ),
-            2,
-        ),
-        make_compacted_message(
-            harnx_core::message::MessageRole::User,
-            harnx_core::message::MessageContent::Text("Current question".to_string()),
-            3,
-        ),
-    ];
+    session.compaction_summary = Some("Prior conversation summary line".to_string());
+    session.messages = vec![make_compacted_message(
+        harnx_core::message::MessageRole::User,
+        harnx_core::message::MessageContent::Text("Current question".to_string()),
+        3,
+    )];
     guard.session = Some(session);
 }
 
@@ -8597,20 +8591,18 @@ fn build_transcript_with_compaction_orders_history_marker_and_suffix() {
             1,
         ),
     ];
-    let active = vec![
-        make_compacted_message(
-            MessageRole::System,
-            MessageContent::Text("Summary of the past".to_string()),
-            2,
-        ),
-        make_compacted_message(
-            MessageRole::User,
-            MessageContent::Text("Fresh question".to_string()),
-            3,
-        ),
-    ];
+    let active = vec![make_compacted_message(
+        MessageRole::User,
+        MessageContent::Text("Fresh question".to_string()),
+        3,
+    )];
 
-    let items = crate::lifecycle::build_transcript_with_compaction(&compressed, &active, &decl_map);
+    let items = crate::lifecycle::build_transcript_with_compaction(
+        &compressed,
+        &active,
+        Some("Summary of the past"),
+        &decl_map,
+    );
 
     let archived_q = items
         .iter()
@@ -8654,7 +8646,12 @@ fn build_transcript_with_compaction_orders_history_marker_and_suffix() {
     }
 
     // No archived messages => no marker, only the active messages render.
-    let no_compaction = crate::lifecycle::build_transcript_with_compaction(&[], &active, &decl_map);
+    let no_compaction = crate::lifecycle::build_transcript_with_compaction(
+        &[],
+        &active,
+        Some("Summary of the past"),
+        &decl_map,
+    );
     assert!(!no_compaction
         .iter()
         .any(|item| matches!(item, TranscriptItem::CompactionMarker { .. })));

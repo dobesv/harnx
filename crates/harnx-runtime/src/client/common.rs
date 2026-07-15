@@ -32,16 +32,16 @@ use tokio::sync::mpsc::unbounded_channel;
 /// only the `ChatCompletionsData`-based inner method.
 pub async fn chat_completions_with_input(
     client: &dyn Client,
-    input: Input,
+    mut input: Input,
     config: &GlobalConfig,
     ctx: &ClientCallContext<'_>,
 ) -> Result<ChatCompletionsOutput> {
     if ctx.dry_run {
-        let content = crate::config::input::echo_messages(&input, config)?;
+        let content = crate::config::input::echo_messages(&mut input, config)?;
         return Ok(ChatCompletionsOutput::new(&content));
     }
     let data = crate::config::input::prepare_completion_data(
-        &input,
+        &mut input,
         config,
         client.model(),
         false,
@@ -55,7 +55,7 @@ pub async fn chat_completions_with_input(
 /// caller's abort signal attached to `handler`.
 pub async fn chat_completions_streaming_with_input(
     client: &dyn Client,
-    input: &Input,
+    input: &mut Input,
     config: &GlobalConfig,
     handler: &mut SseHandler,
     ctx: &ClientCallContext<'_>,
@@ -107,7 +107,7 @@ fn spinner_label(config: &GlobalConfig) -> String {
 }
 
 pub async fn call_chat_completions(
-    input: &Input,
+    input: &mut Input,
     print: bool,
     extract_code: bool,
     client: &dyn Client,
@@ -180,7 +180,7 @@ pub async fn call_chat_completions(
 }
 
 pub async fn call_chat_completions_streaming(
-    input: &Input,
+    input: &mut Input,
     client: &dyn Client,
     config: &GlobalConfig,
     abort_signal: AbortSignal,

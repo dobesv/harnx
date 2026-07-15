@@ -139,7 +139,7 @@ pub fn create_client(input: &Input, config: &GlobalConfig) -> Result<Box<dyn Cli
 
 /// Fetch chat text with retry and model fallback support.
 /// Uses the agent's configured fallback models if the primary model fails.
-pub async fn fetch_chat_text(input: &Input, config: &GlobalConfig) -> Result<String> {
+pub async fn fetch_chat_text(input: &mut Input, config: &GlobalConfig) -> Result<String> {
     let abort_signal = create_abort_signal();
     let (text, _, _, _) =
         crate::client::retry::call_with_retry_and_fallback(input, config, abort_signal).await?;
@@ -148,17 +148,18 @@ pub async fn fetch_chat_text(input: &Input, config: &GlobalConfig) -> Result<Str
 }
 
 pub fn prepare_completion_data(
-    input: &Input,
+    input: &mut Input,
     config: &GlobalConfig,
     model: &Model,
     stream: bool,
     client: &dyn Client,
 ) -> Result<ChatCompletionsData> {
+    let functions = config.read().select_tools(input.agent());
+    input.resolved_tools = functions.clone();
     let mut messages = build_messages(input, config)?;
     patch_messages(&mut messages, model);
     model.guard_max_input_tokens(&messages)?;
     let (temperature, top_p) = (input.agent().temperature(), input.agent().top_p());
-    let functions = config.read().select_tools(input.agent());
 
     // Clients either expand attachments internally (Gemini native) or rely on
     // the runtime base64 pre-pass (all other providers).
@@ -219,7 +220,9 @@ pub fn build_messages(input: &Input, config: &GlobalConfig) -> Result<Vec<Messag
     Ok(messages)
 }
 
-pub fn echo_messages(input: &Input, config: &GlobalConfig) -> anyhow::Result<String> {
+pub fn echo_messages(input: &mut Input, config: &GlobalConfig) -> anyhow::Result<String> {
+    let functions = config.read().select_tools(input.agent());
+    input.resolved_tools = functions;
     if let Some(session) = session_of(input, &config.read().session) {
         Ok(crate::config::session::echo_messages(session, input))
     } else {
@@ -539,7 +542,7 @@ mod tests {
 
         // Call prepare_completion_data
         let data = prepare_completion_data(
-            &input,
+            &mut input,
             &global_config,
             mock_client.model(),
             false,
@@ -608,7 +611,7 @@ mod tests {
             .expands_attachments_internally(false)
             .build();
         let data = prepare_completion_data(
-            &input,
+            &mut input,
             &global_config,
             mock_client.model(),
             false,
@@ -672,7 +675,7 @@ mod tests {
 
         // Call prepare_completion_data
         let data = prepare_completion_data(
-            &input,
+            &mut input,
             &global_config,
             mock_client.model(),
             false,

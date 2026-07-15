@@ -94,7 +94,7 @@ impl Config {
         input.with_session = false;
         input.with_agent = true;
 
-        let summary = crate::config::input::fetch_chat_text(&input, config).await?;
+        let summary = crate::config::input::fetch_chat_text(&mut input, config).await?;
 
         let summary_with_note = append_recovery_note(summary, covered);
         Self::apply_compaction_summary(config, &session_id, summary_with_note, split);
