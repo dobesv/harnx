@@ -218,6 +218,25 @@ describe('toAgUiMessages', () => {
       });
       expect(onStatus).toHaveBeenCalledWith('Running');
 
+      // Simulate onEvent CUSTOM session_title_updated
+      await subscriber.onEvent({
+        event: {
+          type: 'CUSTOM',
+          name: 'session_title_updated',
+          value: { title: 'New Test Title' }
+        }
+      });
+      expect(document.title).toBe('harnx — New Test Title');
+
+      await subscriber.onEvent({
+        event: {
+          type: 'CUSTOM',
+          name: 'session_title_updated',
+          value: { title: '' }
+        }
+      });
+      expect(document.title).toBe('harnx');
+
       // Test missing fields tolerance (e.g. older server without context_tokens)
       await subscriber.onEvent({
         event: {

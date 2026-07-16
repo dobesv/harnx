@@ -7631,6 +7631,7 @@ async fn session_picker_enter_loads_selected_session() {
         git_remote: None,
         session_id: None,
         terminal_session_id: None,
+        title: None,
         modified: None,
     };
 
@@ -7720,6 +7721,7 @@ async fn session_picker_enter_reconciles_from_origin_not_current_agent() {
         git_remote: None,
         session_id: None,
         terminal_session_id: None,
+        title: None,
         modified: None,
     };
 
@@ -8316,6 +8318,24 @@ async fn render_agent_event_user_message_produces_user_transcript_entry() {
     ));
 }
 
+#[tokio::test]
+async fn render_agent_event_title_updated_executes_without_panic() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    // Verify handling a TitleUpdated event does not crash
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(harnx_core::event::SessionEvent::TitleUpdated(
+            "Test Title".to_string(),
+        )),
+        None,
+    ))
+    .await
+    .unwrap();
+}
 #[tokio::test]
 async fn render_agent_event_compacting_started_produces_transcript_entry() {
     let config = test_config();

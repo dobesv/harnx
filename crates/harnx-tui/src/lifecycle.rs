@@ -354,6 +354,12 @@ impl Tui {
     pub async fn run(&mut self) -> Result<()> {
         let _panic_terminal_hook = PanicTerminalHookGuard::install();
         let mut terminal = Self::setup_terminal()?;
+
+        if let Some(title) = self.config.read().session.as_ref().and_then(|s| s.title()) {
+            let _ = std::io::stdout()
+                .execute(crossterm::terminal::SetTitle(format!("harnx — {title}")));
+        }
+
         let mut event_source = CrosstermEventSource;
         let result = self.run_loop_inner(&mut terminal, &mut event_source).await;
         Self::restore_terminal(&mut terminal)?;

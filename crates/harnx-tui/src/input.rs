@@ -5,6 +5,7 @@ use crate::types::Tui;
 use crate::types::{TranscriptItem, TuiEvent};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::ExecutableCommand;
 use harnx_core::event::{AgentEvent, AgentSource};
 use harnx_render::pretty_error_string;
 use harnx_runtime::config::{
@@ -1324,6 +1325,11 @@ impl Tui {
                 vec![TranscriptItem::ErrorText(format!(
                     "Compaction failed: {err}"
                 ))]
+            }
+            AgentEvent::Session(SessionEvent::TitleUpdated(title)) => {
+                let _ = std::io::stdout()
+                    .execute(crossterm::terminal::SetTitle(format!("harnx — {title}")));
+                vec![]
             }
             _ => vec![],
         };

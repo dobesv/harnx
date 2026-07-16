@@ -56,7 +56,11 @@ fn spawn_log_lines(path: &Path) -> Vec<String> {
 fn wait_for_spawn_count(path: &Path, min_lines: usize) -> Vec<String> {
     use std::time::{Duration, Instant};
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Poll returns as soon as the expected lines appear; the deadline only
+    // guards against a genuine hang. Keep it generous so CI (which runs 2000+
+    // tests in parallel and can starve freshly spawned MCP servers) doesn't
+    // flake on a too-tight timeout.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let lines = spawn_log_lines(path);
         if lines.len() >= min_lines {
@@ -273,17 +277,6 @@ fn test_agent_from_prompt() {
         .contains("You are a pirate"));
     assert!(agent.model_id().is_none());
     assert!(agent.temperature().is_none());
-}
-
-#[test]
-fn test_agent_builtin_create_title() {
-    let agent = super::builtin("%create-title%").unwrap();
-    assert_eq!(agent.name(), "%create-title%");
-    assert!(!agent.interpolated_instructions().unwrap().is_empty());
-    assert!(agent
-        .interpolated_instructions()
-        .unwrap()
-        .contains("concise"));
 }
 
 #[test]

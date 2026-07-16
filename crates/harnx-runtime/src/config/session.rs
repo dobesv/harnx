@@ -297,6 +297,18 @@ pub(crate) fn replay_log_entries_for_external(
                 session.compressed_messages.append(&mut session.messages);
                 session.compaction_summary = Some(prompt);
             }
+            SessionLogEntry::Title {
+                title,
+                manual,
+                tokens,
+            } => {
+                session.title = Some(title);
+                // A manually set title freezes automatic regeneration across
+                // reloads; auto-generated titles restore the exact token count
+                // recorded in the entry (session.tokens is still 0 mid-replay,
+                // so we must NOT derive it from session state here).
+                session.title_last_updated_tokens = if manual { usize::MAX } else { tokens };
+            }
             SessionLogEntry::Clear => {
                 pending = None;
                 session.messages.clear();
@@ -617,6 +629,24 @@ pub fn append_event(session: &mut Session, entry: &SessionLogEntry) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Append a `Title` log entry and update the in-memory session title state.
+/// Shared by automatic generation (`manual = false`) and the `.set title`
+/// command (`manual = true`). A manual title freezes automatic regeneration by
+/// setting `title_last_updated_tokens` to `usize::MAX`; an automatic title
+/// records the token count it was generated at so reloads restore it exactly.
+pub fn record_title(session: &mut Session, title: String, manual: bool, tokens: usize) {
+    let entry = SessionLogEntry::Title {
+        title: title.clone(),
+        manual,
+        tokens,
+    };
+    if !append_event(session, &entry) {
+        session.dirty = true;
+    }
+    session.set_title(title);
+    session.set_title_last_updated_tokens(if manual { usize::MAX } else { tokens });
 }
 
 pub fn render(session: &Session) -> Result<String> {
@@ -1740,6 +1770,32 @@ prompt: summary
                 (MessageRole::Assistant, "second".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn replay_auto_title_restores_token_count_from_entry_not_session_state() {
+        // Regression: title_last_updated_tokens must come from the Title entry's
+        // recorded token count, NOT session.tokens (which is 0 mid-replay). If
+        // derived from session state, large auto-titled sessions would re-title
+        // on every reload.
+        let content = "type: header\nmodel: openai:gpt-4o\nsession_id: sess-a\n---\ntype: message\nrole: user\ncontent: hello\n---\ntype: title\ntitle: Some generated title\ntokens: 30000\n";
+        let session = super::load_from_log_for_test(content);
+
+        assert_eq!(session.title.as_deref(), Some("Some generated title"));
+        assert_eq!(session.title_last_updated_tokens, 30000);
+        // With a 50k threshold and ~30k baseline, a freshly loaded session does
+        // not immediately re-title unless it has grown 50k tokens past 30k.
+        assert!(!session.need_generate_title(50_000));
+    }
+
+    #[test]
+    fn replay_manual_title_freezes_regeneration_across_reload() {
+        let content = "type: header\nmodel: openai:gpt-4o\nsession_id: sess-b\n---\ntype: message\nrole: user\ncontent: hello\n---\ntype: title\ntitle: My Manual Title\nmanual: true\n";
+        let session = super::load_from_log_for_test(content);
+
+        assert_eq!(session.title.as_deref(), Some("My Manual Title"));
+        assert_eq!(session.title_last_updated_tokens, usize::MAX);
+        assert!(!session.need_generate_title(1));
     }
 
     #[test]

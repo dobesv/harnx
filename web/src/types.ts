@@ -8,6 +8,7 @@ export interface Agent {
 
 export interface SessionRef {
   session_id: string;
+  title?: string | null;
   updated_at?: string | number | null;
   [key: string]: unknown;
 }

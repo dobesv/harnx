@@ -1239,6 +1239,10 @@ fn agent_sessions_json(config: &Config, agent: &str) -> Result<Vec<Value>> {
                 String::from("session_id"),
                 Value::String(session_id),
             )]);
+            value.insert(
+                String::from("title"),
+                session.title.map(Value::String).unwrap_or(Value::Null),
+            );
             if let Some(modified) = session.modified {
                 value.insert(
                     String::from("updated_at"),
@@ -1702,6 +1706,7 @@ mod tests {
                 git_remote: None,
                 terminal_session_id: None,
                 agent_name: Some("plain".into()),
+                title: None,
                 modified: None,
             },
             SessionMeta {
@@ -1712,6 +1717,7 @@ mod tests {
                 git_remote: None,
                 terminal_session_id: None,
                 agent_name: Some("other".into()),
+                title: None,
                 modified: None,
             },
             SessionMeta {
@@ -1722,6 +1728,7 @@ mod tests {
                 git_remote: None,
                 terminal_session_id: None,
                 agent_name: None,
+                title: None,
                 modified: None,
             },
         ];
@@ -1900,6 +1907,7 @@ mod tests {
             git_remote: None,
             terminal_session_id: None,
             agent_name: Some("plain".into()),
+            title: None,
             modified,
         };
 

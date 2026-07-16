@@ -26,6 +26,10 @@ use std::path::PathBuf;
 // The Header variant is intentionally large — it holds all session-level metadata
 // fields. Boxing would require pervasive refactoring; the allocation cost is acceptable
 // since Headers are only created/read at session boundaries.
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
@@ -123,6 +127,21 @@ pub enum SessionLogEntry {
     Rewind {
         /// All entries with seq > after_seq are excluded from context on replay.
         after_seq: usize,
+    },
+    #[serde(rename = "title")]
+    Title {
+        title: String,
+        /// `true` when the title was set manually (`.set title`). A manual title
+        /// freezes automatic regeneration across reloads. Defaults to `false`
+        /// so auto-generated and legacy title entries deserialize cleanly.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        manual: bool,
+        /// Session token count when this title was generated. Persisted so that
+        /// on reload `title_last_updated_tokens` can be restored exactly instead
+        /// of being derived from a mid-replay (still-zero) token count. Defaults
+        /// to `0` for legacy entries that predate this field.
+        #[serde(default, skip_serializing_if = "is_zero_usize")]
+        tokens: usize,
     },
     #[serde(other)]
     Unknown,
@@ -247,6 +266,12 @@ pub struct Session {
     pub save_session_this_time: bool,
     #[serde(skip)]
     pub compressing: bool,
+    #[serde(skip)]
+    pub title: Option<String>,
+    #[serde(skip)]
+    pub titling: bool,
+    #[serde(skip)]
+    pub title_last_updated_tokens: usize,
     #[serde(skip)]
     pub sessions_dir: Option<PathBuf>,
     #[serde(skip)]
@@ -482,6 +507,48 @@ impl Session {
 
     pub fn set_compressing(&mut self, compressing: bool) {
         self.compressing = compressing;
+    }
+
+    pub fn need_generate_title(&self, threshold: usize) -> bool {
+        if self.titling {
+            return false;
+        }
+        if threshold == 0 {
+            return false;
+        }
+        // First title: as soon as the session has any content and no title yet,
+        // generate one (don't wait for a full threshold of growth). A manually
+        // set title freezes `title_last_updated_tokens` at `usize::MAX`, so this
+        // branch does not fire once a title exists.
+        if self.title.is_none() {
+            return self.tokens > 0;
+        }
+        // Subsequent regeneration: only after another `threshold` tokens of growth.
+        self.tokens.saturating_sub(self.title_last_updated_tokens) >= threshold
+    }
+
+    pub fn titling(&self) -> bool {
+        self.titling
+    }
+
+    pub fn set_titling(&mut self, v: bool) {
+        self.titling = v;
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub fn set_title(&mut self, t: String) {
+        self.title = Some(t);
+    }
+
+    pub fn title_last_updated_tokens(&self) -> usize {
+        self.title_last_updated_tokens
+    }
+
+    pub fn set_title_last_updated_tokens(&mut self, t: usize) {
+        self.title_last_updated_tokens = t;
     }
 
     pub fn guard_empty(&self) -> Result<()> {
@@ -896,6 +963,46 @@ field: value
         let entry: SessionLogEntry = serde_yaml::from_str(yaml).unwrap();
 
         assert!(matches!(entry, SessionLogEntry::Unknown));
+    }
+
+    #[test]
+    fn need_generate_title_uses_titling_threshold_and_token_delta() {
+        // First-title branch: no title yet and some content -> generate.
+        let mut session = Session {
+            tokens: 20,
+            title_last_updated_tokens: 10,
+            titling: true,
+            ..Default::default()
+        };
+
+        // While titling is in progress, never trigger.
+        assert!(!session.need_generate_title(5));
+
+        session.titling = false;
+        // Threshold 0 disables generation entirely.
+        assert!(!session.need_generate_title(0));
+        // No title yet + tokens > 0 -> first title fires regardless of delta.
+        assert!(session.need_generate_title(10));
+        assert!(session.need_generate_title(usize::MAX));
+
+        // Empty session (no tokens) never generates a first title.
+        let empty = Session::default();
+        assert!(!empty.need_generate_title(10));
+
+        // Regeneration branch: once a title exists, only token growth beyond the
+        // threshold triggers again.
+        let mut titled = Session {
+            tokens: 20,
+            title_last_updated_tokens: 10,
+            title: Some("Existing title".to_string()),
+            ..Default::default()
+        };
+        assert!(titled.need_generate_title(10)); // delta 10 >= 10
+        assert!(!titled.need_generate_title(11)); // delta 10 < 11
+
+        // A frozen (manual) title uses usize::MAX and never regenerates.
+        titled.title_last_updated_tokens = usize::MAX;
+        assert!(!titled.need_generate_title(1));
     }
 
     #[test]

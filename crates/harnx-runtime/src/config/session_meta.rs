@@ -12,6 +12,7 @@ pub struct SessionMeta {
     pub git_remote: Option<String>,
     pub terminal_session_id: Option<String>,
     pub agent_name: Option<String>,
+    pub title: Option<String>,
     pub modified: Option<SystemTime>,
 }
 
@@ -205,6 +206,39 @@ fn read_session_header_bytes(path: &Path) -> Option<String> {
     String::from_utf8(content[..boundary].to_vec()).ok()
 }
 
+/// The title text of a document, if it parses as a `SessionLogEntry::Title`.
+fn title_of_doc(doc: &str) -> Option<String> {
+    let doc = doc
+        .trim_start_matches("---\n")
+        .trim_start_matches("---\r\n");
+    match serde_yaml::from_str::<SessionLogEntry>(doc) {
+        Ok(SessionLogEntry::Title { title, .. }) => Some(title),
+        _ => None,
+    }
+}
+
+/// Return the text of the LAST parseable `SessionLogEntry::Title` document in a
+/// buffer of concatenated YAML documents. Malformed documents are skipped.
+fn last_title_in_buffer(buffer: &str) -> Option<String> {
+    buffer
+        .split("\n---\n")
+        .flat_map(|d| d.split("\n---\r\n"))
+        .filter_map(title_of_doc)
+        .last()
+}
+
+/// Find the most recent session title. Title events are small and rare, so we
+/// scan the whole log for the LAST `Title` document rather than a fixed prefix
+/// window — a bounded window would miss titles written past the window in long
+/// sessions (regenerations and manual overrides late in the session). The file
+/// is read as UTF-8 (lossy) and only string-split; no full YAML parse of the
+/// transcript occurs, keeping listing cheap.
+fn scan_latest_title(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    last_title_in_buffer(&text)
+}
+
 pub fn parse_session_meta(name: &str, path: &Path) -> Option<SessionMeta> {
     let header_str = read_session_header_bytes(path)?;
     let modified = std::fs::metadata(path).ok()?.modified().ok();
@@ -226,6 +260,7 @@ pub fn parse_session_meta(name: &str, path: &Path) -> Option<SessionMeta> {
             git_remote,
             terminal_session_id,
             agent_name,
+            title: scan_latest_title(path),
             modified,
         }),
         _ => None,
@@ -251,8 +286,38 @@ mod tests {
             git_remote: None,
             terminal_session_id: None,
             agent_name: None,
+            title: None,
             modified: None,
         }
+    }
+
+    #[test]
+    fn parse_session_meta_populates_latest_title_event() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("titled.yaml");
+        fs::write(
+            &path,
+            "type: header\nmodel: test-model\nsession_id: sess-t\n---\ntype: message\nrole: user\ncontent: hi\n---\ntype: title\ntitle: An earlier title\n---\ntype: title\ntitle: The latest title\n",
+        )
+        .unwrap();
+
+        // The most recent title wins so manual overrides / regenerations show.
+        let meta = parse_session_meta("titled", &path).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("The latest title"));
+    }
+
+    #[test]
+    fn parse_session_meta_title_is_none_without_title_event() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("untitled.yaml");
+        fs::write(
+            &path,
+            "type: header\nmodel: test-model\nsession_id: sess-u\n---\ntype: message\nrole: user\ncontent: hi\n",
+        )
+        .unwrap();
+
+        let meta = parse_session_meta("untitled", &path).unwrap();
+        assert_eq!(meta.title, None);
     }
 
     #[test]

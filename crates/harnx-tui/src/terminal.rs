@@ -25,6 +25,7 @@ pub(super) fn cleanup_terminal_state() {
     }
     let _ = stdout.execute(DisableBracketedPaste);
     let _ = stdout.execute(DisableMouseCapture);
+    let _ = stdout.execute(crossterm::terminal::SetTitle("harnx"));
     let _ = stdout.execute(LeaveAlternateScreen);
     let _ = stdout.flush();
 }

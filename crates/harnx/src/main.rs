@@ -1287,6 +1287,7 @@ mod tests_list_sessions_routing {
                 git_remote: None,
                 terminal_session_id: None,
                 agent_name: None,
+                title: None,
                 modified: None,
             },
             SessionMeta {
@@ -1297,6 +1298,7 @@ mod tests_list_sessions_routing {
                 git_remote: None,
                 terminal_session_id: None,
                 agent_name: None,
+                title: None,
                 modified: None,
             },
         ];
@@ -1323,6 +1325,7 @@ mod tests_list_sessions_routing {
             git_remote: None,
             terminal_session_id: None,
             agent_name: None,
+            title: None,
             modified: None,
         }];
         let output = format_sessions_for_output(&sessions);
@@ -1350,6 +1353,7 @@ mod tests_list_sessions_routing {
                 git_remote: None,
                 terminal_session_id: None,
                 agent_name: None,
+                title: None,
                 modified: None,
             },
             SessionMeta {
@@ -1360,6 +1364,7 @@ mod tests_list_sessions_routing {
                 git_remote: None,
                 terminal_session_id: None,
                 agent_name: None,
+                title: None,
                 modified: None,
             },
         ];

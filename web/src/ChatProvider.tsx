@@ -7,6 +7,7 @@ import type { AgentSubscriber, Message } from '@ag-ui/client';
 import { PendingContext } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { uploadAttachment } from './api';
+import { setDocumentTitle } from './sessionTitle';
 
 export interface ChatProviderProps {
   agentName: string;
@@ -114,13 +115,13 @@ export class HarnxHttpAgent extends HttpAgent {
   }
 
   private handleCustomEvent(name: string, value: any) {
-    if (name === 'status') {
-      this.onStatus(value?.text || null);
-    } else if (name === 'usage') {
-      this.onUsageCb(value);
-    } else if (name === 'tool_summary') {
-      this.onToolSummaryCb(value?.tool_call_id, value?.markdown);
-    }
+    const handlers: Record<string, (v: any) => void> = {
+      status: (v) => this.onStatus(v?.text || null),
+      usage: (v) => this.onUsageCb(v),
+      tool_summary: (v) => this.onToolSummaryCb(v?.tool_call_id, v?.markdown),
+      session_title_updated: (v) => setDocumentTitle(v?.title),
+    };
+    handlers[name]?.(value);
   }
 
   override async runAgent(params: any, subscriber?: AgentSubscriber) {

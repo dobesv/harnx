@@ -17,6 +17,7 @@ fn session_index_record_to_meta(record: &SessionIndexRecord) -> SessionMeta {
         git_remote: record.git_remote.clone(),
         terminal_session_id: None,
         agent_name: Some(record.agent_name.clone()),
+        title: record.title.clone(),
         modified: UNIX_EPOCH.checked_add(Duration::from_secs(record.last_activity)),
     }
 }
@@ -504,6 +505,7 @@ mod tests_remote_sessions {
             working_dir: Some("/home/user/project".to_string()),
             git_branch: Some("feature-branch".to_string()),
             git_remote: Some("git@github.com:org/repo.git".to_string()),
+            title: None,
             last_activity: 1_719_531_234,
         };
 
@@ -536,6 +538,7 @@ mod tests_remote_sessions {
             working_dir: None,
             git_branch: None,
             git_remote: None,
+            title: None,
             last_activity: 0,
         };
 
@@ -566,6 +569,7 @@ mod tests_remote_sessions {
             working_dir: None,
             git_branch: None,
             git_remote: None,
+            title: None,
             last_activity: u64::MAX,
         };
 

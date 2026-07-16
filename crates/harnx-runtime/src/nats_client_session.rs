@@ -562,6 +562,7 @@ fn render_log_entry_to_sink(
         SessionLogEntry::Header { .. }
         | SessionLogEntry::DataUrls { .. }
         | SessionLogEntry::Compress { .. }
+        | SessionLogEntry::Title { .. }
         | SessionLogEntry::Clear
         | SessionLogEntry::EditEntries { .. }
         | SessionLogEntry::Rewind { .. }

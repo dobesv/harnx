@@ -5,6 +5,13 @@ use anyhow::{anyhow, bail, Context, Result};
 
 impl Config {
     pub fn update(config: &GlobalConfig, data: &str) -> Result<()> {
+        // `title` takes a free-form, possibly multi-word value: everything
+        // after the key is the title text (not split on whitespace).
+        if let Some(rest) = data.trim_start().strip_prefix("title") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return Self::apply_update(config, "title", rest.trim());
+            }
+        }
         let parts: Vec<&str> = data.split_whitespace().collect();
         if parts.len() != 2 {
             bail!("Usage: .set <key> <value>. If value is null, unset key.");
@@ -46,8 +53,35 @@ impl Config {
             "highlight" => {
                 Self::update_bool_field(config, value, |cfg, value| cfg.highlight = value)
             }
+            "title" => Self::set_session_title(config, value),
             _ => bail!("Unknown key '{key}'"),
         }
+    }
+
+    /// Manually set the session title via `.set title <text>`. Appends a
+    /// `SessionLogEntry::Title` to the log, updates the in-memory session, and
+    /// freezes automatic regeneration by setting `title_last_updated_tokens`
+    /// to `usize::MAX`. Emits `TitleUpdated`. An empty value is rejected.
+    fn set_session_title(config: &GlobalConfig, value: &str) -> Result<()> {
+        let title = value.trim().to_string();
+        if title.is_empty() {
+            bail!("Usage: .set title <text>");
+        }
+        {
+            let mut guard = config.write();
+            let session = guard
+                .session
+                .as_mut()
+                .context("No active session to set a title on")?;
+            // Manual title: record the current token count for provenance;
+            // `record_title` freezes regeneration (usize::MAX) for manual titles.
+            let tokens = session.tokens;
+            crate::config::session::record_title(session, title.clone(), true, tokens);
+        }
+        harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
+            harnx_core::event::SessionEvent::TitleUpdated(title),
+        ));
+        Ok(())
     }
 
     fn update_optional_f64(
@@ -308,5 +342,56 @@ where
         Ok(None)
     } else {
         Ok(Some(value.parse().with_context(|| "Invalid value")?))
+    }
+}
+
+#[cfg(test)]
+mod title_command_tests {
+    use super::super::*;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn config_with_session(dir: &std::path::Path) -> GlobalConfig {
+        let mut config = Config::default();
+        let mut session = crate::config::session::new(&config, "title-test", None).unwrap();
+        session.set_sessions_dir(dir.to_path_buf());
+        crate::config::session::save(
+            &mut session,
+            "title-test",
+            &dir.join("title-test.yaml"),
+            false,
+        )
+        .unwrap();
+        config.session = Some(session);
+        Arc::new(RwLock::new(config))
+    }
+
+    #[test]
+    fn set_title_multiword_updates_session_and_freezes_regeneration() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_session(tmp.path());
+
+        Config::update(&config, "title My Custom Session Title").unwrap();
+
+        let guard = config.read();
+        let session = guard.session.as_ref().unwrap();
+        assert_eq!(session.title(), Some("My Custom Session Title"));
+        // Frozen: auto-regeneration is disabled after a manual title.
+        assert_eq!(session.title_last_updated_tokens(), usize::MAX);
+        assert!(!session.need_generate_title(50_000));
+
+        // The manual title is persisted to the log with manual: true.
+        let persisted = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+        assert!(persisted.contains("type: title"));
+        assert!(persisted.contains("title: My Custom Session Title"));
+        assert!(persisted.contains("manual: true"));
+    }
+
+    #[test]
+    fn set_title_empty_value_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_session(tmp.path());
+        assert!(Config::update(&config, "title   ").is_err());
     }
 }

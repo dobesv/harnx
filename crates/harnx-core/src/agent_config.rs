@@ -18,21 +18,6 @@ use std::sync::LazyLock;
 /// Agent name used for transient prompts that aren't loaded from disk.
 pub const TEMP_AGENT_NAME: &str = "%%";
 
-const CREATE_TITLE_PROMPT: &str = r#"Create a concise, 3-6 word title.
-
-**Notes**:
-- Avoid quotation marks or emojis
-- RESPOND ONLY WITH TITLE SLUG TEXT
-
-**Examples**:
-stock-market-trends
-perfect-chocolate-chip-recipe
-remote-work-productivity-tips
-video-game-development-insights"#;
-
-/// Built-in agent name: routes to the title-creation prompt.
-pub const CREATE_TITLE_AGENT_NAME: &str = "%create-title%";
-
 pub type AgentVariables = IndexMap<String, String>;
 
 /// Collect flat `[KEY, VALUE, KEY, VALUE, ...]` CLI pairs (as produced by the
@@ -163,6 +148,8 @@ pub struct AgentConfig {
     compaction_keep_recent_tokens: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compaction_tool_output_max_chars: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title_agent: Option<String>,
     #[serde(default)]
     pub role: AgentRole,
     #[serde(default)]
@@ -214,6 +201,7 @@ impl AgentConfig {
             compaction_keep_recent_turns: frontmatter.compaction_keep_recent_turns,
             compaction_keep_recent_tokens: frontmatter.compaction_keep_recent_tokens,
             compaction_tool_output_max_chars: frontmatter.compaction_tool_output_max_chars,
+            title_agent: frontmatter.title_agent,
             role: frontmatter.role,
             prompt,
             ..Default::default()
@@ -233,13 +221,8 @@ impl AgentConfig {
         &self.description
     }
 
-    /// Markdown body for the built-in `%create-title%` agent, or `None`
-    /// if `name` is not a recognised built-in.
-    pub fn builtin_markdown(name: &str) -> Option<&'static str> {
-        match name {
-            CREATE_TITLE_AGENT_NAME => Some(CREATE_TITLE_PROMPT),
-            _ => None,
-        }
+    pub fn builtin_markdown(_name: &str) -> Option<&'static str> {
+        None
     }
 
     pub fn export(&self) -> Result<String> {
@@ -351,6 +334,10 @@ impl AgentConfig {
         self.compaction_agent = value;
     }
 
+    pub fn set_title_agent(&mut self, value: Option<String>) {
+        self.title_agent = value;
+    }
+
     pub fn use_tools(&self) -> Option<Vec<String>> {
         self.use_tools.clone()
     }
@@ -361,6 +348,10 @@ impl AgentConfig {
 
     pub fn compaction_agent(&self) -> Option<&str> {
         self.compaction_agent.as_deref()
+    }
+
+    pub fn title_agent(&self) -> Option<&str> {
+        self.title_agent.as_deref()
     }
 
     pub fn compaction_keep_recent_turns(&self) -> Option<usize> {
@@ -574,6 +565,8 @@ struct AgentFrontMatter {
     compaction_keep_recent_tokens: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compaction_tool_output_max_chars: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title_agent: Option<String>,
     #[serde(default)]
     role: AgentRole,
 }
@@ -598,6 +591,7 @@ impl AgentFrontMatter {
             compaction_keep_recent_turns: config.compaction_keep_recent_turns,
             compaction_keep_recent_tokens: config.compaction_keep_recent_tokens,
             compaction_tool_output_max_chars: config.compaction_tool_output_max_chars,
+            title_agent: config.title_agent.clone(),
             role: config.role,
         }
     }
@@ -628,10 +622,15 @@ impl AgentFrontMatter {
             && self.compaction_tool_output_max_chars.is_none()
     }
 
+    fn title_is_empty(&self) -> bool {
+        self.title_agent.is_none()
+    }
+
     fn is_empty(&self) -> bool {
         self.model_is_empty()
             && self.content_is_empty()
             && self.compaction_is_empty()
+            && self.title_is_empty()
             && self.role == AgentRole::Assistant
     }
 }
@@ -920,6 +919,30 @@ You are a compaction agent.\n";
         // Completely empty frontmatter — AgentRole::Assistant is the serde default
         let agent = AgentConfig::from_markdown("plain", "You are plain.").unwrap();
         assert_eq!(agent.role, AgentRole::Assistant);
+    }
+
+    #[test]
+    fn title_agent_roundtrip() {
+        // Round-trip an AgentConfig with title_agent set and assert it survives serialize→deserialize
+        let mut agent = AgentConfig::from_markdown(
+            "title-test",
+            "---\nmodel: openai:gpt-4o\ntitle_agent: claude-sonnet-4-6\n---\nYou are an agent.",
+        )
+        .unwrap();
+        assert_eq!(agent.title_agent(), Some("claude-sonnet-4-6"));
+
+        // Clear and set via setter
+        agent.set_title_agent(None);
+        assert!(agent.title_agent().is_none());
+
+        // Set it back
+        agent.set_title_agent(Some("title-generator-v2".to_string()));
+        assert_eq!(agent.title_agent(), Some("title-generator-v2"));
+
+        // Export and reparse
+        let exported = agent.export().unwrap();
+        let reparsed = AgentConfig::from_markdown("title-test", &exported).unwrap();
+        assert_eq!(reparsed.title_agent(), Some("title-generator-v2"));
     }
 }
 
