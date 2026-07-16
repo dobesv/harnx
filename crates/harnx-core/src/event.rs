@@ -141,6 +141,9 @@ pub enum SessionEvent {
     LogSeqAssigned {
         seq: usize,
     },
+    /// Emitted after a session title has been generated or manually set.
+    /// Carries the new title text.
+    TitleUpdated(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

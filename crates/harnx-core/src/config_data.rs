@@ -82,6 +82,10 @@ pub struct ConfigData {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<HooksConfig>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_agent: Option<String>,
+    pub title_update_threshold: usize,
 }
 
 impl Default for ConfigData {
@@ -129,6 +133,9 @@ impl Default for ConfigData {
             sync_models_url: None,
 
             hooks: None,
+
+            title_agent: None,
+            title_update_threshold: 50_000,
         }
     }
 }
@@ -202,5 +209,24 @@ hooks:
             got.toolsets.get("demo"),
             Some(&vec!["fs_read".to_string(), "fs_write".to_string()])
         );
+    }
+
+    #[test]
+    fn empty_yaml_has_default_title_update_threshold() {
+        // Empty YAML must deserialize to the default 50000
+        let got: ConfigData = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(got.title_update_threshold, 50_000);
+        assert!(got.title_agent.is_none());
+    }
+
+    #[test]
+    fn title_agent_and_threshold_roundtrip() {
+        let yaml = r#"
+title_agent: claude-sonnet-4-6
+title_update_threshold: 25000
+"#;
+        let got: ConfigData = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(got.title_agent, Some("claude-sonnet-4-6".to_string()));
+        assert_eq!(got.title_update_threshold, 25_000);
     }
 }

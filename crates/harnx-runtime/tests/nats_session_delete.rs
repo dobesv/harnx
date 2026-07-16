@@ -74,6 +74,7 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
         working_dir: Some("/tmp".to_string()),
         git_branch: Some("main".to_string()),
         git_remote: Some("origin".to_string()),
+        title: None,
         last_activity: 1_700_000_000,
     };
     put_record(&index_store, &index_record).await?;

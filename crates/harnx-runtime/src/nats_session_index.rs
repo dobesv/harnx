@@ -21,6 +21,8 @@ pub struct SessionIndexRecord {
     pub working_dir: Option<String>,
     pub git_branch: Option<String>,
     pub git_remote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub last_activity: u64,
 }
 
@@ -159,6 +161,20 @@ pub async fn update_record_with_revision(
         })
 }
 
+/// Update just the `title` field of an existing session index record via a
+/// compare-and-swap read/modify/write. If the record doesn't exist yet (e.g.
+/// the header hasn't been indexed), this is a no-op that logs a warning and
+/// returns `Ok(())` — the title will be picked up on the next header write.
+pub async fn update_session_title(store: &kv::Store, session_id: &str, title: &str) -> Result<()> {
+    let Some((mut record, revision)) = get_record_with_revision(store, session_id).await? else {
+        warn!("session index record not found; skipping title update for session_id={session_id}");
+        return Ok(());
+    };
+    record.title = Some(title.to_owned());
+    update_record_with_revision(store, &record, revision).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -170,6 +186,40 @@ mod tests {
     // =============================================================================
     // Test helpers for NATS integration tests
     // =============================================================================
+
+    #[test]
+    fn old_json_record_without_title_deserializes_with_none() {
+        // Backward compatibility: records written before the `title` field
+        // existed must still deserialize cleanly (serde default -> None).
+        let json = r#"{
+            "session_id": "sess-legacy",
+            "agent_name": "hephaestus",
+            "working_dir": "/tmp/project",
+            "git_branch": "main",
+            "git_remote": null,
+            "last_activity": 1719531234
+        }"#;
+        let record: SessionIndexRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.session_id, "sess-legacy");
+        assert_eq!(record.title, None);
+    }
+
+    #[test]
+    fn record_with_title_round_trips_through_json() {
+        let json = r#"{
+            "session_id": "sess-titled",
+            "agent_name": "hephaestus",
+            "working_dir": null,
+            "git_branch": null,
+            "git_remote": null,
+            "title": "Debugging async lifetimes",
+            "last_activity": 1
+        }"#;
+        let record: SessionIndexRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.title.as_deref(), Some("Debugging async lifetimes"));
+        let reserialized = serde_json::to_string(&record).unwrap();
+        assert!(reserialized.contains("\"title\":\"Debugging async lifetimes\""));
+    }
 
     /// Get NATS test URL from environment, returning None if not set.
     /// Tests should skip gracefully when this returns None.
@@ -200,6 +250,7 @@ mod tests {
             working_dir: Some("/tmp/project".to_string()),
             git_branch: Some("main".to_string()),
             git_remote: Some("git@github.com:dobesv/harnx.git".to_string()),
+            title: None,
             last_activity: 1_719_531_234,
         }
     }

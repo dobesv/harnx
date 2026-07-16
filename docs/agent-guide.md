@@ -395,8 +395,3 @@ Agent prompts are rendered using [MiniJinja](https://github.com/mitsuhiko/miniji
 - `{{ tools }}`: A list of available tools. You can iterate over them: `{% for t in tools %}- {{ t.name }}: {{ t.description }}{% endfor %}`.
 - `{{ __os__ }}`, `{{ __arch__ }}`, `{{ __shell__ }}`, `{{ __cwd__ }}`, `{{ __now__ }}`, `{{ __locale__ }}`: Environment and system information.
 
-## Built-in Agents
-
-Harnx includes one internal agent:
-
-- `%create-title%`: Generates session titles automatically. This is internal and not intended for direct use.

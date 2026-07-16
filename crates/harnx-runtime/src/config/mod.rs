@@ -22,6 +22,7 @@ pub mod session_meta;
 mod session_ops_compaction;
 mod session_ops_core;
 mod session_ops_split;
+pub mod session_ops_title;
 mod settings_split;
 
 pub use self::env_split::load_env_file;

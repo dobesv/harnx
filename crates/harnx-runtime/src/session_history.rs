@@ -41,6 +41,7 @@ pub fn entry_type(entry: &SessionLogEntry) -> &'static str {
         SessionLogEntry::Cancel { .. } => "cancel",
         SessionLogEntry::EditEntries { .. } => "edit_entries",
         SessionLogEntry::Rewind { .. } => "rewind",
+        SessionLogEntry::Title { .. } => "title",
         SessionLogEntry::Unknown => "unknown",
     }
 }
@@ -63,6 +64,7 @@ fn entry_searchable_text(entry: &SessionLogEntry) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         SessionLogEntry::Compress { prompt } => prompt.clone(),
+        SessionLogEntry::Title { title, .. } => title.clone(),
         SessionLogEntry::Header { model_id, .. } => format!("model: {model_id}"),
         _ => String::new(),
     }

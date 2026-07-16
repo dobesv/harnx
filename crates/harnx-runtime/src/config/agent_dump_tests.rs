@@ -203,20 +203,6 @@ fn render_agent_dump_errors_cleanly_for_unknown_agent() {
 }
 
 #[test]
-fn render_agent_dump_works_for_builtin_agent() {
-    let config = Config::default();
-
-    let result = render_agent_dump(&config, "%create-title%");
-
-    let rendered = result.expect("should work for builtin agent");
-    assert!(rendered.contains("---"), "should have front-matter");
-    assert!(
-        rendered.contains("title") || rendered.contains("Title"),
-        "should contain title-related content"
-    );
-}
-
-#[test]
 fn render_agent_dump_handles_package_qualified_agent() {
     let _guard = TEST_CONFIG_DIR_LOCK.lock().unwrap();
     let config_dir = unique_test_config_dir();

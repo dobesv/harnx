@@ -494,6 +494,7 @@ mod tests {
             working_dir: None,
             git_branch: None,
             git_remote: None,
+            title: None,
             last_activity: u64::MAX,
         };
 

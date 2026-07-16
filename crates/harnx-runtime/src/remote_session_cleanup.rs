@@ -266,6 +266,7 @@ mod tests {
             working_dir: Some("/tmp/project".to_string()),
             git_branch: Some("main".to_string()),
             git_remote: Some("git@github.com:dobesv/harnx.git".to_string()),
+            title: None,
             last_activity,
         }
     }

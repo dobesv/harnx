@@ -14,6 +14,7 @@ mod tests {
             git_remote: None,
             terminal_session_id: None,
             agent_name: None,
+            title: None,
             modified: None,
         }
     }

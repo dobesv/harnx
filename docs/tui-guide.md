@@ -118,7 +118,13 @@ If the response is interrupted or unsatisfactory, you can regenerate it with `.r
 .set rag_reranker_model <tab>
 .set rag_top_k 4
 .set highlight true
+.set title My Custom Session Title
 ```
+
+`.set title <text>` sets a title for the current session. The text may contain
+spaces. Setting a title manually freezes automatic title regeneration for the
+rest of the session. See the [Configuration Guide](configuration-guide.md#session-titles)
+for automatic title generation (`title_agent`, `title_update_threshold`).
 
 ### `.edit` - modify config/session/agent/rag-docs
 

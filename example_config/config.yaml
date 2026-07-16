@@ -10,6 +10,19 @@ save_session: true
 cleanup_inactive_sessions_days: 14
 keybindings: emacs
 
+# ---- session titles ----
+# Auto-generate a short, human-readable title for each session using an LLM.
+# Titles appear in session listings and set the terminal / browser tab title.
+# `title_agent` names an agent (see agents/example-title-agent.md); leave it
+# unset to disable title generation. Point it at a small, fast chat model —
+# NOT a reasoning model (o1/o3/DeepSeek-R1), which exhaust the token budget on
+# internal reasoning and return empty/truncated titles.
+title_agent: example-title-agent
+# Regenerate the title after this many additional tokens of conversation
+# (default 50000). The first title is generated on the first exchange. Set to 0
+# to disable automatic generation entirely.
+title_update_threshold: 50000
+
 # ---- tool-use ----
 tool_use: true
 use_tools: '*'

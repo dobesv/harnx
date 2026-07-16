@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { listAgents, listSessions, newSessionId } from './api';
 import type { Agent, SessionRef } from './types';
+import { setDocumentTitle } from './sessionTitle';
 
 export function useAgentSessions() {
   const getInitialState = () => {
@@ -91,6 +92,13 @@ export function useAgentSessions() {
     setSelectedSessionId('');
   }, []);
 
+
+  useEffect(() => {
+    const session = selectedSessionId
+      ? sessions.find(s => s.session_id === selectedSessionId)
+      : undefined;
+    setDocumentTitle(session?.title);
+  }, [selectedSessionId, sessions]);
   return {
     agents,
     agentsError,

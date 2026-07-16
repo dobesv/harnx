@@ -653,6 +653,9 @@ impl harnx_core::event::AgentEventSink for AgUiSink {
             AgentEvent::Status(status) => {
                 self.emit_custom("status", json!({ "text": status.text }));
             }
+            AgentEvent::Session(SessionEvent::TitleUpdated(title)) => {
+                self.emit_custom("session_title_updated", json!({ "title": title }))
+            }
             AgentEvent::Session(SessionEvent::Generic { text }) => {
                 self.finish_turn();
                 self.emit_custom("session_generic", json!({ "text": text }));

@@ -200,3 +200,44 @@ See the [RAG Guide](rag-guide.md) for detailed setup instructions.
 
 - **highlight**: Whether to enable syntax highlighting.
 - **light_theme**: Whether to use the light theme.
+
+### Session Titles
+
+Harnx can automatically generate a short, human-readable title for each session
+using an LLM. Titles are stored in the session log and shown in session
+listings (local and remote). The active title is also used to set the terminal
+window title in the TUI and the browser tab title in the web UI (as
+`harnx — <title>`).
+
+- **title_agent**: Name of the agent used to generate titles. When unset, no
+  titles are generated. Can be set globally in `config.yaml` or per-agent in an
+  agent's front matter (the agent-level value takes precedence). Point it at a
+  small, fast chat model.
+- **title_update_threshold**: Number of tokens of growth after which the title
+  is regenerated. Defaults to `50000`. The first title is generated on the first
+  exchange (growth from 0 crosses any non-zero threshold). Set to `0` to disable
+  automatic title generation entirely.
+
+Example `config.yaml`:
+
+```yaml
+title_agent: title-writer      # an agent configured with a small, fast model
+title_update_threshold: 50000
+```
+
+You can also override the title agent for a specific agent in its front matter:
+
+```yaml
+---
+model: openai:gpt-4o
+title_agent: title-writer
+---
+```
+
+**Do not configure a reasoning model** (e.g. OpenAI `o1`/`o3`, DeepSeek-R1) as
+the `title_agent`. Such models spend their token budget on internal reasoning
+and often return an empty or truncated title. Use a standard chat model.
+
+To set a title manually, use the [`.set title`](tui-guide.md) command in the
+TUI. A manually set title freezes automatic regeneration for the rest of the
+session.
