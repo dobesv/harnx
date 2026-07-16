@@ -27,6 +27,24 @@ const ATTACHMENT_PREVIEW_HEAD_LINES: usize = ATTACHMENT_PREVIEW_MAX_LINES / 2;
 const ATTACHMENT_PREVIEW_TAIL_LINES: usize =
     ATTACHMENT_PREVIEW_MAX_LINES - ATTACHMENT_PREVIEW_HEAD_LINES;
 
+/// A multi-line paste is only converted into an attachment when it is "large".
+/// Small pastes (a handful of short lines) are inserted inline instead, so
+/// pasting a couple of lines is not needlessly turned into a file.
+///
+/// A paste becomes an attachment when it exceeds EITHER of these limits.
+const PASTE_ATTACHMENT_MAX_LINES: usize = 8;
+const PASTE_ATTACHMENT_MAX_CHARS: usize = 512;
+
+/// Returns true when a normalized (LF-only) paste is large enough to warrant
+/// being stored as an attachment rather than inserted inline.
+///
+/// Line counting uses `str::lines()` so a single trailing newline does not
+/// inflate the count (an 8-line paste ending in `\n` still counts as 8 lines).
+fn paste_should_attach(text: &str) -> bool {
+    let line_count = text.lines().count();
+    line_count > PASTE_ATTACHMENT_MAX_LINES || text.chars().count() > PASTE_ATTACHMENT_MAX_CHARS
+}
+
 /// How long `start_prompt` waits for a prior prompt task to finish
 /// cooperatively (after signalling its abort) before force-cancelling it
 /// via `JoinHandle::abort`. Long enough for `bash_wait` and similar
@@ -710,8 +728,8 @@ impl Tui {
         }
         // Normalize line endings: \r\n -> \n, then \r -> \n
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        if text.contains('\n') {
-            // Multi-line paste: write to temp file and attach
+        if paste_should_attach(&text) {
+            // Large paste: write to temp file and attach
             match self.write_paste_to_attachment_dir(&text).await {
                 Ok(attachment) => {
                     self.app.attachments.push(attachment);
@@ -723,7 +741,7 @@ impl Tui {
                 }
             }
         } else {
-            // Single-line paste: insert inline
+            // Small paste (single line or a few short lines): insert inline
             self.app.input.insert_str(&text);
         }
     }
@@ -2848,9 +2866,54 @@ impl Tui {
 
 #[cfg(test)]
 mod tests {
+    use super::paste_should_attach;
     use super::tool_completed_to_transcript_items;
     use crate::types::TranscriptItem;
     use serde_json::json;
+
+    #[test]
+    fn paste_should_attach_thresholds() {
+        // Single line, short: inline.
+        assert!(!paste_should_attach("just one line"));
+        // A few short lines: inline.
+        assert!(!paste_should_attach("line one\nline two\nline three"));
+        // Exactly at the line limit (8 lines): still inline.
+        assert!(!paste_should_attach("1\n2\n3\n4\n5\n6\n7\n8"));
+        // 8 content lines with a trailing newline must still count as 8 lines
+        // (str::lines ignores the trailing newline): inline.
+        assert!(!paste_should_attach("1\n2\n3\n4\n5\n6\n7\n8\n"));
+        // Over the line limit (9 lines): attach.
+        assert!(paste_should_attach("1\n2\n3\n4\n5\n6\n7\n8\n9"));
+        // Two lines but over the character limit: attach.
+        let long = "a".repeat(600);
+        assert!(paste_should_attach(&format!("{long}\n{long}")));
+    }
+
+    #[test]
+    fn paste_should_attach_char_boundary() {
+        // Exactly at the char limit (512): inline.
+        let at_limit = "a".repeat(512);
+        assert_eq!(at_limit.chars().count(), 512);
+        assert!(!paste_should_attach(&at_limit));
+        // One over the char limit (513): attach.
+        let over_limit = "a".repeat(513);
+        assert!(paste_should_attach(&over_limit));
+    }
+
+    #[test]
+    fn paste_should_attach_counts_chars_not_bytes() {
+        // 300 multibyte chars (each is multiple bytes) stays under the 512-char
+        // limit even though its byte length far exceeds 512: inline.
+        let multibyte = "é".repeat(300);
+        assert_eq!(multibyte.chars().count(), 300);
+        assert!(
+            multibyte.len() > 512,
+            "byte length should exceed char limit"
+        );
+        assert!(!paste_should_attach(&multibyte));
+        // 513 multibyte chars exceeds the char limit: attach.
+        assert!(paste_should_attach(&"é".repeat(513)));
+    }
 
     #[test]
     fn tool_completed_preserves_fenced_diff_in_transcript() {
