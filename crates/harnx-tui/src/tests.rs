@@ -3269,12 +3269,17 @@ async fn paste_multiline_creates_temp_attachment() {
         .await
         .unwrap();
 
-    tui.handle_paste("line one\nline two\nline three".to_string())
-        .await;
+    // 9 lines exceeds the small-paste threshold, so this becomes an attachment.
+    let pasted =
+        "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9".to_string();
+    tui.handle_paste(pasted.clone()).await;
 
-    // Multi-line paste should NOT insert into the textarea
+    // Large multi-line paste should NOT insert into the textarea
     let text = tui.app.input.lines().join("\n");
-    assert_eq!(text, "", "Multi-line paste should not go into textarea");
+    assert_eq!(
+        text, "",
+        "Large multi-line paste should not go into textarea"
+    );
 
     // Instead it should create a temp file attachment in the attachment dir
     assert_eq!(tui.app.attachments.len(), 1, "Should create one attachment");
@@ -3292,7 +3297,7 @@ async fn paste_multiline_creates_temp_attachment() {
     let contents = tokio::fs::read_to_string(&tui.app.attachments[0].path)
         .await
         .unwrap();
-    assert_eq!(contents, "line one\nline two\nline three");
+    assert_eq!(contents, pasted);
 
     // No submission should have occurred
     let user_entries: Vec<_> = tui
@@ -3318,9 +3323,12 @@ async fn paste_multiline_with_cr_creates_temp_attachment() {
         .await
         .unwrap();
 
-    // Some terminals send \r instead of \n for newlines in paste
-    tui.handle_paste("line one\rline two\rline three".to_string())
-        .await;
+    // Some terminals send \r instead of \n for newlines in paste.
+    // 9 lines exceeds the small-paste threshold, so this becomes an attachment.
+    tui.handle_paste(
+        "line 1\rline 2\rline 3\rline 4\rline 5\rline 6\rline 7\rline 8\rline 9".to_string(),
+    )
+    .await;
 
     assert_eq!(
         tui.app.attachments.len(),
@@ -3329,7 +3337,7 @@ async fn paste_multiline_with_cr_creates_temp_attachment() {
     );
     let contents = std::fs::read_to_string(&tui.app.attachments[0].path).unwrap();
     assert_eq!(
-        contents, "line one\nline two\nline three",
+        contents, "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9",
         "CRs should be normalized to LFs"
     );
 
@@ -3344,9 +3352,13 @@ async fn paste_multiline_with_crlf_creates_temp_attachment() {
         .await
         .unwrap();
 
-    // Windows-style line endings
-    tui.handle_paste("line one\r\nline two\r\nline three".to_string())
-        .await;
+    // Windows-style line endings.
+    // 9 lines exceeds the small-paste threshold, so this becomes an attachment.
+    tui.handle_paste(
+        "line 1\r\nline 2\r\nline 3\r\nline 4\r\nline 5\r\nline 6\r\nline 7\r\nline 8\r\nline 9"
+            .to_string(),
+    )
+    .await;
 
     assert_eq!(
         tui.app.attachments.len(),
@@ -3356,7 +3368,7 @@ async fn paste_multiline_with_crlf_creates_temp_attachment() {
 
     let contents = std::fs::read_to_string(&tui.app.attachments[0].path).unwrap();
     assert_eq!(
-        contents, "line one\nline two\nline three",
+        contents, "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9",
         "CRLFs should be normalized to LFs"
     );
 
@@ -3379,6 +3391,107 @@ async fn paste_single_line_inserts_inline() {
         tui.app.attachments.is_empty(),
         "Single-line paste should not create attachment"
     );
+}
+
+#[tokio::test]
+async fn paste_small_multiline_inserts_inline() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    // A few short lines should stay inline rather than becoming an attachment.
+    tui.handle_paste("line one\nline two\nline three".to_string())
+        .await;
+
+    let text = tui.app.input.lines().join("\n");
+    assert_eq!(text, "line one\nline two\nline three");
+    assert!(
+        tui.app.attachments.is_empty(),
+        "Small multi-line paste should not create attachment"
+    );
+}
+
+#[tokio::test]
+async fn paste_small_crlf_multiline_normalizes_inline() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    // Small paste with Windows line endings stays inline and is normalized to LF.
+    tui.handle_paste("line one\r\nline two".to_string()).await;
+
+    let text = tui.app.input.lines().join("\n");
+    assert_eq!(text, "line one\nline two");
+    assert!(
+        tui.app.attachments.is_empty(),
+        "Small CRLF paste should not create attachment"
+    );
+}
+
+#[tokio::test]
+async fn paste_many_lines_creates_attachment() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    // More than the line threshold (8) of short lines becomes an attachment.
+    let pasted: String = (1..=9)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    tui.handle_paste(pasted.clone()).await;
+
+    assert_eq!(
+        tui.app.attachments.len(),
+        1,
+        "Paste over the line threshold should create attachment"
+    );
+    assert_eq!(
+        tui.app.input.lines().join("\n"),
+        "",
+        "Large paste should not go into the textarea"
+    );
+    let contents = tokio::fs::read_to_string(&tui.app.attachments[0].path)
+        .await
+        .unwrap();
+    assert_eq!(contents, pasted);
+
+    tui.cleanup_attachments();
+}
+
+#[tokio::test]
+async fn paste_long_two_line_text_creates_attachment() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    // Only two lines, but the total character count exceeds the size threshold
+    // (512), so it should still become an attachment.
+    let long_line = "x".repeat(400);
+    let pasted = format!("{long_line}\n{long_line}");
+    assert!(pasted.chars().count() > 512);
+    tui.handle_paste(pasted.clone()).await;
+
+    assert_eq!(
+        tui.app.attachments.len(),
+        1,
+        "Paste over the size threshold should create attachment"
+    );
+    assert_eq!(
+        tui.app.input.lines().join("\n"),
+        "",
+        "Large paste should not go into the textarea"
+    );
+
+    tui.cleanup_attachments();
 }
 
 #[tokio::test]
@@ -3413,8 +3526,11 @@ async fn detach_cleans_up_temp_dir() {
         .await
         .unwrap();
 
-    // Paste multi-line to create a temp attachment
-    tui.handle_paste("line one\nline two".to_string()).await;
+    // Paste large multi-line text to create a temp attachment
+    tui.handle_paste(
+        "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9".to_string(),
+    )
+    .await;
     assert_eq!(tui.app.attachments.len(), 1);
     let temp_dir = tui.app.attachment_dir.clone().unwrap();
     let temp_path = tui.app.attachments[0].path.clone();

@@ -17,6 +17,7 @@ There is no readline-based REPL.
 - **Multi-line input** via paste (bracketed-paste terminals) or `Shift+Enter` / `Ctrl+J` to insert a newline.
 - **History:** `↑` / `↓` to navigate prior submissions.
 - **Attachments:** `.attach <path>` to attach a file to the next message; `.detach` to remove.
+  - **Large pastes** (more than 8 lines or more than 512 characters) are automatically saved as a text attachment instead of being inserted inline. Smaller multi-line pastes are inserted directly into the input.
 
 ## Dot-Commands
 
