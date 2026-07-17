@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::session_lock::SessionLock;
 
 /// Rendered transcript of the messages to compact, plus the split index, the
 /// covered log-seq range `(from, to, count)`, and the session id.
@@ -86,6 +87,27 @@ impl Config {
         let (transcript, split, covered, session_id) =
             Self::build_compaction_transcript(config, &params)?;
 
+        // Derive session path BEFORE making LLM call, to check if we need lock.
+        let session_path = {
+            let guard = config.read();
+            let Some(session) = guard.session.as_ref() else {
+                return Ok(()); // No session to compact
+            };
+            if session.id != session_id {
+                return Ok(()); // Session swapped
+            }
+            // Skip locking for ephemeral/unsaved sessions
+            if session.save_session() == Some(false) {
+                None
+            } else {
+                match (&session.path, &session.sessions_dir) {
+                    (Some(path), _) => Some(std::path::PathBuf::from(path)),
+                    (None, Some(dir)) => Some(dir.join(format!("{}.yaml", session.id))),
+                    (None, None) => None,
+                }
+            }
+        };
+
         let mut input = harnx_core::input::Input::new(
             transcript.clone(),
             (transcript, vec![]),
@@ -97,7 +119,60 @@ impl Config {
         let summary = crate::config::input::fetch_chat_text(&mut input, config).await?;
 
         let summary_with_note = append_recovery_note(summary, covered);
-        Self::apply_compaction_summary(config, &session_id, summary_with_note, split);
+
+        // Apply compaction with proper locking to avoid race/deadlock.
+        // This runs on a background task that may start BEFORE the agent loop's
+        // SessionLock is released. Use bounded try_acquire to avoid deadlock.
+        if let Some(session_path) = session_path {
+            // Try to acquire the session lock with bounded retries.
+            let lock = {
+                let session_path = session_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut attempts = 0;
+                    let max_attempts = 20; // ~2s total with 100ms sleeps
+                    let sleep_ms = 100;
+                    loop {
+                        match SessionLock::try_acquire(&session_path) {
+                            Ok(Some(lock)) => return Ok(lock),
+                            Ok(None) => {
+                                // Lock held by another process; retry
+                                attempts += 1;
+                                if attempts >= max_attempts {
+                                    return Err(anyhow::anyhow!(
+                                        "compaction: could not acquire session lock after {} attempts",
+                                        attempts
+                                    ));
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                })
+                .await
+                .context("compaction lock task join")?
+            };
+
+            match lock {
+                Ok(_session_lock) => {
+                    // Lock acquired - apply compaction under lock.
+                    Self::apply_compaction_summary(config, &session_id, summary_with_note, split);
+                }
+                Err(e) => {
+                    // Failed to acquire lock - skip this compaction cycle.
+                    // Will re-trigger on next turn.
+                    log::warn!(
+                        "compaction: could not acquire session lock for {}: {}; skipping this cycle",
+                        session_id,
+                        e
+                    );
+                }
+            }
+        } else {
+            // No path - ephemeral session; apply in-memory compaction without log append.
+            Self::apply_compaction_summary(config, &session_id, summary_with_note, split);
+        }
+
         Ok(())
     }
 

@@ -64,6 +64,11 @@ impl Config {
         }
     }
 
+    /// Returns the `.yaml.lock` sidecar path for a session name.
+    pub fn session_lock_path(&self, name: &str) -> PathBuf {
+        session_lock::SessionLock::lock_path_for(&self.session_file(name))
+    }
+
     /// Atomically claim a short session ID by creating its stub file with
     /// `create_new(true)`. Returns `Ok(true)` if the claim succeeded, `Ok(false)`
     /// if another process already claimed the same ID (caller should retry with a
@@ -132,5 +137,34 @@ impl Config {
 
     pub fn models_override_file() -> PathBuf {
         paths::models_override_file()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_lock_path_returns_yaml_lock_sidecar() {
+        let config = Config::default();
+        let lock_path = config.session_lock_path("foo");
+        assert!(lock_path.ends_with("foo.yaml.lock"));
+        assert_eq!(
+            lock_path,
+            config.session_file("foo").with_extension("yaml.lock")
+        );
+    }
+
+    #[test]
+    fn session_lock_path_handles_subdir_names() {
+        let config = Config::default();
+        let lock_path = config.session_lock_path("subdir/leaf");
+        assert!(lock_path.ends_with("leaf.yaml.lock"));
+        assert_eq!(
+            lock_path,
+            config
+                .session_file("subdir/leaf")
+                .with_extension("yaml.lock")
+        );
     }
 }

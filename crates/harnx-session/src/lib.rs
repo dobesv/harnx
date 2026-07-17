@@ -43,6 +43,7 @@ pub fn build_context(
         max_resume: None,
         pending_async_context: None,
         working_dir,
+        session_lock: None,
     }
 }
 

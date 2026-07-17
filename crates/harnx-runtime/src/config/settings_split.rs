@@ -1,5 +1,5 @@
 //! Reserved for config/mod.rs cluster extraction (code health). Currently unused.
-use super::{update_rag, Config, GlobalConfig};
+use super::{session_lock::SessionLock, update_rag, Config, GlobalConfig};
 use crate::client::ModelType;
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -67,6 +67,34 @@ impl Config {
         if title.is_empty() {
             bail!("Usage: .set title <text>");
         }
+
+        let session_path = {
+            let guard = config.read();
+            let session = guard
+                .session
+                .as_ref()
+                .context("No active session to set a title on")?;
+            if session.save_session() == Some(false) {
+                None
+            } else {
+                session
+                    .path
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        session
+                            .sessions_dir
+                            .as_ref()
+                            .map(|dir| dir.join(format!("{}.yaml", session.id)))
+                    })
+                    .or_else(|| Some(guard.session_file(&session.id)))
+            }
+        };
+        let _lock = match session_path.as_ref() {
+            Some(session_path) => Some(SessionLock::acquire(session_path)?),
+            None => None,
+        };
+
         {
             let mut guard = config.write();
             let session = guard
@@ -361,6 +389,7 @@ mod title_command_tests {
             "title-test",
             &dir.join("title-test.yaml"),
             false,
+            None,
         )
         .unwrap();
         config.session = Some(session);

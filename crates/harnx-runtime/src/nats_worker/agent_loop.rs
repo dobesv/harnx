@@ -237,6 +237,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         max_resume: None,
         pending_async_context: None,
         working_dir,
+        session_lock: None,
     };
 
     // Run the unified agent loop
