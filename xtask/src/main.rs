@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -32,6 +32,7 @@ enum CommandLine {
 
 struct InstallArgs {
     debug: bool,
+    skip_web: bool,
     bins: Vec<String>,
 }
 
@@ -50,11 +51,13 @@ fn parse_cli(args: Vec<OsString>) -> Result<CommandLine> {
 
 fn parse_install_args(args: &[OsString]) -> Result<InstallArgs> {
     let mut debug = false;
+    let mut skip_web = false;
     let mut bins = Vec::new();
 
     for arg in args {
         match arg.to_str() {
             Some("--debug") => debug = true,
+            Some("--skip-web") => skip_web = true,
             Some("-h") | Some("--help") => {
                 print_install_help();
                 std::process::exit(0);
@@ -67,7 +70,11 @@ fn parse_install_args(args: &[OsString]) -> Result<InstallArgs> {
         }
     }
 
-    Ok(InstallArgs { debug, bins })
+    Ok(InstallArgs {
+        debug,
+        skip_web,
+        bins,
+    })
 }
 
 fn install(args: InstallArgs) -> Result<()> {
@@ -102,6 +109,220 @@ fn install(args: InstallArgs) -> Result<()> {
         install_binary(&source, &destination)?;
     }
 
+    if args.skip_web {
+        println!("==> Skipping web-ui build (--skip-web)");
+    } else {
+        install_web_assets(&metadata.workspace_root)?;
+    }
+
+    Ok(())
+}
+
+/// Build the web UI and copy the compiled assets into the directory that
+/// `harnx serve` loads from by default (`<data_dir>/web-assets`).
+///
+/// The web project lives in `web/` at the workspace root and builds with pnpm
+/// (`pnpm install` + `pnpm build`), emitting static files into `web/dist`.
+fn install_web_assets(workspace_root: &Path) -> Result<()> {
+    let web_dir = workspace_root.join("web");
+    if !web_dir.join("package.json").is_file() {
+        bail!(
+            "web project not found at {} (missing package.json); pass --skip-web to skip",
+            web_dir.display()
+        );
+    }
+
+    let pnpm = pnpm_command();
+    ensure_pnpm_available(&pnpm)?;
+
+    println!("==> Installing web-ui dependencies (pnpm install)");
+    let mut install = Command::new(&pnpm);
+    install
+        .arg("install")
+        .arg("--frozen-lockfile")
+        .current_dir(&web_dir);
+    run_command(&mut install, "pnpm install")?;
+
+    println!("==> Building web-ui (pnpm build)");
+    let mut build = Command::new(&pnpm);
+    build.arg("build").current_dir(&web_dir);
+    run_command(&mut build, "pnpm build")?;
+
+    let dist = web_dir.join("dist");
+    if !dist.is_dir() {
+        bail!(
+            "web build did not produce a dist directory at {}",
+            dist.display()
+        );
+    }
+
+    let destination = harnx_data_dir()?.join("web-assets");
+    println!("==> Installing web-ui assets -> {}", destination.display());
+    replace_dir(&dist, &destination)?;
+
+    Ok(())
+}
+
+/// Resolve the pnpm executable, honoring an override via `PNPM` for
+/// environments where pnpm is invoked through a wrapper (e.g. corepack).
+fn pnpm_command() -> OsString {
+    env::var_os("PNPM").unwrap_or_else(|| OsString::from("pnpm"))
+}
+
+/// Verify the pnpm executable can be run before we lean on it, so a missing
+/// pnpm yields an actionable message instead of a raw "No such file" IO error.
+fn ensure_pnpm_available(pnpm: &OsString) -> Result<()> {
+    match Command::new(pnpm).arg("--version").output() {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(command_failure(
+            "pnpm --version",
+            output.status,
+            &output.stderr,
+        )),
+        Err(err) => Err(anyhow::Error::from(err).context(format!(
+            "failed to run `{}` — install pnpm (https://pnpm.io/) or pass --skip-web \
+             to install without the web UI",
+            pnpm.to_string_lossy()
+        ))),
+    }
+}
+
+/// Root data directory, mirroring `harnx_core::config_paths::data_dir()`:
+/// 1. `HARNX_DATA_DIR` env var (literal path).
+/// 2. `XDG_DATA_HOME/harnx` (XDG override).
+/// 3. OS default (`dirs::data_dir()/harnx`).
+///
+/// Reimplemented locally to keep `xtask` free of a `harnx-core` dependency.
+fn harnx_data_dir() -> Result<PathBuf> {
+    if let Some(v) = env::var_os("HARNX_DATA_DIR") {
+        if !v.is_empty() {
+            return Ok(PathBuf::from(v));
+        }
+    }
+    if let Some(v) = env::var_os("XDG_DATA_HOME") {
+        if !v.is_empty() {
+            return Ok(PathBuf::from(v).join("harnx"));
+        }
+    }
+    dirs::data_dir()
+        .map(|dir| dir.join("harnx"))
+        .ok_or_else(|| {
+            anyhow!("failed to resolve data dir from HARNX_DATA_DIR, XDG_DATA_HOME, or OS default")
+        })
+}
+
+/// Replace `destination` with a fresh copy of `source`, keeping stale files
+/// from previous builds from lingering.
+///
+/// The copy lands in a sibling staging directory first; only once it is fully
+/// populated do we swap it into place with a double rename
+/// (`destination -> <destination>.old`, then `staging -> destination`). Renames
+/// are near-instant and, on Windows, moving a directory that holds open files
+/// tends to succeed where deleting it in place would fail — so a concurrent
+/// `harnx serve` is very unlikely to observe a missing or half-written asset
+/// directory.
+fn replace_dir(source: &Path, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow!("destination {} has no parent dir", destination.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create dir {}", parent.display()))?;
+
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| anyhow!("destination {} has no file name", destination.display()))?;
+    let staging = sibling_with_suffix(parent, file_name, ".new");
+    let backup = sibling_with_suffix(parent, file_name, ".old");
+
+    // Clean up leftovers from a previous interrupted run.
+    remove_dir_if_exists(&staging)
+        .with_context(|| format!("failed to clear stale staging dir {}", staging.display()))?;
+    remove_dir_if_exists(&backup)
+        .with_context(|| format!("failed to clear stale backup dir {}", backup.display()))?;
+
+    if let Err(err) = copy_dir_recursive(source, &staging) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(err);
+    }
+
+    // Move any existing install aside first so the destination is only briefly
+    // absent (between two renames) rather than during a full delete.
+    let had_existing = destination.exists();
+    if had_existing {
+        if let Err(err) = fs::rename(destination, &backup) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to move existing dir {} aside to {}",
+                    destination.display(),
+                    backup.display()
+                )
+            });
+        }
+    }
+
+    if let Err(err) = fs::rename(&staging, destination) {
+        // Roll back: restore the previous install if we moved it aside.
+        if had_existing {
+            let _ = fs::rename(&backup, destination);
+        }
+        let _ = fs::remove_dir_all(&staging);
+        return Err(err).with_context(|| {
+            format!(
+                "failed to move staged assets {} into place at {}",
+                staging.display(),
+                destination.display()
+            )
+        });
+    }
+
+    // Best-effort cleanup of the superseded install.
+    let _ = fs::remove_dir_all(&backup);
+    Ok(())
+}
+
+/// Build a sibling path in `parent` named `.<file_name><suffix>`.
+fn sibling_with_suffix(parent: &Path, file_name: &std::ffi::OsStr, suffix: &str) -> PathBuf {
+    let mut name = OsString::from(".");
+    name.push(file_name);
+    name.push(suffix);
+    parent.join(name)
+}
+
+/// Remove `dir` recursively if it exists, treating a missing dir as success.
+fn remove_dir_if_exists(dir: &Path) -> Result<()> {
+    match fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Recursively copy the contents of `source` into `destination`.
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)
+        .with_context(|| format!("failed to create dir {}", destination.display()))?;
+    for entry in
+        fs::read_dir(source).with_context(|| format!("failed to read dir {}", source.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in {}", source.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to stat {}", entry.path().display()))?;
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    entry.path().display(),
+                    target.display()
+                )
+            })?;
+        }
+    }
     Ok(())
 }
 
@@ -267,6 +488,11 @@ fn parse_metadata(stdout: &[u8]) -> Result<Metadata> {
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("cargo metadata missing string target_directory"))?;
+    let workspace_root = root
+        .get("workspace_root")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("cargo metadata missing string workspace_root"))?;
 
     let packages = root
         .get("packages")
@@ -279,6 +505,7 @@ fn parse_metadata(stdout: &[u8]) -> Result<Metadata> {
     Ok(Metadata {
         packages,
         target_directory,
+        workspace_root,
         workspace_members,
     })
 }
@@ -381,12 +608,13 @@ fn help_text() -> &'static str {
 }
 
 fn install_help_text() -> &'static str {
-    "Build and copy workspace binaries into cargo bin dir\n\nUsage: cargo xtask install [OPTIONS] [BINS]...\n\nArguments:\n  [BINS]...  Restrict install to one or more workspace binary names\n\nOptions:\n      --debug  Install debug build instead of default release build\n  -h, --help   Print help"
+    "Build and copy workspace binaries into cargo bin dir\n\nAlso builds the web UI (pnpm) and copies it to the default web-assets\ndirectory that `harnx serve` loads from (<data_dir>/web-assets).\n\nUsage: cargo xtask install [OPTIONS] [BINS]...\n\nArguments:\n  [BINS]...  Restrict install to one or more workspace binary names\n\nOptions:\n      --debug     Install debug build instead of default release build\n      --skip-web  Skip building and installing the web UI assets\n  -h, --help      Print help"
 }
 
 struct Metadata {
     packages: Vec<MetadataPackage>,
     target_directory: PathBuf,
+    workspace_root: PathBuf,
     workspace_members: BTreeSet<String>,
 }
 
@@ -400,4 +628,184 @@ struct MetadataPackage {
 struct MetadataTarget {
     name: String,
     kind: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::id;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Serialize env-mutating tests: process-global env is shared across the
+    /// binary, so concurrent mutation would race.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn unique_tmp(label: &str) -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        env::temp_dir().join(format!("xtask-{label}-{}-{n}", id()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, prev }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let prev = env::var_os(key);
+            env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => env::set_var(self.key, v),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn harnx_data_dir_prefers_explicit_env() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _xdg = EnvVarGuard::unset("XDG_DATA_HOME");
+        let _data = EnvVarGuard::set("HARNX_DATA_DIR", "/tmp/explicit-data");
+        assert_eq!(
+            harnx_data_dir().unwrap(),
+            PathBuf::from("/tmp/explicit-data")
+        );
+    }
+
+    #[test]
+    fn harnx_data_dir_uses_xdg_override() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _data = EnvVarGuard::unset("HARNX_DATA_DIR");
+        let _xdg = EnvVarGuard::set("XDG_DATA_HOME", "/tmp/xdg-data");
+        assert_eq!(
+            harnx_data_dir().unwrap(),
+            PathBuf::from("/tmp/xdg-data").join("harnx")
+        );
+    }
+
+    #[test]
+    fn copy_dir_recursive_copies_nested_tree() {
+        let src = unique_tmp("copy-src");
+        let dst = unique_tmp("copy-dst");
+        fs::create_dir_all(src.join("assets")).unwrap();
+        fs::write(src.join("index.html"), b"<html>").unwrap();
+        fs::write(src.join("assets").join("app.js"), b"console.log(1)").unwrap();
+
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        assert_eq!(fs::read(dst.join("index.html")).unwrap(), b"<html>");
+        assert_eq!(
+            fs::read(dst.join("assets").join("app.js")).unwrap(),
+            b"console.log(1)"
+        );
+
+        fs::remove_dir_all(&src).ok();
+        fs::remove_dir_all(&dst).ok();
+    }
+
+    #[test]
+    fn replace_dir_clears_stale_files() {
+        let src = unique_tmp("replace-src");
+        let dst = unique_tmp("replace-dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("new.txt"), b"new").unwrap();
+
+        // Pre-populate destination with a stale file that must not survive.
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(dst.join("stale.txt"), b"stale").unwrap();
+
+        replace_dir(&src, &dst).unwrap();
+
+        assert!(dst.join("new.txt").is_file());
+        assert!(!dst.join("stale.txt").exists());
+
+        fs::remove_dir_all(&src).ok();
+        fs::remove_dir_all(&dst).ok();
+    }
+
+    #[test]
+    fn replace_dir_swaps_over_existing_install_without_residue() {
+        let base = unique_tmp("replace-base");
+        let src = base.join("src");
+        let dst = base.join("web-assets");
+        fs::create_dir_all(src.join("assets")).unwrap();
+        fs::write(src.join("index.html"), b"v2").unwrap();
+        fs::write(src.join("assets").join("app.js"), b"v2js").unwrap();
+
+        // Existing install with a stale file that must be gone afterwards.
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(dst.join("old.html"), b"v1").unwrap();
+
+        replace_dir(&src, &dst).unwrap();
+
+        assert_eq!(fs::read(dst.join("index.html")).unwrap(), b"v2");
+        assert_eq!(
+            fs::read(dst.join("assets").join("app.js")).unwrap(),
+            b"v2js"
+        );
+        assert!(!dst.join("old.html").exists());
+        // No leftover staging/backup siblings.
+        assert!(!base.join(".web-assets.new").exists());
+        assert!(!base.join(".web-assets.old").exists());
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn harnx_data_dir_falls_back_to_os_default() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _data = EnvVarGuard::unset("HARNX_DATA_DIR");
+        let _xdg = EnvVarGuard::unset("XDG_DATA_HOME");
+        // On CI/dev hosts dirs::data_dir() resolves; assert the harnx suffix.
+        if let Some(expected) = dirs::data_dir() {
+            assert_eq!(harnx_data_dir().unwrap(), expected.join("harnx"));
+        }
+    }
+
+    #[test]
+    fn parse_install_args_accepts_skip_web() {
+        let args = parse_install_args(&[OsString::from("--skip-web")]).unwrap();
+        assert!(args.skip_web);
+        assert!(!args.debug);
+        assert!(args.bins.is_empty());
+    }
+
+    #[test]
+    fn parse_install_args_default_builds_web() {
+        let args = parse_install_args(&[]).unwrap();
+        assert!(!args.skip_web);
+    }
+
+    #[test]
+    fn parse_metadata_reads_workspace_root() {
+        let json = br#"{
+            "workspace_members": ["pkg 0.1.0 (path+file:///w)"],
+            "target_directory": "/w/target",
+            "workspace_root": "/w",
+            "packages": []
+        }"#;
+        let metadata = parse_metadata(json).unwrap();
+        assert_eq!(metadata.workspace_root, PathBuf::from("/w"));
+        assert_eq!(metadata.target_directory, PathBuf::from("/w/target"));
+    }
+
+    #[test]
+    fn install_help_mentions_web_and_skip_flag() {
+        let help = install_help_text();
+        assert!(help.contains("web UI"));
+        assert!(help.contains("--skip-web"));
+    }
 }
