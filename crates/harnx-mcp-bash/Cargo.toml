@@ -26,14 +26,6 @@ tempfile = "3"
 tokio = { workspace = true, features = ["fs"] }
 uuid = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
-birdcage = { workspace = true }
-
 [[bin]]
 name = "harnx-mcp-bash"
 path = "src/main.rs"
-
-# Kept for backward compatibility — now an alias; harnx-sandbox-exec is the canonical binary.
-[[bin]]
-name = "harnx-mcp-bash-sandbox-run"
-path = "src/bin/sandbox_run.rs"

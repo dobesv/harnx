@@ -3838,7 +3838,6 @@ name = "harnx-mcp-bash"
 version = "0.33.2"
 dependencies = [
  "anyhow",
- "birdcage",
  "fancy-regex 0.18.0",
  "gix",
  "harnx-core",

@@ -145,12 +145,12 @@ jobs:
 
         # Each entry is "archive-name:bin1[,bin2...]" — the archive's
         # filename uses archive-name; staged contents are the listed bins.
-        # harnx-mcp-bash ships its sandbox helper alongside the main bin.
+        # Each binary ships in its own archive; harnx-sandbox-exec is packaged separately.
         archive_specs=(
           "harnx:harnx"
           "harnx-serve:harnx-serve"
           "harnx-acp-server:harnx-acp-server"
-          "harnx-mcp-bash:harnx-mcp-bash,harnx-mcp-bash-sandbox-run"
+          "harnx-mcp-bash:harnx-mcp-bash"
           "harnx-mcp-fs:harnx-mcp-fs"
           "harnx-mcp-plans:harnx-mcp-plans"
           "harnx-mcp-plans-github:harnx-mcp-plans-github"
@@ -389,7 +389,7 @@ jobs:
         run: |
           missing=0
           for dir in linux-amd64 linux-arm64; do
-            for bin in harnx harnx-serve harnx-acp-server harnx-mcp-bash harnx-mcp-bash-sandbox-run harnx-mcp-fs harnx-mcp-plans harnx-mcp-plans-github harnx-mcp-time harnx-aws-creds harnx-k8s-creds harnx-pkg harnx-proxy-auth harnx-mcp-hooks-proxy harnx-sandbox-run harnx-sandbox-exec; do
+            for bin in harnx harnx-serve harnx-acp-server harnx-mcp-bash harnx-mcp-fs harnx-mcp-plans harnx-mcp-plans-github harnx-mcp-time harnx-aws-creds harnx-k8s-creds harnx-pkg harnx-proxy-auth harnx-mcp-hooks-proxy harnx-sandbox-run harnx-sandbox-exec; do
               if [ ! -f "$dir/$bin" ]; then
                 echo "ERROR: missing $dir/$bin"
                 missing=1

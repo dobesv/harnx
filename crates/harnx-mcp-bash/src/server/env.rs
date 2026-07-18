@@ -49,7 +49,7 @@ impl BashServer {
     ///    precedence.
     ///
     /// This applies on every platform; sandbox-specific behaviour
-    /// (birdcage exceptions, `sandbox_run` helper) remains Unix-only.
+    /// (sandbox exceptions, `harnx-sandbox-exec` helper) remains Unix-only.
     pub(crate) fn build_child_env(&self) -> Vec<(String, String)> {
         let mut env_vars: Vec<(String, String)> = Vec::new();
 

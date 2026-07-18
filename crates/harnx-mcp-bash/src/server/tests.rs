@@ -271,7 +271,7 @@ fn sandboxed_server(roots: Vec<PathBuf>) -> BashServer {
     )
 }
 
-/// Probe whether birdcage's sandbox can actually initialize in the current
+/// Probe whether the sandbox helper can actually initialize in the current
 /// environment. GitHub Actions Ubuntu runners and other restricted Linux
 /// environments commonly disallow unprivileged user namespaces, which
 /// causes `Sandbox::spawn()` to fail with EPERM at runtime. The
@@ -325,7 +325,7 @@ fn sandbox_runtime_works() -> bool {
         Ok(o) if o.status.success() => true,
         Ok(o) => {
             eprintln!(
-                    "sandbox runtime probe: birdcage cannot initialize here (exit={:?}, stderr={:?}) — skipping",
+                    "sandbox runtime probe: sandbox helper cannot initialize here (exit={:?}, stderr={:?}) — skipping",
                     o.status.code(),
                     String::from_utf8_lossy(&o.stderr).trim()
                 );

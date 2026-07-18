@@ -53,7 +53,7 @@ args:
   - --env
   - CS_ACCESS_TOKEN
 #   - --sandbox-run                                         # Override sandbox helper binary
-#   - /opt/harnx/harnx-mcp-bash-sandbox-run
+#   - /opt/harnx/harnx-sandbox-exec
 #   - --env                                                 # Allow git push over SSH
 #   - SSH_AUTH_SOCK
 #
