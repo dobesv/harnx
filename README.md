@@ -30,10 +30,6 @@ what you need:
 | `harnx-k8s-creds`       | Persistent hook that injects scoped Kubernetes credentials into sandboxed tools | [README](crates/harnx-k8s-creds/README.md)       |
 | `harnx-proxy-auth`      | TLS-intercepting auth proxy that injects credentials and runs hooks             | [README](crates/harnx-proxy-auth/README.md)      |
 
-One helper binary ships bundled alongside its parent rather than as its own
-archive: `harnx-mcp-bash-sandbox-run` is included in the `harnx-mcp-bash`
-archive.
-
 Install whichever you need. Most users want just `harnx`; headless server
 deployments can skip the TUI deps by picking `harnx-serve` or
 `harnx-acp-server` directly. The MCP server binaries (`harnx-mcp-*`) are only
