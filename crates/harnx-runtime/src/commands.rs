@@ -1096,6 +1096,7 @@ async fn ask_inner(
         max_resume: Some(max_resume),
         pending_async_context: Some(pending_arc.clone()),
         working_dir: None,
+        session_lock: None,
     };
 
     let result = crate::agent_loop::run_agent_loop(&ctx, input).await;

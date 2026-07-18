@@ -13,11 +13,11 @@
 //! front-ends now delegate to.
 
 use crate::{
-    config::{Config, GlobalConfig, Input},
+    config::{session_lock::SessionLock, Config, GlobalConfig, Input},
     tool::{execute_tool_round, CompletionText, ToolResult},
     utils::dimmed_text,
 };
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use harnx_hooks::{
     dispatch_hooks_with_count_and_manager, dispatch_hooks_with_managers, drain_async_results,
     inject_pending_async_context, AsyncHookManager, HookEvent, HookResultControl,
@@ -110,6 +110,10 @@ pub struct AgentLoopContext {
     /// Optional per-session working directory. When unset, runtime falls back
     /// to process cwd for CLI/ACP compatibility.
     pub working_dir: Option<PathBuf>,
+    /// Optional session lock held across the agent loop (T6).
+    /// When set, passed through to exit paths to avoid re-entrancy deadlock.
+    #[allow(dead_code)]
+    pub session_lock: Option<SessionLock>,
 }
 
 /// Resume a tool round that was interrupted for approval.
@@ -210,7 +214,9 @@ pub async fn continue_agent_loop_from_tool_round(
 
         // Handle agent switch
         if let Some(switch) = switch_agent {
-            config.write().exit_agent()?;
+            config
+                .write()
+                .exit_agent_with_lock(ctx.session_lock.as_ref())?;
             crate::config::Config::use_agent(
                 config,
                 &switch.agent,
@@ -219,7 +225,9 @@ pub async fn continue_agent_loop_from_tool_round(
             )
             .await?;
             if config.read().session.is_some() {
-                config.write().empty_session()?;
+                config
+                    .write()
+                    .empty_session_with_lock(ctx.session_lock.as_ref())?;
             }
             let new_input = crate::config::input::from_str(config, &switch.prompt, None);
             return run_agent_loop(ctx, new_input).await;
@@ -255,9 +263,66 @@ pub struct ToolApprovalDecision {
 /// errors are already converted to `{"is_error":true}` results by
 /// `execute_tool_round` and fed back to the LLM.
 pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Result<()> {
+    let session_path = {
+        let config_read = ctx.config.read();
+        match config_read.session.as_ref() {
+            Some(session) if session.save_session() != Some(false) => {
+                session.path.as_deref().map(PathBuf::from).or_else(|| {
+                    session
+                        .sessions_dir
+                        .as_ref()
+                        .map(|sessions_dir| sessions_dir.join(format!("{}.yaml", session.id)))
+                })
+            }
+            _ => None,
+        }
+    };
+
+    // Acquire session lock if needed, or use the one from ctx
+    let _session_lock: Option<SessionLock> = if let Some(session_path) = session_path {
+        // Use the lock from ctx if available (preferred)
+        if let Some(ref _lock) = ctx.session_lock {
+            // We don't clone SessionLock (File isn't Clone), but we don't need to -
+            // the lock in ctx keeps it held. We just pass a reference through.
+            None
+        } else {
+            // Otherwise acquire it ourselves
+            let lock = match SessionLock::try_acquire(&session_path)? {
+                Some(lock) => lock,
+                None => {
+                    harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Notice(
+                        harnx_core::event::NoticeEvent::Info(
+                            "Waiting for session lock…".to_string(),
+                        ),
+                    ));
+                    let sp = session_path.clone();
+                    tokio::task::spawn_blocking(move || SessionLock::acquire(&sp))
+                        .await
+                        .context("session lock task join failed")??
+                }
+            };
+            crate::config::reload_session_from_disk(&ctx.config)?;
+            Some(lock)
+        }
+    } else {
+        None
+    };
+
+    run_agent_loop_inner(
+        ctx,
+        initial_input,
+        ctx.session_lock.as_ref().or(_session_lock.as_ref()),
+    )
+    .await
+}
+
+async fn run_agent_loop_inner(
+    ctx: &AgentLoopContext,
+    initial_input: Input,
+    session_lock: Option<&SessionLock>,
+) -> Result<()> {
     let config = &ctx.config;
     let abort_signal = &ctx.abort_signal;
-
     let mut input = initial_input;
     let mut resume_count: u32 = ctx.initial_resume_count;
     let mut with_embeddings = ctx.initial_with_embeddings;
@@ -506,7 +571,7 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
             }
 
             if let Some(switch) = switch_agent {
-                config.write().exit_agent()?;
+                config.write().exit_agent_with_lock(session_lock)?;
                 Config::use_agent(
                     config,
                     &switch.agent,
@@ -516,7 +581,7 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
                 .await?;
                 // Empty session so new agent starts fresh (see #291).
                 if config.read().session.is_some() {
-                    config.write().empty_session()?;
+                    config.write().empty_session_with_lock(session_lock)?;
                 }
                 // Rebuild input from the handoff prompt (#303).
                 input = crate::config::input::from_str(config, &switch.prompt, None);
@@ -698,6 +763,7 @@ mod tests {
             initial_resume_count: 0,
             max_resume: Some(0),
             pending_async_context: None,
+            session_lock: None,
         };
 
         let input = crate::config::input::from_str(&global_config, "do work", None);

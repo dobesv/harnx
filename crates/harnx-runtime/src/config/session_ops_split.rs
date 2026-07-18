@@ -1,7 +1,11 @@
 //! Session lifecycle and editing methods extracted from config/mod.rs for code health.
 use super::*;
+use crate::config::session_lock::SessionLock;
 use crate::nats_admin::kv_bucket_missing;
 use crate::nats_session_index::{self, SessionIndexRecord};
+use harnx_core::session_log::SessionLog;
+use std::fs::read_to_string;
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 /// Convert a `SessionIndexRecord` to `SessionMeta`.
@@ -20,6 +24,100 @@ fn session_index_record_to_meta(record: &SessionIndexRecord) -> SessionMeta {
         title: record.title.clone(),
         modified: UNIX_EPOCH.checked_add(Duration::from_secs(record.last_activity)),
     }
+}
+
+/// Called immediately after acquiring the session lock, to pick up entries
+/// written by the previous lock holder. Reloads the session log from disk
+/// and merges into the in-memory Session, preserving the existing runtime
+/// append sink and sessions_dir. Also resets the sink's seq cache so the
+/// next append re-derives from the freshly-reloaded file.
+pub fn reload_session_from_disk(config: &GlobalConfig) -> Result<()> {
+    let mut config = config.write();
+    let Some(session) = config.session.as_ref() else {
+        return Ok(());
+    };
+    let Some(path_str) = session.path.clone() else {
+        return Ok(());
+    };
+
+    let path = PathBuf::from(&path_str);
+    let name = session.id.clone();
+
+    // Skip reload if the session file doesn't exist or is empty (uninitialized stub).
+    // New sessions are claimed by creating a zero-byte stub; the first append will
+    // initialize the header. Reloading from an empty file would fail with
+    // "invalid type: Option value, expected internally tagged enum SessionLogEntry".
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata = path.metadata().with_context(|| {
+        format!(
+            "Failed to read metadata for session {} at {}",
+            name,
+            path.display()
+        )
+    })?;
+    if metadata.len() == 0 {
+        return Ok(());
+    }
+
+    // Preserve the exact Arc<dyn SessionAppendSink> — no re-wrapping.
+    let runtime = session.runtime.clone();
+    let sessions_dir = session.sessions_dir.clone();
+    // Preserve the current in-memory model in case reload fails to resolve it.
+    // This can happen when the model is a mock or dynamically-built client not
+    // present in the static clients catalog (e.g., TUI tests with MockClient).
+    let preserved_model = session.model.clone();
+    let preserved_model_id = session.model_id.clone();
+
+    let content = read_to_string(&path)
+        .with_context(|| format!("Failed to load session {} at {}", name, path.display()))?;
+    let mut reloaded = match self::session::load_from_log(&config, &name, &path, &content) {
+        Ok(session) => session,
+        Err(e) => {
+            // If load_from_log failed due to model resolution but the in-memory
+            // session has a valid model for the same model_id, try loading again
+            // without model resolution and restore the preserved model.
+            let is_model_error =
+                e.to_string().contains("Unknown") && e.to_string().contains("model");
+            if !is_model_error {
+                return Err(e);
+            }
+            // Fall back to loading log entries without model resolution
+            let log = self::session::FileSessionLog::new_for_reload(&path, &name);
+            let raw_entries = log.load_events()?;
+            let replay_entries: Vec<_> = raw_entries
+                .iter()
+                .map(|(seq, entry)| (*seq as usize, entry.clone()))
+                .collect();
+            let mut session =
+                self::session::replay_log_entries_for_external(&replay_entries, &name)?;
+            session.log_entry_count = raw_entries.len();
+            self::session::apply_name_and_path(&mut session, &name, &path, &config)?;
+            session.update_tokens();
+            session
+        }
+    };
+
+    // Reset the sink's seq cache so next append re-derives from the reloaded file.
+    // Call through the SessionAppendSink trait method.
+    if let Some(sink) = runtime
+        .as_ref()
+        .and_then(|r| r.downcast_ref::<Arc<dyn self::session::SessionAppendSink>>())
+    {
+        sink.reset_seq_cache();
+    }
+
+    reloaded.runtime = runtime;
+    reloaded.sessions_dir = sessions_dir;
+    // Preserve the in-memory model when the reloaded model_id matches the current one.
+    // The running turn already holds a fully-resolved Model (possibly a mock or
+    // dynamically-built client not resolvable from the static clients catalog).
+    if reloaded.model_id == preserved_model_id {
+        reloaded.model = preserved_model;
+    }
+    config.session = Some(reloaded);
+    Ok(())
 }
 
 impl Config {
@@ -51,12 +149,15 @@ impl Config {
             session.set_sessions_dir(sessions_dir);
             if session.runtime.is_none() {
                 let session_path = self.session_file(&session.id);
-                session.runtime = Some(Arc::new(Arc::new(self::session::FileSessionLogSink::new(
-                    &session_path,
-                    &session.id,
-                    session.build_header_entry(),
-                ))
-                    as Arc<dyn self::session::SessionAppendSink>));
+                let sink: Arc<dyn self::session::SessionAppendSink> =
+                    Arc::new(self::session::FileSessionLogSink::new(
+                        &session_path,
+                        &session.id,
+                        session.build_header_entry(),
+                    ));
+                // Double-wrap to match convention: Arc<dyn Any> wrapping Arc<dyn SessionAppendSink>.
+                // This is required for append_event's downcast to work.
+                session.runtime = Some(Arc::new(sink));
             }
             if session.is_empty() {
                 new_session = true;
@@ -97,9 +198,18 @@ impl Config {
     }
 
     pub fn exit_session(&mut self) -> Result<()> {
+        self.exit_session_with_lock(None)
+    }
+
+    pub fn exit_session_with_lock(&mut self, lock: Option<&SessionLock>) -> Result<()> {
         if let Some(mut session) = self.session.take() {
             let sessions_dir = self.sessions_dir();
-            self::session::exit(&mut session, &sessions_dir, self.working_mode.is_tui())?;
+            self::session::exit(
+                &mut session,
+                &sessions_dir,
+                self.working_mode.is_tui(),
+                lock,
+            )?;
             self.discontinuous_last_message();
         }
         Ok(())
@@ -120,6 +230,7 @@ impl Config {
                 &session_name,
                 &session_path,
                 self.working_mode.is_tui(),
+                None,
             )?;
         }
         Ok(())
@@ -194,6 +305,10 @@ impl Config {
             to,
             replacements: edited_documents,
         };
+
+        // Acquire session lock before appending edit entry.
+        let _lock = SessionLock::acquire(&session_path)?;
+
         let session = self.session.as_mut().context("No session")?;
         if !crate::config::session::append_event(session, &edit_entry) {
             bail!("Failed to append session edit entry")
@@ -245,6 +360,10 @@ impl Config {
             to,
             replacements: vec![],
         };
+
+        // Acquire session lock before appending delete entry.
+        let _lock = SessionLock::acquire(&session_path)?;
+
         let session = self.session.as_mut().context("No session")?;
         if !crate::config::session::append_event(session, &edit_entry) {
             bail!("Failed to append session delete entry")
@@ -284,6 +403,10 @@ impl Config {
         )?;
 
         let rewind_entry = SessionLogEntry::Rewind { after_seq };
+
+        // Acquire session lock before appending rewind entry.
+        let _lock = SessionLock::acquire(&session_path)?;
+
         let session = self.session.as_mut().context("No session")?;
         if !crate::config::session::append_event(session, &rewind_entry) {
             bail!("Failed to append session rewind entry")
@@ -315,6 +438,33 @@ impl Config {
     }
 
     pub fn empty_session(&mut self) -> Result<()> {
+        self.empty_session_with_lock(None)
+    }
+
+    pub fn empty_session_with_lock(&mut self, lock: Option<&SessionLock>) -> Result<()> {
+        let session_path = match self.session.as_ref() {
+            Some(session) if session.save_session() == Some(false) => None,
+            Some(session) => session
+                .path
+                .as_deref()
+                .map(PathBuf::from)
+                .or_else(|| {
+                    session
+                        .sessions_dir
+                        .as_ref()
+                        .map(|dir| dir.join(format!("{}.yaml", session.id)))
+                })
+                .or_else(|| Some(self.session_file(&session.id))),
+            None => bail!("No session"),
+        };
+        // If caller already holds the lock (Some), don't re-acquire (File::lock is not re-entrant).
+        // If None (standalone caller), acquire our own short-lived lock.
+        let _lock = match (session_path.as_ref(), lock) {
+            (_, Some(_)) => None, // Caller holds lock; don't reacquire
+            (Some(session_path), None) => Some(SessionLock::acquire(session_path)?),
+            (None, None) => None, // Ephemeral session; no lock
+        };
+
         if let Some(session) = self.session.as_mut() {
             if let Some(agent) = self.agent.as_ref() {
                 session.sync_agent(agent)?;
@@ -576,5 +726,96 @@ mod tests_remote_sessions {
         let meta = session_index_record_to_meta(&record);
 
         assert!(meta.modified.is_none());
+    }
+
+    #[test]
+    fn reload_session_from_disk_reloads_log_entry_count_from_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_path = tmp.path().join("reload-test.yaml");
+        let content = r#"type: header
+model: test:model
+---
+type: message
+role: user
+content: first
+---
+type: message
+role: assistant
+content: second
+"#;
+        std::fs::write(&session_path, content).unwrap();
+
+        let mut config = Config {
+            sessions_dir_override: Some(tmp.path().to_path_buf()),
+            working_mode: WorkingMode::Cmd,
+            ..Config::default()
+        };
+        config
+            .clients
+            .push(harnx_client::ClientConfig::OpenAICompatibleConfig(
+                harnx_core::provider_config::openai_compatible::OpenAICompatibleConfig {
+                    name: "test".to_string(),
+                    api_base: None,
+                    api_key: None,
+                    models: vec![],
+                    patches: None,
+                    extra: None,
+                    system_prompt_prefix: None,
+                    package: None,
+                },
+            ));
+        config.model = harnx_client::Model::new("test", "model");
+        config.model_id = "test:model".to_string();
+        let mut session = self::session::new(&config, "reload-test", None).unwrap();
+        session.path = Some(session_path.display().to_string());
+        session.set_sessions_dir(tmp.path().to_path_buf());
+        session.log_entry_count = 1;
+        // Create the inner sink: Arc<dyn SessionAppendSink>
+        let inner_sink: Arc<dyn self::session::SessionAppendSink> =
+            Arc::new(self::session::FileSessionLogSink::new(
+                &session_path,
+                &session.id,
+                session.build_header_entry(),
+            ));
+        // Double-wrap to match convention: Arc<dyn Any> wrapping Arc<dyn SessionAppendSink>.
+        let original_runtime: Arc<dyn std::any::Any + Send + Sync> = Arc::new(inner_sink);
+        let original_ptr = Arc::as_ptr(&original_runtime) as *const ();
+        session.runtime = Some(original_runtime);
+        config.session = Some(session);
+        let global_config: GlobalConfig = Arc::new(RwLock::new(config));
+
+        super::reload_session_from_disk(&global_config).unwrap();
+
+        let mut config = global_config.write();
+        let session = config.session.as_mut().unwrap();
+        assert_eq!(session.log_entry_count, 3);
+        assert_eq!(
+            session.path.as_deref(),
+            Some(session_path.to_str().unwrap())
+        );
+        assert_eq!(session.sessions_dir.as_deref(), Some(tmp.path()));
+        assert!(session.runtime.is_some());
+        // Verify we preserved the exact same outer Arc<dyn Any> by comparing raw pointers
+        let reloaded_runtime = session.runtime.as_ref().unwrap();
+        let reloaded_ptr = Arc::as_ptr(reloaded_runtime) as *const ();
+        assert_eq!(
+            original_ptr, reloaded_ptr,
+            "runtime Arc must be ptr_eq to original"
+        );
+
+        // REGRESSION GUARD: Append through the sink after reload, verify it uses the sink
+        // (not the fallback path) and assigns correct seq derived from the reloaded file.
+        let entry = self::session::SessionLogEntry::Title {
+            title: "test title".to_string(),
+            manual: true,
+            tokens: 0,
+        };
+        let appended = self::session::append_event(session, &entry);
+        assert!(appended, "append_event should use the sink after reload");
+        // After appending 1 entry to a file with 3 entries, log_entry_count should be 4.
+        assert_eq!(
+            session.log_entry_count, 4,
+            "seq should be derived from reloaded file (3 entries -> next seq 3 -> count 4)"
+        );
     }
 }

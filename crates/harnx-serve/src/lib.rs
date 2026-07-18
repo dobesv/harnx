@@ -1779,8 +1779,14 @@ mod tests {
                 MessageRole::User,
                 harnx_core::message::MessageContent::Text("hi from scoped dir".into()),
             ));
-            harnx_runtime::config::session::save(session, "agent-real", &agent_session_path, false)
-                .expect("save scoped session");
+            harnx_runtime::config::session::save(
+                session,
+                "agent-real",
+                &agent_session_path,
+                false,
+                None,
+            )
+            .expect("save scoped session");
         }
 
         std::fs::write(
@@ -1850,7 +1856,7 @@ mod tests {
                     MessageRole::User,
                     harnx_core::message::MessageContent::Text("hi".into()),
                 ));
-                harnx_runtime::config::session::save(session, "agent-real", &path, false)
+                harnx_runtime::config::session::save(session, "agent-real", &path, false, None)
                     .expect("save scoped session");
             }
 

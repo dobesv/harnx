@@ -17,6 +17,7 @@ mod servers_split;
 pub mod session;
 mod session_dump;
 mod session_externalize;
+pub mod session_lock;
 mod session_log_split;
 pub mod session_meta;
 mod session_ops_compaction;
@@ -34,6 +35,7 @@ pub(crate) use self::session_log_split::{
     adjust_range_for_tool_pairs, split_session_log_documents, validate_edited_session_documents,
     validate_tool_pair_integrity,
 };
+pub use self::session_ops_split::reload_session_from_disk;
 
 pub use self::agent::TEMP_AGENT_NAME;
 pub use self::agent::{
