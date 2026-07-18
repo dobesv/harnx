@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use jaq_core::load::{Arena, File, Loader};
 use jaq_core::{data, unwrap_valr, Compiler, Ctx, Vars};
 use jaq_json::Val;
@@ -44,7 +46,25 @@ fn val_to_json(val: &Val) -> Option<Value> {
     serde_json::from_str(&json_str).ok()
 }
 
-fn run_filter(filter: &JsonFilter, input: Value) -> Option<Value> {
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn runtime_failure_message(expr: &str, err: &impl Display, input: &Value) -> String {
+    format!(
+        "jaq runtime failed for {expr:?}: {err} (input was {})",
+        json_kind(input)
+    )
+}
+
+fn run_filter(filter: &JsonFilter, expr: &str, input: Value) -> Option<Value> {
     let input_val = json_to_val(&input);
     let ctx = Ctx::<data::JustLut<Val>>::new(&filter.lut, Vars::new([]));
     let mut outputs = filter.id.run((ctx, input_val)).map(unwrap_valr);
@@ -52,7 +72,7 @@ fn run_filter(filter: &JsonFilter, input: Value) -> Option<Value> {
     match outputs.next() {
         Some(Ok(value)) => val_to_json(&value).or(Some(input)),
         Some(Err(err)) => {
-            warn!("jaq runtime failed: {err}");
+            warn!("{}", runtime_failure_message(expr, &err, &input));
             None
         }
         None => Some(input),
@@ -70,7 +90,7 @@ pub fn eval_filter(expr: &str, input: Value) -> Option<Value> {
         }
     };
 
-    run_filter(&filter, input)
+    run_filter(&filter, expr, input)
 }
 
 /// Runs expressions in sequence — result of N is input to N+1.
@@ -91,15 +111,20 @@ pub fn eval_filters_strict(exprs: &[String], input: Value) -> anyhow::Result<Val
 /// Like eval_filter, but returns Err instead of None on failure.
 fn eval_filter_strict(expr: &str, input: Value) -> anyhow::Result<Value> {
     let filter = compile_filter(expr)
-        .map_err(|e| anyhow::anyhow!("jq compile error in {:?}: {}", expr, e))?;
-    run_filter(&filter, input)
-        .ok_or_else(|| anyhow::anyhow!("jq runtime error in {:?}: no output", expr))
+        .map_err(|e| anyhow::anyhow!("jaq compile failed for {:?}: {}", expr, e))?;
+    // `run_filter` only returns `None` after a jaq runtime error, which it has
+    // already logged (via `warn!`) with the failing expression and input kind.
+    // A legitimate empty filter yields `Some(input)`, so `None` here always
+    // means a runtime failure — point the caller at the logs for the reason.
+    run_filter(&filter, expr, input).ok_or_else(|| {
+        anyhow::anyhow!("jaq runtime failed for {expr:?}; see logs for the runtime error details")
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{eval_filter, eval_filters, eval_filters_strict};
-    use serde_json::json;
+    use super::{eval_filter, eval_filters, eval_filters_strict, runtime_failure_message};
+    use serde_json::{json, Value};
 
     #[test]
     fn identity_filter_returns_input() {
@@ -158,5 +183,50 @@ mod tests {
         let exprs = vec![".a = 2".to_string(), ".b = .a + 1".to_string()];
         let output = eval_filters(&exprs, input);
         assert_eq!(output, json!({"a": 2, "b": 3}));
+    }
+
+    #[test]
+    fn runtime_failure_message_includes_expr_and_input_kind() {
+        let expr = ".[]";
+        let err = "cannot use null as iterable (array or object)";
+        let message = runtime_failure_message(expr, &err, &Value::Null);
+
+        assert!(message.contains("jaq runtime failed for"));
+        assert!(message.contains(expr));
+        assert!(message.contains("cannot use null as iterable"));
+        assert!(message.contains("input was null"));
+    }
+
+    #[test]
+    fn eval_filters_strict_runtime_error_points_to_logs() {
+        // `.[]` on a number is a genuine runtime error (not an empty result).
+        // The strict error should name the expression and direct the user to
+        // the logs for the underlying reason, rather than claiming "no output".
+        let input = json!(1);
+        let err = eval_filters_strict(&[".[]".to_string()], input)
+            .expect_err("iterating a number must be a runtime error");
+        let message = err.to_string();
+
+        assert!(
+            message.contains(".[]"),
+            "message should name the expr: {message}"
+        );
+        assert!(
+            message.contains("see logs"),
+            "message should point to the logs: {message}"
+        );
+        assert!(
+            !message.contains("no output"),
+            "message must not claim 'no output' for a runtime error: {message}"
+        );
+    }
+
+    #[test]
+    fn eval_filters_strict_preserves_empty_filter_output() {
+        // A filter that legitimately produces no output (e.g. `empty`) must not
+        // be treated as an error; strict eval passes the input through unchanged.
+        let input = json!({"a": 1});
+        let result = eval_filters_strict(&["empty".to_string()], input.clone());
+        assert_eq!(result.unwrap(), input);
     }
 }
