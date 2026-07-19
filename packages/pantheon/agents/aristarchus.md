@@ -24,6 +24,7 @@ use_tools:
   - melpomene_session_prompt
   - minos_session_prompt
   - nemesis_session_prompt
+  - opis_session_prompt
   - oracle_session_prompt
   - plans_add_note
   - plans_add_plan

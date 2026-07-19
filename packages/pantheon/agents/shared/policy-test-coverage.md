@@ -35,7 +35,7 @@ properly formatted opt-out justification.
 
 The following eleven categories are the only recognized exemptions:
 
-1. **docs-only** — changes confined to documentation files (e.g. `.md`, `.txt`, `docs/`)
+1. **docs-only** — changes confined to inert documentation files under documentation paths (e.g. `.md`/`.txt` under `docs/`, `README`s, changelogs). This exemption does NOT cover runtime prompt templates or deployed prompt artifacts (e.g. Markdown under `packages/pantheon/agents/` or `configuration/kagent/agents/`) — those are executable behavior and require rendered-prompt verification, not a docs-only exemption.
 2. **comment-only** — changes that add, remove, or modify inline code comments only
    - Note: This also falls within the trigger exclusions defined above and requires no opt-out documentation.
 3. **pure formatting** — whitespace, indentation, line-ending, or linter-auto-fix changes

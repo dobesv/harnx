@@ -24,7 +24,7 @@ Aristarchus multi-agent review pipeline deploys to two repos (harnx local + k8s-
 
 ## Symptoms
 
-```
+```text
 - harnx prompts rendered with literal `{{ include "shared/policy-..." }}` text passed to LLM
 - MiniJinja has NO {{ include }} support — variables only expand in top-level wrapper body
 - k8s includes resolved by configMap KEY (e.g., `policy-test-coverage`) not filesystem path (`policies/test-coverage`)
@@ -53,10 +53,12 @@ Aristarchus multi-agent review pipeline deploys to two repos (harnx local + k8s-
 **k8s configMap key resolution:**
 Invoking `{{ include "shared/policies/test-coverage" }}` fails silently — kagent resolves by configMap KEY registered in `shared/kustomization.yaml`, not filesystem path. Correct form: `{{ include "shared/policy-test-coverage" }}` matching the key `policy-test-coverage`.
 
-**Architecture requirement:**
-Shared core files must contain NO `{{ include }}` and NO cross-file `{{varname}}`. All composition happens at wrapper level:
-- harnx: declare `variables:` entry, reference `{{varname}}` in wrapper body
-- k8s: place `{{ include }}` directly in wrapper or core (kagent resolves recursively)
+**Architecture requirement (engine-specific — the rules differ per repo):**
+
+- **harnx (MiniJinja):** shared core files must contain NO `{{ include }}` and NO cross-file `{{varname}}` — neither resolves inside loaded core content. All composition must be declared and referenced at the wrapper level: add a `variables:` entry and reference `{{varname}}` in the wrapper body.
+- **k8s (kagent):** shared-core includes ARE allowed and resolve recursively at any depth. `{{ include "shared/KEY" }}` may live directly in a shared core or in a wrapper; kagent expands it transitively. (The include target must match the configMap KEY, not the filesystem path — see below.)
+
+Each engine keeps its own distinct syntax and behavior; do not apply the harnx no-include rule to k8s cores or vice-versa.
 
 **Process pitfalls:**
 - Parallel `fs_edit` calls on same file corrupted content (collisions → truncation/mangling) — must edit sequentially
@@ -101,16 +103,27 @@ Key proviso: include path MUST match configMap key in `shared/kustomization.yaml
 VERIFY_DIR=$(mktemp -d)
 ln -s /mnt/projects/ai-tools/harnx/packages $VERIFY_DIR/packages
 
-# Capture baseline renders
+# Render each agent, then extract ONLY the rendered prompt body before the leak
+# check. `harnx info agent` emits YAML frontmatter + a variable-default metadata
+# dump (which legitimately contains placeholder-looking text) followed by the
+# rendered prompt body after the closing `---`. Strip everything up to and
+# including the last frontmatter delimiter so the leak grep sees only the body.
 for agent in minos rhadamanthus aeacus thalia aristarchus; do
-  HARNX_CONFIG_DIR=$VERIFY_DIR harnx info agent pantheon/$agent > /tmp/baseline-$agent.txt
-done
+  HARNX_CONFIG_DIR=$VERIFY_DIR harnx info agent pantheon/$agent \
+    | awk 'f{print} /^---$/{n++} n>=2{f=1}' > /tmp/body-$agent.txt
 
-# Check for leaks
-grep -n '{{ include\|{{[a-z_]\+}}' /tmp/baseline-*.txt
+  # Leak check on the BODY only — any match here is a real unrendered directive.
+  if grep -nE '\{\{ ?include|\{\{[a-z_]+\}\}' /tmp/body-$agent.txt; then
+    echo "LEAK in $agent"
+  fi
+done
 ```
 
-Caveat: `harnx info agent` also dumps variable-default metadata — rendered strings appear ~twice. Judge the prompt BODY, not metadata dump.
+The awk step drops the frontmatter and the variable-default metadata dump so
+expected placeholders in the metadata do not cause false positives. Any
+`{{ include ... }}` or `{{varname}}` that survives into the body is a genuine
+unrendered directive. (Adjust the delimiter count if the `info` output format
+changes.)
 
 ### k8s Generated Manifests
 

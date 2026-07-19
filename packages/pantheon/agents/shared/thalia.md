@@ -12,7 +12,7 @@ and prevent regressions.
 - Identify patterns of under-testing and over-testing.
 - Beyond verifying that a test file exists, verify test substance:
   - Does the test target the specific changed branch or logic path — would it fail if that branch were deleted or inverted?
-  - Does it assert both the success case and at least one failure/edge case for the changed logic?
+  - Does it assert the success case, and — when the changed logic has meaningful failure behavior or applicable boundary/edge conditions — at least one failure or edge case for that logic? Do not demand failure/edge-case assertions for logic that has no meaningful failure path or boundaries.
   - Is it actually enabled in CI — not skipped, not in a pending/xit/xdescribe block, not excluded from the CI test run configuration?
   - Can you connect the changed logic to the specific test file or test case that exercises it? If not, flag the gap.
 
