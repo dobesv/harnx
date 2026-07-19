@@ -3,11 +3,13 @@
 use super::backend::{FencedSessionLogSink, NatsSessionLogBackend};
 use crate::agent_loop::OnToolRoundFn;
 use crate::config::{GlobalConfig, Input};
-use crate::nats_lease::NatsSessionLease;
+use crate::nats_event_sink::NatsEventSink;
+use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use crate::nats_metrics;
 use crate::nats_session_index::{put_record, SessionIndexRecord};
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result};
+use async_nats::jetstream;
 use harnx_core::message::Message;
 use harnx_core::session::SessionLogEntry;
 use harnx_hooks::{AsyncHookManager, PersistentHookManager};
@@ -24,6 +26,7 @@ pub struct RunAgentLoopArgs<'a> {
     pub abort_signal: AbortSignal,
     pub call_fn: Option<crate::agent_loop::AgentCallFn>,
     pub lease: Option<Arc<NatsSessionLease>>,
+    pub lease_config: NatsLeaseConfig,
     pub after_seq_observer: Option<Arc<AtomicU64>>,
     /// Optional observer of the JetStream seq of the header-insert migration
     /// EditEntries (S2), when the worker migrates a headerless remote session on
@@ -185,6 +188,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         abort_signal,
         call_fn,
         lease,
+        lease_config,
         after_seq_observer,
         header_insert_observer,
         session_index,
@@ -201,7 +205,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
     let jetstream_ctx = cfg_snapshot.nats_jetstream(cluster_key).await?;
 
     // Load or create session from NATS
-    let mut backend = NatsSessionLogBackend::new(jetstream_ctx, session_id);
+    let mut backend = NatsSessionLogBackend::new(jetstream_ctx.clone(), session_id);
     if let Some(observer) = after_seq_observer {
         backend = backend.with_after_seq_observer(observer);
     }
@@ -226,7 +230,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
     // Build AgentLoopContext
     let ctx = crate::agent_loop::AgentLoopContext {
         config: config.clone(),
-        abort_signal,
+        abort_signal: abort_signal.clone(),
         async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::new())),
         persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new())),
         call_fn,
@@ -240,9 +244,135 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         session_lock: None,
     };
 
-    // Run the unified agent loop
+    // Run unified agent loop
     // Persistence goes through shared Config.save_message entry construction; append_event routes sink
-    crate::agent_loop::run_agent_loop(&ctx, initial_input).await
+    run_agent_loop_segment(AgentLoopSegmentArgs {
+        config,
+        ctx,
+        input: initial_input,
+        abort_signal,
+        jetstream_ctx,
+        lease,
+        lease_config,
+        session_index: session_index.cloned(),
+    })
+    .await
+}
+
+struct AgentLoopSegmentArgs {
+    config: GlobalConfig,
+    ctx: crate::agent_loop::AgentLoopContext,
+    input: Input,
+    abort_signal: AbortSignal,
+    jetstream_ctx: jetstream::Context,
+    lease: Option<Arc<NatsSessionLease>>,
+    lease_config: NatsLeaseConfig,
+    session_index: Option<async_nats::jetstream::kv::Store>,
+}
+
+fn run_agent_loop_segment(
+    args: AgentLoopSegmentArgs,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
+    Box::pin(async move {
+        let AgentLoopSegmentArgs {
+            config,
+            ctx,
+            input,
+            abort_signal,
+            jetstream_ctx,
+            lease,
+            lease_config,
+            session_index,
+        } = args;
+        let loop_result = crate::agent_loop::run_agent_loop(&ctx, input).await?;
+        match loop_result {
+            crate::agent_loop::LoopResult::Completed => Ok(()),
+            crate::agent_loop::LoopResult::HandoffRequested {
+                agent,
+                session_id,
+                prompt,
+            } => {
+                let handoff_input = crate::config::input::from_str(&config, &prompt, None);
+                let handoff_args = AgentLoopSegmentArgs {
+                    config,
+                    ctx,
+                    input: handoff_input,
+                    abort_signal,
+                    jetstream_ctx,
+                    lease,
+                    lease_config,
+                    session_index,
+                };
+                let (handoff_args, new_event_sink) =
+                    prepare_nats_handoff(handoff_args, agent, session_id).await?;
+                harnx_core::sink::with_agent_event_sink(new_event_sink, async move {
+                    run_agent_loop_segment(handoff_args).await
+                })
+                .await
+            }
+        }
+    })
+}
+
+async fn prepare_nats_handoff(
+    mut args: AgentLoopSegmentArgs,
+    agent: String,
+    session_id: Option<String>,
+) -> Result<(AgentLoopSegmentArgs, Arc<NatsEventSink>)> {
+    let previous_lease = args
+        .lease
+        .as_ref()
+        .context("NATS handoff requires active session lease")?;
+    args.config
+        .write()
+        .exit_agent_with_lock(args.ctx.session_lock.as_ref())?;
+    crate::config::Config::use_agent(
+        &args.config,
+        &agent,
+        session_id.as_deref(),
+        args.abort_signal.clone(),
+    )
+    .await?;
+    let new_session_id = args
+        .config
+        .read()
+        .session
+        .as_ref()
+        .and_then(|session| session.session_id.clone())
+        .context("NATS handoff did not establish new session")?;
+    let new_lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
+        jetstream: args.jetstream_ctx.clone(),
+        session_id: &new_session_id,
+        worker_id: previous_lease.worker_id().to_string(),
+        generation: previous_lease.generation(),
+        config: args.lease_config.clone(),
+        session_index: args.session_index.clone(),
+    })
+    .await?
+    .with_context(|| {
+        format!("Failed to acquire NATS lease for handed-off session '{new_session_id}'")
+    })?;
+    let new_lease = Arc::new(new_lease);
+    let new_event_sink = Arc::new(
+        NatsEventSink::new(
+            args.jetstream_ctx.client().clone(),
+            args.jetstream_ctx.clone(),
+            new_session_id.clone(),
+        )
+        .await,
+    );
+    let new_after_seq_observer = new_event_sink.after_seq_handle();
+    let mut new_backend = NatsSessionLogBackend::new(args.jetstream_ctx.clone(), &new_session_id);
+    new_backend = new_backend.with_after_seq_observer(Arc::clone(&new_after_seq_observer));
+    let new_session = args
+        .config
+        .read()
+        .session
+        .clone()
+        .context("NATS handoff missing session after activation")?;
+    attach_session_to_config(&args.config, new_session, &new_backend, Some(&new_lease));
+    args.lease = Some(new_lease);
+    Ok((args, new_event_sink))
 }
 
 /// Fence-on-resume fail-safe: if the persisted tail carries a worker fence

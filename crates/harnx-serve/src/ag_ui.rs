@@ -435,6 +435,12 @@ impl AgUiSink {
         }));
     }
 
+    fn emit_handoff(&self, agent: String, session_id: Option<String>) {
+        let payload = json!({ "agent": agent, "session_id": session_id });
+        self.emit_custom("turn_handoff_requested", payload.clone());
+        self.emit_custom("session_handoff", payload);
+    }
+
     fn session_usage_context(&self) -> Option<UsageContextSnapshot> {
         self.session_context
             .as_ref()
@@ -614,10 +620,7 @@ impl harnx_core::event::AgentEventSink for AgUiSink {
                 self.emit_custom("turn_model_fallback", json!({ "from": from, "to": to }));
             }
             AgentEvent::Turn(TurnEvent::HandoffRequested { agent, session_id }) => {
-                self.emit_custom(
-                    "turn_handoff_requested",
-                    json!({ "agent": agent, "session_id": session_id }),
-                );
+                self.emit_handoff(agent, session_id);
             }
             AgentEvent::Session(SessionEvent::CompactingStarted) => {
                 self.emit_custom("session_compacting_started", json!({}));

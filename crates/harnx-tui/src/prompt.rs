@@ -154,7 +154,7 @@ impl Tui {
             session_lock: None,
         };
 
-        harnx_runtime::run_agent_loop(&loop_ctx, input).await
+        harnx_runtime::run_agent_loop_with_local_handoff(&loop_ctx, input).await
     }
 
     /// Run a prompt task for a remote agent (NATS thin-client mode).

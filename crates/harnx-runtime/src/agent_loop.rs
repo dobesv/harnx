@@ -133,7 +133,7 @@ pub async fn continue_agent_loop_from_tool_round(
     tool_calls: Vec<ToolCall>,
     decisions: Vec<ToolApprovalDecision>,
     pending_interrupt_ids: std::collections::BTreeSet<String>,
-) -> Result<()> {
+) -> Result<LoopResult> {
     use crate::tool::ToolApprovalInterrupt;
 
     let config = &ctx.config;
@@ -212,25 +212,8 @@ pub async fn continue_agent_loop_from_tool_round(
             cb(&mut merged_input, &tool_results).await;
         }
 
-        // Handle agent switch
-        if let Some(switch) = switch_agent {
-            config
-                .write()
-                .exit_agent_with_lock(ctx.session_lock.as_ref())?;
-            crate::config::Config::use_agent(
-                config,
-                &switch.agent,
-                switch.session_id.as_deref(),
-                abort_signal.clone(),
-            )
-            .await?;
-            if config.read().session.is_some() {
-                config
-                    .write()
-                    .empty_session_with_lock(ctx.session_lock.as_ref())?;
-            }
-            let new_input = crate::config::input::from_str(config, &switch.prompt, None);
-            return run_agent_loop(ctx, new_input).await;
+        if switch_agent.is_some() {
+            return run_agent_loop(ctx, merged_input).await;
         }
 
         input = merged_input;
@@ -251,6 +234,15 @@ pub struct ToolApprovalDecision {
     pub reason: Option<String>,
 }
 
+pub enum LoopResult {
+    Completed,
+    HandoffRequested {
+        agent: String,
+        session_id: Option<String>,
+        prompt: String,
+    },
+}
+
 /// Run the canonical agent loop.
 ///
 /// Executes: embeddings → async-hook drain → `before_chat_completion` →
@@ -258,11 +250,11 @@ pub struct ToolApprovalDecision {
 /// (if tool calls) → persist → stop hook → resume / agent switch / done.
 /// Repeats until no tool results and no resume signal.
 ///
-/// On clean exit returns `Ok(())`. On LLM error dispatches `StopFailure`
-/// hook and propagates. On fatal tool error propagates. Recoverable tool
-/// errors are already converted to `{"is_error":true}` results by
-/// `execute_tool_round` and fed back to the LLM.
-pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Result<()> {
+/// On clean exit returns `Ok(LoopResult::Completed)`. On LLM error dispatches
+/// `StopFailure` hook and propagates. On fatal tool error propagates.
+/// Recoverable tool errors are already converted to `{"is_error":true}`
+/// results by `execute_tool_round` and fed back to the LLM.
+pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Result<LoopResult> {
     let session_path = {
         let config_read = ctx.config.read();
         match config_read.session.as_ref() {
@@ -316,11 +308,53 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
     .await
 }
 
+/// Runs agent loop, applying file-backed local handoffs until completion.
+///
+/// Used by local frontends (CLI, TUI, ACP) that all share same file-backed
+/// handoff semantics: exit current agent, activate target agent/session,
+/// clear newly loaded session contents, then rebuild input from handoff prompt.
+pub async fn run_agent_loop_with_local_handoff(
+    ctx: &AgentLoopContext,
+    mut input: Input,
+) -> Result<()> {
+    loop {
+        match run_agent_loop(ctx, input).await? {
+            LoopResult::Completed => return Ok(()),
+            LoopResult::HandoffRequested {
+                agent,
+                session_id,
+                prompt,
+            } => {
+                apply_local_handoff(ctx, &agent, session_id.as_deref(), &prompt).await?;
+                input = crate::config::input::from_str(&ctx.config, &prompt, None);
+            }
+        }
+    }
+}
+
+async fn apply_local_handoff(
+    ctx: &AgentLoopContext,
+    agent: &str,
+    session_id: Option<&str>,
+    _prompt: &str,
+) -> Result<()> {
+    ctx.config
+        .write()
+        .exit_agent_with_lock(ctx.session_lock.as_ref())?;
+    Config::use_agent(&ctx.config, agent, session_id, ctx.abort_signal.clone()).await?;
+    if ctx.config.read().session.is_some() {
+        ctx.config
+            .write()
+            .empty_session_with_lock(ctx.session_lock.as_ref())?;
+    }
+    Ok(())
+}
+
 async fn run_agent_loop_inner(
     ctx: &AgentLoopContext,
     initial_input: Input,
-    session_lock: Option<&SessionLock>,
-) -> Result<()> {
+    _session_lock: Option<&SessionLock>,
+) -> Result<LoopResult> {
     let config = &ctx.config;
     let abort_signal = &ctx.abort_signal;
     let mut input = initial_input;
@@ -571,41 +605,25 @@ async fn run_agent_loop_inner(
             }
 
             if let Some(switch) = switch_agent {
-                config.write().exit_agent_with_lock(session_lock)?;
-                Config::use_agent(
-                    config,
-                    &switch.agent,
-                    switch.session_id.as_deref(),
-                    abort_signal.clone(),
-                )
-                .await?;
-                // Empty session so new agent starts fresh (see #291).
-                if config.read().session.is_some() {
-                    config.write().empty_session_with_lock(session_lock)?;
-                }
-                // Rebuild input from the handoff prompt (#303).
-                input = crate::config::input::from_str(config, &switch.prompt, None);
-                resume_count = 0;
-                with_embeddings = true;
-                // Emit a sourced Turn::Started so every front-end's sink
-                // sees the agent change. The TUI's `render_ui_output_heading`
-                // inserts a `> {agent} ▸ {session}` heading on source
-                // changes; the CLI sink prints the same heading; the ACP
-                // sink forwards it to `session_notification`. Without
-                // this emit the unified loop silently switches agents
-                // and the sub-agent's chunks render under the parent's
-                // heading (the planner→executor e2e snapshot regression
-                // and #312/#249 follow-up tests).
                 let source = harnx_core::event::AgentSource {
                     agent: switch.agent.clone(),
                     session_id: switch.session_id.clone(),
                     model: ctx.config.read().current_model_id(),
                 };
                 harnx_core::sink::emit_agent_event_with_source(
-                    harnx_core::event::AgentEvent::Turn(harnx_core::event::TurnEvent::Started),
+                    harnx_core::event::AgentEvent::Turn(
+                        harnx_core::event::TurnEvent::HandoffRequested {
+                            agent: switch.agent.clone(),
+                            session_id: switch.session_id.clone(),
+                        },
+                    ),
                     Some(source),
                 );
-                continue;
+                return Ok(LoopResult::HandoffRequested {
+                    agent: switch.agent.clone(),
+                    session_id: switch.session_id.clone(),
+                    prompt: switch.prompt.clone(),
+                });
             }
 
             // Normal tool round: loop with merged input.
@@ -669,7 +687,7 @@ async fn run_agent_loop_inner(
         bail!("interrupted by user");
     }
     Config::run_post_turn_maintenance(config.clone());
-    Ok(())
+    Ok(LoopResult::Completed)
 }
 
 #[cfg(test)]
@@ -677,10 +695,25 @@ mod tests {
     use super::*;
     use crate::client::MessageRole;
     use crate::utils::create_abort_signal;
+    use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, TurnEvent};
     use harnx_hooks::{AsyncHookManager, PersistentHookManager};
     use parking_lot::RwLock;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    static SINK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[derive(Default)]
+    struct CollectingSink {
+        events: Mutex<Vec<(AgentEvent, Option<AgentSource>)>>,
+    }
+
+    impl AgentEventSink for CollectingSink {
+        fn emit(&self, event: AgentEvent, source: Option<AgentSource>) {
+            self.events.lock().unwrap().push((event, source));
+        }
+    }
+
     use tempfile::TempDir;
 
     /// Regression test for the user-message-replay bug: a user message typed
@@ -770,7 +803,6 @@ mod tests {
         run_agent_loop(&ctx, input).await.unwrap();
 
         // The injection happened once; the bug would have made it appear in
-        // session.messages once per round after the injection (here: 2x —
         // round 2 and round 3). With the fix it appears exactly once.
         let cfg = global_config.read();
         let session = cfg.session.as_ref().expect("session attached above");
@@ -785,5 +817,186 @@ mod tests {
              replayed on every subsequent loop iteration. Got {count} copies \
              in session.messages."
         );
+    }
+
+    fn handoff_on_tool_round() -> OnToolRoundFn {
+        Arc::new(move |_merged_input, results| {
+            Box::pin(async move {
+                let result = results
+                    .first()
+                    .expect("handoff test should produce single tool result");
+                assert_eq!(result.call.name, "delegate-agent_session_handoff");
+            })
+        })
+    }
+
+    fn make_handoff_test_context(
+        global_config: GlobalConfig,
+        call_fn: AgentCallFn,
+    ) -> AgentLoopContext {
+        AgentLoopContext {
+            config: global_config,
+            abort_signal: create_abort_signal(),
+            async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::new())),
+            persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new())),
+            call_fn: Some(call_fn),
+            on_tool_round: Some(handoff_on_tool_round()),
+            on_text_response: None,
+            working_dir: None,
+            initial_with_embeddings: false,
+            initial_resume_count: 0,
+            max_resume: Some(0),
+            pending_async_context: None,
+            session_lock: None,
+        }
+    }
+
+    fn handoff_event_matches_expected((event, source): &(AgentEvent, Option<AgentSource>)) -> bool {
+        matches!(
+            event,
+            AgentEvent::Turn(TurnEvent::HandoffRequested { agent, session_id })
+                if agent == "delegate-agent"
+                    && session_id.as_deref() == Some("handoff-target-session")
+        ) && source.as_ref().is_some_and(|source| {
+            source.agent == "delegate-agent"
+                && source.session_id.as_deref() == Some("handoff-target-session")
+        })
+    }
+
+    /// Test that the dispatch path for _session_handoff tools returns a
+    /// ToolResult.switch_agent that the loop detects. We inject a mock
+    /// ToolProvider that returns the switch_agent JSON; the engine's
+    /// detect_switch_agent picks it up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handoff_returns_handoff_requested_and_emits_event() {
+        let _guard = SINK_LOCK.lock().await;
+        let _state_guard = crate::client::TestStateGuard::new(None).await;
+
+        harnx_core::sink::clear_agent_event_sink();
+
+        // Write a delegate-agent file so list_agents() discovers it.
+        let tmp = TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("delegate-agent.md"),
+            "---\nmodel: test-model\n---\nDelegate agent instructions\n",
+        )
+        .unwrap();
+
+        // Set HARNX_CONFIG_DIR to our temp dir for agent discovery
+        struct EnvGuard {
+            key: &'static str,
+            previous: Option<std::ffi::OsString>,
+        }
+        impl EnvGuard {
+            fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+                let previous = std::env::var_os(key);
+                unsafe { std::env::set_var(key, value) };
+                Self { key, previous }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.previous {
+                    Some(value) => unsafe { std::env::set_var(self.key, value) },
+                    None => unsafe { std::env::remove_var(self.key) },
+                }
+            }
+        }
+        let _config_dir_guard = EnvGuard::set_path("HARNX_CONFIG_DIR", tmp.path());
+
+        let mut config = crate::config::Config {
+            model: crate::client::Model::new("test", "test-model"),
+            sessions_dir_override: Some(tmp.path().join("sessions")),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(config.sessions_dir()).unwrap();
+        let session = crate::config::session::new(&config, "handoff-session", None).unwrap();
+        config.session = Some(session);
+        config.set_use_tools(Some(vec!["delegate-agent_session_handoff".to_string()]));
+
+        let global_config = Arc::new(RwLock::new(config));
+
+        // Register our mock provider. We need to inject it into the tool
+        // evaluation context. The providers are built by build_tool_providers
+        // from Config.mcp_manager/acp_manager. For this test, we'll use the
+        // handoff's built-in dispatch path which checks allowed_tool_names
+        // and handoff_targets. The mock provider is an alternative but the
+        // dispatch path for _session_handoff tools in dispatch_tool_call
+        // synthesizes the switch_agent JSON directly when allowed_tool_names
+        // contains the tool name.
+        //
+        // We need delegates-agent to be in handoff_targets. That's populated
+        // by handoff_tool_declarations_for_agents which calls list_agents().
+        // With HARNX_CONFIG_DIR set, list_agents() will find our test agent.
+        //
+        // However the problem is that build_tool_eval_context creates the
+        // context from Config which doesn't have mcp/acp managers. We need to
+        // make the handoff tool be recognized. The dispatch path checks:
+        // 1. Name ends with "_session_handoff"
+        // 2. Name is in allowed_tool_names
+        // 3. handoff_targets maps the bare name to target agent
+        //
+        // Since list_agents() will now find delegate-agent, handoff_targets
+        // should contain "delegate-agent" -> "delegate-agent". We don't need
+        // a mock provider — the dispatch path handles it.
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = call_count.clone();
+        let call_fn: AgentCallFn = Arc::new(move |_input, _config, _abort| {
+            let cc = cc.clone();
+            Box::pin(async move {
+                let _n = cc.fetch_add(1, Ordering::SeqCst);
+                Ok((
+                    "handoff now".to_string(),
+                    None,
+                    vec![ToolCall::new(
+                        "delegate-agent_session_handoff".to_string(),
+                        json!({
+                            "prompt": "finish delegated work",
+                            "session_id": "handoff-target-session"
+                        }),
+                        Some("handoff-call-1".to_string()),
+                        None,
+                    )],
+                    CompletionTokenUsage::default(),
+                ))
+            })
+        });
+
+        let ctx = make_handoff_test_context(global_config.clone(), call_fn);
+
+        assert!(!global_config.read().is_compacting_session());
+        let sink = Arc::new(CollectingSink::default());
+        let input = crate::config::input::from_str(&global_config, "start handoff", None);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+                run_agent_loop(&ctx, input).await
+            }),
+        )
+        .await
+        .expect("run_agent_loop timed out in handoff test")
+        .unwrap();
+
+        match result {
+            LoopResult::HandoffRequested {
+                agent,
+                session_id,
+                prompt,
+            } => {
+                assert_eq!(agent, "delegate-agent");
+                assert_eq!(session_id.as_deref(), Some("handoff-target-session"));
+                assert_eq!(prompt, "finish delegated work");
+            }
+            LoopResult::Completed => panic!("expected handoff result, got Completed"),
+        }
+
+        let events = sink.events.lock().unwrap();
+        assert!(events.iter().any(handoff_event_matches_expected));
+
+        drop(events);
+        harnx_core::sink::clear_agent_event_sink();
     }
 }

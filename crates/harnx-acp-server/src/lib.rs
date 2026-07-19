@@ -665,10 +665,16 @@ impl HarnxAgent {
                     }
                 }
                 None => {
-                    let input = input.expect("local mode always builds input");
-                    let mut run_loop = Box::pin(harnx_runtime::run_agent_loop(&loop_ctx, input));
+                    let run_local = async {
+                        harnx_runtime::run_agent_loop_with_local_handoff(
+                            &loop_ctx,
+                            input.expect("local mode always builds input"),
+                        )
+                        .await
+                    };
+                    let mut run_local = Box::pin(run_local);
                     tokio::select! {
-                        r = &mut run_loop => Some(r),
+                        r = &mut run_local => Some(r),
                         _ = grace_cancel => None,
                     }
                 }

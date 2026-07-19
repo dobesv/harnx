@@ -608,6 +608,7 @@ impl WorkerRuntime {
                         abort_signal: abort_signal.clone(),
                         call_fn: self.call_fn.clone(),
                         lease: None,
+                        lease_config: self.lease.clone(),
                         after_seq_observer: None,
                         header_insert_observer: None,
                         session_index: self.session_index.as_ref(),

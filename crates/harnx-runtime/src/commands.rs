@@ -1099,7 +1099,7 @@ async fn ask_inner(
         session_lock: None,
     };
 
-    let result = crate::agent_loop::run_agent_loop(&ctx, input).await;
+    let result = crate::agent_loop::run_agent_loop_with_local_handoff(&ctx, input).await;
 
     let mut guard = am_arc.lock().await;
     *async_manager = std::mem::take(&mut *guard);

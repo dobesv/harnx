@@ -13,6 +13,7 @@ export interface ChatProviderProps {
   agentName: string;
   sessionId: string;
   isFreshSession: boolean;
+  onHandoff?: (agent: string, sessionId: string | null) => void;
   children: React.ReactNode;
 }
 
@@ -97,6 +98,7 @@ export interface HarnxHttpAgentOptions {
   onRunFailed: (message: string) => void;
   onUsage: (usage: UsageData) => void;
   onToolSummary: (id: string, summary: string) => void;
+  onHandoff?: (agent: string, sessionId: string | null) => void;
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
@@ -105,6 +107,8 @@ export class HarnxHttpAgent extends HttpAgent {
   private readonly onRunFailedCb: (message: string) => void;
   private readonly onUsageCb: (usage: UsageData) => void;
   private readonly onToolSummaryCb: (id: string, summary: string) => void;
+  private readonly onHandoff?: (agent: string, sessionId: string | null) => void;
+  private isRunActive = false;
 
   constructor(options: HarnxHttpAgentOptions) {
     super({ url: options.url });
@@ -112,6 +116,7 @@ export class HarnxHttpAgent extends HttpAgent {
     this.onRunFailedCb = options.onRunFailed;
     this.onUsageCb = options.onUsage;
     this.onToolSummaryCb = options.onToolSummary;
+    this.onHandoff = options.onHandoff;
   }
 
   private handleCustomEvent(name: string, value: any) {
@@ -120,6 +125,11 @@ export class HarnxHttpAgent extends HttpAgent {
       usage: (v) => this.onUsageCb(v),
       tool_summary: (v) => this.onToolSummaryCb(v?.tool_call_id, v?.markdown),
       session_title_updated: (v) => setDocumentTitle(v?.title),
+      session_handoff: (v) => {
+        if (this.isRunActive) {
+          this.onHandoff?.(v?.agent, v?.session_id ?? null);
+        }
+      },
     };
     handlers[name]?.(value);
   }
@@ -129,7 +139,11 @@ export class HarnxHttpAgent extends HttpAgent {
       ...subscriber,
       onEvent: async (payload) => {
         const event = payload.event as any;
-        if (event?.type === 'CUSTOM') {
+        if (event?.type === 'RUN_STARTED') {
+          this.isRunActive = true;
+        } else if (event?.type === 'RUN_FINISHED' || event?.type === 'RUN_ERROR') {
+          this.isRunActive = false;
+        } else if (event?.type === 'CUSTOM') {
           this.handleCustomEvent(event.name, event.value);
         }
         return subscriber?.onEvent?.(payload as any);
@@ -160,7 +174,7 @@ export class HarnxHttpAgent extends HttpAgent {
   }
 }
 
-export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId, isFreshSession, children }) => {
+export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId, isFreshSession, onHandoff, children }) => {
   const [statusText, setStatusText] = useState<string | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [usage, setUsage] = useState<UsageData | null>(null);
@@ -222,7 +236,8 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId
         });
       }
     },
-  }), [agentName, sessionId]);
+    onHandoff,
+  }), [agentName, sessionId, onHandoff]);
 
   const runtime = useAgUiRuntime({
     agent,
