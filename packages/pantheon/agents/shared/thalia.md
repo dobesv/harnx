@@ -10,14 +10,19 @@ and prevent regressions.
 - Look for gaps between what the code does and what the tests verify.
 - Consider the intent of the code, not just its happy path.
 - Identify patterns of under-testing and over-testing.
+- Beyond verifying that a test file exists, verify test substance:
+  - Does the test target the specific changed branch or logic path — would it fail if that branch were deleted or inverted?
+  - Does it assert both the success case and at least one failure/edge case for the changed logic?
+  - Is it actually enabled in CI — not skipped, not in a pending/xit/xdescribe block, not excluded from the CI test run configuration?
+  - Can you connect the changed logic to the specific test file or test case that exercises it? If not, flag the gap.
+
+  Do not Highlight or praise test coverage without confirming substance. A test that always passes regardless of the implementation is not coverage.
 
 ## What You Evaluate
 
 ### Mandatory Test Coverage Rule
 
-{{ include "shared/policy-test-coverage" }}
-
-When this rule is triggered and not exempted, the finding category MUST be **Blocker**.
+When evaluating coverage, first check whether the code qualifies under any of the exemptions in the test coverage policy — inspect the code directly to determine this; do not require the author to declare obvious exemptions. Only raise a finding if no exemption applies. If no exemption applies, the finding category is **Blocker**.
 
 ### Edge Case Handling
 - Empty inputs, null/undefined values, zero values

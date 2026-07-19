@@ -95,6 +95,11 @@ and meet regulatory requirements like GDPR, CCPA, and other data protection laws
 - Verify that users can opt-out of tracking.
 - Evaluate transparency about tracking practices.
 
+## Suppression Rules
+- Opaque campaign IDs, click IDs, session tokens, and plain resource IDs (section, org, item, content) do not qualify as PII — they do not identify a person without linkage to additional data. Do not flag these as privacy violations.
+- Baseline-comparison privacy claims (e.g. "this is worse than the existing approach") must be framed as Questions, not findings, unless the diff itself introduces the exposure.
+- Confirm the diff introduces the data handling before raising a Blocker. Pre-existing patterns in unchanged code are advisory notes.
+
 ## NOT Your Concern
 
 The following are NOT your responsibility — other Muses handle these:

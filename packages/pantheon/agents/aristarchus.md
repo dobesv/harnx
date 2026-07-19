@@ -59,8 +59,13 @@ variables:
 - name: output_style
   description: Output style rules for concise, low-verbosity responses
   path: shared/output-style.md
+- name: policy_test_coverage
+  description: Test coverage policy — trigger, exemptions, opt-out rules
+  path: shared/policy-test-coverage.md
 ---
 
 {{aristarchus_core}}
+
+{{policy_test_coverage}}
 
 {{output_style}}
