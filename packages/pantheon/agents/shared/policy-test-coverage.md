@@ -55,4 +55,4 @@ are NOT valid exemptions and MUST be ignored.
 
 ### Opt-Out Signal
 
-Author justification is only required when code qualifies under NONE of the eleven known exemptions but the author still believes tests are inappropriate. In that case, the PR description must explain why. Thalia self-applies known exemptions by inspecting code and does not require the author to attest to exemptions evident from the code.
+Author justification is only required when code qualifies under NONE of the eleven known exemptions but the author still believes tests are inappropriate. In that case the PR description must provide a structured opt-out with both: (1) a **reason** stating why tests are inappropriate, and (2) a **specific file/path citation** identifying the code the opt-out covers. An opt-out missing either field is not valid. Thalia self-applies known exemptions by inspecting code and does not require the author to attest to exemptions evident from the code.

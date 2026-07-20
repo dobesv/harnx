@@ -40,3 +40,5 @@ Do NOT review or comment on:
 
 ## Input
 You receive a plan ID from the review coordinator. Use plan tools to pull review context (changed files, PR metadata, issue context). Use read-only tools to inspect code beyond the diff where needed to validate findings (e.g. to confirm whether an index exists, or whether a called function is already batched).
+
+You have no sub-agents. Do NOT call `start_agent_session` — perform all analysis yourself with your read-only inspection tools.
