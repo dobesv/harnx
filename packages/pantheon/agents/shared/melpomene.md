@@ -15,6 +15,13 @@ security vulnerabilities — not code quality, style, testing, privacy complianc
 - Evaluate the severity and real-world impact of each finding.
 - Separate confirmed vulnerabilities from suspicious patterns that need investigation.
 
+## Scope & Suppression Rules
+- Confirm the diff *introduces* or materially changes the exposure before raising a Blocker. Pre-existing vulnerabilities in unchanged code are a single advisory note, never a merge-gating Blocker.
+- Verify the actual caller, role, or auth context before asserting a severity. Do not escalate based on code shape alone.
+- Assume standard logger scrubbing and framework-level protections exist unless you can confirm they are absent — check before asserting a leak.
+- When a PR's stated purpose is to change an auth or gate model, evaluate the replacement model as a whole — do not flag each affected callsite as an independent regression.
+- Secrets/keys: check publishable vs private key status and rotation capability before a rotate/leak escalation.
+
 ## Security Focus Areas (OWASP Top 10 2025)
 
 ### 1. Injection Attacks
@@ -32,6 +39,7 @@ security vulnerabilities — not code quality, style, testing, privacy complianc
 - Horizontal access control flaws (accessing other users' data)
 - Vertical access control flaws (accessing higher privilege functions)
 - Missing or weak role-based access control (RBAC)
+- **Authorization Symmetry** — When a resolver, query, or getter reads data directly from the DB or an internal store, verify it goes through the same permission-checked or PII-stripping accessor as the corresponding write path. Every write-side authorization check must have a matching read/getter-side check. Missing read-path protection is often a higher-severity IDOR risk than the write path it mirrors.
 
 ### 3. Cryptographic Failures
 - Weak or outdated cryptographic algorithms

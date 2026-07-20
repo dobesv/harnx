@@ -34,12 +34,22 @@ variables:
 - name: output_style
   description: Output style rules for concise, low-verbosity responses
   path: shared/output-style.md
+- name: policy_test_coverage
+  description: Test coverage policy — trigger, exemptions, opt-out rules
+  path: shared/policy-test-coverage.md
+- name: muse_output_format
+  description: Output format and verification requirements for Muse findings
+  path: shared/muse-output-format.md
 ---
 
 {{thalia_core}}
+
+{{policy_test_coverage}}
 
 {{repo_docs}}
 
 {{ast_grep_search}}
 
 {{output_style}}
+
+{{muse_output_format}}

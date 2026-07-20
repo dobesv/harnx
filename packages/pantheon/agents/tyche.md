@@ -37,6 +37,9 @@ variables:
 - name: output_style
   description: Output style rules for concise, low-verbosity responses
   path: shared/output-style.md
+- name: muse_output_format
+  description: Output format and verification requirements for Muse findings
+  path: shared/muse-output-format.md
 ---
 
 {{tyche_core}}
@@ -46,3 +49,5 @@ variables:
 {{ast_grep_search}}
 
 {{output_style}}
+
+{{muse_output_format}}
