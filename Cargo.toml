@@ -147,7 +147,7 @@ duct = "1.0.0"
 rmcp = { version = "2.0", features = ["client", "server", "transport-child-process", "transport-io", "transport-streamable-http-server"] }
 process-wrap = { version = "9", features = ["tokio1"] }
 libc = "0.2"
-agent-client-protocol = { git = "https://github.com/agentclientprotocol/rust-sdk", rev = "b0c1b19e3ea10322ad6989a7cdf086c637224686" }
+agent-client-protocol = { git = "https://github.com/agentclientprotocol/rust-sdk", rev = "468012dbc242cc4d64f0b83ee13b0eb437505a80" }
 async-nats = { version = "0.49", default-features = false, features = ["server_2_10", "server_2_11", "ring", "jetstream", "kv"] }
 glob = "0.3"
 globset = "0.4"
