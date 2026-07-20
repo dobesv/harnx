@@ -73,7 +73,7 @@ Five phases, tracked in the plan. Each phase is a task. Plans are kept for futur
   - For both modes: search for issue tracker references in the branch name, PR title/description, or commit messages — detect the tracker from `AGENTS.md`/`README.md` first — and fetch ticket details and acceptance criteria (if no issue is found, extract goals from the PR description or commit messages instead); check for a plan reference in commit trailers and read the linked plan for implementation context if present.
   - Detect PR type from title, labels, and description. Classify as one of: `production` (default), `draft`, `wip`, `strawman`, `demo`, `one-liner`. Record as `pr_type` field in the `pr-metadata` plan note.
   - Fetch all existing review comments from prior bot review rounds on this PR. Save as plan note `prior-round-findings`.
-  - Save all findings as plan notes: `metadata`, `changed-files`, `issue-context`, `existing-reviews`, `implementation-plan`.
+  - Save all findings as plan notes: `metadata`, `pr-metadata` (including the `pr_type` field), `changed-files`, `issue-context`, `existing-reviews`, `prior-round-findings`, `implementation-plan`.
   - Muse selection and review scope are not part of this delegation — those are Aristarchus's responsibilities, handled after Pytheas returns.
 - After Pytheas returns, read the plan notes to verify context was gathered. If gaps exist, delegate back to Pytheas to fill them.
 - All Muses and Judges use `origin/HEAD` as the diff base (e.g. `git diff origin/HEAD...`). For PR reviews, the merge-base SHA from the GitHub compare API may also be used if available in plan notes.
