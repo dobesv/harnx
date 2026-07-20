@@ -53,6 +53,12 @@ test.describe('Gallery', () => {
     await page.locator('.grid-item').filter({ hasText: 'coding/coder' }).click();
     await page.click('text=session-gallery');
     
+    // Wait for the initial subscribe/hydration to settle (the composer remounts
+    // when the promptless subscribe run finishes) before interacting, otherwise
+    // fill() can race the remount and hit a detached element.
+    await expect(page.locator('.aui-message').first()).toBeVisible();
+    await expect(page.locator('.aui-composer-send')).toHaveText('Send');
+    
     await page.locator('.aui-composer-input').fill('Trigger tool');
     await page.locator('.aui-composer-send').click();
     
@@ -88,7 +94,7 @@ test.describe('Gallery', () => {
     await expect(page.locator('.aui-status-bar')).toBeVisible();
     await expect(page.locator('text=Running task...')).toBeVisible();
     
-    await expect(page.locator('.aui-composer-send')).toHaveText('Queue');
+    await expect(page.locator('.aui-composer-send')).toHaveText('Queued');
 
     await expect(page.locator('text=Working on it')).toBeVisible();
 

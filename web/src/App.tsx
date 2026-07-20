@@ -114,18 +114,32 @@ const MyAttachment = () => (
 const MyComposer = ({
   agentName,
   sessionId,
-  queuedMessage,
-  setQueuedMessage,
 }: {
   agentName: string;
   sessionId: string;
-  queuedMessage: QueuedMessage | null;
-  setQueuedMessage: React.Dispatch<React.SetStateAction<QueuedMessage | null>>;
 }) => {
   const { setErrorText } = useContext(PendingContext);
   const isRunning = useThread(s => s.isRunning);
   const composerRuntime = useComposerRuntime();
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const [queuedMessage, setQueuedMessage] = useState<QueuedMessage | null>(null);
+
+  // Monitor run state to flush queued message
+  const wasRunning = useRef(isRunning);
+  useEffect(() => {
+    if (wasRunning.current && !isRunning) {
+      if (queuedMessage?.text.trim()) {
+        try {
+          composerRuntime.setText(queuedMessage.text);
+          composerRuntime.send();
+          setQueuedMessage(null);
+        } catch (err) {
+          console.error('Failed to send queued message', err);
+        }
+      }
+    }
+    wasRunning.current = isRunning;
+  }, [isRunning, composerRuntime, queuedMessage]);
 
   const resizeTextarea = useCallback((el: HTMLTextAreaElement | null) => {
     if (!el) return;
@@ -333,28 +347,10 @@ const BatchInterruptUI = () => {
 
 const MyThread = ({ agentName, sessionId, onRunFinish }: { agentName: string, sessionId: string, onRunFinish: () => void }) => {
   const isEmpty = useThread(s => s.messages.length === 0);
-  const composerRuntime = useComposerRuntime();
-  const [queuedMessage, setQueuedMessage] = useState<QueuedMessage | null>(null);
-
-  const handleRunFinish = useCallback(() => {
-    onRunFinish();
-    if (!queuedMessage?.text.trim()) return;
-
-    // Flush the queued message now that the run has finished. Keep the queued
-    // state until send() succeeds so a synchronous failure doesn't silently
-    // drop the user's text.
-    try {
-      composerRuntime.setText(queuedMessage.text);
-      composerRuntime.send();
-      setQueuedMessage(null);
-    } catch (err) {
-      console.error('Failed to send queued message', err);
-    }
-  }, [composerRuntime, onRunFinish, queuedMessage]);
 
   return (
     <ThreadPrimitive.Root className={`aui-thread ${isEmpty ? 'aui-thread-empty' : ''}`}>
-      <RunStateMonitor onRunFinish={handleRunFinish} />
+      <RunStateMonitor onRunFinish={onRunFinish} />
 
       {!isEmpty && (
         <ThreadPrimitive.Viewport className="aui-thread-viewport">
@@ -370,8 +366,6 @@ const MyThread = ({ agentName, sessionId, onRunFinish }: { agentName: string, se
           <MyComposer
             agentName={agentName}
             sessionId={sessionId}
-            queuedMessage={queuedMessage}
-            setQueuedMessage={setQueuedMessage}
           />
         </div>
       </div>
