@@ -579,6 +579,7 @@ impl SessionActor {
             .await
             .ok();
 
+        done.sink.sink.close_text_segment();
         let _ = self.broadcast_tx.send(Event::RunFinished(RunFinishedEvent {
             base: base_event(),
             thread_id: done.thread_id.clone(),

@@ -1228,6 +1228,8 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nats_worker_handoff_persists_to_jetstream_not_file() -> Result<()> {
+    require_nextest();
+
     let Some(server) = require_nats_server().await? else {
         return Ok(());
     };
