@@ -10,29 +10,11 @@ use crate::cli::Cli;
 fn config_from_cli(cli: &Cli) -> Result<StreamableHttpClientTransportConfig> {
     let parsed_url = Url::parse(cli.url.as_str())
         .with_context(|| format!("invalid remote MCP URL: {}", cli.url))?;
-
-    if cli.bearer_token.is_some()
-        && parsed_url.scheme() != "https"
-        && !is_loopback_host(&parsed_url)
-        && !cli.insecure
-    {
-        anyhow::bail!(
-            "refusing to send bearer token over non-HTTPS URL {}; use HTTPS, loopback, or --insecure",
-            cli.url
-        );
-    }
+    ensure_bearer_transport_is_secure(&parsed_url, cli.bearer_token.is_some(), cli.insecure)?;
 
     let mut config = StreamableHttpClientTransportConfig::with_uri(cli.url.as_str());
     config.auth_header = cli.bearer_token.clone();
-
-    for header in &cli.header {
-        let (name, value) = header
-            .split_once(':')
-            .ok_or_else(|| anyhow!("invalid header '{header}': expected NAME:VALUE"))?;
-        let header_name: HeaderName = name.trim().parse()?;
-        let header_value = HeaderValue::from_str(value.trim())?;
-        config.custom_headers.insert(header_name, header_value);
-    }
+    config.custom_headers = parse_custom_headers(&cli.header)?;
 
     if cli.strict_session {
         config.allow_stateless = false;
@@ -41,12 +23,44 @@ fn config_from_cli(cli: &Cli) -> Result<StreamableHttpClientTransportConfig> {
     Ok(config)
 }
 
-fn is_loopback_host(url: &Url) -> bool {
-    match url.host_str() {
-        Some("localhost") => true,
-        Some(host) => host == "127.0.0.1" || host == "::1",
-        None => false,
+fn ensure_bearer_transport_is_secure(url: &Url, has_bearer: bool, insecure: bool) -> Result<()> {
+    if !has_bearer || insecure || uses_https(url) || is_loopback_url(url) {
+        return Ok(());
     }
+
+    anyhow::bail!(
+        "refusing to send bearer token over non-HTTPS URL {}; use HTTPS, loopback, or --insecure",
+        url
+    );
+}
+
+fn uses_https(url: &Url) -> bool {
+    url.scheme() == "https"
+}
+
+fn is_loopback_url(url: &Url) -> bool {
+    url.host_str().is_some_and(is_loopback_host)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn parse_custom_headers(
+    headers: &[String],
+) -> Result<std::collections::HashMap<HeaderName, HeaderValue>> {
+    let mut parsed = std::collections::HashMap::new();
+
+    for header in headers {
+        let (name, value) = header
+            .split_once(':')
+            .ok_or_else(|| anyhow!("invalid header '{header}': expected NAME:VALUE"))?;
+        let header_name: HeaderName = name.trim().parse()?;
+        let header_value = HeaderValue::from_str(value.trim())?;
+        parsed.insert(header_name, header_value);
+    }
+
+    Ok(parsed)
 }
 
 pub async fn build_transport(cli: &Cli) -> Result<StreamableHttpClientTransport<reqwest::Client>> {
