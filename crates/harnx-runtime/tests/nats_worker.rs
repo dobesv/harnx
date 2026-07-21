@@ -16,6 +16,7 @@ use harnx_core::{
 use harnx_runtime::{
     client::CompletionTokenUsage,
     config::{Config, NatsServerConfig},
+    nats_lease::NatsLeaseConfig,
     nats_session_log::NatsSessionLog,
     nats_worker::{
         publish_session_activate, run_agent_loop_with_nats, run_worker_daemon,
@@ -241,6 +242,7 @@ struct WorkerTurnParams<'a> {
     global_config: Arc<RwLock<Config>>,
     labels: WorkerTurnLabels<'a>,
     call_fn: harnx_runtime::agent_loop::AgentCallFn,
+    lease: Option<Arc<harnx_runtime::nats_lease::NatsSessionLease>>,
 }
 
 async fn run_worker_turn(params: WorkerTurnParams<'_>) -> Result<()> {
@@ -253,6 +255,7 @@ async fn run_worker_turn(params: WorkerTurnParams<'_>) -> Result<()> {
                 prompt,
             },
         call_fn,
+        lease,
     } = params;
     let input = harnx_runtime::config::input::from_str(&global_config, prompt, None);
     run_agent_loop_with_nats(RunAgentLoopArgs {
@@ -262,7 +265,8 @@ async fn run_worker_turn(params: WorkerTurnParams<'_>) -> Result<()> {
         initial_input: input,
         abort_signal: create_abort_signal(),
         call_fn: Some(call_fn),
-        lease: None,
+        lease,
+        lease_config: NatsLeaseConfig::default(),
         after_seq_observer: None,
         header_insert_observer: None,
         session_index: None,
@@ -311,6 +315,68 @@ fn append_user_message_entry(message_id: &str, text: &str) -> SessionLogEntry {
         content: harnx_core::message::MessageContent::Text(text.to_string()),
         timestamp: None,
         fence_token: None,
+    }
+}
+
+fn make_handoff_call_fn() -> harnx_runtime::agent_loop::AgentCallFn {
+    let call_count = Arc::new(AtomicUsize::new(0));
+    Arc::new(move |_input, _config, _abort| {
+        let cc = call_count.clone();
+        Box::pin(async move {
+            let n = cc.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Ok((
+                    "handoff requested".to_string(),
+                    None,
+                    vec![ToolCall::new(
+                        "delegate-agent_session_handoff".to_string(),
+                        json!({
+                            "prompt": "finish delegated work",
+                            "session_id": "handoff-remote-session"
+                        }),
+                        Some("handoff-call-1".to_string()),
+                        None,
+                    )],
+                    CompletionTokenUsage::default(),
+                ))
+            } else {
+                Ok((
+                    "handoff completed".to_string(),
+                    None,
+                    vec![],
+                    CompletionTokenUsage::default(),
+                ))
+            }
+        })
+    })
+}
+
+fn write_test_agent(config_dir: &Path, agent_name: &str, body: &str) -> Result<()> {
+    let agents_dir = config_dir.join("agents");
+    std::fs::create_dir_all(&agents_dir)?;
+    std::fs::write(agents_dir.join(format!("{agent_name}.md")), body)?;
+    Ok(())
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set_path(key: &'static str, value: &Path) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
     }
 }
 
@@ -733,6 +799,7 @@ async fn nats_worker_persists_full_turn_end_to_end() -> Result<()> {
             prompt: "test prompt",
         },
         call_fn: make_stub_llm_call_fn(),
+        lease: None,
     })
     .await?;
 
@@ -803,6 +870,7 @@ async fn nats_worker_honors_configured_token_auth() -> Result<()> {
             prompt: "test prompt",
         },
         call_fn: make_stub_llm_call_fn(),
+        lease: None,
     })
     .await?;
 
@@ -1002,22 +1070,7 @@ async fn fenced_sink_rejects_append_when_lease_lost() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
-    use harnx_runtime::nats_lease::{NatsLeaseConfig, NatsSessionLease};
-    use harnx_runtime::nats_session_log::NatsSessionLog;
-    use harnx_runtime::nats_worker::run_agent_loop_with_nats_inner;
-    use std::time::Duration;
-
-    let Some(server) = require_nats_server().await? else {
-        return Ok(());
-    };
-    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let session_id = "resume-fence-session";
-
-    // Persist an assistant entry stamped with a very high fence, as if a newer
-    // worker (higher KV revision) had written it.
-    let log = NatsSessionLog::new(js.clone(), session_id);
+async fn append_resume_fence_seed(log: &NatsSessionLog) -> Result<()> {
     log.append_event_async(&SessionLogEntry::Message {
         id: None,
         role: harnx_core::message::MessageRole::User,
@@ -1034,13 +1087,22 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
         fence_token: Some(u64::MAX),
     })
     .await?;
+    Ok(())
+}
 
-    // This worker holds a fresh lease whose revision is far below u64::MAX.
-    let lease = Arc::new(
+async fn acquire_test_lease(
+    js: async_nats::jetstream::Context,
+    session_id: &str,
+    worker_id: &str,
+) -> Result<Arc<harnx_runtime::nats_lease::NatsSessionLease>> {
+    use harnx_runtime::nats_lease::{NatsLeaseConfig, NatsSessionLease};
+    use std::time::Duration;
+
+    Ok(Arc::new(
         NatsSessionLease::acquire(harnx_runtime::nats_lease::NatsLeaseAcquireParams {
-            jetstream: js.clone(),
+            jetstream: js,
             session_id,
-            worker_id: "worker-stale".to_string(),
+            worker_id: worker_id.to_string(),
             generation: 1,
             config: NatsLeaseConfig {
                 ttl: Duration::from_secs(30),
@@ -1051,7 +1113,92 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
         })
         .await?
         .expect("acquire"),
+    ))
+}
+
+fn assert_resume_fenced(result: Result<()>) {
+    assert!(
+        result.is_err(),
+        "resume must abort when tail fence exceeds held lease revision"
     );
+    let msg = format!("{:#}", result.unwrap_err());
+    assert!(
+        msg.contains("fenced") || msg.contains("exceeds held lease"),
+        "error should indicate fencing, got: {msg}"
+    );
+}
+
+fn assert_handoff_original_session_entries(entries: &[(u64, SessionLogEntry)]) {
+    assert!(
+        entries.iter().any(|(_, entry)| matches!(
+            entry,
+            SessionLogEntry::ToolResults { results, .. }
+                if results.iter().any(|result| result.switch_agent.as_ref().is_some_and(|switch| {
+                    switch.agent == "delegate-agent"
+                        && switch.session_id.as_deref() == Some("handoff-remote-session")
+                }))
+        )),
+        "expected original session to persist handoff tool result"
+    );
+}
+
+fn assert_handoff_target_session(config: &Arc<RwLock<Config>>) -> String {
+    assert!(
+        config
+            .read()
+            .session
+            .as_ref()
+            .is_some_and(|session| session.id() == "handoff-remote-session"),
+        "expected active config session to switch to handoff target"
+    );
+    config
+        .read()
+        .session
+        .as_ref()
+        .and_then(|session| session.session_id.clone())
+        .expect("expected active handed-off session id")
+}
+
+fn assert_handoff_target_log(
+    entries: &[(u64, SessionLogEntry)],
+    local_session_path: &std::path::Path,
+) {
+    assert!(
+        !entries.is_empty(),
+        "expected handed-off session to persist to JetStream"
+    );
+    assert!(
+        entries.iter().any(|(_, entry)| matches!(
+            entry,
+            SessionLogEntry::Message {
+                role: MessageRole::Assistant,
+                content: harnx_core::message::MessageContent::Text(text),
+                ..
+            } if text.contains("handoff completed")
+        )),
+        "expected handed-off JetStream log to contain delegated assistant reply"
+    );
+    assert!(
+        !local_session_path.exists(),
+        "handoff should stay NATS-backed; unexpected local session file at {}",
+        local_session_path.display()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
+    use harnx_runtime::nats_session_log::NatsSessionLog;
+    use harnx_runtime::nats_worker::run_agent_loop_with_nats_inner;
+
+    let Some(server) = require_nats_server().await? else {
+        return Ok(());
+    };
+    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+    let session_id = "resume-fence-session";
+
+    let log = NatsSessionLog::new(js.clone(), session_id);
+    append_resume_fence_seed(&log).await?;
+    let lease = acquire_test_lease(js.clone(), session_id, "worker-stale").await?;
 
     let config = cluster_config(server.url());
     let input = harnx_runtime::config::input::from_str(&config, "go", None);
@@ -1064,6 +1211,7 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
             abort_signal: create_abort_signal(),
             call_fn: Some(counting_stub_call_fn(Arc::new(AtomicUsize::new(0)))),
             lease: None,
+            lease_config: NatsLeaseConfig::default(),
             after_seq_observer: None,
             header_insert_observer: None,
             session_index: None,
@@ -1074,15 +1222,105 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
     )
     .await;
 
-    assert!(
-        result.is_err(),
-        "resume must abort when tail fence exceeds held lease revision"
+    assert_resume_fenced(result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nats_worker_handoff_persists_to_jetstream_not_file() -> Result<()> {
+    require_nextest();
+
+    let Some(server) = require_nats_server().await? else {
+        return Ok(());
+    };
+
+    let root = tempfile::tempdir()?;
+    let config_dir = root.path().join("config");
+    let data_dir = root.path().join("data");
+    let state_dir = root.path().join("state");
+    std::fs::create_dir_all(&config_dir)?;
+    std::fs::create_dir_all(config_dir.join("clients"))?;
+    std::fs::create_dir_all(config_dir.join("nats_servers"))?;
+    std::fs::create_dir_all(&data_dir)?;
+    std::fs::create_dir_all(&state_dir)?;
+
+    write_test_agent(
+        &config_dir,
+        "delegate-agent",
+        "---\nmodel: openai:test-model\nuse_tools: delegate-agent_session_handoff\n---\nDelegate agent instructions\n",
+    )?;
+
+    let _config_guard = EnvVarGuard::set_path("HARNX_CONFIG_DIR", &config_dir);
+    let _data_guard = EnvVarGuard::set_path("HARNX_DATA_DIR", &data_dir);
+    let _state_guard = EnvVarGuard::set_path("HARNX_STATE_DIR", &state_dir);
+
+    std::fs::write(config_dir.join("config.yaml"), "model: openai:test-model\n")?;
+    std::fs::write(
+        config_dir.join("nats_servers").join("local.yaml"),
+        format!("url: {}\n", server.url()),
+    )?;
+    std::fs::write(
+        config_dir.join("clients").join("openai.yaml"),
+        "type: openai\napi_key: sk-test\nmodels:\n  - name: test-model\n    type: chat\n    max_input_tokens: 4096\n",
+    )?;
+
+    let config_path = config_dir.join("config.yaml");
+    let base = {
+        let _config_guard = EnvVarGuard::set_path("HARNX_CONFIG_DIR", &config_dir);
+        Config::load_from_file(&config_path)?
+    };
+
+    let config = Arc::new(RwLock::new(base));
+    harnx_runtime::config::Config::use_agent(
+        &config,
+        "delegate-agent",
+        Some("nats-handoff-root"),
+        create_abort_signal(),
+    )
+    .await?;
+
+    let js = {
+        let cfg = config.read().clone();
+        cfg.nats_jetstream("local").await?
+    };
+    let original_log =
+        seed_session_and_attach_runtime(&config, js.clone(), "nats-handoff-root").await?;
+    let lease = Arc::new(
+        harnx_runtime::nats_lease::NatsSessionLease::acquire(
+            harnx_runtime::nats_lease::NatsLeaseAcquireParams {
+                jetstream: js.clone(),
+                session_id: "nats-handoff-root",
+                worker_id: "worker-handoff".to_string(),
+                generation: 1,
+                config: NatsLeaseConfig::default(),
+                session_index: None,
+            },
+        )
+        .await?
+        .expect("acquire"),
     );
-    let msg = format!("{:#}", result.unwrap_err());
-    assert!(
-        msg.contains("fenced") || msg.contains("exceeds held lease"),
-        "error should indicate fencing, got: {msg}"
-    );
+
+    run_worker_turn(WorkerTurnParams {
+        global_config: config.clone(),
+        labels: WorkerTurnLabels {
+            cluster_key: "local",
+            session_id: "nats-handoff-root",
+            prompt: "start handoff",
+        },
+        call_fn: make_handoff_call_fn(),
+        lease: Some(lease),
+    })
+    .await?;
+
+    let original_entries_after = original_log.load_events_async().await?;
+    assert_handoff_original_session_entries(&original_entries_after);
+    let actual_new_session_id = assert_handoff_target_session(&config);
+    let new_log = NatsSessionLog::new(js.clone(), &actual_new_session_id);
+    let new_entries = new_log.load_events_async().await?;
+
+    let local_session_path = config.read().session_file(&actual_new_session_id);
+    assert_handoff_target_log(&new_entries, &local_session_path);
+
     Ok(())
 }
 

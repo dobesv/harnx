@@ -35,6 +35,15 @@ use tokio::{
 
 const DEFAULT_REAP_TTL: Duration = Duration::from_secs(5);
 const COMMAND_BUFFER: usize = 32;
+// AG-UI event broadcast channel capacity.
+//
+// Kept at 64 despite Oracle's concern about race timing when Web UI attaches:
+// - Late subscribers receive a history snapshot on subscribe, so they won't miss
+//   events that fired before attachment.
+// - AG-UI events are small JSON objects (~100-500 bytes); 64 slots ~= 32KB worst-case.
+// - A larger buffer (e.g., 256) would only delay backpressure, not eliminate the race.
+// - The correct fix for the race is consumer-side: Web UI should subscribe before/atomically
+//   with requesting the run, not after. That's a caller contract, not a buffer-sizing issue.
 const BROADCAST_BUFFER: usize = 64;
 const FAR_FUTURE_SECS: u64 = 365 * 24 * 60 * 60;
 
@@ -225,7 +234,7 @@ struct ActiveRun {
 
 struct RunFinished {
     run_id: RunId,
-    result: anyhow::Result<()>,
+    result: anyhow::Result<harnx_runtime::LoopResult>,
     sink: Arc<BroadcastEventSender>,
     thread_id: ThreadId,
     attachment_refs: Vec<String>,
@@ -472,7 +481,7 @@ impl SessionActor {
         self.active_run = None;
         self.refresh_history_snapshot();
         match &done.result {
-            Ok(()) => {
+            Ok(harnx_runtime::LoopResult::Completed) => {
                 done.sink.sink.close_text_segment();
                 let _ = self.broadcast_tx.send(Event::RunFinished(RunFinishedEvent {
                     base: base_event(),
@@ -481,6 +490,19 @@ impl SessionActor {
                     result: None,
                 }));
                 self.state = SessionState::Idle;
+            }
+            Ok(harnx_runtime::LoopResult::HandoffRequested {
+                agent,
+                session_id,
+                prompt,
+            }) => {
+                self.dispatch_handoff_to_target(
+                    &done,
+                    agent.clone(),
+                    session_id.clone(),
+                    prompt.clone(),
+                )
+                .await;
             }
             Err(err) => {
                 // Check for typed tool approval interrupt
@@ -504,31 +526,106 @@ impl SessionActor {
                             started_at: Utc::now(),
                             pending: Box::new(pending),
                         };
-                        return;
+                    } else {
+                        done.sink.sink.close_text_segment();
+                        let _ = self.broadcast_tx.send(Event::RunError(RunErrorEvent {
+                            base: base_event(),
+                            message: err.to_string(),
+                            code: None,
+                        }));
+                        self.state = SessionState::Idle;
                     }
+                } else {
+                    done.sink.sink.close_text_segment();
+                    let _ = self.broadcast_tx.send(Event::RunError(RunErrorEvent {
+                        base: base_event(),
+                        message: err.to_string(),
+                        code: None,
+                    }));
+                    self.state = SessionState::Idle;
                 }
-                // Non-tool-interrupt error (failure or cancellation). Close any
-                // open text segment first so a client that was mid-stream when the
-                // run failed doesn't stay stuck in a "streaming"/typing state with
-                // an orphaned TEXT_MESSAGE_START.
-                done.sink.sink.close_text_segment();
-                let _ = self.broadcast_tx.send(Event::RunError(RunErrorEvent {
-                    base: base_event(),
-                    message: err.to_string(),
-                    code: None,
-                }));
-                self.state = SessionState::Idle;
             }
         }
-
-        if let Some(next_prompt) = self.pending.pop_front() {
-            self.start_run(next_prompt, SessionPromptOptions::default(), reap_sleep)
-                .await;
-            return;
-        }
-
         if self.subscribers == 0 {
             self.arm_reap(reap_sleep);
+        }
+    }
+
+    async fn dispatch_handoff_to_target(
+        &mut self,
+        done: &RunFinished,
+        agent: String,
+        session_id: Option<String>,
+        prompt: String,
+    ) {
+        let Some(target_session_id) = self.resolve_handoff_session_id(session_id) else {
+            self.state = SessionState::Idle;
+            return;
+        };
+
+        let target_key = SessionKey {
+            agent,
+            session: target_session_id,
+        };
+        let target_handle = self.get_or_spawn_target_session_actor(target_key.clone());
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        target_handle
+            .tx
+            .send(SessionCommand::Prompt {
+                text: prompt,
+                options: SessionPromptOptions::default(),
+                reply: reply_tx,
+            })
+            .await
+            .ok();
+
+        done.sink.sink.close_text_segment();
+        let _ = self.broadcast_tx.send(Event::RunFinished(RunFinishedEvent {
+            base: base_event(),
+            thread_id: done.thread_id.clone(),
+            run_id: done.run_id.clone(),
+            result: None,
+        }));
+        self.state = SessionState::Idle;
+    }
+
+    fn resolve_handoff_session_id(&self, session_id: Option<String>) -> Option<String> {
+        match session_id {
+            Some(id) => Some(id),
+            None => {
+                let prompt_config = prompt_config_for_agent_session_from_global(
+                    &self.actor_config.base_config,
+                    &self.key,
+                );
+                let new_session_id = prompt_config.write().new_session_id();
+                match new_session_id {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        let _ = self.broadcast_tx.send(Event::RunError(RunErrorEvent {
+                            base: base_event(),
+                            message: format!("handoff failed: could not allocate session ID: {e}"),
+                            code: None,
+                        }));
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_or_spawn_target_session_actor(&mut self, target_key: SessionKey) -> SessionHandle {
+        match self.registry.entry(target_key.clone()) {
+            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Vacant(entry) => {
+                let handle = spawn_session_actor(
+                    target_key,
+                    Arc::clone(&self.registry),
+                    self.reap_ttl,
+                    self.actor_config.clone(),
+                );
+                entry.insert(handle.clone());
+                handle
+            }
         }
     }
 
@@ -608,9 +705,12 @@ impl SessionActor {
             session_event_context,
         ));
         let sink_for_task = sink.clone();
+        let _abort_signal_for_task = abort_signal.clone();
         let task = tokio::spawn(async move {
             let loop_result = with_agent_event_sink(sink_for_task.clone(), async {
-                Box::pin(run_agent_loop(&loop_ctx, input)).await
+                // Serve path: run completes cleanly on HandoffRequested.
+                // The delegated turn runs on the target actor, not in-place here.
+                run_agent_loop(&loop_ctx, input).await
             })
             .await;
             let _ = done_tx
@@ -872,23 +972,55 @@ impl SessionActor {
             session_event_context,
         ));
         let sink_for_task = sink.clone();
+        let abort_signal_for_task = abort_signal.clone();
         let task = tokio::spawn(async move {
             let loop_result = with_agent_event_sink(sink_for_task.clone(), async {
-                continue_agent_loop_from_tool_round(
-                    &loop_ctx,
-                    input,
-                    resume.pending.completion_output.clone(),
-                    resume.pending.completion_thought.clone(),
-                    resume.pending.tool_calls.clone(),
-                    resume.decisions.clone(),
-                    resume
-                        .pending
-                        .interrupts
-                        .iter()
-                        .map(|i| i.tool_call_id.clone())
-                        .collect(),
-                )
-                .await
+                let mut input = input;
+                loop {
+                    match continue_agent_loop_from_tool_round(
+                        &loop_ctx,
+                        input,
+                        resume.pending.completion_output.clone(),
+                        resume.pending.completion_thought.clone(),
+                        resume.pending.tool_calls.clone(),
+                        resume.decisions.clone(),
+                        resume
+                            .pending
+                            .interrupts
+                            .iter()
+                            .map(|i| i.tool_call_id.clone())
+                            .collect(),
+                    )
+                    .await
+                    {
+                        Ok(harnx_runtime::LoopResult::Completed) => {
+                            break Ok(harnx_runtime::LoopResult::Completed)
+                        }
+                        Ok(harnx_runtime::LoopResult::HandoffRequested {
+                            agent,
+                            session_id,
+                            prompt,
+                        }) => {
+                            prompt_config.write().exit_agent_with_lock(None)?;
+                            harnx_runtime::config::Config::use_agent(
+                                &prompt_config,
+                                &agent,
+                                session_id.as_deref(),
+                                abort_signal_for_task.clone(),
+                            )
+                            .await?;
+                            if prompt_config.read().session.is_some() {
+                                prompt_config.write().empty_session_with_lock(None)?;
+                            }
+                            input = harnx_runtime::config::input::from_str(
+                                &prompt_config,
+                                &prompt,
+                                None,
+                            );
+                        }
+                        Err(e) => break Err(e),
+                    }
+                }
             })
             .await;
             let _ = done_tx
@@ -2482,5 +2614,155 @@ mod tests {
         })
         .await
         .expect("timed out waiting for re-interrupt");
+    }
+
+    #[tokio::test]
+    async fn session_actor_handoff_dispatches_to_target_actor() {
+        // When HandoffRequested fires, the serve actor ends its run cleanly
+        // and dispatches the handoff prompt to the TARGET session's actor.
+        // The target actor then executes the delegated turn.
+        //
+        // This test uses the real handoff mechanism: the source agent has
+        // `use_tools: target-agent_session_handoff` and the call_fn returns
+        // a tool call with that name, triggering run_agent_loop to return
+        // HandoffRequested. The SessionActor then re-dispatches to the target.
+        let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+
+        // Write source agent WITH handoff tool enabled - required for handoff detection
+        sandbox.write_agent_with_front_matter(
+            "source-agent",
+            "model: openai:gpt-4o\nuse_tools: target-agent_session_handoff",
+            "You are the source agent.",
+        );
+        sandbox.write_agent("target-agent", "You are the target agent.");
+
+        // Track invocations per agent
+        let source_count = Arc::new(AtomicUsize::new(0));
+        let target_count = Arc::new(AtomicUsize::new(0));
+        let source_count_clone = source_count.clone();
+        let target_count_clone = target_count.clone();
+
+        // Stateful call_fn: source returns handoff tool call, target returns text
+        let call_fn: AgentCallFn = Arc::new(move |_input, config, _abort| {
+            let source_count = source_count_clone.clone();
+            let target_count = target_count_clone.clone();
+            let agent_name = config
+                .read()
+                .agent
+                .as_ref()
+                .map(|a| a.name().to_string())
+                .unwrap_or_default();
+            Box::pin(async move {
+                if agent_name == "source-agent" {
+                    source_count.fetch_add(1, Ordering::SeqCst);
+                    // Return a handoff tool call - triggers HandoffRequested
+                    Ok((
+                        "handoff now".to_string(),
+                        None,
+                        vec![ToolCall::new(
+                            "target-agent_session_handoff".to_string(),
+                            json!({
+                                "prompt": "delegated work",
+                                "session_id": "handoff-target-session"
+                            }),
+                            Some("handoff-call-1".to_string()),
+                            None,
+                        )],
+                        harnx_runtime::client::CompletionTokenUsage::default(),
+                    ))
+                } else if agent_name == "target-agent" {
+                    target_count.fetch_add(1, Ordering::SeqCst);
+                    // Target completes normally
+                    Ok((
+                        "target-response".to_string(),
+                        None,
+                        vec![],
+                        harnx_runtime::client::CompletionTokenUsage::default(),
+                    ))
+                } else {
+                    panic!("unexpected agent: {}", agent_name);
+                }
+            })
+        });
+
+        let registry = registry_with_call_fn(call_fn);
+        let source_handle = registry.get_or_spawn(key("source-agent", "source-session"));
+        let mut source_sub = subscribe(&source_handle).await.events;
+
+        // Prompt the source agent
+        let result = prompt(&source_handle, "start handoff").await;
+        let source_run_id = match result {
+            PromptResult::Accepted { run_id } => run_id,
+            other => panic!("expected Accepted, got {other:?}"),
+        };
+
+        // Track whether we saw session_handoff event
+        let saw_handoff_event = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_handoff_event_clone = saw_handoff_event.clone();
+
+        // Wait for source run to finish (RUN_FINISHED) and observe handoff event
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match source_sub.recv().await.expect("recv event") {
+                    Event::RunFinished(finished) => {
+                        if finished.run_id.to_string() == source_run_id {
+                            // Source run completed
+                            break;
+                        }
+                    }
+                    Event::Custom(event) if event.name == "session_handoff" => {
+                        // Verify the handoff event payload
+                        assert_eq!(event.value["agent"].as_str(), Some("target-agent"));
+                        assert_eq!(
+                            event.value["session_id"].as_str(),
+                            Some("handoff-target-session")
+                        );
+                        saw_handoff_event_clone.store(true, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for source run to finish");
+
+        // Verify source call_fn was invoked exactly once
+        assert_eq!(
+            source_count.load(Ordering::SeqCst),
+            1,
+            "source agent should be invoked once"
+        );
+
+        // Verify session_handoff event was emitted
+        assert!(
+            saw_handoff_event.load(Ordering::SeqCst),
+            "session_handoff event should be emitted"
+        );
+
+        // Verify target actor was actually invoked - poll with timeout
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let count = target_count.load(Ordering::SeqCst);
+                if count >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for target agent to run");
+
+        assert_eq!(
+            target_count.load(Ordering::SeqCst),
+            1,
+            "target agent should be invoked once by handoff dispatch"
+        );
+
+        // Verify the target actor was registered (created by handoff)
+        assert!(
+            registry.has_session(&key("target-agent", "handoff-target-session")),
+            "target session should be registered in registry after handoff dispatch"
+        );
     }
 }

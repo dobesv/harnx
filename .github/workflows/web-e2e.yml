@@ -1,9 +1,5 @@
 name: Web E2E
 
-# NOTE: This workflow is intended to be NON-REQUIRED in branch protection.
-# Do not add this status check as a required check in GitHub branch protection rules.
-# This allows e2e failures to be reviewed without blocking PRs.
-
 on:
   push:
     branches:

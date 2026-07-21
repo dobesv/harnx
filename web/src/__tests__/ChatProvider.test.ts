@@ -247,4 +247,88 @@ describe('toAgUiMessages', () => {
       });
       expect(onUsage).toHaveBeenCalledWith({ input: 1, output: 2 });
     });
+    
+    it('should route session_handoff custom event only if run is active', async () => {
+      const onStatus = vi.fn();
+      const onUsage = vi.fn();
+      const onToolSummary = vi.fn();
+      const onRunFailed = vi.fn();
+      const onHandoff = vi.fn();
+
+      const { HarnxHttpAgent } = await import('../ChatProvider');
+      const agent = new HarnxHttpAgent({
+        url: '/url',
+        onStatus,
+        onRunFailed,
+        onUsage,
+        onToolSummary,
+        onHandoff
+      });
+
+      const subscriber: any = {};
+      vi.spyOn(Object.getPrototypeOf(Object.getPrototypeOf(agent)), 'runAgent').mockImplementation((_params: any, sub: any) => {
+        Object.assign(subscriber, sub);
+        return Promise.resolve();
+      });
+
+      await agent.runAgent({});
+
+      // Simulate onEvent CUSTOM session_handoff without RUN_STARTED
+      await subscriber.onEvent({
+        event: {
+          type: 'CUSTOM',
+          name: 'session_handoff',
+          value: { agent: 'targetAgent', session_id: '1234' }
+        }
+      });
+      expect(onHandoff).not.toHaveBeenCalled();
+
+      // Simulate RUN_STARTED to set isRunActive true
+      await subscriber.onEvent({
+        event: {
+          type: 'RUN_STARTED',
+        }
+      });
+
+      // Now session_handoff should trigger the callback
+      await subscriber.onEvent({
+        event: {
+          type: 'CUSTOM',
+          name: 'session_handoff',
+          value: { agent: 'targetAgent', session_id: '1234' }
+        }
+      });
+      expect(onHandoff).toHaveBeenCalledWith('targetAgent', '1234');
+
+      onHandoff.mockClear();
+
+      // Test session_handoff with null session_id
+      await subscriber.onEvent({
+        event: {
+          type: 'CUSTOM',
+          name: 'session_handoff',
+          value: { agent: 'targetAgent', session_id: null }
+        }
+      });
+      expect(onHandoff).toHaveBeenCalledWith('targetAgent', null);
+
+      onHandoff.mockClear();
+
+      // Simulate RUN_FINISHED to set isRunActive false
+      await subscriber.onEvent({
+        event: {
+          type: 'RUN_FINISHED',
+        }
+      });
+
+      // session_handoff should not trigger callback again
+      await subscriber.onEvent({
+        event: {
+          type: 'CUSTOM',
+          name: 'session_handoff',
+          value: { agent: 'targetAgent', session_id: '1234' }
+        }
+      });
+      expect(onHandoff).not.toHaveBeenCalled();
+    });
   });

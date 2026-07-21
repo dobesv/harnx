@@ -38,8 +38,9 @@ pub use nats_client_session::{
 pub use nats_worker::ControlCommand;
 
 pub use agent_loop::{
-    continue_agent_loop_from_tool_round, run_agent_loop, AgentCallFn, AgentLoopContext,
-    OnTextResponseFn, OnToolRoundFn, ToolApprovalDecision,
+    continue_agent_loop_from_tool_round, run_agent_loop, run_agent_loop_with_local_handoff,
+    AgentCallFn, AgentLoopContext, LoopResult, OnTextResponseFn, OnToolRoundFn,
+    ToolApprovalDecision,
 };
 
 pub use tool::{ConfirmToolUseFn, ToolApprovalInterrupt, ToolUseConfirmation};

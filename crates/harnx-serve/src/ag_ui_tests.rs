@@ -889,6 +889,107 @@ fn ag_ui_sink_maps_plan_event_to_custom() {
     }
 }
 
+fn collect_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>) -> Vec<Event> {
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    events
+}
+
+fn find_custom_event<'a>(events: &'a [Event], name: &str) -> &'a CustomEvent {
+    events
+        .iter()
+        .find_map(|event| match event {
+            Event::Custom(custom) if custom.name == name => Some(custom),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{name} event should be present"))
+}
+
+fn assert_handoff_payload(event: &CustomEvent) {
+    assert_eq!(event.value["agent"].as_str(), Some("target-agent"));
+    assert_eq!(
+        event.value["session_id"].as_str(),
+        Some("target-session-123")
+    );
+}
+
+#[test]
+fn ag_ui_sink_emits_session_handoff_custom_event_on_handoff_requested() {
+    // When HandoffRequested fires, both 'turn_handoff_requested' and 'session_handoff'
+    // custom events must be emitted. The session_handoff event carries the raw
+    // {agent, session_id} payload for Web UI navigation.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let message_id = MessageId::from(uuid::Uuid::new_v4());
+    let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
+
+    // Emit the handoff event
+    sink.emit(
+        AgentEvent::Turn(TurnEvent::HandoffRequested {
+            agent: "target-agent".to_string(),
+            session_id: Some("target-session-123".to_string()),
+        }),
+        None,
+    );
+
+    // Emit a step finished event (simulating turn end after handoff)
+    sink.emit(
+        AgentEvent::Turn(TurnEvent::Ended {
+            outcome: harnx_core::event::TurnOutcome::default(),
+        }),
+        None,
+    );
+
+    // Collect all events in order
+    let mut events: Vec<Event> = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+
+    // Extract event types for ordering assertions
+    let event_types: Vec<&str> = events
+        .iter()
+        .map(|e| match e {
+            Event::Custom(ce) => ce.name.as_str(),
+            Event::StepFinished(_) => "STEP_FINISHED",
+            Event::StepStarted(_) => "STEP_STARTED",
+            _ => "OTHER",
+        })
+        .collect();
+
+    // Find positions of relevant events
+    let session_handoff_idx = event_types.iter().position(|&t| t == "session_handoff");
+    let turn_handoff_idx = event_types
+        .iter()
+        .position(|&t| t == "turn_handoff_requested");
+    let step_finished_idx = event_types.iter().position(|&t| t == "STEP_FINISHED");
+
+    // Both custom events must be present
+    assert!(
+        session_handoff_idx.is_some(),
+        "session_handoff event should be emitted"
+    );
+    assert!(
+        turn_handoff_idx.is_some(),
+        "turn_handoff_requested event should be emitted"
+    );
+    assert!(
+        step_finished_idx.is_some(),
+        "STEP_FINISHED event should be emitted"
+    );
+
+    // session_handoff must come BEFORE STEP_FINISHED (the terminal event for this test)
+    assert!(
+        session_handoff_idx.unwrap() < step_finished_idx.unwrap(),
+        "session_handoff must appear before STEP_FINISHED; got order: {:?}",
+        event_types
+    );
+
+    assert_handoff_payload(find_custom_event(&events, "session_handoff"));
+    assert_handoff_payload(find_custom_event(&events, "turn_handoff_requested"));
+}
+
 #[test]
 fn ag_ui_sink_maps_compaction_completed_to_custom_and_snapshot() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();

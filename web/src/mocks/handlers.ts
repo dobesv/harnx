@@ -120,26 +120,7 @@ function createAgUiStream({ session, body }: { session: string; body: any }) {
         runId,
       }));
 
-      if (isPromptlessSubscribe) {
-        // Passive subscribe/hydrate ONLY: emit the transcript snapshot, then
-        // close the run envelope (mirrors the server's build_promptless_event_stream:
-        // RUN_STARTED -> MESSAGES_SNAPSHOT -> RUN_FINISHED). A prompted run below
-        // is a pure delta and must NOT emit MESSAGES_SNAPSHOT — applying an empty/
-        // stale snapshot mid-run would wipe the optimistic user message + reply.
-        controller.enqueue(encodeSseEvent({
-          type: 'MESSAGES_SNAPSHOT',
-          messages: buildSnapshot(session),
-        }));
-        controller.enqueue(encodeSseEvent({
-          type: 'RUN_FINISHED',
-          threadId,
-          runId,
-        }));
-        controller.close();
-        return;
-      }
-
-      if (session === 'session-pending') {
+      if (isPromptlessSubscribe && session === 'session-pending') {
         await new Promise((resolve) => setTimeout(resolve, 25));
         controller.enqueue(encodeSseEvent({
           type: 'CUSTOM',
@@ -164,7 +145,26 @@ function createAgUiStream({ session, body }: { session: string; body: any }) {
         // stays live so the status indicator and busy composer remain visible.
         return;
       }
-      
+
+      if (isPromptlessSubscribe) {
+        // Passive subscribe/hydrate ONLY: emit the transcript snapshot, then
+        // close the run envelope (mirrors the server's build_promptless_event_stream:
+        // RUN_STARTED -> MESSAGES_SNAPSHOT -> RUN_FINISHED). A prompted run below
+        // is a pure delta and must NOT emit MESSAGES_SNAPSHOT — applying an empty/
+        // stale snapshot mid-run would wipe the optimistic user message + reply.
+        controller.enqueue(encodeSseEvent({
+          type: 'MESSAGES_SNAPSHOT',
+          messages: buildSnapshot(session),
+        }));
+        controller.enqueue(encodeSseEvent({
+          type: 'RUN_FINISHED',
+          threadId,
+          runId,
+        }));
+        controller.close();
+        return;
+      }
+
       if (session === 'session-gallery') {
         await new Promise((resolve) => setTimeout(resolve, 25));
 
