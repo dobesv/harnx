@@ -1,6 +1,28 @@
 # Changelog
 
 All notable changes to the `coding` agent package will be documented here.
+## 0.3.3 (2026-07-21)
+
+### Features
+
+- bring web UI to TUI parity with GFM markdown and collapsible tool cards (#1031)
+- fix and harden hook-based auth injection (Jira/GitHub) + startup handshake (#1050)
+- render system prompt at request time with tool and model awareness (#1055)
+- add automatic LLM-driven session title generation (#1069)
+- add cross-process file locking for local sessions (#1077)
+- implement agent handoff for Web UI and NATS worker (#1109)
+- serialize concurrent file mutations to prevent corruption (#1122)
+
+### Fixes
+
+- only prefetch selector-matching MCP servers at agent init (#1029) (#1030)
+- overhaul transcript history navigation seq mapping (#1032)
+- emit streamed notifications in order, not per-chunk tasks (#1038)
+- sandboxed acli auth — write synthetic token as YAML !!binary (#1052)
+- update dependency @assistant-ui/react to v0.14.27 (#1105)
+- update dependency @assistant-ui/react-ag-ui to v0.0.45 (#1106)
+- update dependency @assistant-ui/react-markdown to v0.14.6 (#1107)
+
 ## 0.3.2 (2026-07-09)
 
 ### Features

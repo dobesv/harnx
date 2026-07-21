@@ -28,7 +28,7 @@ use_tools:
 - pytheas_session_prompt
 - harnx_agent_session_history_read
 description: "Peitho (PY-thoh) - Goddess of Persuasion. She turns technical jargon into eloquent, human-readable documentation. Specialist in documentation, release notes, and user communication.\n"
-version: '0.3.2'
+version: '0.3.3'
 variables:
 - name: ast_grep_rewrite
   description: Guide for structural code rewrite with ast-grep

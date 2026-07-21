@@ -28,7 +28,7 @@ use_tools:
 - pytheas_session_prompt
 - harnx_agent_session_history_read
 description: "Maintenance, stability, and routine tasks specialist — keeps the codebase warm, clean, and stable for day-to-day operations. Named after Hestia (HES-tee-uh), Guardian of the Hearth.\n"
-version: '0.3.2'
+version: '0.3.3'
 variables:
 - name: ast_grep_rewrite
   description: Guide for structural code rewrite with ast-grep

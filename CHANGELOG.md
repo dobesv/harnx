@@ -11,6 +11,197 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add GitHub auth proxy hook (`harnx-proxy-auth`): persistent hook binary that acts as an HTTPS MITM proxy, injecting configurable auth headers for matching URLs into `bash_exec`/`bash_spawn` tool environments (closes #531)
 
+## 0.33.3 (2026-07-21)
+
+### Features
+
+- bring web UI to TUI parity with GFM markdown and collapsible tool cards (#1031)
+- fix and harden hook-based auth injection (Jira/GitHub) + startup handshake (#1050)
+- render system prompt at request time with tool and model awareness (#1055)
+- add automatic LLM-driven session title generation (#1069)
+- add cross-process file locking for local sessions (#1077)
+- implement agent handoff for Web UI and NATS worker (#1109)
+- serialize concurrent file mutations to prevent corruption (#1122)
+- Add AG-UI tool summary custom events and context token usage metadata for live and restored sessions.
+- Serialize concurrent mutations in the filesystem MCP server to prevent corruption from parallel edits. Same-file edits (write, edit, insert, re_replace) are now serialized via per-file locks, while `rollback_file` takes an exclusive repository-wide lock so it cannot interleave with concurrent edits to other files in the same repository.
+- Render agent system prompts at request time with current tool and model context instead of storing them in session transcripts.
+
+#### feat(proxy-auth): send resolved `vars` to executable hooks on each request
+
+Executable (`--hook <path>` / inline shebang) hooks now receive a `vars` object
+on every JSONL request containing the resolved, non-secret context that jq hooks
+reference as jaq variables — the `fake_*` sentinels and `temp_file_root`. Real
+secrets are deliberately excluded (a hook already inherits proxy-auth's process
+environment, so putting them in the payload would only widen the logging
+surface).
+
+This lets a hook write files into proxy-auth's own per-instance temp dir
+(`--fs`'s `$temp_file_root`) — unique per proxy and auto-deleted on exit — and
+agree with a sibling `--env` on the path, instead of guessing a shared location.
+`example_config/jira-auth-hook.py` uses `vars.temp_file_root` to place its
+synthetic acli config exactly where `--env` points `ACLI_CONFIG_DIR`, fixing
+`acli` auth in the sandbox (the previous `\($temp_file_root)/harnx-fs-acli`
+rendered as `/harnx-fs-acli` because `$temp_file_root` is empty without `--fs`).
+The hook also gained verbose per-request tracing (method + host + path +
+injection decision) when `HARNX_JIRA_LOG_FILE` is set.
+
+#### feat(hooks): structured notice channel + failure surfacing to the UI
+
+Hooks can now surface messages to the active UI (TUI/CLI/serve) two ways:
+
+- **Structured channel (live hooks):** a persistent hook prints a standalone
+  JSONL line `{"notice": {"level": "error"|"warning"|"info", "message": "…"}}`
+  on stdout (no request `id`). harnx recognizes it and posts an
+  `AgentEvent::Notice`. `harnx-proxy-auth` forwards such lines from its exec
+  sub-hooks, so a nested hook (e.g. `jira-auth-hook.py`) can report an internal
+  error even while it keeps running.
+- **Dead-child fallback:** when a persistent hook process fails to launch or
+  exits unexpectedly, harnx emits an Error notice with the child's captured
+  stderr tail (deduped per command within 30s).
+
+`jira-auth-hook.py` uses the structured channel to report auth-init failures
+(e.g. keyring/config problems) instead of failing silently.
+
+#### feat(hooks): inject `$HARNX_PACKAGE_DIR` into hook processes
+
+Every hook command now runs with a `HARNX_PACKAGE_DIR` environment variable set
+to the directory of the package that owns the hook (for hooks defined by a
+packaged MCP server), falling back to the config directory for hooks defined
+outside a package. This lets packages bundle helper scripts alongside their
+config and reference them without hardcoding an absolute path, e.g.
+`harnx-proxy-auth --hook $HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py`.
+
+#### feat(commands): add `.info env` to inspect the harnx process environment
+
+`.info env` lists the environment variable **names** harnx (and therefore its
+hooks and MCP servers) inherit — values hidden. `.info env <NAME>` prints a
+single variable's value. Useful for diagnosing hook/proxy problems (e.g. is
+`DBUS_SESSION_BUS_ADDRESS` present, is a token var set) without dumping secrets.
+
+Also adds `example_config/probe-auth-hook.py`: a standalone script that drives a
+`harnx-proxy-auth` exec hook (e.g. `jira-auth-hook.py`) directly, showing its
+debug/init state and the masked Authorization header it would inject per host.
+
+#### feat(session): cross-process file locking for local filesystem sessions
+
+Multiple HarnX processes (TUI, Web UI, CLI, ACP) sharing the same local session
+file are now serialized via a per-session `.yaml.lock` file (`std::fs::File::lock`).
+A second process shows "Waiting for session lock…" in the transcript, then acquires
+the lock when the first goes idle, reloads the session from disk to pick up entries
+written by the prior holder, and proceeds. Session file writes (`save`, `append_event`,
+`ensure_log_file`) no longer truncate or drop entries under concurrent access, and
+sequence numbers are re-derived from the file while the lock is held to avoid stale
+caches.
+
+#### feat(commands): add `.info mcp [server]` diagnostics
+
+Print an MCP server's resolved command, args, env, roots, connection status,
+child PID, and — crucially — the exact `command` string of each configured
+hook plus the **live PID of any running persistent hook** (e.g. the
+`harnx-proxy-auth` process). Seeing the hook command verbatim and its PID makes
+it easy to spot YAML-folding/argument-dropping problems or a hook that never
+spawned. With no server name, lists all running servers with status and PID.
+
+#### Add a startup message to the harnx-proxy-auth exec-hook protocol. After a hook
+
+prints `READY`, the proxy sends `{"event": "startup", "vars": {...}}` and the
+hook may respond with an `env` map that is injected into the sandboxed command
+(and write files to `temp_file_root`) before the first request runs. The bundled
+`jira-auth-hook.py` now initializes eagerly at startup.
+
+#### feat(session): automatic session title generation
+
+Sessions now get a short, LLM-generated title after the first exchange and
+periodically as they grow (every `title_update_threshold` tokens, default
+50,000). Configure the generator via `title_agent` (global in `config.yaml` or
+per-agent in front matter); leave it unset to disable. Titles are stored as
+append-only `Title` log entries, surfaced in local and remote (NATS) session
+listings and the serve API, and can be set manually with `.set title <text>`
+(which freezes automatic regeneration). Do not use a reasoning model as the
+title agent.
+
+#### feat(ui): show the generated session title in the terminal and browser tab
+
+The automatically generated session title now sets the terminal window title in
+the TUI and the browser tab title in the web UI (as `harnx — <title>`), updating
+live as the title is (re)generated or set with `.set title`. Adds an
+`example-title-agent` and `title_agent` / `title_update_threshold` settings to
+the example configuration.
+
+### Fixes
+
+- only prefetch selector-matching MCP servers at agent init (#1029) (#1030)
+- overhaul transcript history navigation seq mapping (#1032)
+- emit streamed notifications in order, not per-chunk tasks (#1038)
+- sandboxed acli auth — write synthetic token as YAML !!binary (#1052)
+- update dependency @assistant-ui/react to v0.14.27 (#1105)
+- update dependency @assistant-ui/react-ag-ui to v0.0.45 (#1106)
+- update dependency @assistant-ui/react-markdown to v0.14.6 (#1107)
+- Polish web chat UI with breadcrumb navigation, flatter composer styling, auto-growing input, cleaner token status display, and a real queue for submit-during-run behavior.
+
+#### fix(example): jira-auth-hook.py injected auth on the wrong Atlassian host
+
+acli `jira` data calls authenticate to `api.atlassian.com/cli/<cloud_id>/…`
+with the api_token; it separately POSTs to `as.atlassian.com/api/v1/batch`
+**unauthenticated** (`Basic BLANK`). The hook was matching `*.atlassian.com`,
+so it forced the real token onto the `as.atlassian.com` batch call — which
+Atlassian rejects there — aborting acli before it reached the working
+`api.atlassian.com` data call ("unauthorized").
+
+Now the hook injects only for the hosts acli authenticates to: `api.atlassian.com`
+and the configured site. `as.atlassian.com` is left untouched. (Verified against
+a capture of a working interactive `acli jira project list`.)
+
+#### fix(example): sandboxed acli authenticates again — synthetic token written as YAML `!!binary`
+
+`jira-auth-hook.py` wrote the synthetic acli config token as a plain string.
+acli stores its token as an encrypted SecretStore blob it expects as a YAML
+`!!binary` scalar (the YAML parser base64-decodes it before acli decrypts).
+With a plain string, acli failed to decrypt and aborted with "failed to
+retrieve authenticated status" **before** ever calling `api.atlassian.com`, so
+the proxy's on-the-wire token swap never ran and the sandboxed `acli` reported
+unauthorized. This restores the `!!binary` format (originally fixed in the
+inline `bash.yaml` config, dropped when the logic moved into the hook) across
+all three `jira-auth-hook.py` copies.
+
+The hook now also sources the token per platform automatically — `secret-tool`
+on Linux and `security find-generic-password` (login keychain) on macOS —
+instead of assuming `secret-tool`; `HARNX_JIRA_TOKEN_CMD` still overrides it.
+The Jira docs recipes now use `jira-auth-hook.py` directly rather than an inline
+config that re-serialized the token as a plain string.
+
+#### fix(packages): bash.yaml proxy-auth hook silently dropped all args after the first
+
+The `harnx-proxy-auth` hook command in `packages/{pantheon,coding}/mcp_servers/bash.yaml`
+is a folded (`>-`) YAML scalar. Its jq `then`/`end` lines were indented deeper
+than the `--hook` they belonged to, so YAML preserved those as **literal
+newlines between arguments**. Because the hook runs via `sh -c`, each newline
+was a command separator — `sh` executed `harnx-proxy-auth --hook '<first hook>'`
+and discarded everything after it (`--hook` for api.github.com, `--env`, and
+`--hook …/jira-auth-hook.py`), reporting `sh: --hook: not found`.
+
+Result: GitHub API (`api.github.com` Bearer) auth was never injected, the acli
+config dir was never set, and the Jira auth hook never ran (hence no log file).
+Fixed by aligning the jq continuation lines with `--hook` so the scalar folds
+to a single space-separated command; verified all arguments now reach
+`harnx-proxy-auth`.
+
+#### fix(example): robust config parsing, lazy init, and diagnostics for jira-auth-hook.py
+
+- **Config parsing**: use PyYAML when available, else an indentation-agnostic
+  line parser. The old hand-rolled parser required list items indented exactly
+  `  - ` and silently parsed **zero profiles** for other (valid) layouts,
+  producing `profile matching current_profile not found` and no auth injection.
+- **Lazy init**: read the acli config + keyring on the first Atlassian request
+  instead of at startup, retrying on failure — so the hook never touches the
+  keyring before it's ready and a transient miss isn't cached for the process's
+  lifetime.
+- **Diagnostics**: step-by-step logging (never the token), optional
+  `HARNX_JIRA_LOG_FILE`, a full traceback on failure, and a `/jira-auth-hook/debug`
+  endpoint reporting `initialized`, `target_hosts`, and the captured `error`.
+- Fall back to `ATLASSIAN_EMAIL` when the profile has no email (was producing a
+  blank Basic-auth username).
+
 ## 0.33.2 (2026-07-09)
 
 ### Features
