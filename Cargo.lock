@@ -3969,6 +3969,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-mcp-remote"
+version = "0.33.3"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "parking_lot",
+ "reqwest",
+ "rmcp",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "harnx-mcp-time"
 version = "0.33.3"
 dependencies = [
@@ -7155,6 +7172,7 @@ dependencies = [
  "pin-project-lite",
  "process-wrap",
  "rand 0.10.2",
+ "reqwest",
  "rmcp-macros",
  "schemars 1.2.1",
  "serde",
@@ -7960,9 +7978,9 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "sse-stream"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3962b63f038885f15bce2c6e02c0e7925c072f1ac86bb60fd44c5c6b762fb72"
+checksum = "39f24a9b78c40b90817bbcd1821c74ddfd74916aadd29403d001532a9195532d"
 dependencies = [
  "bytes",
  "futures-util",

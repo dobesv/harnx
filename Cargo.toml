@@ -19,6 +19,7 @@ members = [
     "crates/harnx-mcp-hooks-proxy",
     "crates/harnx-mcp-fs",
     "crates/harnx-mcp-time",
+    "crates/harnx-mcp-remote",
     "crates/harnx-mcp-plans",
     "crates/harnx-mcp-plans-core",
     "crates/harnx-mcp-plans-github",
@@ -144,7 +145,7 @@ which = "8.0.0"
 fuzzy-matcher = "0.3.7"
 terminal-colorsaurus = "1.0.3"
 duct = "1.0.0"
-rmcp = { version = "2.0", features = ["client", "server", "transport-child-process", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "2.0", features = ["client", "server", "transport-child-process", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }
 process-wrap = { version = "9", features = ["tokio1"] }
 libc = "0.2"
 agent-client-protocol = { git = "https://github.com/agentclientprotocol/rust-sdk", rev = "e410bada56f868f70c25b9a29567cece7d89d201" }

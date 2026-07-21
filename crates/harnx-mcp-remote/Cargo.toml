@@ -1,0 +1,31 @@
+[package]
+name = "harnx-mcp-remote"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "stdio MCP proxy that forwards to remote HTTP MCP servers"
+
+[dependencies]
+rmcp = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
+reqwest = { workspace = true }
+parking_lot = { workspace = true }
+
+[[bin]]
+name = "harnx-mcp-remote"
+path = "src/main.rs"
+
+[dev-dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+rmcp = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
