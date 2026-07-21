@@ -24,7 +24,7 @@ fn config_from_cli(cli: &Cli) -> Result<StreamableHttpClientTransportConfig> {
 }
 
 fn ensure_bearer_transport_is_secure(url: &Url, has_bearer: bool, insecure: bool) -> Result<()> {
-    if !has_bearer || insecure || uses_https(url) || is_loopback_url(url) {
+    if bearer_transport_is_secure(url, has_bearer, insecure) {
         return Ok(());
     }
 
@@ -32,6 +32,17 @@ fn ensure_bearer_transport_is_secure(url: &Url, has_bearer: bool, insecure: bool
         "refusing to send bearer token over non-HTTPS URL {}; use HTTPS, loopback, or --insecure",
         url
     );
+}
+
+/// A bearer token may be sent when there is no token, when the caller opts out
+/// of the check, or when the endpoint is already safe (HTTPS or loopback).
+fn bearer_transport_is_secure(url: &Url, has_bearer: bool, insecure: bool) -> bool {
+    let bearer_check_waived = !has_bearer || insecure;
+    bearer_check_waived || endpoint_is_safe(url)
+}
+
+fn endpoint_is_safe(url: &Url) -> bool {
+    uses_https(url) || is_loopback_url(url)
 }
 
 fn uses_https(url: &Url) -> bool {
