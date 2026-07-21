@@ -125,16 +125,25 @@ mod tests {
         super::config_from_cli(&cli).expect("valid transport config")
     }
 
+    /// Asserts that the given CLI args produce a config whose bearer auth header
+    /// matches `expected`. Shared by the several "token is accepted" cases.
+    fn assert_auth_header(args: &[&str], expected: &str) {
+        let config = config_from_args(args);
+        assert_eq!(config.auth_header.as_deref(), Some(expected));
+    }
+
     #[test]
     fn bearer_token_sets_auth_header() {
-        let config = config_from_args(&[
-            "harnx-mcp-remote",
-            "--url",
-            "https://example.com",
-            "--bearer-token",
+        assert_auth_header(
+            &[
+                "harnx-mcp-remote",
+                "--url",
+                "https://example.com",
+                "--bearer-token",
+                "mytoken",
+            ],
             "mytoken",
-        ]);
-        assert_eq!(config.auth_header.as_deref(), Some("mytoken"));
+        );
     }
 
     #[test]
@@ -186,27 +195,31 @@ mod tests {
 
     #[test]
     fn bearer_token_over_http_loopback_is_allowed() {
-        let config = config_from_args(&[
-            "harnx-mcp-remote",
-            "--url",
-            "http://127.0.0.1:8000",
-            "--bearer-token",
+        assert_auth_header(
+            &[
+                "harnx-mcp-remote",
+                "--url",
+                "http://127.0.0.1:8000",
+                "--bearer-token",
+                "secret",
+            ],
             "secret",
-        ]);
-        assert_eq!(config.auth_header.as_deref(), Some("secret"));
+        );
     }
 
     #[test]
     fn bearer_token_over_http_non_loopback_is_allowed_with_insecure() {
-        let config = config_from_args(&[
-            "harnx-mcp-remote",
-            "--url",
-            "http://example.com",
-            "--bearer-token",
+        assert_auth_header(
+            &[
+                "harnx-mcp-remote",
+                "--url",
+                "http://example.com",
+                "--bearer-token",
+                "secret",
+                "--insecure",
+            ],
             "secret",
-            "--insecure",
-        ]);
-        assert_eq!(config.auth_header.as_deref(), Some("secret"));
+        );
     }
 
     #[test]
