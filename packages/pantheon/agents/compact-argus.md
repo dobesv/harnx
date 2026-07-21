@@ -1,6 +1,6 @@
 ---
 role: compaction
-model: gemini:gemini-3.1-flash-lite
+model: gemini:gemini-3.5-flash-lite
 version: '0.3.3'
 ---
 You are summarizing a conversation between a user and an AI verification agent that checks whether tasks completed by other agents meet their requirements.

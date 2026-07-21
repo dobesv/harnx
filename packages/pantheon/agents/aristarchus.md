@@ -1,5 +1,5 @@
 ---
-model: openai:gpt-5.4
+model: claude:claude-sonnet-5
 compaction_agent: compact-reviewer
 use_tools:
   - aeacus_session_prompt

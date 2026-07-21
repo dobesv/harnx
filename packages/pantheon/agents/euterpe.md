@@ -1,6 +1,6 @@
 ---
 role: subagent
-model: gemini:gemini-3-flash-preview
+model: gemini:gemini-3.6-flash
 compaction_agent: compact-reviewer
 use_tools:
 - bash_exec

@@ -1,6 +1,6 @@
 ---
 role: compaction
-model: gemini:gemini-3.1-flash-lite
+model: gemini:gemini-3.5-flash-lite
 version: '0.3.3'
 ---
 You are summarizing a conversation between a user and an AI deployment verification agent that assesses deployment readiness and produces Go/No-Go checklists for pull requests.
