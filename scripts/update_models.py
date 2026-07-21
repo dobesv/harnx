@@ -310,6 +310,26 @@ def is_adaptive_only_opus(name: str) -> bool:
     return minor is not None and minor >= ADAPTIVE_ONLY_OPUS_MIN_MINOR
 
 
+def claude_requires_max_tokens(name: str) -> bool:
+    """True for Claude models that reject requests without an explicit
+    `max_tokens` (the Messages API returns `max_tokens: Field required`).
+
+    Covers the modern Sonnet/Haiku families from the 4-5 generation onward and
+    any bare major >= 5 name (e.g. `claude-sonnet-5`), matched by name so new
+    releases are handled automatically without a per-model list. Opus models
+    are handled separately by `is_adaptive_only_opus` (see apply_base_thinking),
+    so they are intentionally excluded here to avoid changing their existing
+    behaviour.
+    """
+    match = re.search(r"claude-(sonnet|haiku)-(\d+)(?:-(\d+))?", name)
+    if not match:
+        return False
+    major = int(match.group(2))
+    minor = int(match.group(3)) if match.group(3) is not None else 0
+    # Major version >= 5 (e.g. claude-sonnet-5), or the 4-5+ point releases.
+    return major >= 5 or (major == 4 and minor >= 5)
+
+
 def is_variant_name(name: str) -> bool:
     return ":" in name and name.rsplit(":", 1)[1] in VARIANT_SUFFIXES
 
@@ -561,7 +581,9 @@ def apply_base_thinking(model: dict[str, Any], provider: str) -> None:
         return
     if name.startswith("claude-") and is_adaptive_only_opus(name):
         model["patches"] = [claude_adaptive_patch(BASE_EFFORT)]
-        # These models reject requests without an explicit max_tokens.
+    # Modern Claude models reject requests without an explicit max_tokens,
+    # regardless of the adaptive-thinking patch above.
+    if claude_requires_max_tokens(name):
         model["require_max_tokens"] = True
 
 

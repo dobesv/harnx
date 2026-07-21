@@ -1,10 +1,10 @@
 ---
 role: assistant
-model: claude:claude-sonnet-4-6
+model: claude:claude-sonnet-5
 compaction_agent: compact-coder
 model_fallbacks:
   - claude:claude-opus-4-8
-  - openai:gpt-5.4
+  - openai:gpt-5.6-sol
 
 use_tools:
   - bash_exec

@@ -741,6 +741,20 @@
       output_price: 9
       supports_vision: true
       supports_tool_use: true
+    - name: gemini-3.5-flash-lite
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.25
+      output_price: 1.5
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemini-3.6-flash
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 1.5
+      output_price: 9
+      supports_vision: true
+      supports_tool_use: true
     - name: gemma-3-27b-it
       max_input_tokens: 131072
       max_output_tokens: 8192
@@ -833,6 +847,7 @@
     - name: claude-haiku-4-5
       max_input_tokens: 200000
       max_output_tokens: 64000
+      require_max_tokens: true
       input_price: 1
       output_price: 5
       supports_vision: true
@@ -1076,6 +1091,7 @@
     - name: claude-sonnet-4-5
       max_input_tokens: 200000
       max_output_tokens: 64000
+      require_max_tokens: true
       input_price: 3
       output_price: 15
       supports_vision: true
@@ -1132,6 +1148,7 @@
     - name: claude-sonnet-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 2
       output_price: 10
       supports_vision: true
@@ -2074,6 +2091,7 @@
     - name: claude-haiku-4-5
       max_input_tokens: 200000
       max_output_tokens: 8192
+      require_max_tokens: true
       input_price: 1
       output_price: 5
       supports_vision: true
@@ -2403,6 +2421,7 @@
     - name: claude-sonnet-4-5
       max_input_tokens: 200000
       max_output_tokens: 64000
+      require_max_tokens: true
       input_price: 3
       output_price: 15
       supports_vision: true
@@ -2459,6 +2478,7 @@
     - name: claude-sonnet-4-6@default
       max_input_tokens: 1000000
       max_output_tokens: 64000
+      require_max_tokens: true
       input_price: 3
       output_price: 15
       supports_vision: true
@@ -2495,6 +2515,7 @@
     - name: claude-sonnet-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 2
       output_price: 10
       supports_vision: true
@@ -2513,6 +2534,7 @@
     - name: claude-sonnet-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 2
       output_price: 10
       supports_vision: true
@@ -2654,6 +2676,20 @@
       supports_vision: true
       supports_tool_use: true
     - name: gemini-3.5-flash
+      max_input_tokens: 1048576
+      max_output_tokens: 65535
+      input_price: 1.5
+      output_price: 9
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemini-3.5-flash-lite
+      max_input_tokens: 1048576
+      max_output_tokens: 65535
+      input_price: 0.25
+      output_price: 1.5
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemini-3.6-flash
       max_input_tokens: 1048576
       max_output_tokens: 65535
       input_price: 1.5
