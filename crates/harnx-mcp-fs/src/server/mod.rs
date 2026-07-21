@@ -26,12 +26,13 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex, Weak};
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
 mod handler;
 mod handlers;
@@ -48,6 +49,8 @@ pub struct FsServer {
     roots: Arc<RwLock<Vec<PathBuf>>>,
     roots_initialized: Arc<AtomicBool>,
     history: Arc<HistoryManager>,
+    repo_locks: Arc<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>>,
+    file_locks: Arc<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>>,
 }
 
 /// Build a `_meta` block with only the call template. We deliberately

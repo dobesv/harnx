@@ -15,10 +15,67 @@ impl FsServer {
             roots: Arc::new(RwLock::new(initial_roots.clone())),
             roots_initialized: Arc::new(AtomicBool::new(false)),
             history: Arc::new(HistoryManager::new(&initial_roots)),
+            repo_locks: Arc::new(Mutex::new(HashMap::new())),
+            file_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    async fn snapshot_before(&self, path: &Path, label: &str) -> Option<gix::ObjectId> {
+    fn repo_lock_key_for_path(path: &Path) -> PathBuf {
+        harnx_mcp_history::discover::find_repo_for_path(path)
+            .or_else(|| path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| path.to_path_buf())
+    }
+
+    fn repo_lock_for_path(&self, path: &Path) -> Arc<RwLock<()>> {
+        let key = Self::repo_lock_key_for_path(path);
+        let mut locks = self
+            .repo_locks
+            .lock()
+            .expect("repo lock registry mutex poisoned");
+        locks.retain(|_, weak| weak.strong_count() > 0);
+
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+
+        let lock = Arc::new(RwLock::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+
+    fn lock_for_path(&self, path: &Path) -> Arc<AsyncMutex<()>> {
+        let mut locks = self
+            .file_locks
+            .lock()
+            .expect("per-file lock registry mutex poisoned");
+        locks.retain(|_, weak| weak.strong_count() > 0);
+
+        if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+            return lock;
+        }
+
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+        lock
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn repo_read_guard_for_path(
+        &self,
+        path: &Path,
+    ) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.repo_lock_for_path(path).read_owned().await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn repo_write_guard_for_path(
+        &self,
+        path: &Path,
+    ) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.repo_lock_for_path(path).write_owned().await
+    }
+
+    pub(crate) async fn snapshot_before(&self, path: &Path, label: &str) -> Option<gix::ObjectId> {
         self.history
             .snapshot_file(path, label)
             .await
@@ -28,7 +85,7 @@ impl FsServer {
             .ok()
     }
 
-    async fn snapshot_after_diff(
+    pub(crate) async fn snapshot_after_diff(
         &self,
         path: &Path,
         before: Option<gix::ObjectId>,
@@ -467,6 +524,10 @@ impl FsServer {
         let roots = self.roots.read().await;
         let path = validate_write_path(&params.path, &roots).map_err(invalid_params)?;
         drop(roots);
+        let repo_lock = self.repo_lock_for_path(&path);
+        let _repo_guard = repo_lock.read().await;
+        let file_lock = self.lock_for_path(&path);
+        let _file_guard = file_lock.lock().await;
 
         if params.content.len() > WRITE_MAX_BYTES {
             return tool_error(format!(
@@ -512,6 +573,10 @@ impl FsServer {
         let roots = self.roots.read().await;
         let path = validate_write_path(&params.path, &roots).map_err(invalid_params)?;
         drop(roots);
+        let repo_lock = self.repo_lock_for_path(&path);
+        let _repo_guard = repo_lock.read().await;
+        let file_lock = self.lock_for_path(&path);
+        let _file_guard = file_lock.lock().await;
 
         let before_snap = self.snapshot_before(&path, "before insert").await;
 
@@ -564,6 +629,10 @@ impl FsServer {
         let roots = self.roots.read().await;
         let path = validate_write_path(&params.path, &roots).map_err(invalid_params)?;
         drop(roots);
+        let repo_lock = self.repo_lock_for_path(&path);
+        let _repo_guard = repo_lock.read().await;
+        let file_lock = self.lock_for_path(&path);
+        let _file_guard = file_lock.lock().await;
 
         let before_snap = self.snapshot_before(&path, "before re_replace").await;
 
@@ -635,6 +704,10 @@ impl FsServer {
         let roots = self.roots.read().await;
         let path = validate_write_path(&params.path, &roots).map_err(invalid_params)?;
         drop(roots);
+        let repo_lock = self.repo_lock_for_path(&path);
+        let _repo_guard = repo_lock.read().await;
+        let file_lock = self.lock_for_path(&path);
+        let _file_guard = file_lock.lock().await;
 
         let before_snap = self.snapshot_before(&path, "before edit_file").await;
 
@@ -906,12 +979,18 @@ impl FsServer {
         let path = validate_path(&params.repo_path, &roots).map_err(invalid_params)?;
         drop(roots);
 
+        // Validate inputs and resolve the repository root *before* taking the
+        // exclusive repo lock, so invalid requests fail fast without blocking
+        // concurrent edits, and so the lock is keyed on the real repo root.
         let commit_id = gix::ObjectId::from_hex(params.commit_id.as_bytes())
             .map_err(|e| ErrorData::invalid_params(format!("invalid commit_id: {e}"), None))?;
 
         let repo_dir = harnx_mcp_history::discover::find_repo_for_path(&path).ok_or_else(|| {
             ErrorData::invalid_params("path is not inside a git repository".to_string(), None)
         })?;
+
+        let repo_lock = self.repo_lock_for_path(&repo_dir);
+        let _repo_guard = repo_lock.write().await;
 
         let new_commit_id = self
             .history
