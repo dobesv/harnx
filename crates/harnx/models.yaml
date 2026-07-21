@@ -741,9 +741,6 @@
       output_price: 9
       supports_vision: true
       supports_tool_use: true
-    # Curated GA entries added ahead of LiteLLM registry publication (2026-07-21).
-    # Pricing carried forward from the prior flash / flash-lite tier; LiteLLM data
-    # will overwrite shared fields on the next `scripts/update_models.py` sync.
     - name: gemini-3.5-flash-lite
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -850,6 +847,7 @@
     - name: claude-haiku-4-5
       max_input_tokens: 200000
       max_output_tokens: 64000
+      require_max_tokens: true
       input_price: 1
       output_price: 5
       supports_vision: true
@@ -1093,6 +1091,7 @@
     - name: claude-sonnet-4-5
       max_input_tokens: 200000
       max_output_tokens: 64000
+      require_max_tokens: true
       input_price: 3
       output_price: 15
       supports_vision: true
@@ -1149,6 +1148,7 @@
     - name: claude-sonnet-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 2
       output_price: 10
       supports_vision: true
@@ -2091,6 +2091,7 @@
     - name: claude-haiku-4-5
       max_input_tokens: 200000
       max_output_tokens: 8192
+      require_max_tokens: true
       input_price: 1
       output_price: 5
       supports_vision: true
@@ -2420,6 +2421,7 @@
     - name: claude-sonnet-4-5
       max_input_tokens: 200000
       max_output_tokens: 64000
+      require_max_tokens: true
       input_price: 3
       output_price: 15
       supports_vision: true
@@ -2476,6 +2478,7 @@
     - name: claude-sonnet-4-6@default
       max_input_tokens: 1000000
       max_output_tokens: 64000
+      require_max_tokens: true
       input_price: 3
       output_price: 15
       supports_vision: true
@@ -2512,6 +2515,7 @@
     - name: claude-sonnet-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 2
       output_price: 10
       supports_vision: true
@@ -2530,6 +2534,7 @@
     - name: claude-sonnet-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 2
       output_price: 10
       supports_vision: true
@@ -2677,7 +2682,6 @@
       output_price: 9
       supports_vision: true
       supports_tool_use: true
-    # Curated GA entries added ahead of LiteLLM registry publication (2026-07-21).
     - name: gemini-3.5-flash-lite
       max_input_tokens: 1048576
       max_output_tokens: 65535
