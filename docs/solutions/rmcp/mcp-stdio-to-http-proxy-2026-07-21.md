@@ -58,7 +58,7 @@ One rmcp 2.2.0 type handles both MCP 2024-11 SSE and 2025-03 streamable HTTP. En
 
 ```toml
 # Cargo.toml root
-rmcp = { version = "0.2", features = [
+rmcp = { version = "2.0", features = [ # Resolves to 2.2.0+
     "client",
     "server",
     "transport-streamable-http-client-reqwest",  # ADD THIS
@@ -116,25 +116,24 @@ config.auth_header = cli.bearer_token.clone();
 Combine cert+key PEM bytes into one buffer; use `from_pem` (not `from_pem_parts` on rustls backend):
 
 ```rust
-fn build_identity(cert_pem: &[u8], key_pem: &[u8]) -> reqwest::Identity {
+fn build_identity(cert_pem: &[u8], key_pem: &[u8]) -> anyhow::Result<reqwest::Identity> {
     let mut combined = Vec::with_capacity(cert_pem.len() + key_pem.len());
     combined.extend_from_slice(cert_pem);
     combined.extend_from_slice(key_pem);
-    reqwest::Identity::from_pem(&combined)
-        .expect("invalid cert/key PEM")
+    Ok(reqwest::Identity::from_pem(&combined)?)
 }
 
-fn build_client(cert_path: &Path, key_path: &Path, ca_path: Option<&Path>) -> anyhow::Result<reqwest::Client> {
+async fn build_client(cert_path: &Path, key_path: &Path, ca_path: Option<&Path>) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder();
     
     // mTLS identity
-    let cert = std::fs::read(cert_path)?;
-    let key = std::fs::read(key_path)?;
-    builder = builder.identity(build_identity(&cert, &key));
+    let cert = tokio::fs::read(cert_path).await?;
+    let key = tokio::fs::read(key_path).await?;
+    builder = builder.identity(build_identity(&cert, &key)?);
     
     // Custom CA (optional)
     if let Some(ca) = ca_path {
-        let ca_pem = std::fs::read(ca)?;
+        let ca_pem = tokio::fs::read(ca).await?;
         let cert = reqwest::Certificate::from_pem(&ca_pem)?;
         builder = builder.add_root_certificate(cert);
     }
@@ -172,6 +171,7 @@ fn main() -> anyhow::Result<()> {
 
 async fn async_main() -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
+    let transport = rmcp::transport::stdio();
     let serve_ct = CancellationToken::new();
     
     tokio::select! {
@@ -197,34 +197,31 @@ Key points:
 - Create `Signal` before `serve_with_ct` — installs OS handler immediately
 - Use `serve_with_ct` + `tokio::select!` to handle pre-initialize SIGTERM
 - Manual runtime + `shutdown_timeout(1s)` guarantees exit (blocked stdio thread)
-- Take `RunningService` out of `RwLock` before `.await` — no lock held across await
 
-### 7. Transparent capability reflection
+### 7. Capability reflection via peer_info()
 
-After `serve_client()` completes handshake, read cached remote capabilities via `peer.peer_info()`:
+When `harnx-mcp-remote` initializes, it connects to the remote server first. Instead of hardcoding capabilities, reflect the remote's actual capabilities:
 
 ```rust
 async fn initialize(
     &self,
-    request: InitializeRequestParams,
-    context: RequestContext<RoleServer>,
-) -> Result<InitializeResult, ErrorData> {
-    // Connect to remote
-    let transport = build_transport(&self.cli)?;
-    let service = rmcp::service::serve_client(RemoteClientHandler, transport).await
-        .map_err(proxy_error)?;
+    _request: InitializeRequestParams,
+    _context: RequestContext<RoleServer>,
+) -> Result<rmcp::model::InitializeResult, ErrorData> {
+    // 1. Connect to remote
+    let transport = build_transport(&self.cli).await?;
+    let service = rmcp::service::serve_client(RemoteClientHandler, transport).await?;
     let peer = service.peer().clone();
     
-    // Store state
-    *self.peer.write().await = Some(peer.clone());
-    *self.client_service.write().await = Some(service);
+    // 2. Extract remote capabilities
+    let remote_info = peer.peer_info().expect("handshake must be complete");
     
-    // Reflect remote capabilities + instructions, rebrand server_info
-    let remote_info = peer.peer_info()
-        .ok_or_else(|| ErrorData::internal_error("remote info unavailable", None))?;
+    // 3. Store for proxying
+    *self.peer.write() = Some(peer);
+    *self.client_service.write() = Some(service);
     
-    let mut result = InitializeResult::default();
-    result.capabilities = remote_info.capabilities.clone();
+    // 4. Return remote info + proxy's own name/version
+    let mut result = remote_info.clone();
     result.instructions = remote_info.instructions.clone();
     result.server_info = ServerInfo {
         name: "harnx-mcp-remote".into(),

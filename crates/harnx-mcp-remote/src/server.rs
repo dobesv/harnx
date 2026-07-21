@@ -58,10 +58,8 @@ impl ServerHandler for RemoteProxyServer {
                 .enable_resources()
                 .build(),
         );
-        info.server_info = rmcp::model::Implementation::new(
-            "harnx-mcp-remote",
-            env!("CARGO_PKG_VERSION"),
-        );
+        info.server_info =
+            rmcp::model::Implementation::new("harnx-mcp-remote", env!("CARGO_PKG_VERSION"));
         info
     }
 
@@ -71,6 +69,7 @@ impl ServerHandler for RemoteProxyServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::InitializeResult, ErrorData> {
         let transport = build_transport(&self.cli)
+            .await
             .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
         let service = rmcp::service::serve_client(RemoteClientHandler, transport)
             .await
@@ -80,10 +79,8 @@ impl ServerHandler for RemoteProxyServer {
             .peer_info()
             .map(|info| (*info).clone())
             .unwrap_or_else(|| self.get_info());
-        info.server_info = rmcp::model::Implementation::new(
-            "harnx-mcp-remote",
-            env!("CARGO_PKG_VERSION"),
-        );
+        info.server_info =
+            rmcp::model::Implementation::new("harnx-mcp-remote", env!("CARGO_PKG_VERSION"));
         *self.peer.write() = Some(peer);
         *self.client_service.write() = Some(service);
         Ok(info)

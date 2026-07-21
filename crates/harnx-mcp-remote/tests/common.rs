@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::Router;
 use axum::extract::Request;
 use axum::middleware::Next;
+use axum::Router;
 use rmcp::handler::client::ClientHandler;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -13,11 +13,11 @@ use rmcp::model::{
     InitializeRequestParams, ServerInfo,
 };
 use rmcp::service::{RequestContext, RoleClient, RoleServer};
-use rmcp::transport::TokioChildProcess;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
-use serde_json::{Map, Value, json};
+use rmcp::transport::TokioChildProcess;
+use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use serde_json::{json, Map, Value};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -89,7 +89,11 @@ impl TestHttpServer {
 #[tool_handler]
 impl ServerHandler for TestHttpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(rmcp::model::ServerCapabilities::builder().enable_tools().build())
+        ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
     }
 }
 
@@ -102,7 +106,7 @@ pub struct HttpTestServerHandle {
 impl HttpTestServerHandle {
     pub async fn shutdown(self) {
         self.shutdown.cancel();
-        let _ = self.join.await;
+        self.join.await.expect("test HTTP server task panicked");
     }
 }
 
@@ -166,22 +170,27 @@ pub async fn spawn_auth_guard_server(expected_auth: &'static str) -> Result<Http
         Arc::new(NeverSessionManager::default()),
         config,
     );
-    let app = Router::new().nest_service("/mcp", mcp_service).route_layer(
-        axum::middleware::from_fn(move |req: Request, next: Next| async move {
-            let authorized = req
-                .headers()
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                == Some(expected_auth);
-            if !authorized {
-                return Ok::<_, std::convert::Infallible>(axum::http::Response::builder()
-                    .status(axum::http::StatusCode::UNAUTHORIZED)
-                    .body(axum::body::Body::from("unauthorized"))
-                    .expect("response"));
-            }
-            Ok::<_, std::convert::Infallible>(next.run(req).await)
-        }),
-    );
+    let app =
+        Router::new()
+            .nest_service("/mcp", mcp_service)
+            .route_layer(axum::middleware::from_fn(
+                move |req: Request, next: Next| async move {
+                    let authorized = req
+                        .headers()
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        == Some(expected_auth);
+                    if !authorized {
+                        return Ok::<_, std::convert::Infallible>(
+                            axum::http::Response::builder()
+                                .status(axum::http::StatusCode::UNAUTHORIZED)
+                                .body(axum::body::Body::from("unauthorized"))
+                                .expect("response"),
+                        );
+                    }
+                    Ok::<_, std::convert::Infallible>(next.run(req).await)
+                },
+            ));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
     let shutdown_wait = shutdown.clone();
@@ -204,10 +213,7 @@ pub async fn spawn_auth_guard_server(expected_auth: &'static str) -> Result<Http
 
 pub async fn spawn_proxy_client(
     args: &[&str],
-) -> Result<(
-    rmcp::service::RunningService<RoleClient, TestClientHandler>,
-    tokio::process::ChildStderr,
-)> {
+) -> Result<rmcp::service::RunningService<RoleClient, TestClientHandler>> {
     let bin = proxy_binary_path().context("harnx-mcp-remote binary not found")?;
     let mut command = tokio::process::Command::new(bin);
     command.args(args);
@@ -216,19 +222,27 @@ pub async fn spawn_proxy_client(
         .spawn()
         .context("spawn harnx-mcp-remote")?;
     let mut stderr = stderr.expect("proxy stderr should be piped");
-    let service = match rmcp::service::serve_client(TestClientHandler, transport).await {
-        Ok(service) => service,
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut stderr_buf = String::new();
+        let _ = stderr.read_to_string(&mut stderr_buf).await;
+        stderr_buf
+    });
+    match rmcp::service::serve_client(TestClientHandler, transport).await {
+        Ok(service) => {
+            std::mem::drop(stderr_task);
+            Ok(service)
+        }
         Err(err) => {
-            let mut stderr_buf = String::new();
-            use tokio::io::AsyncReadExt;
-            let _ = stderr.read_to_string(&mut stderr_buf).await;
-            return Err(anyhow::anyhow!(
+            let stderr_buf = stderr_task
+                .await
+                .unwrap_or_else(|_| String::from("<stderr task panicked>"));
+            Err(anyhow::anyhow!(
                 "connect MCP client to proxy stdio: {err}; proxy stderr: {}",
                 stderr_buf.trim()
-            ));
+            ))
         }
-    };
-    Ok((service, stderr))
+    }
 }
 
 pub fn text_content(result: &CallToolResult) -> String {

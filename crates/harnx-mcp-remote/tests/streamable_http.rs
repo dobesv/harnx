@@ -9,7 +9,7 @@ use serde_json::json;
 async fn proxies_streamable_http_tools_and_calls() -> Result<()> {
     let server = spawn_http_test_server(None, false).await?;
     let url = format!("http://127.0.0.1:{}/mcp", server.port);
-    let (proxy, _stderr) = spawn_proxy_client(&["--url", &url]).await?;
+    let proxy = spawn_proxy_client(&["--url", &url]).await?;
     let peer = proxy.peer().clone();
 
     let proxy_info = peer
@@ -21,7 +21,11 @@ async fn proxies_streamable_http_tools_and_calls() -> Result<()> {
     assert!(
         tools.tools.iter().any(|tool| tool.name.as_ref() == "echo"),
         "expected echo tool in proxied list, got {:?}",
-        tools.tools.iter().map(|tool| tool.name.as_ref()).collect::<Vec<_>>()
+        tools
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>()
     );
 
     let result = peer
@@ -31,7 +35,10 @@ async fn proxies_streamable_http_tools_and_calls() -> Result<()> {
         )
         .await?;
     let text = text_content(&result);
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&text)?["text"], "hello through proxy");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text)?["text"],
+        "hello through proxy"
+    );
 
     proxy.cancel().await?;
     server.shutdown().await;

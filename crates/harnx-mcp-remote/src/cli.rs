@@ -12,6 +12,13 @@ pub struct Cli {
     #[arg(long, env = "MCP_REMOTE_BEARER_TOKEN", hide_env_values = true)]
     pub bearer_token: Option<String>,
 
+    #[arg(
+        long,
+        env = "MCP_REMOTE_INSECURE",
+        help = "Allow bearer tokens over non-HTTPS transport for non-loopback hosts"
+    )]
+    pub insecure: bool,
+
     #[arg(long, action = ArgAction::Append)]
     pub header: Vec<String>,
 

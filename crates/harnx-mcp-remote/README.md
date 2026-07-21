@@ -4,12 +4,12 @@
 
 ## Overview
 
-This binary acts as a transparent proxy, allowing you to treat a remote HTTP-based MCP server as if it were running locally via stdio. It handles all necessary transport negotiation and authentication, providing a seamless integration for tools and services that require a remote backend.
+This binary acts as a stdio-to-HTTP proxy, allowing you to treat a remote HTTP-based MCP server as if it were running locally via stdio. It handles transport negotiation and authentication for forwarded MCP capabilities such as tools, prompts, and resources.
 
 Key capabilities include:
 - **Unified Transport Support**: Automatically handles both modern streamable HTTP (MCP 2025-03) and legacy SSE (MCP 2024-11) transports.
 - **Flexible Authentication**: Support for Bearer tokens, custom HTTP headers, and mutual TLS (mTLS).
-- **Environment-First Configuration**: All settings can be provided via CLI flags or environment variables for easy deployment.
+- **Environment-First Configuration**: Most settings can be provided via CLI flags or environment variables for easy deployment (`--header` remains CLI-only).
 
 ## Installation
 
@@ -76,7 +76,8 @@ All command-line flags (except `--header`) have corresponding environment variab
 | Flag | Environment Variable | Description |
 | :--- | :--- | :--- |
 | `--url <URL>` | `MCP_REMOTE_URL` | **Required.** The URL of the remote MCP server. |
-| `--bearer-token <TOKEN>` | `MCP_REMOTE_BEARER_TOKEN` | Token for the `Authorization: Bearer` header. |
+| `--bearer-token <TOKEN>` | `MCP_REMOTE_BEARER_TOKEN` | Token for the `Authorization: Bearer` header. HTTPS required unless loopback or `--insecure` is set. |
+| `--insecure` | `MCP_REMOTE_INSECURE` | Allow bearer tokens over plaintext HTTP for non-loopback hosts. |
 | `--header <NAME:VALUE>` | (None) | Repeatable flag for custom HTTP headers. |
 | `--tls-cert <PATH>` | `MCP_REMOTE_TLS_CERT` | Path to the client's PEM certificate. |
 | `--tls-key <PATH>` | `MCP_REMOTE_TLS_KEY` | Path to the client's PEM private key. |

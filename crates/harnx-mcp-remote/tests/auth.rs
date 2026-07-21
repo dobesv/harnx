@@ -26,8 +26,7 @@ async fn missing_bearer_token_surfaces_remote_401() -> Result<()> {
 async fn bearer_token_allows_proxy_calls() -> Result<()> {
     let server = spawn_auth_guard_server("Bearer test-token").await?;
     let url = format!("http://127.0.0.1:{}/mcp", server.port);
-    let (proxy, _stderr) =
-        spawn_proxy_client(&["--url", &url, "--bearer-token", "test-token"]).await?;
+    let proxy = spawn_proxy_client(&["--url", &url, "--bearer-token", "test-token"]).await?;
     let peer = proxy.peer().clone();
 
     let tools = peer.list_tools(None).await?;
@@ -35,10 +34,14 @@ async fn bearer_token_allows_proxy_calls() -> Result<()> {
 
     let result = peer
         .call_tool(
-            CallToolRequestParams::new("echo").with_arguments(tool_args(json!({ "text": "auth ok" }))),
+            CallToolRequestParams::new("echo")
+                .with_arguments(tool_args(json!({ "text": "auth ok" }))),
         )
         .await?;
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&text_content(&result))?["text"], "auth ok");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text_content(&result))?["text"],
+        "auth ok"
+    );
 
     proxy.cancel().await?;
     server.shutdown().await;
