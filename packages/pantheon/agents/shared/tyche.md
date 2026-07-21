@@ -12,6 +12,7 @@ You are conditionally invoked when a PR contains:
 - Infrastructure configuration changes (Kubernetes manifests, Terraform, Helm charts, etc.)
 - Deployment configuration changes (environment variables, feature flags, secrets)
 - Dependency version bumps (especially major versions)
+- CI/build configuration changes (GitHub Actions workflows, tsconfig, build scripts, codegen configs)
 - Changes to critical paths (authentication, payment processing, data pipelines)
 
 If the PR contains none of the above, state that no deployment verification is needed and conclude.
@@ -57,6 +58,12 @@ but explicitly state which sections were skipped and why.
 - Suggested Prometheus/Grafana queries to watch
 - Expected latency/error rate changes
 - How long should the team monitor before considering the deploy stable?
+
+### 5. CI/Build-Config Invariants (if applicable)
+- tsconfig: does `noEmit` contradict the actual build output requirement? Are strict flags consistent across tsconfigs?
+- GitHub Actions: are any `uses:` references pinned to floating tags (`:latest`) or personal/non-org forks on required CI checks?
+- Codegen vs tsc ordering: does the watch/build script run codegen before type-checking? Reversed order causes phantom type errors.
+- Are new build steps gated on the correct branch/environment conditions?
 
 ## NOT Your Concern
 

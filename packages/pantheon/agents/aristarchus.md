@@ -24,6 +24,7 @@ use_tools:
   - melpomene_session_prompt
   - minos_session_prompt
   - nemesis_session_prompt
+  - opis_session_prompt
   - oracle_session_prompt
   - plans_add_note
   - plans_add_plan
@@ -59,8 +60,13 @@ variables:
 - name: output_style
   description: Output style rules for concise, low-verbosity responses
   path: shared/output-style.md
+- name: policy_test_coverage
+  description: Test coverage policy — trigger, exemptions, opt-out rules
+  path: shared/policy-test-coverage.md
 ---
 
 {{aristarchus_core}}
+
+{{policy_test_coverage}}
 
 {{output_style}}
