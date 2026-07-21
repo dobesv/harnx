@@ -39,6 +39,10 @@ const SESSION_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
 enum AcpForward {
     /// Text chunk for `SessionUpdate::AgentMessageChunk`.
     Text(String, Option<AgentSource>),
+    /// Error chunk for `SessionUpdate::AgentMessageChunk`, flagged via
+    /// `harnx:error` meta so ACP clients can render it without accumulating it
+    /// into `response_text`.
+    Error(String, Option<AgentSource>),
     /// User-turn text for `SessionUpdate::UserMessageChunk`. Kept separate
     /// from `Text` so replayed/attached user turns are NOT mixed into the
     /// parent's accumulated `response_text` (which forms the next agent's
@@ -118,7 +122,7 @@ pub(crate) fn event_to_forward(
             Some(AcpForward::Text(output, source))
         }
         AgentEvent::Model(ModelEvent::Error(err)) if !err.is_empty() => {
-            Some(AcpForward::Text(format!("error: {err}"), source))
+            Some(AcpForward::Error(err, source))
         }
         AgentEvent::User(UserEvent::Message { content }) if !content.is_empty() => {
             Some(AcpForward::UserText(content, source))
@@ -442,6 +446,31 @@ impl HarnxAgent {
             }
         }
 
+        fn send_notify_error(
+            conn: &Option<acp::ConnectionTo<acp::Client>>,
+            session_key: &str,
+            err: String,
+            source: Option<AgentSource>,
+        ) {
+            if err.is_empty() {
+                return;
+            }
+            if let Some(conn) = conn.as_ref() {
+                let sid = session_key.to_string();
+                let mut meta = source
+                    .as_ref()
+                    .and_then(meta_from_source)
+                    .unwrap_or_default();
+                meta.insert("harnx:error".to_string(), serde_json::Value::Bool(true));
+                let chunk = ContentChunk::new(format!("error: {err}").into()).meta(meta);
+                let notification = SessionNotification::new(
+                    SessionId::new(sid),
+                    SessionUpdate::AgentMessageChunk(chunk),
+                );
+                let _ = conn.send_notification(notification);
+            }
+        }
+
         fn send_notify_user_text(
             conn: &Option<acp::ConnectionTo<acp::Client>>,
             session_key: &str,
@@ -572,6 +601,9 @@ impl HarnxAgent {
             match forward {
                 AcpForward::Text(text, source) => {
                     send_notify_text(conn, session_key, text, source);
+                }
+                AcpForward::Error(err, source) => {
+                    send_notify_error(conn, session_key, err, source);
                 }
                 AcpForward::UserText(text, source) => {
                     send_notify_user_text(conn, session_key, text, source);

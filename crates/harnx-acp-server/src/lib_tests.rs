@@ -446,11 +446,11 @@ mod tests {
         );
 
         match rx.try_recv().expect("should forward error text") {
-            AcpForward::Text(text, source) => {
-                assert_eq!(text, "error: Internal server error");
+            AcpForward::Error(text, source) => {
+                assert_eq!(text, "Internal server error");
                 assert!(source.is_none());
             }
-            _ => panic!("expected Text forward"),
+            _ => panic!("expected Error forward"),
         }
     }
 

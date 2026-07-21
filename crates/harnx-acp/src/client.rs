@@ -162,19 +162,26 @@ impl AcpNotificationClient {
             return Ok(());
         }
 
-        let is_agent_message = matches!(args.update, SessionUpdate::AgentMessageChunk(_));
+        let mut accumulate_response_text = false;
         let mut message_text: Option<String> = None;
         let event: Option<AgentEvent> = match args.update {
             SessionUpdate::AgentMessageChunk(chunk) => {
                 let text = chunk_text(&chunk.content);
+                let meta = chunk.meta.as_ref().map(|meta| json!(meta));
+                let is_error = meta.as_ref().is_some_and(is_error_from_meta_value);
                 // Only drop genuinely empty chunks. Whitespace-only chunks
                 // (e.g. a lone "\n" between streamed list items or paragraphs)
                 // are meaningful: stripping them concatenates adjacent chunks
-                // and corrupts the rendered markdown (see issue #862, where
+                // and corrupts rendered markdown (see issue #862, where
                 // "1. Confirm\n2. Confirm" rendered as "1. Confirm2. Confirm").
                 if text.is_empty() {
                     None
+                } else if is_error {
+                    Some(AgentEvent::Model(ModelEvent::Error(
+                        strip_error_prefix(&text).to_string(),
+                    )))
                 } else {
+                    accumulate_response_text = true;
                     message_text = Some(text.clone());
                     Some(AgentEvent::Model(ModelEvent::MessageChunk {
                         blocks: vec![ContentBlock::Text(text)],
@@ -265,8 +272,8 @@ impl AcpNotificationClient {
             SessionUpdate::UserMessageChunk(chunk) => {
                 // User turns (e.g. from remote attach/resume history replay)
                 // are rendered as user transcript entries and deliberately
-                // NOT accumulated into `response_text` (`is_agent_message` is
-                // only set for `AgentMessageChunk`).
+                // NOT accumulated into `response_text` (`accumulate_response_text`
+                // is only set for non-error `AgentMessageChunk`s).
                 let text = chunk_text(&chunk.content);
                 if text.is_empty() {
                     None
@@ -284,7 +291,7 @@ impl AcpNotificationClient {
         };
 
         if let Some(event) = event {
-            if is_agent_message {
+            if accumulate_response_text {
                 if let Some(ref chunk) = message_text {
                     let mut sessions = self.sessions.write().await;
                     let state = sessions.entry(session_id).or_default();
@@ -1085,6 +1092,17 @@ fn markdown_from_meta_value(value: &serde_json::Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn is_error_from_meta_value(value: &serde_json::Value) -> bool {
+    value
+        .get("harnx:error")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn strip_error_prefix(text: &str) -> &str {
+    text.strip_prefix("error: ").unwrap_or(text)
+}
+
 fn resolve_notification_source(
     fallback_agent: &str,
     notification: &SessionNotification,
@@ -1811,6 +1829,161 @@ mod tests {
         }
 
         assert_eq!(received, "Step one\nStep two");
+    }
+
+    /// Error chunks from nested ACP agents must surface as `ModelEvent::Error`
+    /// without being accumulated into `response_text`, which becomes next
+    /// agent input.
+    #[tokio::test]
+    async fn error_message_chunk_forwards_error_event_without_polluting_response_text() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        chunk_forwarder.write().await.insert(1, chunk_tx);
+        let (activity_tx, _) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions.clone(),
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        let notification = SessionNotification::new(
+            SessionId::new("outer-session"),
+            SessionUpdate::AgentMessageChunk(
+                ContentChunk::new("error: upstream failed".into()).meta(
+                    serde_json::Map::from_iter([("harnx:error".to_string(), json!(true))]),
+                ),
+            ),
+        );
+        client.session_notification(notification).await.unwrap();
+
+        let forwarded = chunk_rx.recv().await.expect("forwarded error chunk");
+        match forwarded {
+            NestedAcpEvent::Agent(AgentEvent::Model(ModelEvent::Error(message)), _) => {
+                assert_eq!(message, "upstream failed");
+            }
+            other => panic!("unexpected nested ACP event: {other:?}"),
+        }
+
+        let sessions = sessions.read().await;
+        if let Some(state) = sessions.get("outer-session") {
+            assert!(
+                state.response_text.is_empty(),
+                "error message chunk must not accumulate into response_text"
+            );
+        }
+    }
+
+    /// A chunk with `harnx:error = false` is a normal message chunk: it must
+    /// forward a `MessageChunk` event and DO accumulate into `response_text`.
+    #[tokio::test]
+    async fn message_chunk_with_error_meta_false_is_treated_as_normal_message() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        chunk_forwarder.write().await.insert(1, chunk_tx);
+        let (activity_tx, _) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions.clone(),
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        let notification = SessionNotification::new(
+            SessionId::new("outer-session"),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new("hello".into()).meta(
+                serde_json::Map::from_iter([("harnx:error".to_string(), json!(false))]),
+            )),
+        );
+        client.session_notification(notification).await.unwrap();
+
+        let forwarded = chunk_rx.recv().await.expect("forwarded message chunk");
+        match forwarded {
+            NestedAcpEvent::Agent(AgentEvent::Model(ModelEvent::MessageChunk { .. }), _) => {}
+            other => panic!("unexpected nested ACP event: {other:?}"),
+        }
+
+        let sessions = sessions.read().await;
+        let state = sessions.get("outer-session").expect("session state");
+        assert_eq!(
+            state.response_text, "hello",
+            "non-error message chunk must accumulate into response_text"
+        );
+    }
+
+    /// A `harnx:error` meta with a non-boolean value falls back to normal
+    /// message handling (fails open safely, not treated as an error).
+    #[tokio::test]
+    async fn message_chunk_with_non_bool_error_meta_is_treated_as_normal_message() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        chunk_forwarder.write().await.insert(1, chunk_tx);
+        let (activity_tx, _) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions.clone(),
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        let notification = SessionNotification::new(
+            SessionId::new("outer-session"),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new("hi".into()).meta(
+                serde_json::Map::from_iter([("harnx:error".to_string(), json!("yes"))]),
+            )),
+        );
+        client.session_notification(notification).await.unwrap();
+
+        let forwarded = chunk_rx.recv().await.expect("forwarded message chunk");
+        match forwarded {
+            NestedAcpEvent::Agent(AgentEvent::Model(ModelEvent::MessageChunk { .. }), _) => {}
+            other => panic!("unexpected nested ACP event: {other:?}"),
+        }
+
+        let sessions = sessions.read().await;
+        let state = sessions.get("outer-session").expect("session state");
+        assert_eq!(state.response_text, "hi");
+    }
+
+    /// An error-flagged chunk WITHOUT the legacy `error: ` prefix still surfaces
+    /// as a `ModelEvent::Error` carrying the raw text, and is not accumulated.
+    #[tokio::test]
+    async fn error_chunk_without_prefix_forwards_raw_error_text() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        chunk_forwarder.write().await.insert(1, chunk_tx);
+        let (activity_tx, _) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions.clone(),
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        let notification = SessionNotification::new(
+            SessionId::new("outer-session"),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new("bare failure".into()).meta(
+                serde_json::Map::from_iter([("harnx:error".to_string(), json!(true))]),
+            )),
+        );
+        client.session_notification(notification).await.unwrap();
+
+        let forwarded = chunk_rx.recv().await.expect("forwarded error chunk");
+        match forwarded {
+            NestedAcpEvent::Agent(AgentEvent::Model(ModelEvent::Error(message)), _) => {
+                assert_eq!(message, "bare failure");
+            }
+            other => panic!("unexpected nested ACP event: {other:?}"),
+        }
+
+        let sessions = sessions.read().await;
+        if let Some(state) = sessions.get("outer-session") {
+            assert!(state.response_text.is_empty());
+        }
     }
 
     /// A genuinely empty thought chunk ("") is still dropped.
