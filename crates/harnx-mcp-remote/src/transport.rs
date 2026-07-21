@@ -125,25 +125,31 @@ mod tests {
         super::config_from_cli(&cli).expect("valid transport config")
     }
 
-    /// Asserts that the given CLI args produce a config whose bearer auth header
-    /// matches `expected`. Shared by the several "token is accepted" cases.
-    fn assert_auth_header(args: &[&str], expected: &str) {
-        let config = config_from_args(args);
-        assert_eq!(config.auth_header.as_deref(), Some(expected));
-    }
-
+    /// Table-driven coverage of the cases where a bearer token is accepted and
+    /// forwarded verbatim as the auth header: HTTPS, loopback HTTP, and
+    /// non-loopback HTTP with `--insecure`.
     #[test]
-    fn bearer_token_sets_auth_header() {
-        assert_auth_header(
-            &[
-                "harnx-mcp-remote",
-                "--url",
-                "https://example.com",
-                "--bearer-token",
-                "mytoken",
-            ],
-            "mytoken",
-        );
+    fn bearer_token_is_forwarded_for_allowed_endpoints() {
+        let cases: &[(&str, &[&str])] = &[
+            ("https endpoint", &["--url", "https://example.com"]),
+            ("loopback http", &["--url", "http://127.0.0.1:8000"]),
+            (
+                "insecure http",
+                &["--url", "http://example.com", "--insecure"],
+            ),
+        ];
+
+        for (label, url_args) in cases {
+            let mut args = vec!["harnx-mcp-remote"];
+            args.extend_from_slice(url_args);
+            args.extend_from_slice(&["--bearer-token", "secret"]);
+            let config = config_from_args(&args);
+            assert_eq!(
+                config.auth_header.as_deref(),
+                Some("secret"),
+                "auth header should be forwarded for {label}"
+            );
+        }
     }
 
     #[test]
@@ -191,35 +197,6 @@ mod tests {
         ]);
         let err = super::config_from_cli(&cli).expect_err("plaintext bearer token should fail");
         assert!(err.to_string().contains("refusing to send bearer token"));
-    }
-
-    #[test]
-    fn bearer_token_over_http_loopback_is_allowed() {
-        assert_auth_header(
-            &[
-                "harnx-mcp-remote",
-                "--url",
-                "http://127.0.0.1:8000",
-                "--bearer-token",
-                "secret",
-            ],
-            "secret",
-        );
-    }
-
-    #[test]
-    fn bearer_token_over_http_non_loopback_is_allowed_with_insecure() {
-        assert_auth_header(
-            &[
-                "harnx-mcp-remote",
-                "--url",
-                "http://example.com",
-                "--bearer-token",
-                "secret",
-                "--insecure",
-            ],
-            "secret",
-        );
     }
 
     #[test]
