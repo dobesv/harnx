@@ -3,7 +3,7 @@ role: assistant
 model: claude:claude-opus-4-8
 model_fallbacks:
 - claude:claude-sonnet-5
-- openai:gpt-5.6-terra
+- openai:gpt-5.4
 compaction_agent: compact-planner
 use_tools:
 - bash_exec

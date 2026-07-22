@@ -1,6 +1,6 @@
 ---
 role: assistant
-model: openai:gpt-5.6-sol
+model: openai:gpt-5.5
 compaction_agent: compact-researcher
 model_fallbacks:
 - claude:claude-opus-4-8

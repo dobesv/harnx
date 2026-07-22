@@ -3,7 +3,7 @@ role: assistant
 model: claude:claude-opus-4-8
 compaction_agent: compact-dev
 model_fallbacks:
-- openai:gpt-5.6-terra
+- openai:gpt-5.4
 use_tools:
 - bash_exec
 - bash_read_exec_log
