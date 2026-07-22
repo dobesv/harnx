@@ -70,7 +70,6 @@ pub enum AuthSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthConfig {
     pub base_url: String,
-    pub repo: RepoConfig,
     pub source: AuthSource,
 }
 
@@ -358,7 +357,6 @@ se1WmgkjgdgmMWBVaajht3Y=
         let auth = GitHubAuth::with_clock(
             AuthConfig {
                 base_url,
-                repo: RepoConfig::parse("acme/plans").expect("repo"),
                 source: AuthSource::GitHubApp(AppAuthConfig {
                     app_id: "1".to_owned(),
                     private_key_pem: TEST_PRIVATE_KEY.to_owned(),
@@ -395,7 +393,6 @@ se1WmgkjgdgmMWBVaajht3Y=
         let auth = GitHubAuth::with_clock(
             AuthConfig {
                 base_url: base_url.clone(),
-                repo: RepoConfig::parse("acme/plans").expect("repo"),
                 source: AuthSource::GitHubApp(AppAuthConfig {
                     app_id: "1".to_owned(),
                     private_key_pem: TEST_PRIVATE_KEY.to_owned(),

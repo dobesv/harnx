@@ -16,7 +16,7 @@ use wiremock::{
 };
 
 use harnx_mcp_plans_core::{NewTask, PageToken, PlanStore, StoreError, TaskFilter};
-use harnx_mcp_plans_github::auth::{AuthConfig, AuthSource, GitHubAuth, RepoConfig};
+use harnx_mcp_plans_github::auth::{AuthConfig, AuthSource, GitHubAuth};
 use harnx_mcp_plans_github::client::GitHubClient;
 use harnx_mcp_plans_github::store_github::GitHubPlanStore;
 
@@ -24,10 +24,6 @@ use harnx_mcp_plans_github::store_github::GitHubPlanStore;
 async fn create_test_store(server: &MockServer) -> GitHubPlanStore {
     let config = AuthConfig {
         base_url: server.uri(),
-        repo: RepoConfig {
-            owner: "test-owner".to_string(),
-            repo: "test-repo".to_string(),
-        },
         source: AuthSource::PersonalAccessToken("test-token".to_string()),
     };
 

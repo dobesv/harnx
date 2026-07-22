@@ -162,12 +162,22 @@ struct CreateLabelRequest<'a> {
 
 impl From<GitHubClient> for GitHubClientFactory {
     fn from(client: GitHubClient) -> Self {
+        let default_repo = match RepoTarget::new(client.owner.clone(), client.repo.clone()) {
+            Ok(target) => Some(target),
+            Err(err) => {
+                eprintln!(
+                    "harnx-mcp-plans-github: ignoring invalid default repository {}/{}: {err}",
+                    client.owner, client.repo
+                );
+                None
+            }
+        };
         Self {
             auth: client.auth,
             base_url: client.base_url,
             raw_http: client.raw_http,
             ratelimit: client.ratelimit,
-            default_repo: RepoTarget::new(client.owner, client.repo).ok(),
+            default_repo,
         }
     }
 }
@@ -656,8 +666,24 @@ impl GitHubClient {
         .await
     }
 
+    /// Percent-encode a single URL path segment.
+    ///
+    /// Passes through RFC 3986 unreserved characters (`A-Z a-z 0-9 - . _ ~`) and
+    /// percent-encodes everything else — including path separators (`/`, `\`) and
+    /// reserved characters such as `#`, `?`, `%`, and spaces — so that
+    /// caller-configurable values (e.g. the plan label) cannot alter the request
+    /// path or introduce a query/fragment.
     fn encode_path_segment(value: &str) -> String {
-        value.replace('/', "%2F").replace('\\', "%5C")
+        let mut encoded = String::with_capacity(value.len());
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    encoded.push(byte as char);
+                }
+                _ => encoded.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        encoded
     }
 
     fn absolute_url(&self, endpoint: &str) -> String {
@@ -794,4 +820,33 @@ struct IssueCommentWire {
     created_at: Option<String>,
     #[serde(default)]
     updated_at: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_path_segment_escapes_reserved_characters() {
+        // Path separators must not survive.
+        assert_eq!(GitHubClient::encode_path_segment("a/b"), "a%2Fb");
+        assert_eq!(GitHubClient::encode_path_segment("a\\b"), "a%5Cb");
+        // Reserved URL characters that could alter the request path or start a
+        // query/fragment must be percent-encoded.
+        assert_eq!(GitHubClient::encode_path_segment("a#b"), "a%23b");
+        assert_eq!(GitHubClient::encode_path_segment("a?b"), "a%3Fb");
+        assert_eq!(GitHubClient::encode_path_segment("100%"), "100%25");
+        assert_eq!(
+            GitHubClient::encode_path_segment("needs review"),
+            "needs%20review"
+        );
+    }
+
+    #[test]
+    fn encode_path_segment_preserves_unreserved_characters() {
+        assert_eq!(
+            GitHubClient::encode_path_segment("harnx-plan_v1.0~beta"),
+            "harnx-plan_v1.0~beta"
+        );
+    }
 }

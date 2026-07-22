@@ -164,10 +164,6 @@ impl AppConfig {
         Ok(Self {
             auth: AuthConfig {
                 base_url,
-                repo: default_repo.clone().unwrap_or_else(|| RepoConfig {
-                    owner: String::new(),
-                    repo: String::new(),
-                }),
                 source: auth_source,
             },
             default_repo,
@@ -409,8 +405,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(cfg.auth.repo.owner, "acme");
-        assert_eq!(cfg.auth.repo.repo, "plans");
+        let default_repo = cfg.default_repo.as_ref().expect("default repo detected");
+        assert_eq!(default_repo.owner, "acme");
+        assert_eq!(default_repo.repo, "plans");
         assert!(matches!(
             cfg.auth.source,
             AuthSource::PersonalAccessToken(_)

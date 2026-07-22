@@ -93,8 +93,9 @@ impl GitHubPlanStore {
         }
     }
 
-    pub fn client_for(&self, target: &RepoTarget) -> GitHubClient {
-        self.client_factory.client_for(target)
+    pub fn client_for(&self, target: &RepoTarget) -> Result<GitHubClient, StoreError> {
+        target.validate().map_err(StoreError::InvalidParams)?;
+        Ok(self.client_factory.client_for(target))
     }
 
     fn client_for_store_target(&self, target: &Target) -> Result<GitHubClient, StoreError> {
@@ -104,8 +105,8 @@ impl GitHubPlanStore {
                 StoreError::InvalidParams("GitHub plan store requires a GitHub target".to_string())
             })?,
         };
-        repo.validate().map_err(StoreError::InvalidParams)?;
-        Ok(self.client_for(repo))
+        let client = self.client_for(repo)?;
+        Ok(client)
     }
 
     pub fn config_ref(&self) -> &GitHubStoreConfig {

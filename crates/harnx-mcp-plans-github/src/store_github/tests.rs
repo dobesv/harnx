@@ -12,7 +12,7 @@ use wiremock::{
 use harnx_mcp_plans_core::{NewPlan, NewTask, PageToken, PlanStore, StoreError, TaskFilter};
 
 use crate::auth::SystemClock;
-use crate::auth::{AuthConfig, AuthSource, GitHubAuth, RepoConfig};
+use crate::auth::{AuthConfig, AuthSource, GitHubAuth};
 use crate::client::{GitHubClient, GitHubClientFactory};
 use crate::ratelimit::{RateLimitConfig, RateLimitExecutor, TokioSleeper};
 use std::sync::Arc;
@@ -22,10 +22,6 @@ use super::*;
 async fn create_test_store(server: &MockServer) -> GitHubPlanStore {
     let config = AuthConfig {
         base_url: server.uri(),
-        repo: RepoConfig {
-            owner: "test-owner".to_string(),
-            repo: "test-repo".to_string(),
-        },
         source: AuthSource::PersonalAccessToken("test-token".to_string()),
     };
 
@@ -49,10 +45,6 @@ async fn create_test_store_with_config(
 ) -> GitHubPlanStore {
     let auth_config = AuthConfig {
         base_url: server.uri(),
-        repo: RepoConfig {
-            owner: "test-owner".to_string(),
-            repo: "test-repo".to_string(),
-        },
         source: AuthSource::PersonalAccessToken("test-token".to_string()),
     };
 
@@ -84,10 +76,6 @@ async fn create_store_with_default(
 ) -> GitHubPlanStore {
     let config = AuthConfig {
         base_url: server.uri(),
-        repo: RepoConfig {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-        },
         source: AuthSource::PersonalAccessToken("test-token".to_string()),
     };
 
@@ -144,6 +132,26 @@ fn mock_comment_json(id: u64, body: &str) -> serde_json::Value {
     })
 }
 
+#[tokio::test]
+async fn client_for_rejects_path_traversal_without_request() {
+    let server = MockServer::start().await;
+    let store = create_test_store(&server).await;
+    let traversal = RepoTarget {
+        owner: "acme".to_string(),
+        repo: "../../../user".to_string(),
+    };
+
+    let err = store
+        .client_for(&traversal)
+        .expect_err("repo traversal should be rejected");
+    assert!(matches!(err, StoreError::InvalidParams(_)));
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.is_empty(),
+        "invalid target made GitHub API requests: {requests:?}"
+    );
+}
 #[tokio::test]
 async fn explicit_target_rejects_path_traversal_without_request() {
     let server = MockServer::start().await;

@@ -291,7 +291,7 @@ async fn close_stale_plan(store: &GitHubPlanStore, target: &Target, plan: &Plan)
         return Ok(());
     };
     store
-        .client_for(repo)
+        .client_for(repo)?
         .close_issue(parse_issue_number(&plan.id)?)
         .await
         .map_err(sanitize_github_error)
