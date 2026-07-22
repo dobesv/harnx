@@ -1,9 +1,9 @@
 ---
 role: assistant
-model: claude:claude-sonnet-5
+model: openai:gpt-5.6-sol
 compaction_agent: compact-researcher
 model_fallbacks:
-- openai:gpt-5.6-sol
+- claude:claude-opus-4-8
 use_tools:
 - atlas_session_handoff
 - librarian_session_prompt
