@@ -150,7 +150,16 @@ async fn add_task_sends_correct_internal_id_in_post_body() {
         dependencies: vec![],
     };
 
-    let result = store.add_task(&"1".to_string(), new_task).await;
+    let result = store
+        .add_task(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &"1".to_string(),
+            new_task,
+        )
+        .await;
     assert!(result.is_ok(), "add_task should succeed");
 }
 
@@ -211,7 +220,16 @@ async fn add_task_returns_error_when_cap_reached() {
         dependencies: vec![],
     };
 
-    let result = store.add_task(&"1".to_string(), new_task).await;
+    let result = store
+        .add_task(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &"1".to_string(),
+            new_task,
+        )
+        .await;
     assert!(result.is_err());
     match result.unwrap_err() {
         StoreError::InvalidParams(msg) => {
@@ -258,7 +276,15 @@ async fn delete_plan_closes_issue() {
         .await;
 
     let store = create_test_store(&server).await;
-    let result = store.delete_plan(&"123".to_string()).await;
+    let result = store
+        .delete_plan(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &"123".to_string(),
+        )
+        .await;
     assert!(result.is_ok());
 }
 
@@ -311,7 +337,14 @@ async fn delete_task_closes_issue() {
 
     let store = create_test_store(&server).await;
     let result = store
-        .delete_task(&"1".to_string(), &"456".to_string())
+        .delete_task(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &"1".to_string(),
+            &"456".to_string(),
+        )
         .await;
     assert!(result.is_ok());
 }
@@ -355,7 +388,15 @@ async fn list_tasks_dedupes_by_client_id_keeps_most_recent() {
 
     let store = create_test_store(&server).await;
     let page = store
-        .list_tasks(&"1".to_string(), TaskFilter::default(), None)
+        .list_tasks(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &"1".to_string(),
+            TaskFilter::default(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -392,7 +433,16 @@ async fn list_plans_encodes_link_header_in_page_token() {
         .await;
 
     let store = create_test_store(&server).await;
-    let page = store.list_plans(None).await.unwrap();
+    let page = store
+        .list_plans(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
 
     assert!(page.next.is_some(), "should have next page token");
     let token = page.next.unwrap();
@@ -416,7 +466,13 @@ async fn list_plans_uses_token_for_next_page() {
 
     let store = create_test_store(&server).await;
     let page = store
-        .list_plans(Some(PageToken(format!("{}/page2", server.uri()))))
+        .list_plans(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            Some(PageToken(format!("{}/page2", server.uri()))),
+        )
         .await
         .unwrap();
 
@@ -453,11 +509,17 @@ async fn jira_key_round_trips_in_title() {
 
     use harnx_mcp_plans_core::NewPlan;
     let plan = store
-        .add_plan(NewPlan {
-            id: "plan-1".to_string(),
-            title: Some("[PROJ-123] Test Plan".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            NewPlan {
+                id: "plan-1".to_string(),
+                title: Some("[PROJ-123] Test Plan".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -488,7 +550,15 @@ async fn rate_limit_headers_handled() {
         .await;
 
     let store = create_test_store(&server).await;
-    let result = store.list_plans(None).await;
+    let result = store
+        .list_plans(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            None,
+        )
+        .await;
     assert!(
         result.is_ok(),
         "request should succeed with rate-limit headers"

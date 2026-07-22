@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use harnx_mcp_plans_core::RepoTarget;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,16 @@ use crate::auth::{GitHubAuth, SystemClock, GITHUB_ACCEPT, GITHUB_API_VERSION, US
 use crate::ratelimit::{
     send_rate_limited, RateLimitConfig, RateLimitExecutor, RequestContext, TokioSleeper,
 };
+
+/// Factory for cheap per-repository GitHub clients sharing auth, HTTP, and rate limits.
+#[derive(Debug, Clone)]
+pub struct GitHubClientFactory {
+    auth: GitHubAuth,
+    base_url: String,
+    raw_http: Client,
+    ratelimit: Arc<RateLimitExecutor>,
+    default_repo: Option<RepoTarget>,
+}
 
 #[derive(Debug, Clone)]
 pub struct GitHubClient {
@@ -149,6 +160,54 @@ struct CreateLabelRequest<'a> {
     description: &'a str,
 }
 
+impl From<GitHubClient> for GitHubClientFactory {
+    fn from(client: GitHubClient) -> Self {
+        Self {
+            auth: client.auth,
+            base_url: client.base_url,
+            raw_http: client.raw_http,
+            ratelimit: client.ratelimit,
+            default_repo: RepoTarget::new(client.owner, client.repo).ok(),
+        }
+    }
+}
+
+impl GitHubClientFactory {
+    /// Create a factory with no implicit default repository fallback.
+    pub fn new(auth: GitHubAuth, ratelimit: Arc<RateLimitExecutor>) -> Result<Self> {
+        let base_url = auth.base_url().to_owned();
+        let raw_http = Client::builder()
+            .user_agent(USER_AGENT)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("build raw GitHub client")?;
+        Ok(Self {
+            auth,
+            base_url,
+            raw_http,
+            ratelimit,
+            default_repo: None,
+        })
+    }
+
+    /// Return a repo-bound client for a validated target repository.
+    pub fn client_for(&self, target: &RepoTarget) -> GitHubClient {
+        GitHubClient {
+            auth: self.auth.clone(),
+            owner: target.owner.clone(),
+            repo: target.repo.clone(),
+            base_url: self.base_url.clone(),
+            raw_http: self.raw_http.clone(),
+            ratelimit: self.ratelimit.clone(),
+        }
+    }
+
+    pub fn default_repo(&self) -> Option<&RepoTarget> {
+        self.default_repo.as_ref()
+    }
+}
+
 impl GitHubClient {
     pub async fn new(
         auth: GitHubAuth,
@@ -208,7 +267,7 @@ impl GitHubClient {
     }
 
     pub async fn create_issue(&self, input: CreateIssue) -> Result<IssueRecord> {
-        let endpoint = format!("/repos/{}/{}/issues", self.owner, self.repo);
+        let endpoint = self.repo_endpoint("/issues");
         let issue: IssueRecordWire = self
             .post_json(
                 &endpoint,
@@ -227,19 +286,13 @@ impl GitHubClient {
     }
 
     pub async fn get_issue(&self, issue_number: u64) -> Result<IssueRecord> {
-        let endpoint = format!(
-            "/repos/{}/{}/issues/{}",
-            self.owner, self.repo, issue_number
-        );
+        let endpoint = self.repo_endpoint(&format!("/issues/{issue_number}"));
         let issue: IssueRecordWire = self.get_json(&endpoint).await?;
         Ok(map_issue(issue))
     }
 
     pub async fn update_issue(&self, issue_number: u64, input: UpdateIssue) -> Result<IssueRecord> {
-        let endpoint = format!(
-            "/repos/{}/{}/issues/{}",
-            self.owner, self.repo, issue_number
-        );
+        let endpoint = self.repo_endpoint(&format!("/issues/{issue_number}"));
         let issue: IssueRecordWire = self
             .patch_json(
                 &endpoint,
@@ -266,7 +319,7 @@ impl GitHubClient {
 
     pub async fn list_issues(&self, params: ListIssuesParams) -> Result<GhPage<IssueRecord>> {
         let endpoint = with_query(
-            format!("/repos/{}/{}/issues", self.owner, self.repo),
+            self.repo_endpoint("/issues"),
             params
                 .state
                 .into_iter()
@@ -296,10 +349,7 @@ impl GitHubClient {
         issue_number: u64,
         input: CreateComment,
     ) -> Result<IssueComment> {
-        let endpoint = format!(
-            "/repos/{}/{}/issues/{}/comments",
-            self.owner, self.repo, issue_number
-        );
+        let endpoint = self.repo_endpoint(&format!("/issues/{issue_number}/comments"));
         let comment: IssueCommentWire = self
             .post_json(&endpoint, &CreateCommentRequest { body: &input.body })
             .await?;
@@ -307,10 +357,7 @@ impl GitHubClient {
     }
 
     pub async fn get_comment(&self, comment_id: u64) -> Result<IssueComment> {
-        let endpoint = format!(
-            "/repos/{}/{}/issues/comments/{}",
-            self.owner, self.repo, comment_id
-        );
+        let endpoint = self.repo_endpoint(&format!("/issues/comments/{comment_id}"));
         let comment: IssueCommentWire = self.get_json(&endpoint).await?;
         Ok(map_comment(comment))
     }
@@ -320,10 +367,7 @@ impl GitHubClient {
         comment_id: u64,
         input: UpdateComment,
     ) -> Result<IssueComment> {
-        let endpoint = format!(
-            "/repos/{}/{}/issues/comments/{}",
-            self.owner, self.repo, comment_id
-        );
+        let endpoint = self.repo_endpoint(&format!("/issues/comments/{comment_id}"));
         let comment: IssueCommentWire = self
             .patch_json(&endpoint, &CreateCommentRequest { body: &input.body })
             .await?;
@@ -336,10 +380,7 @@ impl GitHubClient {
         per_page: Option<u8>,
     ) -> Result<GhPage<IssueComment>> {
         let endpoint = with_query(
-            format!(
-                "/repos/{}/{}/issues/{}/comments",
-                self.owner, self.repo, issue_number
-            ),
+            self.repo_endpoint(&format!("/issues/{issue_number}/comments")),
             per_page
                 .map(|value| vec![("per_page", value.to_string())])
                 .unwrap_or_default(),
@@ -362,10 +403,7 @@ impl GitHubClient {
     /// Delete a comment.
     /// DELETE /repos/{owner}/{repo}/issues/comments/{comment_id}
     pub async fn delete_comment(&self, comment_id: u64) -> Result<()> {
-        let endpoint = format!(
-            "/repos/{}/{}/issues/comments/{}",
-            self.owner, self.repo, comment_id
-        );
+        let endpoint = self.repo_endpoint(&format!("/issues/comments/{comment_id}"));
         let url = self.absolute_url(&endpoint);
         self.request_json_empty::<()>(reqwest::Method::DELETE, &url, None)
             .await
@@ -384,10 +422,7 @@ impl GitHubClient {
         parent_issue_number: u64,
         sub_issue_internal_id: u64,
     ) -> Result<()> {
-        let endpoint = format!(
-            "/repos/{}/{}/issues/{}/sub_issues",
-            self.owner, self.repo, parent_issue_number
-        );
+        let endpoint = self.repo_endpoint(&format!("/issues/{parent_issue_number}/sub_issues"));
         let _: Value = self
             .post_json(
                 &endpoint,
@@ -406,10 +441,7 @@ impl GitHubClient {
         parent_issue_number: u64,
         sub_issue_internal_id: u64,
     ) -> Result<()> {
-        let endpoint = format!(
-            "/repos/{}/{}/issues/{}/sub_issue",
-            self.owner, self.repo, parent_issue_number
-        );
+        let endpoint = self.repo_endpoint(&format!("/issues/{parent_issue_number}/sub_issue"));
         self.request_json::<Value, _>(
             reqwest::Method::DELETE,
             &endpoint,
@@ -421,19 +453,17 @@ impl GitHubClient {
     }
 
     pub async fn get_repository(&self) -> Result<RepoRecord> {
-        let endpoint = format!("/repos/{}/{}", self.owner, self.repo);
+        let endpoint = self.repo_endpoint("");
         self.get_json(&endpoint)
             .await
             .context("get GitHub repository")
     }
 
     pub async fn get_label(&self, label_name: &str) -> Result<LabelRecord> {
-        let endpoint = format!(
-            "/repos/{}/{}/labels/{}",
-            self.owner,
-            self.repo,
+        let endpoint = self.repo_endpoint(&format!(
+            "/labels/{}",
             Self::encode_path_segment(label_name)
-        );
+        ));
         self.get_json(&endpoint).await.context("get GitHub label")
     }
 
@@ -443,7 +473,7 @@ impl GitHubClient {
         color: &str,
         description: &str,
     ) -> Result<LabelRecord> {
-        let endpoint = format!("/repos/{}/{}/labels", self.owner, self.repo);
+        let endpoint = self.repo_endpoint("/labels");
         self.post_json(
             &endpoint,
             &CreateLabelRequest {
@@ -484,10 +514,7 @@ impl GitHubClient {
         }
     }
     pub async fn list_sub_issues(&self, parent_issue_number: u64) -> Result<GhPage<Value>> {
-        let endpoint = format!(
-            "/repos/{}/{}/issues/{}/sub_issues",
-            self.owner, self.repo, parent_issue_number
-        );
+        let endpoint = self.repo_endpoint(&format!("/issues/{parent_issue_number}/sub_issues"));
         self.get_page_json(&endpoint)
             .await
             .context("list GitHub sub-issues")
@@ -630,11 +657,20 @@ impl GitHubClient {
     }
 
     fn encode_path_segment(value: &str) -> String {
-        value.replace('/', "%2F")
+        value.replace('/', "%2F").replace('\\', "%5C")
     }
 
     fn absolute_url(&self, endpoint: &str) -> String {
         format!("{}{}", self.base_url, endpoint)
+    }
+
+    fn repo_endpoint(&self, suffix: &str) -> String {
+        format!(
+            "/repos/{}/{}{}",
+            Self::encode_path_segment(&self.owner),
+            Self::encode_path_segment(&self.repo),
+            suffix
+        )
     }
 }
 

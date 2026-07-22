@@ -107,12 +107,18 @@ async fn live_e2e_create_plan() {
 
     // Create a plan
     let plan = store
-        .add_plan(NewPlan {
-            id: plan_id.clone(),
-            title: Some(format!("[TEST] {}", plan_id)),
-            summary: Some("Created by live e2e test".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            NewPlan {
+                id: plan_id.clone(),
+                title: Some(format!("[TEST] {}", plan_id)),
+                summary: Some("Created by live e2e test".to_string()),
+                ..Default::default()
+            },
+        )
         .await;
 
     match plan {
@@ -124,13 +130,29 @@ async fn live_e2e_create_plan() {
             );
 
             // Read it back
-            let fetched = store.get_plan(&plan.id).await;
+            let fetched = store
+                .get_plan(
+                    &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                        owner: "test-owner".to_string(),
+                        repo: "test-repo".to_string(),
+                    }),
+                    &plan.id,
+                )
+                .await;
             assert!(fetched.is_ok(), "should be able to fetch created plan");
             let fetched = fetched.unwrap();
             assert_eq!(fetched.id, plan.id);
 
             // Clean up: close the issue
-            let _ = store.delete_plan(&plan.id).await;
+            let _ = store
+                .delete_plan(
+                    &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                        owner: "test-owner".to_string(),
+                        repo: "test-repo".to_string(),
+                    }),
+                    &plan.id,
+                )
+                .await;
         }
         Err(e) => {
             eprintln!("Failed to create plan: {:?}", e);
@@ -153,17 +175,27 @@ async fn live_e2e_create_task() {
 
     // Create a plan first
     let plan = store
-        .add_plan(NewPlan {
-            id: plan_id.clone(),
-            title: Some(format!("[TEST] Task container {}", plan_id)),
-            ..Default::default()
-        })
+        .add_plan(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            NewPlan {
+                id: plan_id.clone(),
+                title: Some(format!("[TEST] Task container {}", plan_id)),
+                ..Default::default()
+            },
+        )
         .await
         .expect("create plan");
 
     // Create a task
     let task = store
         .add_task(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
             &plan.id,
             NewTask {
                 id: task_id.clone(),
@@ -179,16 +211,50 @@ async fn live_e2e_create_task() {
             println!("Created task: {} (ID: {})", task.title, task.id);
 
             // Read it back
-            let fetched = store.get_task(&plan.id, &task.id).await;
+            let fetched = store
+                .get_task(
+                    &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                        owner: "test-owner".to_string(),
+                        repo: "test-repo".to_string(),
+                    }),
+                    &plan.id,
+                    &task.id,
+                )
+                .await;
             assert!(fetched.is_ok(), "should be able to fetch created task");
 
             // Clean up
-            let _ = store.delete_task(&plan.id, &task.id).await;
-            let _ = store.delete_plan(&plan.id).await;
+            let _ = store
+                .delete_task(
+                    &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                        owner: "test-owner".to_string(),
+                        repo: "test-repo".to_string(),
+                    }),
+                    &plan.id,
+                    &task.id,
+                )
+                .await;
+            let _ = store
+                .delete_plan(
+                    &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                        owner: "test-owner".to_string(),
+                        repo: "test-repo".to_string(),
+                    }),
+                    &plan.id,
+                )
+                .await;
         }
         Err(e) => {
             eprintln!("Failed to create task: {:?}", e);
-            let _ = store.delete_plan(&plan.id).await;
+            let _ = store
+                .delete_plan(
+                    &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                        owner: "test-owner".to_string(),
+                        repo: "test-repo".to_string(),
+                    }),
+                    &plan.id,
+                )
+                .await;
             panic!("Live test failed");
         }
     }
@@ -208,17 +274,27 @@ async fn live_e2e_create_note() {
 
     // Create a plan first
     let plan = store
-        .add_plan(NewPlan {
-            id: plan_id.clone(),
-            title: Some(format!("[TEST] Note container {}", plan_id)),
-            ..Default::default()
-        })
+        .add_plan(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            NewPlan {
+                id: plan_id.clone(),
+                title: Some(format!("[TEST] Note container {}", plan_id)),
+                ..Default::default()
+            },
+        )
         .await
         .expect("create plan");
 
     // Create a note
     let note = store
         .add_note(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
             &plan.id,
             NewNote {
                 id: note_id.clone(),
@@ -233,16 +309,50 @@ async fn live_e2e_create_note() {
             println!("Created note: ID {})", note.id);
 
             // Read it back
-            let fetched = store.get_note(&plan.id, &note.id).await;
+            let fetched = store
+                .get_note(
+                    &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                        owner: "test-owner".to_string(),
+                        repo: "test-repo".to_string(),
+                    }),
+                    &plan.id,
+                    &note.id,
+                )
+                .await;
             assert!(fetched.is_ok(), "should be able to fetch created note");
 
             // Clean up
-            let _ = store.delete_note(&plan.id, &note.id).await;
-            let _ = store.delete_plan(&plan.id).await;
+            let _ = store
+                .delete_note(
+                    &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                        owner: "test-owner".to_string(),
+                        repo: "test-repo".to_string(),
+                    }),
+                    &plan.id,
+                    &note.id,
+                )
+                .await;
+            let _ = store
+                .delete_plan(
+                    &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                        owner: "test-owner".to_string(),
+                        repo: "test-repo".to_string(),
+                    }),
+                    &plan.id,
+                )
+                .await;
         }
         Err(e) => {
             eprintln!("Failed to create note: {:?}", e);
-            let _ = store.delete_plan(&plan.id).await;
+            let _ = store
+                .delete_plan(
+                    &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                        owner: "test-owner".to_string(),
+                        repo: "test-repo".to_string(),
+                    }),
+                    &plan.id,
+                )
+                .await;
             panic!("Live test failed");
         }
     }
@@ -260,7 +370,13 @@ async fn live_e2e_pagination() {
 
     // List plans (should return at least an empty page)
     let page = store
-        .list_plans(None)
+        .list_plans(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            None,
+        )
         .await
         .expect("list plans should succeed");
 
@@ -269,7 +385,13 @@ async fn live_e2e_pagination() {
     // If there's a next page, fetch it
     if let Some(token) = page.next {
         let next_page = store
-            .list_plans(Some(token))
+            .list_plans(
+                &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                    owner: "test-owner".to_string(),
+                    repo: "test-repo".to_string(),
+                }),
+                Some(token),
+            )
             .await
             .expect("next page should succeed");
         println!("Next page has {} plans", next_page.items.len());
@@ -291,13 +413,19 @@ async fn live_e2e_full_crud_cycle() {
 
     // 1. Create plan
     let plan = store
-        .add_plan(NewPlan {
-            id: plan_id.clone(),
-            title: Some(format!("[TEST] Full CRUD {}", plan_id)),
-            summary: Some("Full CRUD test".to_string()),
-            author: Some("live_e2e_test".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            NewPlan {
+                id: plan_id.clone(),
+                title: Some(format!("[TEST] Full CRUD {}", plan_id)),
+                summary: Some("Full CRUD test".to_string()),
+                author: Some("live_e2e_test".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("create plan");
 
@@ -305,17 +433,37 @@ async fn live_e2e_full_crud_cycle() {
 
     // 2. Write body
     store
-        .write_plan_body(&plan.id, "# Test Plan\n\nThis is a test plan body.")
+        .write_plan_body(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &plan.id,
+            "# Test Plan\n\nThis is a test plan body.",
+        )
         .await
         .expect("write body");
 
     // 3. Read body
-    let body = store.read_plan_body(&plan.id).await.expect("read body");
+    let body = store
+        .read_plan_body(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &plan.id,
+        )
+        .await
+        .expect("read body");
     assert!(body.contains("Test Plan"), "body should contain title");
 
     // 4. Create task
     let task = store
         .add_task(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
             &plan.id,
             NewTask {
                 id: task_id.clone(),
@@ -332,6 +480,10 @@ async fn live_e2e_full_crud_cycle() {
     // 5. Create note
     let note = store
         .add_note(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
             &plan.id,
             NewNote {
                 id: note_id.clone(),
@@ -346,7 +498,15 @@ async fn live_e2e_full_crud_cycle() {
 
     // 6. List tasks
     let tasks = store
-        .list_tasks(&plan.id, TaskFilter::default(), None)
+        .list_tasks(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &plan.id,
+            TaskFilter::default(),
+            None,
+        )
         .await
         .expect("list tasks");
     assert!(
@@ -355,7 +515,17 @@ async fn live_e2e_full_crud_cycle() {
     );
 
     // 7. List notes
-    let notes = store.list_notes(&plan.id, None).await.expect("list notes");
+    let notes = store
+        .list_notes(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &plan.id,
+            None,
+        )
+        .await
+        .expect("list notes");
     assert!(
         notes.items.iter().any(|n| n.id == note.id),
         "should find created note"
@@ -363,14 +533,37 @@ async fn live_e2e_full_crud_cycle() {
 
     // 8. Cleanup
     store
-        .delete_note(&plan.id, &note.id)
+        .delete_note(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &plan.id,
+            &note.id,
+        )
         .await
         .expect("delete note");
     store
-        .delete_task(&plan.id, &task.id)
+        .delete_task(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &plan.id,
+            &task.id,
+        )
         .await
         .expect("delete task");
-    store.delete_plan(&plan.id).await.expect("delete plan");
+    store
+        .delete_plan(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &plan.id,
+        )
+        .await
+        .expect("delete plan");
 
     println!("Cleaned up plan: {}", plan.id);
 }

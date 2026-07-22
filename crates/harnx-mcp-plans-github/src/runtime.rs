@@ -3,31 +3,42 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::Router;
-use harnx_mcp_plans_core::server::{PlansServer, ServerMeta};
-use harnx_mcp_plans_core::{PageToken, Plan, PlanStore};
+use harnx_mcp_plans_core::server::{PlansServer, ServerMeta, TargetPolicy};
+use harnx_mcp_plans_core::{PageToken, Plan, PlanStore, RepoTarget, Target};
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::ServiceExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{GitHubAuth, SystemClock};
+use crate::client::GitHubClientFactory;
 use crate::config::AppConfig;
 use crate::ratelimit::{RateLimitExecutor, TokioSleeper};
 use crate::store_github::GitHubPlanStore;
 
-const LABEL_COLOR: &str = "5319e7";
-const LABEL_DESCRIPTION: &str = "harnx plans root issue";
 const RETENTION_SCAN_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const BASE_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
-const GITHUB_SERVER_META: ServerMeta = ServerMeta::new(
-    "harnx-mcp-plans-github",
-    "GitHub Issues-backed plan/task/note management server using issue bodies and comment front matter",
-);
+fn github_server_meta(default_repo: Option<RepoTarget>) -> ServerMeta {
+    let target_note = match &default_repo {
+        Some(default_repo) => format!(
+            " Target repository defaults to {}/{} detected at startup; owner/repo tool args may override it.",
+            default_repo.owner, default_repo.repo
+        ),
+        None => " No default repository was detected at startup; owner and repo tool args are required.".to_string(),
+    };
+    ServerMeta {
+        name: "harnx-mcp-plans-github".into(),
+        instructions: format!(
+            "GitHub Issues-backed plan/task/note management server using issue bodies and comment front matter.{target_note}"
+        )
+        .into(),
+        target_policy: TargetPolicy::GitHub { default_repo },
+    }
+}
 
 pub async fn run(config: AppConfig) -> Result<()> {
     let store = build_store(&config).await?;
-    validate_startup(store.as_ref(), &config.store.plan_label).await?;
 
     if config.http {
         run_http(store, config).await
@@ -43,39 +54,19 @@ pub async fn build_store(config: &AppConfig) -> Result<Arc<GitHubPlanStore>> {
         Arc::new(TokioSleeper),
         config.rate_limit.clone(),
     ));
-    let client = crate::client::GitHubClient::with_ratelimit(
-        auth,
-        config.auth.repo.owner.clone(),
-        config.auth.repo.repo.clone(),
-        ratelimit,
-    )
-    .await
-    .context("build GitHub API client")?;
+    let client_factory =
+        GitHubClientFactory::new(auth, ratelimit).context("build GitHub API client factory")?;
     Ok(Arc::new(GitHubPlanStore::with_config(
-        client,
+        client_factory,
         config.store.clone(),
     )))
 }
 
-pub async fn validate_startup(store: &GitHubPlanStore, plan_label: &str) -> Result<()> {
-    store
-        .client_ref()
-        .get_repository()
-        .await
-        .map_err(sanitize_github_error)
-        .context("startup validation failed: cannot access configured repository")?;
-    store
-        .client_ref()
-        .ensure_label(plan_label, LABEL_COLOR, LABEL_DESCRIPTION)
-        .await
-        .map_err(sanitize_github_error)
-        .with_context(|| {
-            format!("startup validation failed: cannot ensure label '{plan_label}'")
-        })?;
-    Ok(())
-}
-
-pub async fn run_retention_pass(store: &GitHubPlanStore, retention_days: u64) -> Result<()> {
+pub async fn run_retention_pass(
+    store: &GitHubPlanStore,
+    target: &Target,
+    retention_days: u64,
+) -> Result<()> {
     if retention_days == 0 {
         return Ok(());
     }
@@ -85,10 +76,10 @@ pub async fn run_retention_pass(store: &GitHubPlanStore, retention_days: u64) ->
 
     let mut page: Option<PageToken> = None;
     loop {
-        let response = store.list_plans(page.clone()).await?;
+        let response = store.list_plans(target, page.clone()).await?;
         for plan in response.items {
             if plan.updated_at.unwrap_or(plan.created_at) < cutoff {
-                close_stale_plan(store, &plan).await?;
+                close_stale_plan(store, target, &plan).await?;
             }
         }
         if response.next.is_none() {
@@ -111,17 +102,37 @@ fn redact_bearer_tokens(input: &str) -> String {
         .into_owned()
 }
 
+fn default_repo_target(config: &AppConfig) -> Option<RepoTarget> {
+    config.default_repo.as_ref().map(|repo| RepoTarget {
+        owner: repo.owner.clone(),
+        repo: repo.repo.clone(),
+    })
+}
+
+fn log_startup_target(default_repo: Option<&RepoTarget>) {
+    match default_repo {
+        Some(default_repo) => eprintln!(
+            "harnx-mcp-plans-github: default repository detected: {}/{}",
+            default_repo.owner, default_repo.repo
+        ),
+        None => eprintln!(
+            "harnx-mcp-plans-github: no default repository detected; owner/repo are required per tool call"
+        ),
+    }
+}
+
 async fn run_stdio(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()> {
+    let default_repo = default_repo_target(&config);
+    log_startup_target(default_repo.as_ref());
+
     eprintln!(
-        "harnx-mcp-plans-github v{}: starting (repo: {}/{}, label: {}, retention: {} days)",
+        "harnx-mcp-plans-github v{}: starting (label: {}, retention: {} days)",
         env!("CARGO_PKG_VERSION"),
-        config.auth.repo.owner,
-        config.auth.repo.repo,
         config.store.plan_label,
         config.retention_days
     );
 
-    let server = PlansServer::with_meta(store.clone(), GITHUB_SERVER_META);
+    let server = PlansServer::with_meta(store.clone(), github_server_meta(default_repo.clone()));
     let transport = rmcp::transport::stdio();
     let service = server.serve(transport).await?;
 
@@ -131,7 +142,11 @@ async fn run_stdio(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()>
         return Ok(());
     }
 
-    let mut retention_handle = tokio::spawn(retention_loop(store.clone(), config.retention_days));
+    let mut retention_handle = tokio::spawn(retention_loop(
+        store.clone(),
+        default_repo.clone(),
+        config.retention_days,
+    ));
     let service_handle = tokio::spawn(async move { service.waiting().await });
     tokio::pin!(service_handle);
     let mut backoff = BASE_BACKOFF;
@@ -152,7 +167,7 @@ async fn run_stdio(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()>
                     }
                     Ok(()) => backoff = BASE_BACKOFF,
                 }
-                retention_handle = tokio::spawn(retention_loop(store.clone(), config.retention_days));
+                retention_handle = tokio::spawn(retention_loop(store.clone(), default_repo.clone(), config.retention_days));
             }
         }
     }
@@ -161,17 +176,21 @@ async fn run_stdio(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()>
 }
 
 async fn run_http(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()> {
+    let default_repo = default_repo_target(&config);
+    log_startup_target(default_repo.as_ref());
+
     let ct = CancellationToken::new();
     let factory_store = store.clone();
     let server_config = StreamableHttpServerConfig::default()
         .with_stateful_mode(false)
         .with_json_response(true)
         .with_cancellation_token(ct.child_token());
+    let service_default_repo = default_repo.clone();
     let mcp_service = StreamableHttpService::new(
         move || {
             Ok(PlansServer::with_meta(
                 factory_store.clone(),
-                GITHUB_SERVER_META,
+                github_server_meta(service_default_repo.clone()),
             ))
         },
         Arc::new(NeverSessionManager::default()),
@@ -190,12 +209,10 @@ async fn run_http(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()> 
     spawn_shutdown_handler(ct.clone());
 
     eprintln!(
-        "harnx-mcp-plans-github v{}: listening on http://{}:{}/mcp (repo: {}/{}, label: {}, retention: {} days)",
+        "harnx-mcp-plans-github v{}: listening on http://{}:{}/mcp (label: {}, retention: {} days)",
         env!("CARGO_PKG_VERSION"),
         config.host,
         config.port,
-        config.auth.repo.owner,
-        config.auth.repo.repo,
         config.store.plan_label,
         config.retention_days
     );
@@ -214,7 +231,11 @@ async fn run_http(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()> 
         return Ok(());
     }
 
-    let mut retention_handle = tokio::spawn(retention_loop(store.clone(), config.retention_days));
+    let mut retention_handle = tokio::spawn(retention_loop(
+        store.clone(),
+        default_repo.clone(),
+        config.retention_days,
+    ));
     let mut backoff = BASE_BACKOFF;
 
     loop {
@@ -233,7 +254,7 @@ async fn run_http(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()> 
                     }
                     Ok(()) => backoff = BASE_BACKOFF,
                 }
-                retention_handle = tokio::spawn(retention_loop(store.clone(), config.retention_days));
+                retention_handle = tokio::spawn(retention_loop(store.clone(), default_repo.clone(), config.retention_days));
             }
         }
     }
@@ -241,22 +262,36 @@ async fn run_http(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()> 
     Ok(())
 }
 
-async fn retention_loop(store: Arc<GitHubPlanStore>, retention_days: u64) {
+async fn retention_loop(
+    store: Arc<GitHubPlanStore>,
+    default_repo: Option<RepoTarget>,
+    retention_days: u64,
+) {
+    let Some(default_repo) = default_repo else {
+        eprintln!(
+            "[retention] disabled because no default GitHub repository was detected at startup"
+        );
+        return;
+    };
+    let target = Target::GitHub(default_repo);
     loop {
-        if let Err(err) = run_retention_pass(store.as_ref(), retention_days).await {
+        if let Err(err) = run_retention_pass(store.as_ref(), &target, retention_days).await {
             eprintln!("[retention] pass failed: {}", sanitize_github_error(err));
         }
         tokio::time::sleep(RETENTION_SCAN_INTERVAL).await;
     }
 }
 
-async fn close_stale_plan(store: &GitHubPlanStore, plan: &Plan) -> Result<()> {
+async fn close_stale_plan(store: &GitHubPlanStore, target: &Target, plan: &Plan) -> Result<()> {
     if !store.config_ref().delete_is_close {
         return Ok(());
     }
 
+    let Target::GitHub(repo) = target else {
+        return Ok(());
+    };
     store
-        .client_ref()
+        .client_for(repo)
         .close_issue(parse_issue_number(&plan.id)?)
         .await
         .map_err(sanitize_github_error)
