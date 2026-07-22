@@ -7,3 +7,10 @@ type: openai
 # patches:
 #   chat_completions:
 #     - 'if (.body.model | startswith("gpt-5")) then .body.reasoning_effort = "high" else . end'
+#   responses:
+#     - '.body.store = true'  # Override default store:false; re-enables dashboard logging
+
+# Note: gpt-5.6-*:high and gpt-5.6-*:max aliases route to /v1/responses with
+# store:false default. store:false prevents dashboard logging, but OpenAI
+# retains payloads ~30 days for abuse monitoring unless the account has ZDR
+# (applies to both endpoints).

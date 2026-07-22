@@ -593,6 +593,7 @@ fn package_delegation_script() -> MockOpenAiScript {
                         "message": "Explain whether same-package delegation succeeded."
                     }),
                     id: Some("call_package_peer_1".to_string()),
+                    ..Default::default()
                 }],
                 error: None,
                 expect: None,
@@ -664,6 +665,7 @@ fn script() -> MockOpenAiScript {
                         )
                     }),
                     id: Some("call_delegate_1".to_string()),
+                    ..Default::default()
                 }],
                 error: None,
                 expect: None,
@@ -675,6 +677,7 @@ fn script() -> MockOpenAiScript {
                     name: REPRO_249_MCP_TOOL_NAME.to_string(),
                     arguments: json!({}),
                     id: Some("call_mcp_1".to_string()),
+                    ..Default::default()
                 }],
                 error: None,
                 expect: None,
@@ -715,6 +718,7 @@ fn proxy_auth_hook_script() -> MockOpenAiScript {
                         "command": "echo HTTPS_PROXY=$HTTPS_PROXY SSL_CERT_FILE=$SSL_CERT_FILE"
                     }),
                     id: Some("call_proxy_env".to_string()),
+                    ..Default::default()
                 }],
                 error: None,
                 expect: None,
@@ -1385,6 +1389,7 @@ fn handoff_script() -> MockOpenAiScript {
                         "session_id": HANDOFF_SESSION_ID,
                     }),
                     id: Some("call_handoff_1".to_string()),
+                    ..Default::default()
                 }],
                 error: None,
                 expect: None,
@@ -1399,6 +1404,7 @@ fn handoff_script() -> MockOpenAiScript {
                         "content": "// Theme toggle component"
                     }),
                     id: Some("call_create_file_1".to_string()),
+                    ..Default::default()
                 }],
                 error: None,
                 expect: None,
@@ -1420,6 +1426,7 @@ fn handoff_script() -> MockOpenAiScript {
                         "edit": "Add keyboard shortcut Ctrl+Shift+T"
                     }),
                     id: Some("call_edit_file_1".to_string()),
+                    ..Default::default()
                 }],
                 error: None,
                 expect: None,
@@ -1451,6 +1458,7 @@ fn simple_handoff_script() -> MockOpenAiScript {
                         "session_id": HANDOFF_SESSION_ID,
                     }),
                     id: Some("call_handoff_1".to_string()),
+                    ..Default::default()
                 }],
                 error: None,
                 expect: None,
@@ -1464,6 +1472,7 @@ fn simple_handoff_script() -> MockOpenAiScript {
                         "path": "/tmp"
                     }),
                     id: Some("call_tool_1".to_string()),
+                    ..Default::default()
                 }],
                 error: None,
                 expect: None,
@@ -1751,6 +1760,7 @@ fn nested_script() -> MockOpenAiScript {
                     name: format!("{}_session_prompt", NESTED_SUB_AGENT),
                     arguments: json!({"message": "Research this deeply and delegate analysis."}),
                     id: Some("call_nested_parent_1".to_string()),
+                    ..Default::default()
                 }],
                 expect: Some(MockTurnExpectation {
                     system_contains: Some("nested-parent".to_string()),
@@ -1763,6 +1773,7 @@ fn nested_script() -> MockOpenAiScript {
                     name: format!("{}_session_prompt", NESTED_SUB_SUB_AGENT),
                     arguments: json!({"message": "Analyze data and report back."}),
                     id: Some("call_nested_researcher_1".to_string()),
+                    ..Default::default()
                 }],
                 expect: Some(MockTurnExpectation {
                     system_contains: Some("nested-researcher".to_string()),

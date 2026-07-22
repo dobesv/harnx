@@ -67,6 +67,7 @@ pub fn script_call_wait_tool(seconds: u32) -> MockOpenAiScript {
         turns: vec![MockOpenAiTurn {
             text_chunks: vec!["Waiting...".to_string()],
             tool_calls: vec![MockOpenAiToolCall {
+                encrypted_content: None,
                 name: "time_wait".to_string(),
                 arguments: serde_json::json!({ "seconds": seconds }),
                 id: None,
@@ -177,6 +178,7 @@ pub fn script_call_trivial_tool() -> MockOpenAiScript {
         turns: vec![MockOpenAiTurn {
             text_chunks: vec!["Listing...".to_string()],
             tool_calls: vec![MockOpenAiToolCall {
+                encrypted_content: None,
                 name: "time_wait".to_string(),
                 arguments: serde_json::json!({ "seconds": 1 }),
                 id: None,
@@ -365,6 +367,7 @@ pub fn script_call_sub_agent(agent_name: &str) -> MockOpenAiScript {
         turns: vec![MockOpenAiTurn {
             text_chunks: vec!["Delegating...".to_string()],
             tool_calls: vec![MockOpenAiToolCall {
+                encrypted_content: None,
                 name: format!("{agent_name}_session_prompt"),
                 arguments: serde_json::json!({ "message": "do the thing" }),
                 id: None,

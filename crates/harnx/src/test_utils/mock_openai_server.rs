@@ -56,12 +56,17 @@ pub struct MockOpenAiError {
     pub headers: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct MockOpenAiToolCall {
     pub name: String,
     pub arguments: Value,
     #[serde(default)]
     pub id: Option<String>,
+    /// Optional encrypted reasoning content for Responses API testing.
+    /// When set, the mock emits a reasoning input item with this encrypted_content
+    /// BEFORE the function_call item. The client captures it into thought_signature.
+    #[serde(default)]
+    pub encrypted_content: Option<String>,
 }
 
 struct ServerState {
@@ -129,9 +134,21 @@ impl ServerState {
         }
     }
 
+    #[allow(dead_code)]
     fn log_request(&self, request: Value) {
         if let Ok(mut log) = self.request_log.lock() {
             log.push(request);
+        }
+    }
+
+    fn log_request_with_path(&self, request: Value, path: &str) {
+        if let Ok(mut log) = self.request_log.lock() {
+            // Inject synthetic __path field for test assertions
+            let mut request_with_path = request;
+            if let Some(obj) = request_with_path.as_object_mut() {
+                obj.insert("__path".to_string(), json!(path));
+            }
+            log.push(request_with_path);
         }
     }
 }
@@ -399,8 +416,14 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
         ("POST", "/v1/chat/completions") => {
             let body_json: Value =
                 serde_json::from_str(&body).unwrap_or_else(|_| json!({"error": "Invalid JSON"}));
-            state.log_request(body_json.clone());
+            state.log_request_with_path(body_json.clone(), "/v1/chat/completions");
             handle_chat_completions(body_json, &state, &mut stream);
+        }
+        ("POST", "/v1/responses") => {
+            let body_json: Value =
+                serde_json::from_str(&body).unwrap_or_else(|_| json!({"error": "Invalid JSON"}));
+            state.log_request_with_path(body_json.clone(), "/v1/responses");
+            handle_responses(body_json, &state, &mut stream);
         }
         _ => write_http_response(
             &mut stream,
@@ -650,4 +673,95 @@ fn write_http_response(stream: &mut TcpStream, status: &str, content_type: &str,
     );
     let _ = stream.write_all(http_response.as_bytes());
     let _ = stream.flush();
+}
+
+/// Handle OpenAI Responses API requests.
+/// Emits a Responses-shaped non-streaming response with output[] items.
+fn handle_responses(request: Value, state: &ServerState, stream: &mut TcpStream) {
+    let turn = state.next_turn_for_request(&request);
+
+    // Handle error responses
+    if let Some(error) = &turn.error {
+        let body = json!({
+            "error": {
+                "message": error.message,
+                "type": error.error_type,
+            }
+        });
+        let body_str = body.to_string();
+        let status_text = match error.status {
+            401 => format!("{} Unauthorized", error.status),
+            403 => format!("{} Forbidden", error.status),
+            429 => format!("{} Too Many Requests", error.status),
+            500 => format!("{} Internal Server Error", error.status),
+            502 => format!("{} Bad Gateway", error.status),
+            503 => format!("{} Service Unavailable", error.status),
+            other => format!("{other} Error"),
+        };
+        let mut extra_headers = String::new();
+        for (key, value) in &error.headers {
+            extra_headers.push_str(&format!("{key}: {value}\r\n"));
+        }
+        let response = format!(
+            "HTTP/1.1 {status_text}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
+            body_str.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+        return;
+    }
+
+    // Build Responses output array
+    let mut output: Vec<Value> = Vec::new();
+
+    // Emit reasoning item if tool_call has encrypted_content
+    // Per t4 wire shapes: reasoning item comes BEFORE function_call
+    for tc in &turn.tool_calls {
+        if let Some(encrypted) = &tc.encrypted_content {
+            output.push(json!({
+                "type": "reasoning",
+                "encrypted_content": encrypted,
+                "summary": [],
+            }));
+        }
+    }
+
+    // Emit function_call items
+    for (i, tc) in turn.tool_calls.iter().enumerate() {
+        let call_id = tc.id.clone().unwrap_or_else(|| format!("call_{i}"));
+        output.push(json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": tc.name,
+            "arguments": tc.arguments.to_string(),
+        }));
+    }
+
+    // Emit message item with output_text
+    let full_text = turn.text_chunks.join("");
+    if !full_text.is_empty() {
+        output.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": full_text,
+            }]
+        }));
+    }
+
+    // Usage per t4/t6 wire shapes: input_tokens/output_tokens, cached under input_tokens_details
+    let response_json = json!({
+        "id": format!("resp_{}", uuid::Uuid::new_v4()),
+        "output": output,
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "input_tokens_details": {
+                "cached_tokens": 5,
+            }
+        }
+    });
+
+    write_json_response(stream, &response_json);
 }
