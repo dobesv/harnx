@@ -1,6 +1,6 @@
 ---
 role: subagent
-model: openai:gpt-5.6-terra
+model: openai:gpt-5.4
 compaction_agent: compact-planner
 use_tools:
 - bash_exec
