@@ -5,6 +5,72 @@ pub type PlanId = String;
 pub type TaskId = String;
 pub type NoteId = String;
 
+/// GitHub repository target for one plan store operation.
+///
+/// Values must be GitHub path slugs: non-empty ASCII letters, digits, `.`, `_`, or `-`,
+/// excluding `.` and `..`. This deliberately rejects path separators, whitespace, and
+/// control characters before values can be used in GitHub REST paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoTarget {
+    pub owner: String,
+    pub repo: String,
+}
+
+impl RepoTarget {
+    /// Build a validated GitHub repository target from caller or startup-detected values.
+    pub fn new(owner: impl Into<String>, repo: impl Into<String>) -> Result<Self, String> {
+        let owner = owner.into();
+        let repo = repo.into();
+        validate_github_slug("owner", &owner)?;
+        validate_github_slug("repo", &repo)?;
+        Ok(Self { owner, repo })
+    }
+
+    /// Validate this target's owner and repository slug values.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_github_slug("owner", &self.owner)?;
+        validate_github_slug("repo", &self.repo)
+    }
+}
+
+/// Storage target resolved for a single tool call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Target {
+    /// Local filesystem backend target; remote owner/repo params are ignored.
+    Local,
+    /// GitHub repository backend target.
+    GitHub(RepoTarget),
+}
+
+fn validate_github_slug(kind: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("GitHub {kind} must not be empty"));
+    }
+    if value == "." || value == ".." {
+        return Err(format!("GitHub {kind} must not be '.' or '..'"));
+    }
+    if value.contains('/') || value.contains('\\') {
+        return Err(format!("GitHub {kind} must not contain path separators"));
+    }
+    if value
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err(format!(
+            "GitHub {kind} must not contain whitespace or control characters"
+        ));
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err(format!(
+            "GitHub {kind} must contain only ASCII letters, digits, '.', '_', or '-'"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageToken(pub String);
 

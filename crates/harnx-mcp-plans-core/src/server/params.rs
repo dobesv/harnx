@@ -2,6 +2,10 @@ use super::*;
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct ListTasksParams {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
     pub plan: String,
     #[serde(default = "default_open_status")]
     pub filter: String,
@@ -11,12 +15,20 @@ pub struct ListTasksParams {
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct GetTaskParams {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
     pub plan: String,
     pub id: String,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct AddTaskParams {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
     pub plan: String,
     pub title: String,
     #[serde(default)]
@@ -41,6 +53,10 @@ pub struct AddTaskParams {
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct UpdateTaskParams {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
     pub plan: String,
     pub id: String,
     #[serde(default)]
@@ -77,15 +93,28 @@ pub struct ReplaceInContent {
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct DeleteTaskParams {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
     pub plan: String,
     pub id: String,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
-pub struct ListPlansParams {}
+pub struct ListPlansParams {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
+}
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct AddPlanParams {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
     pub name: String,
     #[serde(default)]
     pub title: Option<String>,
@@ -109,11 +138,19 @@ pub struct AddPlanParams {
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct GetPlanParams {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
     pub name: String,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct UpdatePlanParams {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
     pub name: String,
     #[serde(default)]
     pub replace_content: Option<String>,
@@ -141,16 +178,28 @@ pub struct UpdatePlanParams {
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct DeletePlanParams {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
     pub name: String,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct ListNotesParams {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
     pub plan: String,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct AddNoteParams {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
     pub plan: String,
     #[serde(default)]
     pub id: Option<String>,
@@ -163,18 +212,30 @@ pub struct AddNoteParams {
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct GetNoteParams {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
     pub plan: String,
     pub note_id: String,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct DeleteNoteParams {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
     pub plan: String,
     pub note_id: String,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct UpdateNoteParams {
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
     pub plan: String,
     pub note_id: String,
     #[serde(default)]

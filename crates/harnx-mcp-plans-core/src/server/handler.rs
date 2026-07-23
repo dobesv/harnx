@@ -15,10 +15,10 @@ impl<S: PlanStore + 'static> ServerHandler for PlansServer<S> {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
-                self.meta.name,
+                self.meta.name.clone(),
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(self.meta.instructions)
+            .with_instructions(self.meta.instructions.clone())
     }
 
     async fn list_tools(
@@ -26,9 +26,7 @@ impl<S: PlanStore + 'static> ServerHandler for PlansServer<S> {
         _pagination: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult {
-            meta: None,
-            tools: vec![
+        let mut tools = vec![
                 Tool::new("list_plans", "List all plans with metadata and task/note counts.", Map::new())
                     .with_input_schema::<ListPlansParams>()
                     .with_meta(Meta(json!({"call_template": "list plans", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
@@ -74,7 +72,13 @@ impl<S: PlanStore + 'static> ServerHandler for PlansServer<S> {
                 Tool::new("delete_note", "Delete a note from a plan.", Map::new())
                     .with_input_schema::<DeleteNoteParams>()
                     .with_meta(Meta(json!({"call_template": "delete note {{ args.plan }}/{{ args.note_id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
-            ],
+            ];
+        for tool in &mut tools {
+            self.meta.target_policy.apply_to_tool_schema(tool);
+        }
+        Ok(ListToolsResult {
+            meta: None,
+            tools,
             next_cursor: None,
         })
     }
@@ -86,8 +90,8 @@ impl<S: PlanStore + 'static> ServerHandler for PlansServer<S> {
     ) -> Result<CallToolResult, ErrorData> {
         match request.name.as_ref() {
             "list_plans" => {
-                let _params = parse_arguments::<ListPlansParams>(request.arguments)?;
-                self.handle_list_plans().await
+                let params = parse_arguments::<ListPlansParams>(request.arguments)?;
+                self.handle_list_plans(params).await
             }
             "add_plan" => {
                 let params = parse_arguments::<AddPlanParams>(request.arguments)?;
@@ -150,5 +154,298 @@ impl<S: PlanStore + 'static> ServerHandler for PlansServer<S> {
                 None,
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Page, PageToken, RepoTarget};
+    use rmcp::handler::client::ClientHandler;
+    use rmcp::model::{ClientCapabilities, InitializeRequestParams};
+    use rmcp::service::{serve_client, serve_server, RoleClient, RoleServer, RunningService};
+    use tokio::io::duplex;
+
+    #[derive(Clone, Default)]
+    struct TestClientHandler;
+
+    impl ClientHandler for TestClientHandler {
+        fn get_info(&self) -> InitializeRequestParams {
+            InitializeRequestParams::new(
+                ClientCapabilities::builder().build(),
+                Implementation::new("test", "0.1"),
+            )
+        }
+    }
+
+    struct EmptyStore;
+
+    #[async_trait::async_trait]
+    impl PlanStore for EmptyStore {
+        async fn list_plans(
+            &self,
+            _target: &Target,
+            _page: Option<PageToken>,
+        ) -> Result<Page<Plan>, StoreError> {
+            unreachable!()
+        }
+        async fn get_plan(&self, _target: &Target, _plan: &PlanId) -> Result<Plan, StoreError> {
+            unreachable!()
+        }
+        async fn add_plan(&self, _target: &Target, _new_plan: NewPlan) -> Result<Plan, StoreError> {
+            unreachable!()
+        }
+        async fn update_plan_meta(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+            _update: PlanMetaUpdate,
+        ) -> Result<Plan, StoreError> {
+            unreachable!()
+        }
+        async fn delete_plan(&self, _target: &Target, _plan: &PlanId) -> Result<(), StoreError> {
+            unreachable!()
+        }
+        async fn read_plan_body(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+        ) -> Result<String, StoreError> {
+            unreachable!()
+        }
+        async fn write_plan_body(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+            _body: &str,
+        ) -> Result<(), StoreError> {
+            unreachable!()
+        }
+        async fn list_tasks(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+            _filter: TaskFilter,
+            _page: Option<PageToken>,
+        ) -> Result<Page<Task>, StoreError> {
+            unreachable!()
+        }
+        async fn get_task(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+            _task: &crate::model::TaskId,
+        ) -> Result<Task, StoreError> {
+            unreachable!()
+        }
+        async fn add_task(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+            _new_task: NewTask,
+        ) -> Result<Task, StoreError> {
+            unreachable!()
+        }
+        async fn update_task_meta(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+            _task: &crate::model::TaskId,
+            _update: TaskMetaUpdate,
+        ) -> Result<Task, StoreError> {
+            unreachable!()
+        }
+        async fn delete_task(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+            _task: &crate::model::TaskId,
+        ) -> Result<(), StoreError> {
+            unreachable!()
+        }
+        async fn read_task_body(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+            _task: &crate::model::TaskId,
+        ) -> Result<String, StoreError> {
+            unreachable!()
+        }
+        async fn write_task_body(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+            _task: &crate::model::TaskId,
+            _body: &str,
+        ) -> Result<(), StoreError> {
+            unreachable!()
+        }
+        async fn list_notes(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+            _page: Option<PageToken>,
+        ) -> Result<Page<Note>, StoreError> {
+            unreachable!()
+        }
+        async fn get_note(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+            _note: &crate::model::NoteId,
+        ) -> Result<Note, StoreError> {
+            unreachable!()
+        }
+        async fn add_note(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+            _new_note: NewNote,
+        ) -> Result<Note, StoreError> {
+            unreachable!()
+        }
+        async fn update_note_meta(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+            _note: &crate::model::NoteId,
+            _update: NoteMetaUpdate,
+        ) -> Result<Note, StoreError> {
+            unreachable!()
+        }
+        async fn delete_note(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+            _note: &crate::model::NoteId,
+        ) -> Result<(), StoreError> {
+            unreachable!()
+        }
+        async fn read_note_body(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+            _note: &crate::model::NoteId,
+        ) -> Result<String, StoreError> {
+            unreachable!()
+        }
+        async fn write_note_body(
+            &self,
+            _target: &Target,
+            _plan: &PlanId,
+            _note: &crate::model::NoteId,
+            _body: &str,
+        ) -> Result<(), StoreError> {
+            unreachable!()
+        }
+    }
+
+    async fn list_tools_for(default_repo: Option<RepoTarget>) -> ListToolsResult {
+        let (client_transport, server_transport) = duplex(65_536);
+        let server = PlansServer::with_meta(
+            Arc::new(EmptyStore),
+            ServerMeta {
+                name: "test".into(),
+                instructions: "test".into(),
+                target_policy: TargetPolicy::GitHub { default_repo },
+            },
+        );
+        let server_fut = serve_server(server, server_transport);
+        let client_fut = serve_client(TestClientHandler, client_transport);
+        type TestServerService = RunningService<RoleServer, PlansServer<EmptyStore>>;
+        type TestClientService = RunningService<RoleClient, TestClientHandler>;
+        let (server_res, client_res): (Result<TestServerService, _>, Result<TestClientService, _>) =
+            tokio::join!(server_fut, client_fut);
+        let _server = server_res.unwrap();
+        let client = client_res.unwrap();
+        let peer = client.peer().clone();
+        let _client_task = tokio::spawn(async move {
+            let _ = client.waiting().await;
+        });
+        peer.list_tools(Default::default()).await.unwrap()
+    }
+
+    fn required_for(tool: &Tool) -> Vec<String> {
+        tool.input_schema
+            .get("required")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn github_tool_schema_owner_repo_requiredness_tracks_default_repo() {
+        let with_default = list_tools_for(Some(RepoTarget {
+            owner: "acme".to_string(),
+            repo: "plans".to_string(),
+        }))
+        .await;
+        let list_plans = with_default
+            .tools
+            .iter()
+            .find(|tool| tool.name == "list_plans")
+            .unwrap();
+        let required = required_for(list_plans);
+        assert!(!required.contains(&"owner".to_string()));
+        assert!(!required.contains(&"repo".to_string()));
+
+        let without_default = list_tools_for(None).await;
+        let list_plans = without_default
+            .tools
+            .iter()
+            .find(|tool| tool.name == "list_plans")
+            .unwrap();
+        let required = required_for(list_plans);
+        assert!(required.contains(&"owner".to_string()));
+        assert!(required.contains(&"repo".to_string()));
+    }
+
+    #[tokio::test]
+    async fn resolve_target_rejects_path_traversal_owner_and_repo() {
+        let server = PlansServer::with_meta(
+            Arc::new(EmptyStore),
+            ServerMeta {
+                name: "test".into(),
+                instructions: "test".into(),
+                target_policy: TargetPolicy::GitHub { default_repo: None },
+            },
+        );
+
+        let repo_err = server
+            .resolve_target(Some("acme"), Some("../../../user"))
+            .expect_err("repo traversal should be rejected");
+        assert!(repo_err.message.contains("GitHub repo"));
+        assert!(repo_err.message.contains("path separators"));
+
+        let owner_err = server
+            .resolve_target(Some("../../../user"), Some("plans"))
+            .expect_err("owner traversal should be rejected");
+        assert!(owner_err.message.contains("GitHub owner"));
+        assert!(owner_err.message.contains("path separators"));
+    }
+
+    #[tokio::test]
+    async fn resolve_target_accepts_normal_repo_slug_with_dot() {
+        let server = PlansServer::with_meta(
+            Arc::new(EmptyStore),
+            ServerMeta {
+                name: "test".into(),
+                instructions: "test".into(),
+                target_policy: TargetPolicy::GitHub { default_repo: None },
+            },
+        );
+        let target = server
+            .resolve_target(Some("acme"), Some("plans.rs"))
+            .expect("normal repo target should resolve");
+
+        assert_eq!(
+            target,
+            Target::GitHub(RepoTarget {
+                owner: "acme".to_string(),
+                repo: "plans.rs".to_string(),
+            })
+        );
     }
 }

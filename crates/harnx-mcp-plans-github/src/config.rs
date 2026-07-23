@@ -19,6 +19,7 @@ const GIT_DETECTION_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub auth: AuthConfig,
+    pub default_repo: Option<RepoConfig>,
     pub store: GitHubStoreConfig,
     pub rate_limit: RateLimitConfig,
     pub retention_days: u64,
@@ -105,7 +106,15 @@ impl AppConfig {
             }
         }
 
-        let repo = parse_github_origin(&origin_provider()?)?;
+        let default_repo = match origin_provider().and_then(|origin| parse_github_origin(&origin)) {
+            Ok(repo) => Some(repo),
+            Err(err) => {
+                eprintln!(
+                    "harnx-mcp-plans-github: warning: could not detect default GitHub repository from git origin: {err}"
+                );
+                None
+            }
+        };
 
         let base_url = first_non_empty(base_url_arg, env("GITHUB_API_URL"))
             .unwrap_or_else(|| DEFAULT_GITHUB_API_URL.to_string())
@@ -155,9 +164,9 @@ impl AppConfig {
         Ok(Self {
             auth: AuthConfig {
                 base_url,
-                repo,
                 source: auth_source,
             },
+            default_repo,
             store: GitHubStoreConfig {
                 plan_label,
                 delete_is_close,
@@ -396,8 +405,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(cfg.auth.repo.owner, "acme");
-        assert_eq!(cfg.auth.repo.repo, "plans");
+        let default_repo = cfg.default_repo.as_ref().expect("default repo detected");
+        assert_eq!(default_repo.owner, "acme");
+        assert_eq!(default_repo.repo, "plans");
         assert!(matches!(
             cfg.auth.source,
             AuthSource::PersonalAccessToken(_)

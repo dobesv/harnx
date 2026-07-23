@@ -11,7 +11,7 @@ use jiff::Timestamp;
 use wiremock::{matchers::method, Mock, MockServer, Request, ResponseTemplate};
 
 use harnx_mcp_plans_core::conformance::{run_conformance, BackendCapabilities};
-use harnx_mcp_plans_github::auth::{AuthConfig, AuthSource, GitHubAuth, RepoConfig};
+use harnx_mcp_plans_github::auth::{AuthConfig, AuthSource, GitHubAuth};
 use harnx_mcp_plans_github::client::GitHubClient;
 use harnx_mcp_plans_github::store_github::GitHubPlanStore;
 
@@ -239,10 +239,6 @@ async fn create_mock_store_and_server() -> GitHubPlanStore {
 async fn create_test_store_with_server(server: &MockServer) -> GitHubPlanStore {
     let config = AuthConfig {
         base_url: server.uri(),
-        repo: RepoConfig {
-            owner: "test-owner".to_string(),
-            repo: "test-repo".to_string(),
-        },
         source: AuthSource::PersonalAccessToken("test-token".to_string()),
     };
 

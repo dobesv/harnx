@@ -5,33 +5,38 @@
 
 use jiff::Timestamp;
 use wiremock::{
-    matchers::{body_json, method, path, query_param},
+    matchers::{body_json, body_partial_json, method, path, query_param},
     Mock, MockServer, ResponseTemplate,
 };
 
 use harnx_mcp_plans_core::{NewPlan, NewTask, PageToken, PlanStore, StoreError, TaskFilter};
 
-use crate::auth::{AuthConfig, AuthSource, GitHubAuth, RepoConfig};
-use crate::client::GitHubClient;
+use crate::auth::SystemClock;
+use crate::auth::{AuthConfig, AuthSource, GitHubAuth};
+use crate::client::{GitHubClient, GitHubClientFactory};
+use crate::ratelimit::{RateLimitConfig, RateLimitExecutor, TokioSleeper};
+use std::sync::Arc;
 
 use super::*;
 
 async fn create_test_store(server: &MockServer) -> GitHubPlanStore {
     let config = AuthConfig {
         base_url: server.uri(),
-        repo: RepoConfig {
-            owner: "test-owner".to_string(),
-            repo: "test-repo".to_string(),
-        },
         source: AuthSource::PersonalAccessToken("test-token".to_string()),
     };
 
     let auth = GitHubAuth::new(config).unwrap();
-    let client = GitHubClient::new(auth, "test-owner", "test-repo")
-        .await
-        .unwrap();
+    let factory = GitHubClientFactory::new(
+        auth,
+        Arc::new(RateLimitExecutor::new(
+            Arc::new(SystemClock),
+            Arc::new(TokioSleeper),
+            RateLimitConfig::default(),
+        )),
+    )
+    .unwrap();
 
-    GitHubPlanStore::new(client)
+    GitHubPlanStore::new(factory)
 }
 
 async fn create_test_store_with_config(
@@ -40,21 +45,44 @@ async fn create_test_store_with_config(
 ) -> GitHubPlanStore {
     let auth_config = AuthConfig {
         base_url: server.uri(),
-        repo: RepoConfig {
-            owner: "test-owner".to_string(),
-            repo: "test-repo".to_string(),
-        },
         source: AuthSource::PersonalAccessToken("test-token".to_string()),
     };
 
     let auth = GitHubAuth::new(auth_config).unwrap();
-    let client = GitHubClient::new(auth, "test-owner", "test-repo")
-        .await
-        .unwrap();
+    let factory = GitHubClientFactory::new(
+        auth,
+        Arc::new(RateLimitExecutor::new(
+            Arc::new(SystemClock),
+            Arc::new(TokioSleeper),
+            RateLimitConfig::default(),
+        )),
+    )
+    .unwrap();
 
-    GitHubPlanStore::with_config(client, config)
+    GitHubPlanStore::with_config(factory, config)
 }
 
+fn target(owner: &str, repo: &str) -> harnx_mcp_plans_core::Target {
+    harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+    })
+}
+
+async fn create_store_with_default(
+    server: &MockServer,
+    owner: &str,
+    repo: &str,
+) -> GitHubPlanStore {
+    let config = AuthConfig {
+        base_url: server.uri(),
+        source: AuthSource::PersonalAccessToken("test-token".to_string()),
+    };
+
+    let auth = GitHubAuth::new(config).unwrap();
+    let client = GitHubClient::new(auth, owner, repo).await.unwrap();
+    GitHubPlanStore::new(client)
+}
 fn mock_issue_json(id: u64, number: u64, title: &str, body: &str) -> serde_json::Value {
     let created = Timestamp::now().to_string();
     serde_json::json!({
@@ -81,6 +109,7 @@ fn mock_issue_with_labels_json(
     let created = Timestamp::now().to_string();
     serde_json::json!({
         "id": id,
+
         "number": number,
         "title": title,
         "body": body,
@@ -104,6 +133,274 @@ fn mock_comment_json(id: u64, body: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn client_for_rejects_path_traversal_without_request() {
+    let server = MockServer::start().await;
+    let store = create_test_store(&server).await;
+    let traversal = RepoTarget {
+        owner: "acme".to_string(),
+        repo: "../../../user".to_string(),
+    };
+
+    let err = store
+        .client_for(&traversal)
+        .expect_err("repo traversal should be rejected");
+    assert!(matches!(err, StoreError::InvalidParams(_)));
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.is_empty(),
+        "invalid target made GitHub API requests: {requests:?}"
+    );
+}
+#[tokio::test]
+async fn explicit_target_rejects_path_traversal_without_request() {
+    let server = MockServer::start().await;
+    let store = create_test_store(&server).await;
+
+    let repo_err = store
+        .list_plans(&target("acme", "../../../user"), None)
+        .await
+        .expect_err("repo traversal should be rejected");
+    assert!(matches!(repo_err, StoreError::InvalidParams(_)));
+
+    let owner_err = store
+        .list_plans(&target("../../../user", "plans"), None)
+        .await
+        .expect_err("owner traversal should be rejected");
+    assert!(matches!(owner_err, StoreError::InvalidParams(_)));
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.is_empty(),
+        "invalid targets made GitHub API requests: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn explicit_target_routes_requests_to_requested_repo() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/target-owner/target-repo/issues"))
+        .and(query_param("labels", "harnx-plan"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = create_test_store(&server).await;
+    let page = store
+        .list_plans(&target("target-owner", "target-repo"), None)
+        .await
+        .unwrap();
+    assert!(page.items.is_empty());
+}
+
+#[tokio::test]
+async fn explicit_target_accepts_repo_slug_with_dot() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/plans.rs/issues"))
+        .and(query_param("labels", "harnx-plan"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = create_test_store(&server).await;
+    let page = store
+        .list_plans(&target("acme", "plans.rs"), None)
+        .await
+        .unwrap();
+    assert!(page.items.is_empty());
+}
+
+#[tokio::test]
+async fn local_target_falls_back_to_default_repo_for_requests() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/default-owner/default-repo/issues"))
+        .and(query_param("labels", "harnx-plan"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = create_store_with_default(&server, "default-owner", "default-repo").await;
+    let page = store
+        .list_plans(&harnx_mcp_plans_core::Target::Local, None)
+        .await
+        .unwrap();
+    assert!(page.items.is_empty());
+}
+
+#[tokio::test]
+async fn constructing_store_does_not_call_github_api() {
+    let server = MockServer::start().await;
+    let _store = create_test_store(&server).await;
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.is_empty(),
+        "store construction made GitHub API requests: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn ensure_label_failure_still_creates_plan() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/test-owner/test-repo/labels/harnx-plan"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("boom"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/test-owner/test-repo/issues"))
+        .and(body_partial_json(
+            serde_json::json!({ "labels": ["harnx-plan"] }),
+        ))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(mock_issue_with_labels_json(
+                1002,
+                2,
+                "Plan B",
+                "---\nclient_id: plan-b\n---\n",
+                &["harnx-plan"],
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = create_test_store(&server).await;
+    let plan = store
+        .add_plan(
+            &target("test-owner", "test-repo"),
+            NewPlan {
+                id: "plan-b".to_string(),
+                title: Some("Plan B".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(plan.id, "2");
+}
+
+#[tokio::test]
+async fn create_label_conflict_is_handled_when_ensuring_plan_label() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/test-owner/test-repo/labels/harnx-plan"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/test-owner/test-repo/labels"))
+        .respond_with(ResponseTemplate::new(422).set_body_string("already_exists"))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/test-owner/test-repo/issues"))
+        .and(body_partial_json(
+            serde_json::json!({ "labels": ["harnx-plan"] }),
+        ))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(mock_issue_with_labels_json(
+                1003,
+                3,
+                "Plan C",
+                "---\nclient_id: plan-c\n---\n",
+                &["harnx-plan"],
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = create_test_store(&server).await;
+    let plan = store
+        .add_plan(
+            &target("test-owner", "test-repo"),
+            NewPlan {
+                id: "plan-c".to_string(),
+                title: Some("Plan C".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(plan.id, "3");
+}
+
+#[tokio::test]
+async fn create_with_label_validation_failure_retries_without_label() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/test-owner/test-repo/labels/harnx-plan"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 1,
+            "name": "harnx-plan"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/test-owner/test-repo/issues"))
+        .and(body_partial_json(
+            serde_json::json!({ "labels": ["harnx-plan"] }),
+        ))
+        .respond_with(
+            ResponseTemplate::new(422).set_body_string("Validation Failed: invalid label"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/test-owner/test-repo/issues"))
+        .and(body_partial_json(serde_json::json!({
+            "title": "Plan D"
+        })))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(mock_issue_with_labels_json(
+                1004,
+                4,
+                "Plan D",
+                "---\nclient_id: plan-d\n---\n",
+                &[],
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = create_test_store(&server).await;
+    let plan = store
+        .add_plan(
+            &target("test-owner", "test-repo"),
+            NewPlan {
+                id: "plan-d".to_string(),
+                title: Some("Plan D".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(plan.id, "4");
+}
+
+#[tokio::test]
 async fn add_plan_applies_plan_label() {
     let server = MockServer::start().await;
 
@@ -123,11 +420,17 @@ async fn add_plan_applies_plan_label() {
 
     let store = create_test_store(&server).await;
     let plan = store
-        .add_plan(NewPlan {
-            id: "plan-a".to_string(),
-            title: Some("Plan A".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            NewPlan {
+                id: "plan-a".to_string(),
+                title: Some("Plan A".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -153,7 +456,16 @@ async fn get_plan_unlabeled_issue_returns_not_found() {
         .await;
 
     let store = create_test_store(&server).await;
-    let err = store.get_plan(&"7".to_string()).await.unwrap_err();
+    let err = store
+        .get_plan(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &"7".to_string(),
+        )
+        .await
+        .unwrap_err();
     assert!(matches!(err, StoreError::NotFound));
 }
 
@@ -176,7 +488,16 @@ async fn delete_plan_unlabeled_issue_returns_not_found() {
         .await;
 
     let store = create_test_store(&server).await;
-    let err = store.delete_plan(&"7".to_string()).await.unwrap_err();
+    let err = store
+        .delete_plan(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &"7".to_string(),
+        )
+        .await
+        .unwrap_err();
     assert!(matches!(err, StoreError::NotFound));
 }
 
@@ -219,7 +540,16 @@ async fn list_plans_filters_non_plan_issues_and_dedupes() {
         .await;
 
     let store = create_test_store(&server).await;
-    let page = store.list_plans(None).await.unwrap();
+    let page = store
+        .list_plans(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
 
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].id, "12");
@@ -251,7 +581,17 @@ async fn list_notes_dedupes_by_client_id_keeps_most_recent() {
         .await;
 
     let store = create_test_store(&server).await;
-    let page = store.list_notes(&"1".to_string(), None).await.unwrap();
+    let page = store
+        .list_notes(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &"1".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
 
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].id, "5002");
@@ -294,7 +634,16 @@ async fn dedupe_tie_break_prefers_higher_issue_number() {
         .await;
 
     let store = create_test_store(&server).await;
-    let page = store.list_plans(None).await.unwrap();
+    let page = store
+        .list_plans(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].id, "22");
 }
@@ -350,6 +699,10 @@ async fn add_task_sends_correct_internal_id_in_post_body() {
 
     let result = store
         .add_task(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
             &"1".to_string(),
             NewTask {
                 id: "task-1".to_string(),
@@ -414,6 +767,10 @@ async fn add_task_returns_error_when_cap_reached_without_creating_issue() {
 
     let result = store
         .add_task(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
             &"1".to_string(),
             NewTask {
                 id: "task-overflow".to_string(),
@@ -471,7 +828,14 @@ async fn get_task_wrong_plan_returns_not_found() {
 
     let store = create_test_store(&server).await;
     let err = store
-        .get_task(&"2".to_string(), &"42".to_string())
+        .get_task(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &"2".to_string(),
+            &"42".to_string(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::NotFound));
@@ -545,7 +909,14 @@ async fn get_task_on_second_page_succeeds() {
 
     let store = create_test_store(&server).await;
     let task = store
-        .get_task(&"1".to_string(), &"31".to_string())
+        .get_task(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &"1".to_string(),
+            &"31".to_string(),
+        )
         .await
         .unwrap();
     assert_eq!(task.id, "31");
@@ -577,7 +948,14 @@ async fn delete_task_wrong_plan_returns_not_found() {
 
     let store = create_test_store(&server).await;
     let err = store
-        .delete_task(&"2".to_string(), &"42".to_string())
+        .delete_task(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &"2".to_string(),
+            &"42".to_string(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::NotFound));
@@ -623,7 +1001,14 @@ async fn get_note_wrong_plan_returns_not_found() {
 
     let store = create_test_store(&server).await;
     let err = store
-        .get_note(&"2".to_string(), &"5001".to_string())
+        .get_note(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &"2".to_string(),
+            &"5001".to_string(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::NotFound));
@@ -689,7 +1074,14 @@ async fn get_note_on_second_page_succeeds() {
 
     let store = create_test_store(&server).await;
     let note = store
-        .get_note(&"1".to_string(), &"7001".to_string())
+        .get_note(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &"1".to_string(),
+            &"7001".to_string(),
+        )
         .await
         .unwrap();
     assert_eq!(note.id, "7001");
@@ -730,7 +1122,14 @@ async fn delete_note_wrong_plan_returns_not_found() {
 
     let store = create_test_store(&server).await;
     let err = store
-        .delete_note(&"2".to_string(), &"5001".to_string())
+        .delete_note(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &"2".to_string(),
+            &"5001".to_string(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::NotFound));
@@ -766,7 +1165,16 @@ async fn delete_plan_closes_issue() {
         .await;
 
     let store = create_test_store(&server).await;
-    assert!(store.delete_plan(&"123".to_string()).await.is_ok());
+    assert!(store
+        .delete_plan(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string()
+            }),
+            &"123".to_string()
+        )
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
@@ -816,7 +1224,14 @@ async fn delete_task_closes_issue() {
 
     let store = create_test_store(&server).await;
     assert!(store
-        .delete_task(&"1".to_string(), &"456".to_string())
+        .delete_task(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string()
+            }),
+            &"1".to_string(),
+            &"456".to_string()
+        )
         .await
         .is_ok());
 }
@@ -833,7 +1248,16 @@ async fn delete_leave_mode_is_honest() {
     )
     .await;
 
-    let err = store.delete_plan(&"123".to_string()).await.unwrap_err();
+    let err = store
+        .delete_plan(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &"123".to_string(),
+        )
+        .await
+        .unwrap_err();
     assert!(matches!(err, StoreError::InvalidParams(_)));
 }
 
@@ -879,7 +1303,14 @@ async fn delete_note_deletes_comment() {
 
     let store = create_test_store(&server).await;
     assert!(store
-        .delete_note(&"1".to_string(), &"789".to_string())
+        .delete_note(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string()
+            }),
+            &"1".to_string(),
+            &"789".to_string()
+        )
         .await
         .is_ok());
 }
@@ -928,7 +1359,15 @@ async fn list_tasks_dedupes_by_client_id_keeps_most_recent() {
 
     let store = create_test_store(&server).await;
     let page = store
-        .list_tasks(&"1".to_string(), TaskFilter::default(), None)
+        .list_tasks(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            &"1".to_string(),
+            TaskFilter::default(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -976,7 +1415,16 @@ async fn list_plans_encodes_link_header_in_page_token() {
         .await;
 
     let store = create_test_store(&server).await;
-    let page = store.list_plans(None).await.unwrap();
+    let page = store
+        .list_plans(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
 
     assert!(page.next.is_some());
     let token = page.next.unwrap();
@@ -1003,7 +1451,13 @@ async fn list_plans_uses_token_for_next_page() {
 
     let store = create_test_store(&server).await;
     let page = store
-        .list_plans(Some(PageToken(format!("{}/page2", server.uri()))))
+        .list_plans(
+            &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+                owner: "test-owner".to_string(),
+                repo: "test-repo".to_string(),
+            }),
+            Some(PageToken(format!("{}/page2", server.uri()))),
+        )
         .await
         .unwrap();
 
@@ -1047,24 +1501,14 @@ async fn retention_pass_closes_stale_plan() {
         .await;
 
     let store = create_test_store(&server).await;
-    crate::runtime::run_retention_pass(&store, 14)
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn startup_validation_fails_for_missing_repo() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/repos/test-owner/test-repo"))
-        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
-        .mount(&server)
-        .await;
-
-    let store = create_test_store(&server).await;
-    let err = crate::runtime::validate_startup(&store, "harnx-plan")
-        .await
-        .expect_err("missing repo should fail");
-    assert!(err.to_string().contains("startup validation failed"));
+    crate::runtime::run_retention_pass(
+        &store,
+        &harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
+            owner: "test-owner".to_string(),
+            repo: "test-repo".to_string(),
+        }),
+        14,
+    )
+    .await
+    .unwrap();
 }

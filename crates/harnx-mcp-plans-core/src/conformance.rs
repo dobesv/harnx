@@ -122,7 +122,7 @@ async fn assert_deleted_plan_contract<S: PlanStore>(
 ) {
     if caps.deletes_permanently {
         let err = store
-            .get_plan(&id.to_string())
+            .get_plan(&crate::model::Target::Local, &id.to_string())
             .await
             .expect_err("get_plan on deleted plan should fail");
         assert!(
@@ -146,7 +146,11 @@ async fn assert_deleted_task_contract<S: PlanStore>(
 ) {
     if caps.deletes_permanently {
         let err = store
-            .get_task(&plan_id.to_string(), &task_id.to_string())
+            .get_task(
+                &crate::model::Target::Local,
+                &plan_id.to_string(),
+                &task_id.to_string(),
+            )
             .await
             .expect_err("get_task on deleted task should fail");
         assert!(
@@ -167,7 +171,7 @@ async fn collect_all_plans<S: PlanStore>(store: &Arc<S>) -> Vec<Plan> {
     let mut next: Option<PageToken> = None;
     loop {
         let page = store
-            .list_plans(next.clone())
+            .list_plans(&crate::model::Target::Local, next.clone())
             .await
             .expect("list_plans should succeed");
         items.extend(page.items);
@@ -184,7 +188,12 @@ async fn collect_all_tasks<S: PlanStore>(store: &Arc<S>, plan_id: &str) -> Vec<T
     let mut next: Option<PageToken> = None;
     loop {
         let page = store
-            .list_tasks(&plan_id.to_string(), TaskFilter::default(), next.clone())
+            .list_tasks(
+                &crate::model::Target::Local,
+                &plan_id.to_string(),
+                TaskFilter::default(),
+                next.clone(),
+            )
             .await
             .expect("list_tasks should succeed");
         items.extend(page.items);
@@ -198,16 +207,19 @@ async fn collect_all_tasks<S: PlanStore>(store: &Arc<S>, plan_id: &str) -> Vec<T
 
 async fn test_plan_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities) {
     let plan1 = store
-        .add_plan(NewPlan {
-            id: "auto-gen-test-plan".to_string(),
-            title: Some("Auto-generated ID plan".to_string()),
-            summary: None,
-            author: None,
-            assignee: None,
-            executor: None,
-            git_branch: None,
-            github_owner_repo: None,
-        })
+        .add_plan(
+            &crate::model::Target::Local,
+            NewPlan {
+                id: "auto-gen-test-plan".to_string(),
+                title: Some("Auto-generated ID plan".to_string()),
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                git_branch: None,
+                github_owner_repo: None,
+            },
+        )
         .await
         .expect("add_plan with provided ID should succeed");
     assert!(!plan1.id.is_empty(), "plan ID should be non-empty");
@@ -215,16 +227,19 @@ async fn test_plan_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
 
     let client_id = "custom-plan-id";
     let plan2 = store
-        .add_plan(NewPlan {
-            id: client_id.to_string(),
-            title: Some("Custom ID plan".to_string()),
-            summary: Some("Plan summary".to_string()),
-            author: Some("hestia".to_string()),
-            assignee: None,
-            executor: None,
-            git_branch: None,
-            github_owner_repo: None,
-        })
+        .add_plan(
+            &crate::model::Target::Local,
+            NewPlan {
+                id: client_id.to_string(),
+                title: Some("Custom ID plan".to_string()),
+                summary: Some("Plan summary".to_string()),
+                author: Some("hestia".to_string()),
+                assignee: None,
+                executor: None,
+                git_branch: None,
+                github_owner_repo: None,
+            },
+        )
         .await
         .expect("add_plan with custom ID should succeed");
     assert_preserved_id(caps, &plan2.id, client_id, "plan");
@@ -232,14 +247,14 @@ async fn test_plan_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
     assert_eq!(plan2.author.as_deref(), Some("hestia"));
 
     let fetched = store
-        .get_plan(&plan2.id)
+        .get_plan(&crate::model::Target::Local, &plan2.id)
         .await
         .expect("get_plan should succeed");
     assert_eq!(fetched.id, plan2.id);
     assert_eq!(fetched.title, plan2.title);
     if caps.preserves_client_id {
         let fetched_by_client_id = store
-            .get_plan(&client_id.to_string())
+            .get_plan(&crate::model::Target::Local, &client_id.to_string())
             .await
             .expect("get_plan by client-provided ID should succeed when IDs are preserved");
         assert_eq!(fetched_by_client_id.id, client_id);
@@ -247,6 +262,7 @@ async fn test_plan_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
 
     let updated = store
         .update_plan_meta(
+            &crate::model::Target::Local,
             &plan2.id,
             PlanMetaUpdate {
                 title: Some("Updated title".to_string()),
@@ -264,11 +280,11 @@ async fn test_plan_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
     assert_eq!(updated.assignee.as_deref(), Some("atlas"));
 
     store
-        .write_plan_body(&plan2.id, "Plan body content")
+        .write_plan_body(&crate::model::Target::Local, &plan2.id, "Plan body content")
         .await
         .expect("write_plan_body should succeed");
     let body = store
-        .read_plan_body(&plan2.id)
+        .read_plan_body(&crate::model::Target::Local, &plan2.id)
         .await
         .expect("read_plan_body should succeed");
     assert!(
@@ -277,46 +293,51 @@ async fn test_plan_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
     );
 
     store
-        .delete_plan(&plan2.id)
+        .delete_plan(&crate::model::Target::Local, &plan2.id)
         .await
         .expect("delete_plan should succeed");
     assert_deleted_plan_contract(store, &plan2.id, caps).await;
 
-    let _ = store.delete_plan(&plan1.id).await;
+    let _ = store
+        .delete_plan(&crate::model::Target::Local, &plan1.id)
+        .await;
 }
 
 async fn test_plan_list_pagination<S: PlanStore>(store: &Arc<S>) {
     let ids: Vec<_> = (0..5).map(|i| format!("pagination-plan-{}", i)).collect();
 
     for id in &ids {
-        let _ = store.delete_plan(id).await;
+        let _ = store.delete_plan(&crate::model::Target::Local, id).await;
     }
 
     for id in &ids {
         store
-            .add_plan(NewPlan {
-                id: id.clone(),
-                title: Some(format!("Plan {}", id)),
-                summary: None,
-                author: None,
-                assignee: None,
-                executor: None,
-                git_branch: None,
-                github_owner_repo: None,
-            })
+            .add_plan(
+                &crate::model::Target::Local,
+                NewPlan {
+                    id: id.clone(),
+                    title: Some(format!("Plan {}", id)),
+                    summary: None,
+                    author: None,
+                    assignee: None,
+                    executor: None,
+                    git_branch: None,
+                    github_owner_repo: None,
+                },
+            )
             .await
             .expect("add_plan should succeed");
     }
 
     let page1 = store
-        .list_plans(None)
+        .list_plans(&crate::model::Target::Local, None)
         .await
         .expect("list_plans should succeed");
     assert!(!page1.items.is_empty(), "page 1 should have items");
 
     if let Some(next) = page1.next {
         let page2 = store
-            .list_plans(Some(next))
+            .list_plans(&crate::model::Target::Local, Some(next))
             .await
             .expect("list_plans page 2 should succeed");
         let page1_ids: std::collections::HashSet<_> = page1.items.iter().map(|p| &p.id).collect();
@@ -330,27 +351,35 @@ async fn test_plan_list_pagination<S: PlanStore>(store: &Arc<S>) {
 
     for plan in collect_all_plans(store).await {
         if plan.id.starts_with("pagination-plan-") {
-            let _ = store.delete_plan(&plan.id).await;
+            let _ = store
+                .delete_plan(&crate::model::Target::Local, &plan.id)
+                .await;
         }
     }
 }
 
 async fn test_plan_duplicate_id<S: PlanStore>(store: &Arc<S>) {
     let plan = store
-        .add_plan(NewPlan {
-            id: "duplicate-plan-id".to_string(),
-            title: Some("First plan".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &crate::model::Target::Local,
+            NewPlan {
+                id: "duplicate-plan-id".to_string(),
+                title: Some("First plan".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("first add_plan should succeed");
 
     let result = store
-        .add_plan(NewPlan {
-            id: "duplicate-plan-id".to_string(),
-            title: Some("Second plan".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &crate::model::Target::Local,
+            NewPlan {
+                id: "duplicate-plan-id".to_string(),
+                title: Some("Second plan".to_string()),
+                ..Default::default()
+            },
+        )
         .await;
 
     if let Err(err) = result {
@@ -361,21 +390,27 @@ async fn test_plan_duplicate_id<S: PlanStore>(store: &Arc<S>) {
         );
     }
 
-    let _ = store.delete_plan(&plan.id).await;
+    let _ = store
+        .delete_plan(&crate::model::Target::Local, &plan.id)
+        .await;
 }
 
 async fn test_task_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities) {
     let plan = store
-        .add_plan(NewPlan {
-            id: "task-crud-plan".to_string(),
-            title: Some("Task CRUD plan".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &crate::model::Target::Local,
+            NewPlan {
+                id: "task-crud-plan".to_string(),
+                title: Some("Task CRUD plan".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("add_plan should succeed");
 
     let task1 = store
         .add_task(
+            &crate::model::Target::Local,
             &plan.id,
             NewTask {
                 id: "auto-gen-test-task".to_string(),
@@ -397,6 +432,7 @@ async fn test_task_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
     let client_id = "custom-task-id";
     let task2 = store
         .add_task(
+            &crate::model::Target::Local,
             &plan.id,
             NewTask {
                 id: client_id.to_string(),
@@ -417,13 +453,17 @@ async fn test_task_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
     assert_eq!(task2.author.as_deref(), Some("apollo"));
 
     let fetched = store
-        .get_task(&plan.id, &task2.id)
+        .get_task(&crate::model::Target::Local, &plan.id, &task2.id)
         .await
         .expect("get_task should succeed");
     assert_eq!(fetched.id, task2.id);
     if caps.preserves_client_id {
         let fetched_by_client_id = store
-            .get_task(&plan.id, &client_id.to_string())
+            .get_task(
+                &crate::model::Target::Local,
+                &plan.id,
+                &client_id.to_string(),
+            )
             .await
             .expect("get_task by client-provided ID should succeed when IDs are preserved");
         assert_eq!(fetched_by_client_id.id, client_id);
@@ -431,6 +471,7 @@ async fn test_task_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
 
     let updated = store
         .update_task_meta(
+            &crate::model::Target::Local,
             &plan.id,
             &task2.id,
             TaskMetaUpdate {
@@ -451,11 +492,16 @@ async fn test_task_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
     assert_eq!(updated.status, "in_progress");
 
     store
-        .write_task_body(&plan.id, &task2.id, "Task body")
+        .write_task_body(
+            &crate::model::Target::Local,
+            &plan.id,
+            &task2.id,
+            "Task body",
+        )
         .await
         .expect("write_task_body should succeed");
     let body = store
-        .read_task_body(&plan.id, &task2.id)
+        .read_task_body(&crate::model::Target::Local, &plan.id, &task2.id)
         .await
         .expect("read_task_body should succeed");
     assert!(
@@ -464,27 +510,35 @@ async fn test_task_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
     );
 
     store
-        .delete_task(&plan.id, &task2.id)
+        .delete_task(&crate::model::Target::Local, &plan.id, &task2.id)
         .await
         .expect("delete_task should succeed");
     assert_deleted_task_contract(store, &plan.id, &task2.id, caps).await;
 
-    let _ = store.delete_task(&plan.id, &task1.id).await;
-    let _ = store.delete_plan(&plan.id).await;
+    let _ = store
+        .delete_task(&crate::model::Target::Local, &plan.id, &task1.id)
+        .await;
+    let _ = store
+        .delete_plan(&crate::model::Target::Local, &plan.id)
+        .await;
 }
 
 async fn test_task_filtering<S: PlanStore>(store: &Arc<S>) {
     let plan = store
-        .add_plan(NewPlan {
-            id: "task-filter-plan".to_string(),
-            title: Some("Task filter plan".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &crate::model::Target::Local,
+            NewPlan {
+                id: "task-filter-plan".to_string(),
+                title: Some("Task filter plan".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("add_plan should succeed");
 
     store
         .add_task(
+            &crate::model::Target::Local,
             &plan.id,
             NewTask {
                 id: "task-open".to_string(),
@@ -499,6 +553,7 @@ async fn test_task_filtering<S: PlanStore>(store: &Arc<S>) {
 
     store
         .add_task(
+            &crate::model::Target::Local,
             &plan.id,
             NewTask {
                 id: "task-done".to_string(),
@@ -513,6 +568,7 @@ async fn test_task_filtering<S: PlanStore>(store: &Arc<S>) {
 
     let open_tasks = store
         .list_tasks(
+            &crate::model::Target::Local,
             &plan.id,
             TaskFilter {
                 status: Some("open".to_string()),
@@ -526,6 +582,7 @@ async fn test_task_filtering<S: PlanStore>(store: &Arc<S>) {
 
     let backend_tasks = store
         .list_tasks(
+            &crate::model::Target::Local,
             &plan.id,
             TaskFilter {
                 status: None,
@@ -540,22 +597,28 @@ async fn test_task_filtering<S: PlanStore>(store: &Arc<S>) {
         .iter()
         .all(|t| t.tags.contains(&"backend".to_string())));
 
-    let _ = store.delete_plan(&plan.id).await;
+    let _ = store
+        .delete_plan(&crate::model::Target::Local, &plan.id)
+        .await;
 }
 
 async fn test_task_list_pagination<S: PlanStore>(store: &Arc<S>) {
     let plan = store
-        .add_plan(NewPlan {
-            id: "task-pag-plan".to_string(),
-            title: Some("Task pagination plan".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &crate::model::Target::Local,
+            NewPlan {
+                id: "task-pag-plan".to_string(),
+                title: Some("Task pagination plan".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("add_plan should succeed");
 
     for i in 0..5 {
         store
             .add_task(
+                &crate::model::Target::Local,
                 &plan.id,
                 NewTask {
                     id: format!("task-pag-{}", i),
@@ -568,14 +631,24 @@ async fn test_task_list_pagination<S: PlanStore>(store: &Arc<S>) {
     }
 
     let page1 = store
-        .list_tasks(&plan.id, TaskFilter::default(), None)
+        .list_tasks(
+            &crate::model::Target::Local,
+            &plan.id,
+            TaskFilter::default(),
+            None,
+        )
         .await
         .expect("list_tasks should succeed");
     assert!(!page1.items.is_empty(), "page 1 should have items");
 
     if let Some(next) = page1.next {
         let page2 = store
-            .list_tasks(&plan.id, TaskFilter::default(), Some(next))
+            .list_tasks(
+                &crate::model::Target::Local,
+                &plan.id,
+                TaskFilter::default(),
+                Some(next),
+            )
             .await
             .expect("list_tasks page 2 should succeed");
         let page1_ids: std::collections::HashSet<_> = page1.items.iter().map(|t| &t.id).collect();
@@ -587,21 +660,27 @@ async fn test_task_list_pagination<S: PlanStore>(store: &Arc<S>) {
         }
     }
 
-    let _ = store.delete_plan(&plan.id).await;
+    let _ = store
+        .delete_plan(&crate::model::Target::Local, &plan.id)
+        .await;
 }
 
 async fn test_task_dependencies<S: PlanStore>(store: &Arc<S>) {
     let plan = store
-        .add_plan(NewPlan {
-            id: "task-deps-plan".to_string(),
-            title: Some("Task deps plan".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &crate::model::Target::Local,
+            NewPlan {
+                id: "task-deps-plan".to_string(),
+                title: Some("Task deps plan".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("add_plan should succeed");
 
     let task1 = store
         .add_task(
+            &crate::model::Target::Local,
             &plan.id,
             NewTask {
                 id: "dep-task-1".to_string(),
@@ -614,6 +693,7 @@ async fn test_task_dependencies<S: PlanStore>(store: &Arc<S>) {
 
     let task2 = store
         .add_task(
+            &crate::model::Target::Local,
             &plan.id,
             NewTask {
                 id: "dep-task-2".to_string(),
@@ -627,29 +707,38 @@ async fn test_task_dependencies<S: PlanStore>(store: &Arc<S>) {
 
     assert_eq!(task2.dependencies, vec![task1.id.clone()]);
 
-    let _ = store.delete_plan(&plan.id).await;
+    let _ = store
+        .delete_plan(&crate::model::Target::Local, &plan.id)
+        .await;
 }
 
 async fn test_cross_plan_isolation<S: PlanStore>(store: &Arc<S>) {
     let plan_a = store
-        .add_plan(NewPlan {
-            id: "cross-plan-a".to_string(),
-            title: Some("Cross plan A".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &crate::model::Target::Local,
+            NewPlan {
+                id: "cross-plan-a".to_string(),
+                title: Some("Cross plan A".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("add_plan A should succeed");
     let plan_b = store
-        .add_plan(NewPlan {
-            id: "cross-plan-b".to_string(),
-            title: Some("Cross plan B".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &crate::model::Target::Local,
+            NewPlan {
+                id: "cross-plan-b".to_string(),
+                title: Some("Cross plan B".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("add_plan B should succeed");
 
     let task = store
         .add_task(
+            &crate::model::Target::Local,
             &plan_a.id,
             NewTask {
                 id: "cross-task".to_string(),
@@ -661,13 +750,14 @@ async fn test_cross_plan_isolation<S: PlanStore>(store: &Arc<S>) {
         .expect("add_task should succeed");
 
     let err = store
-        .get_task(&plan_b.id, &task.id)
+        .get_task(&crate::model::Target::Local, &plan_b.id, &task.id)
         .await
         .expect_err("get_task with wrong plan should fail");
     assert!(matches!(err, StoreError::NotFound));
 
     let note = store
         .add_note(
+            &crate::model::Target::Local,
             &plan_a.id,
             NewNote {
                 id: "cross-note".to_string(),
@@ -679,27 +769,35 @@ async fn test_cross_plan_isolation<S: PlanStore>(store: &Arc<S>) {
         .expect("add_note should succeed");
 
     let err = store
-        .get_note(&plan_b.id, &note.id)
+        .get_note(&crate::model::Target::Local, &plan_b.id, &note.id)
         .await
         .expect_err("get_note with wrong plan should fail");
     assert!(matches!(err, StoreError::NotFound));
 
-    let _ = store.delete_plan(&plan_a.id).await;
-    let _ = store.delete_plan(&plan_b.id).await;
+    let _ = store
+        .delete_plan(&crate::model::Target::Local, &plan_a.id)
+        .await;
+    let _ = store
+        .delete_plan(&crate::model::Target::Local, &plan_b.id)
+        .await;
 }
 
 async fn test_note_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities) {
     let plan = store
-        .add_plan(NewPlan {
-            id: "note-crud-plan".to_string(),
-            title: Some("Note CRUD plan".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &crate::model::Target::Local,
+            NewPlan {
+                id: "note-crud-plan".to_string(),
+                title: Some("Note CRUD plan".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("add_plan should succeed");
 
     let note1 = store
         .add_note(
+            &crate::model::Target::Local,
             &plan.id,
             NewNote {
                 id: "auto-gen-test-note".to_string(),
@@ -714,6 +812,7 @@ async fn test_note_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
     let client_id = "custom-note-id";
     let note2 = store
         .add_note(
+            &crate::model::Target::Local,
             &plan.id,
             NewNote {
                 id: client_id.to_string(),
@@ -727,13 +826,17 @@ async fn test_note_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
     assert_eq!(note2.summary.as_deref(), Some("Note summary"));
 
     let fetched = store
-        .get_note(&plan.id, &note2.id)
+        .get_note(&crate::model::Target::Local, &plan.id, &note2.id)
         .await
         .expect("get_note should succeed");
     assert_eq!(fetched.id, note2.id);
     if caps.preserves_client_id {
         let fetched_by_client_id = store
-            .get_note(&plan.id, &client_id.to_string())
+            .get_note(
+                &crate::model::Target::Local,
+                &plan.id,
+                &client_id.to_string(),
+            )
             .await
             .expect("get_note by client-provided ID should succeed when IDs are preserved");
         assert_eq!(fetched_by_client_id.id, client_id);
@@ -741,6 +844,7 @@ async fn test_note_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
 
     let updated = store
         .update_note_meta(
+            &crate::model::Target::Local,
             &plan.id,
             &note2.id,
             NoteMetaUpdate {
@@ -754,11 +858,16 @@ async fn test_note_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
     assert_eq!(updated.author.as_deref(), Some("atlas"));
 
     store
-        .write_note_body(&plan.id, &note2.id, "Note body")
+        .write_note_body(
+            &crate::model::Target::Local,
+            &plan.id,
+            &note2.id,
+            "Note body",
+        )
         .await
         .expect("write_note_body should succeed");
     let body = store
-        .read_note_body(&plan.id, &note2.id)
+        .read_note_body(&crate::model::Target::Local, &plan.id, &note2.id)
         .await
         .expect("read_note_body should succeed");
     assert!(
@@ -767,32 +876,40 @@ async fn test_note_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
     );
 
     store
-        .delete_note(&plan.id, &note2.id)
+        .delete_note(&crate::model::Target::Local, &plan.id, &note2.id)
         .await
         .expect("delete_note should succeed");
     let err = store
-        .get_note(&plan.id, &note2.id)
+        .get_note(&crate::model::Target::Local, &plan.id, &note2.id)
         .await
         .expect_err("get_note on deleted note should fail");
     assert!(matches!(err, StoreError::NotFound));
 
-    let _ = store.delete_note(&plan.id, &note1.id).await;
-    let _ = store.delete_plan(&plan.id).await;
+    let _ = store
+        .delete_note(&crate::model::Target::Local, &plan.id, &note1.id)
+        .await;
+    let _ = store
+        .delete_plan(&crate::model::Target::Local, &plan.id)
+        .await;
 }
 
 async fn test_note_list_pagination<S: PlanStore>(store: &Arc<S>) {
     let plan = store
-        .add_plan(NewPlan {
-            id: "note-pag-plan".to_string(),
-            title: Some("Note pagination plan".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &crate::model::Target::Local,
+            NewPlan {
+                id: "note-pag-plan".to_string(),
+                title: Some("Note pagination plan".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("add_plan should succeed");
 
     for i in 0..5 {
         store
             .add_note(
+                &crate::model::Target::Local,
                 &plan.id,
                 NewNote {
                     id: format!("note-pag-{}", i),
@@ -805,14 +922,14 @@ async fn test_note_list_pagination<S: PlanStore>(store: &Arc<S>) {
     }
 
     let page1 = store
-        .list_notes(&plan.id, None)
+        .list_notes(&crate::model::Target::Local, &plan.id, None)
         .await
         .expect("list_notes should succeed");
     assert!(!page1.items.is_empty(), "page 1 should have items");
 
     if let Some(next) = page1.next {
         let page2 = store
-            .list_notes(&plan.id, Some(next))
+            .list_notes(&crate::model::Target::Local, &plan.id, Some(next))
             .await
             .expect("list_notes page 2 should succeed");
         let page1_ids: std::collections::HashSet<_> = page1.items.iter().map(|n| &n.id).collect();
@@ -824,51 +941,69 @@ async fn test_note_list_pagination<S: PlanStore>(store: &Arc<S>) {
         }
     }
 
-    let _ = store.delete_plan(&plan.id).await;
+    let _ = store
+        .delete_plan(&crate::model::Target::Local, &plan.id)
+        .await;
 }
 
 async fn test_body_edits<S: PlanStore>(store: &Arc<S>) {
     let plan = store
-        .add_plan(NewPlan {
-            id: "body-edits-plan".to_string(),
-            title: Some("Body edits plan".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &crate::model::Target::Local,
+            NewPlan {
+                id: "body-edits-plan".to_string(),
+                title: Some("Body edits plan".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("add_plan should succeed");
 
     store
-        .write_plan_body(&plan.id, "line1\nline2\nline3")
+        .write_plan_body(
+            &crate::model::Target::Local,
+            &plan.id,
+            "line1\nline2\nline3",
+        )
         .await
         .expect("write_plan_body should succeed");
     let body = store
-        .read_plan_body(&plan.id)
+        .read_plan_body(&crate::model::Target::Local, &plan.id)
         .await
         .expect("read_plan_body should succeed");
     assert!(body.ends_with("line1\nline2\nline3"));
 
     store
-        .write_plan_body(&plan.id, "line1\nREPLACED\nline3")
+        .write_plan_body(
+            &crate::model::Target::Local,
+            &plan.id,
+            "line1\nREPLACED\nline3",
+        )
         .await
         .expect("write_plan_body replace should succeed");
     let body = store
-        .read_plan_body(&plan.id)
+        .read_plan_body(&crate::model::Target::Local, &plan.id)
         .await
         .expect("read_plan_body should succeed");
     assert!(body.ends_with("line1\nREPLACED\nline3"));
 
     store
-        .write_plan_body(&plan.id, "line1\nREPLACED\nline3\nappended")
+        .write_plan_body(
+            &crate::model::Target::Local,
+            &plan.id,
+            "line1\nREPLACED\nline3\nappended",
+        )
         .await
         .expect("write_plan_body append should succeed");
     let body = store
-        .read_plan_body(&plan.id)
+        .read_plan_body(&crate::model::Target::Local, &plan.id)
         .await
         .expect("read_plan_body should succeed");
     assert!(body.ends_with("line1\nREPLACED\nline3\nappended"));
 
     let task = store
         .add_task(
+            &crate::model::Target::Local,
             &plan.id,
             NewTask {
                 id: "body-task".to_string(),
@@ -879,17 +1014,23 @@ async fn test_body_edits<S: PlanStore>(store: &Arc<S>) {
         .await
         .expect("add_task should succeed");
     store
-        .write_task_body(&plan.id, &task.id, "Task body content")
+        .write_task_body(
+            &crate::model::Target::Local,
+            &plan.id,
+            &task.id,
+            "Task body content",
+        )
         .await
         .expect("write_task_body should succeed");
     let task_body = store
-        .read_task_body(&plan.id, &task.id)
+        .read_task_body(&crate::model::Target::Local, &plan.id, &task.id)
         .await
         .expect("read_task_body should succeed");
     assert!(task_body.ends_with("Task body content"));
 
     let note = store
         .add_note(
+            &crate::model::Target::Local,
             &plan.id,
             NewNote {
                 id: "body-note".to_string(),
@@ -900,27 +1041,38 @@ async fn test_body_edits<S: PlanStore>(store: &Arc<S>) {
         .await
         .expect("add_note should succeed");
     store
-        .write_note_body(&plan.id, &note.id, "Note body content")
+        .write_note_body(
+            &crate::model::Target::Local,
+            &plan.id,
+            &note.id,
+            "Note body content",
+        )
         .await
         .expect("write_note_body should succeed");
     let note_body = store
-        .read_note_body(&plan.id, &note.id)
+        .read_note_body(&crate::model::Target::Local, &plan.id, &note.id)
         .await
         .expect("read_note_body should succeed");
     assert!(note_body.ends_with("Note body content"));
 
-    let _ = store.delete_plan(&plan.id).await;
+    let _ = store
+        .delete_plan(&crate::model::Target::Local, &plan.id)
+        .await;
 }
 
 async fn test_not_found_errors<S: PlanStore>(store: &Arc<S>) {
     let err = store
-        .get_plan(&"nonexistent-plan".to_string())
+        .get_plan(
+            &crate::model::Target::Local,
+            &"nonexistent-plan".to_string(),
+        )
         .await
         .expect_err("get_plan should fail for nonexistent ID");
     assert!(matches!(err, StoreError::NotFound) || matches!(err, StoreError::InvalidParams(_)));
 
     let err = store
         .get_task(
+            &crate::model::Target::Local,
             &"nonexistent-plan".to_string(),
             &"nonexistent-task".to_string(),
         )
@@ -930,6 +1082,7 @@ async fn test_not_found_errors<S: PlanStore>(store: &Arc<S>) {
 
     let err = store
         .get_note(
+            &crate::model::Target::Local,
             &"nonexistent-plan".to_string(),
             &"nonexistent-note".to_string(),
         )
@@ -940,20 +1093,26 @@ async fn test_not_found_errors<S: PlanStore>(store: &Arc<S>) {
 
 async fn test_already_exists_errors<S: PlanStore>(store: &Arc<S>) {
     let plan = store
-        .add_plan(NewPlan {
-            id: "already-exists-plan".to_string(),
-            title: Some("Existing plan".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &crate::model::Target::Local,
+            NewPlan {
+                id: "already-exists-plan".to_string(),
+                title: Some("Existing plan".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("first add_plan should succeed");
 
     let result = store
-        .add_plan(NewPlan {
-            id: "already-exists-plan".to_string(),
-            title: Some("Duplicate plan".to_string()),
-            ..Default::default()
-        })
+        .add_plan(
+            &crate::model::Target::Local,
+            NewPlan {
+                id: "already-exists-plan".to_string(),
+                title: Some("Duplicate plan".to_string()),
+                ..Default::default()
+            },
+        )
         .await;
 
     if let Err(err) = result {
@@ -964,17 +1123,22 @@ async fn test_already_exists_errors<S: PlanStore>(store: &Arc<S>) {
         );
     }
 
-    let _ = store.delete_plan(&plan.id).await;
+    let _ = store
+        .delete_plan(&crate::model::Target::Local, &plan.id)
+        .await;
 }
 
 async fn test_invalid_id_errors<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities) {
     if caps.rejects_invalid_create_ids {
         let err = store
-            .add_plan(NewPlan {
-                id: "invalid/plan/id".to_string(),
-                title: Some("Invalid ID".to_string()),
-                ..Default::default()
-            })
+            .add_plan(
+                &crate::model::Target::Local,
+                NewPlan {
+                    id: "invalid/plan/id".to_string(),
+                    title: Some("Invalid ID".to_string()),
+                    ..Default::default()
+                },
+            )
             .await
             .expect_err("add_plan should fail for invalid ID");
         assert!(
@@ -985,16 +1149,20 @@ async fn test_invalid_id_errors<S: PlanStore>(store: &Arc<S>, caps: BackendCapab
     }
 
     let plan = store
-        .add_plan(NewPlan {
-            id: "plan-invalid-task".to_string(),
-            ..Default::default()
-        })
+        .add_plan(
+            &crate::model::Target::Local,
+            NewPlan {
+                id: "plan-invalid-task".to_string(),
+                ..Default::default()
+            },
+        )
         .await
         .expect("add_plan should succeed");
 
     if caps.rejects_invalid_create_ids {
         let err = store
             .add_task(
+                &crate::model::Target::Local,
                 &plan.id,
                 NewTask {
                     id: "invalid/task/id".to_string(),
@@ -1011,7 +1179,9 @@ async fn test_invalid_id_errors<S: PlanStore>(store: &Arc<S>, caps: BackendCapab
         );
     }
 
-    let _ = store.delete_plan(&plan.id).await;
+    let _ = store
+        .delete_plan(&crate::model::Target::Local, &plan.id)
+        .await;
 }
 
 #[cfg(test)]
