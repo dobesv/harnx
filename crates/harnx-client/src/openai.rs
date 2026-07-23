@@ -67,9 +67,16 @@ fn prepare_chat_completions(
         .get_api_base()
         .unwrap_or_else(|_| API_BASE.to_string());
 
-    let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
-
-    let body = openai_build_chat_completions_body(data, &self_.model);
+    let (url, body) = match self_.model.endpoint() {
+        Some("responses") => (
+            format!("{}/responses", api_base.trim_end_matches('/')),
+            crate::openai_responses::openai_build_responses_body(data, &self_.model),
+        ),
+        _ => (
+            format!("{}/chat/completions", api_base.trim_end_matches('/')),
+            openai_build_chat_completions_body(data, &self_.model),
+        ),
+    };
 
     let mut request_data = RequestData::new(url, body);
 
@@ -103,7 +110,7 @@ fn prepare_embeddings(self_: &OpenAIClient, data: &EmbeddingsData) -> Result<Req
 
 pub async fn openai_chat_completions(
     builder: RequestBuilder,
-    _model: &Model,
+    model: &Model,
 ) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
@@ -115,7 +122,10 @@ pub async fn openai_chat_completions(
 
     debug!("non-stream-data: {data}");
     harnx_core::llm_trace::response("openai", &data);
-    openai_extract_chat_completions(&data)
+    match model.endpoint() {
+        Some("responses") => crate::openai_responses::openai_extract_responses(&data),
+        _ => openai_extract_chat_completions(&data),
+    }
 }
 
 /// Mutable accumulator state for the OpenAI streaming parser. Extracted
@@ -274,8 +284,12 @@ pub(crate) fn openai_handle_stream_event(
 pub async fn openai_chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
-    _model: &Model,
+    model: &Model,
 ) -> Result<()> {
+    if let Some("responses") = model.endpoint() {
+        return crate::openai_responses::openai_responses_streaming(builder, handler, model).await;
+    }
+
     let mut state = OpenAiStreamState::default();
     let handle = |message: SseMmessage| -> Result<bool> {
         if handler.aborted() {

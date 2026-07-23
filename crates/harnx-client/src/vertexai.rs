@@ -513,7 +513,7 @@ pub fn gemini_build_chat_completions_body(
                 }
                 vec![
                     json!({ "role": "model", "parts": model_parts }),
-                    json!({ "role": "function", "parts": function_parts }),
+                    json!({ "role": "user", "parts": function_parts }),
                         ]
                     }
                 }
@@ -684,6 +684,16 @@ fn strip_model_version(name: &str) -> &str {
 }
 
 
+/// A tool-result turn is serialized as a `user` role turn whose parts carry
+/// `functionResponse` objects (Gemini only accepts `user`/`model` roles).
+/// Tests locate that turn by its payload rather than a role string.
+#[cfg(test)]
+fn content_has_function_response(content: &serde_json::Value) -> bool {
+    content["parts"]
+        .as_array()
+        .is_some_and(|parts| parts.iter().any(|p| p.get("functionResponse").is_some()))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -741,8 +751,9 @@ mod tests {
         let contents = body["contents"].as_array().unwrap();
         let function_turn = contents
             .iter()
-            .find(|content| content["role"] == "function")
-            .expect("tool results must serialize to function turn");
+            .find(|content| content_has_function_response(content))
+            .expect("tool results must serialize to a functionResponse turn");
+        assert_eq!(function_turn["role"], "user");
         let parts = function_turn["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 4);
         assert_eq!(parts[0]["functionResponse"]["name"], "first_tool");
@@ -792,8 +803,9 @@ mod tests {
         let contents = body["contents"].as_array().unwrap();
         let function_turn = contents
             .iter()
-            .find(|content| content["role"] == "function")
-            .expect("tool results must serialize to function turn");
+            .find(|content| content_has_function_response(content))
+            .expect("tool results must serialize to a functionResponse turn");
+        assert_eq!(function_turn["role"], "user");
         let parts = function_turn["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["functionResponse"]["name"], "plain_tool");
@@ -1102,8 +1114,9 @@ mod attachment_emission_tests {
         let contents = body["contents"].as_array().unwrap();
         let function_turn = contents
             .iter()
-            .find(|c| c["role"] == "function")
-            .expect("should have function turn");
+            .find(|c| content_has_function_response(c))
+            .expect("should have a functionResponse turn");
+        assert_eq!(function_turn["role"], "user");
         let parts = function_turn["parts"].as_array().unwrap();
 
         assert!(parts.iter().any(|p| p["text"] == "[Tool show_image returned image]"));
@@ -1151,8 +1164,9 @@ mod attachment_emission_tests {
         let contents = body["contents"].as_array().unwrap();
         let function_turn = contents
             .iter()
-            .find(|c| c["role"] == "function")
-            .expect("should have function turn");
+            .find(|c| content_has_function_response(c))
+            .expect("should have a functionResponse turn");
+        assert_eq!(function_turn["role"], "user");
         let parts = function_turn["parts"].as_array().unwrap();
         assert!(parts.iter().any(|p| p["text"] == "[Tool show_image returned image]"));
         assert!(parts.iter().any(|p| {

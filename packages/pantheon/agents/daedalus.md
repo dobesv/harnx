@@ -1,9 +1,10 @@
 ---
 role: assistant
-model: openai:gpt-5.5
+model: claude:claude-opus-4-8
 compaction_agent: compact-researcher
 model_fallbacks:
-- claude:claude-opus-4-8
+- gemini:gemini-3.1-pro-preview
+- openai:gpt-5.6-sol
 use_tools:
 - atlas_session_handoff
 - librarian_session_prompt

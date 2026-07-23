@@ -321,15 +321,20 @@ pub trait Client: Sync + Send {
         }
 
         if let Some(patches_config) = self.patches_config() {
-            if let Some(patches) = self.model().model_type().extract_patches(patches_config) {
+            if let Some(patches) = self
+                .model()
+                .model_type()
+                .extract_patches_for(patches_config, self.model().endpoint())
+            {
                 json_value = harnx_core::jaq::eval_filters(patches, json_value);
             }
         }
 
-        let api_name = match self.model().model_type() {
-            ModelType::Chat => "CHAT_COMPLETIONS",
-            ModelType::Embedding => "EMBEDDINGS",
-            ModelType::Reranker => "RERANK",
+        let api_name = match (self.model().model_type(), self.model().endpoint()) {
+            (ModelType::Chat, Some("responses")) => "RESPONSES",
+            (ModelType::Chat, _) => "CHAT_COMPLETIONS",
+            (ModelType::Embedding, _) => "EMBEDDINGS",
+            (ModelType::Reranker, _) => "RERANK",
         };
         let env_name = format!("HARNX_PATCH_{}_{}", self.name(), api_name).to_ascii_uppercase();
         if let Ok(raw_patches) = std::env::var(&env_name) {

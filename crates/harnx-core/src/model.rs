@@ -63,6 +63,10 @@ impl Model {
         self.data.real_name.as_deref().unwrap_or(&self.data.name)
     }
 
+    pub fn endpoint(&self) -> Option<&str> {
+        self.data.endpoint.as_deref()
+    }
+
     pub fn model_type(&self) -> ModelType {
         if self.data.model_type.starts_with("embed") {
             ModelType::Embedding
@@ -271,6 +275,8 @@ pub struct ModelData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub real_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_input_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_price: Option<f64>,
@@ -431,10 +437,19 @@ impl ModelType {
     }
 
     pub fn extract_patches(self, request_patches: &RequestPatches) -> Option<&Vec<String>> {
-        match self {
-            ModelType::Chat => request_patches.chat_completions.as_ref(),
-            ModelType::Embedding => request_patches.embeddings.as_ref(),
-            ModelType::Reranker => request_patches.rerank.as_ref(),
+        self.extract_patches_for(request_patches, None)
+    }
+
+    pub fn extract_patches_for<'a>(
+        self,
+        request_patches: &'a RequestPatches,
+        endpoint: Option<&str>,
+    ) -> Option<&'a Vec<String>> {
+        match (self, endpoint) {
+            (ModelType::Chat, Some("responses")) => request_patches.responses.as_ref(),
+            (ModelType::Chat, _) => request_patches.chat_completions.as_ref(),
+            (ModelType::Embedding, _) => request_patches.embeddings.as_ref(),
+            (ModelType::Reranker, _) => request_patches.rerank.as_ref(),
         }
     }
 }
@@ -442,6 +457,7 @@ impl ModelType {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct RequestPatches {
     pub chat_completions: Option<Vec<String>>,
+    pub responses: Option<Vec<String>>,
     pub embeddings: Option<Vec<String>>,
     pub rerank: Option<Vec<String>>,
 }
@@ -462,4 +478,55 @@ where
 pub struct ModelsOverride {
     pub version: String,
     pub list: Vec<ProviderModels>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_endpoint_accessor_reflects_yaml_endpoint() {
+        let with_endpoint: ModelData =
+            serde_yaml::from_str("name: x\nendpoint: responses\n").unwrap();
+        let without_endpoint: ModelData = serde_yaml::from_str("name: x\n").unwrap();
+        let models = Model::from_config("openai", &[with_endpoint, without_endpoint]);
+
+        assert_eq!(models[0].endpoint(), Some("responses"));
+        assert_eq!(models[1].endpoint(), None);
+    }
+
+    #[test]
+    fn extract_patches_for_selects_chat_or_responses_by_endpoint() {
+        let request_patches = RequestPatches {
+            chat_completions: Some(vec![".body.chat = true".to_string()]),
+            responses: Some(vec![".body.store = true".to_string()]),
+            embeddings: Some(vec![".body.embedding = true".to_string()]),
+            rerank: Some(vec![".body.rerank = true".to_string()]),
+        };
+
+        assert_eq!(
+            ModelType::Chat
+                .extract_patches_for(&request_patches, Some("responses"))
+                .map(Vec::as_slice),
+            Some([".body.store = true".to_string()].as_slice())
+        );
+        assert_eq!(
+            ModelType::Chat
+                .extract_patches_for(&request_patches, None)
+                .map(Vec::as_slice),
+            Some([".body.chat = true".to_string()].as_slice())
+        );
+        assert_eq!(
+            ModelType::Embedding
+                .extract_patches_for(&request_patches, Some("responses"))
+                .map(Vec::as_slice),
+            Some([".body.embedding = true".to_string()].as_slice())
+        );
+        assert_eq!(
+            ModelType::Reranker
+                .extract_patches_for(&request_patches, Some("responses"))
+                .map(Vec::as_slice),
+            Some([".body.rerank = true".to_string()].as_slice())
+        );
+    }
 }
