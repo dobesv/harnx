@@ -108,6 +108,15 @@ function createAgUiStream({ session, body }: { session: string; body: any }) {
         : ''
     : '';
 
+  // For the "pending" session we intentionally keep the run live (no
+  // RUN_FINISHED) so the busy composer + status indicator stay visible. That
+  // means the response stream stays open. We must NOT leave it open forever:
+  // an unbounded stream leaks the connection between test runs (the next
+  // subscribe then never receives its events, e.g. `Running task...`). We
+  // auto-close after a bounded window and also clean up on client disconnect
+  // via cancel(), so every run gets a fresh, working stream.
+  let pendingAutoCloseTimer: ReturnType<typeof setTimeout> | undefined;
+
   return new ReadableStream({
     async start(controller) {
       // AG-UI stream ordering (matches crates/harnx-serve/src/ag_ui.rs and the
@@ -141,8 +150,18 @@ function createAgUiStream({ session, body }: { session: string; body: any }) {
           messageId: 'assistant-pending',
           delta: 'Working on it — analyzing the request and preparing'
         }));
-        // Deliberately never send TEXT_MESSAGE_END / RUN_FINISHED: the run
-        // stays live so the status indicator and busy composer remain visible.
+        // Deliberately do NOT send TEXT_MESSAGE_END / RUN_FINISHED while the
+        // test observes the running state. Keep the run live for a bounded
+        // window (long enough for assertions + screenshot), then close so the
+        // connection is released and the next run starts clean. If the client
+        // disconnects first, cancel() clears this timer.
+        pendingAutoCloseTimer = setTimeout(() => {
+          try {
+            controller.close();
+          } catch {
+            // Stream may already be closed/cancelled — ignore.
+          }
+        }, 8000);
         return;
       }
 
@@ -288,6 +307,15 @@ function createAgUiStream({ session, body }: { session: string; body: any }) {
         runId
       }));
       controller.close();
+    },
+    cancel() {
+      // The client (browser EventSource) disconnected — e.g. the test navigated
+      // away or finished. Clear the pending auto-close timer so we don't leak a
+      // timer/connection into the next run.
+      if (pendingAutoCloseTimer !== undefined) {
+        clearTimeout(pendingAutoCloseTimer);
+        pendingAutoCloseTimer = undefined;
+      }
     }
   });
 }

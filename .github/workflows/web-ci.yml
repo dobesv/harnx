@@ -1,37 +1,72 @@
 name: Web CI
 
+# NOTE: This workflow is a REQUIRED merge gate (see .mergify.yml ->
+# merge_conditions "check-success=Web Build"). For a required check to work with
+# the Mergify merge queue it MUST:
+#   1. trigger on `merge_group` so it runs on the queue branch, and
+#   2. always post a conclusion for the `Web Build` job, even when `web/**` is
+#      unchanged.
+# A workflow-level `paths:` filter would skip the whole workflow and never post
+# a status, which hangs the merge queue until it times out. Instead we run the
+# workflow unconditionally and gate the expensive build steps on an internal
+# change-detection job, so the required check always reports success.
 on:
   push:
     branches:
       - main
-    paths:
-      - 'web/**'
   pull_request:
     branches:
       - '*'
-    paths:
-      - 'web/**'
+  merge_group:
+    types: [checks_requested]
 
 defaults:
   run:
     shell: bash
 
 jobs:
-  web:
-    name: Web Build
+  changes:
+    name: Detect web changes
     runs-on: ubuntu-latest
-
+    outputs:
+      web: ${{ steps.filter.outputs.web }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
+      - name: Filter web paths
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210cf1f72e7f9d89e3 # v3.0.2
+        id: filter
+        with:
+          filters: |
+            web:
+              - 'web/**'
+              - '.github/workflows/web-ci.yml'
+
+  web:
+    name: Web Build
+    needs: changes
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Skip notice
+        if: needs.changes.outputs.web != 'true'
+        run: echo "No web/** changes detected — skipping Web CI and reporting success."
+
+      - uses: actions/checkout@v7
+        if: needs.changes.outputs.web == 'true'
+        with:
+          persist-credentials: false
+
       - name: Set up pnpm
+        if: needs.changes.outputs.web == 'true'
         uses: pnpm/action-setup@v6
         with:
           version: 11.15.1
 
       - name: Set up Node
+        if: needs.changes.outputs.web == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: '24.18.0'
@@ -39,17 +74,21 @@ jobs:
           cache-dependency-path: web/pnpm-lock.yaml
 
       - name: Install dependencies
+        if: needs.changes.outputs.web == 'true'
         working-directory: web
         run: pnpm install --frozen-lockfile
 
       - name: Lint
+        if: needs.changes.outputs.web == 'true'
         working-directory: web
         run: pnpm lint
 
       - name: Typecheck
+        if: needs.changes.outputs.web == 'true'
         working-directory: web
         run: pnpm exec tsc --noEmit
 
       - name: Build
+        if: needs.changes.outputs.web == 'true'
         working-directory: web
         run: pnpm build

@@ -13,6 +13,11 @@ queue_rules:
       - check-success=All (macos-latest)
       - check-success=All (windows-latest)
       - check-success=Lint Dockerfiles
+      # Web checks always run (on pull_request + merge_group) and report success
+      # even when web/** is unchanged, so they are safe as required gates.
+      # See .github/workflows/web-ci.yml and web-e2e.yml.
+      - check-success=Web Build
+      - check-success=Playwright E2E Tests
 
 pull_request_rules:
   - name: Automerge passing Renovate PRs

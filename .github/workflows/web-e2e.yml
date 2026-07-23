@@ -1,39 +1,72 @@
 name: Web E2E
 
+# NOTE: This workflow is a REQUIRED merge gate (see .mergify.yml ->
+# merge_conditions "check-success=Playwright E2E Tests"). For a required check
+# to work with the Mergify merge queue it MUST:
+#   1. trigger on `merge_group` so it runs on the queue branch, and
+#   2. always post a conclusion for the `Playwright E2E Tests` job, even when
+#      `web/**` is unchanged.
+# A workflow-level `paths:` filter would skip the whole workflow and never post
+# a status, which hangs the merge queue until it times out. Instead we run the
+# workflow unconditionally and gate the expensive Playwright steps on an
+# internal change-detection job, so the required check always reports success.
 on:
   push:
     branches:
       - main
-    paths:
-      - 'web/**'
-      - '.github/workflows/web-e2e.yml'
   pull_request:
     branches:
       - '*'
-    paths:
-      - 'web/**'
-      - '.github/workflows/web-e2e.yml'
+  merge_group:
+    types: [checks_requested]
 
 defaults:
   run:
     shell: bash
 
 jobs:
-  e2e:
-    name: Playwright E2E Tests
+  changes:
+    name: Detect web changes
     runs-on: ubuntu-latest
-
+    outputs:
+      web: ${{ steps.filter.outputs.web }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
+      - name: Filter web paths
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210cf1f72e7f9d89e3 # v3.0.2
+        id: filter
+        with:
+          filters: |
+            web:
+              - 'web/**'
+              - '.github/workflows/web-e2e.yml'
+
+  e2e:
+    name: Playwright E2E Tests
+    needs: changes
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Skip notice
+        if: needs.changes.outputs.web != 'true'
+        run: echo "No web/** changes detected — skipping Playwright E2E and reporting success."
+
+      - uses: actions/checkout@v7
+        if: needs.changes.outputs.web == 'true'
+        with:
+          persist-credentials: false
+
       - name: Set up pnpm
+        if: needs.changes.outputs.web == 'true'
         uses: pnpm/action-setup@v6
         with:
           version: 11.15.1
 
       - name: Set up Node
+        if: needs.changes.outputs.web == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: '24.18.0'
@@ -41,19 +74,22 @@ jobs:
           cache-dependency-path: web/pnpm-lock.yaml
 
       - name: Install dependencies
+        if: needs.changes.outputs.web == 'true'
         working-directory: web
         run: pnpm install --frozen-lockfile
 
       - name: Install Playwright Chromium
+        if: needs.changes.outputs.web == 'true'
         working-directory: web
         run: pnpm exec playwright install --with-deps chromium
 
       - name: Run E2E tests
+        if: needs.changes.outputs.web == 'true'
         working-directory: web
         run: pnpm test:e2e
 
       - name: Upload Playwright report
-        if: ${{ !cancelled() }}
+        if: ${{ needs.changes.outputs.web == 'true' && !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
           name: playwright-report
