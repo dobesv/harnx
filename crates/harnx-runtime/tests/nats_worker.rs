@@ -512,7 +512,7 @@ fn final_assistant_texts(entries: &[(u64, SessionLogEntry)]) -> Vec<String> {
             SessionLogEntry::Message {
                 role,
                 content,
-                fence_token: _, // Include all assistant messages, fenced or not
+                // Include all assistant messages, fenced or not (fence_token ignored)
                 ..
             } if role.is_assistant() => Some(content.to_text()),
             _ => None,

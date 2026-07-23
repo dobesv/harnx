@@ -2582,7 +2582,6 @@ impl Tui {
                 if let Some(crate::types::ModalState::SessionPicker {
                     origin_session,
                     origin_agent,
-                    error: _,
                     ..
                 }) = self.app.modal.as_ref()
                 {
@@ -2624,7 +2623,6 @@ impl Tui {
                     if let Some(crate::types::ModalState::SessionPicker {
                         origin_agent,
                         origin_session,
-                        error: _,
                         ..
                     }) = self.app.modal.take()
                     {
