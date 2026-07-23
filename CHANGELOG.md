@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add GitHub auth proxy hook (`harnx-proxy-auth`): persistent hook binary that acts as an HTTPS MITM proxy, injecting configurable auth headers for matching URLs into `bash_exec`/`bash_spawn` tool environments (closes #531)
 
+## 0.33.4 (2026-07-23)
+
+### Features
+
+- Add OpenAI `/v1/responses` support so gpt-5.6 reasoning models work with function tools and `reasoning_effort` (blocked on `/v1/chat/completions`). New reasoning-level model aliases `gpt-5.6-sol:high|max` and `gpt-5.6-terra:high|max` route to `/v1/responses` via a new `endpoint` model field, with cross-turn reasoning replay (`reasoning.encrypted_content` via `thought_signature`), `store: false` default overridable through a new `patches.responses` client-config key.
+
+### Fixes
+
+- include failing expression and input kind in runtime error logs (#1088)
+- forward model errors via harnx:error meta instead of plain text (#964) (#1128)
+- Forward nested ACP model errors with a `harnx:error` marker so clients render them as errors without feeding them into downstream agent context.
+- Fix Gemini requests failing with a 400 "Role 'function' is not supported" error. Tool-result turns are now sent with the `user` role, which is the only valid container for `functionResponse` parts (Gemini accepts only `user`/`model` roles). Newer Gemini endpoints reject the previously-tolerated `function` role.
+
 ## 0.33.3 (2026-07-21)
 
 ### Features

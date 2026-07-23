@@ -23,7 +23,7 @@ description: "Reliability specialist \u2014 reviews error handling, retry logic,
   \ breakers, timeouts, health checks, graceful degradation, and async handler safety.\
   \ Named after Nemesis (NEM-uh-sis), goddess of retribution who ensures hubris does\
   \ not go unpunished.\n"
-version: '0.3.3'
+version: '0.3.4'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep

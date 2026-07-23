@@ -32,7 +32,7 @@ description: "Strategic planner \u2014 interviews users, delegates pre-analysis 
   \ then hands off to Atlas for execution. Named after Daedalus (DED-uh-lus), the\
   \ master architect of Greek myth. The single entry point for the full plan-to-execution\
   \ pipeline.\n"
-version: '0.3.3'
+version: '0.3.4'
 variables:
 - name: daedalus_core
   description: Core identity and instructions for Daedalus

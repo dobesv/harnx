@@ -1,6 +1,13 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.3.4 (2026-07-23)
+
+### Fixes
+
+- include failing expression and input kind in runtime error logs (#1088)
+- forward model errors via harnx:error meta instead of plain text (#964) (#1128)
+
 ## 0.3.3 (2026-07-21)
 
 ### Features
