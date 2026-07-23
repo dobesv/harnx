@@ -506,6 +506,7 @@ Error paths: non-git-dir, repo-without-origin.
 ## Related Issues
 
 - **GitHub:** [#949](https://github.com/dobesv/harnx/issues/949) — Original issue
+- **Related Solution:** [github-per-call-target-mcp-schema-2026-07-22.md](github-per-call-target-mcp-schema-2026-07-22.md) — Per-call repository targeting, non-fatal startup, dynamic schema, path-traversal fix (supersedes fail-fast startup from this doc)
 - **Related Solution:** [api-design/mcp-plans-surgical-edit-api-2026-05-11.md](../api-design/mcp-plans-surgical-edit-api-2026-05-11.md) — Body-edit mutual exclusion, diff output
 - **Related Solution:** [logic-errors/mcp-plans-rewrite-patterns-2026-05-04.md](../logic-errors/mcp-plans-rewrite-patterns-2026-05-04.md) — Atomic writes, ID normalization
 - **Related Solution:** [integration-issues/plan-note-file-storage-2026-05-03.md](../integration-issues/plan-note-file-storage-2026-05-03.md) — Per-file notes, JSON overview

@@ -14,8 +14,8 @@ use serde_json::{json, Map, Value};
 use similar::{ChangeTag, TextDiff};
 
 use crate::model::{
-    NewNote, NewPlan, NewTask, Note, NoteMetaUpdate, Plan, PlanId, PlanMetaUpdate, Task,
-    TaskFilter, TaskMetaUpdate,
+    NewNote, NewPlan, NewTask, Note, NoteMetaUpdate, Plan, PlanId, PlanMetaUpdate, RepoTarget,
+    Target, Task, TaskFilter, TaskMetaUpdate,
 };
 use crate::store::{PlanStore, StoreError};
 
@@ -26,15 +26,85 @@ mod params;
 pub use handler::{serve_plans_server, serve_plans_server_with_meta};
 pub use params::*;
 
+/// Repository targeting policy exposed by a plans server.
+#[derive(Debug, Clone, Default)]
+pub enum TargetPolicy {
+    /// Backend has no remote repository target; owner/repo params are ignored.
+    #[default]
+    None,
+    /// GitHub backend with an optional startup-detected default repository.
+    GitHub { default_repo: Option<RepoTarget> },
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerMeta {
-    pub name: &'static str,
-    pub instructions: &'static str,
+    pub name: Cow<'static, str>,
+    pub instructions: Cow<'static, str>,
+    pub target_policy: TargetPolicy,
 }
 
 impl ServerMeta {
     pub const fn new(name: &'static str, instructions: &'static str) -> Self {
-        Self { name, instructions }
+        Self {
+            name: Cow::Borrowed(name),
+            instructions: Cow::Borrowed(instructions),
+            target_policy: TargetPolicy::None,
+        }
+    }
+
+    pub fn with_target_policy(mut self, target_policy: TargetPolicy) -> Self {
+        self.target_policy = target_policy;
+        self
+    }
+}
+
+impl TargetPolicy {
+    fn apply_to_tool_schema(&self, tool: &mut Tool) {
+        let Self::GitHub { default_repo } = self else {
+            return;
+        };
+
+        let mut schema = tool.input_schema.as_ref().clone();
+        let properties = schema
+            .entry("properties".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Value::Object(properties) = properties else {
+            return;
+        };
+
+        let description = match default_repo {
+            Some(default_repo) => format!(
+                "Optional. Defaults to {}/{} detected at startup.",
+                default_repo.owner, default_repo.repo
+            ),
+            None => "Required. No default repository was detected at startup.".to_string(),
+        };
+        let property_schema = |description: &str| {
+            let mut property = Map::new();
+            property.insert("type".to_string(), Value::String("string".to_string()));
+            property.insert(
+                "description".to_string(),
+                Value::String(description.to_string()),
+            );
+            Value::Object(property)
+        };
+        properties.insert("owner".to_string(), property_schema(&description));
+        properties.insert("repo".to_string(), property_schema(&description));
+
+        if default_repo.is_none() {
+            let required = schema
+                .entry("required".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Value::Array(required) = required {
+                for name in ["owner", "repo"] {
+                    if !required.iter().any(|value| value.as_str() == Some(name)) {
+                        required.push(Value::String(name.to_string()));
+                    }
+                }
+            }
+        }
+
+        tool.input_schema = Arc::new(schema);
     }
 }
 
@@ -56,6 +126,47 @@ impl<S: PlanStore> PlansServer<S> {
     pub fn with_meta(store: Arc<S>, meta: ServerMeta) -> Self {
         Self { store, meta }
     }
+
+    /// Resolve and validate one per-call storage target from tool arguments and server defaults.
+    pub(crate) fn resolve_target(
+        &self,
+        owner: Option<&str>,
+        repo: Option<&str>,
+    ) -> Result<Target, ErrorData> {
+        match &self.meta.target_policy {
+            TargetPolicy::None => Ok(Target::Local),
+            TargetPolicy::GitHub { default_repo } => {
+                let owner = owner.and_then(non_empty_trimmed);
+                let repo = repo.and_then(non_empty_trimmed);
+                match (owner, repo) {
+                    (Some(owner), Some(repo)) => RepoTarget::new(owner, repo)
+                        .map(Target::GitHub)
+                        .map_err(|message| ErrorData::invalid_params(message, None)),
+                    (Some(_), None) | (None, Some(_)) => Err(ErrorData::invalid_params(
+                        "owner and repo must be provided together",
+                        None,
+                    )),
+                    (None, None) => {
+                        let default_repo = default_repo.clone().ok_or_else(|| {
+                            ErrorData::invalid_params(
+                                "owner and repo are required because no default GitHub repository was detected at startup",
+                                None,
+                            )
+                        })?;
+                        default_repo
+                            .validate()
+                            .map_err(|message| ErrorData::invalid_params(message, None))?;
+                        Ok(Target::GitHub(default_repo))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 fn default_open_status() -> String {

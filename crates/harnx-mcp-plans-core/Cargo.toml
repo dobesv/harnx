@@ -22,3 +22,6 @@ serde_yaml = { workspace = true }
 similar = { workspace = true }
 thiserror = "2"
 uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }

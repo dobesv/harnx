@@ -146,12 +146,14 @@ fn map_note_not_found(plan_name: &str, note_id: &str, err: StoreError) -> ErrorD
 
 async fn validate_batch_task_specs<S: PlanStore>(
     store: &S,
+    target: &Target,
     name: &str,
     plan_id: &PlanId,
     task_specs: &[TaskSpec],
 ) -> Result<(), ErrorData> {
     let existing_tasks = store
         .list_tasks(
+            target,
             plan_id,
             TaskFilter {
                 status: None,
@@ -209,19 +211,20 @@ impl<S: PlanStore> PlansServer<S> {
         &self,
         params: ListTasksParams,
     ) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let plan_name =
             validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
         let plan_id: PlanId = plan_name.clone();
         let tasks = self
             .store
-            .list_tasks(&plan_id, task_filter_from_params(&params), None)
+            .list_tasks(&target, &plan_id, task_filter_from_params(&params), None)
             .await
             .map_err(store_error_to_error_data)?;
         let mut tasks_json = Vec::new();
         for task in tasks.items {
             let body = self
                 .store
-                .read_task_body(&plan_id, &task.id)
+                .read_task_body(&target, &plan_id, &task.id)
                 .await
                 .map_err(|err| map_task_not_found(&plan_name, &task.id, err))?;
             tasks_json.push(task_to_json(task, body));
@@ -233,6 +236,7 @@ impl<S: PlanStore> PlansServer<S> {
         &self,
         params: GetTaskParams,
     ) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let plan_name =
             validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
         let task_id =
@@ -240,12 +244,12 @@ impl<S: PlanStore> PlansServer<S> {
         let plan_id: PlanId = plan_name.clone();
         let task = self
             .store
-            .get_task(&plan_id, &task_id)
+            .get_task(&target, &plan_id, &task_id)
             .await
             .map_err(|err| map_task_not_found(&plan_name, &task_id, err))?;
         let body = self
             .store
-            .read_task_body(&plan_id, &task_id)
+            .read_task_body(&target, &plan_id, &task_id)
             .await
             .map_err(|err| map_task_not_found(&plan_name, &task_id, err))?;
         result_json(task_to_json(task, body))
@@ -255,6 +259,7 @@ impl<S: PlanStore> PlansServer<S> {
         &self,
         params: AddTaskParams,
     ) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let plan_name =
             validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
         let plan_id: PlanId = plan_name.clone();
@@ -278,7 +283,7 @@ impl<S: PlanStore> PlansServer<S> {
         };
         let task = self
             .store
-            .add_task(&plan_id, new_task)
+            .add_task(&target, &plan_id, new_task)
             .await
             .map_err(|err| match err {
                 StoreError::AlreadyExists => ErrorData::invalid_params(
@@ -292,7 +297,7 @@ impl<S: PlanStore> PlansServer<S> {
                 other => store_error_to_error_data(other),
             })?;
         self.store
-            .write_task_body(&plan_id, &task.id, &body)
+            .write_task_body(&target, &plan_id, &task.id, &body)
             .await
             .map_err(store_error_to_error_data)?;
         let serialized = serde_yaml::to_string(&task_to_json(task.clone(), body.clone()))
@@ -310,6 +315,7 @@ impl<S: PlanStore> PlansServer<S> {
         &self,
         params: UpdateTaskParams,
     ) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let plan_name =
             validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
         let task_id =
@@ -317,12 +323,12 @@ impl<S: PlanStore> PlansServer<S> {
         let plan_id: PlanId = plan_name.clone();
         let task = self
             .store
-            .get_task(&plan_id, &task_id)
+            .get_task(&target, &plan_id, &task_id)
             .await
             .map_err(|err| map_task_not_found(&plan_name, &task_id, err))?;
         let before_body = self
             .store
-            .read_task_body(&plan_id, &task_id)
+            .read_task_body(&target, &plan_id, &task_id)
             .await
             .map_err(|err| map_task_not_found(&plan_name, &task_id, err))?;
         let body = apply_body_edit(
@@ -343,11 +349,11 @@ impl<S: PlanStore> PlansServer<S> {
             dependencies: params.dependencies,
         };
         self.store
-            .update_task_meta(&plan_id, &task_id, update)
+            .update_task_meta(&target, &plan_id, &task_id, update)
             .await
             .map_err(|err| map_task_not_found(&plan_name, &task_id, err))?;
         self.store
-            .write_task_body(&plan_id, &task_id, &body)
+            .write_task_body(&target, &plan_id, &task_id, &body)
             .await
             .map_err(|err| map_task_not_found(&plan_name, &task_id, err))?;
         let diff = diff_text(
@@ -363,6 +369,7 @@ impl<S: PlanStore> PlansServer<S> {
         &self,
         params: DeleteTaskParams,
     ) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let plan_name =
             validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
         let task_id =
@@ -370,14 +377,18 @@ impl<S: PlanStore> PlansServer<S> {
         let plan_id: PlanId = plan_name.clone();
         let before_body = self
             .store
-            .read_task_body(&plan_id, &task_id)
+            .read_task_body(&target, &plan_id, &task_id)
             .await
             .map_err(|err| map_task_not_found(&plan_name, &task_id, err))?;
         self.store
-            .delete_task(&plan_id, &task_id)
+            .delete_task(&target, &plan_id, &task_id)
             .await
             .map_err(|err| map_task_not_found(&plan_name, &task_id, err))?;
-        let after_body = self.store.read_task_body(&plan_id, &task_id).await.ok();
+        let after_body = self
+            .store
+            .read_task_body(&target, &plan_id, &task_id)
+            .await
+            .ok();
         match after_body {
             Some(_current_body) => result_text(format!(
                 "left task {} unchanged (delete behavior is leave)",
@@ -394,24 +405,28 @@ impl<S: PlanStore> PlansServer<S> {
         }
     }
 
-    pub async fn handle_list_plans(&self) -> Result<CallToolResult, ErrorData> {
+    pub async fn handle_list_plans(
+        &self,
+        params: ListPlansParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let plans = self
             .store
-            .list_plans(None)
+            .list_plans(&target, None)
             .await
             .map_err(store_error_to_error_data)?;
         let mut result = Vec::new();
         for plan in plans.items {
             let task_count = self
                 .store
-                .list_tasks(&plan.id, TaskFilter::default(), None)
+                .list_tasks(&target, &plan.id, TaskFilter::default(), None)
                 .await
                 .map_err(store_error_to_error_data)?
                 .items
                 .len();
             let note_count = self
                 .store
-                .list_notes(&plan.id, None)
+                .list_notes(&target, &plan.id, None)
                 .await
                 .map_err(store_error_to_error_data)?
                 .items
@@ -425,22 +440,26 @@ impl<S: PlanStore> PlansServer<S> {
         &self,
         params: AddPlanParams,
     ) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let name =
             validate_plan_name(&params.name).map_err(|err| ErrorData::invalid_params(err, None))?;
         let plan_id: PlanId = name.clone();
         let body = params.body.unwrap_or_default();
         let plan = self
             .store
-            .add_plan(NewPlan {
-                id: plan_id.clone(),
-                title: params.title,
-                summary: params.summary,
-                author: params.author,
-                assignee: params.assignee,
-                executor: params.executor,
-                git_branch: params.git_branch,
-                github_owner_repo: params.github_owner_repo,
-            })
+            .add_plan(
+                &target,
+                NewPlan {
+                    id: plan_id.clone(),
+                    title: params.title,
+                    summary: params.summary,
+                    author: params.author,
+                    assignee: params.assignee,
+                    executor: params.executor,
+                    git_branch: params.git_branch,
+                    github_owner_repo: params.github_owner_repo,
+                },
+            )
             .await
             .map_err(|err| match err {
                 StoreError::AlreadyExists => {
@@ -449,36 +468,39 @@ impl<S: PlanStore> PlansServer<S> {
                 other => store_error_to_error_data(other),
             })?;
         self.store
-            .write_plan_body(&plan_id, &body)
+            .write_plan_body(&target, &plan_id, &body)
             .await
             .map_err(store_error_to_error_data)?;
 
         let task_specs = params.tasks.unwrap_or_default();
-        validate_batch_task_specs(self.store.as_ref(), &name, &plan_id, &task_specs).await?;
+        validate_batch_task_specs(self.store.as_ref(), &target, &name, &plan_id, &task_specs)
+            .await?;
         let mut created_task_ids = Vec::new();
         let mut task_failures = Vec::new();
         for spec in task_specs {
             match build_new_task(&name, spec) {
-                Ok((new_task, task_body)) => match self.store.add_task(&plan_id, new_task).await {
-                    Ok(task) => {
-                        if let Err(err) = self
-                            .store
-                            .write_task_body(&plan_id, &task.id, &task_body)
-                            .await
-                        {
-                            task_failures.push(format!(
-                                "{}: {}",
-                                display_id(&task.id),
-                                store_error_to_error_data(err).message
-                            ));
-                        } else {
-                            created_task_ids.push(display_id(&task.id));
+                Ok((new_task, task_body)) => {
+                    match self.store.add_task(&target, &plan_id, new_task).await {
+                        Ok(task) => {
+                            if let Err(err) = self
+                                .store
+                                .write_task_body(&target, &plan_id, &task.id, &task_body)
+                                .await
+                            {
+                                task_failures.push(format!(
+                                    "{}: {}",
+                                    display_id(&task.id),
+                                    store_error_to_error_data(err).message
+                                ));
+                            } else {
+                                created_task_ids.push(display_id(&task.id));
+                            }
+                        }
+                        Err(err) => {
+                            task_failures.push(store_error_to_error_data(err).message.to_string())
                         }
                     }
-                    Err(err) => {
-                        task_failures.push(store_error_to_error_data(err).message.to_string())
-                    }
-                },
+                }
                 Err(err) => task_failures.push(err.message.to_string()),
             }
         }
@@ -502,12 +524,13 @@ impl<S: PlanStore> PlansServer<S> {
         &self,
         params: GetPlanParams,
     ) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let name =
             validate_plan_name(&params.name).map_err(|err| ErrorData::invalid_params(err, None))?;
         let plan_id: PlanId = name.clone();
         let plan = self
             .store
-            .get_plan(&plan_id)
+            .get_plan(&target, &plan_id)
             .await
             .map_err(|err| match err {
                 StoreError::NotFound => {
@@ -517,12 +540,12 @@ impl<S: PlanStore> PlansServer<S> {
             })?;
         let body = self
             .store
-            .read_plan_body(&plan_id)
+            .read_plan_body(&target, &plan_id)
             .await
             .map_err(store_error_to_error_data)?;
         let task_ids = self
             .store
-            .list_tasks(&plan_id, TaskFilter::default(), None)
+            .list_tasks(&target, &plan_id, TaskFilter::default(), None)
             .await
             .map_err(store_error_to_error_data)?
             .items
@@ -531,7 +554,7 @@ impl<S: PlanStore> PlansServer<S> {
             .collect();
         let note_ids = self
             .store
-            .list_notes(&plan_id, None)
+            .list_notes(&target, &plan_id, None)
             .await
             .map_err(store_error_to_error_data)?
             .items
@@ -545,33 +568,37 @@ impl<S: PlanStore> PlansServer<S> {
         &self,
         params: UpdatePlanParams,
     ) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let name =
             validate_plan_name(&params.name).map_err(|err| ErrorData::invalid_params(err, None))?;
         let plan_id: PlanId = name.clone();
 
-        let existing = match self.store.get_plan(&plan_id).await {
+        let existing = match self.store.get_plan(&target, &plan_id).await {
             Ok(plan) => Some(plan),
             Err(StoreError::NotFound) => None,
             Err(err) => return Err(store_error_to_error_data(err)),
         };
         if existing.is_none() {
             self.store
-                .add_plan(NewPlan {
-                    id: plan_id.clone(),
-                    title: None,
-                    summary: None,
-                    author: None,
-                    assignee: None,
-                    executor: None,
-                    git_branch: None,
-                    github_owner_repo: None,
-                })
+                .add_plan(
+                    &target,
+                    NewPlan {
+                        id: plan_id.clone(),
+                        title: None,
+                        summary: None,
+                        author: None,
+                        assignee: None,
+                        executor: None,
+                        git_branch: None,
+                        github_owner_repo: None,
+                    },
+                )
                 .await
                 .map_err(store_error_to_error_data)?;
         }
         let before_body = self
             .store
-            .read_plan_body(&plan_id)
+            .read_plan_body(&target, &plan_id)
             .await
             .unwrap_or_default();
         let new_body = apply_body_edit(
@@ -583,6 +610,7 @@ impl<S: PlanStore> PlansServer<S> {
         )?;
         self.store
             .update_plan_meta(
+                &target,
                 &plan_id,
                 PlanMetaUpdate {
                     title: params
@@ -611,39 +639,42 @@ impl<S: PlanStore> PlansServer<S> {
             .await
             .map_err(store_error_to_error_data)?;
         self.store
-            .write_plan_body(&plan_id, &new_body)
+            .write_plan_body(&target, &plan_id, &new_body)
             .await
             .map_err(store_error_to_error_data)?;
 
         let task_specs = params.tasks.unwrap_or_default();
-        validate_batch_task_specs(self.store.as_ref(), &name, &plan_id, &task_specs).await?;
+        validate_batch_task_specs(self.store.as_ref(), &target, &name, &plan_id, &task_specs)
+            .await?;
         let mut created_task_ids = Vec::new();
         let mut task_failures = Vec::new();
         for spec in task_specs {
             match build_new_task(&name, spec) {
-                Ok((new_task, task_body)) => match self.store.add_task(&plan_id, new_task).await {
-                    Ok(task) => {
-                        if let Err(err) = self
-                            .store
-                            .write_task_body(&plan_id, &task.id, &task_body)
-                            .await
-                        {
-                            task_failures.push(format!(
-                                "{}: {}",
-                                display_id(&task.id),
-                                store_error_to_error_data(err).message
-                            ));
-                        } else {
-                            created_task_ids.push(display_id(&task.id));
+                Ok((new_task, task_body)) => {
+                    match self.store.add_task(&target, &plan_id, new_task).await {
+                        Ok(task) => {
+                            if let Err(err) = self
+                                .store
+                                .write_task_body(&target, &plan_id, &task.id, &task_body)
+                                .await
+                            {
+                                task_failures.push(format!(
+                                    "{}: {}",
+                                    display_id(&task.id),
+                                    store_error_to_error_data(err).message
+                                ));
+                            } else {
+                                created_task_ids.push(display_id(&task.id));
+                            }
+                        }
+                        Err(StoreError::AlreadyExists) => {
+                            task_failures.push(format!("task already exists in plan '{}'", name))
+                        }
+                        Err(err) => {
+                            task_failures.push(store_error_to_error_data(err).message.to_string())
                         }
                     }
-                    Err(StoreError::AlreadyExists) => {
-                        task_failures.push(format!("task already exists in plan '{}'", name))
-                    }
-                    Err(err) => {
-                        task_failures.push(store_error_to_error_data(err).message.to_string())
-                    }
-                },
+                }
                 Err(err) => task_failures.push(err.message.to_string()),
             }
         }
@@ -673,23 +704,25 @@ impl<S: PlanStore> PlansServer<S> {
         &self,
         params: DeletePlanParams,
     ) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let name =
             validate_plan_name(&params.name).map_err(|err| ErrorData::invalid_params(err, None))?;
         let plan_id: PlanId = name.clone();
-        let plan_body = self
-            .store
-            .read_plan_body(&plan_id)
-            .await
-            .map_err(|err| match err {
-                StoreError::NotFound => {
-                    ErrorData::invalid_params(format!("plan '{}' not found", name), None)
-                }
-                other => store_error_to_error_data(other),
-            })?;
+        let plan_body =
+            self.store
+                .read_plan_body(&target, &plan_id)
+                .await
+                .map_err(|err| match err {
+                    StoreError::NotFound => {
+                        ErrorData::invalid_params(format!("plan '{}' not found", name), None)
+                    }
+                    other => store_error_to_error_data(other),
+                })?;
         let mut diffs = vec![diff_text(&plan_body, "", &format!("{name}/plan.md"))];
         let tasks = self
             .store
             .list_tasks(
+                &target,
                 &plan_id,
                 TaskFilter {
                     status: None,
@@ -702,7 +735,7 @@ impl<S: PlanStore> PlansServer<S> {
         for task in tasks.items {
             let body = self
                 .store
-                .read_task_body(&plan_id, &task.id)
+                .read_task_body(&target, &plan_id, &task.id)
                 .await
                 .map_err(store_error_to_error_data)?;
             let diff = diff_text(&body, "", &format!("{name}/tasks/{}.md", task.id));
@@ -712,13 +745,13 @@ impl<S: PlanStore> PlansServer<S> {
         }
         let notes = self
             .store
-            .list_notes(&plan_id, None)
+            .list_notes(&target, &plan_id, None)
             .await
             .map_err(store_error_to_error_data)?;
         for note in notes.items {
             let body = self
                 .store
-                .read_note_body(&plan_id, &note.id)
+                .read_note_body(&target, &plan_id, &note.id)
                 .await
                 .map_err(store_error_to_error_data)?;
             let diff = diff_text(&body, "", &format!("{name}/notes/{}.md", note.id));
@@ -727,7 +760,7 @@ impl<S: PlanStore> PlansServer<S> {
             }
         }
         self.store
-            .delete_plan(&plan_id)
+            .delete_plan(&target, &plan_id)
             .await
             .map_err(|err| match err {
                 StoreError::NotFound => {
@@ -735,7 +768,7 @@ impl<S: PlanStore> PlansServer<S> {
                 }
                 other => store_error_to_error_data(other),
             })?;
-        let after_body = self.store.read_plan_body(&plan_id).await.ok();
+        let after_body = self.store.read_plan_body(&target, &plan_id).await.ok();
         if after_body.is_some() {
             result_text(format!(
                 "left plan {} unchanged (delete behavior is leave)",
@@ -763,19 +796,20 @@ impl<S: PlanStore> PlansServer<S> {
         &self,
         params: ListNotesParams,
     ) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let plan =
             validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
         let plan_id: PlanId = plan.clone();
         let notes = self
             .store
-            .list_notes(&plan_id, None)
+            .list_notes(&target, &plan_id, None)
             .await
             .map_err(store_error_to_error_data)?;
         let mut result = Vec::new();
         for note in notes.items {
             let body = self
                 .store
-                .read_note_body(&plan_id, &note.id)
+                .read_note_body(&target, &plan_id, &note.id)
                 .await
                 .map_err(|err| map_note_not_found(&plan, &note.id, err))?;
             result.push(note_to_json(note, body));
@@ -787,6 +821,7 @@ impl<S: PlanStore> PlansServer<S> {
         &self,
         params: AddNoteParams,
     ) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let plan =
             validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
         let plan_id: PlanId = plan.clone();
@@ -799,6 +834,7 @@ impl<S: PlanStore> PlansServer<S> {
         let note = self
             .store
             .add_note(
+                &target,
                 &plan_id,
                 NewNote {
                     id: id.unwrap_or_else(|| {
@@ -817,7 +853,7 @@ impl<S: PlanStore> PlansServer<S> {
                 other => store_error_to_error_data(other),
             })?;
         self.store
-            .write_note_body(&plan_id, &note.id, &params.body)
+            .write_note_body(&target, &plan_id, &note.id, &params.body)
             .await
             .map_err(store_error_to_error_data)?;
         let diff = diff_text(
@@ -833,6 +869,7 @@ impl<S: PlanStore> PlansServer<S> {
         &self,
         params: GetNoteParams,
     ) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let plan =
             validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
         let note_id =
@@ -840,12 +877,12 @@ impl<S: PlanStore> PlansServer<S> {
         let plan_id: PlanId = plan.clone();
         let note = self
             .store
-            .get_note(&plan_id, &note_id)
+            .get_note(&target, &plan_id, &note_id)
             .await
             .map_err(|err| map_note_not_found(&plan, &note_id, err))?;
         let body = self
             .store
-            .read_note_body(&plan_id, &note_id)
+            .read_note_body(&target, &plan_id, &note_id)
             .await
             .map_err(|err| map_note_not_found(&plan, &note_id, err))?;
         result_json(note_to_json(note, body))
@@ -855,6 +892,7 @@ impl<S: PlanStore> PlansServer<S> {
         &self,
         params: DeleteNoteParams,
     ) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let plan =
             validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
         let note_id =
@@ -862,14 +900,18 @@ impl<S: PlanStore> PlansServer<S> {
         let plan_id: PlanId = plan.clone();
         let before_body = self
             .store
-            .read_note_body(&plan_id, &note_id)
+            .read_note_body(&target, &plan_id, &note_id)
             .await
             .map_err(|err| map_note_not_found(&plan, &note_id, err))?;
         self.store
-            .delete_note(&plan_id, &note_id)
+            .delete_note(&target, &plan_id, &note_id)
             .await
             .map_err(|err| map_note_not_found(&plan, &note_id, err))?;
-        let after_body = self.store.read_note_body(&plan_id, &note_id).await.ok();
+        let after_body = self
+            .store
+            .read_note_body(&target, &plan_id, &note_id)
+            .await
+            .ok();
         match after_body {
             Some(_) => result_text(format!(
                 "left note {} unchanged (delete behavior is leave)",
@@ -886,6 +928,7 @@ impl<S: PlanStore> PlansServer<S> {
         &self,
         params: UpdateNoteParams,
     ) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let plan =
             validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
         let note_id =
@@ -893,12 +936,12 @@ impl<S: PlanStore> PlansServer<S> {
         let plan_id: PlanId = plan.clone();
         let note = self
             .store
-            .get_note(&plan_id, &note_id)
+            .get_note(&target, &plan_id, &note_id)
             .await
             .map_err(|err| map_note_not_found(&plan, &note_id, err))?;
         let before_body = self
             .store
-            .read_note_body(&plan_id, &note_id)
+            .read_note_body(&target, &plan_id, &note_id)
             .await
             .map_err(|err| map_note_not_found(&plan, &note_id, err))?;
         let body = apply_body_edit(
@@ -910,6 +953,7 @@ impl<S: PlanStore> PlansServer<S> {
         )?;
         self.store
             .update_note_meta(
+                &target,
                 &plan_id,
                 &note_id,
                 NoteMetaUpdate {
@@ -920,7 +964,7 @@ impl<S: PlanStore> PlansServer<S> {
             .await
             .map_err(|err| map_note_not_found(&plan, &note_id, err))?;
         self.store
-            .write_note_body(&plan_id, &note_id, &body)
+            .write_note_body(&target, &plan_id, &note_id, &body)
             .await
             .map_err(|err| map_note_not_found(&plan, &note_id, err))?;
         let diff = diff_text(

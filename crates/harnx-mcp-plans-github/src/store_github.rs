@@ -26,13 +26,14 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use harnx_mcp_plans_core::{
     NewNote, NewPlan, NewTask, Note, NoteId, NoteMetaUpdate, Page, PageToken, Plan, PlanId,
-    PlanMetaUpdate, PlanStore, StoreError, Task, TaskFilter, TaskId, TaskMetaUpdate,
+    PlanMetaUpdate, PlanStore, RepoTarget, StoreError, Target, Task, TaskFilter, TaskId,
+    TaskMetaUpdate,
 };
 use jiff::Timestamp;
 
 use crate::client::{
-    CreateComment, CreateIssue, GitHubClient, IssueRecord, ListIssuesParams, UpdateComment,
-    UpdateIssue,
+    CreateComment, CreateIssue, GitHubClient, GitHubClientFactory, IssueRecord, ListIssuesParams,
+    UpdateComment, UpdateIssue,
 };
 use crate::codec::{
     comment_to_note, issue_to_plan, issue_to_task, new_note_to_comment, new_plan_to_issue,
@@ -42,6 +43,8 @@ use crate::codec::{
 
 /// Maximum number of sub-issues allowed per parent issue.
 const MAX_SUB_ISSUES: usize = 100;
+const LABEL_COLOR: &str = "5319e7";
+const LABEL_DESCRIPTION: &str = "harnx plans root issue";
 
 /// Configuration for `GitHubPlanStore`.
 #[derive(Debug, Clone)]
@@ -66,26 +69,44 @@ impl Default for GitHubStoreConfig {
 /// GitHub-backed `PlanStore` implementation.
 #[derive(Debug, Clone)]
 pub struct GitHubPlanStore {
-    client: GitHubClient,
+    client_factory: GitHubClientFactory,
     config: GitHubStoreConfig,
 }
 
 impl GitHubPlanStore {
     /// Create a new store with default configuration.
-    pub fn new(client: GitHubClient) -> Self {
+    pub fn new(client_factory: impl Into<GitHubClientFactory>) -> Self {
         Self {
-            client,
+            client_factory: client_factory.into(),
             config: GitHubStoreConfig::default(),
         }
     }
 
-    /// Create a new store with the given client and config.
-    pub fn with_config(client: GitHubClient, config: GitHubStoreConfig) -> Self {
-        Self { client, config }
+    /// Create a new store with the given client factory and config.
+    pub fn with_config(
+        client_factory: impl Into<GitHubClientFactory>,
+        config: GitHubStoreConfig,
+    ) -> Self {
+        Self {
+            client_factory: client_factory.into(),
+            config,
+        }
     }
 
-    pub fn client_ref(&self) -> &GitHubClient {
-        &self.client
+    pub fn client_for(&self, target: &RepoTarget) -> Result<GitHubClient, StoreError> {
+        target.validate().map_err(StoreError::InvalidParams)?;
+        Ok(self.client_factory.client_for(target))
+    }
+
+    fn client_for_store_target(&self, target: &Target) -> Result<GitHubClient, StoreError> {
+        let repo = match target {
+            Target::GitHub(repo) => repo,
+            Target::Local => self.client_factory.default_repo().ok_or_else(|| {
+                StoreError::InvalidParams("GitHub plan store requires a GitHub target".to_string())
+            })?,
+        };
+        let client = self.client_for(repo)?;
+        Ok(client)
     }
 
     pub fn config_ref(&self) -> &GitHubStoreConfig {
@@ -161,9 +182,12 @@ impl GitHubPlanStore {
         }
     }
 
-    async fn ensure_issue_is_plan(&self, plan_number: u64) -> Result<IssueRecord, StoreError> {
-        let issue = self
-            .client
+    async fn ensure_issue_is_plan(
+        &self,
+        client: &GitHubClient,
+        plan_number: u64,
+    ) -> Result<IssueRecord, StoreError> {
+        let issue = client
             .get_issue(plan_number)
             .await
             .map_err(map_github_error)?;
@@ -178,10 +202,13 @@ impl GitHubPlanStore {
         }
     }
 
-    async fn count_sub_issues(&self, plan_number: u64) -> Result<usize, StoreError> {
+    async fn count_sub_issues(
+        &self,
+        client: &GitHubClient,
+        plan_number: u64,
+    ) -> Result<usize, StoreError> {
         let mut total = 0usize;
-        let mut page = self
-            .client
+        let mut page = client
             .list_sub_issues(plan_number)
             .await
             .map_err(map_github_error)?;
@@ -190,8 +217,7 @@ impl GitHubPlanStore {
             let Some(next) = page.next.take() else {
                 break;
             };
-            page = self
-                .client
+            page = client
                 .list_sub_issues_next(&next)
                 .await
                 .map_err(map_github_error)?;
@@ -201,11 +227,11 @@ impl GitHubPlanStore {
 
     async fn find_task_membership(
         &self,
+        client: &GitHubClient,
         plan_number: u64,
         task_number: u64,
     ) -> Result<bool, StoreError> {
-        let mut page = self
-            .client
+        let mut page = client
             .list_sub_issues(plan_number)
             .await
             .map_err(map_github_error)?;
@@ -221,8 +247,7 @@ impl GitHubPlanStore {
             let Some(next) = page.next.take() else {
                 return Ok(false);
             };
-            page = self
-                .client
+            page = client
                 .list_sub_issues_next(&next)
                 .await
                 .map_err(map_github_error)?;
@@ -231,11 +256,11 @@ impl GitHubPlanStore {
 
     async fn find_note_membership(
         &self,
+        client: &GitHubClient,
         plan_number: u64,
         comment_id: u64,
     ) -> Result<bool, StoreError> {
-        let mut page = self
-            .client
+        let mut page = client
             .list_comments(plan_number, Some(100))
             .await
             .map_err(map_github_error)?;
@@ -246,8 +271,7 @@ impl GitHubPlanStore {
             let Some(next) = page.next.take() else {
                 return Ok(false);
             };
-            page = self
-                .client
+            page = client
                 .list_comments_next(&next)
                 .await
                 .map_err(map_github_error)?;
@@ -354,14 +378,18 @@ impl GitHubPlanStore {
 
     async fn ensure_task_belongs_to_plan(
         &self,
+        client: &GitHubClient,
         plan: &PlanId,
         task: &TaskId,
     ) -> Result<u64, StoreError> {
         let plan_number = Self::parse_plan_id(plan)?;
-        self.ensure_issue_is_plan(plan_number).await?;
+        self.ensure_issue_is_plan(client, plan_number).await?;
         let task_number = Self::parse_task_id(task)?;
 
-        if self.find_task_membership(plan_number, task_number).await? {
+        if self
+            .find_task_membership(client, plan_number, task_number)
+            .await?
+        {
             Ok(task_number)
         } else {
             Err(StoreError::NotFound)
@@ -370,19 +398,22 @@ impl GitHubPlanStore {
 
     async fn ensure_note_belongs_to_plan(
         &self,
+        client: &GitHubClient,
         plan: &PlanId,
         note: &NoteId,
     ) -> Result<crate::client::IssueComment, StoreError> {
         let plan_number = Self::parse_plan_id(plan)?;
-        self.ensure_issue_is_plan(plan_number).await?;
+        self.ensure_issue_is_plan(client, plan_number).await?;
         let comment_id = Self::parse_note_id(note)?;
-        let comment = self
-            .client
+        let comment = client
             .get_comment(comment_id)
             .await
             .map_err(map_github_error)?;
 
-        if self.find_note_membership(plan_number, comment_id).await? {
+        if self
+            .find_note_membership(client, plan_number, comment_id)
+            .await?
+        {
             Ok(comment)
         } else {
             Err(StoreError::NotFound)
@@ -394,6 +425,31 @@ impl GitHubPlanStore {
 fn parse_github_timestamp(s: &str) -> Result<Timestamp, StoreError> {
     s.parse::<Timestamp>()
         .map_err(|e| StoreError::Backend(anyhow!("failed to parse timestamp '{}': {}", s, e)))
+}
+
+fn is_label_validation_error(err: &StoreError) -> bool {
+    match err {
+        StoreError::InvalidParams(message) => {
+            let message = message.to_lowercase();
+            message.contains("422")
+                || message.contains("validation")
+                || message.contains("unprocessable entity")
+        }
+        _ => false,
+    }
+}
+
+async fn ensure_plan_label_warning_only(client: &GitHubClient, label: &str) {
+    if let Err(err) = client
+        .ensure_label(label, LABEL_COLOR, LABEL_DESCRIPTION)
+        .await
+        .map_err(map_github_error)
+    {
+        eprintln!(
+            "[github] warning: could not ensure label '{}' before plan creation: {}",
+            label, err
+        );
+    }
 }
 
 /// Map GitHub client errors to StoreError.
@@ -415,11 +471,16 @@ fn map_github_error(e: anyhow::Error) -> StoreError {
 
 #[async_trait]
 impl PlanStore for GitHubPlanStore {
-    async fn list_plans(&self, page: Option<PageToken>) -> Result<Page<Plan>, StoreError> {
+    async fn list_plans(
+        &self,
+        target: &Target,
+        page: Option<PageToken>,
+    ) -> Result<Page<Plan>, StoreError> {
+        let client = self.client_for_store_target(target)?;
         let gh_page = match page {
-            Some(token) => self.client.list_issues_next(&token.0).await,
+            Some(token) => client.list_issues_next(&token.0).await,
             None => {
-                self.client
+                client
                     .list_issues(ListIssuesParams {
                         state: Some("open".to_string()),
                         labels: Some(self.config.plan_label.clone()),
@@ -467,26 +528,51 @@ impl PlanStore for GitHubPlanStore {
         })
     }
 
-    async fn get_plan(&self, plan: &PlanId) -> Result<Plan, StoreError> {
+    async fn get_plan(&self, target: &Target, plan: &PlanId) -> Result<Plan, StoreError> {
+        let client = self.client_for_store_target(target)?;
         let issue_number = Self::parse_plan_id(plan)?;
-        let issue = self.ensure_issue_is_plan(issue_number).await?;
+        let issue = self.ensure_issue_is_plan(&client, issue_number).await?;
 
         let decoded = Self::decode_issue_to_plan(issue)?;
         Ok(decoded.plan)
     }
 
-    async fn add_plan(&self, new_plan: NewPlan) -> Result<Plan, StoreError> {
+    async fn add_plan(&self, target: &Target, new_plan: NewPlan) -> Result<Plan, StoreError> {
+        let client = self.client_for_store_target(target)?;
         let (title, body) = new_plan_to_issue(&new_plan, None, "");
 
-        let issue = self
-            .client
-            .create_issue(CreateIssue {
-                title,
-                body: Some(body),
-                labels: vec![self.config.plan_label.clone()],
-            })
+        ensure_plan_label_warning_only(&client, &self.config.plan_label).await;
+
+        // Label application is best-effort: GitHub can reject create-with-label when
+        // label creation/visibility races or repository label permissions fail. Retry
+        // without labels and return the plan so write-time label problems remain warning-only.
+        let create_with_label = CreateIssue {
+            title: title.clone(),
+            body: Some(body.clone()),
+            labels: vec![self.config.plan_label.clone()],
+        };
+        let issue = match client
+            .create_issue(create_with_label)
             .await
-            .map_err(map_github_error)?;
+            .map_err(map_github_error)
+        {
+            Ok(issue) => issue,
+            Err(err) if is_label_validation_error(&err) => {
+                eprintln!(
+                    "[github] warning: plan label '{}' was rejected during issue creation; retrying without label: {}",
+                    self.config.plan_label, err
+                );
+                client
+                    .create_issue(CreateIssue {
+                        title,
+                        body: Some(body),
+                        labels: Vec::new(),
+                    })
+                    .await
+                    .map_err(map_github_error)?
+            }
+            Err(err) => return Err(err),
+        };
 
         Ok(Plan {
             id: issue.number.to_string(),
@@ -504,17 +590,18 @@ impl PlanStore for GitHubPlanStore {
 
     async fn update_plan_meta(
         &self,
+        target: &Target,
         plan: &PlanId,
         update: PlanMetaUpdate,
     ) -> Result<Plan, StoreError> {
+        let client = self.client_for_store_target(target)?;
         let issue_number = Self::parse_plan_id(plan)?;
-        let issue = self.ensure_issue_is_plan(issue_number).await?;
+        let issue = self.ensure_issue_is_plan(&client, issue_number).await?;
         let decoded = Self::decode_issue_to_plan(issue)?;
 
         let (new_title_opt, new_body) = plan_meta_update_to_issue_body(&decoded, &update);
 
-        let updated = self
-            .client
+        let updated = client
             .update_issue(
                 issue_number,
                 UpdateIssue {
@@ -530,11 +617,12 @@ impl PlanStore for GitHubPlanStore {
         Ok(decoded.plan)
     }
 
-    async fn delete_plan(&self, plan: &PlanId) -> Result<(), StoreError> {
+    async fn delete_plan(&self, target: &Target, plan: &PlanId) -> Result<(), StoreError> {
+        let client = self.client_for_store_target(target)?;
         if self.config.delete_is_close {
             let issue_number = Self::parse_plan_id(plan)?;
-            self.ensure_issue_is_plan(issue_number).await?;
-            self.client
+            self.ensure_issue_is_plan(&client, issue_number).await?;
+            client
                 .close_issue(issue_number)
                 .await
                 .map_err(map_github_error)?;
@@ -546,16 +634,23 @@ impl PlanStore for GitHubPlanStore {
         }
     }
 
-    async fn read_plan_body(&self, plan: &PlanId) -> Result<String, StoreError> {
+    async fn read_plan_body(&self, target: &Target, plan: &PlanId) -> Result<String, StoreError> {
+        let client = self.client_for_store_target(target)?;
         let issue_number = Self::parse_plan_id(plan)?;
-        let issue = self.ensure_issue_is_plan(issue_number).await?;
+        let issue = self.ensure_issue_is_plan(&client, issue_number).await?;
         let decoded = Self::decode_issue_to_plan(issue)?;
         Ok(decoded.body)
     }
 
-    async fn write_plan_body(&self, plan: &PlanId, body: &str) -> Result<(), StoreError> {
+    async fn write_plan_body(
+        &self,
+        target: &Target,
+        plan: &PlanId,
+        body: &str,
+    ) -> Result<(), StoreError> {
+        let client = self.client_for_store_target(target)?;
         let issue_number = Self::parse_plan_id(plan)?;
-        let issue = self.ensure_issue_is_plan(issue_number).await?;
+        let issue = self.ensure_issue_is_plan(&client, issue_number).await?;
         let decoded = Self::decode_issue_to_plan(issue)?;
 
         let (title_opt, final_body) = plan_meta_update_to_issue_body(
@@ -568,7 +663,7 @@ impl PlanStore for GitHubPlanStore {
             &PlanMetaUpdate::default(),
         );
 
-        self.client
+        client
             .update_issue(
                 issue_number,
                 UpdateIssue {
@@ -585,15 +680,17 @@ impl PlanStore for GitHubPlanStore {
 
     async fn list_tasks(
         &self,
+        target: &Target,
         plan: &PlanId,
         filter: TaskFilter,
         page: Option<PageToken>,
     ) -> Result<Page<Task>, StoreError> {
+        let client = self.client_for_store_target(target)?;
         let plan_number = Self::parse_plan_id(plan)?;
 
         let gh_page = match page {
-            Some(token) => self.client.list_sub_issues_next(&token.0).await,
-            None => self.client.list_sub_issues(plan_number).await,
+            Some(token) => client.list_sub_issues_next(&token.0).await,
+            None => client.list_sub_issues(plan_number).await,
         }
         .map_err(map_github_error)?;
 
@@ -636,11 +733,18 @@ impl PlanStore for GitHubPlanStore {
         })
     }
 
-    async fn get_task(&self, plan: &PlanId, task: &TaskId) -> Result<Task, StoreError> {
-        let task_number = self.ensure_task_belongs_to_plan(plan, task).await?;
+    async fn get_task(
+        &self,
+        target: &Target,
+        plan: &PlanId,
+        task: &TaskId,
+    ) -> Result<Task, StoreError> {
+        let client = self.client_for_store_target(target)?;
+        let task_number = self
+            .ensure_task_belongs_to_plan(&client, plan, task)
+            .await?;
 
-        let issue = self
-            .client
+        let issue = client
             .get_issue(task_number)
             .await
             .map_err(map_github_error)?;
@@ -649,11 +753,17 @@ impl PlanStore for GitHubPlanStore {
         Ok(decoded.task)
     }
 
-    async fn add_task(&self, plan: &PlanId, new_task: NewTask) -> Result<Task, StoreError> {
+    async fn add_task(
+        &self,
+        target: &Target,
+        plan: &PlanId,
+        new_task: NewTask,
+    ) -> Result<Task, StoreError> {
+        let client = self.client_for_store_target(target)?;
         let plan_number = Self::parse_plan_id(plan)?;
 
-        self.ensure_issue_is_plan(plan_number).await?;
-        let current_sub_count = self.count_sub_issues(plan_number).await?;
+        self.ensure_issue_is_plan(&client, plan_number).await?;
+        let current_sub_count = self.count_sub_issues(&client, plan_number).await?;
         if current_sub_count >= MAX_SUB_ISSUES {
             return Err(StoreError::InvalidParams(format!(
                 "plan {} already has maximum number of sub-issues ({})",
@@ -663,8 +773,7 @@ impl PlanStore for GitHubPlanStore {
 
         let (title, body) = new_task_to_issue(plan, &new_task, None, "");
 
-        let issue = self
-            .client
+        let issue = client
             .create_issue(CreateIssue {
                 title,
                 body: Some(body),
@@ -676,7 +785,7 @@ impl PlanStore for GitHubPlanStore {
         let task_number = issue.number;
         let task_internal_id = issue.id;
 
-        self.client
+        client
             .add_sub_issue(plan_number, task_internal_id)
             .await
             .map_err(map_github_error)?;
@@ -699,14 +808,17 @@ impl PlanStore for GitHubPlanStore {
 
     async fn update_task_meta(
         &self,
+        target: &Target,
         plan: &PlanId,
         task: &TaskId,
         update: TaskMetaUpdate,
     ) -> Result<Task, StoreError> {
-        let task_number = self.ensure_task_belongs_to_plan(plan, task).await?;
+        let client = self.client_for_store_target(target)?;
+        let task_number = self
+            .ensure_task_belongs_to_plan(&client, plan, task)
+            .await?;
 
-        let issue = self
-            .client
+        let issue = client
             .get_issue(task_number)
             .await
             .map_err(map_github_error)?;
@@ -714,8 +826,7 @@ impl PlanStore for GitHubPlanStore {
 
         let (new_title_opt, new_body) = task_meta_update_to_issue_body(&decoded, &update);
 
-        let updated = self
-            .client
+        let updated = client
             .update_issue(
                 task_number,
                 UpdateIssue {
@@ -731,10 +842,18 @@ impl PlanStore for GitHubPlanStore {
         Ok(decoded.task)
     }
 
-    async fn delete_task(&self, plan: &PlanId, task: &TaskId) -> Result<(), StoreError> {
+    async fn delete_task(
+        &self,
+        target: &Target,
+        plan: &PlanId,
+        task: &TaskId,
+    ) -> Result<(), StoreError> {
+        let client = self.client_for_store_target(target)?;
         if self.config.delete_is_close {
-            let task_number = self.ensure_task_belongs_to_plan(plan, task).await?;
-            self.client
+            let task_number = self
+                .ensure_task_belongs_to_plan(&client, plan, task)
+                .await?;
+            client
                 .close_issue(task_number)
                 .await
                 .map_err(map_github_error)?;
@@ -746,10 +865,17 @@ impl PlanStore for GitHubPlanStore {
         }
     }
 
-    async fn read_task_body(&self, plan: &PlanId, task: &TaskId) -> Result<String, StoreError> {
-        let task_number = self.ensure_task_belongs_to_plan(plan, task).await?;
-        let issue = self
-            .client
+    async fn read_task_body(
+        &self,
+        target: &Target,
+        plan: &PlanId,
+        task: &TaskId,
+    ) -> Result<String, StoreError> {
+        let client = self.client_for_store_target(target)?;
+        let task_number = self
+            .ensure_task_belongs_to_plan(&client, plan, task)
+            .await?;
+        let issue = client
             .get_issue(task_number)
             .await
             .map_err(map_github_error)?;
@@ -759,14 +885,17 @@ impl PlanStore for GitHubPlanStore {
 
     async fn write_task_body(
         &self,
+        target: &Target,
         plan: &PlanId,
         task: &TaskId,
         body: &str,
     ) -> Result<(), StoreError> {
-        let task_number = self.ensure_task_belongs_to_plan(plan, task).await?;
+        let client = self.client_for_store_target(target)?;
+        let task_number = self
+            .ensure_task_belongs_to_plan(&client, plan, task)
+            .await?;
 
-        let issue = self
-            .client
+        let issue = client
             .get_issue(task_number)
             .await
             .map_err(map_github_error)?;
@@ -782,7 +911,7 @@ impl PlanStore for GitHubPlanStore {
             &TaskMetaUpdate::default(),
         );
 
-        self.client
+        client
             .update_issue(
                 task_number,
                 UpdateIssue {
@@ -799,14 +928,16 @@ impl PlanStore for GitHubPlanStore {
 
     async fn list_notes(
         &self,
+        target: &Target,
         plan: &PlanId,
         page: Option<PageToken>,
     ) -> Result<Page<Note>, StoreError> {
+        let client = self.client_for_store_target(target)?;
         let plan_number = Self::parse_plan_id(plan)?;
 
         let gh_page = match page {
-            Some(token) => self.client.list_comments_next(&token.0).await,
-            None => self.client.list_comments(plan_number, Some(100)).await,
+            Some(token) => client.list_comments_next(&token.0).await,
+            None => client.list_comments(plan_number, Some(100)).await,
         }
         .map_err(map_github_error)?;
 
@@ -824,19 +955,32 @@ impl PlanStore for GitHubPlanStore {
         })
     }
 
-    async fn get_note(&self, plan: &PlanId, note: &NoteId) -> Result<Note, StoreError> {
-        let comment = self.ensure_note_belongs_to_plan(plan, note).await?;
+    async fn get_note(
+        &self,
+        target: &Target,
+        plan: &PlanId,
+        note: &NoteId,
+    ) -> Result<Note, StoreError> {
+        let client = self.client_for_store_target(target)?;
+        let comment = self
+            .ensure_note_belongs_to_plan(&client, plan, note)
+            .await?;
         let decoded = Self::decode_comment_to_note(comment)?;
         Ok(decoded.note)
     }
 
-    async fn add_note(&self, plan: &PlanId, new_note: NewNote) -> Result<Note, StoreError> {
+    async fn add_note(
+        &self,
+        target: &Target,
+        plan: &PlanId,
+        new_note: NewNote,
+    ) -> Result<Note, StoreError> {
+        let client = self.client_for_store_target(target)?;
         let plan_number = Self::parse_plan_id(plan)?;
 
         let body = new_note_to_comment(&new_note, "");
 
-        let comment = self
-            .client
+        let comment = client
             .create_comment(plan_number, CreateComment { body })
             .await
             .map_err(map_github_error)?;
@@ -852,18 +996,21 @@ impl PlanStore for GitHubPlanStore {
 
     async fn update_note_meta(
         &self,
+        target: &Target,
         plan: &PlanId,
         note: &NoteId,
         update: NoteMetaUpdate,
     ) -> Result<Note, StoreError> {
-        let comment = self.ensure_note_belongs_to_plan(plan, note).await?;
+        let client = self.client_for_store_target(target)?;
+        let comment = self
+            .ensure_note_belongs_to_plan(&client, plan, note)
+            .await?;
         let decoded = Self::decode_comment_to_note(comment)?;
         let comment_id = Self::parse_note_id(note)?;
 
         let new_body = note_meta_update_to_comment_body(&decoded, &update);
 
-        let updated = self
-            .client
+        let updated = client
             .update_comment(comment_id, UpdateComment { body: new_body })
             .await
             .map_err(map_github_error)?;
@@ -872,9 +1019,17 @@ impl PlanStore for GitHubPlanStore {
         Ok(decoded.note)
     }
 
-    async fn delete_note(&self, plan: &PlanId, note: &NoteId) -> Result<(), StoreError> {
-        let comment = self.ensure_note_belongs_to_plan(plan, note).await?;
-        self.client
+    async fn delete_note(
+        &self,
+        target: &Target,
+        plan: &PlanId,
+        note: &NoteId,
+    ) -> Result<(), StoreError> {
+        let client = self.client_for_store_target(target)?;
+        let comment = self
+            .ensure_note_belongs_to_plan(&client, plan, note)
+            .await?;
+        client
             .delete_comment(comment.id)
             .await
             .map_err(map_github_error)?;
@@ -882,19 +1037,31 @@ impl PlanStore for GitHubPlanStore {
         Ok(())
     }
 
-    async fn read_note_body(&self, plan: &PlanId, note: &NoteId) -> Result<String, StoreError> {
-        let comment = self.ensure_note_belongs_to_plan(plan, note).await?;
+    async fn read_note_body(
+        &self,
+        target: &Target,
+        plan: &PlanId,
+        note: &NoteId,
+    ) -> Result<String, StoreError> {
+        let client = self.client_for_store_target(target)?;
+        let comment = self
+            .ensure_note_belongs_to_plan(&client, plan, note)
+            .await?;
         let decoded = Self::decode_comment_to_note(comment)?;
         Ok(decoded.body)
     }
 
     async fn write_note_body(
         &self,
+        target: &Target,
         plan: &PlanId,
         note: &NoteId,
         body: &str,
     ) -> Result<(), StoreError> {
-        let comment = self.ensure_note_belongs_to_plan(plan, note).await?;
+        let client = self.client_for_store_target(target)?;
+        let comment = self
+            .ensure_note_belongs_to_plan(&client, plan, note)
+            .await?;
         let decoded = Self::decode_comment_to_note(comment)?;
         let comment_id = Self::parse_note_id(note)?;
 
@@ -907,7 +1074,7 @@ impl PlanStore for GitHubPlanStore {
             &NoteMetaUpdate::default(),
         );
 
-        self.client
+        client
             .update_comment(comment_id, UpdateComment { body: final_body })
             .await
             .map_err(map_github_error)?;

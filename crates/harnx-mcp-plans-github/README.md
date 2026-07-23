@@ -11,11 +11,20 @@ This MCP server provides a persistent storage backend for plans and todo lists u
 - **Note**: Represented as a **Comment** on the parent plan issue.
 - **Metadata**: Plan/Task metadata (ID, status, tags, dependencies) is stored as YAML front-matter within the issue or comment body, mirroring the format used by the filesystem backend.
 
+## Repository Targeting
+
+The server targets a GitHub repository (`owner`/`repo`) for plan, task, and note operations:
+
+- **Startup Auto-Detection**: At startup, the server attempts to detect a default GitHub repository from the `origin` remote of the current working directory. Only `github.com` origins are recognized.
+- **Non-Fatal Startup**: Detection is non-fatal. If the working directory is not a git repository, has no `origin`, uses a non-GitHub origin, or the origin URL cannot be parsed, a warning is logged and the server starts with no default repository. Startup performs no GitHub repository or label API validation — it never fails to start for those reasons.
+- **Per-Call Target Parameters**: Every plan, task, and note tool accepts per-call `owner` and `repo` target parameters:
+  - **With Default Repo**: When a default repository was detected at startup, `owner` and `repo` are optional and default to `<owner>/<repo>`.
+  - **Without Default Repo**: When no default repository was detected, `owner` and `repo` are required on every tool call (and `tools/list` schemas mark them required accordingly).
+- **Storage Target vs. Plan Metadata**: On `add_plan` and `update_plan`, the existing `github_owner_repo` parameter remains plan metadata only (stored in the plan's YAML front-matter) and is **never** used to select the storage target repository. Storage target selection is handled exclusively by the `owner` and `repo` parameters.
+
 ## Configuration
 
 The server can be configured via command-line flags or environment variables. CLI flags take precedence.
-
-Target repository is auto-detected from the `origin` remote of process current working directory. Only `github.com` origins are accepted. Startup fails fast if current directory is not a git repo, has no `origin`, uses a non-`github.com` origin, or origin URL cannot be parsed.
 
 ### Configuration Options
 
@@ -48,8 +57,13 @@ If both PAT and App credentials are provided, the PAT takes precedence.
 ### JIRA Cross-Referencing
 If a plan or task has a JIRA key associated with it, the server automatically prefixes the GitHub Issue title with `[KEY-123]`.
 
+### Label Handling
+The plan label (default: `harnx-plan`) is ensured and applied at write time when creating a plan (`add_plan`), not at server startup. Label operations are warning-only and non-fatal:
+- If label creation or application fails (e.g. due to permissions), a warning is logged and plan creation proceeds.
+- If GitHub rejects issue creation with a label validation error, the server automatically retries creating the plan issue without the label and logs a warning.
+
 ### Retention
-A background loop runs every hour to close plan issues that have not been updated for more than the configured retention period (default 14 days). Retention math uses a fixed 86,400 seconds per day.
+A background loop runs every hour to close plan issues that have not been updated for more than the configured retention period (default 14 days). Retention math uses a fixed 86,400 seconds per day. Retention runs against the default repository when detected at startup; if no default repository was detected, background retention is disabled.
 
 ### Rate Limiting
 The server handles GitHub API rate limits gracefully:

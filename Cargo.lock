@@ -3938,6 +3938,7 @@ dependencies = [
  "serde_yaml",
  "similar 3.1.1",
  "thiserror 2.0.19",
+ "tokio",
  "uuid",
 ]
 
