@@ -125,6 +125,10 @@ export class HarnxHttpAgent extends HttpAgent {
       usage: (v) => this.onUsageCb(v),
       tool_summary: (v) => this.onToolSummaryCb(v?.tool_call_id, v?.markdown),
       session_title_updated: (v) => setDocumentTitle(v?.title),
+      session_title_generation_failed: (v) => {
+        console.error('session_title_generation_failed:', v?.error);
+        this.onStatus(v?.error || null);
+      },
       session_handoff: (v) => {
         if (this.isRunActive) {
           this.onHandoff?.(v?.agent, v?.session_id ?? null);

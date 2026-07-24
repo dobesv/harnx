@@ -13,6 +13,66 @@ use crate::config::session_lock::SessionLock;
 
 use harnx_core::message::MessageRole;
 
+/// Result of attempting to resolve a title agent from configuration.
+///
+/// Distinguishes three error cases that were previously collapsed into one
+/// generic "no title agent configured" message:
+///
+/// - `NotConfigured`: Neither `AgentConfig.title_agent` nor global `ConfigData.title_agent`
+///   is set. The error message MUST be exactly "no title agent configured".
+/// - `NotFound`: A title-agent name is configured but no such agent file exists.
+///   The error includes the configured name.
+/// - `LoadError`: Agent file exists but fails to load/parse. The underlying error
+///   is surfaced with the agent name in context.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum TitleAgentResolution {
+    /// Title agent is not configured (neither agent frontmatter nor global config).
+    NotConfigured,
+    /// Title agent name is configured but the agent file was not found.
+    NotFound {
+        /// The configured title agent name.
+        name: String,
+    },
+    /// Title agent file exists but failed to load or parse.
+    LoadError {
+        /// The configured title agent name.
+        name: String,
+        /// The underlying error from `retrieve_agent` or `resolve_variables`.
+        source: anyhow::Error,
+    },
+    /// Title agent resolved successfully.
+    Ok(crate::config::agent::Agent),
+}
+
+impl TitleAgentResolution {
+    /// Returns `true` if this represents a successfully resolved agent.
+    pub(crate) fn is_ok(&self) -> bool {
+        matches!(self, Self::Ok(_))
+    }
+
+    /// Convert to `Result<Option<Agent>>` for callers that need Result-based
+    /// error handling.
+    ///
+    /// - `Ok(Some(agent))` = successfully resolved
+    /// - `Ok(None)` = not configured
+    /// - `Err(..)` = configured but broken (precise error with agent name)
+    ///
+    /// The `NotConfigured` → `Ok(None)` mapping lets callers attach their own
+    /// context message (e.g. `generate_title` turns it into a hard error, while
+    /// background generation silently skips).
+    pub(crate) fn into_result(self) -> Result<Option<crate::config::agent::Agent>> {
+        match self {
+            Self::NotConfigured => Ok(None),
+            Self::NotFound { name } => Err(anyhow::anyhow!("title agent '{}' not found", name)),
+            Self::LoadError { name, source } => {
+                Err(source.context(format!("title agent '{}' failed to load", name)))
+            }
+            Self::Ok(agent) => Ok(Some(agent)),
+        }
+    }
+}
+
 /// System prompt used when no explicit title agent is configured. Produces a
 /// short natural-language title (not a slug) suitable for session listings.
 pub const DEFAULT_TITLE_SYSTEM_PROMPT: &str = r#"Generate a concise session title (10 words or fewer).
@@ -151,16 +211,87 @@ fn post_process_title(raw: &str) -> String {
 }
 
 /// Handle the outcome of a spawned `generate_title`: emit `TitleUpdated` on a
-/// new title, warn on error, ignore the "nothing to title" case.
-fn handle_title_result(result: anyhow::Result<Option<String>>) {
+/// new title, emit `TitleGenerationFailed` and warn on error, and ignore the
+/// "nothing to title" case.
+pub(crate) fn handle_title_result(result: anyhow::Result<Option<String>>) {
     match result {
         Ok(Some(title)) => {
+            info!("session title generated: {title:?}");
             harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
                 harnx_core::event::SessionEvent::TitleUpdated(title),
             ));
         }
-        Ok(None) => {}
-        Err(err) => warn!("Failed to generate session title: {err}"),
+        Ok(None) => debug!("title generation produced nothing"),
+        Err(err) => {
+            warn!("Failed to generate session title: {err:#}");
+            harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
+                harnx_core::event::SessionEvent::TitleGenerationFailed(format!("{err:#}")),
+            ));
+        }
+    }
+}
+
+/// Decide which title-agent name to look up and how to qualify it, given the
+/// active agent's own `title_agent` frontmatter, the global
+/// `ConfigData.title_agent`, and the active agent's package.
+///
+/// The name can come from two sources, which resolve differently:
+///   1. The active agent's own `title_agent` frontmatter — a bare peer name
+///      means a peer *within the active agent's package*, so it resolves
+///      package-relative.
+///   2. The global `ConfigData.title_agent` — this refers to a *top-level*
+///      agent, so a bare name must resolve at the top level (NOT prefixed with
+///      whatever package agent happens to be active). Resolving it
+///      package-relative was the bug behind #103: running a package agent (e.g.
+///      `pantheon/sisyphus`) rewrote `title-agent` into `pantheon/title-agent`,
+///      which does not exist.
+///
+/// Returns `(name, resolved_name)` where `name` is the bare configured name and
+/// `resolved_name` is the (possibly package-qualified) name to look up first.
+/// Returns `None` when no title agent is configured from either source.
+pub(crate) fn resolve_title_agent_name(
+    agent_title_agent: Option<&str>,
+    global_title_agent: Option<&str>,
+    active_pkg: Option<&str>,
+) -> Option<(String, String)> {
+    if let Some(name) = agent_title_agent {
+        // Source 1: active agent frontmatter → package-relative.
+        let resolved =
+            harnx_core::package_namespace::resolve_package_relative_name(name, active_pkg);
+        Some((name.to_string(), resolved))
+    } else {
+        // Source 2: global config → resolve at top level. Passing `None` still
+        // honors an explicitly qualified `pkg/foo` or `/foo`, but keeps a bare
+        // name top-level.
+        let name = global_title_agent?;
+        let resolved = harnx_core::package_namespace::resolve_package_relative_name(name, None);
+        Some((name.to_string(), resolved))
+    }
+}
+
+/// Choose which name to look up for the title agent, given the bare configured
+/// `name`, its (possibly package-qualified) `resolved_name`, and whether an
+/// agent file exists at `resolved_name`.
+///
+/// When a package prefix was applied (`resolved_name != name`) but no agent
+/// file exists at that package path, fall back to the bare top-level name.
+/// Otherwise use `resolved_name` as-is — crucially, this means a package agent
+/// file that EXISTS but fails to load surfaces its own error rather than being
+/// masked by a top-level agent of the same name (#103 follow-up).
+///
+/// The fallback strips a leading `/` from `name` (an explicit "top-level"
+/// escape such as `/foo` resolves to the file `foo`), so we never fall back to
+/// a literal slash-prefixed name that no agent file would match.
+fn title_agent_lookup_name<'a>(
+    name: &'a str,
+    resolved_name: &'a str,
+    resolved_file_exists: bool,
+) -> &'a str {
+    let package_prefix_applied = resolved_name != name;
+    if package_prefix_applied && !resolved_file_exists {
+        name.strip_prefix('/').unwrap_or(name)
+    } else {
+        resolved_name
     }
 }
 
@@ -180,24 +311,49 @@ impl Config {
     /// `maybe_compact_session`.
     pub fn maybe_generate_title(config: GlobalConfig) {
         if !Self::claim_titling(&config) {
+            let guard = config.read();
+            let session_state = guard.session.as_ref().map(|session| {
+                (
+                    session.tokens(),
+                    session.title().map(str::to_owned),
+                    session.title_last_updated_tokens(),
+                )
+            });
+            debug!(
+                "title generation: guard not met; threshold={}, session_state={session_state:?}",
+                guard.title_update_threshold
+            );
             return;
         }
 
-        // Only proceed if a title agent is actually configured; otherwise clear
-        // the flag we just set and bail (no fallback title generation).
-        if Self::resolve_title_agent(&config).is_none() {
-            Self::clear_titling(&config, None);
-            return;
-        }
-
+        // Capture the id of the session whose titling flag we just claimed, so
+        // every cleanup path (including the no-agent early return) targets that
+        // exact session even if the active session were to change.
         let titling_session_id = config
             .read()
             .session
             .as_ref()
             .map(|session| session.id.clone());
 
+        // Only proceed if a title agent is actually configured; otherwise clear
+        // the flag we just set and bail (no fallback title generation).
+        let resolution = Self::resolve_title_agent(&config);
+        if !resolution.is_ok() {
+            debug!("title generation: no title agent configured; skipping");
+            Self::clear_titling(&config, titling_session_id.as_deref());
+            return;
+        }
+
+        if let Some(id) = titling_session_id.as_deref() {
+            info!("title generation: starting for session {id}");
+        }
+
         tokio::spawn(async move {
-            let result = Self::generate_title(&config).await;
+            let result = harnx_core::sink::with_agent_event_sink(
+                Arc::new(harnx_core::event::NullSink),
+                Self::generate_title(&config),
+            )
+            .await;
             Self::clear_titling(&config, titling_session_id.as_deref());
             handle_title_result(result);
         });
@@ -230,32 +386,57 @@ impl Config {
     }
 
     /// Resolve the configured title agent: `AgentConfig.title_agent` first, then
-    /// the global `ConfigData.title_agent`. Returns `None` when neither is set
-    /// (no title generation). Mirrors `resolve_compaction_agent`.
-    fn resolve_title_agent(config: &GlobalConfig) -> Option<crate::config::agent::Agent> {
+    /// the global `ConfigData.title_agent`. Returns a `TitleAgentResolution`
+    /// distinguishing between not configured, not found, load error, and success.
+    pub(crate) fn resolve_title_agent(config: &GlobalConfig) -> TitleAgentResolution {
         let active_agent_name = config.read().extract_agent().name().to_string();
         let active_pkg = harnx_core::package_namespace::pkg_from_qualified(&active_agent_name);
-        let name = {
+
+        let (name, resolved_name) = {
             let guard = config.read();
             let agent = guard.extract_agent();
-            agent
-                .title_agent()
-                .map(str::to_owned)
-                .or_else(|| guard.title_agent.clone())?
+            let Some((name, resolved_name)) = resolve_title_agent_name(
+                agent.title_agent(),
+                guard.title_agent.as_deref(),
+                active_pkg,
+            ) else {
+                return TitleAgentResolution::NotConfigured;
+            };
+            (name, resolved_name)
         };
 
-        let resolved_name =
-            harnx_core::package_namespace::resolve_package_relative_name(&name, active_pkg);
-        match config.read().retrieve_agent(&resolved_name) {
+        // Try the resolved name first; if a package prefix was applied and the
+        // package-qualified agent FILE DOES NOT EXIST, fall back to the bare
+        // top-level name. The decision is gated on file existence (not on
+        // `retrieve_agent` erroring) so that a package agent file which *exists
+        // but fails to load* (malformed frontmatter, unknown model, …) surfaces
+        // its real error instead of being masked by a top-level agent of the
+        // same name. See `title_agent_lookup_name`.
+        let resolved_exists = Self::agent_file(&resolved_name).exists();
+        let lookup_name = title_agent_lookup_name(&name, &resolved_name, resolved_exists);
+        let lookup_path = Self::agent_file(lookup_name);
+        let lookup_exists = lookup_path.exists();
+
+        match config.read().retrieve_agent(lookup_name) {
             Ok(mut title_agent) => {
                 if let Err(e) = self::agent::resolve_variables(&mut title_agent) {
                     warn!("Failed to resolve variables for title_agent '{name}': {e}");
+                    return TitleAgentResolution::LoadError { name, source: e };
                 }
-                Some(title_agent)
+                TitleAgentResolution::Ok(title_agent)
             }
             Err(e) => {
                 warn!("Failed to load title_agent '{name}': {e}; skipping title generation");
-                None
+                // Distinguish between "not found" and other errors based on file existence.
+                // retrieve_agent checks both file existence and builtin agents, so we need
+                // to check file existence ourselves to correctly categorize this.
+                if lookup_exists {
+                    // File exists but failed to load - this is a load/parse error
+                    TitleAgentResolution::LoadError { name, source: e }
+                } else {
+                    // File doesn't exist - this is "not found"
+                    TitleAgentResolution::NotFound { name }
+                }
             }
         }
     }
@@ -263,10 +444,19 @@ impl Config {
     /// Perform the actual title generation. Returns `Ok(Some(title))` on success,
     /// `Ok(None)` when there is nothing to title (empty transcript / model
     /// returned an empty string), and `Err` on LLM/model failure.
-    async fn generate_title(config: &GlobalConfig) -> Result<Option<String>> {
+    pub(crate) async fn generate_title(config: &GlobalConfig) -> Result<Option<String>> {
+        // `into_result` maps NotFound/LoadError to precise errors and
+        // NotConfigured to `Ok(None)`; turn the latter into the hard
+        // "no title agent configured" error specific to explicit generation.
         let title_agent = Self::resolve_title_agent(config)
+            .into_result()?
             .context("no title agent configured")?
             .into_config();
+        info!(
+            "title generation: using agent '{}' with model '{}'",
+            title_agent.name(),
+            title_agent.model().id()
+        );
 
         let (transcript, session_id, tokens) = {
             let guard = config.read();
@@ -277,6 +467,7 @@ impl Config {
                 session.tokens,
             )
         };
+        debug!("title generation: transcript length={}", transcript.len());
         if transcript.trim().is_empty() {
             return Ok(None);
         }
@@ -408,8 +599,138 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, NoticeEvent, SessionEvent};
     use harnx_core::message::{Message, MessageContent};
     use harnx_core::session::Session;
+    use std::sync::Mutex;
+
+    // --- title-agent name resolution (#103) ---
+
+    #[test]
+    fn global_title_agent_resolves_top_level_even_inside_a_package_agent() {
+        // Regression for #103: running a package agent (e.g. `pantheon/sisyphus`)
+        // must NOT rewrite a globally-configured bare `title-agent` into
+        // `pantheon/title-agent`. The global title agent is a top-level agent.
+        let (name, resolved) = resolve_title_agent_name(
+            None,                // active agent has no title_agent frontmatter
+            Some("title-agent"), // global ConfigData.title_agent
+            Some("pantheon"),    // active package
+        )
+        .expect("global title agent should resolve");
+        assert_eq!(name, "title-agent");
+        assert_eq!(resolved, "title-agent", "global name must stay top-level");
+    }
+
+    #[test]
+    fn agent_frontmatter_title_agent_resolves_package_relative() {
+        // A bare title_agent in an agent's own frontmatter refers to a peer in
+        // the same package, so it resolves package-relative.
+        let (name, resolved) = resolve_title_agent_name(
+            Some("peer"), // active agent frontmatter
+            None,
+            Some("pkg"), // active package
+        )
+        .expect("frontmatter title agent should resolve");
+        assert_eq!(name, "peer");
+        assert_eq!(resolved, "pkg/peer");
+    }
+
+    #[test]
+    fn agent_frontmatter_takes_precedence_over_global() {
+        // When both are set, the active agent's own frontmatter wins.
+        let (name, resolved) =
+            resolve_title_agent_name(Some("peer"), Some("title-agent"), Some("pkg")).unwrap();
+        assert_eq!(name, "peer");
+        assert_eq!(resolved, "pkg/peer");
+    }
+
+    #[test]
+    fn explicitly_qualified_global_title_agent_is_preserved() {
+        // An explicitly qualified global name keeps its qualification and is not
+        // re-prefixed with the active package.
+        let (name, resolved) =
+            resolve_title_agent_name(None, Some("otherpkg/foo"), Some("pkg")).unwrap();
+        assert_eq!(name, "otherpkg/foo");
+        assert_eq!(resolved, "otherpkg/foo");
+    }
+
+    #[test]
+    fn leading_slash_global_title_agent_escapes_to_top_level() {
+        let (name, resolved) = resolve_title_agent_name(None, Some("/foo"), Some("pkg")).unwrap();
+        assert_eq!(name, "/foo");
+        assert_eq!(resolved, "foo");
+    }
+
+    #[test]
+    fn no_title_agent_configured_returns_none() {
+        assert!(resolve_title_agent_name(None, None, Some("pkg")).is_none());
+        assert!(resolve_title_agent_name(None, None, None).is_none());
+    }
+
+    #[test]
+    fn top_level_active_agent_keeps_global_name_bare() {
+        // No active package → bare global name stays bare.
+        let (name, resolved) = resolve_title_agent_name(None, Some("title-agent"), None).unwrap();
+        assert_eq!(name, "title-agent");
+        assert_eq!(resolved, "title-agent");
+    }
+
+    // --- fallback lookup gating (#103 follow-up) ---
+
+    #[test]
+    fn lookup_name_falls_back_to_bare_when_package_agent_file_missing() {
+        // Package prefix applied AND the package file doesn't exist → fall back
+        // to the bare top-level name.
+        assert_eq!(
+            title_agent_lookup_name("title-agent", "pantheon/title-agent", false),
+            "title-agent"
+        );
+    }
+
+    #[test]
+    fn lookup_name_strips_leading_slash_when_falling_back() {
+        // A global `/foo` resolves to file `foo`. When that file is missing, the
+        // fallback must return the stripped `foo`, never the literal `/foo`
+        // (which no agent file would match).
+        assert_eq!(title_agent_lookup_name("/foo", "foo", false), "foo");
+        // When the file exists, use the resolved (stripped) name as-is.
+        assert_eq!(title_agent_lookup_name("/foo", "foo", true), "foo");
+    }
+
+    #[test]
+    fn lookup_name_keeps_package_name_when_package_agent_file_exists() {
+        // Package prefix applied and the package file EXISTS → use the package
+        // name so a broken package file surfaces its own error (not masked).
+        assert_eq!(
+            title_agent_lookup_name("title-agent", "pantheon/title-agent", true),
+            "pantheon/title-agent"
+        );
+    }
+
+    #[test]
+    fn lookup_name_uses_resolved_when_no_package_prefix_applied() {
+        // No package prefix (resolved == name) → never falls back, regardless
+        // of the existence flag (short-circuits before the file check).
+        assert_eq!(
+            title_agent_lookup_name("title-agent", "title-agent", false),
+            "title-agent"
+        );
+        assert_eq!(
+            title_agent_lookup_name("title-agent", "title-agent", true),
+            "title-agent"
+        );
+    }
+
+    #[derive(Default)]
+    struct CollectingSink {
+        events: Mutex<Vec<AgentEvent>>,
+    }
+
+    impl AgentEventSink for CollectingSink {
+        fn emit(&self, event: AgentEvent, _source: Option<AgentSource>) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
 
     fn user(text: &str) -> Message {
         Message::new(MessageRole::User, MessageContent::Text(text.to_string()))
@@ -424,6 +745,37 @@ mod tests {
         Session {
             messages,
             ..Session::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn title_failure_emits_full_error_after_isolated_generation_events() {
+        let sink = Arc::new(CollectingSink::default());
+
+        harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+            let result = harnx_core::sink::with_agent_event_sink(
+                Arc::new(harnx_core::event::NullSink),
+                async {
+                    harnx_core::sink::emit_agent_event(AgentEvent::Notice(NoticeEvent::Info(
+                        "title-agent output".to_string(),
+                    )));
+                    Err(anyhow::Error::msg("Miss 'api_key'")
+                        .context("Failed to call chat-completions api"))
+                },
+            )
+            .await;
+
+            handle_title_result(result);
+        })
+        .await;
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "title-agent events must stay isolated");
+        match &events[0] {
+            AgentEvent::Session(SessionEvent::TitleGenerationFailed(error)) => {
+                assert_eq!(error, "Failed to call chat-completions api: Miss 'api_key'");
+            }
+            other => panic!("unexpected event: {other:?}"),
         }
     }
 
@@ -492,6 +844,80 @@ mod tests {
         assert_eq!(post_process_title("Configuring CI!"), "Configuring CI");
         assert_eq!(post_process_title("**Bold title**"), "Bold title");
         assert_eq!(post_process_title("`code title`"), "code title");
+    }
+
+    // --- TitleAgentResolution error cases ---
+
+    #[test]
+    fn resolution_not_configured_when_no_title_agent_set() {
+        // Neither agent frontmatter nor global config has title_agent
+        let resolution = resolve_title_agent_name(
+            None, // agent frontmatter
+            None, // global config
+            None, // active package
+        );
+        assert!(
+            resolution.is_none(),
+            "expected None when no title agent configured"
+        );
+    }
+
+    #[test]
+    fn resolution_not_found_message_includes_agent_name() {
+        use super::*;
+        // When a title agent name is configured but doesn't exist,
+        // the error message should include the name
+        let resolution = TitleAgentResolution::NotFound {
+            name: "missing-title-agent".to_string(),
+        };
+        let result: Result<Option<_>> = resolution.into_result();
+        let err = result.expect_err("should be error for NotFound");
+        // The error message must contain both "not found" and the agent name
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not found"),
+            "error message should contain 'not found': {msg}"
+        );
+        assert!(
+            msg.contains("missing-title-agent"),
+            "error message should contain agent name: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolution_load_error_surfaces_underlying_error() {
+        use super::*;
+        // When a title agent exists but fails to load, the underlying error
+        // should be surfaced with the agent name in context
+        let underlying = anyhow::anyhow!("parse error: invalid frontmatter");
+        let resolution = TitleAgentResolution::LoadError {
+            name: "malformed-title-agent".to_string(),
+            source: underlying,
+        };
+        let result: Result<Option<_>> = resolution.into_result();
+        let err = result.expect_err("should be error for LoadError");
+        let msg = format!("{err:#}");
+        // The error message must include both the agent name and the underlying error
+        assert!(
+            msg.contains("malformed-title-agent"),
+            "error should contain agent name: {msg}"
+        );
+        assert!(
+            msg.contains("parse error"),
+            "error should contain underlying error: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolution_not_configured_is_ok_none() {
+        use super::*;
+        let resolution = TitleAgentResolution::NotConfigured;
+        let result: Result<Option<_>> = resolution.into_result();
+        assert!(result.is_ok(), "NotConfigured should resolve to Ok(None)");
+        assert!(
+            result.unwrap().is_none(),
+            "NotConfigured should resolve to Ok(None)"
+        );
     }
 
     #[test]

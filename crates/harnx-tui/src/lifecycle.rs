@@ -356,8 +356,7 @@ impl Tui {
         let mut terminal = Self::setup_terminal()?;
 
         if let Some(title) = self.config.read().session.as_ref().and_then(|s| s.title()) {
-            let _ = std::io::stdout()
-                .execute(crossterm::terminal::SetTitle(format!("harnx — {title}")));
+            let _ = std::io::stdout().execute(crossterm::terminal::SetTitle(title));
         }
 
         let mut event_source = CrosstermEventSource;

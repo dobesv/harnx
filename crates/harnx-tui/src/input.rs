@@ -1344,9 +1344,13 @@ impl Tui {
                     "Compaction failed: {err}"
                 ))]
             }
+            AgentEvent::Session(SessionEvent::TitleGenerationFailed(err)) => {
+                vec![TranscriptItem::ErrorText(format!(
+                    "Title generation failed: {err}"
+                ))]
+            }
             AgentEvent::Session(SessionEvent::TitleUpdated(title)) => {
-                let _ = std::io::stdout()
-                    .execute(crossterm::terminal::SetTitle(format!("harnx — {title}")));
+                let _ = std::io::stdout().execute(crossterm::terminal::SetTitle(&title));
                 vec![]
             }
             _ => vec![],

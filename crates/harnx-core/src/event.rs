@@ -144,6 +144,9 @@ pub enum SessionEvent {
     /// Emitted after a session title has been generated or manually set.
     /// Carries the new title text.
     TitleUpdated(String),
+    /// Emitted when automatic session-title generation fails. Carries the
+    /// full error chain for display.
+    TitleGenerationFailed(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

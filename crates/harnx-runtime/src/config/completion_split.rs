@@ -32,6 +32,7 @@ impl Config {
                     "add-root",
                     "remove-root",
                 ]),
+                ".title" => map_completion_values(vec!["generate", "now"]),
                 ".use" => map_completion_values(vec!["tool"]),
                 ".drop" => map_completion_values(vec!["tool"]),
                 ".starter" => match &self.agent {
