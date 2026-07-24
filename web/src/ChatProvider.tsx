@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AssistantRuntimeProvider, useThreadRuntime } from '@assistant-ui/react';
 import type { AttachmentAdapter } from '@assistant-ui/react';
 import { useAgUiRuntime } from '@assistant-ui/react-ag-ui';
@@ -21,9 +21,17 @@ const EMPTY_STATE = {};
 
 const RuntimeSessionSubscriber = ({ enabled }: { enabled: boolean }) => {
   const threadRuntime = useThreadRuntime();
+  // The initial promptless subscribe/hydrate must fire exactly once per mount.
+  // React StrictMode double-invokes mount effects in dev (and the e2e suite runs
+  // against the dev server), so an unguarded startRun opens two concurrent runs
+  // on the same thread; they race and the surviving run can drop the transcript
+  // snapshot, leaving the thread empty. A session switch remounts this component
+  // (AssistantRuntimeProvider is keyed on agent:session), which re-arms the ref.
+  const startedRef = useRef(false);
 
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled || startedRef.current) return;
+    startedRef.current = true;
     threadRuntime.startRun({
       parentId: threadRuntime.getState().messages.at(-1)?.id ?? null,
     });
