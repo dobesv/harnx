@@ -46,11 +46,6 @@ pub(crate) enum TitleAgentResolution {
 }
 
 impl TitleAgentResolution {
-    /// Returns `true` if this represents a successfully resolved agent.
-    pub(crate) fn is_ok(&self) -> bool {
-        matches!(self, Self::Ok(_))
-    }
-
     /// Convert to `Result<Option<Agent>>` for callers that need Result-based
     /// error handling.
     ///
@@ -335,10 +330,13 @@ impl Config {
             .as_ref()
             .map(|session| session.id.clone());
 
-        // Only proceed if a title agent is actually configured; otherwise clear
-        // the flag we just set and bail (no fallback title generation).
+        // Only skip when NO title agent is configured. A configured-but-broken
+        // agent (NotFound / LoadError) must fall through so the spawned task's
+        // `generate_title` surfaces the real failure via `TitleGenerationFailed`
+        // — the whole point of the background failure-surfacing path. Skipping
+        // those here would silently swallow them.
         let resolution = Self::resolve_title_agent(&config);
-        if !resolution.is_ok() {
+        if matches!(resolution, TitleAgentResolution::NotConfigured) {
             debug!("title generation: no title agent configured; skipping");
             Self::clear_titling(&config, titling_session_id.as_deref());
             return;
@@ -918,6 +916,25 @@ mod tests {
             result.unwrap().is_none(),
             "NotConfigured should resolve to Ok(None)"
         );
+    }
+
+    #[test]
+    fn background_titling_only_skips_when_not_configured() {
+        use super::*;
+        // The automatic/background guard in `maybe_generate_title` must skip
+        // ONLY when no title agent is configured. A configured-but-broken agent
+        // (NotFound / LoadError) must NOT be skipped — it has to fall through to
+        // `generate_title` so `TitleGenerationFailed` is surfaced (#103 / CR).
+        let skips = |r: &TitleAgentResolution| matches!(r, TitleAgentResolution::NotConfigured);
+
+        assert!(skips(&TitleAgentResolution::NotConfigured));
+        assert!(!skips(&TitleAgentResolution::NotFound {
+            name: "title-agent".to_string(),
+        }));
+        assert!(!skips(&TitleAgentResolution::LoadError {
+            name: "title-agent".to_string(),
+            source: anyhow::anyhow!("bad yaml"),
+        }));
     }
 
     #[test]
