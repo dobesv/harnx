@@ -806,6 +806,58 @@ async fn compute_completions_appends_space_for_command_matches() {
 }
 
 #[tokio::test]
+async fn compute_completions_title_offers_subcommands_not_usage_brackets() {
+    // Regression: `.title` was registered with the name ".title [generate|now]",
+    // so tab-completing `.title ` produced the literal usage string
+    // "[generate|now]" instead of the real subcommands.
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    // Completing the command name must not carry a usage suffix.
+    let name_completions = tui.compute_completions(".title", 6).await;
+    assert!(
+        name_completions.iter().any(|(value, _)| value == ".title "),
+        "expected bare \".title \" command completion, got: {name_completions:?}"
+    );
+    assert!(
+        !name_completions
+            .iter()
+            .any(|(value, _)| value.contains('[') || value.contains(']')),
+        "command completion must not contain usage brackets, got: {name_completions:?}"
+    );
+
+    // Completing the argument after `.title ` must offer exactly the real
+    // subcommands — no usage brackets, no extraneous candidates.
+    let line = ".title ";
+    let arg_completions = tui.compute_completions(line, line.len()).await;
+    let values: Vec<&str> = arg_completions
+        .iter()
+        .map(|(value, _)| value.as_str())
+        .collect();
+    assert_eq!(
+        values,
+        vec!["generate", "now"],
+        "expected exactly the \"generate\"/\"now\" subcommands, got: {values:?}"
+    );
+
+    // A partial subcommand prefix must narrow to the matching subcommand.
+    let line = ".title g";
+    let prefix_completions = tui.compute_completions(line, line.len()).await;
+    let prefix_values: Vec<&str> = prefix_completions
+        .iter()
+        .map(|(value, _)| value.as_str())
+        .collect();
+    assert_eq!(
+        prefix_values,
+        vec!["generate"],
+        "expected \".title g\" to complete to \"generate\", got: {prefix_values:?}"
+    );
+}
+
+#[tokio::test]
 async fn apply_completion_preserves_text_after_cursor() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
@@ -8452,6 +8504,30 @@ async fn render_agent_event_title_updated_executes_without_panic() {
     .await
     .unwrap();
 }
+#[tokio::test]
+async fn render_agent_event_title_generation_failed_produces_error_transcript_entry() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::TitleGenerationFailed(
+            "Miss 'api_key'".to_string(),
+        )),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    assert!(tui.app.transcript.iter().any(|item| matches!(
+        item,
+        TranscriptItem::ErrorText(text)
+            if text == "Title generation failed: Miss 'api_key'"
+    )));
+}
+
 #[tokio::test]
 async fn render_agent_event_compacting_started_produces_transcript_entry() {
     let config = test_config();

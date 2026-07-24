@@ -632,6 +632,9 @@ impl harnx_core::event::AgentEventSink for AgUiSink {
             AgentEvent::Session(SessionEvent::CompactingFailed(error)) => {
                 self.emit_custom("session_compacting_failed", json!({ "error": error }));
             }
+            AgentEvent::Session(SessionEvent::TitleGenerationFailed(error)) => {
+                self.emit_custom("session_title_generation_failed", json!({ "error": error }));
+            }
             AgentEvent::Session(SessionEvent::Saved { path }) => {
                 self.emit_custom("session_saved", json!({ "path": path }));
             }

@@ -721,6 +721,15 @@ pub fn render(session: &Session) -> Result<String> {
         ),
     ));
 
+    let title = match session.title() {
+        Some(title) if session.title_last_updated_tokens() == usize::MAX => {
+            format!("{title} (manual)")
+        }
+        Some(title) => title.to_string(),
+        None => "(none)".to_string(),
+    };
+    items.push(("title", title));
+
     if let Some(temperature) = session.temperature() {
         items.push(("temperature", temperature.to_string()));
     }
@@ -3179,6 +3188,22 @@ content: second
         assert!(appended);
         assert_eq!(session.log_entry_count, 4);
         assert_eq!(session.next_seq(), 4);
+    }
+
+    #[test]
+    fn render_shows_session_title_and_manual_state() {
+        let mut session = test_session();
+
+        let output = super::render(&session).unwrap();
+        assert!(output.contains("title               (none)"), "{output}");
+
+        session.set_title("User chosen title".to_string());
+        session.set_title_last_updated_tokens(usize::MAX);
+        let output = super::render(&session).unwrap();
+        assert!(
+            output.contains("title               User chosen title (manual)"),
+            "{output}"
+        );
     }
 
     #[test]

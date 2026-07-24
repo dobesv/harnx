@@ -2,7 +2,6 @@
 source: crates/harnx-tui/src/tests.rs
 expression: rendered
 ---
-.exit rag                Leave RAG
 .attach                  Attach a file to the next message
 .detach                  Remove attached files
 .macro                   Execute a macro
@@ -12,6 +11,7 @@ expression: rendered
 .regenerate              Regenerate last response
 .copy                    Copy last response
 .set                     Modify runtime settings
+.title                   Show or (re)generate the session title
 .set show_sequence_numbers Toggle [n] prefix in transcript (on/off)
 .set show_timestamps     Toggle timestamp in transcript (on/off)
 .delete                  Delete agents, sessions, RAGs, or macros

@@ -434,6 +434,12 @@ impl AgentEventSink for CliAgentEventSink {
                 }
                 eprintln!("{}", warning_text(&format!("compaction failed: {err}")));
             }
+            AgentEvent::Session(SessionEvent::TitleGenerationFailed(err)) => {
+                eprintln!(
+                    "{}",
+                    warning_text(&format!("title generation failed: {err}"))
+                );
+            }
             // Every other variant — Session (other), Status, Plan — still gets
             // captured so nothing silently disappears. These receive dedicated
             // renderers in a future plan.
@@ -524,6 +530,14 @@ mod tests {
                 input: serde_json::Value::Null,
                 reason: "hook denied".into(),
             }),
+            None,
+        );
+        sink.emit(
+            AgentEvent::Session(SessionEvent::TitleUpdated("A title".into())),
+            None,
+        );
+        sink.emit(
+            AgentEvent::Session(SessionEvent::TitleGenerationFailed("Miss 'api_key'".into())),
             None,
         );
     }

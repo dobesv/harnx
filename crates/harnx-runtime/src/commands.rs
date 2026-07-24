@@ -30,7 +30,7 @@ pub enum CommandOutcome {
     OpenSessionPicker,
 }
 
-pub static COMMANDS: LazyLock<[Command; 49]> = LazyLock::new(|| {
+pub static COMMANDS: LazyLock<[Command; 50]> = LazyLock::new(|| {
     [
         Command::new(".help", "Show this help guide"),
         Command::new(".info", "Show system info"),
@@ -101,6 +101,7 @@ pub static COMMANDS: LazyLock<[Command; 49]> = LazyLock::new(|| {
         Command::new(".regenerate", "Regenerate last response"),
         Command::new(".copy", "Copy last response"),
         Command::new(".set", "Modify runtime settings"),
+        Command::new(".title", "Show or (re)generate the session title"),
         Command::new(
             ".set show_sequence_numbers",
             "Toggle [n] prefix in transcript (on/off)",
@@ -313,6 +314,74 @@ pub async fn run_command_with_output(
             ".help" => {
                 dump_help(output)?;
             }
+            ".title" => match args {
+                None => {
+                    let conf = config.read();
+                    let Some(session) = conf.session.as_ref() else {
+                        writeln!(output, "No session")?;
+                        return Ok(CommandOutcome::Continue);
+                    };
+                    let title = session.title().unwrap_or("(none — not generated yet)");
+                    // Report the configured name AND how it resolves for the
+                    // active agent (which may be a package agent). Resolving
+                    // here mirrors what `resolve_title_agent` actually looks up,
+                    // so the display matches real behavior (#103).
+                    let active_agent = conf.extract_agent();
+                    let active_pkg =
+                        harnx_core::package_namespace::pkg_from_qualified(active_agent.name());
+                    let title_agent = match crate::config::session_ops_title::resolve_title_agent_name(
+                        active_agent.title_agent(),
+                        conf.title_agent.as_deref(),
+                        active_pkg,
+                    ) {
+                        Some((name, resolved)) if resolved == name => name,
+                        Some((name, resolved)) => format!("{name} (resolves to {resolved})"),
+                        None => "(not configured)".to_string(),
+                    };
+                    let last_updated = if session.title_last_updated_tokens() == usize::MAX {
+                        "(frozen/manual)".to_string()
+                    } else {
+                        session.title_last_updated_tokens().to_string()
+                    };
+                    writeln!(output, "title: {title}")?;
+                    writeln!(
+                        output,
+                        "title_update_threshold: {}",
+                        conf.title_update_threshold
+                    )?;
+                    writeln!(output, "title_agent: {title_agent}")?;
+                    writeln!(output, "session.tokens: {}", session.tokens())?;
+                    writeln!(output, "title_last_updated_tokens: {last_updated}")?;
+                }
+                Some("generate" | "now") => {
+                    // Generate synchronously so the user sees the outcome right
+                    // here. Isolate the title-agent's own model/retry events
+                    // from the transcript via NullSink.
+                    let result = harnx_core::sink::with_agent_event_sink(
+                        Arc::new(harnx_core::event::NullSink),
+                        Config::generate_title(config),
+                    )
+                    .await;
+                    // Report the outcome directly as command output. On success
+                    // also emit `TitleUpdated` (updates the terminal title and
+                    // any UI listeners). Do NOT emit `TitleGenerationFailed` on
+                    // error — the error is already shown here, and emitting it
+                    // would double-render the failure in the TUI transcript.
+                    match result {
+                        Ok(Some(title)) => {
+                            writeln!(output, "title: {title}")?;
+                            harnx_core::sink::emit_agent_event(
+                                harnx_core::event::AgentEvent::Session(
+                                    harnx_core::event::SessionEvent::TitleUpdated(title),
+                                ),
+                            );
+                        }
+                        Ok(None) => writeln!(output, "(nothing to title)")?,
+                        Err(err) => writeln!(output, "title generation failed: {err:#}")?,
+                    }
+                }
+                _ => writeln!(output, "Usage: .title [generate|now]")?,
+            },
             ".info" => match args {
                 Some("session") => {
                     let info = config.read().session_info()?;
@@ -1460,6 +1529,169 @@ hooks:
         let mut out = Vec::new();
         write_env_info(&mut out, Some("HARNX_DEFINITELY_UNSET_XYZ")).expect("show unset");
         assert!(String::from_utf8(out).unwrap().contains("is not set"));
+    }
+
+    #[tokio::test]
+    async fn title_command_shows_current_title_and_guard_state() {
+        let mut config = Config {
+            data: ConfigData {
+                title_agent: Some("title-agent".to_string()),
+                title_update_threshold: 12_345,
+                ..Default::default()
+            },
+            working_mode: WorkingMode::Cmd,
+            ..Default::default()
+        };
+        let mut session = config::session::new(&config, "test", None).expect("test session");
+        session.set_title("Inspect title generation".to_string());
+        session.set_title_last_updated_tokens(42);
+        config.session = Some(session);
+        let config = Arc::new(RwLock::new(config));
+        let mut output = Vec::new();
+        let abort_signal = crate::utils::create_abort_signal();
+        let mut async_manager = AsyncHookManager::default();
+        let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
+        let mut pending_async_context = None;
+
+        let outcome = run_command_with_output(
+            &config,
+            abort_signal,
+            ".title",
+            &mut async_manager,
+            &persistent_manager,
+            &mut pending_async_context,
+            &mut output,
+        )
+        .await
+        .expect("command succeeds");
+
+        assert_eq!(outcome, CommandOutcome::Continue);
+        assert_eq!(
+            String::from_utf8(output).expect("utf8 output"),
+            "title: Inspect title generation\ntitle_update_threshold: 12345\ntitle_agent: title-agent\nsession.tokens: 0\ntitle_last_updated_tokens: 42\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn title_command_shows_frozen_manual_without_sentinel_value() {
+        // A manually set title freezes regeneration by setting
+        // title_last_updated_tokens to usize::MAX; the display must show only
+        // "(frozen/manual)", not the raw sentinel integer.
+        let mut config = Config {
+            data: ConfigData {
+                title_agent: Some("title-agent".to_string()),
+                title_update_threshold: 12_345,
+                ..Default::default()
+            },
+            working_mode: WorkingMode::Cmd,
+            ..Default::default()
+        };
+        let mut session = config::session::new(&config, "test", None).expect("test session");
+        session.set_title("Manual title".to_string());
+        session.set_title_last_updated_tokens(usize::MAX);
+        config.session = Some(session);
+        let config = Arc::new(RwLock::new(config));
+        let mut output = Vec::new();
+        let abort_signal = crate::utils::create_abort_signal();
+        let mut async_manager = AsyncHookManager::default();
+        let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
+        let mut pending_async_context = None;
+
+        run_command_with_output(
+            &config,
+            abort_signal,
+            ".title",
+            &mut async_manager,
+            &persistent_manager,
+            &mut pending_async_context,
+            &mut output,
+        )
+        .await
+        .expect("command succeeds");
+
+        let out = String::from_utf8(output).expect("utf8 output");
+        assert!(
+            out.contains("title_last_updated_tokens: (frozen/manual)\n"),
+            "expected frozen/manual annotation without sentinel, got: {out:?}"
+        );
+        assert!(
+            !out.contains(&usize::MAX.to_string()),
+            "raw usize::MAX sentinel must not appear, got: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn title_generate_without_a_loadable_agent_reports_failure() {
+        // Hermetic: `title_agent` names an agent that isn't present on disk, so
+        // `generate_title` fails at agent resolution. Exercises the command's
+        // `Err` branch deterministically (no LLM/network) and asserts the error
+        // is surfaced directly as command output (not double-rendered).
+        let mut config = Config {
+            data: ConfigData {
+                title_agent: Some("definitely-missing-title-agent".to_string()),
+                ..Default::default()
+            },
+            working_mode: WorkingMode::Cmd,
+            ..Default::default()
+        };
+        let session = config::session::new(&config, "test", None).expect("test session");
+        config.session = Some(session);
+        let config = Arc::new(RwLock::new(config));
+        let mut output = Vec::new();
+        let abort_signal = crate::utils::create_abort_signal();
+        let mut async_manager = AsyncHookManager::default();
+        let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
+        let mut pending_async_context = None;
+
+        let outcome = run_command_with_output(
+            &config,
+            abort_signal,
+            ".title generate",
+            &mut async_manager,
+            &persistent_manager,
+            &mut pending_async_context,
+            &mut output,
+        )
+        .await
+        .expect("command succeeds");
+
+        assert_eq!(outcome, CommandOutcome::Continue);
+        let out = String::from_utf8(output).expect("utf8 output");
+        assert!(
+            out.starts_with("title generation failed:"),
+            "expected a failure line, got: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn title_command_rejects_unknown_subcommand() {
+        let config = Config {
+            working_mode: WorkingMode::Cmd,
+            ..Default::default()
+        };
+        let config = Arc::new(RwLock::new(config));
+        let mut output = Vec::new();
+        let abort_signal = crate::utils::create_abort_signal();
+        let mut async_manager = AsyncHookManager::default();
+        let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
+        let mut pending_async_context = None;
+
+        run_command_with_output(
+            &config,
+            abort_signal,
+            ".title bogus",
+            &mut async_manager,
+            &persistent_manager,
+            &mut pending_async_context,
+            &mut output,
+        )
+        .await
+        .expect("command succeeds");
+
+        assert_eq!(
+            String::from_utf8(output).expect("utf8 output"),
+            "Usage: .title [generate|now]\n"
+        );
     }
 
     fn model_with_data(

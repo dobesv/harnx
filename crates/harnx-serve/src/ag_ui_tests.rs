@@ -136,6 +136,29 @@ fn ag_ui_sink_emits_run_error_for_model_error() {
 }
 
 #[test]
+fn ag_ui_sink_emits_custom_for_title_generation_failed() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let message_id = MessageId::from(uuid::Uuid::new_v4());
+    let sink = super::AgUiSink::new(tx, message_id);
+
+    sink.emit(
+        AgentEvent::Session(SessionEvent::TitleGenerationFailed(
+            "Miss 'api_key'".to_string(),
+        )),
+        None,
+    );
+
+    let event = rx.try_recv().expect("should receive event");
+    match event {
+        Event::Custom(CustomEvent { name, value, .. }) => {
+            assert_eq!(name, "session_title_generation_failed");
+            assert_eq!(value["error"], json!("Miss 'api_key'"));
+        }
+        _ => panic!("expected Custom event, got: {:?}", event),
+    }
+}
+
+#[test]
 fn ag_ui_sink_emits_run_error_for_notice_error() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let message_id = MessageId::from(uuid::Uuid::new_v4());
