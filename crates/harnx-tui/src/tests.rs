@@ -237,7 +237,7 @@ async fn shift_enter_inserts_newline_without_submitting() {
         .app
         .transcript
         .iter()
-        .all(|entry| !matches!(entry, TranscriptItem::UserText { text: _, .. })));
+        .all(|entry| !matches!(entry, TranscriptItem::UserText { .. })));
 }
 
 #[tokio::test]
@@ -1848,7 +1848,7 @@ async fn submitting_message_with_attachments_renders_attachment_list_and_preview
         .collect();
 
     assert!(matches!(
-        tui.app.transcript.iter().find(|entry| matches!(entry, TranscriptItem::UserText { text: _, .. })),
+        tui.app.transcript.iter().find(|entry| matches!(entry, TranscriptItem::UserText { .. })),
         Some(TranscriptItem::UserText { text, .. }) if text == "hello with files"
     ));
     assert!(system_entries.contains(&"Attachments (1):".to_string()));
@@ -3304,7 +3304,7 @@ async fn paste_multiline_creates_temp_attachment() {
         .app
         .transcript
         .iter()
-        .filter(|entry| matches!(entry, TranscriptItem::UserText { text: _, .. }))
+        .filter(|entry| matches!(entry, TranscriptItem::UserText { .. }))
         .collect();
     assert!(
         user_entries.is_empty(),
@@ -3612,7 +3612,7 @@ async fn attach_command_adds_attachment() {
         .app
         .transcript
         .iter()
-        .filter(|e| matches!(e, TranscriptItem::UserText { text: _, .. }))
+        .filter(|e| matches!(e, TranscriptItem::UserText { .. }))
         .collect();
     assert!(user_entries.is_empty());
 
@@ -3641,7 +3641,7 @@ async fn attach_command_preserves_draft_text() {
         .app
         .transcript
         .iter()
-        .filter(|e| matches!(e, TranscriptItem::UserText { text: _, .. }))
+        .filter(|e| matches!(e, TranscriptItem::UserText { .. }))
         .collect();
     assert!(user_entries.is_empty());
 

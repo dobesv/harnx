@@ -14,12 +14,20 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders};
 use ratatui::Terminal;
 use ratatui_textarea::TextArea;
-use std::io::{self, Stdout, Write};
+use std::io::{self, IsTerminal, Stdout, Write};
 use std::panic;
 
 pub(super) fn cleanup_terminal_state() {
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
+    // Skip terminal escape-sequence cleanup when stdout is not an interactive
+    // TTY (e.g. under `cargo nextest`, piped output, or headless CI). The
+    // `supports_keyboard_enhancement()` query below writes a terminal request
+    // and blocks waiting for a reply that never arrives in those environments,
+    // hanging the process. `disable_raw_mode()` above is always safe to run.
+    if !stdout.is_terminal() {
+        return;
+    }
     if supports_keyboard_enhancement().unwrap_or(false) {
         let _ = stdout.execute(PopKeyboardEnhancementFlags);
     }
