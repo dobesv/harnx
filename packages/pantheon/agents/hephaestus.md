@@ -1,6 +1,6 @@
 ---
 role: subagent
-model: openai:gpt-5.6-sol
+model: openai:gpt-5.6-sol:high
 compaction_agent: compact-dev
 use_tools:
 - bash_exec
