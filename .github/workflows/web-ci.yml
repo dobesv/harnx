@@ -36,7 +36,7 @@ jobs:
           persist-credentials: false
 
       - name: Filter web paths
-        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210cf1f72e7f9d89e3 # v3.0.2
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
         id: filter
         with:
           filters: |
