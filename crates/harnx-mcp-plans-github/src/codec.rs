@@ -193,6 +193,36 @@ pub struct DecodedNote {
 // Plan Encode/Decode
 // =============================================================================
 
+/// Title used when neither a title nor a client id is available.
+const UNTITLED_ISSUE_TITLE: &str = "untitled plan";
+
+/// Trim a value and discard it when nothing is left.
+fn non_blank(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// Pick a non-blank issue title.
+///
+/// GitHub rejects issues with a blank title (`422 "title can't be blank"`), so an
+/// untitled plan or task falls back to its client id and then to a placeholder.
+fn issue_title_or_fallback(title: Option<&str>, client_id: &str) -> String {
+    non_blank(title)
+        .or_else(|| non_blank(Some(client_id)))
+        .unwrap_or(UNTITLED_ISSUE_TITLE)
+        .to_string()
+}
+
+/// Build the title field of an issue update, prefixing the JIRA key when present.
+///
+/// A blank requested title yields `None` so the existing issue title is left alone
+/// rather than PATCHed to something GitHub would reject.
+fn issue_title_update(requested: Option<&str>, jira_key: Option<&str>) -> Option<String> {
+    non_blank(requested).map(|title| match jira_key {
+        Some(key) => format!("[{}] {}", key, title),
+        None => title.to_string(),
+    })
+}
+
 /// Encode a Plan to GitHub issue title and body.
 ///
 /// # Arguments
@@ -204,9 +234,10 @@ pub struct DecodedNote {
 /// (issue_title, issue_body) tuple.
 pub fn plan_to_issue(plan: &Plan, jira_key: Option<&str>, body: &str) -> (String, String) {
     // Build title: prefix with JIRA key if present
+    let issue_title = issue_title_or_fallback(plan.title.as_deref(), &plan.id);
     let title = match jira_key {
-        Some(key) => format!("[{}] {}", key, plan.title.as_deref().unwrap_or("")),
-        None => plan.title.clone().unwrap_or_default(),
+        Some(key) => format!("[{}] {}", key, issue_title),
+        None => issue_title,
     };
 
     // Build front-matter
@@ -297,9 +328,10 @@ pub fn issue_to_plan(
 /// (issue_title, issue_body) tuple.
 pub fn task_to_issue(task: &Task, jira_key: Option<&str>, body: &str) -> (String, String) {
     // Build title: prefix with JIRA key if present
+    let issue_title = issue_title_or_fallback(Some(task.title.as_str()), &task.id);
     let title = match jira_key {
-        Some(key) => format!("[{}] {}", key, task.title),
-        None => task.title.clone(),
+        Some(key) => format!("[{}] {}", key, issue_title),
+        None => issue_title,
     };
 
     // Build dependencies as `#<n>` strings
@@ -561,10 +593,7 @@ pub fn plan_meta_update_to_issue_body(
     let body = serialize_frontmatter(&front, &existing.body);
 
     // Title update: if specified, needs to include JIRA prefix if present
-    let title = update.title.clone().map(|t| match &existing.jira_key {
-        Some(key) => format!("[{}] {}", key, t),
-        None => t,
-    });
+    let title = issue_title_update(update.title.as_deref(), existing.jira_key.as_deref());
 
     (title, body)
 }
@@ -621,10 +650,7 @@ pub fn task_meta_update_to_issue_body(
     let body = serialize_frontmatter(&front, &existing.body);
 
     // Title update: if specified, needs to include JIRA prefix if present
-    let title = update.title.clone().map(|t| match &existing.jira_key {
-        Some(key) => format!("[{}] {}", key, t),
-        None => t,
-    });
+    let title = issue_title_update(update.title.as_deref(), existing.jira_key.as_deref());
 
     (title, body)
 }
@@ -953,6 +979,84 @@ mod tests {
         assert_eq!(decoded.plan.id, "42");
         // But client_id should preserve the original
         assert_eq!(decoded.client_id, Some("my-custom-id".to_string()));
+    }
+
+    fn plan_with_title(id: &str, title: Option<&str>) -> Plan {
+        Plan {
+            id: id.to_string(),
+            title: title.map(str::to_string),
+            summary: None,
+            author: None,
+            assignee: None,
+            executor: None,
+            git_branch: None,
+            github_owner_repo: None,
+            created_at: now(),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn untitled_plan_falls_back_to_client_id_for_issue_title() {
+        let (title, _) = plan_to_issue(&plan_with_title("my-plan-slug", None), None, "");
+        assert_eq!(title, "my-plan-slug");
+
+        let (blank, _) = plan_to_issue(&plan_with_title("my-plan-slug", Some("   ")), None, "");
+        assert_eq!(blank, "my-plan-slug");
+    }
+
+    #[test]
+    fn untitled_plan_with_jira_key_still_has_non_blank_title() {
+        let (title, _) = plan_to_issue(&plan_with_title("my-plan-slug", None), Some("ABC-1"), "");
+        assert_eq!(title, "[ABC-1] my-plan-slug");
+    }
+
+    #[test]
+    fn plan_without_title_or_id_falls_back_to_placeholder() {
+        let (title, _) = plan_to_issue(&plan_with_title("", None), None, "");
+        assert!(!title.trim().is_empty(), "issue title must never be blank");
+    }
+
+    #[test]
+    fn untitled_task_falls_back_to_client_id_for_issue_title() {
+        let task = Task {
+            id: "task-slug".to_string(),
+            title: String::new(),
+            summary: None,
+            author: None,
+            assignee: None,
+            executor: None,
+            tags: Vec::new(),
+            plan: "1".to_string(),
+            status: "open".to_string(),
+            created_at: now(),
+            updated_at: None,
+            dependencies: Vec::new(),
+        };
+
+        let (title, _) = task_to_issue(&task, None, "");
+        assert_eq!(title, "task-slug");
+    }
+
+    #[test]
+    fn blank_title_updates_leave_issue_titles_unchanged() {
+        let (plan_title, _) = plan_meta_update_to_issue_body(
+            &issue_to_plan(7, "Existing", Some(""), now(), None),
+            &PlanMetaUpdate {
+                title: Some("  ".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(plan_title, None, "plan title should be left alone");
+
+        let (task_title, _) = task_meta_update_to_issue_body(
+            &issue_to_task("1".to_string(), 8, "Existing", Some(""), now(), None),
+            &TaskMetaUpdate {
+                title: Some(String::new()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(task_title, None, "task title should be left alone");
     }
 
     #[test]

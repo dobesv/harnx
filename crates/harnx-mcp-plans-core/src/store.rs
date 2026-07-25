@@ -23,6 +23,16 @@ pub enum StoreError {
     Backend(#[from] AnyhowError),
 }
 
+/// Storage backend for plans, tasks, and notes.
+///
+/// ## Plan ID contract
+///
+/// `add_plan` returns the plan's canonical ID, which a backend may derive itself
+/// (the GitHub backend uses the issue number) instead of keeping `NewPlan.id`.
+/// Every method taking a `PlanId` accepts either that canonical ID or the
+/// client-provided `NewPlan.id`, since MCP callers address plans by name; callers
+/// that already hold a canonical ID should pass it, as resolving a name may cost
+/// the backend an extra lookup.
 #[async_trait]
 pub trait PlanStore: Send + Sync {
     async fn list_plans(

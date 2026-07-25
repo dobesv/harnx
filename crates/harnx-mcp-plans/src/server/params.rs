@@ -90,7 +90,8 @@ pub(crate) struct NoteRecord {
     pub(crate) body: String,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ListTasksParams {
     pub(crate) plan: String,
     #[serde(default = "default_open_status")]
@@ -99,13 +100,15 @@ pub(crate) struct ListTasksParams {
     pub(crate) tag: Option<String>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GetTaskParams {
     pub(crate) plan: String,
     pub(crate) id: String,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AddTaskParams {
     pub(crate) title: String,
     pub(crate) plan: String,
@@ -129,7 +132,8 @@ pub(crate) struct AddTaskParams {
     pub(crate) dependencies: Vec<String>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct UpdateTaskParams {
     pub(crate) plan: String,
     pub(crate) id: String,
@@ -157,7 +161,8 @@ pub(crate) struct UpdateTaskParams {
     pub(crate) dependencies: Option<Vec<String>>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReplaceInContent {
     pub(crate) old_text: String,
     pub(crate) new_text: String,
@@ -165,16 +170,19 @@ pub(crate) struct ReplaceInContent {
     pub(crate) replace_all: Option<bool>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DeleteTaskParams {
     pub(crate) plan: String,
     pub(crate) id: String,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ListPlansParams {}
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AddPlanParams {
     pub(crate) name: String,
     #[serde(default)]
@@ -192,17 +200,25 @@ pub(crate) struct AddPlanParams {
     #[serde(default)]
     pub(crate) github_owner_repo: Option<String>,
     #[serde(default)]
+    pub(crate) parent_issue: Option<u64>,
+    #[serde(default)]
     pub(crate) body: Option<String>,
+    #[serde(default)]
+    pub(crate) content: Option<String>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GetPlanParams {
     pub(crate) name: String,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct UpdatePlanParams {
     pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) content: Option<String>,
     #[serde(default)]
     pub(crate) replace_content: Option<String>,
     #[serde(default)]
@@ -224,20 +240,25 @@ pub(crate) struct UpdatePlanParams {
     #[serde(default)]
     pub(crate) github_owner_repo: Option<String>,
     #[serde(default)]
+    pub(crate) parent_issue: Option<u64>,
+    #[serde(default)]
     pub(crate) tasks: Option<Vec<TaskSpec>>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DeletePlanParams {
     pub(crate) name: String,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ListNotesParams {
     pub(crate) plan: String,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AddNoteParams {
     pub(crate) plan: String,
     #[serde(default)]
@@ -249,19 +270,22 @@ pub(crate) struct AddNoteParams {
     pub(crate) author: Option<String>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GetNoteParams {
     pub(crate) plan: String,
     pub(crate) note_id: String,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DeleteNoteParams {
     pub(crate) plan: String,
     pub(crate) note_id: String,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct UpdateNoteParams {
     pub(crate) plan: String,
     pub(crate) note_id: String,
@@ -277,7 +301,8 @@ pub(crate) struct UpdateNoteParams {
     pub(crate) replace_in_body: Option<ReplaceInContent>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TaskSpec {
     pub(crate) title: String,
     #[serde(default)]
@@ -538,49 +563,61 @@ impl_json_schema!(
 impl_json_schema!(
     AddPlanParams,
     "AddPlanParams",
-    |gen: &mut SchemaGenerator| vec![
-        ("name", "Plan name", gen.subschema_for::<String>()),
-        (
-            "title",
-            "Optional title",
-            gen.subschema_for::<Option<String>>()
-        ),
-        (
-            "summary",
-            "Optional summary",
-            gen.subschema_for::<Option<String>>()
-        ),
-        (
-            "author",
-            "Optional author",
-            gen.subschema_for::<Option<String>>()
-        ),
-        (
-            "assignee",
-            "Optional assignee",
-            gen.subschema_for::<Option<String>>()
-        ),
-        (
-            "executor",
-            "Optional executor",
-            gen.subschema_for::<Option<String>>()
-        ),
-        (
-            "git_branch",
-            "Optional git branch",
-            gen.subschema_for::<Option<String>>()
-        ),
-        (
-            "github_owner_repo",
-            "Optional owner/repo",
-            gen.subschema_for::<Option<String>>()
-        ),
-        (
-            "body",
-            "Optional markdown body",
-            gen.subschema_for::<Option<String>>()
-        ),
-    ],
+    |gen: &mut SchemaGenerator| {
+        vec![
+            ("name", "Plan name", gen.subschema_for::<String>()),
+            (
+                "title",
+                "Optional title",
+                gen.subschema_for::<Option<String>>(),
+            ),
+            (
+                "summary",
+                "Optional summary",
+                gen.subschema_for::<Option<String>>(),
+            ),
+            (
+                "author",
+                "Optional author",
+                gen.subschema_for::<Option<String>>(),
+            ),
+            (
+                "assignee",
+                "Optional assignee",
+                gen.subschema_for::<Option<String>>(),
+            ),
+            (
+                "executor",
+                "Optional executor",
+                gen.subschema_for::<Option<String>>(),
+            ),
+            (
+                "git_branch",
+                "Optional git branch",
+                gen.subschema_for::<Option<String>>(),
+            ),
+            (
+                "github_owner_repo",
+                "Optional owner/repo",
+                gen.subschema_for::<Option<String>>(),
+            ),
+            (
+                "parent_issue",
+                "Originating GitHub issue number for sub-issue nesting. Plan creation only.",
+                gen.subschema_for::<Option<u64>>(),
+            ),
+            (
+                "body",
+                "Optional markdown body",
+                gen.subschema_for::<Option<String>>(),
+            ),
+            (
+                "content",
+                "Plan body markdown; alias for replacing the full body",
+                gen.subschema_for::<Option<String>>(),
+            ),
+        ]
+    },
     &["name"]
 );
 
@@ -597,6 +634,11 @@ impl_json_schema!(
     |gen: &mut SchemaGenerator| {
         vec![
         ("name", "Plan name", gen.subschema_for::<String>()),
+        (
+            "content",
+            "Replace entire plan body with this content. Keep under 1000 words.",
+            gen.subschema_for::<Option<String>>()
+        ),
         (
             "replace_content",
             "Replace entire plan body with this content. Keep under 1000 words.",
@@ -646,6 +688,11 @@ impl_json_schema!(
             "github_owner_repo",
             "Optional owner/repo",
             gen.subschema_for::<Option<String>>()
+        ),
+        (
+            "parent_issue",
+            "Originating GitHub issue number for sub-issue nesting. Plan creation only.",
+            gen.subschema_for::<Option<u64>>()
         ),
         (
             "tasks",

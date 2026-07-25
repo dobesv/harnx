@@ -1,6 +1,7 @@
 use super::*;
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListTasksParams {
     #[serde(default)]
     pub owner: Option<String>,
@@ -13,7 +14,8 @@ pub struct ListTasksParams {
     pub tag: Option<String>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GetTaskParams {
     #[serde(default)]
     pub owner: Option<String>,
@@ -23,7 +25,8 @@ pub struct GetTaskParams {
     pub id: String,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddTaskParams {
     #[serde(default)]
     pub owner: Option<String>,
@@ -51,7 +54,8 @@ pub struct AddTaskParams {
     pub dependencies: Vec<String>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateTaskParams {
     #[serde(default)]
     pub owner: Option<String>,
@@ -83,7 +87,8 @@ pub struct UpdateTaskParams {
     pub dependencies: Option<Vec<String>>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplaceInContent {
     pub old_text: String,
     pub new_text: String,
@@ -91,7 +96,8 @@ pub struct ReplaceInContent {
     pub replace_all: Option<bool>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteTaskParams {
     #[serde(default)]
     pub owner: Option<String>,
@@ -101,7 +107,8 @@ pub struct DeleteTaskParams {
     pub id: String,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListPlansParams {
     #[serde(default)]
     pub owner: Option<String>,
@@ -109,7 +116,8 @@ pub struct ListPlansParams {
     pub repo: Option<String>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddPlanParams {
     #[serde(default)]
     pub owner: Option<String>,
@@ -131,12 +139,17 @@ pub struct AddPlanParams {
     #[serde(default)]
     pub github_owner_repo: Option<String>,
     #[serde(default)]
+    pub parent_issue: Option<u64>,
+    #[serde(default)]
     pub body: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
     #[serde(default)]
     pub tasks: Option<Vec<TaskSpec>>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GetPlanParams {
     #[serde(default)]
     pub owner: Option<String>,
@@ -145,13 +158,16 @@ pub struct GetPlanParams {
     pub name: String,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdatePlanParams {
     #[serde(default)]
     pub owner: Option<String>,
     #[serde(default)]
     pub repo: Option<String>,
     pub name: String,
+    #[serde(default)]
+    pub content: Option<String>,
     #[serde(default)]
     pub replace_content: Option<String>,
     #[serde(default)]
@@ -173,10 +189,13 @@ pub struct UpdatePlanParams {
     #[serde(default)]
     pub github_owner_repo: Option<String>,
     #[serde(default)]
+    pub parent_issue: Option<u64>,
+    #[serde(default)]
     pub tasks: Option<Vec<TaskSpec>>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeletePlanParams {
     #[serde(default)]
     pub owner: Option<String>,
@@ -185,7 +204,8 @@ pub struct DeletePlanParams {
     pub name: String,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListNotesParams {
     #[serde(default)]
     pub owner: Option<String>,
@@ -194,7 +214,8 @@ pub struct ListNotesParams {
     pub plan: String,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddNoteParams {
     #[serde(default)]
     pub owner: Option<String>,
@@ -210,7 +231,8 @@ pub struct AddNoteParams {
     pub author: Option<String>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GetNoteParams {
     #[serde(default)]
     pub owner: Option<String>,
@@ -220,7 +242,8 @@ pub struct GetNoteParams {
     pub note_id: String,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteNoteParams {
     #[serde(default)]
     pub owner: Option<String>,
@@ -230,7 +253,8 @@ pub struct DeleteNoteParams {
     pub note_id: String,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateNoteParams {
     #[serde(default)]
     pub owner: Option<String>,
@@ -250,7 +274,8 @@ pub struct UpdateNoteParams {
     pub replace_in_body: Option<ReplaceInContent>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskSpec {
     pub title: String,
     #[serde(default)]
@@ -467,54 +492,66 @@ impl_json_schema!(
 impl_json_schema!(
     AddPlanParams,
     "AddPlanParams",
-    |generator: &mut SchemaGenerator| vec![
-        ("name", "Plan name", generator.subschema_for::<String>()),
-        (
-            "title",
-            "Optional plan title",
-            generator.subschema_for::<Option<String>>()
-        ),
-        (
-            "summary",
-            "Optional plan summary",
-            generator.subschema_for::<Option<String>>()
-        ),
-        (
-            "author",
-            "Optional plan author",
-            generator.subschema_for::<Option<String>>()
-        ),
-        (
-            "assignee",
-            "Optional plan assignee",
-            generator.subschema_for::<Option<String>>()
-        ),
-        (
-            "executor",
-            "Optional plan executor",
-            generator.subschema_for::<Option<String>>()
-        ),
-        (
-            "git_branch",
-            "Optional git branch name",
-            generator.subschema_for::<Option<String>>()
-        ),
-        (
-            "github_owner_repo",
-            "Optional GitHub owner/repo string",
-            generator.subschema_for::<Option<String>>()
-        ),
-        (
-            "body",
-            "Plan body markdown",
-            generator.subschema_for::<Option<String>>()
-        ),
-        (
-            "tasks",
-            "Optional list of tasks to create with plan",
-            generator.subschema_for::<Option<Vec<TaskSpec>>>()
-        ),
-    ],
+    |generator: &mut SchemaGenerator| {
+        vec![
+            ("name", "Plan name", generator.subschema_for::<String>()),
+            (
+                "title",
+                "Optional plan title",
+                generator.subschema_for::<Option<String>>(),
+            ),
+            (
+                "summary",
+                "Optional plan summary",
+                generator.subschema_for::<Option<String>>(),
+            ),
+            (
+                "author",
+                "Optional plan author",
+                generator.subschema_for::<Option<String>>(),
+            ),
+            (
+                "assignee",
+                "Optional plan assignee",
+                generator.subschema_for::<Option<String>>(),
+            ),
+            (
+                "executor",
+                "Optional plan executor",
+                generator.subschema_for::<Option<String>>(),
+            ),
+            (
+                "git_branch",
+                "Optional git branch name",
+                generator.subschema_for::<Option<String>>(),
+            ),
+            (
+                "github_owner_repo",
+                "Optional GitHub owner/repo string",
+                generator.subschema_for::<Option<String>>(),
+            ),
+            (
+                "parent_issue",
+                "Originating GitHub issue number for sub-issue nesting. Plan creation only.",
+                generator.subschema_for::<Option<u64>>(),
+            ),
+            (
+                "body",
+                "Plan body markdown",
+                generator.subschema_for::<Option<String>>(),
+            ),
+            (
+                "content",
+                "Plan body markdown; alias for replacing the full body",
+                generator.subschema_for::<Option<String>>(),
+            ),
+            (
+                "tasks",
+                "Optional list of tasks to create with plan",
+                generator.subschema_for::<Option<Vec<TaskSpec>>>(),
+            ),
+        ]
+    },
     &["name"]
 );
 
@@ -533,6 +570,11 @@ impl_json_schema!(
     |generator: &mut SchemaGenerator| {
         vec![
             ("name", "Plan name", generator.subschema_for::<String>()),
+            (
+                "content",
+                "Replace entire plan body with this content. Keep under 1000 words.",
+                generator.subschema_for::<Option<String>>()
+            ),
             (
                 "replace_content",
                 "Replace entire plan body with this content. Keep under 1000 words.",
@@ -582,6 +624,11 @@ impl_json_schema!(
                 "github_owner_repo",
                 "Optional GitHub owner/repo string",
                 generator.subschema_for::<Option<String>>()
+            ),
+            (
+                "parent_issue",
+                "Originating GitHub issue number for sub-issue nesting. Plan creation only.",
+                generator.subschema_for::<Option<u64>>()
             ),
             (
                 "tasks",
@@ -750,3 +797,65 @@ impl_json_schema!(
     ],
     &["title"]
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_content_params_round_trip_and_appear_in_schemas() {
+        let add: AddPlanParams = serde_json::from_value(json!({
+            "owner": "acme", "repo": "roadmap", "name": "release",
+            "content": "# Release plan", "tasks": [{ "title": "Ship" }]
+        }))
+        .unwrap();
+        let add_json = serde_json::to_value(&add).unwrap();
+        assert_eq!(add_json["content"], "# Release plan");
+        assert_eq!(add_json["owner"], "acme");
+        assert_eq!(add_json["tasks"][0]["title"], "Ship");
+
+        let update: UpdatePlanParams = serde_json::from_value(json!({
+            "owner": "acme", "repo": "roadmap", "name": "release",
+            "content": "# Revised plan"
+        }))
+        .unwrap();
+        let update_json = serde_json::to_value(&update).unwrap();
+        assert_eq!(update_json["content"], "# Revised plan");
+        assert_eq!(update_json["repo"], "roadmap");
+
+        for schema in [
+            AddPlanParams::json_schema(&mut SchemaGenerator::default()),
+            UpdatePlanParams::json_schema(&mut SchemaGenerator::default()),
+        ] {
+            let schema = schema.as_value();
+            assert!(schema["properties"]["content"].is_object());
+            assert_eq!(schema["additionalProperties"], false);
+        }
+    }
+
+    #[test]
+    fn unknown_plan_task_and_note_fields_are_rejected() {
+        let errors = [
+            serde_json::from_value::<AddPlanParams>(json!({"name": "plan", "bogus": "x"}))
+                .unwrap_err(),
+            serde_json::from_value::<AddTaskParams>(
+                json!({"plan": "plan", "title": "task", "bogus": "x"}),
+            )
+            .unwrap_err(),
+            serde_json::from_value::<AddNoteParams>(
+                json!({"plan": "plan", "body": "note", "bogus": "x"}),
+            )
+            .unwrap_err(),
+        ];
+        for error in errors {
+            assert!(error.to_string().contains("unknown field `bogus`"));
+        }
+    }
+
+    #[test]
+    fn handler_argument_parser_rejects_unknown_fields() {
+        let arguments = json!({ "name": "plan", "bogus": "x" }).as_object().cloned();
+        let error = parse_arguments::<UpdatePlanParams>(arguments).unwrap_err();
+        assert!(error.message.contains("unknown field `bogus`"));
+    }
+}

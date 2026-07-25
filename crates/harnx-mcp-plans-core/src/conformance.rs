@@ -10,8 +10,16 @@
 //!
 //! `add_plan`, `add_task`, and `add_note` return canonical backend IDs. Client-provided
 //! IDs in `NewPlan.id`, `NewTask.id`, and `NewNote.id` are advisory: backends may preserve
-//! them verbatim or replace them with server-assigned canonical IDs. All follow-up CRUD
-//! operations must use returned canonical ID.
+//! them verbatim or replace them with server-assigned canonical IDs. Follow-up CRUD
+//! operations should prefer the returned canonical ID.
+//!
+//! ### Plans Are Also Addressable by Client-Provided ID
+//!
+//! Plan operations MUST accept the client-provided `NewPlan.id` in place of the
+//! canonical ID, because MCP callers name plans rather than numbering them. Backends
+//! that canonicalize IDs are responsible for resolving the client ID back to the plan
+//! (the GitHub backend scans plan issues for matching `client_id` front-matter).
+//! Duplicates resolve the same way reads do: most recently updated wins.
 //!
 //! ### Duplicate ID Resolution (Read-Side Deduplication)
 //!
@@ -205,6 +213,27 @@ async fn collect_all_tasks<S: PlanStore>(store: &Arc<S>, plan_id: &str) -> Vec<T
     items
 }
 
+/// Assert plan operations accept the client-provided ID, not only the canonical one.
+async fn assert_client_id_addresses_plan<S: PlanStore>(
+    store: &Arc<S>,
+    canonical_id: &str,
+    client_id: &str,
+) {
+    let target = crate::model::Target::Local;
+    let fetched = store
+        .get_plan(&target, &client_id.to_string())
+        .await
+        .expect("get_plan by client-provided ID should succeed");
+    assert_eq!(
+        fetched.id, canonical_id,
+        "client-provided ID must resolve to the same plan as the canonical ID"
+    );
+    store
+        .read_plan_body(&target, &client_id.to_string())
+        .await
+        .expect("read_plan_body by client-provided ID should succeed");
+}
+
 async fn test_plan_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities) {
     let plan1 = store
         .add_plan(
@@ -212,12 +241,7 @@ async fn test_plan_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
             NewPlan {
                 id: "auto-gen-test-plan".to_string(),
                 title: Some("Auto-generated ID plan".to_string()),
-                summary: None,
-                author: None,
-                assignee: None,
-                executor: None,
-                git_branch: None,
-                github_owner_repo: None,
+                ..NewPlan::default()
             },
         )
         .await
@@ -234,10 +258,7 @@ async fn test_plan_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
                 title: Some("Custom ID plan".to_string()),
                 summary: Some("Plan summary".to_string()),
                 author: Some("hestia".to_string()),
-                assignee: None,
-                executor: None,
-                git_branch: None,
-                github_owner_repo: None,
+                ..NewPlan::default()
             },
         )
         .await
@@ -252,13 +273,7 @@ async fn test_plan_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
         .expect("get_plan should succeed");
     assert_eq!(fetched.id, plan2.id);
     assert_eq!(fetched.title, plan2.title);
-    if caps.preserves_client_id {
-        let fetched_by_client_id = store
-            .get_plan(&crate::model::Target::Local, &client_id.to_string())
-            .await
-            .expect("get_plan by client-provided ID should succeed when IDs are preserved");
-        assert_eq!(fetched_by_client_id.id, client_id);
-    }
+    assert_client_id_addresses_plan(store, &plan2.id, client_id).await;
 
     let updated = store
         .update_plan_meta(
@@ -266,12 +281,8 @@ async fn test_plan_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
             &plan2.id,
             PlanMetaUpdate {
                 title: Some("Updated title".to_string()),
-                summary: None,
-                author: None,
                 assignee: Some("atlas".to_string()),
-                executor: None,
-                git_branch: None,
-                github_owner_repo: None,
+                ..PlanMetaUpdate::default()
             },
         )
         .await
@@ -317,12 +328,7 @@ async fn test_plan_list_pagination<S: PlanStore>(store: &Arc<S>) {
                 NewPlan {
                     id: id.clone(),
                     title: Some(format!("Plan {}", id)),
-                    summary: None,
-                    author: None,
-                    assignee: None,
-                    executor: None,
-                    git_branch: None,
-                    github_owner_repo: None,
+                    ..NewPlan::default()
                 },
             )
             .await
@@ -415,13 +421,7 @@ async fn test_task_crud<S: PlanStore>(store: &Arc<S>, caps: BackendCapabilities)
             NewTask {
                 id: "auto-gen-test-task".to_string(),
                 title: "Auto-task".to_string(),
-                summary: None,
-                author: None,
-                assignee: None,
-                executor: None,
-                tags: vec![],
-                status: None,
-                dependencies: vec![],
+                ..NewTask::default()
             },
         )
         .await

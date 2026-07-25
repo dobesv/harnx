@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use super::*;
 
-async fn create_test_store(server: &MockServer) -> GitHubPlanStore {
+pub(super) async fn create_test_store(server: &MockServer) -> GitHubPlanStore {
     let config = AuthConfig {
         base_url: server.uri(),
         source: AuthSource::PersonalAccessToken("test-token".to_string()),
@@ -62,7 +62,7 @@ async fn create_test_store_with_config(
     GitHubPlanStore::with_config(factory, config)
 }
 
-fn target(owner: &str, repo: &str) -> harnx_mcp_plans_core::Target {
+pub(super) fn target(owner: &str, repo: &str) -> harnx_mcp_plans_core::Target {
     harnx_mcp_plans_core::Target::GitHub(harnx_mcp_plans_core::RepoTarget {
         owner: owner.to_string(),
         repo: repo.to_string(),

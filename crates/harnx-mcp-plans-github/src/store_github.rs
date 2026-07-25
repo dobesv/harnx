@@ -9,6 +9,11 @@
 //! - Plan/Task IDs = stringified GitHub issue numbers
 //! - Note IDs = stringified GitHub comment IDs
 //!
+//! Plans are also addressable by the client-provided name recorded in `client_id`
+//! front-matter, because MCP callers name plans instead of numbering them. A
+//! numeric plan ID is read as an issue number; anything else is resolved by
+//! scanning the plan-labelled issues for a matching `client_id`.
+//!
 //! ## De-duplication
 //! Multiple issues/comments can share the same client-provided ID (stored in front-matter).
 //! Read operations resolve duplicates by keeping the most recently `updated_at` entry.
@@ -40,6 +45,8 @@ use crate::codec::{
     new_task_to_issue, note_meta_update_to_comment_body, plan_meta_update_to_issue_body,
     task_meta_update_to_issue_body, DecodedNote, DecodedPlan, DecodedTask,
 };
+use crate::ratelimit::GitHubApiError;
+use reqwest::StatusCode;
 
 /// Maximum number of sub-issues allowed per parent issue.
 const MAX_SUB_ISSUES: usize = 100;
@@ -111,11 +118,6 @@ impl GitHubPlanStore {
 
     pub fn config_ref(&self) -> &GitHubStoreConfig {
         &self.config
-    }
-
-    /// Parse a Plan ID (string) to an issue number (u64).
-    fn parse_plan_id(plan_id: &PlanId) -> Result<u64, StoreError> {
-        plan_id.parse::<u64>().map_err(|_| StoreError::NotFound)
     }
 
     /// Parse a Task ID (string) to an issue number (u64).
@@ -382,7 +384,7 @@ impl GitHubPlanStore {
         plan: &PlanId,
         task: &TaskId,
     ) -> Result<u64, StoreError> {
-        let plan_number = Self::parse_plan_id(plan)?;
+        let plan_number = self.resolve_plan_number(client, plan).await?;
         self.ensure_issue_is_plan(client, plan_number).await?;
         let task_number = Self::parse_task_id(task)?;
 
@@ -402,7 +404,7 @@ impl GitHubPlanStore {
         plan: &PlanId,
         note: &NoteId,
     ) -> Result<crate::client::IssueComment, StoreError> {
-        let plan_number = Self::parse_plan_id(plan)?;
+        let plan_number = self.resolve_plan_number(client, plan).await?;
         self.ensure_issue_is_plan(client, plan_number).await?;
         let comment_id = Self::parse_note_id(note)?;
         let comment = client
@@ -427,16 +429,13 @@ fn parse_github_timestamp(s: &str) -> Result<Timestamp, StoreError> {
         .map_err(|e| StoreError::Backend(anyhow!("failed to parse timestamp '{}': {}", s, e)))
 }
 
-fn is_label_validation_error(err: &StoreError) -> bool {
-    match err {
-        StoreError::InvalidParams(message) => {
-            let message = message.to_lowercase();
-            message.contains("422")
-                || message.contains("validation")
-                || message.contains("unprocessable entity")
-        }
-        _ => false,
-    }
+/// True when GitHub rejected the request because of the label specifically.
+///
+/// Only a validation failure that names a label qualifies: any other 422 (a blank
+/// title, say) is the caller's problem and retrying without the label just repeats it.
+fn is_label_validation_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<GitHubApiError>()
+        .is_some_and(|api| api.status == StatusCode::UNPROCESSABLE_ENTITY && api.mentions_label())
 }
 
 async fn ensure_plan_label_warning_only(client: &GitHubClient, label: &str) {
@@ -452,17 +451,67 @@ async fn ensure_plan_label_warning_only(client: &GitHubClient, label: &str) {
     }
 }
 
-/// Map GitHub client errors to StoreError.
-fn map_github_error(e: anyhow::Error) -> StoreError {
-    let err_str = e.to_string().to_lowercase();
+async fn nest_plan_warning_only(
+    client: &GitHubClient,
+    parent_issue: Option<u64>,
+    issue_number: u64,
+    issue_id: u64,
+) {
+    let Some(parent_issue) = parent_issue else {
+        return;
+    };
+    if let Err(err) = client.add_sub_issue(parent_issue, issue_id).await {
+        eprintln!(
+            "[github] warning: could not nest plan issue #{} under originating issue #{}: {}",
+            issue_number, parent_issue, err
+        );
+    }
+}
 
+/// Retry hint used for rate-limit responses the executor did not already wait out.
+const RATE_LIMIT_RETRY_SECS: u64 = 30;
+
+/// Map GitHub client errors to StoreError.
+///
+/// API failures are classified by HTTP status; the response body they now carry must
+/// not sway the classification (a 422 whose body says "not found" is still a 422).
+/// Everything else — transport, decode — falls back to matching the message text.
+fn map_github_error(e: anyhow::Error) -> StoreError {
+    match e.downcast_ref::<GitHubApiError>() {
+        Some(api) => api_error_to_store_error(api.status, api.mentions_rate_limit(), e),
+        None => message_to_store_error(e),
+    }
+}
+
+fn api_error_to_store_error(
+    status: StatusCode,
+    mentions_rate_limit: bool,
+    e: anyhow::Error,
+) -> StoreError {
+    match status {
+        StatusCode::NOT_FOUND => StoreError::NotFound,
+        StatusCode::TOO_MANY_REQUESTS => StoreError::RateLimited {
+            retry_after_secs: RATE_LIMIT_RETRY_SECS,
+        },
+        StatusCode::FORBIDDEN if mentions_rate_limit => StoreError::RateLimited {
+            retry_after_secs: RATE_LIMIT_RETRY_SECS,
+        },
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            StoreError::InvalidParams(e.to_string())
+        }
+        _ => StoreError::Backend(e),
+    }
+}
+
+fn message_to_store_error(e: anyhow::Error) -> StoreError {
+    let err_str = e.to_string().to_lowercase();
     if err_str.contains("404") || err_str.contains("not found") {
         StoreError::NotFound
     } else if err_str.contains("422") || err_str.contains("validation") {
         StoreError::InvalidParams(e.to_string())
     } else if err_str.contains("rate limit") {
         StoreError::RateLimited {
-            retry_after_secs: 30,
+            retry_after_secs: RATE_LIMIT_RETRY_SECS,
         }
     } else {
         StoreError::Backend(e)
@@ -530,7 +579,7 @@ impl PlanStore for GitHubPlanStore {
 
     async fn get_plan(&self, target: &Target, plan: &PlanId) -> Result<Plan, StoreError> {
         let client = self.client_for_store_target(target)?;
-        let issue_number = Self::parse_plan_id(plan)?;
+        let issue_number = self.resolve_plan_number(&client, plan).await?;
         let issue = self.ensure_issue_is_plan(&client, issue_number).await?;
 
         let decoded = Self::decode_issue_to_plan(issue)?;
@@ -551,11 +600,7 @@ impl PlanStore for GitHubPlanStore {
             body: Some(body.clone()),
             labels: vec![self.config.plan_label.clone()],
         };
-        let issue = match client
-            .create_issue(create_with_label)
-            .await
-            .map_err(map_github_error)
-        {
+        let issue = match client.create_issue(create_with_label).await {
             Ok(issue) => issue,
             Err(err) if is_label_validation_error(&err) => {
                 eprintln!(
@@ -571,8 +616,10 @@ impl PlanStore for GitHubPlanStore {
                     .await
                     .map_err(map_github_error)?
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(map_github_error(err)),
         };
+
+        nest_plan_warning_only(&client, new_plan.parent_issue, issue.number, issue.id).await;
 
         Ok(Plan {
             id: issue.number.to_string(),
@@ -595,7 +642,7 @@ impl PlanStore for GitHubPlanStore {
         update: PlanMetaUpdate,
     ) -> Result<Plan, StoreError> {
         let client = self.client_for_store_target(target)?;
-        let issue_number = Self::parse_plan_id(plan)?;
+        let issue_number = self.resolve_plan_number(&client, plan).await?;
         let issue = self.ensure_issue_is_plan(&client, issue_number).await?;
         let decoded = Self::decode_issue_to_plan(issue)?;
 
@@ -620,7 +667,7 @@ impl PlanStore for GitHubPlanStore {
     async fn delete_plan(&self, target: &Target, plan: &PlanId) -> Result<(), StoreError> {
         let client = self.client_for_store_target(target)?;
         if self.config.delete_is_close {
-            let issue_number = Self::parse_plan_id(plan)?;
+            let issue_number = self.resolve_plan_number(&client, plan).await?;
             self.ensure_issue_is_plan(&client, issue_number).await?;
             client
                 .close_issue(issue_number)
@@ -636,7 +683,7 @@ impl PlanStore for GitHubPlanStore {
 
     async fn read_plan_body(&self, target: &Target, plan: &PlanId) -> Result<String, StoreError> {
         let client = self.client_for_store_target(target)?;
-        let issue_number = Self::parse_plan_id(plan)?;
+        let issue_number = self.resolve_plan_number(&client, plan).await?;
         let issue = self.ensure_issue_is_plan(&client, issue_number).await?;
         let decoded = Self::decode_issue_to_plan(issue)?;
         Ok(decoded.body)
@@ -649,7 +696,7 @@ impl PlanStore for GitHubPlanStore {
         body: &str,
     ) -> Result<(), StoreError> {
         let client = self.client_for_store_target(target)?;
-        let issue_number = Self::parse_plan_id(plan)?;
+        let issue_number = self.resolve_plan_number(&client, plan).await?;
         let issue = self.ensure_issue_is_plan(&client, issue_number).await?;
         let decoded = Self::decode_issue_to_plan(issue)?;
 
@@ -686,7 +733,7 @@ impl PlanStore for GitHubPlanStore {
         page: Option<PageToken>,
     ) -> Result<Page<Task>, StoreError> {
         let client = self.client_for_store_target(target)?;
-        let plan_number = Self::parse_plan_id(plan)?;
+        let plan_number = self.resolve_plan_number(&client, plan).await?;
 
         let gh_page = match page {
             Some(token) => client.list_sub_issues_next(&token.0).await,
@@ -760,7 +807,7 @@ impl PlanStore for GitHubPlanStore {
         new_task: NewTask,
     ) -> Result<Task, StoreError> {
         let client = self.client_for_store_target(target)?;
-        let plan_number = Self::parse_plan_id(plan)?;
+        let plan_number = self.resolve_plan_number(&client, plan).await?;
 
         self.ensure_issue_is_plan(&client, plan_number).await?;
         let current_sub_count = self.count_sub_issues(&client, plan_number).await?;
@@ -933,7 +980,7 @@ impl PlanStore for GitHubPlanStore {
         page: Option<PageToken>,
     ) -> Result<Page<Note>, StoreError> {
         let client = self.client_for_store_target(target)?;
-        let plan_number = Self::parse_plan_id(plan)?;
+        let plan_number = self.resolve_plan_number(&client, plan).await?;
 
         let gh_page = match page {
             Some(token) => client.list_comments_next(&token.0).await,
@@ -976,7 +1023,7 @@ impl PlanStore for GitHubPlanStore {
         new_note: NewNote,
     ) -> Result<Note, StoreError> {
         let client = self.client_for_store_target(target)?;
-        let plan_number = Self::parse_plan_id(plan)?;
+        let plan_number = self.resolve_plan_number(&client, plan).await?;
 
         let body = new_note_to_comment(&new_note, "");
 
@@ -1083,5 +1130,9 @@ impl PlanStore for GitHubPlanStore {
     }
 }
 
+mod plan_lookup;
+
+#[cfg(test)]
+mod plan_name_tests;
 #[cfg(test)]
 mod tests;
