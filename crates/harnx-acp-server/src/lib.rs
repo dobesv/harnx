@@ -86,7 +86,7 @@ struct AcpChunkSink {
 }
 
 impl harnx_core::event::AgentEventSink for AcpChunkSink {
-    fn emit(&self, event: AgentEvent, source: Option<AgentSource>) {
+    fn emit(&self, event: AgentEvent) {
         // Source headings are NOT injected into the chunk stream here.
         // Sending `> agent ▸ session` as an `AgentMessageChunk` would
         // pollute the parent's accumulated `response_text` (which forms
@@ -94,7 +94,7 @@ impl harnx_core::event::AgentEventSink for AcpChunkSink {
         // notification`). The parent's UI reconstructs source from the
         // chunk's `meta` (set by `send_notify_text` /
         // `send_notify_tool_call`) and renders the heading itself.
-        if let Some(forward) = event_to_forward(event, source) {
+        if let Some(forward) = event_to_forward(event, None) {
             let _ = self.tx.send(forward);
         }
     }
@@ -176,6 +176,10 @@ pub(crate) fn event_to_forward(
             };
             forwarded.map(|(prefix, msg)| AcpForward::Text(format!("{prefix} {msg}"), source))
         }
+        AgentEvent::SubAgent {
+            source: sub_source,
+            event,
+        } => event_to_forward(*event, Some(sub_source)),
         _ => None,
     }
 }

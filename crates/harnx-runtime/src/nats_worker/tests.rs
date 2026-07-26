@@ -16,7 +16,7 @@ use anyhow::{bail, Context};
 use futures_util::StreamExt;
 use harnx_core::agent_config::AgentConfig;
 use harnx_core::config_data::ConfigData;
-use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, SessionEvent};
+use harnx_core::event::{AgentEvent, AgentEventSink, SessionEvent};
 use harnx_core::session::{SessionLogEntry, ToolOutput};
 use harnx_core::session_reconstruct::{
     active_context_window, reconstruct_state_from_nats, TurnStatus,
@@ -786,7 +786,7 @@ async fn control_log_append_requires_live_lease() {
 struct NoopEventSink;
 
 impl AgentEventSink for NoopEventSink {
-    fn emit(&self, _event: AgentEvent, _source: Option<AgentSource>) {}
+    fn emit(&self, _event: AgentEvent) {}
 }
 
 #[derive(Default)]
@@ -801,7 +801,7 @@ impl RecordingEventSink {
 }
 
 impl AgentEventSink for RecordingEventSink {
-    fn emit(&self, event: AgentEvent, _source: Option<AgentSource>) {
+    fn emit(&self, event: AgentEvent) {
         self.events.lock().unwrap().push(event);
     }
 }

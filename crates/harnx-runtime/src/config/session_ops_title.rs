@@ -597,7 +597,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, NoticeEvent, SessionEvent};
+    use harnx_core::event::{AgentEvent, AgentEventSink, NoticeEvent, SessionEvent};
     use harnx_core::message::{Message, MessageContent};
     use harnx_core::session::Session;
     use std::sync::Mutex;
@@ -725,7 +725,7 @@ mod tests {
     }
 
     impl AgentEventSink for CollectingSink {
-        fn emit(&self, event: AgentEvent, _source: Option<AgentSource>) {
+        fn emit(&self, event: AgentEvent) {
             self.events.lock().unwrap().push(event);
         }
     }

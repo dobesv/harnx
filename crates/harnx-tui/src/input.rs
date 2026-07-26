@@ -807,8 +807,8 @@ impl Tui {
 
     async fn handle_tui_event_inner(&mut self, event: TuiEvent) -> Result<()> {
         match event {
-            TuiEvent::Agent(event, source) => {
-                self.render_agent_event(event, source).await;
+            TuiEvent::Agent(event) => {
+                self.render_agent_event(event).await;
             }
             TuiEvent::ToolRoundComplete => {
                 // Intermediate tool round — prompt loop continues, don't clear llm_busy.
@@ -957,11 +957,15 @@ impl Tui {
         self.flush_pending_thought();
     }
 
-    async fn render_agent_event(&mut self, event: AgentEvent, source: Option<AgentSource>) {
+    async fn render_agent_event(&mut self, event: AgentEvent) {
         use harnx_core::event::{
             ModelEvent, NoticeEvent, SessionEvent, ToolEvent, TurnEvent, UserEvent,
         };
 
+        let (source, event, is_sub_agent) = match event {
+            AgentEvent::SubAgent { source, event } => (Some(source), *event, true),
+            event => (None, event, false),
+        };
         let is_thought = matches!(&event, AgentEvent::Model(ModelEvent::ThoughtChunk { .. }));
         let is_usage = matches!(&event, AgentEvent::Model(ModelEvent::Usage { .. }));
         // No streaming-run bookkeeping is needed here: any event that renders a
@@ -1093,126 +1097,21 @@ impl Tui {
                     vec![]
                 }
             }
+            AgentEvent::SubAgent { .. } => unreachable!("sub-agent event flattened above"),
             AgentEvent::Model(ModelEvent::Final { output, usage }) => {
-                self.flush_pending_thought();
-                self.app.llm_busy = false;
-                self.active_remote_session = None;
-                // The task that emitted Final has signalled it is exiting.
-                // Drop our reference to its abort signal — the next Ctrl+C
-                // should not target a task that's already gone. We keep
-                // the JoinHandle until the next `start_prompt` so the
-                // drain step has something to await on (already-completed
-                // handles resolve immediately).
-                self.current_prompt_abort = None;
-                // Defensive cleanup of the pending-message channel: the
-                // normal mid-tool-round consumption already clears it,
-                // but a text-only response path leaves it set, where it
-                // would otherwise leak into the NEXT prompt task and be
-                // re-injected as a duplicate user message.
-                *self.shared_pending_message.lock().await = None;
-                self.app.last_ui_output_source = None;
-                let usage_str = format_usage(&usage);
-                if !output.is_empty() {
-                    if self.app.streamed_text_this_turn {
-                        // We streamed this turn, so the streamed run is the
-                        // trailing block of AssistantText items. Replace it
-                        // with the model's canonical final `output` (collapsing
-                        // any trailing run to a single block) so streamed text
-                        // is never duplicated by the final message.
-                        let tail_start = self
-                            .app
-                            .transcript
-                            .iter()
-                            .rposition(|item| !matches!(item, TranscriptItem::AssistantText { .. }))
-                            .map_or(0, |idx| idx + 1);
-
-                        if tail_start < self.app.transcript.len() {
-                            let mut tail = self.app.transcript.split_off(tail_start);
-                            if let Some(TranscriptItem::AssistantText {
-                                text,
-                                rendered_cache,
-                                ..
-                            }) = tail.first_mut()
-                            {
-                                *text = output;
-                                *rendered_cache = None;
-                            }
-                            tail.truncate(1);
-                            self.app.transcript.extend(tail);
-                        } else {
-                            self.app.transcript.push(TranscriptItem::AssistantText {
-                                text: output,
-                                seq: None,
-                                timestamp: Some(chrono::Utc::now()),
-                                rendered_cache: None,
-                            });
-                        }
-                    } else {
-                        // Nothing streamed this turn (non-streaming client, or
-                        // an empty stream): append the final text as a fresh
-                        // block.
-                        self.app.transcript.push(TranscriptItem::AssistantText {
-                            text: output,
-                            seq: None,
-                            timestamp: Some(chrono::Utc::now()),
-                            rendered_cache: None,
-                        });
-                    }
-                    self.pin_transcript_to_bottom();
-                }
-                self.app.streaming_open = false;
-                self.app.streamed_text_this_turn = false;
-                if !usage_str.is_empty() {
-                    self.app
-                        .transcript
-                        .push(TranscriptItem::SystemText(format!("Usage: {usage_str}")));
-                    self.pin_transcript_to_bottom();
-                }
-                self.refresh_input_chrome();
-
-                if let Some(pending) = self.app.pending_message.take() {
-                    if let Err(err) = self.submit_pending_message(pending).await {
-                        self.app
-                            .transcript
-                            .push(TranscriptItem::ErrorText(pretty_error_string(&err)));
-                        self.pin_transcript_to_bottom();
-                    }
+                if is_sub_agent {
+                    self.render_sub_agent_final(output, &usage);
+                } else {
+                    self.finish_main_prompt_final(output, &usage).await;
                 }
                 vec![]
             }
             AgentEvent::Model(ModelEvent::Error(err)) => {
-                self.flush_pending_thought();
-                self.app.llm_busy = false;
-                self.active_remote_session = None;
-                // Mirrors the Final cleanup: drop the per-task abort
-                // signal (task has exited) and clear the shared pending
-                // channel so its content can't leak into the next task.
-                self.current_prompt_abort = None;
-                *self.shared_pending_message.lock().await = None;
-                self.app.streaming_open = false;
-                // Symmetric with the Final handler: reset the per-turn
-                // streamed-text flag so a streamed chunk before an error
-                // can't suppress a later turn's final text.
-                self.app.streamed_text_this_turn = false;
-                self.app.last_ui_output_source = None;
-                self.app.transcript.push(TranscriptItem::ErrorText(err));
-
-                // Do NOT auto-replay the pending message on error. Replaying the
-                // exact input that just failed would loop forever for persistent
-                // failures (invalid input, repeated network errors). Instead,
-                // restore it as an editable draft so the user can review/edit and
-                // resubmit it with Enter, breaking the retry loop (issue #199).
-                if let Some(pending) = self.app.pending_message.take() {
-                    self.set_input_text(&pending.text);
-                    self.app.attachments = pending.attachments;
-                    self.app.attachment_dir = pending.attachment_dir;
-                    self.app.paste_count = pending.paste_count;
-                    self.app.transcript.push(TranscriptItem::SystemText(
-                        "Queued message not sent due to error. Press Enter to retry.".to_string(),
-                    ));
+                if is_sub_agent {
+                    self.render_sub_agent_error(err);
+                } else {
+                    self.finish_main_prompt_error(err).await;
                 }
-                self.pin_transcript_to_bottom();
-                self.refresh_input_chrome();
                 vec![]
             }
             AgentEvent::Model(ModelEvent::ThoughtChunk { blocks }) => {
@@ -1371,6 +1270,147 @@ impl Tui {
         }
     }
 
+    async fn finish_main_prompt_final(
+        &mut self,
+        output: String,
+        usage: &harnx_core::api_types::CompletionTokenUsage,
+    ) {
+        self.flush_pending_thought();
+        self.app.llm_busy = false;
+        self.active_remote_session = None;
+        // Final means this task is exiting. Keep its completed JoinHandle for
+        // the next start_prompt drain, but drop the obsolete abort signal.
+        self.current_prompt_abort = None;
+        // Prevent a text-only response from leaking a queued message into the
+        // next prompt task as a duplicate user message.
+        *self.shared_pending_message.lock().await = None;
+        self.app.last_ui_output_source = None;
+        let usage_str = format_usage(usage);
+        if !output.is_empty() {
+            if self.app.streamed_text_this_turn {
+                // Replace the trailing streamed run with canonical final output.
+                let tail_start = self
+                    .app
+                    .transcript
+                    .iter()
+                    .rposition(|item| !matches!(item, TranscriptItem::AssistantText { .. }))
+                    .map_or(0, |idx| idx + 1);
+
+                if tail_start < self.app.transcript.len() {
+                    let mut tail = self.app.transcript.split_off(tail_start);
+                    if let Some(TranscriptItem::AssistantText {
+                        text,
+                        rendered_cache,
+                        ..
+                    }) = tail.first_mut()
+                    {
+                        *text = output;
+                        *rendered_cache = None;
+                    }
+                    tail.truncate(1);
+                    self.app.transcript.extend(tail);
+                } else {
+                    self.app.transcript.push(TranscriptItem::AssistantText {
+                        text: output,
+                        seq: None,
+                        timestamp: Some(chrono::Utc::now()),
+                        rendered_cache: None,
+                    });
+                }
+            } else {
+                self.app.transcript.push(TranscriptItem::AssistantText {
+                    text: output,
+                    seq: None,
+                    timestamp: Some(chrono::Utc::now()),
+                    rendered_cache: None,
+                });
+            }
+            self.pin_transcript_to_bottom();
+        }
+        self.app.streaming_open = false;
+        self.app.streamed_text_this_turn = false;
+        if !usage_str.is_empty() {
+            self.app
+                .transcript
+                .push(TranscriptItem::SystemText(format!("Usage: {usage_str}")));
+            self.pin_transcript_to_bottom();
+        }
+        self.refresh_input_chrome();
+
+        if let Some(pending) = self.app.pending_message.take() {
+            if let Err(err) = self.submit_pending_message(pending).await {
+                self.app
+                    .transcript
+                    .push(TranscriptItem::ErrorText(pretty_error_string(&err)));
+                self.pin_transcript_to_bottom();
+            }
+        }
+    }
+
+    async fn finish_main_prompt_error(&mut self, err: String) {
+        self.flush_pending_thought();
+        self.app.llm_busy = false;
+        self.active_remote_session = None;
+        self.current_prompt_abort = None;
+        *self.shared_pending_message.lock().await = None;
+        self.app.streaming_open = false;
+        self.app.streamed_text_this_turn = false;
+        self.app.last_ui_output_source = None;
+        self.app.transcript.push(TranscriptItem::ErrorText(err));
+
+        // Do not replay input that failed. Restore it as editable draft so user
+        // can change it before resubmitting, avoiding persistent retry loops.
+        if let Some(pending) = self.app.pending_message.take() {
+            self.set_input_text(&pending.text);
+            self.app.attachments = pending.attachments;
+            self.app.attachment_dir = pending.attachment_dir;
+            self.app.paste_count = pending.paste_count;
+            self.app.transcript.push(TranscriptItem::SystemText(
+                "Queued message not sent due to error. Press Enter to retry.".to_string(),
+            ));
+        }
+        self.pin_transcript_to_bottom();
+        self.refresh_input_chrome();
+    }
+
+    /// Render a nested sub-agent's final turn text under its source heading.
+    /// Deliberately touches no main-task state (busy flag, abort signal,
+    /// pending message): the tool call that delegated to the sub-agent is
+    /// still in flight, so the main prompt task is not done.
+    fn render_sub_agent_final(
+        &mut self,
+        output: String,
+        usage: &harnx_core::api_types::CompletionTokenUsage,
+    ) {
+        if !output.is_empty() {
+            self.app.transcript.push(TranscriptItem::AssistantText {
+                text: output,
+                seq: None,
+                timestamp: Some(chrono::Utc::now()),
+                rendered_cache: None,
+            });
+        }
+        // Close any open streaming run so a later chunk from the same source
+        // starts a fresh block instead of appending to this final text.
+        self.app.streaming_open = false;
+        let usage_str = format_usage(usage);
+        if !usage_str.is_empty() {
+            self.app
+                .transcript
+                .push(TranscriptItem::SystemText(format!("Usage: {usage_str}")));
+        }
+        self.pin_transcript_to_bottom();
+    }
+
+    /// Render a nested sub-agent's error. Like `render_sub_agent_final`,
+    /// this only surfaces the text — the main prompt task keeps running,
+    /// so busy state and the queued pending message stay untouched.
+    fn render_sub_agent_error(&mut self, err: String) {
+        self.app.transcript.push(TranscriptItem::ErrorText(err));
+        self.app.streaming_open = false;
+        self.pin_transcript_to_bottom();
+    }
+
     fn render_ui_output_heading(&mut self, source: Option<&AgentSource>, is_usage: bool) {
         let source = source.cloned();
         if source != self.app.last_ui_output_source {
@@ -1489,10 +1529,9 @@ impl Tui {
 
             if let Err(err) = result {
                 use harnx_core::event::{AgentEvent, ModelEvent};
-                let _ = event_tx.send(TuiEvent::Agent(
-                    AgentEvent::Model(ModelEvent::Error(pretty_error_string(&err))),
-                    None,
-                ));
+                let _ = event_tx.send(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Error(
+                    pretty_error_string(&err),
+                ))));
             }
         });
         self.current_prompt_handle = Some(handle);

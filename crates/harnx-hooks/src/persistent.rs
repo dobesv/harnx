@@ -581,7 +581,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_failing_persistent_hook_surfaces_notice() {
-        use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, NoticeEvent};
+        use harnx_core::event::{AgentEvent, AgentEventSink, NoticeEvent};
         use std::sync::{Arc, Mutex};
 
         #[derive(Default)]
@@ -589,7 +589,7 @@ mod tests {
             events: Mutex<Vec<AgentEvent>>,
         }
         impl AgentEventSink for CollectingSink {
-            fn emit(&self, event: AgentEvent, _source: Option<AgentSource>) {
+            fn emit(&self, event: AgentEvent) {
                 self.events.lock().unwrap().push(event);
             }
         }
@@ -626,7 +626,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_persistent_hook_stdout_notice_surfaces() {
-        use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, NoticeEvent};
+        use harnx_core::event::{AgentEvent, AgentEventSink, NoticeEvent};
         use std::sync::{Arc, Mutex};
 
         #[derive(Default)]
@@ -634,7 +634,7 @@ mod tests {
             events: Mutex<Vec<AgentEvent>>,
         }
         impl AgentEventSink for CollectingSink {
-            fn emit(&self, event: AgentEvent, _source: Option<AgentSource>) {
+            fn emit(&self, event: AgentEvent) {
                 self.events.lock().unwrap().push(event);
             }
         }

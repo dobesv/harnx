@@ -1,16 +1,16 @@
 //! TUI-side `AgentEventSink` implementation. Moved from `harnx::agent_event_sink`
 //! (plan P49). The `TuiAgentEventSink` is a pure forwarder that pushes
-//! `TuiEvent::Agent(event, source)` directly into the TUI event loop.
+//! `TuiEvent::Agent(event)` directly into the TUI event loop.
 
 use std::sync::Arc;
 
-use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource};
+use harnx_core::event::{AgentEvent, AgentEventSink};
 use harnx_core::sink::install_agent_event_sink;
 
 use crate::types::TuiEvent;
 
 /// Sink used by the interactive TUI mode. Pure forwarder: carries an
-/// `UnboundedSender<TuiEvent>` and pushes `TuiEvent::Agent(event, source)`
+/// `UnboundedSender<TuiEvent>` and pushes `TuiEvent::Agent(event)`
 /// directly into the TUI event loop where `render_agent_event` dispatches
 /// on the structured `AgentEvent` variants. No translation happens here.
 pub(crate) struct TuiAgentEventSink {
@@ -24,8 +24,8 @@ impl TuiAgentEventSink {
 }
 
 impl AgentEventSink for TuiAgentEventSink {
-    fn emit(&self, event: AgentEvent, source: Option<AgentSource>) {
-        let _ = self.tx.send(TuiEvent::Agent(event, source));
+    fn emit(&self, event: AgentEvent) {
+        let _ = self.tx.send(TuiEvent::Agent(event));
     }
 }
 
@@ -61,22 +61,22 @@ mod tests {
     async fn source_propagates_through_message_chunk() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
         let sink = TuiAgentEventSink::new(tx);
-        sink.emit(
-            AgentEvent::Model(ModelEvent::MessageChunk {
-                blocks: vec![ContentBlock::Text("hello".into())],
-            }),
-            Some(AgentSource {
+        sink.emit(AgentEvent::sub_agent(
+            AgentSource {
                 model: None,
                 agent: "argus".into(),
                 session_id: Some("session-1".into()),
+            },
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text("hello".into())],
             }),
-        );
+        ));
         let ev = rx.try_recv().expect("tui event");
         match ev {
-            TuiEvent::Agent(
-                AgentEvent::Model(ModelEvent::MessageChunk { blocks }),
-                Some(source),
-            ) => {
+            TuiEvent::Agent(AgentEvent::SubAgent { source, event }) => {
+                let AgentEvent::Model(ModelEvent::MessageChunk { blocks }) = *event else {
+                    panic!("unexpected nested AgentEvent");
+                };
                 assert_eq!(blocks.len(), 1);
                 match &blocks[0] {
                     ContentBlock::Text(t) => assert_eq!(t, "hello"),
@@ -93,10 +93,10 @@ mod tests {
     async fn none_source_yields_none_source() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
         let sink = TuiAgentEventSink::new(tx);
-        sink.emit(AgentEvent::Notice(NoticeEvent::Info("hi".into())), None);
+        sink.emit(AgentEvent::Notice(NoticeEvent::Info("hi".into())));
         let ev = rx.try_recv().expect("tui event");
         match ev {
-            TuiEvent::Agent(AgentEvent::Notice(NoticeEvent::Info(msg)), None) => {
+            TuiEvent::Agent(AgentEvent::Notice(NoticeEvent::Info(msg))) => {
                 assert_eq!(msg, "hi");
             }
             _ => panic!("unexpected TuiEvent"),
@@ -107,21 +107,25 @@ mod tests {
     async fn source_propagates_through_tool_completed() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
         let sink = TuiAgentEventSink::new(tx);
-        sink.emit(
+        sink.emit(AgentEvent::sub_agent(
+            AgentSource {
+                agent: "hephaestus".into(),
+                session_id: None,
+                model: None,
+            },
             AgentEvent::Tool(ToolEvent::Completed {
                 id: String::new(),
                 output: serde_json::Value::String("ok".into()),
                 markdown: None,
             }),
-            Some(AgentSource {
-                agent: "hephaestus".into(),
-                session_id: None,
-                model: None,
-            }),
-        );
+        ));
         let ev = rx.try_recv().expect("tui event");
         match ev {
-            TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Completed { .. }), Some(source)) => {
+            TuiEvent::Agent(AgentEvent::SubAgent { source, event }) => {
+                assert!(matches!(
+                    *event,
+                    AgentEvent::Tool(ToolEvent::Completed { .. })
+                ));
                 assert_eq!(source.agent, "hephaestus");
                 assert!(source.session_id.is_none());
             }

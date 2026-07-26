@@ -40,12 +40,12 @@ impl ProxySink {
 }
 
 impl AgentEventSink for ProxySink {
-    fn emit(&self, event: AgentEvent, source: Option<harnx_core::event::AgentSource>) {
+    fn emit(&self, event: AgentEvent) {
         self.recorded
             .lock()
             .expect("proxy sink mutex")
             .push(event.clone());
-        self.inner.emit(event, source);
+        self.inner.emit(event);
     }
 }
 

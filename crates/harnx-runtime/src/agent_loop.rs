@@ -610,15 +610,15 @@ async fn run_agent_loop_inner(
                     session_id: switch.session_id.clone(),
                     model: ctx.config.read().current_model_id(),
                 };
-                harnx_core::sink::emit_agent_event_with_source(
+                harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::sub_agent(
+                    source,
                     harnx_core::event::AgentEvent::Turn(
                         harnx_core::event::TurnEvent::HandoffRequested {
                             agent: switch.agent.clone(),
                             session_id: switch.session_id.clone(),
                         },
                     ),
-                    Some(source),
-                );
+                ));
                 return Ok(LoopResult::HandoffRequested {
                     agent: switch.agent.clone(),
                     session_id: switch.session_id.clone(),
@@ -709,7 +709,11 @@ mod tests {
     }
 
     impl AgentEventSink for CollectingSink {
-        fn emit(&self, event: AgentEvent, source: Option<AgentSource>) {
+        fn emit(&self, event: AgentEvent) {
+            let (event, source) = match event {
+                AgentEvent::SubAgent { source, event } => (*event, Some(source)),
+                event => (event, None),
+            };
             self.events.lock().unwrap().push((event, source));
         }
     }
