@@ -9,7 +9,7 @@ use rmcp::model::{
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use similar::{ChangeTag, TextDiff};
 
@@ -21,6 +21,8 @@ use crate::store::{PlanStore, StoreError};
 
 mod handler;
 mod handlers;
+#[cfg(test)]
+mod handlers_tests;
 mod params;
 
 pub use handler::{serve_plans_server, serve_plans_server_with_meta};

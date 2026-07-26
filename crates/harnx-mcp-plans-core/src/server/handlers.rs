@@ -29,6 +29,16 @@ fn apply_body_edit(
     Ok(current)
 }
 
+/// Title to create a plan with, falling back to the plan name.
+///
+/// Backends may require a title (GitHub rejects a blank issue title), and the plan
+/// name is the best stand-in a caller who omitted one has already given us.
+fn plan_title_or_name(title: Option<String>, name: &str) -> Option<String> {
+    title
+        .filter(|title| !title.trim().is_empty())
+        .or_else(|| Some(name.to_string()))
+}
+
 fn result_with_diff(msg: String, diff: String) -> Result<CallToolResult, ErrorData> {
     if diff.is_empty() {
         result_text(msg)
@@ -180,6 +190,90 @@ async fn validate_batch_task_specs<S: PlanStore>(
         }
     }
     Ok(())
+}
+
+/// The plan a batch write is aimed at.
+#[derive(Clone, Copy)]
+struct PlanRef<'a> {
+    target: &'a Target,
+    /// User-facing plan name, used in messages.
+    name: &'a str,
+    /// Store ID the writes address, which may differ from the name.
+    id: &'a PlanId,
+}
+
+impl<'a> PlanRef<'a> {
+    fn new(target: &'a Target, name: &'a str, id: &'a PlanId) -> Self {
+        Self { target, name, id }
+    }
+}
+
+fn add_plan_body(body: Option<String>, content: Option<String>) -> Result<String, ErrorData> {
+    if body.is_some() && content.is_some() {
+        return Err(ErrorData::invalid_params(
+            "provide at most one of body, content",
+            None,
+        ));
+    }
+    Ok(content.or(body).unwrap_or_default())
+}
+
+fn validate_plan_body_edit(params: &UpdatePlanParams) -> Result<(), ErrorData> {
+    let edit_count = [
+        params.content.is_some(),
+        params.replace_content.is_some(),
+        params.append_content.is_some(),
+        params.replace_in_content.is_some(),
+    ]
+    .into_iter()
+    .filter(|provided| *provided)
+    .count();
+    if edit_count > 1 {
+        return Err(ErrorData::invalid_params(
+            "provide at most one of content, replace_content, append_content, replace_in_content",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn apply_plan_body_edit(
+    before: String,
+    params: &mut UpdatePlanParams,
+) -> Result<String, ErrorData> {
+    validate_plan_body_edit(params)?;
+    apply_body_edit(
+        before,
+        params
+            .content
+            .take()
+            .or_else(|| params.replace_content.take()),
+        params.append_content.take(),
+        params.replace_in_content.take().as_ref(),
+        "provide at most one of content, replace_content, append_content, replace_in_content",
+    )
+}
+
+/// Merge requested plan metadata over the plan's current metadata.
+/// An omitted field keeps its current value rather than clearing it.
+fn plan_meta_update_from_params(
+    params: UpdatePlanParams,
+    existing: Option<&Plan>,
+) -> PlanMetaUpdate {
+    let current = |pick: fn(&Plan) -> Option<String>| existing.and_then(pick);
+    PlanMetaUpdate {
+        title: params.title.or_else(|| current(|p| p.title.clone())),
+        summary: params.summary.or_else(|| current(|p| p.summary.clone())),
+        author: params.author.or_else(|| current(|p| p.author.clone())),
+        assignee: params.assignee.or_else(|| current(|p| p.assignee.clone())),
+        executor: params.executor.or_else(|| current(|p| p.executor.clone())),
+        git_branch: params
+            .git_branch
+            .or_else(|| current(|p| p.git_branch.clone())),
+        github_owner_repo: params
+            .github_owner_repo
+            .or_else(|| current(|p| p.github_owner_repo.clone())),
+    }
 }
 
 fn build_new_task(_plan_name: &str, spec: TaskSpec) -> Result<(NewTask, String), ErrorData> {
@@ -443,21 +537,21 @@ impl<S: PlanStore> PlansServer<S> {
         let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let name =
             validate_plan_name(&params.name).map_err(|err| ErrorData::invalid_params(err, None))?;
-        let plan_id: PlanId = name.clone();
-        let body = params.body.unwrap_or_default();
+        let body = add_plan_body(params.body, params.content)?;
         let plan = self
             .store
             .add_plan(
                 &target,
                 NewPlan {
-                    id: plan_id.clone(),
-                    title: params.title,
+                    id: name.clone(),
+                    title: plan_title_or_name(params.title, &name),
                     summary: params.summary,
                     author: params.author,
                     assignee: params.assignee,
                     executor: params.executor,
                     git_branch: params.git_branch,
                     github_owner_repo: params.github_owner_repo,
+                    parent_issue: params.parent_issue,
                 },
             )
             .await
@@ -467,43 +561,21 @@ impl<S: PlanStore> PlansServer<S> {
                 }
                 other => store_error_to_error_data(other),
             })?;
+        // Address the created plan by the ID the store assigned it: backends are free
+        // to canonicalize (GitHub numbers plans by issue), and a write aimed at the
+        // requested name would miss the plan that was just created.
+        let plan_id: PlanId = plan.id.clone();
         self.store
             .write_plan_body(&target, &plan_id, &body)
             .await
             .map_err(store_error_to_error_data)?;
 
-        let task_specs = params.tasks.unwrap_or_default();
-        validate_batch_task_specs(self.store.as_ref(), &target, &name, &plan_id, &task_specs)
+        let (created_task_ids, task_failures) = self
+            .create_batch_tasks(
+                PlanRef::new(&target, &name, &plan_id),
+                params.tasks.unwrap_or_default(),
+            )
             .await?;
-        let mut created_task_ids = Vec::new();
-        let mut task_failures = Vec::new();
-        for spec in task_specs {
-            match build_new_task(&name, spec) {
-                Ok((new_task, task_body)) => {
-                    match self.store.add_task(&target, &plan_id, new_task).await {
-                        Ok(task) => {
-                            if let Err(err) = self
-                                .store
-                                .write_task_body(&target, &plan_id, &task.id, &task_body)
-                                .await
-                            {
-                                task_failures.push(format!(
-                                    "{}: {}",
-                                    display_id(&task.id),
-                                    store_error_to_error_data(err).message
-                                ));
-                            } else {
-                                created_task_ids.push(display_id(&task.id));
-                            }
-                        }
-                        Err(err) => {
-                            task_failures.push(store_error_to_error_data(err).message.to_string())
-                        }
-                    }
-                }
-                Err(err) => task_failures.push(err.message.to_string()),
-            }
-        }
 
         let diff = diff_text("", &body, &format!("{name}/plan.md"));
         let mut msg = format!("added plan {}", name);
@@ -516,7 +588,6 @@ impl<S: PlanStore> PlansServer<S> {
                 task_failures.join("; ")
             ));
         }
-        let _ = plan;
         result_with_diff(msg, diff)
     }
 
@@ -564,77 +635,126 @@ impl<S: PlanStore> PlansServer<S> {
         result_json(plan_detail_json(plan, body, task_ids, note_ids))
     }
 
+    /// Batch-create tasks in a plan, returning their display IDs and per-task failures.
+    ///
+    /// A task that fails does not abort the batch: the caller reports the failures
+    /// alongside whatever succeeded.
+    async fn create_batch_tasks(
+        &self,
+        plan: PlanRef<'_>,
+        task_specs: Vec<TaskSpec>,
+    ) -> Result<(Vec<String>, Vec<String>), ErrorData> {
+        validate_batch_task_specs(
+            self.store.as_ref(),
+            plan.target,
+            plan.name,
+            plan.id,
+            &task_specs,
+        )
+        .await?;
+        let mut created = Vec::new();
+        let mut failures = Vec::new();
+        for spec in task_specs {
+            match self.create_one_task(plan, spec).await {
+                Ok(task_id) => created.push(task_id),
+                Err(failure) => failures.push(failure),
+            }
+        }
+        Ok((created, failures))
+    }
+
+    /// Create one task and write its body, yielding its display ID or a failure message.
+    async fn create_one_task(&self, plan: PlanRef<'_>, spec: TaskSpec) -> Result<String, String> {
+        let (new_task, task_body) =
+            build_new_task(plan.name, spec).map_err(|err| err.message.to_string())?;
+        let task = match self.store.add_task(plan.target, plan.id, new_task).await {
+            Ok(task) => task,
+            Err(StoreError::AlreadyExists) => {
+                return Err(format!("task already exists in plan '{}'", plan.name))
+            }
+            Err(err) => return Err(store_error_to_error_data(err).message.to_string()),
+        };
+        self.store
+            .write_task_body(plan.target, plan.id, &task.id, &task_body)
+            .await
+            .map_err(|err| {
+                format!(
+                    "{}: {}",
+                    display_id(&task.id),
+                    store_error_to_error_data(err).message
+                )
+            })?;
+        Ok(display_id(&task.id))
+    }
+
+    /// Fetch the named plan, creating it if it does not exist yet.
+    ///
+    /// Returns the store's canonical ID for the plan — which follow-up writes must use,
+    /// since backends may number plans themselves — and the plan as it was before this
+    /// call, or `None` when it was just created.
+    async fn upsert_plan(
+        &self,
+        target: &Target,
+        name: &str,
+        params: &UpdatePlanParams,
+    ) -> Result<(PlanId, Option<Plan>), ErrorData> {
+        match self.store.get_plan(target, &name.to_string()).await {
+            Ok(plan) => Ok((plan.id.clone(), Some(plan))),
+            Err(StoreError::NotFound) => {
+                // Create with the metadata this call asked for: creating the plan bare
+                // and patching afterwards loses the title on backends that require one.
+                let created = self
+                    .store
+                    .add_plan(
+                        target,
+                        NewPlan {
+                            id: name.to_string(),
+                            title: plan_title_or_name(params.title.clone(), name),
+                            summary: params.summary.clone(),
+                            author: params.author.clone(),
+                            assignee: params.assignee.clone(),
+                            executor: params.executor.clone(),
+                            git_branch: params.git_branch.clone(),
+                            github_owner_repo: params.github_owner_repo.clone(),
+                            parent_issue: params.parent_issue,
+                        },
+                    )
+                    .await
+                    .map_err(store_error_to_error_data)?;
+                Ok((created.id, None))
+            }
+            Err(err) => Err(store_error_to_error_data(err)),
+        }
+    }
+
     pub async fn handle_update_plan(
         &self,
-        params: UpdatePlanParams,
+        mut params: UpdatePlanParams,
     ) -> Result<CallToolResult, ErrorData> {
+        validate_plan_body_edit(&params)?;
         let target = self.resolve_target(params.owner.as_deref(), params.repo.as_deref())?;
         let name =
             validate_plan_name(&params.name).map_err(|err| ErrorData::invalid_params(err, None))?;
-        let plan_id: PlanId = name.clone();
 
-        let existing = match self.store.get_plan(&target, &plan_id).await {
-            Ok(plan) => Some(plan),
-            Err(StoreError::NotFound) => None,
-            Err(err) => return Err(store_error_to_error_data(err)),
-        };
-        if existing.is_none() {
-            self.store
-                .add_plan(
-                    &target,
-                    NewPlan {
-                        id: plan_id.clone(),
-                        title: None,
-                        summary: None,
-                        author: None,
-                        assignee: None,
-                        executor: None,
-                        git_branch: None,
-                        github_owner_repo: None,
-                    },
-                )
-                .await
-                .map_err(store_error_to_error_data)?;
+        let (plan_id, existing) = self.upsert_plan(&target, &name, &params).await?;
+        if existing.is_some() && params.parent_issue.is_some() {
+            return Err(ErrorData::invalid_params(
+                "parent_issue can only be set when creating a plan, not when updating an existing plan",
+                None,
+            ));
         }
         let before_body = self
             .store
             .read_plan_body(&target, &plan_id)
             .await
             .unwrap_or_default();
-        let new_body = apply_body_edit(
-            before_body.clone(),
-            params.replace_content,
-            params.append_content,
-            params.replace_in_content.as_ref(),
-            "at most one of replace_content, append_content, replace_in_content may be provided",
-        )?;
+        let new_body = apply_plan_body_edit(before_body.clone(), &mut params)?;
+        let task_specs = params.tasks.take().unwrap_or_default();
         self.store
             .update_plan_meta(
                 &target,
                 &plan_id,
-                PlanMetaUpdate {
-                    title: params
-                        .title
-                        .or(existing.as_ref().and_then(|p| p.title.clone())),
-                    summary: params
-                        .summary
-                        .or(existing.as_ref().and_then(|p| p.summary.clone())),
-                    author: params
-                        .author
-                        .or(existing.as_ref().and_then(|p| p.author.clone())),
-                    assignee: params
-                        .assignee
-                        .or(existing.as_ref().and_then(|p| p.assignee.clone())),
-                    executor: params
-                        .executor
-                        .or(existing.as_ref().and_then(|p| p.executor.clone())),
-                    git_branch: params
-                        .git_branch
-                        .or(existing.as_ref().and_then(|p| p.git_branch.clone())),
-                    github_owner_repo: params
-                        .github_owner_repo
-                        .or(existing.as_ref().and_then(|p| p.github_owner_repo.clone())),
-                },
+                plan_meta_update_from_params(params, existing.as_ref()),
             )
             .await
             .map_err(store_error_to_error_data)?;
@@ -643,41 +763,9 @@ impl<S: PlanStore> PlansServer<S> {
             .await
             .map_err(store_error_to_error_data)?;
 
-        let task_specs = params.tasks.unwrap_or_default();
-        validate_batch_task_specs(self.store.as_ref(), &target, &name, &plan_id, &task_specs)
+        let (created_task_ids, task_failures) = self
+            .create_batch_tasks(PlanRef::new(&target, &name, &plan_id), task_specs)
             .await?;
-        let mut created_task_ids = Vec::new();
-        let mut task_failures = Vec::new();
-        for spec in task_specs {
-            match build_new_task(&name, spec) {
-                Ok((new_task, task_body)) => {
-                    match self.store.add_task(&target, &plan_id, new_task).await {
-                        Ok(task) => {
-                            if let Err(err) = self
-                                .store
-                                .write_task_body(&target, &plan_id, &task.id, &task_body)
-                                .await
-                            {
-                                task_failures.push(format!(
-                                    "{}: {}",
-                                    display_id(&task.id),
-                                    store_error_to_error_data(err).message
-                                ));
-                            } else {
-                                created_task_ids.push(display_id(&task.id));
-                            }
-                        }
-                        Err(StoreError::AlreadyExists) => {
-                            task_failures.push(format!("task already exists in plan '{}'", name))
-                        }
-                        Err(err) => {
-                            task_failures.push(store_error_to_error_data(err).message.to_string())
-                        }
-                    }
-                }
-                Err(err) => task_failures.push(err.message.to_string()),
-            }
-        }
 
         let base_msg = if created_task_ids.is_empty() {
             format!("updated plan {}", name)

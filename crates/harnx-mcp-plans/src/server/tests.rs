@@ -657,6 +657,8 @@ async fn update_plan_append_content() {
 
     server
         .handle_add_plan(AddPlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             title: Some("Plan".to_string()),
             summary: None,
@@ -672,6 +674,8 @@ async fn update_plan_append_content() {
 
     server
         .handle_update_plan(UpdatePlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             replace_content: None,
             append_content: Some("line2".to_string()),
@@ -709,6 +713,8 @@ async fn update_plan_replace_in_content() {
 
     server
         .handle_add_plan(AddPlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             title: Some("Plan".to_string()),
             summary: None,
@@ -724,6 +730,8 @@ async fn update_plan_replace_in_content() {
 
     server
         .handle_update_plan(UpdatePlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             replace_content: None,
             append_content: None,
@@ -761,6 +769,8 @@ async fn update_plan_replace_in_content_not_found() {
 
     server
         .handle_add_plan(AddPlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             title: Some("Plan".to_string()),
             summary: None,
@@ -776,6 +786,8 @@ async fn update_plan_replace_in_content_not_found() {
 
     let err = server
         .handle_update_plan(UpdatePlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             replace_content: None,
             append_content: None,
@@ -809,6 +821,8 @@ async fn update_plan_replace_in_content_empty_old_text_error() {
 
     let err = server
         .handle_update_plan(UpdatePlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             replace_content: None,
             append_content: None,
@@ -842,6 +856,8 @@ async fn update_plan_two_content_fields_error() {
 
     let err = server
         .handle_update_plan(UpdatePlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             replace_content: Some("one".to_string()),
             append_content: Some("two".to_string()),
@@ -871,6 +887,8 @@ async fn update_plan_no_content_preserves_body() {
 
     server
         .handle_add_plan(AddPlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             title: Some("Plan".to_string()),
             summary: None,
@@ -886,6 +904,8 @@ async fn update_plan_no_content_preserves_body() {
 
     server
         .handle_update_plan(UpdatePlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             replace_content: None,
             append_content: None,
@@ -990,6 +1010,8 @@ async fn update_plan_batch_creates_tasks() {
 
     server
         .handle_update_plan(UpdatePlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             replace_content: Some("plan body".to_string()),
             append_content: None,
@@ -1067,6 +1089,8 @@ async fn update_plan_batch_rejects_duplicate_id() {
     // Try to batch-create a task with the same id — should fail
     let result = server
         .handle_update_plan(UpdatePlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             replace_content: Some("".to_string()),
             append_content: None,
@@ -1103,6 +1127,8 @@ async fn update_plan_batch_rejects_intra_batch_duplicate_id() {
     // Two TaskSpecs with the same id in the same batch — should fail
     let result = server
         .handle_update_plan(UpdatePlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             replace_content: Some("".to_string()),
             append_content: None,
@@ -1155,6 +1181,8 @@ async fn update_plan_batch_creates_tasks_with_ids() {
 
     server
         .handle_update_plan(UpdatePlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             replace_content: Some("plan body".to_string()),
             append_content: None,
@@ -1321,6 +1349,8 @@ async fn add_and_get_plan() {
 
     server
         .handle_add_plan(AddPlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             title: Some("Test Plan".to_string()),
             summary: None,
@@ -1352,6 +1382,8 @@ async fn add_plan_duplicate_error() {
 
     server
         .handle_add_plan(AddPlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             title: Some("Test Plan".to_string()),
             summary: None,
@@ -1367,6 +1399,8 @@ async fn add_plan_duplicate_error() {
 
     let err = server
         .handle_add_plan(AddPlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             title: Some("Test Plan".to_string()),
             summary: None,
@@ -1389,6 +1423,8 @@ async fn update_plan_creates_if_missing() {
 
     server
         .handle_update_plan(UpdatePlanParams {
+            parent_issue: Some(42),
+            content: None,
             name: "plan-a".to_string(),
             title: Some("Created".to_string()),
             summary: None,
@@ -1418,12 +1454,41 @@ async fn update_plan_creates_if_missing() {
 }
 
 #[tokio::test]
+async fn update_plan_rejects_parent_issue_for_existing_file_plan() {
+    let dir = temp_test_dir("update-plan-existing-parent-issue");
+    let server = PlansServer::new(dir);
+    server
+        .handle_add_plan(AddPlanParams {
+            name: "plan-a".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let error = server
+        .handle_update_plan(UpdatePlanParams {
+            name: "plan-a".to_string(),
+            parent_issue: Some(42),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(error.message.contains(
+        "parent_issue can only be set when creating a plan, not when updating an existing plan"
+    ));
+}
+
+#[tokio::test]
 async fn update_plan_preserves_metadata() {
     let dir = temp_test_dir("update-plan-preserves-metadata");
     let server = PlansServer::new(dir);
 
     server
         .handle_add_plan(AddPlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             title: Some("Test Plan".to_string()),
             summary: None,
@@ -1439,6 +1504,8 @@ async fn update_plan_preserves_metadata() {
 
     server
         .handle_update_plan(UpdatePlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             title: None,
             summary: None,
@@ -1473,6 +1540,8 @@ async fn delete_plan() {
 
     server
         .handle_add_plan(AddPlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             title: Some("Test Plan".to_string()),
             summary: None,
@@ -1503,6 +1572,8 @@ async fn list_plans_returns_counts() {
 
     server
         .handle_add_plan(AddPlanParams {
+            parent_issue: None,
+            content: None,
             name: "plan-a".to_string(),
             title: Some("Test Plan".to_string()),
             summary: None,
@@ -1616,6 +1687,82 @@ async fn delete_note() {
     assert!(err.message.contains("not found"));
 }
 
+#[tokio::test]
+async fn plan_content_alias_round_trips_in_file_store() {
+    let dir = temp_test_dir("plan-content-alias");
+    let server = PlansServer::new(dir);
+    server
+        .handle_add_plan(AddPlanParams {
+            name: "content-alias".to_string(),
+            content: Some("# Initial markdown".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    server
+        .handle_update_plan(UpdatePlanParams {
+            name: "content-alias".to_string(),
+            content: Some("# Revised markdown".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let result = server
+        .handle_get_plan(GetPlanParams {
+            name: "content-alias".to_string(),
+        })
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_str(&extract_text(result)).unwrap();
+    assert_eq!(value["body"], "# Revised markdown");
+}
+
+#[tokio::test]
+async fn file_store_add_plan_rejects_body_with_content() {
+    let dir = temp_test_dir("add-plan-content-conflict");
+    let server = PlansServer::new(dir);
+    let error = server
+        .handle_add_plan(AddPlanParams {
+            name: "content-conflict".to_string(),
+            body: Some("a".to_string()),
+            content: Some("b".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(error
+        .message
+        .contains("provide at most one of body, content"));
+}
+
+#[tokio::test]
+async fn file_store_rejects_conflicting_content_alias() {
+    let dir = temp_test_dir("plan-content-conflict");
+    let server = PlansServer::new(dir);
+    let error = server
+        .handle_update_plan(UpdatePlanParams {
+            name: "content-conflict".to_string(),
+            content: Some("one".to_string()),
+            replace_content: Some("two".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.message,
+        "provide at most one of content, replace_content, append_content, replace_in_content"
+    );
+}
+
+#[test]
+fn file_store_argument_parser_rejects_unknown_fields() {
+    let arguments = json!({ "name": "plan", "bogus": "x" }).as_object().cloned();
+    let error = parse_arguments::<UpdatePlanParams>(arguments).unwrap_err();
+    assert!(error.message.contains("unknown field `bogus`"));
+}
 #[tokio::test]
 async fn list_notes() {
     let dir = temp_test_dir("list-notes");

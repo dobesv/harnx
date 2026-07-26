@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 #[cfg(test)]
 use chrono::{DateTime, Utc};
 use harnx_mcp_plans_core::StoreError;
@@ -15,6 +15,9 @@ use crate::auth::Clock;
 const DEFAULT_MAX_WAIT_SECS: u64 = 30;
 const DEFAULT_MAX_TRANSIENT_RETRIES: usize = 3;
 const BASE_TRANSIENT_BACKOFF_MILLIS: u64 = 250;
+/// Cap on how much of a GitHub error body is kept in the error message. Enough
+/// for GitHub's validation payloads without pasting an error page into a tool result.
+const MAX_ERROR_BODY_CHARS: usize = 600;
 
 pub trait Sleeper: Send + Sync + fmt::Debug {
     fn sleep<'a>(&'a self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
@@ -79,6 +82,80 @@ pub enum AttemptOutcome<T> {
     Response(Response),
 }
 
+/// A GitHub API request that came back with a non-success status.
+///
+/// Carries the status and (truncated) response body so callers can classify the
+/// failure by status instead of grepping the message, and so the operator sees
+/// *why* GitHub rejected the request.
+#[derive(Debug)]
+pub struct GitHubApiError {
+    pub method: Method,
+    pub url: String,
+    pub status: StatusCode,
+    pub body: Option<String>,
+}
+
+impl fmt::Display for GitHubApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "GitHub request failed: {} {} -> {}",
+            self.method,
+            sanitize_url(&self.url),
+            self.status
+        )?;
+        if let Some(body) = &self.body {
+            write!(f, ": {body}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for GitHubApiError {}
+
+impl GitHubApiError {
+    /// True when the response body mentions a label, i.e. GitHub rejected the
+    /// request over the label rather than some other field.
+    pub fn mentions_label(&self) -> bool {
+        self.body_mentions("label")
+    }
+
+    /// True when the response body attributes the rejection to rate limiting.
+    pub fn mentions_rate_limit(&self) -> bool {
+        self.body_mentions("rate limit")
+    }
+
+    fn body_mentions(&self, needle: &str) -> bool {
+        self.body
+            .as_deref()
+            .is_some_and(|body| body.to_lowercase().contains(needle))
+    }
+
+    async fn from_response(context: &RequestContext, response: Response) -> Self {
+        let status = response.status();
+        Self {
+            method: context.method.clone(),
+            url: context.url.clone(),
+            status,
+            body: error_body_snippet(response).await,
+        }
+    }
+}
+
+/// Read a response body and condense it into a single short line for error messages.
+async fn error_body_snippet(response: Response) -> Option<String> {
+    let body = response.text().await.ok()?;
+    let condensed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if condensed.is_empty() {
+        return None;
+    }
+    let mut snippet: String = condensed.chars().take(MAX_ERROR_BODY_CHARS).collect();
+    if condensed.chars().count() > MAX_ERROR_BODY_CHARS {
+        snippet.push('…');
+    }
+    Some(snippet)
+}
+
 impl RateLimitExecutor {
     pub fn new(clock: Arc<dyn Clock>, sleeper: Arc<dyn Sleeper>, config: RateLimitConfig) -> Self {
         Self {
@@ -117,8 +194,9 @@ impl RateLimitExecutor {
                         self.sleep_or_rate_limited(wait.as_secs().max(1)).await?;
                         continue;
                     }
-                    let message = response_error_message(&context, status);
-                    bail!(message);
+                    return Err(GitHubApiError::from_response(&context, response)
+                        .await
+                        .into());
                 }
             }
         }
@@ -196,15 +274,6 @@ fn transient_backoff(base: Duration, retry: usize) -> Duration {
 
 fn is_transient(status: StatusCode) -> bool {
     status.is_server_error()
-}
-
-fn response_error_message(context: &RequestContext, status: StatusCode) -> String {
-    format!(
-        "GitHub request failed: {} {} -> {}",
-        context.method,
-        sanitize_url(&context.url),
-        status
-    )
 }
 
 fn sanitize_url(url: &str) -> String {
@@ -348,6 +417,94 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(sleeper.recorded(), vec![Duration::from_secs(2)]);
+    }
+
+    #[tokio::test]
+    async fn error_message_includes_github_response_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/issues"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "message": "Validation Failed",
+                "errors": [{"resource": "Issue", "field": "title", "code": "invalid",
+                            "message": "title can't be blank"}],
+            })))
+            .mount(&server)
+            .await;
+
+        let executor = RateLimitExecutor::new(
+            Arc::new(SystemClock),
+            Arc::new(RecordingSleeper::default()),
+            RateLimitConfig::default(),
+        );
+        let client = reqwest::Client::new();
+        let url = format!("{}/issues", server.uri());
+
+        let error = send_rate_limited(&executor, RequestContext::new(Method::POST, &url), || {
+            let client = client.clone();
+            let url = url.clone();
+            async move { client.post(url).send().await.map_err(Into::into) }
+        })
+        .await
+        .expect_err("422");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("422"),
+            "message should keep the status: {message}"
+        );
+        assert!(
+            message.contains("title can't be blank"),
+            "message should surface the GitHub error body: {message}"
+        );
+
+        let api_error = error
+            .downcast_ref::<GitHubApiError>()
+            .expect("typed GitHub API error");
+        assert_eq!(api_error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn error_body_is_truncated() {
+        let server = MockServer::start().await;
+        let long_body = "x".repeat(MAX_ERROR_BODY_CHARS * 2);
+        Mock::given(method("GET"))
+            .and(path("/long"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(long_body))
+            .mount(&server)
+            .await;
+
+        let executor = RateLimitExecutor::new(
+            Arc::new(SystemClock),
+            Arc::new(RecordingSleeper::default()),
+            RateLimitConfig::default(),
+        );
+        let client = reqwest::Client::new();
+        let url = format!("{}/long", server.uri());
+
+        let error = send_rate_limited(&executor, RequestContext::new(Method::GET, &url), || {
+            let client = client.clone();
+            let url = url.clone();
+            async move { client.get(url).send().await.map_err(Into::into) }
+        })
+        .await
+        .expect_err("400");
+
+        let body = error
+            .downcast_ref::<GitHubApiError>()
+            .expect("typed GitHub API error")
+            .body
+            .clone()
+            .expect("body");
+        assert!(
+            body.chars().count() <= MAX_ERROR_BODY_CHARS + 1,
+            "body should be truncated, got {} chars",
+            body.chars().count()
+        );
+        assert!(
+            body.ends_with('…'),
+            "truncated body should be marked: {body}"
+        );
     }
 
     #[tokio::test]

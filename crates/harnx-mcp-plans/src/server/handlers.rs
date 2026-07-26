@@ -88,6 +88,52 @@ fn collect_dir_deletion_diffs(
     diffs
 }
 
+fn add_plan_body(body: Option<String>, content: Option<String>) -> Result<String, ErrorData> {
+    if body.is_some() && content.is_some() {
+        return Err(ErrorData::invalid_params(
+            "provide at most one of body, content",
+            None,
+        ));
+    }
+    Ok(content.or(body).unwrap_or_default())
+}
+
+fn validate_plan_body_edit(params: &UpdatePlanParams) -> Result<(), ErrorData> {
+    let edit_count = [
+        params.content.is_some(),
+        params.replace_content.is_some(),
+        params.append_content.is_some(),
+        params.replace_in_content.is_some(),
+    ]
+    .into_iter()
+    .filter(|provided| *provided)
+    .count();
+    if edit_count > 1 {
+        return Err(ErrorData::invalid_params(
+            "provide at most one of content, replace_content, append_content, replace_in_content",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn apply_plan_body_edit(
+    before: String,
+    params: &mut UpdatePlanParams,
+) -> Result<String, ErrorData> {
+    validate_plan_body_edit(params)?;
+    apply_body_edit(
+        before,
+        params
+            .content
+            .take()
+            .or_else(|| params.replace_content.take()),
+        params.append_content.take(),
+        params.replace_in_content.take().as_ref(),
+        "provide at most one of content, replace_content, append_content, replace_in_content",
+    )
+}
+
 fn build_update_plan_tasks(
     dir: &Path,
     name: &str,
@@ -386,6 +432,7 @@ impl PlansServer {
     ) -> Result<CallToolResult, ErrorData> {
         let name =
             validate_plan_name(&params.name).map_err(|err| ErrorData::invalid_params(err, None))?;
+        let body = add_plan_body(params.body, params.content)?;
         let dir = plan_dir(&self.dir, &name);
         if dir.exists() {
             return Err(ErrorData::invalid_params(
@@ -409,7 +456,7 @@ impl PlansServer {
                 created_at: now_iso(),
                 updated_at: None,
             },
-            body: params.body.unwrap_or_default(),
+            body,
         };
         let serialized =
             serialize_plan(&record).map_err(|err| ErrorData::internal_error(err, None))?;
@@ -464,15 +511,22 @@ impl PlansServer {
 
     pub(crate) async fn handle_update_plan(
         &self,
-        params: UpdatePlanParams,
+        mut params: UpdatePlanParams,
     ) -> Result<CallToolResult, ErrorData> {
+        validate_plan_body_edit(&params)?;
         let name =
             validate_plan_name(&params.name).map_err(|err| ErrorData::invalid_params(err, None))?;
         let dir = plan_dir(&self.dir, &name);
+        let path = plan_file_path(&self.dir, &name);
+        if path.exists() && params.parent_issue.is_some() {
+            return Err(ErrorData::invalid_params(
+                "parent_issue can only be set when creating a plan, not when updating an existing plan",
+                None,
+            ));
+        }
         std::fs::create_dir_all(&dir)
             .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
 
-        let path = plan_file_path(&self.dir, &name);
         let (existing, existing_body) = if path.exists() {
             let content = std::fs::read_to_string(&path)
                 .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
@@ -490,15 +544,8 @@ impl PlansServer {
             )
         };
 
-        // Body-edit: at most one of replace_content / append_content / replace_in_content
         let before_body = existing_body.clone();
-        let new_body = apply_body_edit(
-            existing_body,
-            params.replace_content,
-            params.append_content,
-            params.replace_in_content.as_ref(),
-            "at most one of replace_content, append_content, replace_in_content may be provided",
-        )?;
+        let new_body = apply_plan_body_edit(existing_body, &mut params)?;
 
         let record = PlanRecord {
             front: PlanFrontMatter {

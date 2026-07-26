@@ -127,6 +127,8 @@ pub struct NewPlan {
     pub git_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_owner_repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_issue: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
