@@ -581,6 +581,8 @@ def apply_base_thinking(model: dict[str, Any], provider: str) -> None:
         return
     if name.startswith("claude-") and is_adaptive_only_opus(name):
         model["patches"] = [claude_adaptive_patch(BASE_EFFORT)]
+        # Adaptive-only Opus rejects requests without an explicit max_tokens.
+        model["require_max_tokens"] = True
     # Modern Claude models reject requests without an explicit max_tokens,
     # regardless of the adaptive-thinking patch above.
     if claude_requires_max_tokens(name):
