@@ -28,7 +28,7 @@ Sub-agent events carried provenance via an out-of-band `source: Option<AgentSour
 - Spinner stopped prematurely during active multi-agent sessions
 - Only reproducible with nested sub-agents; single-agent workflows unaffected
 
-```
+```text
 Error: TUI `llm_busy = false` set by sub-agent Final/Error
 Behavior: Spinner stops, UI appears idle, but agent loop continues
 Frequency: Every nested sub-agent completion

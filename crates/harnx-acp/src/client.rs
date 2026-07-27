@@ -131,7 +131,7 @@ impl AcpNotificationClient {
     }
 
     async fn forward_agent_event(&self, event: AgentEvent, source: AgentSource) {
-        let event = AgentEvent::sub_agent(source.clone(), event);
+        let event = AgentEvent::sub_agent(source, event);
         let mut forwarders = self.chunk_forwarder.write().await;
         let mut forwarded_to_chunk = false;
         forwarders.retain(

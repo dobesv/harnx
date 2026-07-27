@@ -82,6 +82,94 @@ fn ag_ui_sink_emits_text_message_content_for_chunk() {
 }
 
 #[test]
+fn ag_ui_sink_unwraps_sub_agent_message_chunk() {
+    // SubAgent wrapper is transparently unwrapped at the top of emit.
+    // The resulting AG-UI events should match the bare MessageChunk path.
+    use harnx_core::event::AgentSource;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let message_id =
+        MessageId::from(uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap());
+    let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
+
+    let source = AgentSource {
+        agent: "sub".into(),
+        session_id: None,
+        model: None,
+    };
+    sink.emit(AgentEvent::sub_agent(
+        source,
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("hello".into())],
+        }),
+    ));
+
+    let opened_message_id = match rx.try_recv().expect("text start") {
+        Event::TextMessageStart(event) => {
+            assert_eq!(event.role, Role::Assistant);
+            event.message_id
+        }
+        other => panic!("expected TextMessageStart event, got: {other:?}"),
+    };
+    match rx.try_recv().expect("text content") {
+        Event::TextMessageContent(TextMessageContentEvent {
+            base,
+            message_id: mid,
+            delta,
+        }) => {
+            assert_eq!(base.timestamp, None);
+            assert_eq!(base.raw_event, None);
+            assert_eq!(mid, opened_message_id);
+            assert_eq!(delta, "hello");
+        }
+        other => panic!("expected TextMessageContent event, got: {other:?}"),
+    }
+
+    assert!(rx.try_recv().is_err(), "no additional events expected");
+}
+
+#[test]
+fn ag_ui_sink_unwraps_sub_agent_error() {
+    // SubAgent wrapper around Model::Error should produce the same RunError
+    // event as the bare error path after unwrapping at the top of emit.
+    use harnx_core::event::AgentSource;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let message_id =
+        MessageId::from(uuid::Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap());
+    // Use `new` (not with_snapshot) for error path — finish_turn is not called
+    // unless a message was already started, so we expect RunError directly.
+    let sink = super::AgUiSink::new(tx, message_id.clone());
+
+    let source = AgentSource {
+        agent: "sub".into(),
+        session_id: None,
+        model: None,
+    };
+    sink.emit(AgentEvent::sub_agent(
+        source,
+        AgentEvent::Model(ModelEvent::Error("boom".into())),
+    ));
+
+    // RunError with the wrapped message
+    match rx.try_recv().expect("run error") {
+        Event::RunError(RunErrorEvent {
+            base,
+            message,
+            code,
+        }) => {
+            assert_eq!(base.timestamp, None);
+            assert_eq!(base.raw_event, None);
+            assert_eq!(message, "boom");
+            assert!(code.is_none());
+        }
+        other => panic!("expected RunError event, got: {other:?}"),
+    }
+
+    assert!(rx.try_recv().is_err(), "no additional events expected");
+}
+
+#[test]
 fn ag_ui_sink_skips_empty_chunk() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let message_id = MessageId::from(uuid::Uuid::new_v4());

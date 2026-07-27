@@ -938,6 +938,73 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sub_agent_final_tracks_source_and_renders() {
+        // SubAgent wrapper with Model::Final should extract the source and
+        // track it (since Final is a model-output event for source-heading).
+        // Note: Final calls cleanup(), which resets last_ui_output_source to None.
+        // We verify the event processed without panic and that cleanup ran.
+        let sink = CliAgentEventSink::new(
+            false,
+            RenderOptions::default(),
+            harnx_core::abort::create_abort_signal(),
+        );
+        let source = AgentSource {
+            agent: "sub".to_string(),
+            session_id: None,
+            model: None,
+        };
+        sink.emit(AgentEvent::sub_agent(
+            source.clone(),
+            AgentEvent::Model(ModelEvent::Final {
+                output: "done".into(),
+                usage: Default::default(),
+            }),
+        ));
+        let state = sink.state.lock().unwrap();
+        // Final triggers cleanup, which clears last_ui_output_source.
+        // We verify the event processed without panic.
+        assert!(
+            state.last_ui_output_source.is_none(),
+            "source should be cleared by cleanup after Final"
+        );
+        assert!(
+            state.buffer.is_empty(),
+            "buffer should be cleared after Final"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sub_agent_error_clears_state_without_panic() {
+        // SubAgent wrapper with Model::Error should be processed without panic.
+        // Error is NOT a model-output event, so source should NOT be tracked.
+        let sink = CliAgentEventSink::new(
+            false,
+            RenderOptions::default(),
+            harnx_core::abort::create_abort_signal(),
+        );
+        let source = AgentSource {
+            agent: "sub".to_string(),
+            session_id: None,
+            model: None,
+        };
+        sink.emit(AgentEvent::sub_agent(
+            source,
+            AgentEvent::Model(ModelEvent::Error("boom".into())),
+        ));
+        let state = sink.state.lock().unwrap();
+        // Error is NOT a model-output event, so source should be None
+        assert!(
+            state.last_ui_output_source.is_none(),
+            "source should NOT be tracked for Error event"
+        );
+        // cleanup is called for Error, so buffer should be empty
+        assert!(
+            state.buffer.is_empty(),
+            "buffer should be cleared after Error"
+        );
+    }
+
     // ----------------------------------------------------------------
     // Compaction event handling: CLI must handle Started/Completed/Failed
     // without falling into the debug catch-all.
