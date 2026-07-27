@@ -209,7 +209,7 @@ mod tests {
     use super::run_chat_completion_streaming;
     use harnx_client::{ChatCompletionsData, ClientCallContext, CompletionTokenUsage, SseHandler};
     use harnx_core::abort::create_abort_signal;
-    use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, ModelEvent};
+    use harnx_core::event::{AgentEvent, AgentEventSink, ModelEvent};
     use harnx_core::sink::{clear_agent_event_sink, install_agent_event_sink};
     use harnx_runtime::test_utils::{MockClient, MockTurnBuilder};
     use parking_lot::Mutex;
@@ -253,7 +253,7 @@ mod tests {
     }
 
     impl AgentEventSink for CollectingSink {
-        fn emit(&self, event: AgentEvent, _source: Option<AgentSource>) {
+        fn emit(&self, event: AgentEvent) {
             self.events.lock().push(event);
         }
     }

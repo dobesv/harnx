@@ -131,21 +131,21 @@ impl AcpNotificationClient {
     }
 
     async fn forward_agent_event(&self, event: AgentEvent, source: AgentSource) {
+        let event = AgentEvent::sub_agent(source, event);
         let mut forwarders = self.chunk_forwarder.write().await;
         let mut forwarded_to_chunk = false;
-        forwarders.retain(|_, tx| {
-            match tx.send(NestedAcpEvent::Agent(event.clone(), Some(source.clone()))) {
+        forwarders.retain(
+            |_, tx| match tx.send(NestedAcpEvent::Agent(event.clone())) {
                 Ok(()) => {
                     forwarded_to_chunk = true;
                     true
                 }
                 Err(_) => false,
-            }
-        });
+            },
+        );
 
         if !forwarded_to_chunk {
-            use harnx_core::sink::emit_agent_event_with_source;
-            emit_agent_event_with_source(event, Some(source));
+            harnx_core::sink::emit_agent_event(event);
         }
     }
 
@@ -1244,6 +1244,15 @@ mod tests {
     };
     use serde_json::json;
 
+    fn unwrap_sub_agent_event(event: NestedAcpEvent) -> NestedAcpEvent {
+        match event {
+            NestedAcpEvent::Agent(AgentEvent::SubAgent { event, .. }) => {
+                NestedAcpEvent::Agent(*event)
+            }
+            event => event,
+        }
+    }
+
     #[test]
     fn session_info_update_event_emits_usage_model_event() {
         let info = SessionInfoUpdate::new().meta(serde_json::Map::from_iter([(
@@ -1425,8 +1434,14 @@ mod tests {
         client.session_notification(notification).await.unwrap();
 
         let forwarded = chunk_rx.recv().await.expect("forwarded nested ACP event");
-        let (forwarded_event, forwarded_source) = match forwarded {
-            NestedAcpEvent::Agent(event, source) => (event, source),
+
+        let forwarded_source = match &forwarded {
+            NestedAcpEvent::Agent(AgentEvent::SubAgent { source, .. }) => Some(source.clone()),
+            _ => None,
+        };
+        let forwarded = unwrap_sub_agent_event(forwarded);
+        let forwarded_event = match forwarded {
+            NestedAcpEvent::Agent(event) => event,
             other => panic!("unexpected nested ACP event: {other:?}"),
         };
 
@@ -1498,8 +1513,14 @@ mod tests {
         client.session_notification(notification).await.unwrap();
 
         let forwarded = chunk_rx.recv().await.expect("forwarded nested ACP event");
-        let (forwarded_event, forwarded_source) = match forwarded {
-            NestedAcpEvent::Agent(event, source) => (event, source),
+
+        let forwarded_source = match &forwarded {
+            NestedAcpEvent::Agent(AgentEvent::SubAgent { source, .. }) => Some(source.clone()),
+            _ => None,
+        };
+        let forwarded = unwrap_sub_agent_event(forwarded);
+        let forwarded_event = match forwarded {
+            NestedAcpEvent::Agent(event) => event,
             other => panic!("unexpected nested ACP event: {other:?}"),
         };
 
@@ -1557,8 +1578,14 @@ mod tests {
         client.session_notification(notification).await.unwrap();
 
         let forwarded = chunk_rx.recv().await.expect("forwarded nested ACP event");
-        let (forwarded_event, forwarded_source) = match forwarded {
-            NestedAcpEvent::Agent(event, source) => (event, source),
+
+        let forwarded_source = match &forwarded {
+            NestedAcpEvent::Agent(AgentEvent::SubAgent { source, .. }) => Some(source.clone()),
+            _ => None,
+        };
+        let forwarded = unwrap_sub_agent_event(forwarded);
+        let forwarded_event = match forwarded {
+            NestedAcpEvent::Agent(event) => event,
             other => panic!("unexpected nested ACP event: {other:?}"),
         };
 
@@ -1619,9 +1646,8 @@ mod tests {
             .await
             .expect("session notification should succeed");
 
-        let NestedAcpEvent::Agent(forwarded_event, _) =
-            chunk_rx.recv().await.expect("forwarded nested ACP event")
-        else {
+        let forwarded = chunk_rx.recv().await.expect("forwarded nested ACP event");
+        let NestedAcpEvent::Agent(forwarded_event) = unwrap_sub_agent_event(forwarded) else {
             panic!("unexpected nested ACP event");
         };
 
@@ -1666,8 +1692,10 @@ mod tests {
         client.session_notification(notification).await.unwrap();
 
         let forwarded = chunk_rx.recv().await.expect("forwarded nested ACP event");
-        let (forwarded_event, _) = match forwarded {
-            NestedAcpEvent::Agent(event, source) => (event, source),
+
+        let forwarded = unwrap_sub_agent_event(forwarded);
+        let forwarded_event = match forwarded {
+            NestedAcpEvent::Agent(event) => event,
             other => panic!("unexpected nested ACP event: {other:?}"),
         };
 
@@ -1716,11 +1744,10 @@ mod tests {
         let mut received = String::new();
         for _ in 0..pieces.len() {
             let forwarded = chunk_rx.recv().await.expect("forwarded chunk");
+
+            let forwarded = unwrap_sub_agent_event(forwarded);
             match forwarded {
-                NestedAcpEvent::Agent(
-                    AgentEvent::Model(ModelEvent::MessageChunk { blocks }),
-                    _,
-                ) => {
+                NestedAcpEvent::Agent(AgentEvent::Model(ModelEvent::MessageChunk { blocks })) => {
                     for b in &blocks {
                         if let ContentBlock::Text(t) = b {
                             received.push_str(t);
@@ -1768,8 +1795,10 @@ mod tests {
         client.session_notification(notification).await.unwrap();
 
         let forwarded = chunk_rx.recv().await.expect("forwarded user chunk");
+
+        let forwarded = unwrap_sub_agent_event(forwarded);
         match forwarded {
-            NestedAcpEvent::Agent(AgentEvent::User(UserEvent::Message { content }), _) => {
+            NestedAcpEvent::Agent(AgentEvent::User(UserEvent::Message { content })) => {
                 assert_eq!(content, "hello from attach");
             }
             other => panic!("unexpected nested ACP event: {other:?}"),
@@ -1813,11 +1842,10 @@ mod tests {
         let mut received = String::new();
         for _ in 0..3 {
             let forwarded = chunk_rx.recv().await.expect("forwarded thought chunk");
+
+            let forwarded = unwrap_sub_agent_event(forwarded);
             match forwarded {
-                NestedAcpEvent::Agent(
-                    AgentEvent::Model(ModelEvent::ThoughtChunk { blocks }),
-                    _,
-                ) => {
+                NestedAcpEvent::Agent(AgentEvent::Model(ModelEvent::ThoughtChunk { blocks })) => {
                     for b in &blocks {
                         if let ContentBlock::Text(t) = b {
                             received.push_str(t);
@@ -1859,8 +1887,10 @@ mod tests {
         client.session_notification(notification).await.unwrap();
 
         let forwarded = chunk_rx.recv().await.expect("forwarded error chunk");
+
+        let forwarded = unwrap_sub_agent_event(forwarded);
         match forwarded {
-            NestedAcpEvent::Agent(AgentEvent::Model(ModelEvent::Error(message)), _) => {
+            NestedAcpEvent::Agent(AgentEvent::Model(ModelEvent::Error(message))) => {
                 assert_eq!(message, "upstream failed");
             }
             other => panic!("unexpected nested ACP event: {other:?}"),
@@ -1900,8 +1930,10 @@ mod tests {
         client.session_notification(notification).await.unwrap();
 
         let forwarded = chunk_rx.recv().await.expect("forwarded message chunk");
+
+        let forwarded = unwrap_sub_agent_event(forwarded);
         match forwarded {
-            NestedAcpEvent::Agent(AgentEvent::Model(ModelEvent::MessageChunk { .. }), _) => {}
+            NestedAcpEvent::Agent(AgentEvent::Model(ModelEvent::MessageChunk { .. })) => {}
             other => panic!("unexpected nested ACP event: {other:?}"),
         }
 
@@ -1938,8 +1970,10 @@ mod tests {
         client.session_notification(notification).await.unwrap();
 
         let forwarded = chunk_rx.recv().await.expect("forwarded message chunk");
+
+        let forwarded = unwrap_sub_agent_event(forwarded);
         match forwarded {
-            NestedAcpEvent::Agent(AgentEvent::Model(ModelEvent::MessageChunk { .. }), _) => {}
+            NestedAcpEvent::Agent(AgentEvent::Model(ModelEvent::MessageChunk { .. })) => {}
             other => panic!("unexpected nested ACP event: {other:?}"),
         }
 
@@ -1973,8 +2007,10 @@ mod tests {
         client.session_notification(notification).await.unwrap();
 
         let forwarded = chunk_rx.recv().await.expect("forwarded error chunk");
+
+        let forwarded = unwrap_sub_agent_event(forwarded);
         match forwarded {
-            NestedAcpEvent::Agent(AgentEvent::Model(ModelEvent::Error(message)), _) => {
+            NestedAcpEvent::Agent(AgentEvent::Model(ModelEvent::Error(message))) => {
                 assert_eq!(message, "bare failure");
             }
             other => panic!("unexpected nested ACP event: {other:?}"),

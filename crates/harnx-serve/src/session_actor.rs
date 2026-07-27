@@ -1050,12 +1050,8 @@ impl SessionActor {
 }
 
 impl harnx_core::event::AgentEventSink for BroadcastEventSender {
-    fn emit(
-        &self,
-        event: harnx_core::event::AgentEvent,
-        source: Option<harnx_core::event::AgentSource>,
-    ) {
-        self.sink.emit(event, source);
+    fn emit(&self, event: harnx_core::event::AgentEvent) {
+        self.sink.emit(event);
     }
 }
 

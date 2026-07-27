@@ -24,7 +24,33 @@ pub enum AgentEvent {
     Notice(NoticeEvent),
     User(UserEvent),
     Status(StatusLine),
-    Plan { entries: Vec<PlanEntry> },
+    Plan {
+        entries: Vec<PlanEntry>,
+    },
+    SubAgent {
+        source: AgentSource,
+        event: Box<AgentEvent>,
+    },
+}
+
+impl AgentEvent {
+    /// Wraps an event from a sub-agent, preserving the innermost existing source.
+    pub fn sub_agent(source: AgentSource, event: AgentEvent) -> AgentEvent {
+        let mut source = source;
+        let mut event = event;
+        while let AgentEvent::SubAgent {
+            source: existing,
+            event: inner,
+        } = event
+        {
+            source = existing;
+            event = *inner;
+        }
+        AgentEvent::SubAgent {
+            source,
+            event: Box::new(event),
+        }
+    }
 }
 
 // --- sub-enums ---------------------------------------------------------------
@@ -253,7 +279,7 @@ pub struct AgentHandoff {
 /// and installed on the `SessionCtx`. The trait is object-safe so the
 /// sink can be held as `Arc<dyn AgentEventSink>`.
 pub trait AgentEventSink: Send + Sync {
-    fn emit(&self, event: AgentEvent, source: Option<AgentSource>);
+    fn emit(&self, event: AgentEvent);
 }
 
 /// A no-op sink useful for tests or code paths that run before a real sink
@@ -262,7 +288,7 @@ pub trait AgentEventSink: Send + Sync {
 pub struct NullSink;
 
 impl AgentEventSink for NullSink {
-    fn emit(&self, _event: AgentEvent, _source: Option<AgentSource>) {}
+    fn emit(&self, _event: AgentEvent) {}
 }
 
 impl AgentSource {
@@ -295,9 +321,94 @@ mod tests {
     }
 
     #[test]
+    fn sub_agent_wraps_bare_event() {
+        let source = AgentSource {
+            agent: "argus".into(),
+            session_id: Some("session-1".into()),
+            model: None,
+        };
+
+        match AgentEvent::sub_agent(
+            source.clone(),
+            AgentEvent::Model(ModelEvent::Error("failed".into())),
+        ) {
+            AgentEvent::SubAgent {
+                source: actual,
+                event,
+            } => {
+                assert_eq!(actual, source);
+                assert!(matches!(*event, AgentEvent::Model(ModelEvent::Error(_))));
+            }
+            other => panic!("expected sub-agent event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sub_agent_flattens_repeated_wrapping_preserving_innermost_source() {
+        let inner_source = AgentSource {
+            agent: "inner".into(),
+            session_id: None,
+            model: None,
+        };
+        let outer_source = AgentSource {
+            agent: "outer".into(),
+            session_id: Some("session-2".into()),
+            model: Some("model".into()),
+        };
+        let model_event = AgentEvent::Model(ModelEvent::Error("failed".into()));
+        let event = AgentEvent::sub_agent(
+            outer_source,
+            AgentEvent::sub_agent(inner_source.clone(), model_event),
+        );
+
+        match event {
+            AgentEvent::SubAgent { source, event } => {
+                assert_eq!(source, inner_source);
+                assert!(matches!(*event, AgentEvent::Model(ModelEvent::Error(_))));
+            }
+            other => panic!("expected flattened sub-agent event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sub_agent_preserves_analyst_source_when_researcher_wraps_final() {
+        let analyst_source = AgentSource {
+            agent: "analyst".into(),
+            session_id: Some("analyst-session".into()),
+            model: None,
+        };
+        let researcher_source = AgentSource {
+            agent: "researcher".into(),
+            session_id: Some("researcher-session".into()),
+            model: None,
+        };
+        let event = AgentEvent::sub_agent(
+            researcher_source,
+            AgentEvent::sub_agent(
+                analyst_source.clone(),
+                AgentEvent::Model(ModelEvent::Final {
+                    output: "Analyst complete".into(),
+                    usage: CompletionTokenUsage::default(),
+                }),
+            ),
+        );
+
+        match event {
+            AgentEvent::SubAgent { source, event } => {
+                assert_eq!(source, analyst_source);
+                assert!(matches!(
+                    *event,
+                    AgentEvent::Model(ModelEvent::Final { .. })
+                ));
+            }
+            other => panic!("expected flattened analyst event, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn null_sink_accepts_events() {
         let sink: Box<dyn AgentEventSink> = Box::new(NullSink);
-        sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
+        sink.emit(AgentEvent::Turn(TurnEvent::Started));
     }
 
     #[test]
@@ -334,18 +445,6 @@ mod tests {
         let decoded: AgentSource = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.agent, "argus");
         assert_eq!(decoded.session_id.as_deref(), Some("session-1"));
-    }
-
-    #[test]
-    fn null_sink_accepts_source() {
-        let sink: Box<dyn AgentEventSink> = Box::new(NullSink);
-        let source = AgentSource {
-            agent: "argus".to_string(),
-            session_id: None,
-            model: None,
-        };
-        sink.emit(AgentEvent::Turn(TurnEvent::Started), Some(source));
-        sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
     }
 
     #[test]

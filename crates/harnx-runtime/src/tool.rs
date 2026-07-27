@@ -789,7 +789,7 @@ mod tests {
     // populated, the consumer-side rendering has nothing to display.
     // ----------------------------------------------------------------
 
-    use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, ToolEvent};
+    use harnx_core::event::{AgentEvent, AgentEventSink, ToolEvent};
     use std::sync::Mutex as StdMutex;
 
     #[derive(Default)]
@@ -797,7 +797,7 @@ mod tests {
         events: StdMutex<Vec<AgentEvent>>,
     }
     impl AgentEventSink for RecordingSink {
-        fn emit(&self, event: AgentEvent, _source: Option<AgentSource>) {
+        fn emit(&self, event: AgentEvent) {
             self.events.lock().unwrap().push(event);
         }
     }

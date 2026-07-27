@@ -250,13 +250,10 @@ async fn pending_message_is_auto_sent_after_finish() {
     tui.app.llm_busy = true;
     tui.queue_pending_message("follow up".to_string()).await;
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Model(ModelEvent::Final {
-            output: "done".to_string(),
-            usage: Default::default(),
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+        output: "done".to_string(),
+        usage: Default::default(),
+    })))
     .await
     .unwrap();
 
@@ -267,6 +264,107 @@ async fn pending_message_is_auto_sent_after_finish() {
             |entry| matches!(entry, TranscriptItem::UserText { text, .. } if text == "follow up"),
         );
     assert!(has_user_entry);
+}
+
+fn sub_agent_source() -> AgentSource {
+    AgentSource {
+        agent: "aristarchus".to_string(),
+        session_id: Some("sub-session-1".to_string()),
+        model: None,
+    }
+}
+
+/// A nested sub-agent's error (e.g. a transient LLM failure inside a
+/// delegated ACP session) arrives as a `SubAgent`-wrapped `ModelEvent::Error`.
+/// It must NOT be mistaken for the end of the main prompt task: the
+/// delegating tool call is still in flight, so busy state and the queued
+/// pending message must survive. Otherwise the TUI shows idle (no spinner)
+/// while the agent loop is still running and output keeps streaming.
+#[tokio::test]
+async fn sub_agent_error_does_not_clear_llm_busy() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+    tui.app.llm_busy = true;
+    tui.queue_pending_message("follow up".to_string()).await;
+
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        sub_agent_source(),
+        AgentEvent::Model(ModelEvent::Error("sub-agent exploded".to_string())),
+    )))
+    .await
+    .unwrap();
+
+    assert!(
+        tui.app.llm_busy,
+        "sub-agent error must not clear the main busy flag"
+    );
+    // The queued message still belongs to the (still running) main task.
+    assert!(tui.app.pending_message.is_some());
+    assert!(tui.shared_pending_message.lock().await.is_some());
+    // The error itself is still surfaced in the transcript.
+    assert!(tui.app.transcript.iter().any(
+        |entry| matches!(entry, TranscriptItem::ErrorText(text) if text == "sub-agent exploded")
+    ));
+}
+
+/// Same as above for `ModelEvent::Final`: only a bare main-task Final may
+/// flip the TUI back to idle.
+#[tokio::test]
+async fn sub_agent_final_does_not_clear_llm_busy() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+    tui.app.llm_busy = true;
+    tui.queue_pending_message("follow up".to_string()).await;
+
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        sub_agent_source(),
+        AgentEvent::Model(ModelEvent::Final {
+            output: "sub-agent final text".to_string(),
+            usage: Default::default(),
+        }),
+    )))
+    .await
+    .unwrap();
+
+    assert!(
+        tui.app.llm_busy,
+        "sub-agent Final must not clear the main busy flag"
+    );
+    // The pending message must not be auto-submitted by a sub-agent Final.
+    assert!(tui.app.pending_message.is_some());
+    assert!(tui.shared_pending_message.lock().await.is_some());
+    // The sub-agent's final text is still rendered.
+    assert!(tui.app.transcript.iter().any(
+        |entry| matches!(entry, TranscriptItem::AssistantText { text, .. } if text == "sub-agent final text")
+    ));
+}
+
+#[tokio::test]
+async fn bare_final_clears_llm_busy() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+    tui.app.llm_busy = true;
+
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+        output: "main final text".to_string(),
+        usage: Default::default(),
+    })))
+    .await
+    .unwrap();
+
+    assert!(
+        !tui.app.llm_busy,
+        "bare Final must clear the main busy flag"
+    );
 }
 
 #[tokio::test]
@@ -297,13 +395,10 @@ async fn pending_dot_command_restores_attachments_before_running() {
     });
     tui.set_input_text(".info attachments");
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Model(ModelEvent::Final {
-            output: "done".to_string(),
-            usage: Default::default(),
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+        output: "done".to_string(),
+        usage: Default::default(),
+    })))
     .await
     .unwrap();
 
@@ -373,13 +468,10 @@ async fn pending_message_not_double_submitted_after_consumed() {
     .unwrap();
 
     // Now LlmFinal arrives.
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Model(ModelEvent::Final {
-            output: "final answer".to_string(),
-            usage: Default::default(),
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+        output: "final answer".to_string(),
+        usage: Default::default(),
+    })))
     .await
     .unwrap();
 
@@ -474,26 +566,23 @@ async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
         .await
         .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Model(ModelEvent::MessageChunk {
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+        ModelEvent::MessageChunk {
             blocks: vec![ContentBlock::Text("Hello\nworld".to_string())],
-        }),
-        None,
-    ))
+        },
+    )))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Notice(NoticeEvent::Info("tool output".to_string())),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Notice(NoticeEvent::Info(
+        "tool output".to_string(),
+    ))))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Model(ModelEvent::MessageChunk {
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+        ModelEvent::MessageChunk {
             blocks: vec![ContentBlock::Text("\nAgain".to_string())],
-        }),
-        None,
-    ))
+        },
+    )))
     .await
     .unwrap();
 
@@ -528,23 +617,19 @@ async fn final_coalesces_streamed_multiline_assistant_text() {
     tui.app.streamed_text_this_turn = false;
 
     for chunk in ["Hello\n", "world\n", "Again"] {
-        tui.handle_tui_event(TuiEvent::Agent(
-            AgentEvent::Model(ModelEvent::MessageChunk {
+        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+            ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
-            }),
-            None,
-        ))
+            },
+        )))
         .await
         .unwrap();
     }
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Model(ModelEvent::Final {
-            output: "Hello\nworld\nAgain".to_string(),
-            usage: Default::default(),
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+        output: "Hello\nworld\nAgain".to_string(),
+        usage: Default::default(),
+    })))
     .await
     .unwrap();
 
@@ -579,24 +664,20 @@ async fn final_coalesces_streamed_fenced_code_block_into_one_entry() {
         "```\n",
     ];
     for chunk in chunks {
-        tui.handle_tui_event(TuiEvent::Agent(
-            AgentEvent::Model(ModelEvent::MessageChunk {
+        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+            ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
-            }),
-            None,
-        ))
+            },
+        )))
         .await
         .unwrap();
     }
 
     let full_block = "```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n";
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Model(ModelEvent::Final {
-            output: full_block.to_string(),
-            usage: Default::default(),
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+        output: full_block.to_string(),
+        usage: Default::default(),
+    })))
     .await
     .unwrap();
 
@@ -623,42 +704,36 @@ async fn final_only_coalesces_trailing_streamed_run_after_interruption() {
     tui.app.llm_busy = true;
 
     for chunk in ["```rust\n", "fn first() {}\n"] {
-        tui.handle_tui_event(TuiEvent::Agent(
-            AgentEvent::Model(ModelEvent::MessageChunk {
+        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+            ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
-            }),
-            None,
-        ))
+            },
+        )))
         .await
         .unwrap();
     }
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Notice(NoticeEvent::Info("tool output".to_string())),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Notice(NoticeEvent::Info(
+        "tool output".to_string(),
+    ))))
     .await
     .unwrap();
 
     for chunk in ["fn second() {}\n", "```\n"] {
-        tui.handle_tui_event(TuiEvent::Agent(
-            AgentEvent::Model(ModelEvent::MessageChunk {
+        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+            ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
-            }),
-            None,
-        ))
+            },
+        )))
         .await
         .unwrap();
     }
 
     let full_block = "```rust\nfn first() {}\nfn second() {}\n```\n";
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Model(ModelEvent::Final {
-            output: full_block.to_string(),
-            usage: Default::default(),
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+        output: full_block.to_string(),
+        usage: Default::default(),
+    })))
     .await
     .unwrap();
 
@@ -691,13 +766,10 @@ async fn final_without_chunks_renders_assistant_text_once() {
 
     tui.app.llm_busy = true;
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Model(ModelEvent::Final {
-            output: "Hello\nworld\nAgain".to_string(),
-            usage: Default::default(),
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+        output: "Hello\nworld\nAgain".to_string(),
+        usage: Default::default(),
+    })))
     .await
     .unwrap();
 
@@ -727,26 +799,26 @@ async fn ui_output_inserts_heading_when_source_changes() {
         model: None,
     };
 
-    tui.handle_tui_event(TuiEvent::Agent(
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        source.clone(),
         AgentEvent::Notice(NoticeEvent::Info("first chunk".to_string())),
-        Some(source.clone()),
-    ))
+    )))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        source,
         AgentEvent::Notice(NoticeEvent::Info("second chunk".to_string())),
-        Some(source),
-    ))
+    )))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Notice(NoticeEvent::Info("other chunk".to_string())),
-        Some(AgentSource {
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        AgentSource {
             model: None,
             agent: "hephaestus".to_string(),
             session_id: Some("session-2".to_string()),
-        }),
-    ))
+        },
+        AgentEvent::Notice(NoticeEvent::Info("other chunk".to_string())),
+    )))
     .await
     .unwrap();
 
@@ -1099,62 +1171,60 @@ async fn sub_agent_heading_transitions_render_in_tui_snapshot() {
 
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(
-            AgentEvent::Model(ModelEvent::MessageChunk {
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+            ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text(
                     "Top-level assistant opening response.".to_string(),
                 )],
-            }),
-            None,
-        ))
+            },
+        )))
         .await
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            AgentSource {
+                model: None,
+                agent: "argus".to_string(),
+                session_id: Some("session-1".to_string()),
+            },
             AgentEvent::Notice(NoticeEvent::Info("sub-agent tool call".to_string())),
-            Some(AgentSource {
-                model: None,
-                agent: "argus".to_string(),
-                session_id: Some("session-1".to_string()),
-            }),
-        ))
+        )))
         .await
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            AgentSource {
+                model: None,
+                agent: "argus".to_string(),
+                session_id: Some("session-1".to_string()),
+            },
             AgentEvent::Notice(NoticeEvent::Info("sub-agent follow-up output".to_string())),
-            Some(AgentSource {
-                model: None,
-                agent: "argus".to_string(),
-                session_id: Some("session-1".to_string()),
-            }),
-        ))
+        )))
         .await
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(
-            AgentEvent::Notice(NoticeEvent::Info("other sub-agent output".to_string())),
-            Some(AgentSource {
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            AgentSource {
                 model: None,
                 agent: "hephaestus".to_string(),
                 session_id: Some("session-2".to_string()),
-            }),
-        ))
+            },
+            AgentEvent::Notice(NoticeEvent::Info("other sub-agent output".to_string())),
+        )))
         .await
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(
-            AgentEvent::Model(ModelEvent::MessageChunk {
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+            ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text(
                     "Top-level assistant closes response.".to_string(),
                 )],
-            }),
-            None,
-        ))
+            },
+        )))
         .await
         .unwrap();
 
@@ -1175,7 +1245,12 @@ async fn structured_system_entries_do_not_insert_blank_lines_between_each_line()
 
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            AgentSource {
+                model: None,
+                agent: "argus".to_string(),
+                session_id: Some("session-1".to_string()),
+            },
             AgentEvent::Tool(ToolEvent::Started {
                 id: String::new(),
                 name: "argus_session_prompt".to_string(),
@@ -1184,26 +1259,21 @@ async fn structured_system_entries_do_not_insert_blank_lines_between_each_line()
                 input: yaml_to_json("message: hello\nsession_id: abc123"),
                 locations: vec![],
             }),
-            Some(AgentSource {
-                model: None,
-                agent: "argus".to_string(),
-                session_id: Some("session-1".to_string()),
-            }),
-        ))
+        )))
         .await
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(
-            AgentEvent::Model(ModelEvent::ThoughtChunk {
-                blocks: vec![ContentBlock::Text("thinking hard\nstep two".to_string())],
-            }),
-            Some(AgentSource {
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            AgentSource {
                 model: None,
                 agent: "argus".to_string(),
                 session_id: Some("session-1".to_string()),
+            },
+            AgentEvent::Model(ModelEvent::ThoughtChunk {
+                blocks: vec![ContentBlock::Text("thinking hard\nstep two".to_string())],
             }),
-        ))
+        )))
         .await
         .unwrap();
 
@@ -1222,37 +1292,32 @@ async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
         .unwrap();
 
     for chunk in ["thinking ", "before ", "tool"] {
-        tui.handle_tui_event(TuiEvent::Agent(
-            AgentEvent::Model(ModelEvent::ThoughtChunk {
+        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+            ModelEvent::ThoughtChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
-            }),
-            None,
-        ))
+            },
+        )))
         .await
         .unwrap();
     }
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Tool(ToolEvent::Started {
-            id: String::new(),
-            name: "argus_session_prompt".to_string(),
-            kind: ToolKind::Other,
-            markdown: None,
-            input: yaml_to_json("message: delegate"),
-            locations: vec![],
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+        id: String::new(),
+        name: "argus_session_prompt".to_string(),
+        kind: ToolKind::Other,
+        markdown: None,
+        input: yaml_to_json("message: delegate"),
+        locations: vec![],
+    })))
     .await
     .unwrap();
 
     for chunk in ["thinking ", "after ", "tool"] {
-        tui.handle_tui_event(TuiEvent::Agent(
-            AgentEvent::Model(ModelEvent::ThoughtChunk {
+        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+            ModelEvent::ThoughtChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
-            }),
-            None,
-        ))
+            },
+        )))
         .await
         .unwrap();
     }
@@ -1297,24 +1362,25 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
         .await
         .unwrap();
 
-    let source = Some(AgentSource {
+    let source = AgentSource {
         agent: "argus".to_string(),
         session_id: Some("session-1".to_string()),
         model: None,
-    });
+    };
 
     for chunk in ["thinking ", "before ", "tool"] {
-        tui.handle_tui_event(TuiEvent::Agent(
+        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            source.clone(),
             AgentEvent::Model(ModelEvent::ThoughtChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
             }),
-            source.clone(),
-        ))
+        )))
         .await
         .unwrap();
     }
 
-    tui.handle_tui_event(TuiEvent::Agent(
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        source.clone(),
         AgentEvent::Tool(ToolEvent::Started {
             id: String::new(),
             name: "argus_session_prompt".to_string(),
@@ -1323,18 +1389,17 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
             input: yaml_to_json("message: delegate"),
             locations: vec![],
         }),
-        source.clone(),
-    ))
+    )))
     .await
     .unwrap();
 
     for chunk in ["thinking ", "after ", "tool"] {
-        tui.handle_tui_event(TuiEvent::Agent(
+        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            source.clone(),
             AgentEvent::Model(ModelEvent::ThoughtChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
             }),
-            source.clone(),
-        ))
+        )))
         .await
         .unwrap();
     }
@@ -1383,12 +1448,11 @@ async fn whitespace_only_thought_chunk_is_preserved_in_tui() {
         .unwrap();
 
     // Send a thought chunk with only a newline
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Model(ModelEvent::ThoughtChunk {
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+        ModelEvent::ThoughtChunk {
             blocks: vec![ContentBlock::Text("\n".to_string())],
-        }),
-        None,
-    ))
+        },
+    )))
     .await
     .unwrap();
 
@@ -1406,12 +1470,11 @@ async fn thought_chunk_with_think_tags_is_stripped_and_dropped_if_empty() {
         .unwrap();
 
     // Send a thought chunk with only <think> tags
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Model(ModelEvent::ThoughtChunk {
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+        ModelEvent::ThoughtChunk {
             blocks: vec![ContentBlock::Text("<think></think>".to_string())],
-        }),
-        None,
-    ))
+        },
+    )))
     .await
     .unwrap();
 
@@ -1428,14 +1491,13 @@ async fn llm_multiline_text_renders_without_extra_blank_lines() {
 
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(
-            AgentEvent::Model(ModelEvent::MessageChunk {
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+            ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text(
                     "line one\nline two\nline three".to_string(),
                 )],
-            }),
-            None,
-        ))
+            },
+        )))
         .await
         .unwrap();
 
@@ -1459,22 +1521,27 @@ async fn thinking_stream_coalescing_around_tool_calls_snapshot() {
     for chunk in ["thinking ", "before ", "tool"] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::Agent(
-                AgentEvent::Model(ModelEvent::ThoughtChunk {
-                    blocks: vec![ContentBlock::Text(chunk.to_string())],
-                }),
-                Some(AgentSource {
+            .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+                AgentSource {
                     model: None,
                     agent: "argus".to_string(),
                     session_id: Some("session-1".to_string()),
+                },
+                AgentEvent::Model(ModelEvent::ThoughtChunk {
+                    blocks: vec![ContentBlock::Text(chunk.to_string())],
                 }),
-            ))
+            )))
             .await
             .unwrap();
     }
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            AgentSource {
+                model: None,
+                agent: "argus".to_string(),
+                session_id: Some("session-1".to_string()),
+            },
             AgentEvent::Tool(ToolEvent::Started {
                 id: String::new(),
                 name: "argus_session_prompt".to_string(),
@@ -1483,27 +1550,22 @@ async fn thinking_stream_coalescing_around_tool_calls_snapshot() {
                 input: yaml_to_json("message: delegate"),
                 locations: vec![],
             }),
-            Some(AgentSource {
-                model: None,
-                agent: "argus".to_string(),
-                session_id: Some("session-1".to_string()),
-            }),
-        ))
+        )))
         .await
         .unwrap();
     for chunk in ["thinking ", "after ", "tool"] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::Agent(
-                AgentEvent::Model(ModelEvent::ThoughtChunk {
-                    blocks: vec![ContentBlock::Text(chunk.to_string())],
-                }),
-                Some(AgentSource {
+            .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+                AgentSource {
                     model: None,
                     agent: "argus".to_string(),
                     session_id: Some("session-1".to_string()),
+                },
+                AgentEvent::Model(ModelEvent::ThoughtChunk {
+                    blocks: vec![ContentBlock::Text(chunk.to_string())],
                 }),
-            ))
+            )))
             .await
             .unwrap();
     }
@@ -1522,7 +1584,12 @@ async fn structured_ui_output_variants_render_in_transcript() {
         .await
         .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        AgentSource {
+            agent: "argus".to_string(),
+            session_id: Some("session-1".to_string()),
+            model: None,
+        },
         AgentEvent::Tool(ToolEvent::Started {
             id: String::new(),
             name: "argus_session_prompt".to_string(),
@@ -1531,42 +1598,42 @@ async fn structured_ui_output_variants_render_in_transcript() {
             input: yaml_to_json("message: hello\nsession_id: abc123"),
             locations: vec![],
         }),
-        Some(AgentSource {
+    )))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
             model: None,
-        }),
-    ))
-    .await
-    .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(
+        },
         AgentEvent::Model(ModelEvent::ThoughtChunk {
             blocks: vec![ContentBlock::Text("thinking hard".to_string())],
         }),
-        Some(AgentSource {
+    )))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
             model: None,
-        }),
-    ))
-    .await
-    .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(
+        },
         AgentEvent::Tool(ToolEvent::Update {
             id: "call-1".to_string(),
             markdown: Some("argus_session_prompt".to_string()),
             status: Some(ToolStatus::Completed),
             content: None,
         }),
-        Some(AgentSource {
+    )))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
             model: None,
-        }),
-    ))
-    .await
-    .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(
+        },
         AgentEvent::Plan {
             entries: vec![
                 PlanEntry {
@@ -1579,50 +1646,39 @@ async fn structured_ui_output_variants_render_in_transcript() {
                 },
             ],
         },
-        Some(AgentSource {
+    )))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
             model: None,
-        }),
-    ))
-    .await
-    .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(
+        },
         AgentEvent::Model(ModelEvent::Usage {
             input: 12,
             output: 34,
             cached: 5,
             session_label: Some("> argus ▸ session-1".to_string()),
         }),
-        Some(AgentSource {
-            agent: "argus".to_string(),
-            session_id: Some("session-1".to_string()),
-            model: None,
-        }),
-    ))
+    )))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Tool(ToolEvent::Started {
-            id: String::new(),
-            name: "bash".to_string(),
-            kind: ToolKind::Other,
-            markdown: None,
-            input: yaml_to_json("command: ls"),
-            locations: vec![],
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+        id: String::new(),
+        name: "bash".to_string(),
+        kind: ToolKind::Other,
+        markdown: None,
+        input: yaml_to_json("command: ls"),
+        locations: vec![],
+    })))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Tool(ToolEvent::Completed {
-            id: String::new(),
-            output: serde_json::Value::String("\u{1b}[2mline one\nline two\u{1b}[0m\n".to_string()),
-            markdown: None,
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Completed {
+        id: String::new(),
+        output: serde_json::Value::String("\u{1b}[2mline one\nline two\u{1b}[0m\n".to_string()),
+        markdown: None,
+    })))
     .await
     .unwrap();
 
@@ -1663,21 +1719,23 @@ async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
         .await
         .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Tool(ToolEvent::Started {
-            id: String::new(),
-            name: "pytheas_session_prompt".to_string(),
-            kind: ToolKind::Other,
-            markdown: None,
-            input: yaml_to_json("message: Count files in /tmp"),
-            locations: vec![],
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+        id: String::new(),
+        name: "pytheas_session_prompt".to_string(),
+        kind: ToolKind::Other,
+        markdown: None,
+        input: yaml_to_json("message: Count files in /tmp"),
+        locations: vec![],
+    })))
     .await
     .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        AgentSource {
+            agent: "pytheas".to_string(),
+            session_id: Some("session-nested".to_string()),
+            model: None,
+        },
         AgentEvent::Tool(ToolEvent::Started {
             id: String::new(),
             name: "bash".to_string(),
@@ -1686,28 +1744,23 @@ async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
             input: yaml_to_json("command: ls -1 /tmp | wc -l"),
             locations: vec![],
         }),
-        Some(AgentSource {
-            agent: "pytheas".to_string(),
-            session_id: Some("session-nested".to_string()),
-            model: None,
-        }),
-    ))
+    )))
     .await
     .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        AgentSource {
+            agent: "pytheas".to_string(),
+            session_id: Some("session-nested".to_string()),
+            model: None,
+        },
         AgentEvent::Model(ModelEvent::Usage {
             input: 10,
             output: 20,
             cached: 0,
             session_label: Some("> pytheas ▸ session-nested".to_string()),
         }),
-        Some(AgentSource {
-            agent: "pytheas".to_string(),
-            session_id: Some("session-nested".to_string()),
-            model: None,
-        }),
-    ))
+    )))
     .await
     .unwrap();
 
@@ -1750,26 +1803,26 @@ async fn consecutive_usage_updates_replace_previous_usage_row_for_same_source() 
         model: None,
     };
 
-    tui.handle_tui_event(TuiEvent::Agent(
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        source.clone(),
         AgentEvent::Model(ModelEvent::Usage {
             input: 10,
             output: 1,
             cached: 0,
             session_label: None,
         }),
-        Some(source.clone()),
-    ))
+    )))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        source.clone(),
         AgentEvent::Model(ModelEvent::Usage {
             input: 20,
             output: 2,
             cached: 0,
             session_label: None,
         }),
-        Some(source.clone()),
-    ))
+    )))
     .await
     .unwrap();
 
@@ -1831,12 +1884,12 @@ async fn acp_message_chunks_coalesce_like_direct_llm_streaming() {
         "information to ",
         "complete my review.",
     ] {
-        tui.handle_tui_event(TuiEvent::Agent(
+        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            source.clone(),
             AgentEvent::Model(ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
             }),
-            Some(source.clone()),
-        ))
+        )))
         .await
         .unwrap();
     }
@@ -2143,10 +2196,9 @@ async fn live_log_seq_assignment_patches_latest_unsequenced_transcript_items() {
         seq: None,
     });
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 2 }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+        SessionEvent::LogSeqAssigned { seq: 2 },
+    )))
     .await
     .unwrap();
 
@@ -2157,10 +2209,9 @@ async fn live_log_seq_assignment_patches_latest_unsequenced_transcript_items() {
         rendered_cache: None,
     });
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 3 }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+        SessionEvent::LogSeqAssigned { seq: 3 },
+    )))
     .await
     .unwrap();
 
@@ -2190,24 +2241,20 @@ async fn live_log_seq_assignment_applies_to_tool_calls_started_after_seq_event()
         .await
         .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 5 }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+        SessionEvent::LogSeqAssigned { seq: 5 },
+    )))
     .await
     .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Tool(ToolEvent::Started {
-            id: "call-1".into(),
-            name: "bash_exec".into(),
-            kind: ToolKind::Other,
-            markdown: None,
-            input: yaml_to_json("command: echo hi"),
-            locations: vec![],
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+        id: "call-1".into(),
+        name: "bash_exec".into(),
+        kind: ToolKind::Other,
+        markdown: None,
+        input: yaml_to_json("command: echo hi"),
+        locations: vec![],
+    })))
     .await
     .unwrap();
 
@@ -2246,20 +2293,18 @@ async fn log_seq_backfill_clears_pending_tool_seq() {
         .unwrap();
 
     // First add an AssistantText with seq=None so backfill can find it.
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Model(ModelEvent::MessageChunk {
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+        ModelEvent::MessageChunk {
             blocks: vec![ContentBlock::Text("assistant reply".to_string())],
-        }),
-        None,
-    ))
+        },
+    )))
     .await
     .unwrap();
 
     // Now LogSeqAssigned should backfill the AssistantText and NOT set pending_tool_seq.
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 3 }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+        SessionEvent::LogSeqAssigned { seq: 3 },
+    )))
     .await
     .unwrap();
 
@@ -2279,22 +2324,18 @@ async fn live_log_seq_assignment_applies_to_blocked_tool_calls() {
         .await
         .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 7 }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+        SessionEvent::LogSeqAssigned { seq: 7 },
+    )))
     .await
     .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Tool(ToolEvent::Blocked {
-            id: "call-2".into(),
-            name: "dangerous_tool".into(),
-            input: yaml_to_json("target: /etc"),
-            reason: "hook denied".into(),
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Blocked {
+        id: "call-2".into(),
+        name: "dangerous_tool".into(),
+        input: yaml_to_json("target: /etc"),
+        reason: "hook denied".into(),
+    })))
     .await
     .unwrap();
 
@@ -3099,10 +3140,9 @@ async fn test_streaming_error_shows_full_cause_chain_in_transcript() {
     harness
         .tui()
         .event_tx
-        .send(TuiEvent::Agent(
-            AgentEvent::Model(ModelEvent::Error(formatted.clone())),
-            None,
-        ))
+        .send(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Error(
+            formatted.clone(),
+        ))))
         .unwrap();
 
     // Drain the single queued event into the transcript.
@@ -3175,10 +3215,9 @@ async fn test_pending_message_not_replayed_on_error() {
     harness
         .tui()
         .event_tx
-        .send(TuiEvent::Agent(
-            AgentEvent::Model(ModelEvent::Error("boom".to_string())),
-            None,
-        ))
+        .send(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Error(
+            "boom".to_string(),
+        ))))
         .unwrap();
     harness.drain_and_settle().await.unwrap();
 
@@ -4200,22 +4239,21 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     harness.tui().persistent_manager = persistent;
     harness.tui().clear_transcript();
 
-    let sub_source = Some(AgentSource {
+    let sub_source = AgentSource {
         agent: "researcher".to_string(),
         session_id: Some("research-session-1".to_string()),
         model: None,
-    });
+    };
 
     // ── Phase 1: Top-level agent streams opening message ─────────────
     for chunk in ["I'll look into ", "that for you. ", "Delegating now."] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::Agent(
-                AgentEvent::Model(ModelEvent::MessageChunk {
+            .handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+                ModelEvent::MessageChunk {
                     blocks: vec![ContentBlock::Text(chunk.to_string())],
-                }),
-                None,
-            ))
+                },
+            )))
             .await
             .unwrap();
     }
@@ -4223,17 +4261,14 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     // ── Phase 2: Top-level delegation tool call ──────────────────────
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(
-            AgentEvent::Tool(ToolEvent::Started {
-                id: String::new(),
-                name: "researcher_session_prompt".to_string(),
-                kind: ToolKind::Other,
-                markdown: None,
-                input: yaml_to_json("message: investigate the data"),
-                locations: vec![],
-            }),
-            None,
-        ))
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+            id: String::new(),
+            name: "researcher_session_prompt".to_string(),
+            kind: ToolKind::Other,
+            markdown: None,
+            input: yaml_to_json("message: investigate the data"),
+            locations: vec![],
+        })))
         .await
         .unwrap();
 
@@ -4241,12 +4276,12 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     for chunk in ["Let me ", "analyze ", "the situation ", "carefully."] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::Agent(
+            .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+                sub_source.clone(),
                 AgentEvent::Model(ModelEvent::ThoughtChunk {
                     blocks: vec![ContentBlock::Text(chunk.to_string())],
                 }),
-                sub_source.clone(),
-            ))
+            )))
             .await
             .unwrap();
     }
@@ -4254,7 +4289,8 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     // ── Phase 4: Sub-agent makes two tool calls ──────────────────────
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            sub_source.clone(),
             AgentEvent::Tool(ToolEvent::Started {
                 id: String::new(),
                 name: "bash".to_string(),
@@ -4263,13 +4299,13 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
                 input: yaml_to_json("command: find /data -name '*.csv'"),
                 locations: vec![],
             }),
-            sub_source.clone(),
-        ))
+        )))
         .await
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            sub_source.clone(),
             AgentEvent::Tool(ToolEvent::Started {
                 id: String::new(),
                 name: "read_file".to_string(),
@@ -4278,8 +4314,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
                 input: yaml_to_json("path: /data/results.csv"),
                 locations: vec![],
             }),
-            sub_source.clone(),
-        ))
+        )))
         .await
         .unwrap();
 
@@ -4293,12 +4328,12 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     for chunk in ["Now I see ", "the pattern ", "in the data."] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::Agent(
+            .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+                sub_source.clone(),
                 AgentEvent::Model(ModelEvent::ThoughtChunk {
                     blocks: vec![ContentBlock::Text(chunk.to_string())],
                 }),
-                sub_source.clone(),
-            ))
+            )))
             .await
             .unwrap();
     }
@@ -4306,7 +4341,8 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     // ── Phase 6: Sub-agent makes one more tool call ──────────────────
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            sub_source.clone(),
             AgentEvent::Tool(ToolEvent::Started {
                 id: String::new(),
                 name: "write_file".to_string(),
@@ -4315,8 +4351,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
                 input: yaml_to_json("path: /data/summary.md"),
                 locations: vec![],
             }),
-            sub_source.clone(),
-        ))
+        )))
         .await
         .unwrap();
 
@@ -4334,12 +4369,12 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     ] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::Agent(
+            .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+                sub_source.clone(),
                 AgentEvent::Model(ModelEvent::MessageChunk {
                     blocks: vec![ContentBlock::Text(chunk.to_string())],
                 }),
-                sub_source.clone(),
-            ))
+            )))
             .await
             .unwrap();
     }
@@ -4347,15 +4382,15 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     // ── Phase 8: Sub-agent usage line ────────────────────────────────
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            sub_source.clone(),
             AgentEvent::Model(ModelEvent::Usage {
                 input: 500,
                 output: 200,
                 cached: 100,
                 session_label: Some("> researcher ▸ research-session-1".to_string()),
             }),
-            sub_source.clone(),
-        ))
+        )))
         .await
         .unwrap();
 
@@ -4368,12 +4403,11 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     ] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::Agent(
-                AgentEvent::Model(ModelEvent::MessageChunk {
+            .handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+                ModelEvent::MessageChunk {
                     blocks: vec![ContentBlock::Text(chunk.to_string())],
-                }),
-                None,
-            ))
+                },
+            )))
             .await
             .unwrap();
     }
@@ -5473,17 +5507,14 @@ async fn tui_renders_started_title_when_template_provides_it() {
     // "```sh\n$ {{ args.command }}\n```" produces this `markdown`. The raw
     // `input` JSON is also kept on the event for transcript serialization,
     // but the user-facing rendering must prefer the rendered title.
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Tool(ToolEvent::Started {
-            id: "call-1".into(),
-            name: "bash_exec".into(),
-            kind: ToolKind::Other,
-            markdown: Some("```sh\n$ ls -la /tmp\n```".into()),
-            input: yaml_to_json("command: ls -la /tmp"),
-            locations: vec![],
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+        id: "call-1".into(),
+        name: "bash_exec".into(),
+        kind: ToolKind::Other,
+        markdown: Some("```sh\n$ ls -la /tmp\n```".into()),
+        input: yaml_to_json("command: ls -la /tmp"),
+        locations: vec![],
+    })))
     .await
     .unwrap();
 
@@ -5516,15 +5547,12 @@ async fn tui_renders_blocked_tool_call_in_transcript() {
     .await
     .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Tool(ToolEvent::Blocked {
-            id: "call-1".into(),
-            name: "bash_exec".into(),
-            input: yaml_to_json("command: rm -rf /tmp/demo"),
-            reason: "hook denied".into(),
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Blocked {
+        id: "call-1".into(),
+        name: "bash_exec".into(),
+        input: yaml_to_json("command: rm -rf /tmp/demo"),
+        reason: "hook denied".into(),
+    })))
     .await
     .unwrap();
 
@@ -5559,17 +5587,14 @@ async fn tui_falls_back_to_yaml_when_no_template_title() {
     .await
     .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Tool(ToolEvent::Started {
-            id: "call-1".into(),
-            name: "no_template_tool".into(),
-            kind: ToolKind::Other,
-            markdown: None,
-            input: yaml_to_json("command: ls"),
-            locations: vec![],
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+        id: "call-1".into(),
+        name: "no_template_tool".into(),
+        kind: ToolKind::Other,
+        markdown: None,
+        input: yaml_to_json("command: ls"),
+        locations: vec![],
+    })))
     .await
     .unwrap();
 
@@ -5606,14 +5631,11 @@ async fn tui_renders_completed_template_title_when_provided() {
         "content": [{"type": "text", "text": "hello"}],
         "isError": false,
     });
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Tool(ToolEvent::Completed {
-            id: "call-1".into(),
-            output: raw_output,
-            markdown: Some("OK: hello".into()),
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Completed {
+        id: "call-1".into(),
+        output: raw_output,
+        markdown: Some("OK: hello".into()),
+    })))
     .await
     .unwrap();
 
@@ -5656,14 +5678,11 @@ async fn tui_renders_fenced_diff_tool_result_with_per_line_syntect_styling() {
         "content": [{"type": "text", "text": result_text}],
         "isError": false,
     });
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Tool(ToolEvent::Completed {
-            id: "call-1".into(),
-            output,
-            markdown: None,
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Completed {
+        id: "call-1".into(),
+        output,
+        markdown: None,
+    })))
     .await
     .unwrap();
 
@@ -5716,14 +5735,11 @@ async fn tui_falls_back_to_output_when_no_template_title() {
     )
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Tool(ToolEvent::Completed {
-            id: "call-1".into(),
-            output: serde_json::Value::String("plain output line".into()),
-            markdown: None,
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Completed {
+        id: "call-1".into(),
+        output: serde_json::Value::String("plain output line".into()),
+        markdown: None,
+    })))
     .await
     .unwrap();
     let lines: Vec<String> = tui
@@ -5826,17 +5842,14 @@ async fn tui_started_template_strips_markers_and_styles_spans() {
     .unwrap();
 
     // Producer-side render of "```sh\n$ {{ args.command }}\n```".
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Tool(ToolEvent::Started {
-            id: "call-1".into(),
-            name: "bash_exec".into(),
-            kind: ToolKind::Other,
-            markdown: Some("```sh\n$ ls -la /tmp\n```".into()),
-            input: yaml_to_json("command: ls -la /tmp"),
-            locations: vec![],
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+        id: "call-1".into(),
+        name: "bash_exec".into(),
+        kind: ToolKind::Other,
+        markdown: Some("```sh\n$ ls -la /tmp\n```".into()),
+        input: yaml_to_json("command: ls -la /tmp"),
+        locations: vec![],
+    })))
     .await
     .unwrap();
 
@@ -5881,17 +5894,14 @@ async fn tui_started_multiline_command_renders_without_fence_markers() {
 
     let multiline_cmd = "cat <<EOF\nline1\nEOF";
     let markdown = format!("```sh\n$ {multiline_cmd}\n```");
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Tool(ToolEvent::Started {
-            id: "call-1".into(),
-            name: "bash_exec".into(),
-            kind: ToolKind::Other,
-            markdown: Some(markdown),
-            input: yaml_to_json(&format!("command: '{multiline_cmd}'")),
-            locations: vec![],
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+        id: "call-1".into(),
+        name: "bash_exec".into(),
+        kind: ToolKind::Other,
+        markdown: Some(markdown),
+        input: yaml_to_json(&format!("command: '{multiline_cmd}'")),
+        locations: vec![],
+    })))
     .await
     .unwrap();
 
@@ -5926,17 +5936,14 @@ async fn tui_started_no_template_keeps_yaml_unstyled() {
     )
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Tool(ToolEvent::Started {
-            id: "call-1".into(),
-            name: "no_template_tool".into(),
-            kind: ToolKind::Other,
-            markdown: None,
-            input: yaml_to_json("flag: _priv_value"),
-            locations: vec![],
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+        id: "call-1".into(),
+        name: "no_template_tool".into(),
+        kind: ToolKind::Other,
+        markdown: None,
+        input: yaml_to_json("flag: _priv_value"),
+        locations: vec![],
+    })))
     .await
     .unwrap();
 
@@ -5977,14 +5984,11 @@ async fn tui_completed_template_styles_spans() {
     .await
     .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Tool(ToolEvent::Completed {
-            id: "call-1".into(),
-            output: serde_json::json!({"content": [{"type": "text", "text": "hello"}]}),
-            markdown: Some("**OK**: `hello`".into()),
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Completed {
+        id: "call-1".into(),
+        output: serde_json::json!({"content": [{"type": "text", "text": "hello"}]}),
+        markdown: Some("**OK**: `hello`".into()),
+    })))
     .await
     .unwrap();
 
@@ -8454,12 +8458,9 @@ async fn render_agent_event_user_message_produces_user_transcript_entry() {
         .await
         .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::User(UserEvent::Message {
-            content: "hello from attach".to_string(),
-        }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::User(UserEvent::Message {
+        content: "hello from attach".to_string(),
+    })))
     .await
     .unwrap();
 
@@ -8474,10 +8475,9 @@ async fn render_agent_event_user_message_produces_user_transcript_entry() {
     ));
 
     // A subsequent LogSeqAssigned must NOT backfill into the replayed row.
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 42 }),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+        SessionEvent::LogSeqAssigned { seq: 42 },
+    )))
     .await
     .unwrap();
     assert!(matches!(
@@ -8495,12 +8495,9 @@ async fn render_agent_event_title_updated_executes_without_panic() {
         .unwrap();
 
     // Verify handling a TitleUpdated event does not crash
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Session(harnx_core::event::SessionEvent::TitleUpdated(
-            "Test Title".to_string(),
-        )),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+        harnx_core::event::SessionEvent::TitleUpdated("Test Title".to_string()),
+    )))
     .await
     .unwrap();
 }
@@ -8512,12 +8509,9 @@ async fn render_agent_event_title_generation_failed_produces_error_transcript_en
         .await
         .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Session(SessionEvent::TitleGenerationFailed(
-            "Miss 'api_key'".to_string(),
-        )),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+        SessionEvent::TitleGenerationFailed("Miss 'api_key'".to_string()),
+    )))
     .await
     .unwrap();
 
@@ -8537,10 +8531,9 @@ async fn render_agent_event_compacting_started_produces_transcript_entry() {
         .unwrap();
 
     // Emit CompactingStarted event
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Session(SessionEvent::CompactingStarted),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+        SessionEvent::CompactingStarted,
+    )))
     .await
     .unwrap();
 
@@ -8593,19 +8586,17 @@ async fn render_agent_event_compacting_completed_reconciles_live_transcript() {
     tui.app.transcript_focus = Some(99);
     tui.app.transcript_selection_anchor = Some(88);
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Session(SessionEvent::CompactingStarted),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+        SessionEvent::CompactingStarted,
+    )))
     .await
     .unwrap();
 
     seed_compressed_session(&config);
 
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Session(SessionEvent::CompactingCompleted),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+        SessionEvent::CompactingCompleted,
+    )))
     .await
     .unwrap();
 
@@ -8902,18 +8893,16 @@ async fn render_agent_event_compacting_failed_produces_error_transcript_entry() 
         .unwrap();
 
     // First emit CompactingStarted
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Session(SessionEvent::CompactingStarted),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+        SessionEvent::CompactingStarted,
+    )))
     .await
     .unwrap();
 
     // Then emit CompactingFailed
-    tui.handle_tui_event(TuiEvent::Agent(
-        AgentEvent::Session(SessionEvent::CompactingFailed("test error".to_string())),
-        None,
-    ))
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+        SessionEvent::CompactingFailed("test error".to_string()),
+    )))
     .await
     .unwrap();
 
@@ -9189,13 +9178,12 @@ async fn test_start_prompt_sets_active_remote_session() {
     // We can simulate an Error or Final event to clear it
     use harnx_core::event::{AgentEvent, ModelEvent};
     let _ = tui
-        .handle_tui_event(crate::types::TuiEvent::Agent(
-            AgentEvent::Model(ModelEvent::Final {
+        .handle_tui_event(crate::types::TuiEvent::Agent(AgentEvent::Model(
+            ModelEvent::Final {
                 output: "done".to_string(),
                 usage: Default::default(),
-            }),
-            None,
-        ))
+            },
+        )))
         .await;
 
     assert_eq!(

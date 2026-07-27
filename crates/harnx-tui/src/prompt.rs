@@ -130,10 +130,10 @@ impl Tui {
                 let event_tx = event_tx.clone();
                 Box::pin(async move {
                     use harnx_core::event::{AgentEvent, ModelEvent};
-                    let _ = event_tx.send(TuiEvent::Agent(
-                        AgentEvent::Model(ModelEvent::Final { output, usage }),
-                        None,
-                    ));
+                    let _ = event_tx.send(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+                        output,
+                        usage,
+                    })));
                 })
             },
         );

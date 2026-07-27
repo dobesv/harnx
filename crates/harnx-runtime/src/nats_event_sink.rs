@@ -18,7 +18,7 @@
 
 use anyhow::Result;
 use async_nats::jetstream;
-use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource};
+use harnx_core::event::{AgentEvent, AgentEventSink};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -153,7 +153,7 @@ impl NatsEventSink {
 }
 
 impl AgentEventSink for NatsEventSink {
-    fn emit(&self, event: AgentEvent, _source: Option<AgentSource>) {
+    fn emit(&self, event: AgentEvent) {
         // The trait method is sync but publish is async. Fire-and-forget onto
         // the current runtime so the agent loop is never blocked, and so this
         // works on any runtime flavor (block_in_place would panic on a

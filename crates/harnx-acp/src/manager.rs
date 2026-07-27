@@ -530,17 +530,17 @@ pub async fn forward_acp_chunks(
     spinner_msg: String,
 ) {
     use harnx_core::event::{AgentEvent, NoticeEvent};
-    use harnx_core::sink::emit_agent_event_with_source;
+    use harnx_core::sink::emit_agent_event;
 
     while let Some(chunk) = chunk_rx.recv().await {
         if let Some(ref s) = spinner {
             s.pause();
         }
-        let (event, source) = match chunk {
-            NestedAcpEvent::Agent(event, source) => (event, source),
-            NestedAcpEvent::Text(text) => (AgentEvent::Notice(NoticeEvent::Info(text)), None),
+        let event = match chunk {
+            NestedAcpEvent::Agent(event) => event,
+            NestedAcpEvent::Text(text) => AgentEvent::Notice(NoticeEvent::Info(text)),
         };
-        emit_agent_event_with_source(event, source);
+        emit_agent_event(event);
         if let Some(ref s) = spinner {
             let _ = s.set_message(spinner_msg.clone());
         }
@@ -1166,7 +1166,11 @@ enabled: false
             events: Mutex<Vec<(AgentEvent, Option<AgentSource>)>>,
         }
         impl AgentEventSink for CollectingSink {
-            fn emit(&self, event: AgentEvent, source: Option<AgentSource>) {
+            fn emit(&self, event: AgentEvent) {
+                let (event, source) = match event {
+                    AgentEvent::SubAgent { source, event } => (*event, Some(source)),
+                    event => (event, None),
+                };
                 self.events.lock().unwrap().push((event, source));
             }
         }
@@ -1187,32 +1191,32 @@ enabled: false
         let _cleanup = SinkCleanupGuard;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        tx.send(NestedAcpEvent::Agent(
+        tx.send(NestedAcpEvent::Agent(AgentEvent::sub_agent(
+            AgentSource {
+                agent: "sub-agent".to_string(),
+                session_id: Some("session-1".to_string()),
+                model: None,
+            },
             AgentEvent::Tool(ToolEvent::Completed {
                 id: "call-1".to_string(),
                 output: json!({"text": "done"}),
                 markdown: None,
             }),
-            Some(AgentSource {
+        )))
+        .expect("send tool completed event");
+        tx.send(NestedAcpEvent::Agent(AgentEvent::sub_agent(
+            AgentSource {
                 agent: "sub-agent".to_string(),
                 session_id: Some("session-1".to_string()),
                 model: None,
-            }),
-        ))
-        .expect("send tool completed event");
-        tx.send(NestedAcpEvent::Agent(
+            },
             AgentEvent::Tool(ToolEvent::Update {
                 id: "call-1".to_string(),
                 markdown: None,
                 status: Some(ToolStatus::InProgress),
                 content: None,
             }),
-            Some(AgentSource {
-                agent: "sub-agent".to_string(),
-                session_id: Some("session-1".to_string()),
-                model: None,
-            }),
-        ))
+        )))
         .expect("send tool update event");
         drop(tx);
 
@@ -1251,7 +1255,11 @@ enabled: false
             events: Mutex<Vec<(AgentEvent, Option<AgentSource>)>>,
         }
         impl AgentEventSink for CollectingSink {
-            fn emit(&self, event: AgentEvent, source: Option<AgentSource>) {
+            fn emit(&self, event: AgentEvent) {
+                let (event, source) = match event {
+                    AgentEvent::SubAgent { source, event } => (*event, Some(source)),
+                    event => (event, None),
+                };
                 self.events.lock().unwrap().push((event, source));
             }
         }
@@ -1264,7 +1272,12 @@ enabled: false
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-        tx.send(NestedAcpEvent::Agent(
+        tx.send(NestedAcpEvent::Agent(AgentEvent::sub_agent(
+            AgentSource {
+                agent: "argus".to_string(),
+                session_id: Some("sub-session-1".to_string()),
+                model: None,
+            },
             AgentEvent::Tool(ToolEvent::Started {
                 id: String::new(),
                 name: "read_file".to_string(),
@@ -1273,12 +1286,7 @@ enabled: false
                 input: serde_json::json!({"path": "/tmp/x.txt"}),
                 locations: vec![],
             }),
-            Some(AgentSource {
-                agent: "argus".to_string(),
-                session_id: Some("sub-session-1".to_string()),
-                model: None,
-            }),
-        ))
+        )))
         .unwrap();
         tx.send(NestedAcpEvent::Text("plain text notification".to_string()))
             .unwrap();
@@ -1324,7 +1332,11 @@ enabled: false
             events: Mutex<Vec<(AgentEvent, Option<AgentSource>)>>,
         }
         impl AgentEventSink for CollectingSink {
-            fn emit(&self, event: AgentEvent, source: Option<AgentSource>) {
+            fn emit(&self, event: AgentEvent) {
+                let (event, source) = match event {
+                    AgentEvent::SubAgent { source, event } => (*event, Some(source)),
+                    event => (event, None),
+                };
                 self.events.lock().unwrap().push((event, source));
             }
         }
@@ -1345,10 +1357,10 @@ enabled: false
             model: None,
         };
 
-        tx.send(NestedAcpEvent::Agent(
+        tx.send(NestedAcpEvent::Agent(AgentEvent::sub_agent(
+            source.clone(),
             AgentEvent::Model(ModelEvent::Error(formatted_error.to_string())),
-            Some(source.clone()),
-        ))
+        )))
         .unwrap();
         drop(tx);
 
@@ -1401,12 +1413,9 @@ enabled: false
             .await;
 
         // Send one event through alpha's forwarder.
-        let event = NestedAcpEvent::Agent(
-            harnx_core::event::AgentEvent::Notice(harnx_core::event::NoticeEvent::Info(
-                "from alpha".to_string(),
-            )),
-            None,
-        );
+        let event = NestedAcpEvent::Agent(harnx_core::event::AgentEvent::Notice(
+            harnx_core::event::NoticeEvent::Info("from alpha".to_string()),
+        ));
         send_tx
             .send(event)
             .expect("send event into alpha forwarder");
@@ -1418,12 +1427,9 @@ enabled: false
             .await
             .expect("alpha_rx must receive the injected event");
         match received {
-            NestedAcpEvent::Agent(
-                harnx_core::event::AgentEvent::Notice(harnx_core::event::NoticeEvent::Info(
-                    ref msg,
-                )),
-                None,
-            ) => assert_eq!(msg, "from alpha"),
+            NestedAcpEvent::Agent(harnx_core::event::AgentEvent::Notice(
+                harnx_core::event::NoticeEvent::Info(ref msg),
+            )) => assert_eq!(msg, "from alpha"),
             other => panic!("unexpected event in alpha_rx: {other:?}"),
         }
 
@@ -1471,7 +1477,6 @@ enabled: false
                 harnx_core::event::AgentEvent::Notice(harnx_core::event::NoticeEvent::Info(
                     "from alpha-broad".to_string(),
                 )),
-                None,
             ))
             .expect("send alpha broad event");
         drop(alpha_send);
@@ -1481,12 +1486,9 @@ enabled: false
             .await
             .expect("alpha entry must deliver event")
         {
-            NestedAcpEvent::Agent(
-                harnx_core::event::AgentEvent::Notice(harnx_core::event::NoticeEvent::Info(
-                    ref msg,
-                )),
-                None,
-            ) => assert_eq!(msg, "from alpha-broad"),
+            NestedAcpEvent::Agent(harnx_core::event::AgentEvent::Notice(
+                harnx_core::event::NoticeEvent::Info(ref msg),
+            )) => assert_eq!(msg, "from alpha-broad"),
             other => panic!("unexpected alpha-broad event: {other:?}"),
         }
 
@@ -1500,18 +1502,14 @@ enabled: false
                 harnx_core::event::AgentEvent::Notice(harnx_core::event::NoticeEvent::Info(
                     "from beta-broad".to_string(),
                 )),
-                None,
             ))
             .expect("send beta broad event");
         drop(beta_send);
 
         match beta_rx.recv().await.expect("beta entry must deliver event") {
-            NestedAcpEvent::Agent(
-                harnx_core::event::AgentEvent::Notice(harnx_core::event::NoticeEvent::Info(
-                    ref msg,
-                )),
-                None,
-            ) => assert_eq!(msg, "from beta-broad"),
+            NestedAcpEvent::Agent(harnx_core::event::AgentEvent::Notice(
+                harnx_core::event::NoticeEvent::Info(ref msg),
+            )) => assert_eq!(msg, "from beta-broad"),
             other => panic!("unexpected beta-broad event: {other:?}"),
         }
 

@@ -329,10 +329,7 @@ impl App {
 }
 
 pub(crate) enum TuiEvent {
-    Agent(
-        harnx_core::event::AgentEvent,
-        Option<harnx_core::event::AgentSource>,
-    ),
+    Agent(harnx_core::event::AgentEvent),
     /// Intermediate tool round completed; the prompt loop continues.
     ToolRoundComplete,
     /// The prompt task consumed the pending message during a tool round.

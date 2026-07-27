@@ -34,8 +34,7 @@ use bytes::Bytes;
 use harnx_core::{
     agent_config::AgentConfig,
     event::{
-        AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, SessionEvent, ToolEvent,
-        TurnEvent,
+        AgentEvent, ContentBlock, ModelEvent, NoticeEvent, SessionEvent, ToolEvent, TurnEvent,
     },
     message::{Message as HistoryMsg, MessageContent, MessageRole},
 };
@@ -531,7 +530,11 @@ impl AgUiSink {
 }
 
 impl harnx_core::event::AgentEventSink for AgUiSink {
-    fn emit(&self, event: AgentEvent, _source: Option<AgentSource>) {
+    fn emit(&self, event: AgentEvent) {
+        let event = match event {
+            AgentEvent::SubAgent { event, .. } => *event,
+            event => event,
+        };
         match event {
             AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
                 let delta: String = blocks

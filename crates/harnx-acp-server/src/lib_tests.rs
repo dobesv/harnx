@@ -356,24 +356,18 @@ mod tests {
         let (tx, mut rx) = unbounded_channel::<AcpForward>();
         let sink = AcpChunkSink { tx };
 
-        sink.emit(
-            AgentEvent::Tool(ToolEvent::Completed {
-                id: "call-1".to_string(),
-                output: serde_json::json!({"text": "result"}),
-                markdown: Some("**result**".to_string()),
-            }),
-            None,
-        );
+        sink.emit(AgentEvent::Tool(ToolEvent::Completed {
+            id: "call-1".to_string(),
+            output: serde_json::json!({"text": "result"}),
+            markdown: Some("**result**".to_string()),
+        }));
 
-        sink.emit(
-            AgentEvent::Tool(ToolEvent::Update {
-                id: "call-1".to_string(),
-                markdown: None,
-                status: Some(ToolStatus::InProgress),
-                content: None,
-            }),
-            None,
-        );
+        sink.emit(AgentEvent::Tool(ToolEvent::Update {
+            id: "call-1".to_string(),
+            markdown: None,
+            status: Some(ToolStatus::InProgress),
+            content: None,
+        }));
 
         let completed = rx.try_recv().expect("should have ToolCompleted");
         let update = rx.try_recv().expect("should have ToolUpdate");
@@ -405,12 +399,9 @@ mod tests {
         let (tx, mut rx) = unbounded_channel::<AcpForward>();
         let sink = AcpChunkSink { tx };
 
-        sink.emit(
-            AgentEvent::User(UserEvent::Message {
-                content: "hello user".to_string(),
-            }),
-            None,
-        );
+        sink.emit(AgentEvent::User(UserEvent::Message {
+            content: "hello user".to_string(),
+        }));
 
         match rx.try_recv().expect("should forward user text") {
             AcpForward::UserText(text, source) => {
@@ -420,12 +411,9 @@ mod tests {
             _ => panic!("expected UserText forward"),
         }
 
-        sink.emit(
-            AgentEvent::User(UserEvent::Message {
-                content: String::new(),
-            }),
-            None,
-        );
+        sink.emit(AgentEvent::User(UserEvent::Message {
+            content: String::new(),
+        }));
 
         assert!(
             rx.try_recv().is_err(),
@@ -438,12 +426,9 @@ mod tests {
         let (tx, mut rx) = unbounded_channel::<AcpForward>();
         let sink = AcpChunkSink { tx };
 
-        sink.emit(
-            AgentEvent::Model(harnx_core::event::ModelEvent::Error(
-                "Internal server error".to_string(),
-            )),
-            None,
-        );
+        sink.emit(AgentEvent::Model(harnx_core::event::ModelEvent::Error(
+            "Internal server error".to_string(),
+        )));
 
         match rx.try_recv().expect("should forward error text") {
             AcpForward::Error(text, source) => {

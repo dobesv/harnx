@@ -20,7 +20,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use crate::event::{AgentEvent, AgentEventSink, AgentSource};
+use crate::event::{AgentEvent, AgentEventSink};
 
 tokio::task_local! {
     static SCOPED_SINK: Arc<dyn AgentEventSink>;
@@ -35,7 +35,7 @@ const PENDING_EVENTS_CAP: usize = 64;
 
 struct SinkState {
     sink: Option<Arc<dyn AgentEventSink>>,
-    pending: Vec<(AgentEvent, Option<AgentSource>)>,
+    pending: Vec<AgentEvent>,
 }
 
 impl SinkState {
@@ -61,8 +61,8 @@ pub fn install_agent_event_sink(sink: Arc<dyn AgentEventSink>) {
         guard.sink = Some(sink.clone());
         std::mem::take(&mut guard.pending)
     };
-    for (event, source) in pending {
-        sink.emit(event, source);
+    for event in pending {
+        sink.emit(event);
     }
 }
 
@@ -88,12 +88,8 @@ pub fn current_agent_event_sink() -> Option<Arc<dyn AgentEventSink>> {
 }
 
 pub fn emit_agent_event(event: AgentEvent) -> bool {
-    emit_agent_event_with_source(event, None)
-}
-
-pub fn emit_agent_event_with_source(event: AgentEvent, source: Option<AgentSource>) -> bool {
     if SCOPED_SINK
-        .try_with(|sink| sink.emit(event.clone(), source.clone()))
+        .try_with(|sink| sink.emit(event.clone()))
         .is_ok()
     {
         return true;
@@ -108,12 +104,12 @@ pub fn emit_agent_event_with_source(event: AgentEvent, source: Option<AgentSourc
                 if guard.pending.len() == PENDING_EVENTS_CAP {
                     guard.pending.remove(0);
                 }
-                guard.pending.push((event, source));
+                guard.pending.push(event);
                 return true;
             }
         }
     };
-    sink.emit(event, source);
+    sink.emit(event);
     true
 }
 
@@ -161,7 +157,7 @@ mod tests {
     }
 
     impl AgentEventSink for CollectingSink {
-        fn emit(&self, event: AgentEvent, _source: Option<AgentSource>) {
+        fn emit(&self, event: AgentEvent) {
             self.events.lock().unwrap().push(event);
         }
     }
@@ -205,30 +201,34 @@ mod tests {
         clear_agent_event_sink();
 
         emit_agent_event(AgentEvent::Notice(NoticeEvent::Warning("first".into())));
-        emit_agent_event_with_source(
-            AgentEvent::Notice(NoticeEvent::Warning("second".into())),
-            Some(AgentSource {
+        emit_agent_event(AgentEvent::sub_agent(
+            AgentSource {
                 agent: "argus".into(),
                 session_id: None,
                 model: None,
-            }),
-        );
+            },
+            AgentEvent::Notice(NoticeEvent::Warning("second".into())),
+        ));
 
         let sink = Arc::new(SourceRecordingSink::default());
         install_agent_event_sink(sink.clone());
 
         let events = sink.events.lock().unwrap();
         assert_eq!(events.len(), 2);
-        match &events[0].0 {
+        match &events[0] {
             AgentEvent::Notice(NoticeEvent::Warning(msg)) => assert_eq!(msg, "first"),
             other => panic!("unexpected first event: {other:?}"),
         }
-        assert!(events[0].1.is_none());
-        match &events[1].0 {
-            AgentEvent::Notice(NoticeEvent::Warning(msg)) => assert_eq!(msg, "second"),
+        match &events[1] {
+            AgentEvent::SubAgent { source, event } => {
+                assert_eq!(source.agent, "argus");
+                assert!(matches!(
+                    &**event,
+                    AgentEvent::Notice(NoticeEvent::Warning(msg)) if msg == "second"
+                ));
+            }
             other => panic!("unexpected second event: {other:?}"),
         }
-        assert_eq!(events[1].1.as_ref().unwrap().agent, "argus");
         drop(events);
         clear_agent_event_sink();
     }
@@ -264,17 +264,17 @@ mod tests {
 
     #[derive(Default)]
     struct SourceRecordingSink {
-        events: Mutex<Vec<(AgentEvent, Option<AgentSource>)>>,
+        events: Mutex<Vec<AgentEvent>>,
     }
 
     impl AgentEventSink for SourceRecordingSink {
-        fn emit(&self, event: AgentEvent, source: Option<AgentSource>) {
-            self.events.lock().unwrap().push((event, source));
+        fn emit(&self, event: AgentEvent) {
+            self.events.lock().unwrap().push(event);
         }
     }
 
     #[test]
-    fn emit_with_source_preserves_source() {
+    fn sub_agent_event_preserves_source() {
         use crate::event::AgentSource;
         let _guard = lock_sink_tests();
         clear_agent_event_sink();
@@ -282,22 +282,27 @@ mod tests {
         install_agent_event_sink(sink.clone());
 
         emit_agent_event(AgentEvent::Notice(NoticeEvent::Info("no-source".into())));
-        emit_agent_event_with_source(
-            AgentEvent::Notice(NoticeEvent::Info("with-source".into())),
-            Some(AgentSource {
+        emit_agent_event(AgentEvent::sub_agent(
+            AgentSource {
                 agent: "argus".into(),
                 session_id: Some("s1".into()),
                 model: None,
-            }),
-        );
+            },
+            AgentEvent::Notice(NoticeEvent::Info("with-source".into())),
+        ));
 
         let events = sink.events.lock().unwrap();
         assert_eq!(events.len(), 2);
-        assert!(events[0].1.is_none());
-        let (_, s1) = &events[1];
-        let source = s1.as_ref().expect("second event carries source");
+        assert!(matches!(events[0], AgentEvent::Notice(_)));
+        let AgentEvent::SubAgent { source, event } = &events[1] else {
+            panic!("second event should carry sub-agent source");
+        };
         assert_eq!(source.agent, "argus");
         assert_eq!(source.session_id.as_deref(), Some("s1"));
+        assert!(matches!(
+            &**event,
+            AgentEvent::Notice(NoticeEvent::Info(msg)) if msg == "with-source"
+        ));
         drop(events);
         clear_agent_event_sink();
     }

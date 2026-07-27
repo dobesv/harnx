@@ -265,7 +265,11 @@ impl CliSinkState {
 }
 
 impl AgentEventSink for CliAgentEventSink {
-    fn emit(&self, event: AgentEvent, source: Option<harnx_core::event::AgentSource>) {
+    fn emit(&self, event: AgentEvent) {
+        let (source, event) = match event {
+            AgentEvent::SubAgent { source, event } => (Some(source), *event),
+            event => (None, event),
+        };
         let mut state = match self.state.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -490,56 +494,36 @@ mod tests {
             harnx_core::abort::create_abort_signal(),
         );
 
-        sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
-        sink.emit(
-            AgentEvent::Turn(TurnEvent::Ended {
-                outcome: Default::default(),
-            }),
-            None,
-        );
-        sink.emit(AgentEvent::Notice(NoticeEvent::Info("info".into())), None);
-        sink.emit(
-            AgentEvent::Notice(NoticeEvent::Warning("warn".into())),
-            None,
-        );
-        sink.emit(AgentEvent::Notice(NoticeEvent::Error("err".into())), None);
-        sink.emit(
-            AgentEvent::Model(ModelEvent::MessageChunk {
-                blocks: vec![ContentBlock::Text("hello".into())],
-            }),
-            None,
-        );
-        sink.emit(
-            AgentEvent::Model(ModelEvent::Final {
-                output: "done".into(),
-                usage: Default::default(),
-            }),
-            None,
-        );
-        sink.emit(AgentEvent::Model(ModelEvent::Error("boom".into())), None);
-        sink.emit(
-            AgentEvent::User(UserEvent::Message {
-                content: "hello user".into(),
-            }),
-            None,
-        );
-        sink.emit(
-            AgentEvent::Tool(ToolEvent::Blocked {
-                id: String::new(),
-                name: "test_tool".into(),
-                input: serde_json::Value::Null,
-                reason: "hook denied".into(),
-            }),
-            None,
-        );
-        sink.emit(
-            AgentEvent::Session(SessionEvent::TitleUpdated("A title".into())),
-            None,
-        );
-        sink.emit(
-            AgentEvent::Session(SessionEvent::TitleGenerationFailed("Miss 'api_key'".into())),
-            None,
-        );
+        sink.emit(AgentEvent::Turn(TurnEvent::Started));
+        sink.emit(AgentEvent::Turn(TurnEvent::Ended {
+            outcome: Default::default(),
+        }));
+        sink.emit(AgentEvent::Notice(NoticeEvent::Info("info".into())));
+        sink.emit(AgentEvent::Notice(NoticeEvent::Warning("warn".into())));
+        sink.emit(AgentEvent::Notice(NoticeEvent::Error("err".into())));
+        sink.emit(AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("hello".into())],
+        }));
+        sink.emit(AgentEvent::Model(ModelEvent::Final {
+            output: "done".into(),
+            usage: Default::default(),
+        }));
+        sink.emit(AgentEvent::Model(ModelEvent::Error("boom".into())));
+        sink.emit(AgentEvent::User(UserEvent::Message {
+            content: "hello user".into(),
+        }));
+        sink.emit(AgentEvent::Tool(ToolEvent::Blocked {
+            id: String::new(),
+            name: "test_tool".into(),
+            input: serde_json::Value::Null,
+            reason: "hook denied".into(),
+        }));
+        sink.emit(AgentEvent::Session(SessionEvent::TitleUpdated(
+            "A title".into(),
+        )));
+        sink.emit(AgentEvent::Session(SessionEvent::TitleGenerationFailed(
+            "Miss 'api_key'".into(),
+        )));
     }
 
     #[test]
@@ -558,17 +542,14 @@ mod tests {
             RenderOptions::default(),
             harnx_core::abort::create_abort_signal(),
         );
-        sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
+        sink.emit(AgentEvent::Turn(TurnEvent::Started));
         {
             let state = sink.state.lock().unwrap();
             assert!(state.spinner.is_some(), "spinner should be started");
         }
-        sink.emit(
-            AgentEvent::User(UserEvent::Message {
-                content: "hello user".into(),
-            }),
-            None,
-        );
+        sink.emit(AgentEvent::User(UserEvent::Message {
+            content: "hello user".into(),
+        }));
         {
             let state = sink.state.lock().unwrap();
             assert!(
@@ -585,19 +566,13 @@ mod tests {
             RenderOptions::default(),
             harnx_core::abort::create_abort_signal(),
         );
-        sink.emit(
-            AgentEvent::Status(StatusLine {
-                text: "[test-model] generating".into(),
-            }),
-            None,
-        );
-        sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
-        sink.emit(
-            AgentEvent::Turn(TurnEvent::Ended {
-                outcome: Default::default(),
-            }),
-            None,
-        );
+        sink.emit(AgentEvent::Status(StatusLine {
+            text: "[test-model] generating".into(),
+        }));
+        sink.emit(AgentEvent::Turn(TurnEvent::Started));
+        sink.emit(AgentEvent::Turn(TurnEvent::Ended {
+            outcome: Default::default(),
+        }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -607,19 +582,13 @@ mod tests {
             RenderOptions::default(),
             harnx_core::abort::create_abort_signal(),
         );
-        sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
-        sink.emit(
-            AgentEvent::Status(StatusLine {
-                text: "[rich-label] generating".into(),
-            }),
-            None,
-        );
-        sink.emit(
-            AgentEvent::Turn(TurnEvent::Ended {
-                outcome: Default::default(),
-            }),
-            None,
-        );
+        sink.emit(AgentEvent::Turn(TurnEvent::Started));
+        sink.emit(AgentEvent::Status(StatusLine {
+            text: "[rich-label] generating".into(),
+        }));
+        sink.emit(AgentEvent::Turn(TurnEvent::Ended {
+            outcome: Default::default(),
+        }));
     }
 
     // ----------------------------------------------------------------
@@ -886,12 +855,12 @@ mod tests {
             session_id: Some("s1".to_string()),
             model: None,
         };
-        sink.emit(
+        sink.emit(AgentEvent::sub_agent(
+            source.clone(),
             AgentEvent::Model(ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text("hello".into())],
             }),
-            Some(source.clone()),
-        );
+        ));
         let state = sink.state.lock().unwrap();
         assert_eq!(
             state.last_ui_output_source.as_ref(),
@@ -915,19 +884,16 @@ mod tests {
             model: None,
         };
         // Send a chunk to establish source.
-        sink.emit(
+        sink.emit(AgentEvent::sub_agent(
+            source,
             AgentEvent::Model(ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text("hello".into())],
             }),
-            Some(source),
-        );
+        ));
         // End the turn — should reset source tracking.
-        sink.emit(
-            AgentEvent::Turn(TurnEvent::Ended {
-                outcome: Default::default(),
-            }),
-            None,
-        );
+        sink.emit(AgentEvent::Turn(TurnEvent::Ended {
+            outcome: Default::default(),
+        }));
         let state = sink.state.lock().unwrap();
         assert!(
             state.last_ui_output_source.is_none(),
@@ -950,18 +916,18 @@ mod tests {
             model: None,
         };
         // Push two partial chunks without newline.  Buffer should hold both.
-        sink.emit(
+        sink.emit(AgentEvent::sub_agent(
+            source.clone(),
             AgentEvent::Model(ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text("hello ".into())],
             }),
-            Some(source.clone()),
-        );
-        sink.emit(
+        ));
+        sink.emit(AgentEvent::sub_agent(
+            source,
             AgentEvent::Model(ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text("world".into())],
             }),
-            Some(source),
-        );
+        ));
         // In non-TTY test process, handle_chunk_text uses handle_raw_chunk
         // (print!), so buffer stays empty for raw path.  We verify the
         // source hasn't reset — i.e. cleanup was NOT called between chunks.
@@ -969,6 +935,73 @@ mod tests {
         assert!(
             state.last_ui_output_source.is_some(),
             "source should still be set — cleanup must not run between same-source chunks"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sub_agent_final_tracks_source_and_renders() {
+        // SubAgent wrapper with Model::Final should extract the source and
+        // track it (since Final is a model-output event for source-heading).
+        // Note: Final calls cleanup(), which resets last_ui_output_source to None.
+        // We verify the event processed without panic and that cleanup ran.
+        let sink = CliAgentEventSink::new(
+            false,
+            RenderOptions::default(),
+            harnx_core::abort::create_abort_signal(),
+        );
+        let source = AgentSource {
+            agent: "sub".to_string(),
+            session_id: None,
+            model: None,
+        };
+        sink.emit(AgentEvent::sub_agent(
+            source.clone(),
+            AgentEvent::Model(ModelEvent::Final {
+                output: "done".into(),
+                usage: Default::default(),
+            }),
+        ));
+        let state = sink.state.lock().unwrap();
+        // Final triggers cleanup, which clears last_ui_output_source.
+        // We verify the event processed without panic.
+        assert!(
+            state.last_ui_output_source.is_none(),
+            "source should be cleared by cleanup after Final"
+        );
+        assert!(
+            state.buffer.is_empty(),
+            "buffer should be cleared after Final"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sub_agent_error_clears_state_without_panic() {
+        // SubAgent wrapper with Model::Error should be processed without panic.
+        // Error is NOT a model-output event, so source should NOT be tracked.
+        let sink = CliAgentEventSink::new(
+            false,
+            RenderOptions::default(),
+            harnx_core::abort::create_abort_signal(),
+        );
+        let source = AgentSource {
+            agent: "sub".to_string(),
+            session_id: None,
+            model: None,
+        };
+        sink.emit(AgentEvent::sub_agent(
+            source,
+            AgentEvent::Model(ModelEvent::Error("boom".into())),
+        ));
+        let state = sink.state.lock().unwrap();
+        // Error is NOT a model-output event, so source should be None
+        assert!(
+            state.last_ui_output_source.is_none(),
+            "source should NOT be tracked for Error event"
+        );
+        // cleanup is called for Error, so buffer should be empty
+        assert!(
+            state.buffer.is_empty(),
+            "buffer should be cleared after Error"
         );
     }
 
@@ -984,9 +1017,9 @@ mod tests {
             RenderOptions::default(),
             harnx_core::abort::create_abort_signal(),
         );
-        sink.emit(AgentEvent::Session(SessionEvent::CompactingStarted), None);
+        sink.emit(AgentEvent::Session(SessionEvent::CompactingStarted));
         // cleanup to close spinner
-        sink.emit(AgentEvent::Session(SessionEvent::CompactingCompleted), None);
+        sink.emit(AgentEvent::Session(SessionEvent::CompactingCompleted));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -997,19 +1030,19 @@ mod tests {
             harnx_core::abort::create_abort_signal(),
         );
         // Start spinner first
-        sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
+        sink.emit(AgentEvent::Turn(TurnEvent::Started));
         {
             let state = sink.state.lock().unwrap();
             assert!(state.spinner.is_some(), "spinner should be started");
         }
         // CompactingStarted should NOT replace an existing spinner
-        sink.emit(AgentEvent::Session(SessionEvent::CompactingStarted), None);
+        sink.emit(AgentEvent::Session(SessionEvent::CompactingStarted));
         {
             let state = sink.state.lock().unwrap();
             assert!(state.spinner.is_some(), "spinner should still exist");
         }
         // CompactingCompleted clears spinner
-        sink.emit(AgentEvent::Session(SessionEvent::CompactingCompleted), None);
+        sink.emit(AgentEvent::Session(SessionEvent::CompactingCompleted));
         {
             let state = sink.state.lock().unwrap();
             assert!(
@@ -1027,18 +1060,15 @@ mod tests {
             harnx_core::abort::create_abort_signal(),
         );
         // Start spinner
-        sink.emit(AgentEvent::Session(SessionEvent::CompactingStarted), None);
+        sink.emit(AgentEvent::Session(SessionEvent::CompactingStarted));
         {
             let state = sink.state.lock().unwrap();
             assert!(state.spinner.is_some(), "spinner should be started");
         }
         // Failed clears spinner
-        sink.emit(
-            AgentEvent::Session(SessionEvent::CompactingFailed(
-                "something went wrong".to_string(),
-            )),
-            None,
-        );
+        sink.emit(AgentEvent::Session(SessionEvent::CompactingFailed(
+            "something went wrong".to_string(),
+        )));
         {
             let state = sink.state.lock().unwrap();
             assert!(

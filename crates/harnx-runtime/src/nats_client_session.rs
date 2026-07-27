@@ -578,10 +578,9 @@ fn render_log_entry_to_sink(
     // has a boundary and numbers replayed rows immediately here.
     if rendered && history_window.boundary_index().is_some() {
         for logical_index in logical_indices_for_entry(physical_seq, entry, history_window) {
-            sink.emit(
-                AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: logical_index }),
-                None,
-            );
+            sink.emit(AgentEvent::Session(SessionEvent::LogSeqAssigned {
+                seq: logical_index,
+            }));
         }
     }
     // Note: ToolResults fence_token is not currently exposed in the entry type
@@ -627,7 +626,7 @@ fn flush_pending_advisories(
             envelope.event,
             AgentEvent::Session(SessionEvent::LogSeqAssigned { .. })
         ) {
-            sink.emit(envelope.event, None);
+            sink.emit(envelope.event);
         }
     }
 }
@@ -682,10 +681,9 @@ fn emit_deduped_logical_seq(
     emitted_logical_seqs: &mut HashSet<usize>,
 ) {
     if emitted_logical_seqs.insert(logical_index) {
-        sink.emit(
-            AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: logical_index }),
-            None,
-        );
+        sink.emit(AgentEvent::Session(SessionEvent::LogSeqAssigned {
+            seq: logical_index,
+        }));
     }
 }
 
@@ -713,20 +711,14 @@ fn render_message_entry(
 ) {
     if role.is_assistant() {
         use harnx_core::event::ModelEvent;
-        sink.emit(
-            AgentEvent::Model(ModelEvent::Final {
-                output: content.to_text(),
-                usage: Default::default(),
-            }),
-            None,
-        );
+        sink.emit(AgentEvent::Model(ModelEvent::Final {
+            output: content.to_text(),
+            usage: Default::default(),
+        }));
     } else if role.is_user() {
-        sink.emit(
-            AgentEvent::User(UserEvent::Message {
-                content: content.to_text(),
-            }),
-            None,
-        );
+        sink.emit(AgentEvent::User(UserEvent::Message {
+            content: content.to_text(),
+        }));
     }
 }
 
@@ -738,26 +730,20 @@ fn render_tool_calls_entry(
     use harnx_core::event::{ContentBlock, ModelEvent, ToolEvent, ToolKind};
 
     for call in calls {
-        sink.emit(
-            AgentEvent::Tool(ToolEvent::Started {
-                id: call.id.clone().unwrap_or_default(),
-                name: call.name.clone(),
-                kind: ToolKind::Other,
-                markdown: None,
-                input: call.arguments.clone(),
-                locations: vec![],
-            }),
-            None,
-        );
+        sink.emit(AgentEvent::Tool(ToolEvent::Started {
+            id: call.id.clone().unwrap_or_default(),
+            name: call.name.clone(),
+            kind: ToolKind::Other,
+            markdown: None,
+            input: call.arguments.clone(),
+            locations: vec![],
+        }));
     }
 
     if !text.is_empty() {
-        sink.emit(
-            AgentEvent::Model(ModelEvent::MessageChunk {
-                blocks: vec![ContentBlock::Text(text.to_string())],
-            }),
-            None,
-        );
+        sink.emit(AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text(text.to_string())],
+        }));
     }
 }
 
@@ -768,24 +754,20 @@ fn render_tool_results_entry(
     use harnx_core::event::ToolEvent;
 
     for result in results {
-        sink.emit(
-            AgentEvent::Tool(ToolEvent::Completed {
-                id: result.id.clone().unwrap_or_default(),
-                output: result.output.clone(),
-                markdown: result.markdown.clone(),
-            }),
-            None,
-        );
+        sink.emit(AgentEvent::Tool(ToolEvent::Completed {
+            id: result.id.clone().unwrap_or_default(),
+            output: result.output.clone(),
+            markdown: result.markdown.clone(),
+        }));
     }
 }
 
 fn render_cancel_entry(sink: &Arc<dyn AgentEventSink>) {
     use harnx_core::event::NoticeEvent;
 
-    sink.emit(
-        AgentEvent::Notice(NoticeEvent::Warning("Session cancelled".to_string())),
-        None,
-    );
+    sink.emit(AgentEvent::Notice(NoticeEvent::Warning(
+        "Session cancelled".to_string(),
+    )));
 }
 
 /// Send a control command to a remote session.
@@ -802,7 +784,6 @@ pub async fn send_control_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harnx_core::event::AgentSource;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -811,7 +792,7 @@ mod tests {
         events: Mutex<Vec<AgentEvent>>,
     }
     impl AgentEventSink for TestSink {
-        fn emit(&self, event: AgentEvent, _source: Option<AgentSource>) {
+        fn emit(&self, event: AgentEvent) {
             self.count.fetch_add(1, Ordering::SeqCst);
             self.events.lock().unwrap().push(event);
         }

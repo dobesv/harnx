@@ -53,12 +53,9 @@ fn ag_ui_sink_emits_text_message_content_for_chunk() {
         MessageId::from(uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap());
     let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
 
-    sink.emit(
-        AgentEvent::Model(ModelEvent::MessageChunk {
-            blocks: vec![ContentBlock::Text("hello".to_string())],
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Model(ModelEvent::MessageChunk {
+        blocks: vec![ContentBlock::Text("hello".to_string())],
+    }));
 
     let opened_message_id = match rx.try_recv().expect("text start") {
         Event::TextMessageStart(event) => {
@@ -85,26 +82,110 @@ fn ag_ui_sink_emits_text_message_content_for_chunk() {
 }
 
 #[test]
+fn ag_ui_sink_unwraps_sub_agent_message_chunk() {
+    // SubAgent wrapper is transparently unwrapped at the top of emit.
+    // The resulting AG-UI events should match the bare MessageChunk path.
+    use harnx_core::event::AgentSource;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let message_id =
+        MessageId::from(uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap());
+    let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
+
+    let source = AgentSource {
+        agent: "sub".into(),
+        session_id: None,
+        model: None,
+    };
+    sink.emit(AgentEvent::sub_agent(
+        source,
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("hello".into())],
+        }),
+    ));
+
+    let opened_message_id = match rx.try_recv().expect("text start") {
+        Event::TextMessageStart(event) => {
+            assert_eq!(event.role, Role::Assistant);
+            event.message_id
+        }
+        other => panic!("expected TextMessageStart event, got: {other:?}"),
+    };
+    match rx.try_recv().expect("text content") {
+        Event::TextMessageContent(TextMessageContentEvent {
+            base,
+            message_id: mid,
+            delta,
+        }) => {
+            assert_eq!(base.timestamp, None);
+            assert_eq!(base.raw_event, None);
+            assert_eq!(mid, opened_message_id);
+            assert_eq!(delta, "hello");
+        }
+        other => panic!("expected TextMessageContent event, got: {other:?}"),
+    }
+
+    assert!(rx.try_recv().is_err(), "no additional events expected");
+}
+
+#[test]
+fn ag_ui_sink_unwraps_sub_agent_error() {
+    // SubAgent wrapper around Model::Error should produce the same RunError
+    // event as the bare error path after unwrapping at the top of emit.
+    use harnx_core::event::AgentSource;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let message_id =
+        MessageId::from(uuid::Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap());
+    // Use `new` (not with_snapshot) for error path — finish_turn is not called
+    // unless a message was already started, so we expect RunError directly.
+    let sink = super::AgUiSink::new(tx, message_id.clone());
+
+    let source = AgentSource {
+        agent: "sub".into(),
+        session_id: None,
+        model: None,
+    };
+    sink.emit(AgentEvent::sub_agent(
+        source,
+        AgentEvent::Model(ModelEvent::Error("boom".into())),
+    ));
+
+    // RunError with the wrapped message
+    match rx.try_recv().expect("run error") {
+        Event::RunError(RunErrorEvent {
+            base,
+            message,
+            code,
+        }) => {
+            assert_eq!(base.timestamp, None);
+            assert_eq!(base.raw_event, None);
+            assert_eq!(message, "boom");
+            assert!(code.is_none());
+        }
+        other => panic!("expected RunError event, got: {other:?}"),
+    }
+
+    assert!(rx.try_recv().is_err(), "no additional events expected");
+}
+
+#[test]
 fn ag_ui_sink_skips_empty_chunk() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let message_id = MessageId::from(uuid::Uuid::new_v4());
     let sink = super::AgUiSink::new(tx, message_id);
 
-    sink.emit(
-        AgentEvent::Model(ModelEvent::MessageChunk { blocks: vec![] }),
-        None,
-    );
+    sink.emit(AgentEvent::Model(ModelEvent::MessageChunk {
+        blocks: vec![],
+    }));
     assert!(rx.try_recv().is_err());
 
-    sink.emit(
-        AgentEvent::Model(ModelEvent::MessageChunk {
-            blocks: vec![ContentBlock::Image {
-                data: vec![],
-                mime: "image/png".to_string(),
-            }],
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Model(ModelEvent::MessageChunk {
+        blocks: vec![ContentBlock::Image {
+            data: vec![],
+            mime: "image/png".to_string(),
+        }],
+    }));
     assert!(rx.try_recv().is_err());
 }
 
@@ -114,10 +195,7 @@ fn ag_ui_sink_emits_run_error_for_model_error() {
     let message_id = MessageId::from(uuid::Uuid::new_v4());
     let sink = super::AgUiSink::new(tx, message_id);
 
-    sink.emit(
-        AgentEvent::Model(ModelEvent::Error("boom".to_string())),
-        None,
-    );
+    sink.emit(AgentEvent::Model(ModelEvent::Error("boom".to_string())));
 
     let event = rx.try_recv().expect("should receive event");
     match event {
@@ -141,12 +219,9 @@ fn ag_ui_sink_emits_custom_for_title_generation_failed() {
     let message_id = MessageId::from(uuid::Uuid::new_v4());
     let sink = super::AgUiSink::new(tx, message_id);
 
-    sink.emit(
-        AgentEvent::Session(SessionEvent::TitleGenerationFailed(
-            "Miss 'api_key'".to_string(),
-        )),
-        None,
-    );
+    sink.emit(AgentEvent::Session(SessionEvent::TitleGenerationFailed(
+        "Miss 'api_key'".to_string(),
+    )));
 
     let event = rx.try_recv().expect("should receive event");
     match event {
@@ -164,10 +239,9 @@ fn ag_ui_sink_emits_run_error_for_notice_error() {
     let message_id = MessageId::from(uuid::Uuid::new_v4());
     let sink = super::AgUiSink::new(tx, message_id);
 
-    sink.emit(
-        AgentEvent::Notice(NoticeEvent::Error("fatal error".to_string())),
-        None,
-    );
+    sink.emit(AgentEvent::Notice(NoticeEvent::Error(
+        "fatal error".to_string(),
+    )));
 
     let event = rx.try_recv().expect("should receive event");
     match event {
@@ -184,12 +258,9 @@ fn ag_ui_sink_emits_custom_status_event() {
     let message_id = MessageId::from(uuid::Uuid::new_v4());
     let sink = super::AgUiSink::new(tx, message_id);
 
-    sink.emit(
-        AgentEvent::Status(harnx_core::event::StatusLine {
-            text: "working...".to_string(),
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Status(harnx_core::event::StatusLine {
+        text: "working...".to_string(),
+    }));
 
     let event = rx.try_recv().expect("should receive status event");
     match event {
@@ -211,13 +282,10 @@ fn ag_ui_sink_emits_final_as_content_when_non_empty() {
     let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
 
     let usage = CompletionTokenUsage::new(Some(10), Some(5), Some(0));
-    sink.emit(
-        AgentEvent::Model(ModelEvent::Final {
-            output: "final text".to_string(),
-            usage,
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Model(ModelEvent::Final {
+        output: "final text".to_string(),
+        usage,
+    }));
 
     let opened_message_id = match rx.try_recv().expect("text start") {
         Event::TextMessageStart(event) => {
@@ -247,13 +315,10 @@ fn ag_ui_sink_skips_final_when_empty() {
     let sink = super::AgUiSink::new(tx, message_id);
 
     let usage = CompletionTokenUsage::new(Some(10), Some(5), Some(0));
-    sink.emit(
-        AgentEvent::Model(ModelEvent::Final {
-            output: String::new(),
-            usage,
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Model(ModelEvent::Final {
+        output: String::new(),
+        usage,
+    }));
 
     assert!(rx.try_recv().is_err());
 }
@@ -264,25 +329,16 @@ fn ag_ui_sink_maps_thought_then_text_and_closes_thinking_before_text() {
     let message_id = MessageId::from(uuid::Uuid::new_v4());
     let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
 
-    sink.emit(
-        AgentEvent::Model(ModelEvent::ThoughtChunk {
-            blocks: vec![ContentBlock::Text("thinking...".to_string())],
-        }),
-        None,
-    );
-    sink.emit(
-        AgentEvent::Model(ModelEvent::MessageChunk {
-            blocks: vec![ContentBlock::Text("answer".to_string())],
-        }),
-        None,
-    );
-    sink.emit(
-        AgentEvent::Model(ModelEvent::Final {
-            output: String::new(),
-            usage: CompletionTokenUsage::default(),
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Model(ModelEvent::ThoughtChunk {
+        blocks: vec![ContentBlock::Text("thinking...".to_string())],
+    }));
+    sink.emit(AgentEvent::Model(ModelEvent::MessageChunk {
+        blocks: vec![ContentBlock::Text("answer".to_string())],
+    }));
+    sink.emit(AgentEvent::Model(ModelEvent::Final {
+        output: String::new(),
+        usage: CompletionTokenUsage::default(),
+    }));
 
     assert!(matches!(
         rx.try_recv().expect("thinking start"),
@@ -327,23 +383,17 @@ fn ag_ui_sink_closes_thinking_before_tool_events() {
     let message_id = MessageId::from(uuid::Uuid::new_v4());
     let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
 
-    sink.emit(
-        AgentEvent::Model(ModelEvent::ThoughtChunk {
-            blocks: vec![ContentBlock::Text("planning".to_string())],
-        }),
-        None,
-    );
-    sink.emit(
-        AgentEvent::Tool(ToolEvent::Started {
-            id: "tool-1".to_string(),
-            name: "read_history".to_string(),
-            kind: harnx_core::event::ToolKind::Other,
-            markdown: None,
-            input: json!({"limit": 1}),
-            locations: vec![],
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Model(ModelEvent::ThoughtChunk {
+        blocks: vec![ContentBlock::Text("planning".to_string())],
+    }));
+    sink.emit(AgentEvent::Tool(ToolEvent::Started {
+        id: "tool-1".to_string(),
+        name: "read_history".to_string(),
+        kind: harnx_core::event::ToolKind::Other,
+        markdown: None,
+        input: json!({"limit": 1}),
+        locations: vec![],
+    }));
 
     assert!(matches!(
         rx.try_recv().expect("thinking start"),
@@ -385,30 +435,18 @@ fn ag_ui_sink_keeps_thinking_open_across_background_session_event() {
     let message_id = MessageId::from(uuid::Uuid::new_v4());
     let sink = super::AgUiSink::with_snapshot(tx, message_id, false, None);
 
-    sink.emit(
-        AgentEvent::Model(ModelEvent::ThoughtChunk {
-            blocks: vec![ContentBlock::Text("thinking one".to_string())],
-        }),
-        None,
-    );
-    sink.emit(
-        AgentEvent::Session(SessionEvent::Saved {
-            path: "/tmp/session.json".into(),
-        }),
-        None,
-    );
-    sink.emit(
-        AgentEvent::Model(ModelEvent::ThoughtChunk {
-            blocks: vec![ContentBlock::Text(" thinking two".to_string())],
-        }),
-        None,
-    );
-    sink.emit(
-        AgentEvent::Turn(TurnEvent::Ended {
-            outcome: harnx_core::event::TurnOutcome::default(),
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Model(ModelEvent::ThoughtChunk {
+        blocks: vec![ContentBlock::Text("thinking one".to_string())],
+    }));
+    sink.emit(AgentEvent::Session(SessionEvent::Saved {
+        path: "/tmp/session.json".into(),
+    }));
+    sink.emit(AgentEvent::Model(ModelEvent::ThoughtChunk {
+        blocks: vec![ContentBlock::Text(" thinking two".to_string())],
+    }));
+    sink.emit(AgentEvent::Turn(TurnEvent::Ended {
+        outcome: harnx_core::event::TurnOutcome::default(),
+    }));
 
     assert!(matches!(
         rx.try_recv().expect("thinking start"),
@@ -453,25 +491,19 @@ fn ag_ui_sink_maps_tool_started_completed_to_ag_ui_events() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let message_id = MessageId::from(uuid::Uuid::new_v4());
     let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
-    sink.emit(
-        AgentEvent::Tool(ToolEvent::Started {
-            id: "history-1".to_string(),
-            name: "read_history".to_string(),
-            kind: harnx_core::event::ToolKind::Other,
-            markdown: None,
-            input: json!({"limit": 5, "entry_type": "message"}),
-            locations: vec![],
-        }),
-        None,
-    );
-    sink.emit(
-        AgentEvent::Tool(ToolEvent::Completed {
-            id: "history-1".to_string(),
-            output: json!("history checked"),
-            markdown: None,
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Tool(ToolEvent::Started {
+        id: "history-1".to_string(),
+        name: "read_history".to_string(),
+        kind: harnx_core::event::ToolKind::Other,
+        markdown: None,
+        input: json!({"limit": 5, "entry_type": "message"}),
+        locations: vec![],
+    }));
+    sink.emit(AgentEvent::Tool(ToolEvent::Completed {
+        id: "history-1".to_string(),
+        output: json!("history checked"),
+        markdown: None,
+    }));
 
     match rx.try_recv().expect("tool start") {
         Event::ToolCallStart(event) => {
@@ -530,37 +562,25 @@ fn ag_ui_sink_segments_text_around_tool_calls() {
     let message_id = MessageId::from(uuid::Uuid::new_v4());
     let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
 
-    sink.emit(
-        AgentEvent::Model(ModelEvent::MessageChunk {
-            blocks: vec![ContentBlock::Text("A".to_string())],
-        }),
-        None,
-    );
-    sink.emit(
-        AgentEvent::Tool(ToolEvent::Started {
-            id: "history-3".to_string(),
-            name: "read_history".to_string(),
-            kind: harnx_core::event::ToolKind::Other,
-            markdown: None,
-            input: json!({"limit": 1}),
-            locations: vec![],
-        }),
-        None,
-    );
-    sink.emit(
-        AgentEvent::Tool(ToolEvent::Completed {
-            id: "history-3".to_string(),
-            output: json!("done"),
-            markdown: None,
-        }),
-        None,
-    );
-    sink.emit(
-        AgentEvent::Model(ModelEvent::MessageChunk {
-            blocks: vec![ContentBlock::Text("B".to_string())],
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Model(ModelEvent::MessageChunk {
+        blocks: vec![ContentBlock::Text("A".to_string())],
+    }));
+    sink.emit(AgentEvent::Tool(ToolEvent::Started {
+        id: "history-3".to_string(),
+        name: "read_history".to_string(),
+        kind: harnx_core::event::ToolKind::Other,
+        markdown: None,
+        input: json!({"limit": 1}),
+        locations: vec![],
+    }));
+    sink.emit(AgentEvent::Tool(ToolEvent::Completed {
+        id: "history-3".to_string(),
+        output: json!("done"),
+        markdown: None,
+    }));
+    sink.emit(AgentEvent::Model(ModelEvent::MessageChunk {
+        blocks: vec![ContentBlock::Text("B".to_string())],
+    }));
 
     let first_id = match rx.try_recv().expect("first text start") {
         Event::TextMessageStart(event) => {
@@ -633,23 +653,17 @@ fn ag_ui_sink_does_not_emit_orphan_text_end_after_tool_only_tail() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let sink = super::AgUiSink::with_snapshot(tx, MessageId::random(), false, None);
 
-    sink.emit(
-        AgentEvent::Model(ModelEvent::MessageChunk {
-            blocks: vec![ContentBlock::Text("A".to_string())],
-        }),
-        None,
-    );
-    sink.emit(
-        AgentEvent::Tool(ToolEvent::Started {
-            id: "history-4".to_string(),
-            name: "read_history".to_string(),
-            kind: harnx_core::event::ToolKind::Other,
-            markdown: None,
-            input: json!({"limit": 1}),
-            locations: vec![],
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Model(ModelEvent::MessageChunk {
+        blocks: vec![ContentBlock::Text("A".to_string())],
+    }));
+    sink.emit(AgentEvent::Tool(ToolEvent::Started {
+        id: "history-4".to_string(),
+        name: "read_history".to_string(),
+        kind: harnx_core::event::ToolKind::Other,
+        markdown: None,
+        input: json!({"limit": 1}),
+        locations: vec![],
+    }));
 
     while let Ok(_event) = rx.try_recv() {}
     assert!(sink.close_text_segment().is_none());
@@ -662,17 +676,14 @@ fn ag_ui_sink_emits_tool_summary_custom_event_and_preserves_start_args() {
     let message_id = MessageId::from(uuid::Uuid::new_v4());
     let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
 
-    sink.emit(
-        AgentEvent::Tool(ToolEvent::Started {
-            id: "history-2".to_string(),
-            name: "read_history".to_string(),
-            kind: harnx_core::event::ToolKind::Other,
-            markdown: Some("### Summary\n- item".to_string()),
-            input: json!({"limit": 2}),
-            locations: vec![],
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Tool(ToolEvent::Started {
+        id: "history-2".to_string(),
+        name: "read_history".to_string(),
+        kind: harnx_core::event::ToolKind::Other,
+        markdown: Some("### Summary\n- item".to_string()),
+        input: json!({"limit": 2}),
+        locations: vec![],
+    }));
 
     match rx.try_recv().expect("tool start") {
         Event::ToolCallStart(event) => {
@@ -728,15 +739,12 @@ fn ag_ui_sink_usage_event_includes_context_fields_and_legacy_fields() {
     let sink =
         super::AgUiSink::with_snapshot_and_context(tx, message_id, true, None, Some(context));
 
-    sink.emit(
-        AgentEvent::Model(ModelEvent::Usage {
-            input: 12,
-            output: 34,
-            cached: 5,
-            session_label: Some("sess-a".to_string()),
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Model(ModelEvent::Usage {
+        input: 12,
+        output: 34,
+        cached: 5,
+        session_label: Some("sess-a".to_string()),
+    }));
 
     match rx.try_recv().expect("usage event") {
         Event::Custom(CustomEvent { name, value, .. }) => {
@@ -764,22 +772,16 @@ fn ag_ui_sink_maps_tool_failures_and_blocked_to_results() {
     let message_id = MessageId::from(uuid::Uuid::new_v4());
     let sink = super::AgUiSink::new(tx, message_id);
 
-    sink.emit(
-        AgentEvent::Tool(ToolEvent::Failed {
-            id: "tool-fail".to_string(),
-            error: "boom".to_string(),
-        }),
-        None,
-    );
-    sink.emit(
-        AgentEvent::Tool(ToolEvent::Blocked {
-            id: "tool-blocked".to_string(),
-            name: "danger".to_string(),
-            input: json!({"path": "/tmp"}),
-            reason: "blocked by policy".to_string(),
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Tool(ToolEvent::Failed {
+        id: "tool-fail".to_string(),
+        error: "boom".to_string(),
+    }));
+    sink.emit(AgentEvent::Tool(ToolEvent::Blocked {
+        id: "tool-blocked".to_string(),
+        name: "danger".to_string(),
+        input: json!({"path": "/tmp"}),
+        reason: "blocked by policy".to_string(),
+    }));
 
     for (expected_id, expected_content) in
         [("tool-fail", "boom"), ("tool-blocked", "blocked by policy")]
@@ -866,13 +868,10 @@ fn ag_ui_sink_maps_turn_started_and_ended_to_step_events() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let sink = super::AgUiSink::with_snapshot(tx, MessageId::random(), true, None);
 
-    sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
-    sink.emit(
-        AgentEvent::Turn(TurnEvent::Ended {
-            outcome: harnx_core::event::TurnOutcome::default(),
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Turn(TurnEvent::Started));
+    sink.emit(AgentEvent::Turn(TurnEvent::Ended {
+        outcome: harnx_core::event::TurnOutcome::default(),
+    }));
 
     match rx.try_recv().expect("step started") {
         Event::StepStarted(event) => assert_eq!(event.step_name, "turn-1"),
@@ -890,15 +889,12 @@ fn ag_ui_sink_maps_plan_event_to_custom() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let sink = super::AgUiSink::with_snapshot(tx, MessageId::random(), true, None);
 
-    sink.emit(
-        AgentEvent::Plan {
-            entries: vec![harnx_core::event::PlanEntry {
-                status: "in_progress".to_string(),
-                content: "check logs".to_string(),
-            }],
-        },
-        None,
-    );
+    sink.emit(AgentEvent::Plan {
+        entries: vec![harnx_core::event::PlanEntry {
+            status: "in_progress".to_string(),
+            content: "check logs".to_string(),
+        }],
+    });
 
     match rx.try_recv().expect("plan custom") {
         Event::Custom(event) => {
@@ -948,21 +944,15 @@ fn ag_ui_sink_emits_session_handoff_custom_event_on_handoff_requested() {
     let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
 
     // Emit the handoff event
-    sink.emit(
-        AgentEvent::Turn(TurnEvent::HandoffRequested {
-            agent: "target-agent".to_string(),
-            session_id: Some("target-session-123".to_string()),
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Turn(TurnEvent::HandoffRequested {
+        agent: "target-agent".to_string(),
+        session_id: Some("target-session-123".to_string()),
+    }));
 
     // Emit a step finished event (simulating turn end after handoff)
-    sink.emit(
-        AgentEvent::Turn(TurnEvent::Ended {
-            outcome: harnx_core::event::TurnOutcome::default(),
-        }),
-        None,
-    );
+    sink.emit(AgentEvent::Turn(TurnEvent::Ended {
+        outcome: harnx_core::event::TurnOutcome::default(),
+    }));
 
     // Collect all events in order
     let mut events: Vec<Event> = Vec::new();
@@ -1025,7 +1015,7 @@ fn ag_ui_sink_maps_compaction_completed_to_custom_and_snapshot() {
     });
     let sink = super::AgUiSink::with_snapshot(tx, MessageId::random(), true, Some(snapshot));
 
-    sink.emit(AgentEvent::Session(SessionEvent::CompactingCompleted), None);
+    sink.emit(AgentEvent::Session(SessionEvent::CompactingCompleted));
 
     match rx.try_recv().expect("compaction custom") {
         Event::Custom(event) => {

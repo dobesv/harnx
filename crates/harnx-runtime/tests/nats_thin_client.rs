@@ -92,7 +92,7 @@ async fn append_new_reply_after_current_turn_user(
 struct NoopEventSink;
 
 impl AgentEventSink for NoopEventSink {
-    fn emit(&self, _event: AgentEvent, _source: Option<harnx_core::event::AgentSource>) {}
+    fn emit(&self, _event: AgentEvent) {}
 }
 
 /// Test that control commands are sent correctly
