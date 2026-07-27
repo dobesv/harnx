@@ -23,7 +23,7 @@ dependencies = [
 [[package]]
 name = "agent-client-protocol"
 version = "2.0.0"
-source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=21ab9c94b51d223510718c5ab74c9e32de383fe8#21ab9c94b51d223510718c5ab74c9e32de383fe8"
+source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=2875a2802ac09d2cb49aba4a6e4ad7f02b67a4c0#2875a2802ac09d2cb49aba4a6e4ad7f02b67a4c0"
 dependencies = [
  "agent-client-protocol-derive",
  "agent-client-protocol-schema",
@@ -46,7 +46,7 @@ dependencies = [
 [[package]]
 name = "agent-client-protocol-derive"
 version = "2.0.0"
-source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=21ab9c94b51d223510718c5ab74c9e32de383fe8#21ab9c94b51d223510718c5ab74c9e32de383fe8"
+source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=2875a2802ac09d2cb49aba4a6e4ad7f02b67a4c0#2875a2802ac09d2cb49aba4a6e4ad7f02b67a4c0"
 dependencies = [
  "quote",
  "syn 3.0.2",
@@ -54,9 +54,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-schema"
-version = "1.5.0"
+version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5c231915b4ab578c722eca2d1bd7df4d300bfd6cac3b8e9f0d1e3ddc95b187c"
+checksum = "1c216d4b350cbc1b13f2b7d752af6698c8ba347be274275cb5a5c735da147066"
 dependencies = [
  "anyhow",
  "derive_more",
