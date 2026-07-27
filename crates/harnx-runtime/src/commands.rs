@@ -35,12 +35,14 @@ pub static COMMANDS: LazyLock<[Command; 50]> = LazyLock::new(|| {
         Command::new(".help", "Show this help guide"),
         Command::new(".info", "Show system info"),
         Command::new(".info tools", "List all available tools and their status"),
-        Command::new(
-            ".info mcp [server]",
+        Command::with_usage(
+            ".info mcp",
+            "[server]",
             "Show an MCP server's command, args, env, roots, hooks, and PID",
         ),
-        Command::new(
-            ".info env [name]",
+        Command::with_usage(
+            ".info env",
+            "[name]",
             "List harnx process env var names (or show one var's value)",
         ),
         Command::new(".use tool", "Add a tool or toolset to the active tools"),
@@ -71,12 +73,14 @@ pub static COMMANDS: LazyLock<[Command; 50]> = LazyLock::new(|| {
         ),
         Command::new(".info theme", "Show active syntax-highlight theme"),
         Command::new(".edit session", "Modify current session"),
-        Command::new(
-            ".edit message <n>",
+        Command::with_usage(
+            ".edit message",
+            "<n>",
             "Edit a single log entry by sequence number",
         ),
-        Command::new(
-            ".edit message <n>-<m>",
+        Command::with_usage(
+            ".edit message",
+            "<n>-<m>",
             "Edit a range of log entries by sequence number",
         ),
         Command::new(".save session", "Save current session to file"),
@@ -111,13 +115,19 @@ pub static COMMANDS: LazyLock<[Command; 50]> = LazyLock::new(|| {
             "Toggle timestamp in transcript (on/off)",
         ),
         Command::new(".delete", "Delete agents, sessions, RAGs, or macros"),
-        Command::new(
-            ".delete message <n>",
+        Command::with_usage(
+            ".delete message",
+            "<n>",
             "Delete a log entry by sequence number",
         ),
-        Command::new(".delete message <n>-<m>", "Delete a range of log entries"),
-        Command::new(
-            ".rewind <n>",
+        Command::with_usage(
+            ".delete message",
+            "<n>-<m>",
+            "Delete a range of log entries",
+        ),
+        Command::with_usage(
+            ".rewind",
+            "<n>",
             "Rewind session context to entry N (all later entries excluded)",
         ),
         Command::new(".exit", "Exit the interactive session"),
@@ -130,6 +140,7 @@ static MULTILINE_RE: LazyLock<Regex> =
 #[derive(Debug, Clone)]
 pub struct Command {
     pub name: &'static str,
+    pub usage: Option<&'static str>,
     pub description: &'static str,
 }
 
@@ -137,6 +148,15 @@ impl Command {
     const fn new(name: &'static str, desc: &'static str) -> Self {
         Self {
             name,
+            usage: None,
+            description: desc,
+        }
+    }
+
+    const fn with_usage(name: &'static str, usage: &'static str, desc: &'static str) -> Self {
+        Self {
+            name,
+            usage: Some(usage),
             description: desc,
         }
     }
@@ -1185,7 +1205,13 @@ fn unknown_command() -> Result<()> {
 fn dump_help(output: &mut (dyn Write + Send)) -> Result<()> {
     let head = COMMANDS
         .iter()
-        .map(|cmd| format!("{:<24} {}", cmd.name, cmd.description))
+        .map(|cmd| {
+            let label = match cmd.usage {
+                Some(usage) => format!("{} {usage}", cmd.name),
+                None => cmd.name.to_string(),
+            };
+            format!("{label:<24} {}", cmd.description)
+        })
         .collect::<Vec<String>>()
         .join("\n");
     writeln!(
