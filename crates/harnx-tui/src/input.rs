@@ -13,6 +13,7 @@ use harnx_runtime::config::{
 };
 use harnx_runtime::utils::pretty_yaml_block;
 use ratatui_textarea::{Input as TextInput, Key};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Byte budget for an attachment preview. Applied via `truncate_output`'s
@@ -1923,9 +1924,10 @@ impl Tui {
         // If we're still typing the first word starting with '.', complete commands
         if parts.len() == 1 && cmd.starts_with('.') {
             let filter = cmd;
+            let mut seen = HashSet::new();
             let commands: Vec<(String, Option<String>)> = harnx_runtime::commands::COMMANDS
                 .iter()
-                .filter(|c| c.name.starts_with(filter))
+                .filter(|c| c.name.starts_with(filter) && seen.insert(c.name))
                 .map(|c| (format!("{} ", c.name), Some(c.description.to_string())))
                 .collect();
             return commands;

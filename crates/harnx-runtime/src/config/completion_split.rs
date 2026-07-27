@@ -35,6 +35,9 @@ impl Config {
                 ".title" => map_completion_values(vec!["generate", "now"]),
                 ".use" => map_completion_values(vec!["tool"]),
                 ".drop" => map_completion_values(vec!["tool"]),
+                ".edit" => {
+                    map_completion_values(vec!["config", "agent", "session", "message", "rag-docs"])
+                }
                 ".starter" => match &self.agent {
                     Some(agent) => agent
                         .conversation_staters()
@@ -68,9 +71,14 @@ impl Config {
                         .map(|v| (format!("{v} "), None))
                         .collect()
                 }
-                ".delete" => {
-                    map_completion_values(vec!["agent", "session", "rag", "macro", "agent-data"])
-                }
+                ".delete" => map_completion_values(vec![
+                    "agent",
+                    "session",
+                    "rag",
+                    "macro",
+                    "agent-data",
+                    "message",
+                ]),
                 _ => vec![],
             };
         } else if cmd == ".set" && args.len() == 2 {
