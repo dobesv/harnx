@@ -31,6 +31,7 @@ FIELD_ORDER = [
     "supports_vision",
     "supports_tool_use",
     "patches",
+    "endpoint",
     "type",
     "max_tokens_per_chunk",
     "default_chunk_size",
@@ -40,6 +41,7 @@ FIELD_ORDER = [
 
 HARNX_ONLY_FIELDS = [
     "patches",
+    "endpoint",
     "require_max_tokens",
     "real_name",
     "system_prompt_prefix",

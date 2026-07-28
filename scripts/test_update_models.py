@@ -426,6 +426,20 @@ class TestMergeOldFields(unittest.TestCase):
         merged = um.merge_old_fields(new, None)
         self.assertEqual(merged, new)
 
+    def test_endpoint_preserved(self) -> None:
+        # GPT models pinned to the responses endpoint must keep the field when
+        # regenerated from the LiteLLM registry (which does not carry it).
+        old = {"name": "gpt-5", "endpoint": "responses"}
+        new = {"name": "gpt-5", "max_input_tokens": 400000}
+        merged = um.merge_old_fields(new, old)
+        self.assertEqual(merged["endpoint"], "responses")
+
+    def test_endpoint_survives_ordered_model(self) -> None:
+        # ordered_model only emits fields in FIELD_ORDER; endpoint must be there
+        # so the preserved value is not dropped during serialization.
+        ordered = um.ordered_model({"name": "gpt-5", "endpoint": "responses"})
+        self.assertEqual(ordered["endpoint"], "responses")
+
 
 class TestRenderProviderBlock(unittest.TestCase):
     """Tests for YAML output formatting."""
