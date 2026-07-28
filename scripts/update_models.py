@@ -31,6 +31,7 @@ FIELD_ORDER = [
     "supports_vision",
     "supports_tool_use",
     "patches",
+    "endpoint",
     "type",
     "max_tokens_per_chunk",
     "default_chunk_size",
@@ -40,6 +41,7 @@ FIELD_ORDER = [
 
 HARNX_ONLY_FIELDS = [
     "patches",
+    "endpoint",
     "require_max_tokens",
     "real_name",
     "system_prompt_prefix",
@@ -332,6 +334,35 @@ def claude_requires_max_tokens(name: str) -> bool:
 
 def is_variant_name(name: str) -> bool:
     return ":" in name and name.rsplit(":", 1)[1] in VARIANT_SUFFIXES
+
+
+def apply_openai_endpoint_default(
+    model: dict[str, Any], provider: str, payload: dict[str, Any]
+) -> None:
+    """Route OpenAI chat models to the `responses` endpoint when the LiteLLM
+    registry says they support it.
+
+    OpenAI's Responses API (`/v1/responses`) is the path forward for chat models
+    (starting with gpt-5.4, tool calling is unsupported on Chat Completions with
+    `reasoning: none`). The registry's per-model `supported_endpoints` array is a
+    machine-readable capability signal — when it lists `/v1/responses` we set
+    `endpoint: responses`, so new model families pick this up automatically
+    without a hand-maintained version list. Legacy models whose registry entry
+    omits the field (gpt-4o, gpt-4, gpt-3.5-turbo, o1, ...) are left on Chat
+    Completions.
+
+    A human choice recorded in models.yaml wins: an already-present `endpoint`
+    (preserved via merge_old_fields) is never overwritten.
+    """
+    if provider != "openai":
+        return
+    if model.get("type") is not None:  # non-chat (embedding/reranker) models
+        return
+    if "endpoint" in model:  # preserve any human-curated value
+        return
+    supported = payload.get("supported_endpoints")
+    if isinstance(supported, list) and "/v1/responses" in supported:
+        model["endpoint"] = "responses"
 
 
 def claude_adaptive_patch(effort: str) -> str:
@@ -750,6 +781,7 @@ def main() -> int:
         model = build_model_from_litellm(model_name, payload, mode)
         old_model = old_by_provider.get(provider, {}).get(model_name)
         model = merge_old_fields(model, old_model)
+        apply_openai_endpoint_default(model, provider, payload)
         new_provider_models[provider][model_name] = model
 
     final_provider_models: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
