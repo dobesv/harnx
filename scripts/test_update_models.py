@@ -441,6 +441,47 @@ class TestMergeOldFields(unittest.TestCase):
         self.assertEqual(ordered["endpoint"], "responses")
 
 
+class TestOpenAIEndpointDefault(unittest.TestCase):
+    """OpenAI chat models are routed to the responses endpoint when the LiteLLM
+    registry's supported_endpoints signals it."""
+
+    _RESP = ["/v1/chat/completions", "/v1/batch", "/v1/responses"]
+
+    def test_responses_capable_gets_endpoint(self) -> None:
+        model = {"name": "gpt-5.7"}
+        um.apply_openai_endpoint_default(model, "openai", {"supported_endpoints": self._RESP})
+        self.assertEqual(model["endpoint"], "responses")
+
+    def test_no_signal_leaves_chat_completions(self) -> None:
+        # Legacy models (gpt-4o, gpt-4, ...) have no supported_endpoints field.
+        model = {"name": "gpt-4o"}
+        um.apply_openai_endpoint_default(model, "openai", {})
+        self.assertNotIn("endpoint", model)
+
+    def test_endpoints_without_responses_left_alone(self) -> None:
+        model = {"name": "weird"}
+        um.apply_openai_endpoint_default(
+            model, "openai", {"supported_endpoints": ["/v1/chat/completions"]}
+        )
+        self.assertNotIn("endpoint", model)
+
+    def test_human_override_not_clobbered(self) -> None:
+        # A value already on the (merged) model wins over the registry signal.
+        model = {"name": "gpt-4o", "endpoint": "chat/completions"}
+        um.apply_openai_endpoint_default(model, "openai", {"supported_endpoints": self._RESP})
+        self.assertEqual(model["endpoint"], "chat/completions")
+
+    def test_non_openai_provider_unaffected(self) -> None:
+        model = {"name": "claude-x"}
+        um.apply_openai_endpoint_default(model, "claude", {"supported_endpoints": self._RESP})
+        self.assertNotIn("endpoint", model)
+
+    def test_embedding_model_unaffected(self) -> None:
+        model = {"name": "text-embedding-3-large", "type": "embedding"}
+        um.apply_openai_endpoint_default(model, "openai", {"supported_endpoints": self._RESP})
+        self.assertNotIn("endpoint", model)
+
+
 class TestRenderProviderBlock(unittest.TestCase):
     """Tests for YAML output formatting."""
 
