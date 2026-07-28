@@ -45,6 +45,9 @@ variables:
 - name: output_style
   description: Output style rules for concise, low-verbosity responses
   path: shared/output-style.md
+- name: natural_writing
+  description: Natural writing style rules for prose (comments, docs, commits, PRs)
+  path: shared/natural-writing.md
 ---
 
 {{peitho_core}}
@@ -78,5 +81,7 @@ You are a worker agent delegated to by Sisyphus or Atlas. The local repo and bra
 already set up for you. Focus on doing the work and reporting results — the orchestrator
 handles git operations.
 </context>
+
+{{natural_writing}}
 
 {{output_style}}

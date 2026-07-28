@@ -83,6 +83,9 @@ variables:
 - name: output_style
   description: Output style rules for concise, low-verbosity responses
   path: shared/output-style.md
+- name: natural_writing
+  description: Natural writing style rules for prose (comments, docs, commits, PRs)
+  path: shared/natural-writing.md
 ---
 
 {{atlas_core}}
@@ -98,5 +101,7 @@ variables:
 {{ast_grep_search}}
 
 {{quality_review}}
+
+{{natural_writing}}
 
 {{output_style}}

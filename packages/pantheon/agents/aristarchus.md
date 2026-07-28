@@ -60,6 +60,9 @@ variables:
 - name: output_style
   description: Output style rules for concise, low-verbosity responses
   path: shared/output-style.md
+- name: natural_writing
+  description: Natural writing style rules for prose (comments, docs, commits, PRs)
+  path: shared/natural-writing.md
 - name: policy_test_coverage
   description: Test coverage policy — trigger, exemptions, opt-out rules
   path: shared/policy-test-coverage.md
@@ -68,5 +71,7 @@ variables:
 {{aristarchus_core}}
 
 {{policy_test_coverage}}
+
+{{natural_writing}}
 
 {{output_style}}

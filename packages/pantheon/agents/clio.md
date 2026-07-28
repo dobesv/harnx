@@ -37,6 +37,9 @@ variables:
 - name: output_style
   description: Output style rules for concise, low-verbosity responses
   path: shared/output-style.md
+- name: natural_writing
+  description: Natural writing style rules for prose (comments, docs, commits, PRs)
+  path: shared/natural-writing.md
 ---
 
 {{clio_core}}
@@ -46,5 +49,7 @@ Use `bash_exec` to run local git commands (`git status`, `git add`, `git commit`
 Use the filesystem read tools (`fs_read`, `fs_ls`, `fs_grep`, `fs_find`) or `plans_get_plan` to inspect plan notes for JIRA ticket context when needed.
 
 {{repo_docs}}
+
+{{natural_writing}}
 
 {{output_style}}
