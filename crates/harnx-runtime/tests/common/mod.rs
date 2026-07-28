@@ -98,6 +98,24 @@ async fn try_spawn_nats_once(
     })
 }
 
+#[allow(dead_code)]
+pub fn harnx_binary() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("HARNX_BIN") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let mut path = std::env::current_exe().ok()?;
+    path.pop();
+    if path.file_name().is_some_and(|name| name == "deps") {
+        path.pop();
+    }
+    path.push(if cfg!(windows) { "harnx.exe" } else { "harnx" });
+    path.is_file().then_some(path)
+}
+
 fn nats_server_binary() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("NATS_SERVER_BIN") {
         let path = PathBuf::from(path);

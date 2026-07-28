@@ -252,10 +252,7 @@ impl Config {
         }
     }
 
-    /// Activate a remote agent through NATS thin-client mode.
-    ///
-    /// This sets up the session for remote execution. The actual turn is driven
-    /// by the frontend calling `run_remote_agent_turn` when user input arrives.
+    /// Activate a remote agent for the frontend's next NATS thin-client turn.
     async fn use_remote_agent(params: UseRemoteAgentParams<'_>) -> Result<()> {
         let UseRemoteAgentParams {
             config,

@@ -2,6 +2,7 @@ use harnx_core::event::{AgentSource, PlanEntry};
 use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use harnx_runtime::config::GlobalConfig;
 use harnx_runtime::config::SessionMeta;
+use harnx_runtime::local_orchestrator::LocalWorkerSupervisor;
 use harnx_runtime::utils::AbortSignal;
 
 use crate::markdown_render::RenderedEntry;
@@ -36,6 +37,9 @@ pub struct Tui {
     pub(super) pending_async_context: Arc<Mutex<Option<String>>>,
     /// Shared state so the prompt task can consume a pending message mid-tool-loop.
     pub(super) shared_pending_message: Arc<Mutex<Option<PendingMessage>>>,
+    /// Lazily-created local broker/worker owner. Shared with prompt tasks and
+    /// retained for the full TUI lifetime.
+    pub(super) local_worker: Arc<Mutex<Option<LocalWorkerSupervisor>>>,
     /// Per-task abort signal for the currently running (or most recently
     /// started) prompt task. Ctrl+C signals this; `start_prompt` consults
     /// it to abort an in-flight task before spawning a new one.
@@ -330,9 +334,11 @@ impl App {
 
 pub(crate) enum TuiEvent {
     Agent(harnx_core::event::AgentEvent),
-    /// Intermediate tool round completed; the prompt loop continues.
+    /// Intermediate tool round completed; retained for queued-message tests.
+    #[allow(dead_code)]
     ToolRoundComplete,
-    /// The prompt task consumed the pending message during a tool round.
+    /// Prompt task consumed pending message; retained for queued-message tests.
+    #[allow(dead_code)]
     PendingMessageConsumed(PendingMessage),
     /// A `PreToolUse` hook asked for confirmation. The blocked tool-eval thread
     /// waits on `reply`; the main loop shows a modal and sends the decision back.

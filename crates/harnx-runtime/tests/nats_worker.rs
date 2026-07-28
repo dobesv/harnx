@@ -7,6 +7,7 @@ mod common;
 use anyhow::Result;
 use common::spawn_nats_server;
 use harnx_core::{
+    event::NullSink,
     message::MessageRole,
     require_nextest,
     session::SessionLogEntry,
@@ -23,6 +24,7 @@ use harnx_runtime::{
         NatsSessionLogBackend, RunAgentLoopArgs, SessionActivate, WorkerDaemonConfig,
     },
     utils::create_abort_signal,
+    ControlCommand, ThinClientConfig, ThinClientSession,
 };
 use std::sync::LazyLock;
 
@@ -37,7 +39,7 @@ static RETRACTED_ORPHAN_ACTIVATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 use parking_lot::RwLock;
 use serde_json::json;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
@@ -142,12 +144,12 @@ fn count_tool_results_with_id(entries: &[(u64, SessionLogEntry)], call_id: &str)
 }
 
 async fn wait_for_worker_daemon_idle(metrics_before_lease_acquisitions: u64) -> Result<()> {
-    wait_until(Duration::from_secs(10), || {
+    wait_until(CI_SAFE_TIMEOUT, || {
         harnx_runtime::nats_metrics::snapshot().lease_acquisitions
             > metrics_before_lease_acquisitions
     })
     .await?;
-    wait_until(Duration::from_secs(10), || {
+    wait_until(CI_SAFE_TIMEOUT, || {
         harnx_runtime::nats_metrics::snapshot().active_sessions_per_worker == 0
     })
     .await
@@ -394,6 +396,40 @@ async fn spawn_worker_daemon_with_call_fn(
     daemon
 }
 
+fn abort_blocked_call_fn(
+    entered: Arc<Notify>,
+    saw_abort: Arc<AtomicBool>,
+) -> harnx_runtime::agent_loop::AgentCallFn {
+    Arc::new(move |_input, _config, abort| {
+        let entered = Arc::clone(&entered);
+        let saw_abort = Arc::clone(&saw_abort);
+        Box::pin(async move {
+            entered.notify_one();
+            harnx_core::abort::wait_abort_signal(&abort).await;
+            saw_abort.store(true, Ordering::SeqCst);
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        })
+    })
+}
+
+async fn wait_for_cancel(log: &NatsSessionLog) -> Result<Vec<(u64, SessionLogEntry)>> {
+    tokio::time::timeout(CI_SAFE_TIMEOUT, async {
+        loop {
+            let entries = log.load_events_async().await?;
+            if entries
+                .iter()
+                .any(|(_, entry)| matches!(entry, SessionLogEntry::Cancel { .. }))
+            {
+                return Ok::<_, anyhow::Error>(entries);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?
+}
+
 async fn local_test_nats(server_url: &str) -> Result<async_nats::jetstream::Context> {
     Ok(async_nats::jetstream::new(
         async_nats::connect(server_url).await?,
@@ -583,7 +619,7 @@ async fn mid_tool_round_user_message_is_injected_once_into_same_turn() -> Result
     // Use notify_one() to signal completion - matches the notify_one() in call_fn
     MID_ROUND_APPEND_DONE.notify_one();
 
-    wait_until(Duration::from_secs(10), || {
+    wait_until(CI_SAFE_TIMEOUT, || {
         MID_ROUND_FINAL_CALLS.load(Ordering::SeqCst) >= 1
     })
     .await?;
@@ -758,10 +794,7 @@ async fn idle_concurrent_messages_fold_in_seq_order_into_single_turn() -> Result
     )
     .await?;
 
-    wait_until(Duration::from_secs(10), || {
-        calls.load(Ordering::SeqCst) >= 1
-    })
-    .await?;
+    wait_until(CI_SAFE_TIMEOUT, || calls.load(Ordering::SeqCst) >= 1).await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let prompts = prompts.lock().await.clone();
@@ -908,6 +941,11 @@ fn cluster_config(url: &str) -> Arc<RwLock<Config>> {
     })))
 }
 
+/// Wait for a condition to become true, polling every 100ms.
+///
+/// Uses a generous timeout (callers should pass CI_SAFE_TIMEOUT) to avoid
+/// flaking under CI load. The poll loop returns immediately when the condition
+/// is met, so longer timeouts only matter when the system is slow.
 async fn wait_until(timeout: std::time::Duration, mut cond: impl FnMut() -> bool) -> Result<()> {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
@@ -918,6 +956,13 @@ async fn wait_until(timeout: std::time::Duration, mut cond: impl FnMut() -> bool
     }
     anyhow::bail!("condition not met within {:?}", timeout)
 }
+
+/// Timeout for waiting on worker/broker conditions in tests.
+///
+/// Generous enough to avoid flakes under CI load (contended runners, slow
+/// subprocess startup). The poll loop returns immediately when the condition
+/// is met, so this only matters when the system is slow.
+const CI_SAFE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dispatch_runs_exactly_one_worker_per_activation_and_reactivation_is_noop() -> Result<()> {
@@ -985,7 +1030,7 @@ async fn dispatch_runs_exactly_one_worker_per_activation_and_reactivation_is_noo
     publish_session_activate(&js, "local", &activation).await?;
 
     // Exactly one worker executes one turn.
-    wait_until(Duration::from_secs(10), || {
+    wait_until(CI_SAFE_TIMEOUT, || {
         counter_one.load(Ordering::SeqCst) + counter_two.load(Ordering::SeqCst) >= 1
     })
     .await?;
@@ -1445,7 +1490,7 @@ async fn retracted_mid_tool_round_message_is_not_injected() -> Result<()> {
     .await?;
 
     MID_ROUND_APPEND_DONE.notify_one();
-    wait_until(Duration::from_secs(10), || {
+    wait_until(CI_SAFE_TIMEOUT, || {
         MID_ROUND_RELOAD_SEEN.load(Ordering::SeqCst) >= 1
     })
     .await?;
@@ -1527,10 +1572,7 @@ async fn rewind_truncates_worker_visible_tail_before_activation() -> Result<()> 
 
     activate_session(&js, session_id).await?;
 
-    wait_until(Duration::from_secs(10), || {
-        counter.load(Ordering::SeqCst) >= 1
-    })
-    .await?;
+    wait_until(CI_SAFE_TIMEOUT, || counter.load(Ordering::SeqCst) >= 1).await?;
 
     assert_single_prompt(&prompts, "first prompt").await;
 
@@ -1792,10 +1834,7 @@ async fn retracted_user_message_is_not_executed_by_worker() -> Result<()> {
     .await?;
 
     // Wait for the worker to process.
-    wait_until(Duration::from_secs(10), || {
-        counter.load(Ordering::SeqCst) >= 1
-    })
-    .await?;
+    wait_until(CI_SAFE_TIMEOUT, || counter.load(Ordering::SeqCst) >= 1).await?;
 
     // Verify: only ONE call was made, and the prompt is "hello world", NOT "please ignore this"
     // If the bug is present, the prompt would contain the retracted message.
@@ -1824,5 +1863,135 @@ async fn load_events_latest_async_empty_stream_returns_empty() -> Result<()> {
     let entries = log.load_events_latest_async().await?;
     assert!(entries.is_empty(), "empty stream should return empty Vec");
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn thin_client_abort_signal_cancels_blocked_worker_and_persists_tombstone() -> Result<()> {
+    let Some(server) = require_nats_server().await? else {
+        return Ok(());
+    };
+
+    let entered = Arc::new(Notify::new());
+    let saw_abort = Arc::new(AtomicBool::new(false));
+    let config = local_nats_runtime_config(server.url());
+    let daemon = spawn_worker_daemon_with_call_fn(
+        config,
+        "worker-thin-client-cancel",
+        abort_blocked_call_fn(Arc::clone(&entered), Arc::clone(&saw_abort)),
+    )
+    .await;
+
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_id = "thin-client-abort-cancel";
+    let abort = create_abort_signal();
+    let thin = ThinClientSession::new(
+        ThinClientConfig {
+            cluster: "local".to_string(),
+            agent: "ignored-agent".to_string(),
+            session_id: Some(session_id.to_string()),
+        },
+        client,
+        jetstream.clone(),
+        abort.clone(),
+    )
+    .await?;
+
+    let run_turn = tokio::spawn(async move {
+        thin.run_turn("block until cancelled", Arc::new(NullSink), None)
+            .await
+    });
+    tokio::time::timeout(CI_SAFE_TIMEOUT, entered.notified()).await?;
+    abort.set_ctrlc();
+
+    let result = tokio::time::timeout(CI_SAFE_TIMEOUT, run_turn).await???;
+    assert!(
+        result.was_cancelled,
+        "thin-client turn should report cancellation"
+    );
+
+    let log = NatsSessionLog::new(jetstream, session_id);
+    let entries = wait_for_cancel(&log).await?;
+    tokio::time::timeout(CI_SAFE_TIMEOUT, async {
+        while !saw_abort.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let cancel_fence = entries.iter().find_map(|(_, entry)| match entry {
+        SessionLogEntry::Cancel { fence_token } => Some(*fence_token),
+        _ => None,
+    });
+    assert!(
+        cancel_fence.is_some(),
+        "Cancel must carry worker fence token"
+    );
+    assert_eq!(
+        reconstruct_state_from_nats(&entries).turn_status,
+        TurnStatus::InFlightCancelled
+    );
+
+    daemon.abort();
+    let _ = daemon.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_immediately_after_activation_ack_is_not_lost() -> Result<()> {
+    let Some(server) = require_nats_server().await? else {
+        return Ok(());
+    };
+
+    let entered = Arc::new(Notify::new());
+    let saw_abort = Arc::new(AtomicBool::new(false));
+    let config = local_nats_runtime_config(server.url());
+    let daemon = spawn_worker_daemon_with_call_fn(
+        config,
+        "worker-activation-cancel",
+        abort_blocked_call_fn(Arc::clone(&entered), Arc::clone(&saw_abort)),
+    )
+    .await;
+
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_id = "immediate-activation-cancel";
+    let log = NatsSessionLog::new(jetstream.clone(), session_id);
+    log.append_event_async(&append_user_message_entry(
+        "immediate-cancel-user",
+        "block until cancelled",
+    ))
+    .await?;
+
+    activate_session(&jetstream, session_id).await?;
+    // WorkQueue retention removes the activation after worker ack. Publish cancel
+    // immediately after observing that ack; worker must already be subscribed.
+    let mut notify_stream = jetstream.get_stream("WORK_NOTIFY_local").await?;
+    tokio::time::timeout(CI_SAFE_TIMEOUT, async {
+        loop {
+            if notify_stream.info().await?.state.messages == 0 {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await??;
+    harnx_runtime::send_control_command(&client, session_id, ControlCommand::Cancel).await?;
+
+    tokio::time::timeout(CI_SAFE_TIMEOUT, async {
+        while !saw_abort.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let entries = wait_for_cancel(&log).await?;
+    assert_eq!(
+        reconstruct_state_from_nats(&entries).turn_status,
+        TurnStatus::InFlightCancelled,
+        "turn must end cancelled when control follows activation ack; entries={entries:#?}"
+    );
+
+    daemon.abort();
+    let _ = daemon.await;
     Ok(())
 }

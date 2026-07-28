@@ -297,11 +297,38 @@ async fn write_mcp_info(
 pub async fn run_command_with_output(
     config: &GlobalConfig,
     abort_signal: AbortSignal,
+    line: &str,
+    async_manager: &mut AsyncHookManager,
+    persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
+    pending_async_context: &mut Option<String>,
+    output: &mut (dyn Write + Send),
+) -> Result<CommandOutcome> {
+    let local_worker = Arc::new(tokio::sync::Mutex::new(None));
+    run_command_with_output_and_local_worker(
+        config,
+        abort_signal,
+        line,
+        async_manager,
+        persistent_manager,
+        pending_async_context,
+        output,
+        &local_worker,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_command_with_output_and_local_worker(
+    config: &GlobalConfig,
+    abort_signal: AbortSignal,
     mut line: &str,
     async_manager: &mut AsyncHookManager,
     persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
     pending_async_context: &mut Option<String>,
     output: &mut (dyn Write + Send),
+    local_worker: &Arc<
+        tokio::sync::Mutex<Option<crate::local_orchestrator::LocalWorkerSupervisor>>,
+    >,
 ) -> Result<CommandOutcome> {
     let max_resume = config.read().resolved_hooks().max_resume.unwrap_or(5);
     if let Ok(Some(captures)) = MULTILINE_RE.captures(line) {
@@ -557,6 +584,7 @@ pub async fn run_command_with_output(
                             let input = crate::config::input::from_str(config, &text, None);
                             ask(
                                 config,
+                                local_worker,
                                 abort_signal.clone(),
                                 input,
                                 true,
@@ -605,17 +633,13 @@ pub async fn run_command_with_output(
                     }
                     Some(args) if args.starts_with("message ") => {
                         let (from, to) = parse_message_range(&args[8..])?;
-                        if config.read().is_remote_agent() {
-                            remote_session_ops::edit_remote_message_range(
-                                config,
-                                from,
-                                to,
-                                &abort_signal,
-                            )
-                            .await?;
-                        } else {
-                            config.write().edit_message_range(from, to)?;
-                        }
+                        remote_session_ops::edit_remote_message_range(
+                            config,
+                            from,
+                            to,
+                            &abort_signal,
+                        )
+                        .await?;
                     }
                     _ => writeln!(output, r#"Usage: .edit <config|agent|session|rag-docs|message <n>|message <n>-<m>>"#)?,
                 }
@@ -854,6 +878,7 @@ Commands:
                     .await?;
                     ask(
                         config,
+                        local_worker,
                         abort_signal.clone(),
                         input,
                         true,
@@ -893,6 +918,7 @@ Commands:
                 input.set_continue_output(&output);
                 ask(
                     config,
+                    local_worker,
                     abort_signal.clone(),
                     input,
                     true,
@@ -917,6 +943,7 @@ Commands:
                 crate::config::input::set_regenerate(&mut input, config);
                 ask(
                     config,
+                    local_worker,
                     abort_signal.clone(),
                     input,
                     true,
@@ -984,17 +1011,13 @@ Commands:
             ".delete" => match args {
                 Some(args) if args.starts_with("message ") => {
                     let (from, to) = parse_message_range(&args[8..])?;
-                    if config.read().is_remote_agent() {
-                        remote_session_ops::delete_remote_message_range(
-                            config,
-                            from,
-                            to,
-                            &abort_signal,
-                        )
-                        .await?;
-                    } else {
-                        config.write().delete_message_range(from, to)?;
-                    }
+                    remote_session_ops::delete_remote_message_range(
+                        config,
+                        from,
+                        to,
+                        &abort_signal,
+                    )
+                    .await?;
                     writeln!(output, "Deleted entries {from}-{to}.")?;
                 }
                 Some(args) => {
@@ -1011,11 +1034,7 @@ Commands:
                     .trim()
                     .parse::<usize>()
                     .context("Invalid sequence number")?;
-                if config.read().is_remote_agent() {
-                    remote_session_ops::rewind_remote_session(config, n, &abort_signal).await?;
-                } else {
-                    config.write().rewind_session(n)?;
-                }
+                remote_session_ops::rewind_remote_session(config, n, &abort_signal).await?;
                 writeln!(output, "↩ Rewound session to entry {n}.")?;
             }
             ".copy" => {
@@ -1091,6 +1110,7 @@ Commands:
                     let input = crate::config::input::from_str(config, &input_text, None);
                     ask(
                         config,
+                        local_worker,
                         abort_signal.clone(),
                         input,
                         true,
@@ -1111,71 +1131,73 @@ Commands:
 #[allow(clippy::too_many_arguments)]
 async fn ask(
     config: &GlobalConfig,
+    local_worker: &Arc<
+        tokio::sync::Mutex<Option<crate::local_orchestrator::LocalWorkerSupervisor>>,
+    >,
     abort_signal: AbortSignal,
-    input: Input,
+    mut input: Input,
     with_embeddings: bool,
-    async_manager: &mut AsyncHookManager,
-    persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
-    pending_async_context: &mut Option<String>,
-    max_resume: u32,
+    _async_manager: &mut AsyncHookManager,
+    _persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
+    _pending_async_context: &mut Option<String>,
+    _max_resume: u32,
 ) -> Result<()> {
-    ask_inner(
-        config,
-        abort_signal,
-        input,
-        with_embeddings,
-        async_manager,
-        persistent_manager,
-        pending_async_context,
-        0,
-        max_resume,
-    )
-    .await
-}
+    if with_embeddings {
+        crate::config::input::use_embeddings(&mut input, config, abort_signal.clone()).await?;
+    }
 
-#[allow(clippy::too_many_arguments)]
-async fn ask_inner(
-    config: &GlobalConfig,
-    abort_signal: AbortSignal,
-    input: Input,
-    with_embeddings: bool,
-    async_manager: &mut AsyncHookManager,
-    persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
-    pending_async_context: &mut Option<String>,
-    resume_count: u32,
-    max_resume: u32,
-) -> Result<()> {
-    // Wrap the &mut managers into Arc<Mutex> for the unified loop.
-    // This is safe because ask_inner is called once per user turn (not concurrently).
-    let am = std::mem::take(async_manager);
-    let am_arc = Arc::new(tokio::sync::Mutex::new(am));
-    let pending = std::mem::take(pending_async_context);
-    let pending_arc = Arc::new(tokio::sync::Mutex::new(pending));
-
-    let ctx = crate::agent_loop::AgentLoopContext {
-        config: config.clone(),
-        abort_signal: abort_signal.clone(),
-        async_manager: am_arc.clone(),
-        persistent_manager: persistent_manager.clone(),
-        call_fn: None,
-        on_tool_round: None,
-        on_text_response: None,
-        initial_with_embeddings: with_embeddings,
-        initial_resume_count: resume_count,
-        max_resume: Some(max_resume),
-        pending_async_context: Some(pending_arc.clone()),
-        working_dir: None,
-        session_lock: None,
+    let (agent, cluster, session_id) = {
+        let cfg = config.read();
+        let (agent, cluster) = cfg.remote_agent.clone().unwrap_or_else(|| {
+            (
+                cfg.agent
+                    .as_ref()
+                    .map(|agent| agent.name().to_string())
+                    .unwrap_or_default(),
+                crate::config::LOCAL_CLUSTER_KEY.to_string(),
+            )
+        });
+        let session_id = cfg.session.as_ref().map(|session| session.id().to_string());
+        (agent, cluster, session_id)
     };
 
-    let result = crate::agent_loop::run_agent_loop_with_local_handoff(&ctx, input).await;
+    if cluster == crate::config::LOCAL_CLUSTER_KEY {
+        let mut supervisor = local_worker.lock().await;
+        crate::local_orchestrator::ensure_local_worker(&mut supervisor)
+            .await
+            .context("failed to ensure local NATS worker")?;
+    }
 
-    let mut guard = am_arc.lock().await;
-    *async_manager = std::mem::take(&mut *guard);
-    let mut pending_guard = pending_arc.lock().await;
-    *pending_async_context = std::mem::take(&mut *pending_guard);
+    let session = crate::ThinClientSession::from_global_config(
+        crate::ThinClientConfig {
+            cluster,
+            agent,
+            session_id,
+        },
+        config,
+        abort_signal,
+    )
+    .await
+    .context("failed to create thin-client session for command")?;
+    let sink = harnx_core::sink::current_agent_event_sink()
+        .unwrap_or_else(|| Arc::new(harnx_core::event::NullSink));
+    let result = session.run_turn(&input.text(), sink, None).await?;
+    update_last_message_after_thin_client_turn(config, input, &result);
+    Ok(())
+}
 
-    result
+/// Update front-end continuation state after a completed thin-client turn.
+pub fn update_last_message_after_thin_client_turn(
+    config: &GlobalConfig,
+    input: Input,
+    result: &crate::ThinClientTurnResult,
+) {
+    if result.was_cancelled {
+        return;
+    }
+    if let Some(response) = &result.response {
+        config.write().last_message = Some(LastMessage::new(input, response.clone()));
+    }
 }
 
 fn unknown_command() -> Result<()> {
@@ -1417,6 +1439,44 @@ mod tests {
                 None => unsafe { std::env::remove_var(self.key) },
             }
         }
+    }
+
+    #[test]
+    fn thin_client_result_updates_last_message_only_after_completed_turn() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        let input = crate::config::input::from_str(&config, "hello", None);
+        let completed = crate::ThinClientTurnResult {
+            response: Some("world".to_string()),
+            session_id: "session".to_string(),
+            was_cancelled: false,
+            user_msg_seq: 1,
+            user_msg_id: "message".to_string(),
+        };
+
+        update_last_message_after_thin_client_turn(&config, input.clone(), &completed);
+        let last = config
+            .read()
+            .last_message
+            .clone()
+            .expect("last message set");
+        assert_eq!(last.input.text(), "hello");
+        assert_eq!(last.output, "world");
+        assert!(last.continuous);
+
+        let cancelled = crate::ThinClientTurnResult {
+            response: Some("partial".to_string()),
+            was_cancelled: true,
+            ..completed
+        };
+        update_last_message_after_thin_client_turn(&config, input, &cancelled);
+        assert_eq!(
+            config
+                .read()
+                .last_message
+                .as_ref()
+                .map(|last| last.output.as_str()),
+            Some("world")
+        );
     }
 
     fn write_text(path: &Path, text: &str) {

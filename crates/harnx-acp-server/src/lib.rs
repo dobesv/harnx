@@ -8,6 +8,7 @@ extern crate log;
 
 mod server_main;
 
+mod local_executor;
 pub use server_main::run;
 
 #[cfg(test)]
@@ -23,7 +24,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use harnx_core::event::{AgentEvent, AgentSource, ModelEvent, NoticeEvent, ToolEvent, UserEvent};
-use harnx_runtime::config::GlobalConfig;
+use harnx_runtime::config::{GlobalConfig, LOCAL_CLUSTER_KEY};
+use harnx_runtime::local_orchestrator::{ensure_local_worker, LocalWorkerSupervisor};
 use harnx_runtime::utils::{AbortSignal, AbortSignalInner};
 
 /// Idle session reaper TTL: evict SessionContexts idle > 15 minutes.
@@ -273,12 +275,32 @@ impl SessionContext {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcpExecutionRole {
+    Frontend,
+    Backend,
+}
+
+impl AcpExecutionRole {
+    fn from_env() -> Self {
+        match std::env::var(harnx_acp::ACP_EXECUTION_ROLE_ENV) {
+            Ok(value) if value == harnx_acp::ACP_BACKEND_ROLE => Self::Backend,
+            _ => Self::Frontend,
+        }
+    }
+}
+
 pub struct HarnxAgent {
     agent_name: String,
+    execution_role: AcpExecutionRole,
     /// Base config to fork from for each new session.
     base_config: GlobalConfig,
     /// Active sessions keyed by session_id.
     sessions: Arc<tokio::sync::Mutex<HashMap<String, Arc<SessionContext>>>>,
+    /// Shared local worker retained for a frontend server's lifetime and
+    /// re-ensured before each local thin-client turn. Backend servers leave it
+    /// empty because their local turns execute inside the owning worker.
+    local_worker: Arc<tokio::sync::Mutex<Option<LocalWorkerSupervisor>>>,
     connection: Arc<tokio::sync::Mutex<Option<acp::ConnectionTo<acp::Client>>>>,
 }
 
@@ -286,8 +308,10 @@ impl HarnxAgent {
     pub fn new(agent_name: String, config: GlobalConfig) -> Self {
         Self {
             agent_name,
+            execution_role: AcpExecutionRole::from_env(),
             base_config: config,
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            local_worker: Arc::new(tokio::sync::Mutex::new(None)),
             connection: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
@@ -310,29 +334,35 @@ impl HarnxAgent {
         Ok(config)
     }
 
-    /// Build the local-agent turn input from an already-configured session.
-    fn build_local_input_from_config(
+    async fn run_thin_turn(
         &self,
-        session_config: &GlobalConfig,
-        _session_key: &str,
+        remote_agent: Option<(String, String)>,
+        session_key: String,
         prompt_text: &str,
-    ) -> acp::Result<harnx_runtime::config::Input> {
-        // Agent and session are already set on session_config.
-        // Build a fresh agent for the input.
-        let mut agent = session_config
-            .read()
-            .retrieve_agent(&self.agent_name)
-            .map_err(|e| acp::Error::new(-32603, format!("Failed to retrieve agent: {e}")))?;
-        if let Err(e) = harnx_runtime::config::agent::resolve_variables(&mut agent) {
-            warn!(
-                "Failed to resolve variables for agent '{}': {e}",
-                self.agent_name
-            );
-        }
-
-        let mut input = harnx_runtime::config::input::from_str(session_config, prompt_text, None);
-        harnx_runtime::config::input::set_agent(&mut input, session_config, agent.into_config());
-        Ok(input)
+        prompt_config: &GlobalConfig,
+        abort_signal: AbortSignal,
+        sink: Arc<dyn harnx_core::event::AgentEventSink>,
+    ) -> anyhow::Result<()> {
+        let (agent, cluster) = match remote_agent {
+            Some(remote) => remote,
+            None => {
+                let mut supervisor = self.local_worker.lock().await;
+                ensure_local_worker(&mut supervisor).await?;
+                (self.agent_name.clone(), LOCAL_CLUSTER_KEY.to_string())
+            }
+        };
+        let thin_cfg = harnx_runtime::ThinClientConfig {
+            cluster,
+            agent,
+            session_id: Some(session_key),
+        };
+        let session = harnx_runtime::ThinClientSession::from_global_config(
+            thin_cfg,
+            prompt_config,
+            abort_signal,
+        )
+        .await?;
+        session.run_turn(prompt_text, sink, None).await.map(|_| ())
     }
 }
 
@@ -409,12 +439,6 @@ impl HarnxAgent {
 
         // Use the session's own config (managers already initialized).
         let prompt_config = session_ctx.config.clone();
-
-        let input = if remote_agent.is_none() {
-            Some(self.build_local_input_from_config(&prompt_config, &session_key, &prompt_text)?)
-        } else {
-            None
-        };
 
         // Install a per-prompt AgentEventSink for streaming chunks.
         let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<AcpForward>();
@@ -647,76 +671,44 @@ impl HarnxAgent {
             }
         });
 
-        // Build the agent loop context from the session's config.
         let abort_signal = session_ctx.abort_signal.clone();
         let cancel_notify = session_ctx.cancel_notify.clone();
 
-        let loop_ctx = harnx_session::build_context(
-            prompt_config.clone(),
-            None,
-            abort_signal.clone(),
-            None,
-            None,
-        );
-
-        // Cancel listener: wait on cancel_notify, fire abort.
+        // ACP cancel mutates the same signal observed by ThinClientSession. Its
+        // hardened abort path publishes the NATS control cancel before the
+        // turn future is released.
         let cancel_abort = abort_signal.clone();
         let cancel_listener = tokio::spawn(async move {
             cancel_notify.notified().await;
             cancel_abort.set_ctrlc();
         });
 
-        // Grace period after abort before hard cancellation.
-        let abort_for_grace = abort_signal.clone();
-        let grace_cancel = async move {
-            harnx_core::abort::wait_abort_signal(&abort_for_grace).await;
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let run_local = remote_agent.is_none()
+            && (cfg!(test) || self.execution_role == AcpExecutionRole::Backend);
+        let turn_result = if run_local {
+            local_executor::run_local_turn(local_executor::LocalTurnParams {
+                agent_name: &self.agent_name,
+                session_config: &prompt_config,
+                prompt_text: &prompt_text,
+                abort_signal: abort_signal.clone(),
+                sink,
+            })
+            .await
+        } else {
+            // Standalone frontend local refs and every remote agent@cluster ref
+            // remain NATS thin-client turns. Only worker-owned local ACP
+            // backends execute in-process during Phase 1.
+            self.run_thin_turn(
+                remote_agent,
+                session_key.clone(),
+                &prompt_text,
+                &prompt_config,
+                abort_signal.clone(),
+                sink,
+            )
+            .await
         };
-
-        // Run the agent loop.
-        let remote_sink = sink.clone();
-        let loop_result = harnx_core::sink::with_agent_event_sink(sink, async {
-            match &remote_agent {
-                Some((agent, cluster)) => {
-                    let thin_cfg = harnx_runtime::ThinClientConfig {
-                        cluster: cluster.clone(),
-                        agent: agent.clone(),
-                        session_id: Some(session_key.clone()),
-                    };
-                    let mut run_remote = Box::pin(async {
-                        let session = harnx_runtime::ThinClientSession::from_global_config(
-                            thin_cfg,
-                            &prompt_config,
-                            abort_signal.clone(),
-                        )
-                        .await?;
-                        session
-                            .run_turn(&prompt_text, remote_sink, None)
-                            .await
-                            .map(|_| ())
-                    });
-                    tokio::select! {
-                        r = &mut run_remote => Some(r),
-                        _ = grace_cancel => None,
-                    }
-                }
-                None => {
-                    let run_local = async {
-                        harnx_runtime::run_agent_loop_with_local_handoff(
-                            &loop_ctx,
-                            input.expect("local mode always builds input"),
-                        )
-                        .await
-                    };
-                    let mut run_local = Box::pin(run_local);
-                    tokio::select! {
-                        r = &mut run_local => Some(r),
-                        _ = grace_cancel => None,
-                    }
-                }
-            }
-        })
-        .await;
+        let loop_result = Some(turn_result);
 
         // Refresh activity when the turn STOPS being active — on EVERY exit
         // path (normal completion AND cancellation), not just at prompt start.
@@ -735,7 +727,6 @@ impl HarnxAgent {
         };
 
         cancel_listener.abort();
-        drop(loop_ctx);
         let _ = fwd_task.await;
 
         prompt_stop_response(loop_result, &abort_signal)

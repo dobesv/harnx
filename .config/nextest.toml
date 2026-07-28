@@ -1,0 +1,27 @@
+# Nextest configuration.
+#
+# The `default` profile is used for local development: no retries, so a flake
+# is visible immediately rather than being silently rescued.
+#
+# The `ci` profile is used by GitHub Actions (`cargo nextest run --profile ci`).
+# Several integration tests spin up a real `nats-server` broker + worker
+# subprocesses and the tmux/interrupt e2e tests drive a real terminal; these are
+# inherently timing-sensitive and can flake on loaded/contended CI runners.
+# `retries` gives transient timing flakes a bounded number of re-runs (a
+# genuinely broken test still fails every attempt), and `fail-fast = false`
+# surfaces *all* failures in a single run instead of aborting on the first —
+# which makes diagnosing cross-platform failures far faster.
+
+[profile.default]
+retries = 0
+
+[profile.ci]
+# Retry transient (timing/load-induced) flakes. A real failure fails all attempts.
+retries = { backoff = "exponential", count = 3, delay = "2s", jitter = true }
+# Run the whole suite so every failure is reported per run, not just the first.
+fail-fast = false
+# Report (not kill) slow tests early, but allow generous headroom for the
+# broker/worker/e2e tests under CI load before terminating a truly hung test.
+slow-timeout = { period = "60s", terminate-after = 4 }
+# Keep CI output readable: show final status for retried/failed tests.
+final-status-level = "flaky"

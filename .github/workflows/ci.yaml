@@ -70,8 +70,42 @@ jobs:
         echo "${BINDIR}" >> "${GITHUB_PATH}"
       shell: bash
 
+    # Local execution routes through a shared nats-server, so the one-shot / TUI
+    # e2e tests need the binary on every OS (they skip cleanly if it is absent,
+    # but we want real coverage here).
+    - name: Install nats-server (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        set -euo pipefail
+        VERSION="v2.11.6"
+        ARCH="$(uname -m)"
+        case "${ARCH}" in
+          arm64) NATS_ARCH="arm64" ;;
+          x86_64) NATS_ARCH="amd64" ;;
+          *) echo "unsupported macOS arch: ${ARCH}" >&2; exit 1 ;;
+        esac
+        ASSET="nats-server-${VERSION}-darwin-${NATS_ARCH}.tar.gz"
+        DOWNLOAD_URL="https://github.com/nats-io/nats-server/releases/download/${VERSION}/${ASSET}"
+        BINDIR="${HOME}/.local/bin"
+        mkdir -p "${BINDIR}"
+        curl -sL "${DOWNLOAD_URL}" | tar -xzf - -C "${BINDIR}" --strip-components=1 "nats-server-${VERSION}-darwin-${NATS_ARCH}/nats-server"
+        chmod +x "${BINDIR}/nats-server"
+        echo "${BINDIR}" >> "${GITHUB_PATH}"
+      shell: bash
+
+    # NOTE: nats-server is intentionally NOT installed on Windows. The
+    # shared-broker + worker-subprocess machinery (and the NATS worker
+    # integration tests) is Unix-first; on Windows those integration tests hang
+    # on the JetStream/worker path. Without the binary they skip cleanly (each
+    # guards on nats-server availability), matching the pre-existing behavior
+    # where Windows CI never exercised the NATS path. Linux + macOS get full
+    # coverage. Revisit if/when the worker path gains first-class Windows support.
+
     - name: Test
-      run: cargo nextest run --all
+      # Use the `ci` nextest profile (.config/nextest.toml): retries transient
+      # timing flakes from the broker/worker/e2e tests and reports all failures
+      # per run (fail-fast = false) instead of aborting on the first.
+      run: cargo nextest run --all --profile ci
 
     - name: Check for pending snapshot updates
       if: failure()

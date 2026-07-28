@@ -16,14 +16,12 @@ use crossterm::terminal::{enable_raw_mode, supports_keyboard_enhancement, EnterA
 use crossterm::ExecutableCommand;
 use harnx_core::message::Message;
 use harnx_hooks::{drain_async_results, AsyncHookManager, PersistentHookManager};
-use harnx_runtime::config::remote_session_ops::load_remote_transcript_for_render;
 use harnx_runtime::config::GlobalConfig;
 use harnx_runtime::config::{
     build_picker_context, list_assistant_agents, sort_sessions_for_picker,
 };
 use harnx_runtime::tool::ToolDeclaration;
 use harnx_runtime::utils::create_abort_signal;
-use harnx_runtime::{ThinClientConfig, ThinClientSession};
 use log::warn;
 use ratatui::Terminal;
 #[cfg(test)]
@@ -94,6 +92,66 @@ fn transcript_footprint(items: &[TranscriptItem]) -> (usize, usize) {
     (items.len(), bytes)
 }
 
+fn build_initial_app(
+    config: &GlobalConfig,
+    initial_transcript: Vec<TranscriptItem>,
+) -> Result<App> {
+    Ok(App {
+        transcript: initial_transcript,
+        input: Tui::new_input(),
+        spinner_index: 0,
+        should_quit: false,
+        llm_busy: false,
+        scroll_state: ratatui_widget_scrolling::ScrollState::new(),
+        streaming_open: false,
+        streamed_text_this_turn: false,
+        cache_valid_width: None,
+        last_ui_output_source: None,
+        last_usage_source: None,
+        last_usage_transcript_idx: None,
+        pending_thought_source: None,
+        pending_thought_text: String::new(),
+        pending_tool_seq: None,
+        pending_message: None,
+        completions: vec![],
+        completion_index: 0,
+        completion_prefix: String::new(),
+        completion_suffix: String::new(),
+        history: vec![],
+        history_index: None,
+        history_draft: String::new(),
+        history_preview: false,
+        attachments: vec![],
+        attachment_dir: None,
+        paste_count: 0,
+        last_known_input_width: 1,
+        show_sequence_numbers: config.read().show_sequence_numbers,
+        show_timestamps: config.read().show_timestamps,
+        transcript_focus: None,
+        transcript_selection_anchor: None,
+        modal: None,
+        pending_confirm_reply: None,
+        detail_view_scroll: {
+            let mut s = ratatui_widget_scrolling::ScrollState::new();
+            s.follow = false;
+            s
+        },
+        detail_view_open: false,
+        detail_view_raw_yaml: None,
+        detail_view_text: None,
+        detail_view_title: None,
+        transcript_browsing: false,
+        browsing_view_scroll: {
+            let mut s = ratatui_widget_scrolling::ScrollState::new();
+            s.follow = false;
+            s
+        },
+        copy_notice_until: None,
+        scroll_to_focused_item: false,
+        use_utc_timestamps: false,
+    })
+}
+
 impl Tui {
     #[cfg(test)]
     pub(super) async fn queue_pending_message(&mut self, text: String) {
@@ -154,60 +212,7 @@ impl Tui {
         let initial_transcript = Self::build_initial_transcript(config);
         let code_theme = config.read().render_options()?.theme;
 
-        let mut app = App {
-            transcript: initial_transcript,
-            input: Self::new_input(),
-            spinner_index: 0,
-            should_quit: false,
-            llm_busy: false,
-            scroll_state: ratatui_widget_scrolling::ScrollState::new(),
-            streaming_open: false,
-            streamed_text_this_turn: false,
-            cache_valid_width: None,
-            last_ui_output_source: None,
-            last_usage_source: None,
-            last_usage_transcript_idx: None,
-            pending_thought_source: None,
-            pending_thought_text: String::new(),
-            pending_tool_seq: None,
-            pending_message: None,
-            completions: vec![],
-            completion_index: 0,
-            completion_prefix: String::new(),
-            completion_suffix: String::new(),
-            history: vec![],
-            history_index: None,
-            history_draft: String::new(),
-            history_preview: false,
-            attachments: vec![],
-            attachment_dir: None,
-            paste_count: 0,
-            last_known_input_width: 1,
-            show_sequence_numbers: config.read().show_sequence_numbers,
-            show_timestamps: config.read().show_timestamps,
-            transcript_focus: None,
-            transcript_selection_anchor: None,
-            modal: None,
-            pending_confirm_reply: None,
-            detail_view_scroll: {
-                let mut s = ratatui_widget_scrolling::ScrollState::new();
-                s.follow = false;
-                s
-            },
-            detail_view_open: false,
-            detail_view_raw_yaml: None,
-            detail_view_text: None,
-            detail_view_title: None,
-            transcript_browsing: false,
-            browsing_view_scroll: {
-                let mut s = ratatui_widget_scrolling::ScrollState::new();
-                s.follow = false;
-                s
-            },
-            copy_notice_until: None,
-            scroll_to_focused_item: false,
-            use_utc_timestamps: false,
-        };
+        let mut app = build_initial_app(config, initial_transcript)?;
 
         if !cfg!(test) {
             app.modal = Self::resolve_initial_modal(config).await;
@@ -221,6 +226,7 @@ impl Tui {
             persistent_manager,
             pending_async_context: Arc::new(Mutex::new(None)),
             shared_pending_message: Arc::new(Mutex::new(None)),
+            local_worker: Arc::new(Mutex::new(None)),
             current_prompt_abort: None,
             current_prompt_handle: None,
             active_remote_session: None,
@@ -246,30 +252,27 @@ impl Tui {
         if config.read().session.is_none() {
             // sessions_dir() is already scoped to the active agent, so no
             // extra agent_name filter is needed here.
-            let (is_remote, cluster) = {
-                let cfg = config.read();
-                if let Some((_, ref cluster)) = cfg.remote_agent {
-                    (true, cluster.clone())
-                } else {
-                    (false, String::new())
-                }
-            };
+            let cluster = config
+                .read()
+                .remote_agent
+                .as_ref()
+                .map(|(_, cluster)| cluster.clone())
+                .unwrap_or_else(|| harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string());
 
-            let (sessions, fetch_error) = if is_remote {
-                let cfg = config.read().clone();
-                match cfg.list_remote_sessions_with_meta(&cluster).await {
-                    Ok(s) => (s, None),
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to list remote sessions for cluster '{}': {:#}",
-                            cluster,
-                            e
-                        );
-                        (vec![], Some(format!("remote sessions unavailable: {e:#}")))
-                    }
+            let cfg = config.read().clone();
+            let (sessions, fetch_error) = match cfg.list_remote_sessions_with_meta(&cluster).await {
+                Ok(sessions) => (sessions, None),
+                Err(error) => {
+                    log::warn!(
+                        "Failed to list NATS sessions for cluster '{}': {:#}",
+                        cluster,
+                        error
+                    );
+                    (
+                        vec![],
+                        Some(format!("NATS sessions unavailable: {error:#}")),
+                    )
                 }
-            } else {
-                (config.read().list_sessions_with_meta(), None)
             };
 
             let ctx = build_picker_context(None);
@@ -818,7 +821,14 @@ pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<Tra
         Some(s) if !s.is_empty() => s.id().to_string(),
         _ => return vec![],
     };
-    let remote_agent = cfg.remote_agent.clone();
+    let thin_agent = cfg.remote_agent.clone().or_else(|| {
+        cfg.agent.as_ref().map(|agent| {
+            (
+                agent.name().to_string(),
+                harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
+            )
+        })
+    });
     // Spell handoff tool declaration names relative to the active agent's
     // package so the transcript matches what the agent actually saw (#709).
     let active_pkg = cfg.active_package();
@@ -829,53 +839,24 @@ pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<Tra
         .map(|d| (d.name.clone(), d))
         .collect();
 
-    if let Some((agent, cluster)) = remote_agent {
-        drop(cfg);
-        let abort_signal = harnx_runtime::utils::create_abort_signal();
-        let remote_load = || async {
-            let thin = ThinClientSession::from_global_config(
-                ThinClientConfig {
-                    cluster,
-                    agent,
-                    session_id: Some(session_id),
-                },
-                config,
-                abort_signal,
-            )
-            .await?;
-            load_remote_transcript_for_render(&thin).await
-        };
-        let state = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => match tokio::task::block_in_place(|| handle.block_on(remote_load())) {
-                Ok(state) => state,
-                Err(err) => {
-                    warn!("failed to load remote session transcript for resume: {err:#}");
-                    return vec![];
-                }
-            },
-            Err(_) => {
-                let runtime = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(err) => {
-                        warn!(
-                            "failed to build Tokio runtime for remote transcript resume: {err:#}"
-                        );
-                        return vec![];
-                    }
-                };
-                match runtime.block_on(remote_load()) {
-                    Ok(state) => state,
-                    Err(err) => {
-                        warn!("failed to load remote session transcript for resume: {err:#}");
-                        return vec![];
-                    }
-                }
-            }
-        };
+    #[cfg(test)]
+    if cfg.remote_agent.is_none() {
+        let session = cfg.session.as_ref().expect("checked above");
+        return build_transcript_with_compaction(
+            &session.compressed_messages,
+            &session.messages,
+            session.compaction_summary.as_deref(),
+            &decl_map,
+        );
+    }
 
+    if let Some((agent, cluster)) = thin_agent {
+        drop(cfg);
+        let Some(state) = crate::session_history_loader::load_remote_session_history(
+            config, agent, cluster, session_id,
+        ) else {
+            return vec![];
+        };
         return build_transcript_with_compaction(
             &state.compressed_messages,
             &state.messages,

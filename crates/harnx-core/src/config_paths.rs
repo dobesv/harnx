@@ -49,6 +49,9 @@ pub const CLIENTS_DIR_NAME: &str = "clients";
 /// Subdirectory holding per-cluster NATS server configs.
 pub const NATS_SERVERS_DIR_NAME: &str = "nats_servers";
 
+/// Versioned data subdirectory holding shared local NATS runtime state.
+pub const NATS_RUNTIME_DIR: &str = "nats/v1";
+
 /// Subdirectory holding per-MCP-server YAML files.
 pub const MCP_SERVERS_DIR_NAME: &str = "mcp_servers";
 
@@ -187,6 +190,29 @@ pub fn clients_dir() -> PathBuf {
 /// Subdirectory holding per-cluster NATS server YAML files.
 pub fn nats_servers_dir() -> PathBuf {
     config_dir_path().join(NATS_SERVERS_DIR_NAME)
+}
+
+/// Versioned state directory for shared local NATS: `<data_dir>/nats/v1/`.
+///
+/// This runtime state is deliberately separate from the static cluster
+/// configuration returned by [`nats_servers_dir()`].
+pub fn nats_runtime_dir() -> PathBuf {
+    data_dir().join(NATS_RUNTIME_DIR)
+}
+
+/// Shared local NATS ownership lock file.
+pub fn nats_runtime_lock_file() -> PathBuf {
+    nats_runtime_dir().join("nats.lock")
+}
+
+/// Shared local NATS connection metadata file.
+pub fn nats_runtime_ports_file() -> PathBuf {
+    nats_runtime_dir().join("ports.json")
+}
+
+/// Shared local NATS JetStream store directory.
+pub fn nats_runtime_store_dir() -> PathBuf {
+    nats_runtime_dir().join("store")
 }
 
 /// Subdirectory holding per-MCP-server YAML files.

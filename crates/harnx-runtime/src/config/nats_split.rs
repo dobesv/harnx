@@ -5,6 +5,7 @@ use async_nats::{jetstream, ConnectOptions};
 use harnx_core::agent_config::AgentRole;
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Cow,
     io::BufReader,
     path::{Path, PathBuf},
 };
@@ -41,6 +42,36 @@ impl NatsServerConfig {
     pub fn set_name(&mut self, name: impl Into<String>) {
         self.name = name.into();
     }
+}
+
+/// Resolve connection details for the reserved shared-local cluster.
+///
+/// Front-ends and worker subprocesses use this helper as their single source
+/// of dynamic config. A complete environment handoff takes precedence; without
+/// one, details come from the auto-managed shared broker.
+pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
+    let (url, token) = match (
+        std::env::var(HARNX_NATS_URL_ENV).ok(),
+        std::env::var(HARNX_NATS_TOKEN_ENV).ok(),
+    ) {
+        (Some(url), Some(token)) => (url, token),
+        (None, None) => {
+            let server = crate::nats_local_server::ensure_shared_server().await?;
+            (server.url.clone(), server.token.clone())
+        }
+        _ => bail!("{HARNX_NATS_URL_ENV} and {HARNX_NATS_TOKEN_ENV} must be set together"),
+    };
+
+    Ok(NatsServerConfig {
+        name: LOCAL_CLUSTER_KEY.to_string(),
+        url,
+        token: Some(token),
+        tls: None,
+        tls_cert: None,
+        tls_key: None,
+        tls_ca: None,
+        agents: vec![],
+    })
 }
 
 impl Config {
@@ -83,9 +114,21 @@ impl Config {
             })
     }
 
+    async fn resolve_nats_server<'a>(
+        &'a self,
+        cluster_key: &str,
+    ) -> Result<Cow<'a, NatsServerConfig>> {
+        if cluster_key == LOCAL_CLUSTER_KEY {
+            // Reserved dynamic identity wins even if a file named
+            // nats_servers/__local__.yaml was loaded.
+            return Ok(Cow::Owned(resolve_local_nats_server_config().await?));
+        }
+        self.nats_server(cluster_key).map(Cow::Borrowed)
+    }
+
     pub async fn nats_client(&self, cluster_key: &str) -> Result<async_nats::Client> {
-        let server = self.nats_server(cluster_key)?;
-        Self::connect_nats_server(server).await.with_context(|| {
+        let server = self.resolve_nats_server(cluster_key).await?;
+        Self::connect_nats_server(&server).await.with_context(|| {
             format!(
                 "Failed to connect to NATS cluster '{}' at '{}'",
                 cluster_key, server.url
@@ -301,6 +344,72 @@ fn expand_env_string(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Assert a resolved server matches the expected dynamic-local identity
+    /// (reserved name, url, token) and routes through the authenticated path.
+    /// Uses a single tuple comparison so the check reads as one assertion.
+    fn assert_authenticated_local_server(server: &NatsServerConfig, url: &str, token: &str) {
+        let actual = (
+            server.name.as_str(),
+            server.url.as_str(),
+            server.token.as_deref(),
+            server.has_auth_or_tls_config(),
+        );
+        assert_eq!(actual, (LOCAL_CLUSTER_KEY, url, Some(token), true));
+    }
+
+    /// Assert an error message mentions each expected substring. Keeps the
+    /// per-test assertion blocks small and states intent in one call.
+    fn assert_error_mentions(error: &str, expected: &[&str]) {
+        for needle in expected {
+            assert!(
+                error.contains(needle),
+                "expected error to mention {needle:?}, got: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_cluster_env_handoff_builds_authenticated_dynamic_config() {
+        harnx_core::require_nextest();
+        unsafe {
+            std::env::set_var(HARNX_NATS_URL_ENV, "nats://127.0.0.1:4555");
+            std::env::set_var(HARNX_NATS_TOKEN_ENV, "handoff-token");
+        }
+
+        let server = resolve_local_nats_server_config().await.unwrap();
+
+        assert_authenticated_local_server(&server, "nats://127.0.0.1:4555", "handoff-token");
+    }
+
+    #[tokio::test]
+    async fn local_cluster_dynamic_resolution_wins_over_reserved_yaml_entry() {
+        harnx_core::require_nextest();
+        unsafe {
+            std::env::set_var(HARNX_NATS_URL_ENV, "nats://127.0.0.1:4666");
+            std::env::set_var(HARNX_NATS_TOKEN_ENV, "dynamic-token");
+        }
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("__local__.yaml"),
+            "url: nats://static.invalid:4222\ntoken: static-token\n",
+        )
+        .unwrap();
+        let config = Config {
+            nats_servers: Config::load_nats_servers_from_dir(directory.path()).unwrap(),
+            ..Config::default()
+        };
+        assert_eq!(
+            config.nats_server(LOCAL_CLUSTER_KEY).unwrap().url,
+            "nats://static.invalid:4222"
+        );
+
+        let server = config.resolve_nats_server(LOCAL_CLUSTER_KEY).await.unwrap();
+
+        assert_eq!(server.url, "nats://127.0.0.1:4666");
+        assert_eq!(server.token.as_deref(), Some("dynamic-token"));
+        assert!(matches!(server, Cow::Owned(_)));
+    }
+
     #[test]
     fn expand_nats_server_envs_expands_secret_fields() {
         unsafe {
@@ -406,9 +515,7 @@ tls: false
         };
 
         let error = build_nats_connect_options(&server).unwrap_err().to_string();
-        assert!(error.contains("tls_cert"));
-        assert!(error.contains("tls_key"));
-        assert!(error.contains("mtls"));
+        assert_error_mentions(&error, &["tls_cert", "tls_key", "mtls"]);
     }
 
     #[test]
@@ -425,9 +532,7 @@ tls: false
         };
 
         let error = build_nats_connect_options(&server).unwrap_err().to_string();
-        assert!(error.contains("does not exist"));
-        assert!(error.contains("tls_cert"));
-        assert!(error.contains("secure"));
+        assert_error_mentions(&error, &["does not exist", "tls_cert", "secure"]);
     }
 
     #[test]
@@ -446,8 +551,6 @@ tls: false
         };
 
         let error = build_nats_connect_options(&server).unwrap_err().to_string();
-        assert!(error.contains("tls_ca"));
-        assert!(error.contains("not supported"));
-        assert!(error.contains("alb"));
+        assert_error_mentions(&error, &["tls_ca", "not supported", "alb"]);
     }
 }
