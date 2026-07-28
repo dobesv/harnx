@@ -23,7 +23,7 @@ dependencies = [
 [[package]]
 name = "agent-client-protocol"
 version = "2.0.0"
-source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=333da17267bf3351e1898649197f21487b914c00#333da17267bf3351e1898649197f21487b914c00"
+source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=2deebddabcdcab8a0b9fa4c226fe6eaf514b0e70#2deebddabcdcab8a0b9fa4c226fe6eaf514b0e70"
 dependencies = [
  "agent-client-protocol-derive",
  "agent-client-protocol-schema",
@@ -46,7 +46,7 @@ dependencies = [
 [[package]]
 name = "agent-client-protocol-derive"
 version = "2.0.0"
-source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=333da17267bf3351e1898649197f21487b914c00#333da17267bf3351e1898649197f21487b914c00"
+source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=2deebddabcdcab8a0b9fa4c226fe6eaf514b0e70#2deebddabcdcab8a0b9fa4c226fe6eaf514b0e70"
 dependencies = [
  "quote",
  "syn 3.0.2",
