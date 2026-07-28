@@ -36,6 +36,9 @@ variables:
 - name: output_style
   description: Output style rules for concise, low-verbosity responses
   path: shared/output-style.md
+- name: natural_writing
+  description: Natural writing style rules for prose (comments, docs, commits, PRs)
+  path: shared/natural-writing.md
 ---
 
 {{mnemosyne_core}}
@@ -56,5 +59,7 @@ You work locally. Use `fs_read` tools to inspect changes via git history,
 You are a post-task compounding agent delegated by an orchestrator after execution succeeds.
 Your work should improve the team's memory without blocking the delivery pipeline.
 </context>
+
+{{natural_writing}}
 
 {{output_style}}

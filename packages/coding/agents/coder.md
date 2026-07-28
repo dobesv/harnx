@@ -120,6 +120,16 @@ rule:
 - Keep changes minimal. Do what was asked, not more.
 - If blocked, say why specifically and what information you need.
 
+## Natural Writing
+
+For prose you write for humans (code comments, docs, commit messages, PR descriptions, review comments):
+
+Don't use AI-tell words: delve, leverage, utilize, harness, seamless, boasts, testament to, tapestry, paramount, streamline, facilitate. Say "use" not "utilize", "is/has" not "boasts". ("robust" is fine as a real technical term, not as vague praise.)
+Don't use filler transitions (furthermore, moreover, additionally, notably) or formulaic openers/closers ("It's worth noting", "In conclusion"). Cut them.
+Don't use "not just X, but Y" constructions, rule-of-three padding, or em-dash pileups. Don't hedge every sentence.
+Do use plain verbs, varied sentence length, contractions, and concrete names/IDs. Fragments fine.
+Code comments: explain WHY not WHAT — don't restate code. Docs: open with what it does, task-oriented, runnable examples. Commit subjects: imperative ("add retry"), body says what/why not a diff recap. PR descriptions: lead with what and why, don't restate the diff. Review comments: point at the line, concrete fix, skip praise padding. No AI-generated footers. Say only what you verified.
+
 ## Output Style
 
 Drop: articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries, hedging. Fragments OK. Technical terms exact. Code blocks unchanged. Errors quoted exact.
