@@ -135,6 +135,7 @@
       output_price: 8
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-4.1-2025-04-14
       max_input_tokens: 1047576
       max_output_tokens: 32768
@@ -142,6 +143,7 @@
       output_price: 8
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-4.1-mini
       max_input_tokens: 1047576
       max_output_tokens: 32768
@@ -149,6 +151,7 @@
       output_price: 1.6
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-4.1-mini-2025-04-14
       max_input_tokens: 1047576
       max_output_tokens: 32768
@@ -156,6 +159,7 @@
       output_price: 1.6
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-4.1-nano
       max_input_tokens: 1047576
       max_output_tokens: 32768
@@ -163,6 +167,7 @@
       output_price: 0.4
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-4.1-nano-2025-04-14
       max_input_tokens: 1047576
       max_output_tokens: 32768
@@ -170,6 +175,7 @@
       output_price: 0.4
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-4o
       max_input_tokens: 128000
       max_output_tokens: 16384
@@ -307,6 +313,7 @@
       output_price: 10
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5-2025-08-07
       max_input_tokens: 272000
       max_output_tokens: 128000
@@ -314,6 +321,7 @@
       output_price: 10
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5-chat
       max_input_tokens: 128000
       max_output_tokens: 16384
@@ -321,6 +329,7 @@
       output_price: 10
       supports_vision: true
       supports_tool_use: false
+      endpoint: responses
     - name: gpt-5-chat-latest
       max_input_tokens: 128000
       max_output_tokens: 16384
@@ -328,6 +337,7 @@
       output_price: 10
       supports_vision: true
       supports_tool_use: false
+      endpoint: responses
     - name: gpt-5-mini
       max_input_tokens: 272000
       max_output_tokens: 128000
@@ -335,6 +345,7 @@
       output_price: 2
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5-mini-2025-08-07
       max_input_tokens: 272000
       max_output_tokens: 128000
@@ -342,6 +353,7 @@
       output_price: 2
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5-nano
       max_input_tokens: 272000
       max_output_tokens: 128000
@@ -349,6 +361,7 @@
       output_price: 0.4
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5-nano-2025-08-07
       max_input_tokens: 272000
       max_output_tokens: 128000
@@ -356,6 +369,7 @@
       output_price: 0.4
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5-search-api
       max_input_tokens: 272000
       max_output_tokens: 128000
@@ -377,6 +391,7 @@
       output_price: 10
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5.1-2025-11-13
       max_input_tokens: 272000
       max_output_tokens: 128000
@@ -384,6 +399,7 @@
       output_price: 10
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5.1-chat-latest
       max_input_tokens: 128000
       max_output_tokens: 16384
@@ -391,6 +407,7 @@
       output_price: 10
       supports_vision: true
       supports_tool_use: false
+      endpoint: responses
     - name: gpt-5.2
       max_input_tokens: 272000
       max_output_tokens: 128000
@@ -398,6 +415,7 @@
       output_price: 14
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5.2-2025-12-11
       max_input_tokens: 272000
       max_output_tokens: 128000
@@ -405,6 +423,7 @@
       output_price: 14
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5.2-chat-latest
       max_input_tokens: 128000
       max_output_tokens: 16384
@@ -412,6 +431,7 @@
       output_price: 14
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5.3-chat-latest
       max_input_tokens: 128000
       max_output_tokens: 16384
@@ -419,6 +439,7 @@
       output_price: 14
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5.4
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -426,6 +447,7 @@
       output_price: 15
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5.4-2026-03-05
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -433,6 +455,7 @@
       output_price: 15
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5.4-mini
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -440,6 +463,7 @@
       output_price: 4.5
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5.4-mini-2026-03-17
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -447,6 +471,7 @@
       output_price: 4.5
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5.4-nano
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -454,6 +479,7 @@
       output_price: 1.25
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5.4-nano-2026-03-17
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -461,57 +487,49 @@
       output_price: 1.25
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5.5
-      endpoint: responses
       max_input_tokens: 1050000
       max_output_tokens: 128000
       input_price: 5
       output_price: 30
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5.5-2026-04-23
-      endpoint: responses
       max_input_tokens: 1050000
       max_output_tokens: 128000
       input_price: 5
       output_price: 30
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-5.6
-      endpoint: responses
       max_input_tokens: 1050000
       max_output_tokens: 128000
       input_price: 5
       output_price: 30
       supports_vision: true
       supports_tool_use: true
-    - name: gpt-5.6-luna
       endpoint: responses
+    - name: gpt-5.6-luna
       max_input_tokens: 1050000
       max_output_tokens: 128000
       input_price: 1
       output_price: 6
       supports_vision: true
       supports_tool_use: true
-    - name: gpt-5.6-sol
       endpoint: responses
+    - name: gpt-5.6-sol
       max_input_tokens: 1050000
       max_output_tokens: 128000
       input_price: 5
       output_price: 30
       supports_vision: true
       supports_tool_use: true
-    - name: gpt-5.6-terra
       endpoint: responses
-      max_input_tokens: 1050000
-      max_output_tokens: 128000
-      input_price: 2.5
-      output_price: 15
-      supports_vision: true
-      supports_tool_use: true
     - name: gpt-5.6-sol:high
       real_name: gpt-5.6-sol
-      endpoint: responses
       max_input_tokens: 1050000
       max_output_tokens: 128000
       input_price: 5
@@ -520,20 +538,17 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.reasoning.effort = "high"
-    - name: gpt-5.6-sol:max
-      real_name: gpt-5.6-sol
       endpoint: responses
+    - name: gpt-5.6-terra
       max_input_tokens: 1050000
       max_output_tokens: 128000
-      input_price: 5
-      output_price: 30
+      input_price: 2.5
+      output_price: 15
       supports_vision: true
       supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.reasoning.effort = "max"
+      endpoint: responses
     - name: gpt-5.6-terra:high
       real_name: gpt-5.6-terra
-      endpoint: responses
       max_input_tokens: 1050000
       max_output_tokens: 128000
       input_price: 2.5
@@ -542,17 +557,7 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.reasoning.effort = "high"
-    - name: gpt-5.6-terra:max
-      real_name: gpt-5.6-terra
       endpoint: responses
-      max_input_tokens: 1050000
-      max_output_tokens: 128000
-      input_price: 2.5
-      output_price: 15
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.reasoning.effort = "max"
     - name: gpt-audio
       max_input_tokens: 128000
       max_output_tokens: 16384
@@ -560,6 +565,7 @@
       output_price: 10
       supports_vision: false
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-audio-1.5
       max_input_tokens: 128000
       max_output_tokens: 16384
@@ -574,6 +580,7 @@
       output_price: 10
       supports_vision: false
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-audio-mini
       max_input_tokens: 128000
       max_output_tokens: 16384
@@ -581,6 +588,7 @@
       output_price: 2.4
       supports_vision: false
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-audio-mini-2025-10-06
       max_input_tokens: 128000
       max_output_tokens: 16384
@@ -588,6 +596,7 @@
       output_price: 2.4
       supports_vision: false
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-audio-mini-2025-12-15
       max_input_tokens: 128000
       max_output_tokens: 16384
@@ -595,6 +604,7 @@
       output_price: 2.4
       supports_vision: false
       supports_tool_use: true
+      endpoint: responses
     - name: gpt-realtime
       max_input_tokens: 32000
       max_output_tokens: 4096
@@ -670,6 +680,7 @@
       output_price: 8
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: o3-2025-04-16
       max_input_tokens: 200000
       max_output_tokens: 100000
@@ -677,6 +688,7 @@
       output_price: 8
       supports_vision: true
       supports_tool_use: true
+      endpoint: responses
     - name: o3-mini
       max_input_tokens: 200000
       max_output_tokens: 100000
@@ -1138,6 +1150,24 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.output_config.effort = "xhigh"
+    - name: claude-opus-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_tool_use: true
+    - name: claude-opus-5:thinking
+      real_name: claude-opus-5
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
     - name: claude-sonnet-4-5
       max_input_tokens: 200000
       max_output_tokens: 64000
@@ -2450,6 +2480,42 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+    - name: claude-opus-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_tool_use: true
+    - name: claude-opus-5:thinking
+      real_name: claude-opus-5
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+    - name: claude-opus-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_tool_use: true
+    - name: claude-opus-5@default:thinking
+      real_name: claude-opus-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
     - name: claude-sonnet-4
       max_input_tokens: 1000000
       max_output_tokens: 64000
@@ -2734,16 +2800,16 @@
       supports_tool_use: true
     - name: gemini-3.5-flash-lite
       max_input_tokens: 1048576
-      max_output_tokens: 65535
-      input_price: 0.25
-      output_price: 1.5
+      max_output_tokens: 65536
+      input_price: 0.3
+      output_price: 2.5
       supports_vision: true
       supports_tool_use: true
     - name: gemini-3.6-flash
       max_input_tokens: 1048576
-      max_output_tokens: 65535
+      max_output_tokens: 65536
       input_price: 1.5
-      output_price: 9
+      output_price: 7.5
       supports_vision: true
       supports_tool_use: true
     - name: gemini-embedding-2
