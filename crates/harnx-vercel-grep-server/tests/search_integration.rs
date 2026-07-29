@@ -24,6 +24,11 @@ const NOT_FOUND_OUTPUT: &str = r#"{
   "results": []
 }"#;
 
+/// Normalize CRLF to LF so byte-exact asserts pass on Windows (where git checks out .txt fixtures as CRLF)
+fn golden_output() -> String {
+    GOLDEN_OUTPUT.replace("\r\n", "\n")
+}
+
 fn endpoint(server: &MockServer) -> String {
     format!("{}/api/search", server.uri())
 }
@@ -62,7 +67,7 @@ async fn client_sends_all_filters_and_formats_success_response() {
         panic!("expected successful search outcome");
     };
     let response: SearchResponse = serde_json::from_value(value).expect("fixture must deserialize");
-    assert_eq!(build_output("FastAPI", &response), GOLDEN_OUTPUT);
+    assert_eq!(build_output("FastAPI", &response), golden_output());
 }
 
 #[tokio::test]
@@ -199,5 +204,5 @@ async fn grep_query_handler_runs_full_pipeline_over_rmcp() {
         .expect("tool call must succeed");
 
     assert_eq!(result.is_error, Some(false));
-    assert_eq!(text_content(&result), GOLDEN_OUTPUT);
+    assert_eq!(text_content(&result), golden_output());
 }
