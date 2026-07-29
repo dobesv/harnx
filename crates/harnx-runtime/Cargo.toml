@@ -26,6 +26,7 @@ duct = { workspace = true }
 fancy-regex = { workspace = true }
 fuzzy-matcher = { workspace = true }
 futures-util = { workspace = true }
+fs4 = { workspace = true }
 globset = { workspace = true }
 harnx-acp = { workspace = true }
 harnx-client = { path = "../harnx-client" }
@@ -59,6 +60,7 @@ time = { workspace = true }
 syntect = { workspace = true }
 sys-locale = { workspace = true }
 terminal-colorsaurus = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 unicode-segmentation = { workspace = true }
@@ -66,9 +68,11 @@ unicode-width = { workspace = true }
 uuid = { workspace = true }
 which = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 arboard = { workspace = true, features = ["wayland-data-control"] }
-libc = { workspace = true }
 
 [target.'cfg(not(any(target_os = "linux", target_os = "android", target_os = "emscripten")))'.dependencies]
 arboard = { workspace = true }

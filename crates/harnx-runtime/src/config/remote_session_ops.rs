@@ -297,7 +297,15 @@ async fn remote_thin_session(
 ) -> Result<ThinClientSession> {
     let (agent, cluster, session_id) = {
         let cfg = config.read();
-        let (agent, cluster) = cfg.remote_agent.clone().context("No remote agent")?;
+        let (agent, cluster) = cfg.remote_agent.clone().unwrap_or_else(|| {
+            (
+                cfg.agent
+                    .as_ref()
+                    .map(|agent| agent.name().to_string())
+                    .unwrap_or_default(),
+                super::LOCAL_CLUSTER_KEY.to_string(),
+            )
+        });
         let session_id = cfg
             .session
             .as_ref()

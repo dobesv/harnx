@@ -1,13 +1,19 @@
 use crate::types::Tui;
 use crate::types::{PendingMessage, TuiEvent};
 use anyhow::{Context, Result};
+#[cfg(test)]
 use harnx_core::event::{AgentEvent, ModelEvent};
+#[cfg(test)]
 use harnx_core::sink::emit_agent_event;
-use harnx_hooks::{AsyncHookManager, PersistentHookManager};
+#[cfg(test)]
 use harnx_render::pretty_error_string;
+#[cfg(test)]
 use harnx_runtime::client::CompletionTokenUsage;
-use harnx_runtime::config::{GlobalConfig, Input};
+use harnx_runtime::config::GlobalConfig;
+#[cfg(test)]
+use harnx_runtime::config::Input;
 use harnx_runtime::utils::AbortSignal;
+use harnx_runtime::{ThinClientConfig, ThinClientSession};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -16,15 +22,25 @@ use crate::agent_event_sink::TuiAgentEventSink;
 pub(super) struct PromptTaskContext {
     pub(super) config: GlobalConfig,
     pub(super) abort_signal: AbortSignal,
-    pub(super) async_manager: Arc<Mutex<AsyncHookManager>>,
-    pub(super) persistent_manager: Arc<Mutex<PersistentHookManager>>,
+    #[cfg(test)]
+    pub(super) async_manager: Arc<Mutex<harnx_hooks::AsyncHookManager>>,
+    #[cfg(test)]
+    pub(super) persistent_manager: Arc<Mutex<harnx_hooks::PersistentHookManager>>,
+    #[cfg(test)]
     pub(super) pending_async_context: Arc<Mutex<Option<String>>>,
+    #[cfg(test)]
     pub(super) shared_pending_message: Arc<Mutex<Option<PendingMessage>>>,
+    pub(super) local_worker:
+        Arc<Mutex<Option<harnx_runtime::local_orchestrator::LocalWorkerSupervisor>>>,
     pub(super) event_tx: mpsc::UnboundedSender<TuiEvent>,
 }
 
 impl Tui {
-    pub(super) async fn run_prompt_task(msg: PendingMessage, ctx: PromptTaskContext) -> Result<()> {
+    #[cfg(test)]
+    pub(super) async fn run_test_prompt_task(
+        msg: PendingMessage,
+        ctx: PromptTaskContext,
+    ) -> Result<()> {
         let attachment_dir = msg.attachment_dir.clone();
         let input_res = if msg.attachments.is_empty() {
             Ok(harnx_runtime::config::input::from_str(
@@ -51,6 +67,7 @@ impl Tui {
         Self::run_prompt_inner(ctx, input, 0, true).await
     }
 
+    #[cfg(test)]
     async fn run_prompt_inner(
         ctx: PromptTaskContext,
         input: Input,
@@ -157,79 +174,78 @@ impl Tui {
         harnx_runtime::run_agent_loop_with_local_handoff(&loop_ctx, input).await
     }
 
-    /// Run a prompt task for a remote agent (NATS thin-client mode).
-    ///
-    /// This drives the turn via `ThinClientSession` instead of running
-    /// `run_agent_loop` locally. The worker daemon executes the actual agent loop.
-    pub(super) async fn run_remote_prompt_task(
+    /// Drive either a local or configured remote agent through NATS.
+    pub(super) async fn run_thin_client_prompt_task(
         msg: PendingMessage,
         ctx: PromptTaskContext,
         agent: String,
         cluster: String,
     ) -> Result<()> {
-        use harnx_runtime::{ThinClientConfig, ThinClientSession};
-
-        // Clean up any attachment directory to avoid leaking temp files
         if let Some(dir) = msg.attachment_dir.clone() {
-            let cleanup_dir = dir.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                crate::types::cleanup_attachment_dir(&cleanup_dir);
+                crate::types::cleanup_attachment_dir(&dir);
             })
             .await;
         }
-
-        // We do not support attachments in remote mode yet
         if !msg.attachments.is_empty() {
             return Err(anyhow::anyhow!(
-                "Attachments are not yet supported in remote (thin-client) mode"
+                "Attachments are not yet supported in thin-client mode"
             ));
         }
 
-        let text = msg.text.clone();
+        if cluster == harnx_runtime::config::LOCAL_CLUSTER_KEY {
+            let mut supervisor = ctx.local_worker.lock().await;
+            harnx_runtime::local_orchestrator::ensure_local_worker(&mut supervisor)
+                .await
+                .context("failed to ensure local NATS worker")?;
+        }
 
-        // Create a TUI event sink that forwards to the event channel
-        let event_tx = ctx.event_tx.clone();
-        let sink = Arc::new(TuiAgentEventSink::new(event_tx.clone()));
-
-        // Build thin-client config
-        // Extract session id before any await to avoid holding the read lock.
+        let sink = Arc::new(TuiAgentEventSink::new(ctx.event_tx.clone()));
         let session_id = ctx
             .config
             .read()
             .session
             .as_ref()
-            .map(|s| s.id().to_string());
-        let thin_config = ThinClientConfig {
-            cluster,
-            agent,
-            session_id,
-        };
-
-        // Create the thin-client session
-        // We pass a cloned GlobalConfig, but we must be careful about the
-        // read guard - we need to avoid holding it across the await boundary
+            .map(|session| session.id().to_string());
         let session = ThinClientSession::from_global_config(
-            thin_config,
+            ThinClientConfig {
+                cluster: cluster.clone(),
+                agent,
+                session_id,
+            },
             &ctx.config,
             ctx.abort_signal.clone(),
         )
         .await
         .context("failed to create thin-client session")?;
 
-        // We don't have pending cancel channels in TUI yet
-        // (those would come from UI controls in future work)
-        let result = session.run_turn(&text, sink, None).await?;
-
-        // Log result for debugging
+        let input = harnx_runtime::config::input::from_str(&ctx.config, &msg.text, None);
+        let result = session.run_turn(&msg.text, sink, None).await?;
+        harnx_runtime::commands::update_last_message_after_thin_client_turn(
+            &ctx.config,
+            input,
+            &result,
+        );
+        if result.was_cancelled || result.response.is_none() {
+            let _ = ctx
+                .event_tx
+                .send(TuiEvent::Agent(harnx_core::event::AgentEvent::Model(
+                    harnx_core::event::ModelEvent::Final {
+                        output: String::new(),
+                        usage: Default::default(),
+                    },
+                )));
+        }
         log::info!(
-            "remote prompt completed: session_id={} cancelled={}",
+            "thin-client prompt completed: cluster={} session_id={} cancelled={}",
+            cluster,
             result.session_id,
             result.was_cancelled
         );
-
         Ok(())
     }
 
+    #[cfg(test)]
     async fn call_chat_completions_streaming_tui(
         input: &mut Input,
         client: &dyn harnx_runtime::client::Client,

@@ -35,5 +35,5 @@ pub use backend::{FencedSessionLogSink, NatsSessionLogBackend};
 pub use control::{control_subject, publish_control_command, ControlCommand};
 pub use daemon::{
     new_remote_session_id, notify_subject, publish_session_activate, run_worker_daemon,
-    SessionActivate, WorkerDaemonConfig,
+    worker_ready_subject, SessionActivate, WorkerDaemonConfig,
 };

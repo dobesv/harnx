@@ -28,6 +28,10 @@ session_id: [SID]
 response: Researcher delegating to analyst.
 Nested task complete
 
+🤖 nested-parent ▸   💬 [N]
+No more scripted responses.
+
+🤖 nested-parent ▸   💬 [N]
 
 
 
@@ -75,8 +79,4 @@ Nested task complete
 
 
 
-
-
-
-
-* 🤖 nested-parent ▸ mock-llm:test ▸ [SID]   Context: [N](0%)
+* 🤖 nested-parent ▸ mock-llm:test ▸ [SID]

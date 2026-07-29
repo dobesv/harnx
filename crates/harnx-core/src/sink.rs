@@ -84,7 +84,14 @@ where
 }
 
 pub fn current_agent_event_sink() -> Option<Arc<dyn AgentEventSink>> {
-    SCOPED_SINK.try_with(|sink| sink.clone()).ok()
+    if let Ok(sink) = SCOPED_SINK.try_with(|sink| sink.clone()) {
+        return Some(sink);
+    }
+    AGENT_EVENT_SINK
+        .lock()
+        .expect("AGENT_EVENT_SINK mutex poisoned")
+        .sink
+        .clone()
 }
 
 pub fn emit_agent_event(event: AgentEvent) -> bool {

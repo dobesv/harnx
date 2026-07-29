@@ -9141,7 +9141,7 @@ async fn test_info_session_single_arg_no_active_agent() {
 }
 
 #[tokio::test]
-async fn test_start_prompt_sets_active_remote_session() {
+async fn test_start_prompt_does_not_arm_remote_cancel_without_session() {
     let config = test_config();
     {
         let mut guard = config.write();
@@ -9165,15 +9165,10 @@ async fn test_start_prompt_sets_active_remote_session() {
     // start_prompt handles the spawn
     tui.start_prompt(msg).await.unwrap();
 
-    // The remote info should be set!
-    let session_opt = tui.active_remote_session.as_ref();
-    assert!(
-        session_opt.is_some(),
-        "active_remote_session should be Some when config.remote_agent is set"
+    assert_eq!(
+        tui.active_remote_session, None,
+        "remote cancellation must not use an empty session id"
     );
-    let (session_id, cluster) = session_opt.unwrap();
-    assert_eq!(cluster, "cluster_name");
-    assert_eq!(session_id, ""); // Because we didn't set a session in config, it defaults to ""
 
     // We can simulate an Error or Final event to clear it
     use harnx_core::event::{AgentEvent, ModelEvent};
@@ -9189,6 +9184,34 @@ async fn test_start_prompt_sets_active_remote_session() {
     assert_eq!(
         tui.active_remote_session, None,
         "Final event should clear the active_remote_session"
+    );
+}
+
+#[tokio::test]
+async fn test_start_prompt_arms_remote_cancel_with_real_session_id() {
+    let config = test_config();
+    let session_id = {
+        let mut guard = config.write();
+        guard.remote_agent = Some(("remote_agent_name".to_string(), "cluster_name".to_string()));
+        let session = harnx_runtime::config::session::new(&guard, "real-session", None).unwrap();
+        let session_id = session.id().to_string();
+        guard.session = Some(session);
+        session_id
+    };
+    let mut harness = TuiTestHarness::with_config(config).await;
+    let tui = harness.tui();
+    tui.start_prompt(crate::types::PendingMessage {
+        text: "hello".to_string(),
+        attachments: vec![],
+        attachment_dir: None,
+        paste_count: 0,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        tui.active_remote_session,
+        Some((session_id, "cluster_name".to_string()))
     );
 }
 

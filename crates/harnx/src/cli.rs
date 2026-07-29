@@ -100,13 +100,14 @@ pub enum Commands {
     Info(InfoArgs),
     /// Session management commands
     Session(SessionArgs),
-    /// Run a remote worker daemon for a NATS cluster (HA mode)
+    /// Run a worker daemon for a configured or shared-local NATS cluster
     Worker(WorkerArgs),
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
 pub struct WorkerArgs {
-    /// Cluster key from nats_servers/<name>.yaml
+    /// Cluster key from nats_servers/<name>.yaml, or __local__ with
+    /// HARNX_NATS_URL and HARNX_NATS_TOKEN handoff
     #[arg(long)]
     pub cluster: String,
     /// Stable worker identity for leases and the durable consumer name.

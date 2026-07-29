@@ -347,24 +347,21 @@ impl Tui {
                     let session_id = session_id.clone();
                     let cluster = cluster.clone();
                     tokio::spawn(async move {
-                        let server = { config.read().nats_server(&cluster).cloned() };
-                        if let Ok(server) = server {
-                            match harnx_runtime::config::Config::connect_nats_server(&server).await
-                            {
-                                Ok(client) => {
-                                    if let Err(e) = harnx_runtime::send_control_command(
-                                        &client,
-                                        &session_id,
-                                        harnx_runtime::ControlCommand::Cancel,
-                                    )
-                                    .await
-                                    {
-                                        log::warn!("Failed to send remote cancel command: {e}");
-                                    }
+                        let config = config.read().clone();
+                        match config.nats_client(&cluster).await {
+                            Ok(client) => {
+                                if let Err(e) = harnx_runtime::send_control_command(
+                                    &client,
+                                    &session_id,
+                                    harnx_runtime::ControlCommand::Cancel,
+                                )
+                                .await
+                                {
+                                    log::warn!("Failed to send NATS cancel command: {e}");
                                 }
-                                Err(e) => {
-                                    log::warn!("Failed to connect to NATS for remote cancel: {e}");
-                                }
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to connect to NATS for cancel: {e}");
                             }
                         }
                     });
@@ -957,6 +954,25 @@ impl Tui {
         self.flush_pending_thought();
     }
 
+    #[cfg(not(test))]
+    async fn mirror_worker_handoff(&self, event: &AgentEvent) {
+        let AgentEvent::Turn(harnx_core::event::TurnEvent::HandoffRequested { agent, session_id }) =
+            event
+        else {
+            return;
+        };
+        if let Err(error) = harnx_runtime::config::Config::use_agent(
+            &self.config,
+            agent,
+            session_id.as_deref(),
+            harnx_runtime::utils::create_abort_signal(),
+        )
+        .await
+        {
+            log::warn!("failed to mirror worker handoff in TUI state: {error:#}");
+        }
+    }
+
     async fn render_agent_event(&mut self, event: AgentEvent) {
         use harnx_core::event::{
             ModelEvent, NoticeEvent, SessionEvent, ToolEvent, TurnEvent, UserEvent,
@@ -970,6 +986,8 @@ impl Tui {
         let is_usage = matches!(&event, AgentEvent::Model(ModelEvent::Usage { .. }));
         // No streaming-run bookkeeping is needed here: any event that renders a
         // visible transcript item (tool call, tool result, notice, plan, …)
+        #[cfg(not(test))]
+        self.mirror_worker_handoff(&event).await;
         // becomes the trailing item, which ends the open streaming run on its
         // own — the next MessageChunk sees a non-AssistantText tail and starts
         // a fresh block. See `append_streaming_assistant_chunk`.
@@ -1486,46 +1504,53 @@ impl Tui {
 
         self.app.streamed_text_this_turn = false;
 
-        let remote_info = {
+        let (agent, cluster, session_id) = {
             let guard = self.config.read();
-            let agent_and_cluster = guard.remote_agent.clone();
+            let (agent, cluster) = guard.remote_agent.clone().unwrap_or_else(|| {
+                (
+                    guard
+                        .agent
+                        .as_ref()
+                        .map(|agent| agent.name().to_string())
+                        .unwrap_or_default(),
+                    harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
+                )
+            });
             let session_id = guard
                 .session
                 .as_ref()
-                .map(|s| s.id().to_string())
-                .unwrap_or_default();
-            agent_and_cluster.map(|(_, cluster)| (session_id, cluster))
+                .map(|session| session.id().to_string());
+            (agent, cluster, session_id)
         };
-        self.active_remote_session = remote_info;
+        self.active_remote_session = session_id.map(|id| (id, cluster.clone()));
 
         let event_tx = self.event_tx.clone();
 
         let ctx = crate::prompt::PromptTaskContext {
             config: self.config.clone(),
             abort_signal: new_abort,
+            #[cfg(test)]
             async_manager: self.async_manager.clone(),
+            #[cfg(test)]
             persistent_manager: self.persistent_manager.clone(),
+            #[cfg(test)]
             pending_async_context: self.pending_async_context.clone(),
+            #[cfg(test)]
             shared_pending_message: self.shared_pending_message.clone(),
+            local_worker: self.local_worker.clone(),
             event_tx: event_tx.clone(),
         };
 
         let handle = tokio::spawn(async move {
-            // Check if we're running a remote agent
-            // Clone remote_agent before spawning to avoid holding lock across await
-            let remote_agent = {
-                let guard = ctx.config.read();
-                guard.remote_agent.clone()
-            };
-            // Guard is dropped here before any await
-
-            let result: Result<()> = if let Some((agent, cluster)) = remote_agent {
-                // Run remote agent via NATS thin-client
-                Self::run_remote_prompt_task(msg, ctx, agent, cluster).await
+            #[cfg(test)]
+            let result: Result<()> = if cluster == harnx_runtime::config::LOCAL_CLUSTER_KEY {
+                Self::run_test_prompt_task(msg, ctx).await
             } else {
-                // Run local agent
-                Self::run_prompt_task(msg, ctx).await
+                Self::run_thin_client_prompt_task(msg, ctx, agent, cluster).await
             };
+            #[cfg(not(test))]
+            let result: Result<()> =
+                Self::run_thin_client_prompt_task(msg, ctx, agent, cluster).await;
 
             if let Err(err) = result {
                 use harnx_core::event::{AgentEvent, ModelEvent};
@@ -2033,30 +2058,27 @@ impl Tui {
     }
 
     pub(crate) async fn open_session_picker(&mut self) {
-        let (is_remote, cluster) = {
-            let cfg = self.config.read();
-            if let Some((_, ref cluster)) = cfg.remote_agent {
-                (true, cluster.clone())
-            } else {
-                (false, String::new())
+        let cluster = self
+            .config
+            .read()
+            .remote_agent
+            .as_ref()
+            .map(|(_, cluster)| cluster.clone())
+            .unwrap_or_else(|| harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string());
+        let cfg = self.config.read().clone();
+        let (sessions, fetch_error) = match cfg.list_remote_sessions_with_meta(&cluster).await {
+            Ok(sessions) => (sessions, None),
+            Err(error) => {
+                log::warn!(
+                    "Failed to list NATS sessions for cluster '{}': {:#}",
+                    cluster,
+                    error
+                );
+                (
+                    vec![],
+                    Some(format!("NATS sessions unavailable: {error:#}")),
+                )
             }
-        };
-
-        let (sessions, fetch_error) = if is_remote {
-            let cfg = self.config.read().clone();
-            match cfg.list_remote_sessions_with_meta(&cluster).await {
-                Ok(s) => (s, None),
-                Err(e) => {
-                    log::warn!(
-                        "Failed to list remote sessions for cluster '{}': {:#}",
-                        cluster,
-                        e
-                    );
-                    (vec![], Some(format!("remote sessions unavailable: {e:#}")))
-                }
-            }
-        } else {
-            (self.config.read().list_sessions_with_meta(), None)
         };
 
         let ctx = build_picker_context(None);
@@ -2275,7 +2297,7 @@ impl Tui {
             let mut pending_async_context = self.pending_async_context.lock().await;
             let mut output = Vec::<u8>::new();
 
-            let result = harnx_runtime::commands::run_command_with_output(
+            let result = harnx_runtime::commands::run_command_with_output_and_local_worker(
                 &config,
                 abort_signal,
                 line,
@@ -2283,6 +2305,7 @@ impl Tui {
                 &self.persistent_manager,
                 &mut pending_async_context,
                 &mut output,
+                &self.local_worker,
             )
             .await;
 

@@ -86,6 +86,21 @@ impl TestConfigSandbox {
         fs::write(self.root.join("agents").join(format!("{name}.md")), body).expect("write agent");
     }
 
+    pub fn write_mock_openai_client(&self, api_base: &str) {
+        fs::write(
+            self.root.join("config.yaml"),
+            "save: false\nstream: true\nclient: mock\nmodel: mock:test\n",
+        )
+        .expect("write mock global config");
+        fs::write(
+            self.root.join("clients/mock.yaml"),
+            format!(
+                "type: openai-compatible\nname: mock\napi_base: {api_base:?}\napi_key: test-key\nmodels:\n  - name: test\n    max_input_tokens: 32000\n    max_output_tokens: 1024\n"
+            ),
+        )
+        .expect("write mock client config");
+    }
+
     pub fn config(&self) -> Config {
         let prev = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&self.root).expect("switch cwd");

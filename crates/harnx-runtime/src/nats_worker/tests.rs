@@ -632,7 +632,14 @@ async fn remote_header_matches_local_header_source_of_truth() {
         return;
     };
     let temp_repo = create_test_git_repo();
-    let temp_repo_path = temp_repo.path().to_path_buf();
+    // Canonicalize so the expected `working_dir` matches the physical path that
+    // `std::env::current_dir()` returns after `set_current_dir`. On platforms
+    // where the temp root is a symlink (macOS `/var` -> `/private/var`, or a
+    // symlinked `TMPDIR`), the raw temp path and the resolved cwd differ.
+    let temp_repo_path = temp_repo
+        .path()
+        .canonicalize()
+        .expect("temp repo path must canonicalize");
     let original_cwd = std::env::current_dir().expect("current dir must exist before test");
     let client = async_nats::connect(&url).await.unwrap();
     let jetstream = async_nats::jetstream::new(client);
