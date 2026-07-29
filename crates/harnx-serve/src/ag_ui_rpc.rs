@@ -586,17 +586,14 @@ mod tests {
     use super::*;
     use crate::{
         session_actor::{SessionKey, SessionRegistry},
-        test_support::TestConfigSandbox,
+        test_support::{wait_for_state, TestConfigSandbox},
     };
     use bytes::Bytes;
     use harnx_runtime::{client::TestStateGuard, AgentCallFn};
     use http_body_util::BodyExt;
     use serde_json::json;
     use std::sync::Arc;
-    use tokio::{
-        sync::Notify,
-        time::{sleep, Duration},
-    };
+    use tokio::{sync::Notify, time::Duration};
 
     fn registry_with_call_fn(call_fn: AgentCallFn) -> SessionRegistry {
         SessionRegistry::new_for_tests(
@@ -638,7 +635,10 @@ mod tests {
             session: "rpc-get".into(),
         });
         let _ = prompt(&handle, "seed history", SessionPromptOptions::default()).await;
-        sleep(Duration::from_millis(80)).await;
+        wait_for_state(&handle, "idle after seeding history", |state| {
+            *state == SessionState::Idle
+        })
+        .await;
 
         let response = handle_ag_ui_rpc_bytes(
             Method::POST,
@@ -761,7 +761,10 @@ mod tests {
             session: "rpc-prompt".into(),
         });
         let _ = prompt(&handle, "seed history", SessionPromptOptions::default()).await;
-        sleep(Duration::from_millis(80)).await;
+        wait_for_state(&handle, "idle after seeding history", |state| {
+            *state == SessionState::Idle
+        })
+        .await;
 
         let response = handle_ag_ui_rpc_bytes(Method::POST, "plain", "rpc-prompt", Bytes::from(json!({"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"text":"run me"}}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("rpc response");
         assert_eq!(response.status(), StatusCode::OK);
@@ -769,7 +772,10 @@ mod tests {
         assert_eq!(body["result"]["status"], "accepted");
         assert!(body["result"]["run_id"].as_str().is_some());
 
-        sleep(Duration::from_millis(80)).await;
+        wait_for_state(&handle, "idle after RPC prompt", |state| {
+            *state == SessionState::Idle
+        })
+        .await;
         let mut config = crate::session_actor::load_base_config_for_tests();
         config.use_agent_by_name("plain").expect("set agent");
         config.use_session(Some("rpc-prompt")).expect("set session");
@@ -779,55 +785,71 @@ mod tests {
             .any(|msg| msg.role.is_user() && msg.content.to_text() == "run me"));
     }
 
-    #[tokio::test]
-    async fn rpc_resume_validates_interrupt_ids_and_status_payload() {
-        let _guard = TestStateGuard::new(None).await;
-        let sandbox = TestConfigSandbox::new();
-        sandbox.write_agent_with_front_matter(
-            "plain",
-            "model: openai:gpt-4o\nuse_tools: harnx_agent_session_history_read\nhooks:\n  entries:\n    - event: PreToolUse\n      matcher: ^harnx_agent_session_history_read$\n      type: claude-command\n      command: |\n        printf '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"approval required\"}}'",
-            "You are plain.",
-        );
-
+    fn single_interrupt_call_fn() -> AgentCallFn {
         let round = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let call_fn: AgentCallFn = {
+        Arc::new(move |_input, _config, _abort| {
             let round = Arc::clone(&round);
-            Arc::new(move |_input, _config, _abort| {
-                let round = Arc::clone(&round);
-                Box::pin(async move {
-                    let turn = round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(match turn {
-                        0 => (
-                            "approval required".to_string(),
+            Box::pin(async move {
+                let turn = round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(match turn {
+                    0 => (
+                        "approval required".to_string(),
+                        None,
+                        vec![harnx_core::tool::ToolCall::new(
+                            "harnx_agent_session_history_read".to_string(),
+                            json!({}),
+                            Some("rpc-call-1".to_string()),
                             None,
-                            vec![harnx_core::tool::ToolCall::new(
-                                "harnx_agent_session_history_read".to_string(),
-                                json!({}),
-                                Some("rpc-call-1".to_string()),
-                                None,
-                            )],
-                            harnx_runtime::client::CompletionTokenUsage::default(),
-                        ),
-                        1 => (
-                            "approved by rpc".to_string(),
-                            None,
-                            vec![],
-                            harnx_runtime::client::CompletionTokenUsage::default(),
-                        ),
-                        other => panic!("unexpected rpc round {other}"),
-                    })
+                        )],
+                        harnx_runtime::client::CompletionTokenUsage::default(),
+                    ),
+                    1 => (
+                        "approved by rpc".to_string(),
+                        None,
+                        vec![],
+                        harnx_runtime::client::CompletionTokenUsage::default(),
+                    ),
+                    other => panic!("unexpected rpc round {other}"),
                 })
             })
-        };
-        let registry = registry_with_call_fn(call_fn);
+        })
+    }
 
+    async fn resume_rpc(
+        registry: &SessionRegistry,
+        id: u64,
+        text: &str,
+        resume: Value,
+    ) -> AppResponse {
+        handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "plain",
+            "rpc-resume",
+            Bytes::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "session/prompt",
+                    "params": { "text": text, "resume": resume }
+                })
+                .to_string(),
+            ),
+            &crate::session_actor::load_base_config_for_tests(),
+            registry,
+            PersistenceKind::Filesystem,
+        )
+        .await
+        .expect("resume response")
+    }
+
+    async fn start_interrupted_rpc_session(registry: &SessionRegistry) -> SessionHandle {
         let start = handle_ag_ui_rpc_bytes(
             Method::POST,
             "plain",
             "rpc-resume",
             Bytes::from(json!({"jsonrpc":"2.0","id":20,"method":"session/prompt","params":{"text":"resume me"}}).to_string()),
             &crate::session_actor::load_base_config_for_tests(),
-            &registry,
+            registry,
             PersistenceKind::Filesystem,
         )
         .await
@@ -842,52 +864,47 @@ mod tests {
         });
         let start = prompt(&handle, "resume me", SessionPromptOptions::default()).await;
         assert!(matches!(start, Ok(PromptResult::Accepted { .. })));
-        sleep(Duration::from_millis(120)).await;
+        wait_for_state(&handle, "interrupted", |state| {
+            matches!(state, SessionState::Interrupted { .. })
+        })
+        .await;
+        handle
+    }
 
-        let bad_id = handle_ag_ui_rpc_bytes(
-            Method::POST,
+    #[tokio::test]
+    async fn rpc_resume_validates_interrupt_ids_and_status_payload() {
+        let _guard = TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent_with_front_matter(
             "plain",
-            "rpc-resume",
-            Bytes::from(json!({
-                "jsonrpc":"2.0",
-                "id":21,
-                "method":"session/prompt",
-                "params":{
-                    "text":"",
-                    "resume":[{"interrupt_id":"wrong-id","status":"approved","payload":{"approved":true}}]
-                }
-            }).to_string()),
-            &crate::session_actor::load_base_config_for_tests(),
+            "model: openai:gpt-4o\nuse_tools: harnx_agent_session_history_read\nhooks:\n  entries:\n    - event: PreToolUse\n      matcher: ^harnx_agent_session_history_read$\n      type: claude-command\n      command: |\n        printf '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"approval required\"}}'",
+            "You are plain.",
+        );
+
+        let registry = registry_with_call_fn(single_interrupt_call_fn());
+
+        let handle = start_interrupted_rpc_session(&registry).await;
+
+        let bad_id = resume_rpc(
             &registry,
-            PersistenceKind::Filesystem,
+            21,
+            "",
+            json!([{"interrupt_id":"wrong-id","status":"approved","payload":{"approved":true}}]),
         )
-        .await
-        .expect("bad id response");
+        .await;
         assert_eq!(bad_id.status(), StatusCode::BAD_REQUEST);
         let bad_id_body = response_json(bad_id).await;
         assert_eq!(bad_id_body["error"]["code"], -32602);
         let bad_id_detail = bad_id_body["error"]["data"]["detail"].as_str().unwrap();
         assert!(bad_id_detail.contains("resume interrupt ids do not match pending batch"));
 
-        let bad_status = handle_ag_ui_rpc_bytes(
-            Method::POST,
-            "plain",
-            "rpc-resume",
-            Bytes::from(json!({
-                "jsonrpc":"2.0",
-                "id":22,
-                "method":"session/prompt",
-                "params":{
-                    "text":"resume me",
-                    "resume":[{"interrupt_id":"rpc-call-1","status":"approved","payload":{"approved":false}}]
-                }
-            }).to_string()),
-            &crate::session_actor::load_base_config_for_tests(),
+        let bad_status = resume_rpc(
             &registry,
-            PersistenceKind::Filesystem,
+            22,
+            "resume me",
+            json!([{"interrupt_id":"rpc-call-1","status":"approved","payload":{"approved":false}}]),
         )
-        .await
-        .expect("bad status response");
+        .await;
         assert_eq!(bad_status.status(), StatusCode::BAD_REQUEST);
         let bad_status_body = response_json(bad_status).await;
         assert_eq!(bad_status_body["error"]["code"], -32602);
@@ -896,29 +913,20 @@ mod tests {
             .unwrap()
             .contains("invalid resume status/payload"));
 
-        let ok = handle_ag_ui_rpc_bytes(
-            Method::POST,
-            "plain",
-            "rpc-resume",
-            Bytes::from(json!({
-                "jsonrpc":"2.0",
-                "id":23,
-                "method":"session/prompt",
-                "params":{
-                    "text":"",
-                    "resume":[{"interrupt_id":"rpc-call-1","status":"approved","payload":{"approved":true}}]
-                }
-            }).to_string()),
-            &crate::session_actor::load_base_config_for_tests(),
+        let ok = resume_rpc(
             &registry,
-            PersistenceKind::Filesystem,
+            23,
+            "",
+            json!([{"interrupt_id":"rpc-call-1","status":"approved","payload":{"approved":true}}]),
         )
-        .await
-        .expect("ok response");
+        .await;
         assert_eq!(ok.status(), StatusCode::OK);
         let ok_body = response_json(ok).await;
         assert_eq!(ok_body["result"]["status"], "accepted");
-        sleep(Duration::from_millis(120)).await;
+        wait_for_state(&handle, "idle after resume", |state| {
+            *state == SessionState::Idle
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -976,7 +984,10 @@ mod tests {
         });
         let start = prompt(&handle, "resume me", SessionPromptOptions::default()).await;
         assert!(matches!(start, Ok(PromptResult::Accepted { .. })));
-        sleep(Duration::from_millis(120)).await;
+        wait_for_state(&handle, "interrupted", |state| {
+            matches!(state, SessionState::Interrupted { .. })
+        })
+        .await;
 
         let partial = handle_ag_ui_rpc_bytes(
             Method::POST,

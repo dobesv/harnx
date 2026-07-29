@@ -27,8 +27,6 @@ pub(super) struct PromptTaskContext {
     #[cfg(test)]
     pub(super) persistent_manager: Arc<Mutex<harnx_hooks::PersistentHookManager>>,
     #[cfg(test)]
-    pub(super) pending_async_context: Arc<Mutex<Option<String>>>,
-    #[cfg(test)]
     pub(super) shared_pending_message: Arc<Mutex<Option<PendingMessage>>>,
     pub(super) local_worker:
         Arc<Mutex<Option<harnx_runtime::local_orchestrator::LocalWorkerSupervisor>>>,
@@ -74,8 +72,6 @@ impl Tui {
         _resume_count: u32,
         _with_embeddings: bool,
     ) -> Result<()> {
-        let _ = &ctx.pending_async_context;
-
         let call_fn: harnx_runtime::AgentCallFn = {
             let config = ctx.config.clone();
             Arc::new(
@@ -156,6 +152,7 @@ impl Tui {
         );
 
         let loop_ctx = harnx_runtime::AgentLoopContext {
+            instance_id: harnx_core::instance::InstanceId::new(),
             config: ctx.config.clone(),
             abort_signal: ctx.abort_signal.clone(),
             async_manager: ctx.async_manager.clone(),

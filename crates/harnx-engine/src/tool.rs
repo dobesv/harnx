@@ -85,6 +85,8 @@ pub struct ToolEvalRenderContext {
 }
 
 pub struct ToolEvalContext {
+    /// Worker instance that scopes NATS tool subjects for this evaluation.
+    pub instance_id: harnx_core::instance::InstanceId,
     pub render: Option<ToolEvalRenderContext>,
     /// Ordered tool providers to search when dispatching a call.
     pub providers: Vec<Arc<dyn ToolProvider>>,
@@ -613,6 +615,7 @@ mod tests {
         emit_tool_blocked: impl Fn(&ToolCall, &Value) + Send + Sync + 'static,
     ) -> ToolEvalContext {
         ToolEvalContext {
+            instance_id: harnx_core::instance::InstanceId::new(),
             render: None,
             providers,
             session_name: None,

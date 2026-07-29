@@ -154,3 +154,28 @@ fn canonicalize_for_env(path: PathBuf) -> PathBuf {
 fn canonicalize_existing_dir(path: &Path) -> Option<PathBuf> {
     fs::canonicalize(path).ok()
 }
+
+#[cfg(test)]
+pub(crate) async fn wait_for_state(
+    handle: &crate::session_actor::SessionHandle,
+    description: &str,
+    predicate: impl Fn(&crate::session_actor::SessionState) -> bool,
+) -> crate::session_actor::SessionInfo {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            handle
+                .tx
+                .send(crate::session_actor::SessionCommand::Get { reply: reply_tx })
+                .await
+                .expect("send get");
+            let info = reply_rx.await.expect("recv get reply");
+            if predicate(&info.state) {
+                return info;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for session to become {description}"))
+}

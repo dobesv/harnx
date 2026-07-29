@@ -1282,7 +1282,7 @@ pub(crate) fn load_base_config_for_tests() -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TestConfigSandbox;
+    use crate::test_support::{wait_for_state, TestConfigSandbox};
     use anyhow::anyhow;
     use harnx_core::{
         event::{AgentEvent, ContentBlock, ModelEvent},
@@ -1375,6 +1375,39 @@ mod tests {
             .messages
             .clone();
         messages
+    }
+
+    async fn wait_for_session_messages(
+        agent: &str,
+        session_id: &str,
+        predicate: impl Fn(&[Message]) -> bool,
+    ) -> Vec<Message> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let messages = load_session_messages(agent, session_id);
+                if predicate(&messages) {
+                    return messages;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for persisted session {agent}/{session_id}"))
+    }
+
+    async fn assert_persisted_user_message(agent: &str, session_id: &str, expected: &str) {
+        let messages = wait_for_session_messages(agent, session_id, |messages| {
+            messages
+                .iter()
+                .any(|msg| msg.role.is_user() && msg.content.to_text() == expected)
+        })
+        .await;
+        let user_texts: Vec<String> = messages
+            .iter()
+            .filter(|msg| msg.role.is_user())
+            .map(|msg| msg.content.to_text())
+            .collect();
+        assert!(user_texts.iter().any(|text| text == expected));
     }
 
     #[tokio::test]
@@ -1568,16 +1601,13 @@ mod tests {
         release_first_tool_round.notify_one();
         tokio::task::yield_now().await;
         second_call_release.notify_one();
-        sleep(Duration::from_millis(80)).await;
 
-        assert!(event_watcher.await.expect("watcher task panicked"));
+        assert!(tokio::time::timeout(Duration::from_secs(5), event_watcher)
+            .await
+            .expect("timed out waiting for pending message event")
+            .expect("watcher task panicked"));
 
-        let user_texts: Vec<String> = load_session_messages("plain", "inject")
-            .iter()
-            .filter(|msg| msg.role.is_user())
-            .map(|msg| msg.content.to_text())
-            .collect();
-        assert!(user_texts.iter().any(|text| text == "queued follow-up"));
+        assert_persisted_user_message("plain", "inject", "queued follow-up").await;
     }
 
     #[tokio::test]
@@ -1682,7 +1712,7 @@ mod tests {
         release_second_tool_round.notify_one();
         third_tool_round_started.notified().await;
         release_third_tool_round.notify_one();
-        sleep(Duration::from_millis(80)).await;
+        wait_for_state(&handle, "idle", |state| *state == SessionState::Idle).await;
 
         let seen_injected = seen_injected.lock().await.clone();
         assert_eq!(
@@ -1801,7 +1831,12 @@ mod tests {
             "expected one executed tool result"
         );
 
-        let messages = load_session_messages("plain", "tool-history");
+        let messages = wait_for_session_messages("plain", "tool-history", |messages| {
+            messages
+                .iter()
+                .any(|msg| msg.role.is_assistant() && msg.content.to_text() == "history checked")
+        })
+        .await;
         let assistant_messages: Vec<String> = messages
             .iter()
             .filter(|msg| msg.role.is_assistant())
@@ -1863,9 +1898,11 @@ mod tests {
         assert!(matches!(info.state, SessionState::Running { .. }));
         cancel(&handle).await;
         gate_release.notify_one();
-        sleep(Duration::from_millis(120)).await;
 
-        let info = get_info(&handle).await;
+        let info = wait_for_state(&handle, "idle after cancellation", |state| {
+            *state == SessionState::Idle
+        })
+        .await;
         assert_eq!(info.state, SessionState::Idle);
 
         let persisted = load_session_messages("plain", "cancel");
@@ -1925,7 +1962,10 @@ mod tests {
             PromptResult::Enqueued { .. } | PromptResult::Accepted { .. }
         ));
         second_turn_started.notified().await;
-        sleep(Duration::from_millis(80)).await;
+        wait_for_state(&handle, "idle after boundary prompt", |state| {
+            *state == SessionState::Idle
+        })
+        .await;
 
         let user_texts: Vec<String> = load_session_messages("plain", "boundary")
             .iter()
@@ -2455,72 +2495,59 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn session_actor_resume_preserves_attachment_refs() {
-        let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
-        let sandbox = TestConfigSandbox::new();
-        sandbox.write_agent_with_front_matter(
-            "plain",
-            "model: openai:gpt-4o\nuse_tools: harnx_agent_session_history_read\nhooks:\n  entries:\n    - event: PreToolUse\n      matcher: ^harnx_agent_session_history_read$\n      type: claude-command\n      command: |\n        printf '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"approval needed\"}}'",
-            "You are plain.",
-        );
-
-        let seen_attachments: Arc<tokio::sync::Mutex<Vec<Vec<String>>>> =
-            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    fn attachment_capture_call_fn(
+        seen_attachments: Arc<tokio::sync::Mutex<Vec<Vec<String>>>>,
+    ) -> AgentCallFn {
         let round = Arc::new(AtomicUsize::new(0));
-        let call_fn: AgentCallFn = {
+        Arc::new(move |input, _config, _abort| {
             let round = Arc::clone(&round);
             let seen_attachments = Arc::clone(&seen_attachments);
-            Arc::new(move |input, _config, _abort| {
-                let round = Arc::clone(&round);
-                let seen_attachments = Arc::clone(&seen_attachments);
-                Box::pin(async move {
-                    seen_attachments
-                        .lock()
-                        .await
-                        .push(input.attachment_refs.clone());
-                    let turn = round.fetch_add(1, Ordering::SeqCst);
-                    Ok(match turn {
-                        0 => (
-                            "approval required".to_string(),
+            Box::pin(async move {
+                seen_attachments
+                    .lock()
+                    .await
+                    .push(input.attachment_refs.clone());
+                let turn = round.fetch_add(1, Ordering::SeqCst);
+                Ok(match turn {
+                    0 => (
+                        "approval required".to_string(),
+                        None,
+                        vec![ToolCall::new(
+                            "harnx_agent_session_history_read".to_string(),
+                            json!({}),
+                            Some("attach-call".to_string()),
                             None,
-                            vec![ToolCall::new(
-                                "harnx_agent_session_history_read".to_string(),
-                                json!({}),
-                                Some("attach-call".to_string()),
-                                None,
-                            )],
-                            harnx_runtime::client::CompletionTokenUsage::default(),
-                        ),
-                        1 => (
-                            "resume complete".to_string(),
-                            None,
-                            vec![],
-                            harnx_runtime::client::CompletionTokenUsage::default(),
-                        ),
-                        other => panic!("unexpected LLM round {other}"),
-                    })
+                        )],
+                        harnx_runtime::client::CompletionTokenUsage::default(),
+                    ),
+                    1 => (
+                        "resume complete".to_string(),
+                        None,
+                        vec![],
+                        harnx_runtime::client::CompletionTokenUsage::default(),
+                    ),
+                    other => panic!("unexpected LLM round {other}"),
                 })
             })
-        };
+        })
+    }
 
-        let registry = registry_with_call_fn(call_fn);
-        let handle = registry.get_or_spawn(key("plain", "resume-attachments"));
-        let attachment_refs = vec!["cid:test-attachment".to_string()];
-
+    async fn assert_attachment_resume(handle: &SessionHandle, attachment_refs: &[String]) {
         let started = prompt_with_options(
-            &handle,
+            handle,
             "attachment prompt",
             SessionPromptOptions {
-                attachment_refs: attachment_refs.clone(),
+                attachment_refs: attachment_refs.to_vec(),
                 ..Default::default()
             },
         )
         .await;
         assert!(matches!(started, PromptResult::Accepted { .. }));
-        tokio::time::sleep(Duration::from_millis(120)).await;
 
-        let info = get_info(&handle).await;
+        let info = wait_for_state(handle, "interrupted", |state| {
+            matches!(state, SessionState::Interrupted { .. })
+        })
+        .await;
         let pending = match info.state {
             SessionState::Interrupted { pending, .. } => pending,
             other => panic!("expected interrupted state, got {other:?}"),
@@ -2528,7 +2555,7 @@ mod tests {
         assert_eq!(pending.attachment_refs, attachment_refs);
 
         let resumed = prompt_with_options(
-            &handle,
+            handle,
             "attachment prompt",
             SessionPromptOptions {
                 resume: vec![InterruptResume {
@@ -2544,7 +2571,30 @@ mod tests {
         )
         .await;
         assert!(matches!(resumed, PromptResult::Accepted { .. }));
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        wait_for_state(handle, "idle after resume", |state| {
+            *state == SessionState::Idle
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn session_actor_resume_preserves_attachment_refs() {
+        let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent_with_front_matter(
+            "plain",
+            "model: openai:gpt-4o\nuse_tools: harnx_agent_session_history_read\nhooks:\n  entries:\n    - event: PreToolUse\n      matcher: ^harnx_agent_session_history_read$\n      type: claude-command\n      command: |\n        printf '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"approval needed\"}}'",
+            "You are plain.",
+        );
+
+        let seen_attachments: Arc<tokio::sync::Mutex<Vec<Vec<String>>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let registry =
+            registry_with_call_fn(attachment_capture_call_fn(Arc::clone(&seen_attachments)));
+        let handle = registry.get_or_spawn(key("plain", "resume-attachments"));
+        let attachment_refs = vec!["cid:test-attachment".to_string()];
+
+        assert_attachment_resume(&handle, &attachment_refs).await;
 
         let captured = seen_attachments.lock().await.clone();
         assert_eq!(
@@ -2603,9 +2653,8 @@ mod tests {
         }
 
         gate_release.notify_one();
-        sleep(Duration::from_millis(80)).await;
 
-        let idle = get_info(&handle).await;
+        let idle = wait_for_state(&handle, "idle", |state| *state == SessionState::Idle).await;
         assert_eq!(idle.state, SessionState::Idle);
     }
 

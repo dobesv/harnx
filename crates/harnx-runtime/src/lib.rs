@@ -25,12 +25,14 @@ pub mod nats_local_server;
 pub mod nats_metrics;
 pub mod nats_session_index;
 pub mod nats_session_log;
+pub mod nats_tool_provider;
 pub mod nats_worker;
 pub mod remote_session_cleanup;
 pub mod session_cleanup;
 pub mod session_history;
 pub mod test_utils;
 pub mod tool;
+mod tool_context;
 pub mod utils;
 
 // Re-export thin-client types for frontends

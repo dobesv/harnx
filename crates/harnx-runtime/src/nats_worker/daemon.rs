@@ -6,7 +6,8 @@ use super::agent_loop::{
 };
 use super::backend::NatsSessionLogBackend;
 use super::control::{control_subject, ControlCommand};
-use crate::config::{GlobalConfig, Input};
+use super::tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
+use crate::config::{resolve_local_nats_server_config, GlobalConfig, Input, LOCAL_CLUSTER_KEY};
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use crate::nats_metrics;
 use crate::nats_session_index;
@@ -264,6 +265,39 @@ async fn optional_session_index(
     }
 }
 
+async fn start_local_tool_servers(
+    daemon: &WorkerDaemonConfig,
+    client: async_nats::Client,
+    instance_id: &harnx_core::instance::InstanceId,
+) -> Option<ToolServerSupervisor> {
+    if daemon.cluster != LOCAL_CLUSTER_KEY {
+        return None;
+    }
+    let result = async {
+        let server = resolve_local_nats_server_config().await?;
+        let token = server
+            .token
+            .as_deref()
+            .context("local NATS tool servers require HARNX_NATS_TOKEN")?;
+        let start = ToolServerStartConfig::new(client, instance_id.clone(), &server.url, token);
+        ToolServerSupervisor::start_local(start)
+            .await
+            .context("start local NATS tool servers")
+    }
+    .await;
+    optional_tool_server(result)
+}
+
+fn optional_tool_server<T>(result: Result<T>) -> Option<T> {
+    match result {
+        Ok(supervisor) => Some(supervisor),
+        Err(error) => {
+            log::warn!("local NATS tool servers disabled; continuing with stdio tools: {error:#}");
+            None
+        }
+    }
+}
+
 /// Run a worker daemon: pull `SessionActivate` notifications, claim each via a
 /// KV lease, and execute the session (exactly one worker per session).
 pub async fn run_worker_daemon(
@@ -271,11 +305,17 @@ pub async fn run_worker_daemon(
     daemon: WorkerDaemonConfig,
     call_fn: Option<crate::agent_loop::AgentCallFn>,
 ) -> Result<()> {
+    let instance_id = harnx_core::instance::InstanceId::new();
     let startup = prepare_worker_startup(&config, &daemon).await?;
+    let tool_supervisor =
+        start_local_tool_servers(&daemon, startup.client.clone(), &instance_id).await;
+    // Attempt optional tool startup before readiness so successful pilots are available on turn one.
     spawn_readiness_publisher(startup.client.clone(), &daemon);
     let session_index = optional_session_index(&startup.jetstream).await;
     let runtime = Arc::new(WorkerRuntime {
         config,
+        instance_id,
+        _tool_supervisor: tool_supervisor,
         cluster: daemon.cluster.clone(),
         worker_id: daemon.worker_id.clone(),
         lease: daemon.lease,
@@ -312,6 +352,8 @@ struct ControlListenerCtx<'a> {
 
 struct WorkerRuntime {
     config: GlobalConfig,
+    instance_id: harnx_core::instance::InstanceId,
+    _tool_supervisor: Option<ToolServerSupervisor>,
     #[allow(dead_code)]
     cluster: String,
     worker_id: String,
@@ -688,6 +730,7 @@ impl WorkerRuntime {
                         cluster_key: &self.cluster,
                         session_id: &activation.session_id,
                         config: per_session.clone(),
+                        instance_id: self.instance_id.clone(),
                         initial_input: input,
                         abort_signal: abort_signal.clone(),
                         call_fn: self.call_fn.clone(),
@@ -891,5 +934,20 @@ impl WorkerRuntime {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::optional_tool_server;
+
+    #[test]
+    fn worker_startup_continues_when_pilot_binary_is_missing() {
+        harnx_core::require_nextest();
+        let missing = Err(anyhow::anyhow!(
+            "HARNX_TIME_SERVER_BIN points to a missing tool-server binary"
+        ));
+
+        assert!(optional_tool_server::<()>(missing).is_none());
     }
 }

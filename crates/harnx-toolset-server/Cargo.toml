@@ -1,0 +1,25 @@
+[package]
+name = "harnx-toolset-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NATS server runtime for harnx toolsets"
+
+[dependencies]
+anyhow = { workspace = true }
+async-nats = { workspace = true }
+futures-util = { workspace = true }
+harnx-core = { path = "../harnx-core" }
+harnx-toolset = { path = "../harnx-toolset" }
+log = { workspace = true }
+rmcp = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tempfile = { workspace = true }
+which = { workspace = true }

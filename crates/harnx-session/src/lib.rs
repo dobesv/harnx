@@ -31,6 +31,7 @@ pub fn build_context(
     working_dir: Option<PathBuf>,
 ) -> AgentLoopContext {
     AgentLoopContext {
+        instance_id: harnx_core::instance::InstanceId::new(),
         config: prompt_config,
         abort_signal,
         async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::default())),

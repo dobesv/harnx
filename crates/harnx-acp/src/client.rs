@@ -27,11 +27,6 @@ use tokio::process::{Child, Command};
 use tokio::runtime::Builder;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 
-fn scrub_local_nats_env(command: &mut Command) {
-    command
-        .env_remove("HARNX_NATS_TOKEN")
-        .env_remove("HARNX_NATS_URL");
-}
 use tokio::task::LocalSet;
 
 /// Timeout for the initial connection handshake with the ACP server.
@@ -738,8 +733,6 @@ async fn worker_main(
         // user config cannot accidentally turn it back into a NATS frontend.
         .env(crate::ACP_EXECUTION_ROLE_ENV, crate::ACP_BACKEND_ROLE)
         .kill_on_drop(true);
-    scrub_local_nats_env(&mut cmd);
-
     #[cfg(unix)]
     cmd.process_group(0);
 
@@ -1255,23 +1248,6 @@ mod tests {
     };
     use serde_json::json;
 
-    #[test]
-    fn acp_child_command_scrubs_local_nats_credentials() {
-        harnx_core::require_nextest();
-        let mut command = Command::new("unused");
-        command
-            .env("HARNX_NATS_TOKEN", "secret")
-            .env("HARNX_NATS_URL", "nats://127.0.0.1:4222");
-
-        scrub_local_nats_env(&mut command);
-
-        for name in ["HARNX_NATS_TOKEN", "HARNX_NATS_URL"] {
-            assert!(command
-                .as_std()
-                .get_envs()
-                .any(|(key, value)| { key == std::ffi::OsStr::new(name) && value.is_none() }));
-        }
-    }
     fn unwrap_sub_agent_event(event: NestedAcpEvent) -> NestedAcpEvent {
         match event {
             NestedAcpEvent::Agent(AgentEvent::SubAgent { event, .. }) => {

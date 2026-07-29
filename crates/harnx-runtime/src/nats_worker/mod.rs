@@ -25,6 +25,7 @@ mod agent_loop;
 mod backend;
 mod control;
 mod daemon;
+mod tool_supervisor;
 
 #[cfg(test)]
 mod tests;
@@ -37,3 +38,4 @@ pub use daemon::{
     new_remote_session_id, notify_subject, publish_session_activate, run_worker_daemon,
     worker_ready_subject, SessionActivate, WorkerDaemonConfig,
 };
+pub use tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor, HARNX_TIME_SERVER_BIN};

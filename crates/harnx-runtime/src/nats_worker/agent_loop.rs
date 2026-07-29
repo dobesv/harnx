@@ -22,6 +22,7 @@ pub struct RunAgentLoopArgs<'a> {
     pub cluster_key: &'a str,
     pub session_id: &'a str,
     pub config: GlobalConfig,
+    pub instance_id: harnx_core::instance::InstanceId,
     pub initial_input: Input,
     pub abort_signal: AbortSignal,
     pub call_fn: Option<crate::agent_loop::AgentCallFn>,
@@ -158,6 +159,7 @@ pub(crate) fn build_mid_turn_injection_callback(
 
 struct RepairOrphanToolCallsArgs<'a> {
     config: GlobalConfig,
+    instance_id: &'a harnx_core::instance::InstanceId,
     fence_token: Option<u64>,
     worker_id: Option<String>,
     session_id: &'a str,
@@ -184,6 +186,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         cluster_key,
         session_id,
         config,
+        instance_id,
         initial_input,
         abort_signal,
         call_fn,
@@ -215,6 +218,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
     let session = load_or_repair_session(LoadOrRepairSessionParams {
         backend: &backend,
         config: &config,
+        instance_id: &instance_id,
         input: &initial_input,
         lease: lease.as_deref(),
         session_index,
@@ -230,6 +234,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
     // Build AgentLoopContext
     let ctx = crate::agent_loop::AgentLoopContext {
         config: config.clone(),
+        instance_id,
         abort_signal: abort_signal.clone(),
         async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::new())),
         persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new())),
@@ -403,6 +408,7 @@ fn abort_resume_if_fenced(
 struct LoadOrRepairSessionParams<'a> {
     backend: &'a NatsSessionLogBackend,
     config: &'a GlobalConfig,
+    instance_id: &'a harnx_core::instance::InstanceId,
     input: &'a Input,
     lease: Option<&'a NatsSessionLease>,
     session_index: Option<&'a async_nats::jetstream::kv::Store>,
@@ -424,6 +430,7 @@ async fn load_or_repair_session(
     let LoadOrRepairSessionParams {
         backend,
         config,
+        instance_id,
         input,
         lease,
         session_index,
@@ -477,6 +484,7 @@ async fn load_or_repair_session(
             &orphan_calls,
             RepairOrphanToolCallsArgs {
                 config: config.clone(),
+                instance_id,
                 fence_token: lease.map(|l| l.fence_token()),
                 worker_id: lease.map(|l| l.worker_id().to_string()),
                 session_id,
@@ -654,7 +662,8 @@ async fn repair_orphan_tool_calls_with_hints(
     use harnx_core::session::SessionLogEntry;
 
     let tool_repair = build_tool_repair_context(&args.config);
-    let eval_ctx = build_orphan_tool_eval_context(&args.config, &tool_repair);
+    let eval_ctx =
+        build_orphan_tool_eval_context(&args.config, args.instance_id, &tool_repair).await;
 
     for orphan in orphan_calls {
         let results = repair_single_orphan(orphan, &args, &tool_repair, &eval_ctx).await;
@@ -706,17 +715,20 @@ fn build_tool_repair_context(config: &GlobalConfig) -> ToolRepairContext {
     }
 }
 
-fn build_orphan_tool_eval_context(
+async fn build_orphan_tool_eval_context(
     config: &GlobalConfig,
+    instance_id: &harnx_core::instance::InstanceId,
     repair: &ToolRepairContext,
 ) -> crate::tool::ToolEvalContext {
-    crate::tool::build_tool_eval_context(
+    crate::tool::build_tool_eval_context(crate::tool::BuildToolEvalContextParams {
         config,
-        repair.agent_use_tools.as_deref(),
-        repair.current_agent_package.clone(),
-        &repair.persistent_manager,
-        None,
-    )
+        instance_id,
+        agent_use_tools: repair.agent_use_tools.as_deref(),
+        current_agent_package: repair.current_agent_package.clone(),
+        persistent_manager: &repair.persistent_manager,
+        working_dir: None,
+    })
+    .await
 }
 
 async fn repair_single_orphan(

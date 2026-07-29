@@ -3786,6 +3786,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width 0.2.2",
  "urlencoding",
+ "uuid",
 ]
 
 [[package]]
@@ -4198,6 +4199,9 @@ dependencies = [
  "harnx-render",
  "harnx-spinner",
  "harnx-test-bins",
+ "harnx-time-server",
+ "harnx-toolset",
+ "harnx-toolset-server",
  "http 1.4.2",
  "indexmap 2.14.0",
  "inquire",
@@ -4333,6 +4337,53 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
+]
+
+[[package]]
+name = "harnx-time-server"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "chrono-tz",
+ "harnx-toolset",
+ "harnx-toolset-server",
+ "iana-time-zone",
+ "jiff",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "harnx-toolset"
+version = "0.33.4"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio-util",
+]
+
+[[package]]
+name = "harnx-toolset-server"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "futures-util",
+ "harnx-core",
+ "harnx-toolset",
+ "log",
+ "rmcp",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "which",
 ]
 
 [[package]]

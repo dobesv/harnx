@@ -264,6 +264,7 @@ async fn run_worker_turn(params: WorkerTurnParams<'_>) -> Result<()> {
         cluster_key,
         session_id,
         config: global_config,
+        instance_id: harnx_core::instance::InstanceId::new(),
         initial_input: input,
         abort_signal: create_abort_signal(),
         call_fn: Some(call_fn),
@@ -1234,13 +1235,11 @@ fn assert_handoff_target_log(
 async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
     use harnx_runtime::nats_session_log::NatsSessionLog;
     use harnx_runtime::nats_worker::run_agent_loop_with_nats_inner;
-
     let Some(server) = require_nats_server().await? else {
         return Ok(());
     };
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let session_id = "resume-fence-session";
-
     let log = NatsSessionLog::new(js.clone(), session_id);
     append_resume_fence_seed(&log).await?;
     let lease = acquire_test_lease(js.clone(), session_id, "worker-stale").await?;
@@ -1252,6 +1251,7 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
             cluster_key: "local",
             session_id,
             config,
+            instance_id: harnx_core::instance::InstanceId::new(),
             initial_input: input,
             abort_signal: create_abort_signal(),
             call_fn: Some(counting_stub_call_fn(Arc::new(AtomicUsize::new(0)))),
