@@ -31,6 +31,30 @@ const LOCAL_BOOTSTRAP_SERVERS: &[BootstrapServer] = &[BootstrapServer {
     override_env: HARNX_TIME_SERVER_BIN,
 }];
 
+/// Connection and identity shared by all tool servers spawned for one worker.
+pub struct ToolServerStartConfig {
+    client: async_nats::Client,
+    instance_id: InstanceId,
+    nats_url: String,
+    token: String,
+}
+
+impl ToolServerStartConfig {
+    pub fn new(
+        client: async_nats::Client,
+        instance_id: InstanceId,
+        nats_url: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Self {
+        Self {
+            client,
+            instance_id,
+            nats_url: nats_url.into(),
+            token: token.into(),
+        }
+    }
+}
+
 /// Owns local tool-server children for one worker process.
 pub struct ToolServerSupervisor {
     processes: Arc<Mutex<HashMap<u32, String>>>,
@@ -39,28 +63,19 @@ pub struct ToolServerSupervisor {
 
 impl ToolServerSupervisor {
     /// Spawn the built-in local pilot and wait for its registration.
-    pub async fn start_local(
-        client: async_nats::Client,
-        instance_id: InstanceId,
-        nats_url: &str,
-        token: &str,
-    ) -> Result<Self> {
-        Self::start_local_with_timeout(client, instance_id, nats_url, token, TOOL_STARTUP_TIMEOUT)
-            .await
+    pub async fn start_local(config: ToolServerStartConfig) -> Result<Self> {
+        Self::start_local_with_timeout(config, TOOL_STARTUP_TIMEOUT).await
     }
 
     /// Same startup path with an explicit readiness timeout for tests and callers.
     pub async fn start_local_with_timeout(
-        client: async_nats::Client,
-        instance_id: InstanceId,
-        nats_url: &str,
-        token: &str,
+        config: ToolServerStartConfig,
         readiness_timeout: Duration,
     ) -> Result<Self> {
-        let registry = ensure_registry_bucket(&client).await?;
+        let registry = ensure_registry_bucket(&config.client).await?;
         let mut watches = Vec::new();
         for bootstrap in LOCAL_BOOTSTRAP_SERVERS {
-            let key = registration_key(&instance_id, bootstrap.server);
+            let key = registration_key(&config.instance_id, bootstrap.server);
             let _ = registry.delete(&key).await;
             let watch = registry
                 .watch_with_history(&key)
@@ -70,15 +85,13 @@ impl ToolServerSupervisor {
         }
 
         let processes = Arc::new(Mutex::new(HashMap::new()));
-        let in_flight = NatsInFlightCalls::for_instance(&instance_id);
+        let in_flight = NatsInFlightCalls::for_instance(&config.instance_id);
         let mut supervisor = Self {
             processes: Arc::clone(&processes),
             tasks: Vec::new(),
         };
         for bootstrap in LOCAL_BOOTSTRAP_SERVERS {
-            let binary = resolve_tool_binary(bootstrap)?;
-            let child =
-                spawn_tool_server(&binary, &instance_id, nats_url, token, bootstrap.server)?;
+            let child = spawn_tool_server(&config, bootstrap)?;
             let pid = child
                 .id()
                 .with_context(|| format!("{} child has no process ID", bootstrap.binary))?;
@@ -90,8 +103,8 @@ impl ToolServerSupervisor {
                 child,
                 pid,
                 bootstrap.server.to_string(),
-                instance_id.clone(),
-                client.clone(),
+                config.instance_id.clone(),
+                config.client.clone(),
                 Arc::clone(&processes),
                 in_flight.clone(),
             ));
@@ -161,26 +174,25 @@ fn resolve_tool_binary(bootstrap: &BootstrapServer) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn spawn_tool_server(
-    binary: &PathBuf,
-    instance_id: &InstanceId,
-    nats_url: &str,
-    token: &str,
-    server: &str,
-) -> Result<Child> {
-    let mut command = Command::new(binary);
+fn spawn_tool_server(config: &ToolServerStartConfig, bootstrap: &BootstrapServer) -> Result<Child> {
+    let binary = resolve_tool_binary(bootstrap)?;
+    let mut command = Command::new(&binary);
     command
-        .env(HARNX_INSTANCE_ID, instance_id.as_str())
-        .env(HARNX_NATS_URL_ENV, nats_url)
-        .env(HARNX_NATS_TOKEN_ENV, token)
+        .env(HARNX_INSTANCE_ID, config.instance_id.as_str())
+        .env(HARNX_NATS_URL_ENV, &config.nats_url)
+        .env(HARNX_NATS_TOKEN_ENV, &config.token)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
     configure_tool_process(&mut command);
-    command
-        .spawn()
-        .with_context(|| format!("spawn tool server '{server}' from {}", binary.display()))
+    command.spawn().with_context(|| {
+        format!(
+            "spawn tool server '{}' from {}",
+            bootstrap.server,
+            binary.display()
+        )
+    })
 }
 
 fn spawn_child_monitor(

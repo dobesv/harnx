@@ -290,14 +290,14 @@ async fn hook_injected_env_reaches_bash_exec_command() {
     // Pass Some("*") so tool_declarations_for_use_tools connects to MCP servers
     // and populates their tool lists; None skips MCP entirely.
     let instance_id = harnx_core::instance::InstanceId::new();
-    let ctx = build_tool_eval_context(
-        &config,
-        &instance_id,
-        Some("*"),
-        None,
-        &persistent_manager,
-        None,
-    )
+    let ctx = build_tool_eval_context(harnx_runtime::tool::BuildToolEvalContextParams {
+        config: &config,
+        instance_id: &instance_id,
+        agent_use_tools: Some("*"),
+        current_agent_package: None,
+        persistent_manager: &persistent_manager,
+        working_dir: None,
+    })
     .await;
 
     // Skip if the MCP server failed to connect (e.g. sandbox execution restrictions).

@@ -2534,14 +2534,34 @@ async fn test_sub_agent_delegation_tool_appears() {
     harness.drain_and_settle().await.unwrap();
 }
 
+fn apply_switch_agent_data(result: &mut harnx_runtime::tool::ToolResult) {
+    let Some(obj) = result.output.as_object() else {
+        return;
+    };
+    if obj.get("action").and_then(|value| value.as_str()) != Some("switch_agent") {
+        return;
+    }
+    let Some(agent) = obj.get("agent").and_then(|value| value.as_str()) else {
+        return;
+    };
+    let Some(prompt) = obj.get("prompt").and_then(|value| value.as_str()) else {
+        return;
+    };
+    result.switch_agent = Some(harnx_runtime::tool::SwitchAgentData {
+        agent: agent.to_string(),
+        prompt: prompt.to_string(),
+        session_id: obj
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+    });
+}
 #[tokio::test(flavor = "multi_thread")]
 async fn test_tool_result_switch_agent_parsing() {
     use harnx_acp::{AcpManager, AcpServerConfig};
     use harnx_runtime::tool::{eval_tool_calls, ToolCall};
-
     let _guard = TestStateGuard::new(None).await;
     let config = test_config();
-
     let manager = AcpManager::new();
     manager.initialize(vec![AcpServerConfig {
         name: "specialist".to_string(),
@@ -2555,7 +2575,6 @@ async fn test_tool_result_switch_agent_parsing() {
         package: None,
     }]);
     config.write().acp_manager = Some(Arc::new(manager));
-
     let call = ToolCall::new(
         "specialist_session_handoff".to_string(),
         serde_json::json!({
@@ -2565,24 +2584,18 @@ async fn test_tool_result_switch_agent_parsing() {
         Some("tool-123".to_string()),
         Some("thought-sig".to_string()),
     );
-
-    // eval_tool_calls returns an error result here because the test has no
-    // agent definition file on disk, so specialist_session_handoff isn't in the
-    // allowed tools set.  Override the output manually to exercise the
-    // switch_agent parsing path that runs in eval_tool_calls (line 126-141 of
-    // tool.rs) on the result object.
+    // No agent file means this call errors; set output to exercise switch-agent parsing.
     let abort_signal = harnx_runtime::utils::create_abort_signal();
     let pm = std::sync::Arc::new(tokio::sync::Mutex::new(
         harnx_hooks::PersistentHookManager::new(),
     ));
     let mut results = eval_tool_calls(
         &harnx_runtime::tool::build_tool_eval_context(
-            &config,
-            &harnx_core::instance::InstanceId::new(),
-            None,
-            None,
-            &pm,
-            None,
+            harnx_runtime::tool::BuildToolEvalContextParams::new(
+                &config,
+                &harnx_core::instance::InstanceId::new(),
+                &pm,
+            ),
         )
         .await,
         vec![call],
@@ -2596,23 +2609,7 @@ async fn test_tool_result_switch_agent_parsing() {
         "prompt": "Help!",
         "session_id": "sess-123"
     });
-    if let Some(obj) = results[0].output.as_object() {
-        if obj.get("action").and_then(|v| v.as_str()) == Some("switch_agent") {
-            if let (Some(agent), Some(prompt)) = (
-                obj.get("agent").and_then(|v| v.as_str()),
-                obj.get("prompt").and_then(|v| v.as_str()),
-            ) {
-                results[0].switch_agent = Some(harnx_runtime::tool::SwitchAgentData {
-                    agent: agent.to_string(),
-                    prompt: prompt.to_string(),
-                    session_id: obj
-                        .get("session_id")
-                        .and_then(|v| v.as_str())
-                        .map(ToString::to_string),
-                });
-            }
-        }
-    }
+    apply_switch_agent_data(&mut results[0]);
     let data = results[0]
         .switch_agent
         .as_ref()

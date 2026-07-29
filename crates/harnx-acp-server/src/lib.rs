@@ -14,6 +14,8 @@ pub use server_main::run;
 #[cfg(test)]
 mod lib_tests;
 #[cfg(test)]
+mod role_routing_tests;
+#[cfg(test)]
 mod test_regression_issue_68;
 
 use agent_client_protocol as acp;

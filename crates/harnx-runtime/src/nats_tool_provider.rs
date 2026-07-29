@@ -17,8 +17,21 @@ use std::time::Duration;
 use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const JSON_CONTENT_TYPE: &str = "application/json";
+
+#[derive(Clone, Debug)]
+struct RegisteredTool {
+    server: String,
+    request_timeout: Duration,
+}
+
+struct PendingToolRequest {
+    call_id: String,
+    server: String,
+    subject: String,
+    request: async_nats::Request,
+}
 
 #[derive(Clone, Debug)]
 enum InFlightFailure {
@@ -98,7 +111,7 @@ impl NatsInFlightCalls {
 pub struct NatsToolProvider {
     client: async_nats::Client,
     instance_id: InstanceId,
-    tools: HashMap<String, String>,
+    tools: HashMap<String, RegisteredTool>,
     declarations: Vec<ToolDeclaration>,
     // Owning this subscription establishes the progress/cancel channel before requests start.
     _control_subscription: Mutex<async_nats::Subscriber>,
@@ -120,26 +133,7 @@ impl NatsToolProvider {
         let registrations = registration_snapshot(&client, &instance_id)
             .await
             .unwrap_or_default();
-        let mut tools = HashMap::new();
-        let mut declarations = Vec::new();
-        for registration in registrations {
-            for spec in registration.tools {
-                if let Ok(parameters) = serde_json::from_value::<JsonSchema>(spec.input_schema) {
-                    tools.insert(spec.name.clone(), registration.server.clone());
-                    declarations.push(ToolDeclaration {
-                        name: spec.name,
-                        description: spec.description,
-                        parameters,
-                        mcp_tool_name: None,
-                        mcp_server_name: None,
-                        call_template: None,
-                        result_template: None,
-                        idempotent_hint: Some(spec.idempotent_hint),
-                        read_only_hint: Some(spec.read_only_hint),
-                    });
-                }
-            }
-        }
+        let (tools, declarations) = build_registered_tools(registrations);
 
         Ok(Self {
             client,
@@ -163,7 +157,10 @@ impl NatsToolProvider {
         self.declarations
             .iter()
             .filter(|declaration| {
-                let server = self.tools.get(&declaration.name).map(String::as_str);
+                let server = self
+                    .tools
+                    .get(&declaration.name)
+                    .map(|tool| tool.server.as_str());
                 selectors.iter().any(|selector| {
                     let selector = selector.trim();
                     selector == "*"
@@ -202,56 +199,52 @@ impl NatsToolProvider {
         self.client.flush().await?;
         Ok(())
     }
-}
 
-#[async_trait]
-impl ToolProvider for NatsToolProvider {
-    fn name(&self) -> &str {
-        "nats"
-    }
-
-    fn has_tool(&self, tool_name: &str) -> bool {
-        self.tools.contains_key(tool_name)
-    }
-
-    async fn call_tool(
+    fn prepare_request(
         &self,
         tool_name: &str,
         arguments: Value,
-        abort: &AbortSignal,
-    ) -> Result<Value, ToolError> {
-        let Some(server) = self.tools.get(tool_name) else {
-            return Err(ToolError::Recoverable(anyhow!(
-                "NATS tool is not registered: {tool_name}"
-            )));
-        };
+        route: &RegisteredTool,
+    ) -> Result<PendingToolRequest, ToolError> {
         let call_id = Uuid::new_v4().to_string();
-        let idempotency_key = Uuid::new_v4().to_string();
         let request = ToolRequest {
             call_id: call_id.clone(),
             tool: tool_name.to_string(),
             args: arguments,
         };
         let mut headers = async_nats::HeaderMap::new();
-        headers.insert(HDR_IDEMPOTENCY_KEY, idempotency_key);
+        headers.insert(HDR_IDEMPOTENCY_KEY, Uuid::new_v4().to_string());
         headers.insert(HDR_INSTANCE_ID, self.instance_id.as_str());
         headers.insert(HDR_CALL_ID, call_id.as_str());
         headers.insert(HDR_CONTENT_TYPE, JSON_CONTENT_TYPE);
         let payload = serde_json::to_vec(&request).map_err(|error| {
             ToolError::Fatal(anyhow!("failed to encode NATS tool request: {error}"))
         })?;
-        let subject = self.instance_id.tool_subject(server, tool_name);
-        let mut supervised_failure = self
-            .in_flight
-            .register(call_id.clone(), server.clone())
-            .await;
-        let request = tokio::time::timeout(
-            REQUEST_TIMEOUT,
-            self.client
-                .request_with_headers(subject, headers, payload.into()),
-        );
-        tokio::pin!(request);
+        Ok(PendingToolRequest {
+            call_id,
+            server: route.server.clone(),
+            subject: self.instance_id.tool_subject(&route.server, tool_name),
+            request: async_nats::Request::new()
+                .headers(headers)
+                .payload(payload.into())
+                .timeout(Some(route.request_timeout)),
+        })
+    }
 
+    async fn await_response(
+        &self,
+        pending: PendingToolRequest,
+        abort: &AbortSignal,
+    ) -> Result<async_nats::Message, ToolError> {
+        let PendingToolRequest {
+            call_id,
+            server,
+            subject,
+            request,
+        } = pending;
+        let mut supervised_failure = self.in_flight.register(call_id.clone(), server).await;
+        let request = self.client.send_request(subject, request);
+        tokio::pin!(request);
         let response = tokio::select! {
             _ = wait_abort_signal(abort) => {
                 self.in_flight.complete(&call_id).await;
@@ -273,20 +266,89 @@ impl ToolProvider for NatsToolProvider {
             response = &mut request => response,
         };
         self.in_flight.complete(&call_id).await;
+        response
+            .map_err(|error| ToolError::Recoverable(anyhow!("tool server unavailable: {error}")))
+    }
+}
 
-        let message = match response {
-            Ok(Ok(message)) => message,
-            Ok(Err(error)) => {
-                return Err(ToolError::Recoverable(anyhow!(
-                    "tool server unavailable: {error}"
-                )));
+fn build_registered_tools(
+    mut registrations: Vec<Registration>,
+) -> (HashMap<String, RegisteredTool>, Vec<ToolDeclaration>) {
+    registrations.sort_by(|left, right| left.server.cmp(&right.server));
+    let mut registered = HashMap::new();
+    for registration in registrations {
+        for spec in registration.tools {
+            let parameters = match serde_json::from_value::<JsonSchema>(spec.input_schema) {
+                Ok(parameters) => parameters,
+                Err(error) => {
+                    log::warn!(
+                        "ignoring invalid schema for NATS tool '{}.{}': {error}",
+                        registration.server,
+                        spec.name
+                    );
+                    continue;
+                }
+            };
+            let name = spec.name.clone();
+            let route = RegisteredTool {
+                server: registration.server.clone(),
+                request_timeout: spec
+                    .timeout_secs
+                    .map(Duration::from_secs)
+                    .unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+            };
+            let declaration = ToolDeclaration {
+                name: spec.name,
+                description: spec.description,
+                parameters,
+                mcp_tool_name: None,
+                mcp_server_name: None,
+                call_template: None,
+                result_template: None,
+                idempotent_hint: Some(spec.idempotent_hint),
+                read_only_hint: Some(spec.read_only_hint),
+            };
+            if let Some((previous, _)) = registered.insert(name.clone(), (route, declaration)) {
+                log::warn!(
+                    "duplicate NATS tool '{name}' from server '{}'; server '{}' wins",
+                    previous.server,
+                    registration.server
+                );
             }
-            Err(_) => {
-                return Err(ToolError::Recoverable(anyhow!(
-                    "tool server unavailable: request timed out"
-                )));
-            }
+        }
+    }
+    let (tools, mut declarations): (HashMap<_, _>, Vec<_>) = registered
+        .into_iter()
+        .map(|(name, (route, declaration))| ((name, route), declaration))
+        .unzip();
+    declarations.sort_by(|left, right| left.name.cmp(&right.name));
+    (tools, declarations)
+}
+
+#[async_trait]
+impl ToolProvider for NatsToolProvider {
+    fn name(&self) -> &str {
+        "nats"
+    }
+
+    fn has_tool(&self, tool_name: &str) -> bool {
+        self.tools.contains_key(tool_name)
+    }
+
+    async fn call_tool(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        abort: &AbortSignal,
+    ) -> Result<Value, ToolError> {
+        let Some(route) = self.tools.get(tool_name) else {
+            return Err(ToolError::Recoverable(anyhow!(
+                "NATS tool is not registered: {tool_name}"
+            )));
         };
+        let pending = self.prepare_request(tool_name, arguments, route)?;
+        let call_id = pending.call_id.clone();
+        let message = self.await_response(pending, abort).await?;
         let reply: ToolReply = serde_json::from_slice(&message.payload).map_err(|error| {
             ToolError::Recoverable(anyhow!("invalid reply from tool server: {error}"))
         })?;
@@ -321,8 +383,12 @@ async fn registration_snapshot(
         let Some(value) = store.get(&key).await? else {
             continue;
         };
-        let Ok(registration) = serde_json::from_slice::<Registration>(&value) else {
-            continue;
+        let registration = match serde_json::from_slice::<Registration>(&value) {
+            Ok(registration) => registration,
+            Err(error) => {
+                log::warn!("ignoring invalid NATS tool registration '{key}': {error}");
+                continue;
+            }
         };
         if key == registration_key(instance_id, &registration.server) {
             registrations.push(registration);

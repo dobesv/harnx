@@ -23,6 +23,10 @@ pub struct ToolSpec {
     pub input_schema: Value,
     pub idempotent_hint: bool,
     pub read_only_hint: bool,
+    /// Request/reply timeout advertised to transport clients, in seconds.
+    /// Missing values use the client's default backstop for older registrations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Error returned directly by a [`Toolset`] implementation.
@@ -166,7 +170,21 @@ mod tests {
             }),
             idempotent_hint: true,
             read_only_hint: true,
+            timeout_secs: Some(120),
         }
+    }
+
+    #[test]
+    fn tool_spec_without_timeout_remains_backward_compatible() {
+        let value = serde_json::json!({
+            "name": "echo",
+            "description": "Echo input",
+            "input_schema": { "type": "object" },
+            "idempotent_hint": true,
+            "read_only_hint": true
+        });
+        let spec: ToolSpec = serde_json::from_value(value).expect("decode legacy tool spec");
+        assert_eq!(spec.timeout_secs, None);
     }
 
     #[test]

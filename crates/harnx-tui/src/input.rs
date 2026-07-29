@@ -1534,7 +1534,6 @@ impl Tui {
             #[cfg(test)]
             persistent_manager: self.persistent_manager.clone(),
             #[cfg(test)]
-            pending_async_context: self.pending_async_context.clone(),
             #[cfg(test)]
             shared_pending_message: self.shared_pending_message.clone(),
             local_worker: self.local_worker.clone(),

@@ -9,7 +9,9 @@ use harnx_core::tool::{ToolCall, ToolError, ToolProvider};
 use harnx_mcp::{McpManager, McpServerConfig};
 use harnx_runtime::config::{Config, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
 use harnx_runtime::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
-use harnx_runtime::nats_worker::{ToolServerSupervisor, HARNX_TIME_SERVER_BIN};
+use harnx_runtime::nats_worker::{
+    ToolServerStartConfig, ToolServerSupervisor, HARNX_TIME_SERVER_BIN,
+};
 use harnx_toolset::{ControlKind, ControlMessage};
 use harnx_toolset_server::{registration_key, TOOL_REGISTRY_BUCKET};
 use parking_lot::RwLock;
@@ -109,36 +111,11 @@ async fn wait_until_registration_removed(
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn time_over_nats_pilot_e2e_mixed_stdio_cancel_and_crash() -> Result<()> {
-    let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
-        auth_token: Some(TOKEN.to_string()),
-    })
-    .await?
-    else {
-        return Ok(());
-    };
-    let binary = time_server_binary()?;
-    let binary = binary.to_string_lossy().into_owned();
-    let _env = EnvGuard::install(&[
-        (HARNX_TIME_SERVER_BIN, &binary),
-        (HARNX_NATS_URL_ENV, server.url()),
-        (HARNX_NATS_TOKEN_ENV, TOKEN),
-    ]);
-    let client = async_nats::ConnectOptions::new()
-        .token(TOKEN.to_string())
-        .connect(server.url())
-        .await?;
-    let instance_id = InstanceId::new();
-    let supervisor = ToolServerSupervisor::start_local_with_timeout(
-        client.clone(),
-        instance_id.clone(),
-        server.url(),
-        TOKEN,
-        Duration::from_secs(5),
-    )
-    .await?;
-
+async fn assert_pilot_registration(
+    supervisor: &ToolServerSupervisor,
+    client: &async_nats::Client,
+    instance_id: &InstanceId,
+) -> Result<u32> {
     let pids = supervisor.server_pids().await;
     let (&pid, server_name) = pids.iter().next().context("time server PID")?;
     assert_eq!(server_name, "time");
@@ -146,23 +123,17 @@ async fn time_over_nats_pilot_e2e_mixed_stdio_cancel_and_crash() -> Result<()> {
         .get_key_value(TOOL_REGISTRY_BUCKET)
         .await?;
     assert!(store
-        .get(registration_key(&instance_id, "time"))
+        .get(registration_key(instance_id, "time"))
         .await?
         .is_some());
+    Ok(pid)
+}
 
-    let provider = NatsToolProvider::discover(
-        &Config::default(),
-        instance_id.clone(),
-        NatsInFlightCalls::for_instance(&instance_id),
-    )
-    .await?;
-
-    // Run one worker tool-evaluation batch through both transports. The time
-    // result is the exact ToolResult that is appended to the model transcript.
-    let mcp_manager = Arc::new(McpManager::new());
-    mcp_manager.initialize(vec![McpServerConfig {
+async fn stdio_time_manager(binary: &str) -> Result<Arc<McpManager>> {
+    let manager = Arc::new(McpManager::new());
+    manager.initialize(vec![McpServerConfig {
         name: "legacy".to_string(),
-        command: binary.clone(),
+        command: binary.to_string(),
         args: vec!["--mcp-stdio".to_string()],
         env: Default::default(),
         roots: vec![],
@@ -173,33 +144,36 @@ async fn time_over_nats_pilot_e2e_mixed_stdio_cancel_and_crash() -> Result<()> {
         hooks: None,
         package: None,
     }]);
-    let mcp_tools = mcp_manager.get_all_tools().await;
-    assert!(mcp_tools
+    let tools = manager.get_all_tools().await;
+    assert!(tools
         .iter()
         .any(|tool| tool.name == "legacy_get_current_time"));
+    Ok(manager)
+}
 
+async fn assert_mixed_transport_batch(binary: &str, instance_id: &InstanceId) -> Result<()> {
+    let mcp_manager = stdio_time_manager(binary).await?;
     let config = Arc::new(RwLock::new(Config::default()));
-    config.write().mcp_manager = Some(mcp_manager.clone());
+    config.write().mcp_manager = Some(mcp_manager);
     let persistent_manager = Arc::new(tokio::sync::Mutex::new(
         harnx_hooks::PersistentHookManager::new(),
     ));
-    let eval_context = harnx_runtime::tool::build_tool_eval_context(
-        &config,
-        &instance_id,
-        Some("*"),
-        None,
-        &persistent_manager,
-        None,
+    let context = harnx_runtime::tool::build_tool_eval_context(
+        harnx_runtime::tool::BuildToolEvalContextParams::new(
+            &config,
+            instance_id,
+            &persistent_manager,
+        )
+        .with_agent_use_tools(Some("*")),
     )
     .await;
-    assert_eq!(eval_context.providers[0].name(), "nats");
-    assert!(eval_context
+    assert_eq!(context.providers[0].name(), "nats");
+    assert!(context
         .providers
         .iter()
-        .any(|candidate| candidate.name() == "mcp"));
-
+        .any(|provider| provider.name() == "mcp"));
     let results = harnx_runtime::tool::eval_tool_calls(
-        &eval_context,
+        &context,
         vec![
             ToolCall::new(
                 "get_current_time".to_string(),
@@ -217,20 +191,25 @@ async fn time_over_nats_pilot_e2e_mixed_stdio_cancel_and_crash() -> Result<()> {
         &create_abort_signal(),
     )
     .await?;
-    let nats_result = results
+    let nats = results
         .iter()
         .find(|result| result.call.id.as_deref() == Some("nats-time"))
         .context("NATS time result in worker transcript")?;
-    assert_eq!(nats_result.output["timezone"], "UTC");
-    assert!(nats_result.output["datetime"].as_str().is_some());
-    let stdio_result = results
+    assert_eq!(nats.output["timezone"], "UTC");
+    assert!(nats.output["datetime"].as_str().is_some());
+    let stdio = results
         .iter()
         .find(|result| result.call.id.as_deref() == Some("stdio-time"))
         .context("stdio time result in worker transcript")?;
-    assert!(stdio_result.output.to_string().contains("UTC"));
+    assert!(stdio.output.to_string().contains("UTC"));
+    Ok(())
+}
 
-    // Observe the shared control subject to prove abort reaches the server over
-    // Core NATS, not only the provider's local abort branch.
+async fn assert_cancel_control(
+    provider: &NatsToolProvider,
+    client: &async_nats::Client,
+    instance_id: &InstanceId,
+) -> Result<()> {
     let mut controls = client.subscribe(instance_id.control_subject()).await?;
     client.flush().await?;
     let abort = create_abort_signal();
@@ -241,12 +220,12 @@ async fn time_over_nats_pilot_e2e_mixed_stdio_cancel_and_crash() -> Result<()> {
             abort.set_ctrlc();
         })
     };
-    let cancel_started = Instant::now();
+    let started = Instant::now();
     let cancelled = provider
         .call_tool("wait", json!({ "seconds": 30.0 }), &abort)
         .await;
     abort_task.await?;
-    assert!(cancel_started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < Duration::from_secs(2));
     assert!(matches!(cancelled, Err(ToolError::Fatal(_))));
     let control = tokio::time::timeout(Duration::from_secs(1), controls.next())
         .await
@@ -254,7 +233,15 @@ async fn time_over_nats_pilot_e2e_mixed_stdio_cancel_and_crash() -> Result<()> {
         .context("cancel control subscription closed")?;
     let control: ControlMessage = serde_json::from_slice(&control.payload)?;
     assert_eq!(control.kind, ControlKind::Cancel);
+    Ok(())
+}
 
+async fn assert_crash_failure(
+    provider: &NatsToolProvider,
+    pid: u32,
+    client: &async_nats::Client,
+    instance_id: &InstanceId,
+) -> Result<()> {
     let kill_task = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
         #[cfg(unix)]
@@ -277,21 +264,58 @@ async fn time_over_nats_pilot_e2e_mixed_stdio_cancel_and_crash() -> Result<()> {
     assert!(started.elapsed() < Duration::from_secs(2));
     match result {
         Err(ToolError::Recoverable(error)) => {
-            let message = error.to_string();
-            assert!(message.contains("tool server 'time' crashed, exit"));
+            assert!(error
+                .to_string()
+                .contains("tool server 'time' crashed, exit"));
         }
         _ => anyhow::bail!("crashed server should fail call with a recoverable error"),
     }
-
-    wait_until_registration_removed(&client, &instance_id).await?;
+    wait_until_registration_removed(client, instance_id).await?;
     let snapshot = NatsToolProvider::discover(
+        &Config::default(),
+        instance_id.clone(),
+        NatsInFlightCalls::for_instance(instance_id),
+    )
+    .await?;
+    assert!(!snapshot.has_tool("wait"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn time_over_nats_pilot_e2e_mixed_stdio_cancel_and_crash() -> Result<()> {
+    let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
+        auth_token: Some(TOKEN.to_string()),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let binary = time_server_binary()?.to_string_lossy().into_owned();
+    let _env = EnvGuard::install(&[
+        (HARNX_TIME_SERVER_BIN, &binary),
+        (HARNX_NATS_URL_ENV, server.url()),
+        (HARNX_NATS_TOKEN_ENV, TOKEN),
+    ]);
+    let client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(server.url())
+        .await?;
+    let instance_id = InstanceId::new();
+    let start =
+        ToolServerStartConfig::new(client.clone(), instance_id.clone(), server.url(), TOKEN);
+    let supervisor =
+        ToolServerSupervisor::start_local_with_timeout(start, Duration::from_secs(5)).await?;
+    let pid = assert_pilot_registration(&supervisor, &client, &instance_id).await?;
+    let provider = NatsToolProvider::discover(
         &Config::default(),
         instance_id.clone(),
         NatsInFlightCalls::for_instance(&instance_id),
     )
     .await?;
-    assert!(!snapshot.has_tool("wait"));
-    Ok(())
+
+    assert_mixed_transport_batch(&binary, &instance_id).await?;
+    assert_cancel_control(&provider, &client, &instance_id).await?;
+    assert_crash_failure(&provider, pid, &client, &instance_id).await
 }
 
 #[cfg(unix)]
@@ -317,18 +341,14 @@ async fn tool_supervisor_readiness_barrier_times_out() -> Result<()> {
         .connect(server.url())
         .await?;
     let instance_id = InstanceId::new();
-    let error = match ToolServerSupervisor::start_local_with_timeout(
-        client,
-        instance_id,
-        server.url(),
-        TOKEN,
-        Duration::from_millis(250),
-    )
-    .await
-    {
-        Ok(_) => anyhow::bail!("server that never registers must time out"),
-        Err(error) => error,
-    };
+    let start = ToolServerStartConfig::new(client, instance_id, server.url(), TOKEN);
+    let error =
+        match ToolServerSupervisor::start_local_with_timeout(start, Duration::from_millis(250))
+            .await
+        {
+            Ok(_) => anyhow::bail!("server that never registers must time out"),
+            Err(error) => error,
+        };
     let message = format!("{error:#}");
     assert!(message.contains("tool server 'time' did not register"));
     assert!(message.contains("within 0.25s"));

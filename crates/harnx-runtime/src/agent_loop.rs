@@ -138,7 +138,6 @@ pub async fn continue_agent_loop_from_tool_round(
     use crate::tool::ToolApprovalInterrupt;
 
     let config = &ctx.config;
-    let abort_signal = &ctx.abort_signal;
 
     // Build a preseeded confirm function that returns decisions for known call IDs.
     let decisions = std::sync::Arc::new(decisions);
@@ -177,17 +176,15 @@ pub async fn continue_agent_loop_from_tool_round(
     // Execute full pending tool round using normal helper. Deferred calls resolve via
     // preseeded confirm function; already-approved calls execute normally.
     let tool_results = match crate::tool::execute_tool_round_with_persistence(
-        config,
-        &ctx.instance_id,
-        &input,
-        &crate::tool::CompletionText {
-            output: &output,
-            thought: thought.as_deref(),
-        },
+        ctx.tool_round_params(
+            config,
+            &input,
+            CompletionText {
+                output: &output,
+                thought: thought.as_deref(),
+            },
+        ),
         tool_calls,
-        abort_signal,
-        &ctx.persistent_manager,
-        ctx.working_dir.as_deref(),
         crate::tool::ToolRoundPersistence::REUSE_EXISTING_CALLS,
     )
     .await
@@ -494,17 +491,15 @@ async fn run_agent_loop_inner(
         } else {
             config.write().record_completion_usage(&usage);
             execute_tool_round(
-                config,
-                &ctx.instance_id,
-                &input,
-                &CompletionText {
-                    output: &output,
-                    thought: thought.as_deref(),
-                },
+                ctx.tool_round_params(
+                    config,
+                    &input,
+                    CompletionText {
+                        output: &output,
+                        thought: thought.as_deref(),
+                    },
+                ),
                 tool_calls,
-                abort_signal,
-                &ctx.persistent_manager,
-                ctx.working_dir.as_deref(),
             )
             .await?
         };
@@ -723,6 +718,13 @@ mod tests {
 
     use tempfile::TempDir;
 
+    fn replay_test_config(tmp: &TempDir) -> GlobalConfig {
+        let mut config = Config::default();
+        let mut session = crate::config::session::new(&config, "replay_test", None).unwrap();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+        config.session = Some(session);
+        Arc::new(RwLock::new(config))
+    }
     /// Regression test for the user-message-replay bug: a user message typed
     /// during a running tool round (delivered via `on_tool_round` setting
     /// `Input::injected_user_text`) must not be re-emitted on every
@@ -733,15 +735,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn injected_user_text_is_not_replayed_across_rounds() {
         let _guard = crate::client::TestStateGuard::new(None).await;
-
         let tmp = TempDir::new().unwrap();
 
-        // Build a Config with an attached session pointed at a temp dir.
-        let mut config = Config::default();
-        let mut session = crate::config::session::new(&config, "replay_test", None).unwrap();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-        config.session = Some(session);
-        let global_config = Arc::new(RwLock::new(config));
+        let global_config = replay_test_config(&tmp);
 
         // Mock LLM: round 1 → tool call, round 2 → tool call, round 3 → text-only.
         // No real tool provider is registered, so eval_tool_calls returns

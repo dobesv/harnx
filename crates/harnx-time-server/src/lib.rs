@@ -54,46 +54,11 @@ impl TimeToolset {
 
     fn convert_time(&self, args: Value) -> Result<Value, ToolInvokeError> {
         let args: ConvertTimeParams = parse_args(args)?;
-        let base_inputs = [
-            args.iso_timestamp.is_some(),
-            args.unix_timestamp.is_some(),
-            args.epoch_millis.is_some(),
-        ];
-        if base_inputs.into_iter().filter(|present| *present).count() > 1 {
-            return Err(ToolInvokeError::Recoverable(
-                "provide only one of isoTimestamp, unixTimestamp, or epochMillis".to_string(),
-            ));
-        }
-
-        let timestamp = if let Some(value) = args.iso_timestamp.as_deref() {
-            parse_iso_timestamp(value, args.source_timezone.as_deref())?
-        } else if let Some(value) = args.unix_timestamp {
-            parse_unix_timestamp(value)?
-        } else if let Some(value) = args.epoch_millis {
-            Timestamp::from_millisecond(value).map_err(recoverable)?
-        } else {
-            Timestamp::now()
-        };
-
-        let mut span = Span::new();
-        if let Some(value) = args.offset_days {
-            span = span.try_days(value).map_err(recoverable)?;
-        }
-        if let Some(value) = args.offset_hours {
-            span = span.try_hours(value).map_err(recoverable)?;
-        }
-        if let Some(value) = args.offset_minutes {
-            span = span.try_minutes(value).map_err(recoverable)?;
-        }
-        if let Some(value) = args.offset_seconds {
-            span = span.try_seconds(value).map_err(recoverable)?;
-        }
-        let timestamp = timestamp.checked_add(span).map_err(recoverable)?;
-        let formatted = if let Some(timezone) = args.timezone.as_deref() {
-            timestamp.in_tz(timezone).map_err(recoverable)?.to_string()
-        } else {
-            timestamp.to_string()
-        };
+        let timestamp = conversion_timestamp(&args)?;
+        let timestamp = timestamp
+            .checked_add(conversion_offset(&args)?)
+            .map_err(recoverable)?;
+        let formatted = format_timestamp(timestamp, args.timezone.as_deref())?;
 
         Ok(json!({
             "timestamp": formatted,
@@ -188,11 +153,11 @@ impl Toolset for TimeToolset {
                 description: "Get current time in a specific timezone".to_string(),
                 input_schema: json!({
                     "type": "object",
-                    "properties": { "timezone": { "type": "string" } },
-                    "required": ["timezone"]
+                    "properties": { "timezone": { "type": "string" } }
                 }),
                 idempotent_hint: true,
                 read_only_hint: true,
+                timeout_secs: Some(60),
             },
             ToolSpec {
                 name: "convert_time".to_string(),
@@ -213,6 +178,7 @@ impl Toolset for TimeToolset {
                 }),
                 idempotent_hint: true,
                 read_only_hint: true,
+                timeout_secs: Some(60),
             },
             ToolSpec {
                 name: "wait".to_string(),
@@ -224,6 +190,7 @@ impl Toolset for TimeToolset {
                 }),
                 idempotent_hint: false,
                 read_only_hint: true,
+                timeout_secs: Some(3_660),
             },
             ToolSpec {
                 name: "wait_until".to_string(),
@@ -238,6 +205,7 @@ impl Toolset for TimeToolset {
                 }),
                 idempotent_hint: false,
                 read_only_hint: true,
+                timeout_secs: Some(86_460),
             },
         ]
     }
@@ -288,6 +256,58 @@ struct ConvertTimeParams {
     source_timezone: Option<String>,
 }
 
+fn conversion_timestamp(args: &ConvertTimeParams) -> Result<Timestamp, ToolInvokeError> {
+    let base_inputs = [
+        args.iso_timestamp.is_some(),
+        args.unix_timestamp.is_some(),
+        args.epoch_millis.is_some(),
+    ];
+    if base_inputs.into_iter().filter(|present| *present).count() > 1 {
+        return Err(ToolInvokeError::Recoverable(
+            "provide only one of isoTimestamp, unixTimestamp, or epochMillis".to_string(),
+        ));
+    }
+    if let Some(value) = args.iso_timestamp.as_deref() {
+        return parse_iso_timestamp(value, args.source_timezone.as_deref());
+    }
+    if let Some(value) = args.unix_timestamp {
+        return parse_unix_timestamp(value);
+    }
+    if let Some(value) = args.epoch_millis {
+        return Timestamp::from_millisecond(value).map_err(recoverable);
+    }
+    Ok(Timestamp::now())
+}
+
+fn conversion_offset(args: &ConvertTimeParams) -> Result<Span, ToolInvokeError> {
+    let mut span = Span::new();
+    if let Some(value) = args.offset_days {
+        span = span.try_days(value).map_err(recoverable)?;
+    }
+    if let Some(value) = args.offset_hours {
+        span = span.try_hours(value).map_err(recoverable)?;
+    }
+    if let Some(value) = args.offset_minutes {
+        span = span.try_minutes(value).map_err(recoverable)?;
+    }
+    if let Some(value) = args.offset_seconds {
+        span = span.try_seconds(value).map_err(recoverable)?;
+    }
+    Ok(span)
+}
+
+fn format_timestamp(
+    timestamp: Timestamp,
+    timezone: Option<&str>,
+) -> Result<String, ToolInvokeError> {
+    match timezone {
+        Some(timezone) => timestamp
+            .in_tz(timezone)
+            .map(|timestamp| timestamp.to_string())
+            .map_err(recoverable),
+        None => Ok(timestamp.to_string()),
+    }
+}
 #[derive(Deserialize)]
 struct WaitParams {
     seconds: f64,
@@ -335,13 +355,23 @@ fn parse_unix_timestamp(value: f64) -> Result<Timestamp, ToolInvokeError> {
             "unixTimestamp must be finite".to_string(),
         ));
     }
+    let nanos = checked_unix_nanos(value)?;
+    Timestamp::from_nanosecond(nanos).map_err(recoverable)
+}
+
+fn checked_unix_nanos(value: f64) -> Result<i128, ToolInvokeError> {
     let nanos = value * 1_000_000_000.0;
-    if !nanos.is_finite() || nanos < i128::MIN as f64 || nanos > i128::MAX as f64 {
-        return Err(ToolInvokeError::Recoverable(
-            "unixTimestamp is out of range".to_string(),
-        ));
+    if !nanos.is_finite() {
+        return Err(unix_timestamp_out_of_range());
     }
-    Timestamp::from_nanosecond(nanos.round() as i128).map_err(recoverable)
+    if !((i128::MIN as f64)..=(i128::MAX as f64)).contains(&nanos) {
+        return Err(unix_timestamp_out_of_range());
+    }
+    Ok(nanos.round() as i128)
+}
+
+fn unix_timestamp_out_of_range() -> ToolInvokeError {
+    ToolInvokeError::Recoverable("unixTimestamp is out of range".to_string())
 }
 
 fn recoverable(error: impl std::fmt::Display) -> ToolInvokeError {
@@ -364,6 +394,26 @@ mod tests {
             .expect("get current time");
         assert_eq!(result["timezone"], "UTC");
         assert!(result["datetime"].as_str().is_some());
+    }
+
+    #[test]
+    fn tool_specs_advertise_defaults_and_execution_bounds() {
+        let tools = TimeToolset::new().tools();
+        let current = tools
+            .iter()
+            .find(|tool| tool.name == "get_current_time")
+            .expect("current-time spec");
+        assert!(current.input_schema.get("required").is_none());
+        let wait = tools
+            .iter()
+            .find(|tool| tool.name == "wait")
+            .expect("wait spec");
+        assert!(wait.timeout_secs.expect("wait timeout") > 3_600);
+        let wait_until = tools
+            .iter()
+            .find(|tool| tool.name == "wait_until")
+            .expect("wait-until spec");
+        assert!(wait_until.timeout_secs.expect("wait-until timeout") > 86_400);
     }
 
     #[tokio::test]

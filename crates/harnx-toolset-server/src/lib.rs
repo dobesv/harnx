@@ -18,7 +18,7 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tokio_util::sync::CancellationToken;
 
 pub const TOOL_REGISTRY_BUCKET: &str = "harnx_tool_registry";
@@ -28,10 +28,42 @@ pub const TOOL_SCHEMA_VERSION: u32 = 1;
 const HARNX_NATS_URL: &str = "HARNX_NATS_URL";
 const HARNX_NATS_TOKEN: &str = "HARNX_NATS_TOKEN";
 const IDEMPOTENCY_CACHE_TTL: Duration = Duration::from_secs(60);
+const IDEMPOTENCY_CACHE_MAX_ENTRIES: usize = 1_024;
 const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 type InFlight = Arc<Mutex<HashMap<String, CancellationToken>>>;
-type ReplyCache = Arc<Mutex<HashMap<String, (Instant, ToolReply)>>>;
+type ReplyCache = Arc<Mutex<HashMap<String, ReplyCacheEntry>>>;
+
+enum ReplyCacheEntry {
+    InProgress {
+        reply: watch::Receiver<Option<ToolReply>>,
+    },
+    Complete {
+        created: Instant,
+        reply: ToolReply,
+    },
+}
+
+enum CacheReservation {
+    Execute(watch::Sender<Option<ToolReply>>),
+    Wait(watch::Receiver<Option<ToolReply>>),
+    Complete(ToolReply),
+    Full,
+}
+
+#[derive(Clone)]
+struct ToolRequestContext {
+    client: async_nats::Client,
+    toolset: Arc<dyn Toolset>,
+    in_flight: InFlight,
+    reply_cache: ReplyCache,
+}
+
+struct ValidatedToolRequest {
+    reply_subject: async_nats::Subject,
+    request: ToolRequest,
+    idempotency_key: String,
+}
 
 /// KV key for one worker instance's tool server registration.
 pub fn registration_key(instance_id: &InstanceId, server: &str) -> String {
@@ -87,8 +119,12 @@ async fn serve_with_client(
     let registry = ensure_registry_bucket(&jetstream).await?;
     publish_registration(&registry, &instance_id, &registration).await?;
 
-    let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
-    let reply_cache: ReplyCache = Arc::new(Mutex::new(HashMap::new()));
+    let request_context = ToolRequestContext {
+        client: client.clone(),
+        toolset,
+        in_flight: Arc::new(Mutex::new(HashMap::new())),
+        reply_cache: Arc::new(Mutex::new(HashMap::new())),
+    };
     let mut refresh = tokio::time::interval(REGISTRATION_REFRESH_INTERVAL);
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     refresh.tick().await;
@@ -99,94 +135,228 @@ async fn serve_with_client(
                 let Some(request) = request else {
                     anyhow::bail!("tool request subscription closed");
                 };
-                spawn_tool_request(
-                    client.clone(),
-                    Arc::clone(&toolset),
-                    Arc::clone(&in_flight),
-                    Arc::clone(&reply_cache),
-                    request,
-                );
+                spawn_tool_request(request_context.clone(), request);
             }
             control = controls.next() => {
                 let Some(control) = control else {
                     anyhow::bail!("control subscription closed");
                 };
-                handle_control(control, &in_flight).await;
+                handle_control(control, &request_context.in_flight).await;
             }
             _ = refresh.tick() => {
-                publish_registration(&registry, &instance_id, &registration).await?;
+                if let Err(error) = publish_registration(&registry, &instance_id, &registration).await {
+                    log::warn!("refresh tool registration failed; retrying next interval: {error:#}");
+                }
             }
         }
     }
 }
 
-fn spawn_tool_request(
-    client: async_nats::Client,
-    toolset: Arc<dyn Toolset>,
-    in_flight: InFlight,
-    reply_cache: ReplyCache,
-    message: async_nats::Message,
-) {
+fn spawn_tool_request(context: ToolRequestContext, message: async_nats::Message) {
     tokio::spawn(async move {
-        if let Err(error) =
-            process_tool_request(&client, toolset, &in_flight, &reply_cache, message).await
-        {
-            eprintln!("harnx tool request failed: {error:#}");
+        if let Err(error) = process_tool_request(&context, message).await {
+            log::warn!("harnx tool request failed: {error:#}");
         }
     });
 }
 
 async fn process_tool_request(
-    client: &async_nats::Client,
-    toolset: Arc<dyn Toolset>,
-    in_flight: &InFlight,
-    reply_cache: &ReplyCache,
+    context: &ToolRequestContext,
     message: async_nats::Message,
 ) -> Result<()> {
-    let reply_subject = message
-        .reply
-        .clone()
-        .context("tool request has no reply subject")?;
-    let request: ToolRequest =
-        serde_json::from_slice(&message.payload).context("decode tool request payload")?;
-
-    if let Some(header_call_id) = header_value(&message, HDR_CALL_ID) {
-        anyhow::ensure!(
-            header_call_id == request.call_id,
-            "tool request call ID header does not match payload"
-        );
-    }
-    let idempotency_key = header_value(&message, HDR_IDEMPOTENCY_KEY)
-        .context("tool request is missing Idempotency-Key header")?;
-
-    if let Some(reply) = cached_reply(reply_cache, &idempotency_key).await {
-        return publish_reply(client, reply_subject, &reply).await;
-    }
+    let Some(validated) = validate_tool_request(context, message).await? else {
+        return Ok(());
+    };
+    let ValidatedToolRequest {
+        reply_subject,
+        request,
+        idempotency_key,
+    } = validated;
+    let completion = match reserve_cache_entry(&context.reply_cache, &idempotency_key).await {
+        CacheReservation::Complete(mut reply) => {
+            reply.call_id.clone_from(&request.call_id);
+            return publish_reply(&context.client, reply_subject, &reply).await;
+        }
+        CacheReservation::Wait(reply) => {
+            let mut reply = wait_for_cached_reply(reply).await?;
+            reply.call_id.clone_from(&request.call_id);
+            return publish_reply(&context.client, reply_subject, &reply).await;
+        }
+        CacheReservation::Full => {
+            return publish_recoverable_reply(
+                &context.client,
+                reply_subject,
+                request.call_id,
+                "tool server idempotency cache is full".to_string(),
+            )
+            .await;
+        }
+        CacheReservation::Execute(completion) => completion,
+    };
 
     let cancel = CancellationToken::new();
-    in_flight
+    context
+        .in_flight
         .lock()
         .await
         .insert(request.call_id.clone(), cancel.clone());
-    let result = toolset.invoke(&request.tool, request.args, cancel).await;
-    in_flight.lock().await.remove(&request.call_id);
+    let result = context
+        .toolset
+        .invoke(&request.tool, request.args, cancel)
+        .await;
+    context.in_flight.lock().await.remove(&request.call_id);
 
     let reply = ToolReply {
         call_id: request.call_id,
         result: result.map_err(map_invoke_error),
     };
-    reply_cache
-        .lock()
-        .await
-        .insert(idempotency_key, (Instant::now(), reply.clone()));
-    publish_reply(client, reply_subject, &reply).await
+    complete_cache_entry(
+        &context.reply_cache,
+        idempotency_key,
+        reply.clone(),
+        completion,
+    )
+    .await;
+    publish_reply(&context.client, reply_subject, &reply).await
 }
 
-async fn cached_reply(cache: &ReplyCache, key: &str) -> Option<ToolReply> {
-    let now = Instant::now();
+async fn validate_tool_request(
+    context: &ToolRequestContext,
+    message: async_nats::Message,
+) -> Result<Option<ValidatedToolRequest>> {
+    let reply_subject = message
+        .reply
+        .clone()
+        .context("tool request has no reply subject")?;
+    let header_call_id = header_value(&message, HDR_CALL_ID);
+    let request: ToolRequest = match serde_json::from_slice(&message.payload) {
+        Ok(request) => request,
+        Err(error) => {
+            publish_recoverable_reply(
+                &context.client,
+                reply_subject,
+                header_call_id.unwrap_or_default(),
+                format!("decode tool request payload: {error}"),
+            )
+            .await?;
+            return Ok(None);
+        }
+    };
+    if let Some(header_call_id) = header_call_id {
+        if header_call_id != request.call_id {
+            publish_recoverable_reply(
+                &context.client,
+                reply_subject,
+                header_call_id,
+                "tool request call ID header does not match payload".to_string(),
+            )
+            .await?;
+            return Ok(None);
+        }
+    }
+    let Some(idempotency_key) = header_value(&message, HDR_IDEMPOTENCY_KEY) else {
+        publish_recoverable_reply(
+            &context.client,
+            reply_subject,
+            request.call_id,
+            "tool request is missing Idempotency-Key header".to_string(),
+        )
+        .await?;
+        return Ok(None);
+    };
+    Ok(Some(ValidatedToolRequest {
+        reply_subject,
+        request,
+        idempotency_key,
+    }))
+}
+
+async fn reserve_cache_entry(cache: &ReplyCache, key: &str) -> CacheReservation {
     let mut cache = cache.lock().await;
-    cache.retain(|_, (created, _)| now.duration_since(*created) < IDEMPOTENCY_CACHE_TTL);
-    cache.get(key).map(|(_, reply)| reply.clone())
+    remove_expired_replies(&mut cache, Instant::now());
+    if let Some(entry) = cache.get(key) {
+        return match entry {
+            ReplyCacheEntry::InProgress { reply, .. } => CacheReservation::Wait(reply.clone()),
+            ReplyCacheEntry::Complete { reply, .. } => CacheReservation::Complete(reply.clone()),
+        };
+    }
+    if cache.len() >= IDEMPOTENCY_CACHE_MAX_ENTRIES {
+        evict_oldest_completed_reply(&mut cache);
+    }
+    if cache.len() >= IDEMPOTENCY_CACHE_MAX_ENTRIES {
+        return CacheReservation::Full;
+    }
+    let (completion, reply) = watch::channel(None);
+    cache.insert(key.to_string(), ReplyCacheEntry::InProgress { reply });
+    CacheReservation::Execute(completion)
+}
+
+fn remove_expired_replies(cache: &mut HashMap<String, ReplyCacheEntry>, now: Instant) {
+    cache.retain(|_, entry| match entry {
+        ReplyCacheEntry::InProgress { .. } => true,
+        ReplyCacheEntry::Complete { created, .. } => {
+            now.duration_since(*created) < IDEMPOTENCY_CACHE_TTL
+        }
+    });
+}
+
+fn evict_oldest_completed_reply(cache: &mut HashMap<String, ReplyCacheEntry>) {
+    let oldest = cache
+        .iter()
+        .filter_map(|(key, entry)| match entry {
+            ReplyCacheEntry::Complete { created, .. } => Some((key.clone(), *created)),
+            ReplyCacheEntry::InProgress { .. } => None,
+        })
+        .min_by_key(|(_, created)| *created)
+        .map(|(key, _)| key);
+    if let Some(key) = oldest {
+        cache.remove(&key);
+    }
+}
+
+async fn wait_for_cached_reply(mut reply: watch::Receiver<Option<ToolReply>>) -> Result<ToolReply> {
+    if reply.borrow().is_none() {
+        reply
+            .changed()
+            .await
+            .context("original idempotent tool request ended without a reply")?;
+    }
+    let cached = reply.borrow().clone();
+    cached.context("original idempotent tool request ended without a reply")
+}
+
+async fn complete_cache_entry(
+    cache: &ReplyCache,
+    key: String,
+    reply: ToolReply,
+    completion: watch::Sender<Option<ToolReply>>,
+) {
+    cache.lock().await.insert(
+        key,
+        ReplyCacheEntry::Complete {
+            created: Instant::now(),
+            reply: reply.clone(),
+        },
+    );
+    let _ = completion.send(Some(reply));
+}
+
+async fn publish_recoverable_reply(
+    client: &async_nats::Client,
+    subject: async_nats::Subject,
+    call_id: String,
+    message: String,
+) -> Result<()> {
+    log::warn!("rejecting NATS tool request: {message}");
+    publish_reply(
+        client,
+        subject,
+        &ToolReply {
+            call_id,
+            result: Err(ToolErrorPayload::Recoverable(message)),
+        },
+    )
+    .await
 }
 
 fn map_invoke_error(error: ToolInvokeError) -> ToolErrorPayload {
@@ -356,5 +526,27 @@ impl ServerHandler for McpToolsetAdapter {
                 error.to_string(),
             )])),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn idempotency_cache_rejects_growth_past_cap() {
+        harnx_core::require_nextest();
+        let cache: ReplyCache = Arc::new(Mutex::new(HashMap::new()));
+        for index in 0..IDEMPOTENCY_CACHE_MAX_ENTRIES {
+            assert!(matches!(
+                reserve_cache_entry(&cache, &format!("key-{index}")).await,
+                CacheReservation::Execute(_)
+            ));
+        }
+        assert!(matches!(
+            reserve_cache_entry(&cache, "overflow").await,
+            CacheReservation::Full
+        ));
+        assert_eq!(cache.lock().await.len(), IDEMPOTENCY_CACHE_MAX_ENTRIES);
     }
 }

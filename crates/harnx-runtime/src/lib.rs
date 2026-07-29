@@ -32,6 +32,7 @@ pub mod session_cleanup;
 pub mod session_history;
 pub mod test_utils;
 pub mod tool;
+mod tool_context;
 pub mod utils;
 
 // Re-export thin-client types for frontends

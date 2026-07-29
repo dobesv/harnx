@@ -720,14 +720,14 @@ async fn build_orphan_tool_eval_context(
     instance_id: &harnx_core::instance::InstanceId,
     repair: &ToolRepairContext,
 ) -> crate::tool::ToolEvalContext {
-    crate::tool::build_tool_eval_context(
+    crate::tool::build_tool_eval_context(crate::tool::BuildToolEvalContextParams {
         config,
         instance_id,
-        repair.agent_use_tools.as_deref(),
-        repair.current_agent_package.clone(),
-        &repair.persistent_manager,
-        None,
-    )
+        agent_use_tools: repair.agent_use_tools.as_deref(),
+        current_agent_package: repair.current_agent_package.clone(),
+        persistent_manager: &repair.persistent_manager,
+        working_dir: None,
+    })
     .await
 }
 

@@ -4377,6 +4377,7 @@ dependencies = [
  "futures-util",
  "harnx-core",
  "harnx-toolset",
+ "log",
  "rmcp",
  "serde_json",
  "tempfile",
