@@ -1377,6 +1377,39 @@ mod tests {
         messages
     }
 
+    async fn wait_for_session_messages(
+        agent: &str,
+        session_id: &str,
+        predicate: impl Fn(&[Message]) -> bool,
+    ) -> Vec<Message> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let messages = load_session_messages(agent, session_id);
+                if predicate(&messages) {
+                    return messages;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for persisted session {agent}/{session_id}"))
+    }
+
+    async fn assert_persisted_user_message(agent: &str, session_id: &str, expected: &str) {
+        let messages = wait_for_session_messages(agent, session_id, |messages| {
+            messages
+                .iter()
+                .any(|msg| msg.role.is_user() && msg.content.to_text() == expected)
+        })
+        .await;
+        let user_texts: Vec<String> = messages
+            .iter()
+            .filter(|msg| msg.role.is_user())
+            .map(|msg| msg.content.to_text())
+            .collect();
+        assert!(user_texts.iter().any(|text| text == expected));
+    }
+
     #[tokio::test]
     async fn session_actor_idle_prompt_runs_and_broadcasts_lifecycle() {
         let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
@@ -1574,12 +1607,7 @@ mod tests {
             .expect("timed out waiting for pending message event")
             .expect("watcher task panicked"));
 
-        let user_texts: Vec<String> = load_session_messages("plain", "inject")
-            .iter()
-            .filter(|msg| msg.role.is_user())
-            .map(|msg| msg.content.to_text())
-            .collect();
-        assert!(user_texts.iter().any(|text| text == "queued follow-up"));
+        assert_persisted_user_message("plain", "inject", "queued follow-up").await;
     }
 
     #[tokio::test]
@@ -1803,7 +1831,12 @@ mod tests {
             "expected one executed tool result"
         );
 
-        let messages = load_session_messages("plain", "tool-history");
+        let messages = wait_for_session_messages("plain", "tool-history", |messages| {
+            messages
+                .iter()
+                .any(|msg| msg.role.is_assistant() && msg.content.to_text() == "history checked")
+        })
+        .await;
         let assistant_messages: Vec<String> = messages
             .iter()
             .filter(|msg| msg.role.is_assistant())
