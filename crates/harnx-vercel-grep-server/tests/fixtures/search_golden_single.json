@@ -1,0 +1,28 @@
+{
+  "facets": {
+    "count": 1234,
+    "lang": {
+      "buckets": [
+        { "val": "Python", "count": 500 }
+      ]
+    },
+    "repo": {
+      "buckets": [
+        { "val": "fastapi/fastapi", "count": 100 }
+      ]
+    }
+  },
+  "hits": {
+    "hits": [
+      {
+        "repo": { "raw": "fastapi/fastapi" },
+        "path": { "raw": "src/main.py" },
+        "branch": { "raw": "main" },
+        "total_matches": { "raw": "5" },
+        "content": {
+          "snippet": "<span data-line=\"10\">import fastapi</span>\n<span data-line=\"11\">app = FastAPI()</span>"
+        }
+      }
+    ]
+  }
+}

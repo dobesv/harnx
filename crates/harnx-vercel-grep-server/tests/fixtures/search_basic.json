@@ -1,0 +1,49 @@
+{
+  "facets": {
+    "count": 1234,
+    "lang": {
+      "buckets": [
+        { "val": "Python", "count": 500 },
+        { "val": "JavaScript", "count": 210 },
+        { "val": "TypeScript", "count": 130 }
+      ]
+    },
+    "repo": {
+      "buckets": [
+        { "val": "fastapi/fastapi", "count": 100 },
+        { "val": "tiangolo/full-stack-fastapi-template", "count": 40 }
+      ]
+    }
+  },
+  "hits": {
+    "hits": [
+      {
+        "repo": { "raw": "fastapi/fastapi" },
+        "path": { "raw": "fastapi/applications.py" },
+        "branch": { "raw": "master" },
+        "total_matches": { "raw": "12" },
+        "content": {
+          "snippet": "<div class=\"highlight\"><span data-line=\"20\">from fastapi import FastAPI</span>\n<span data-line=\"21\">app = FastAPI()</span></div>"
+        }
+      },
+      {
+        "repo": { "raw": "fastapi/fastapi" },
+        "path": { "raw": "docs_src/first_steps/tutorial001.py" },
+        "branch": { "raw": "master" },
+        "total_matches": { "raw": "3" },
+        "content": {
+          "snippet": "<span data-line=\"1\">from fastapi import FastAPI</span>\n<span data-line=\"3\">app = FastAPI()</span>"
+        }
+      },
+      {
+        "repo": { "raw": "tiangolo/full-stack-fastapi-template" },
+        "path": { "raw": "backend/app/main.py" },
+        "branch": { "raw": "master" },
+        "total_matches": { "raw": "5" },
+        "content": {
+          "snippet": "<span data-line=\"7\">app = FastAPI(title=settings.PROJECT_NAME)</span>"
+        }
+      }
+    ]
+  }
+}

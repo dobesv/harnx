@@ -1,0 +1,2 @@
+# Keep grep-server golden test fixtures as LF so byte-exact output asserts pass on Windows
+crates/harnx-vercel-grep-server/tests/fixtures/** text eol=lf
