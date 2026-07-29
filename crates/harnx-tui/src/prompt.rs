@@ -156,6 +156,7 @@ impl Tui {
         );
 
         let loop_ctx = harnx_runtime::AgentLoopContext {
+            instance_id: harnx_core::instance::InstanceId::new(),
             config: ctx.config.clone(),
             abort_signal: ctx.abort_signal.clone(),
             async_manager: ctx.async_manager.clone(),

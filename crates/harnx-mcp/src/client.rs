@@ -35,14 +35,6 @@ use std::{
     sync::Arc,
 };
 
-/// Remove inherited local-NATS credentials so MCP tool subprocesses never
-/// receive the shared-broker token/url. Takes and returns the command by
-/// reference so it can wrap an existing `command.envs(..)` call site.
-fn scrub_local_nats_env(command: &mut Command) -> &mut Command {
-    command
-        .env_remove("HARNX_NATS_TOKEN")
-        .env_remove("HARNX_NATS_URL")
-}
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::runtime::{Builder, Handle, RuntimeFlavor};
@@ -340,7 +332,7 @@ impl McpClient {
         let mut command = Command::new(&self.config.command);
         command.args(&self.config.args);
 
-        scrub_local_nats_env(command.envs(&self.config.env));
+        command.envs(&self.config.env);
 
         // Pipe stdin/stdout/stderr for MCP transport
         command.stdin(Stdio::piped());
@@ -1681,24 +1673,6 @@ mod selector_filter_tests {
     use super::{classify_exit, selector_could_match_server, McpManager};
     use crate::McpServerConfig;
     use harnx_core::event::NoticeEvent;
-
-    #[test]
-    fn mcp_child_command_scrubs_local_nats_credentials() {
-        harnx_core::require_nextest();
-        let mut command = tokio::process::Command::new("unused");
-        command
-            .env("HARNX_NATS_TOKEN", "secret")
-            .env("HARNX_NATS_URL", "nats://127.0.0.1:4222");
-
-        super::scrub_local_nats_env(&mut command);
-
-        for name in ["HARNX_NATS_TOKEN", "HARNX_NATS_URL"] {
-            assert!(command
-                .as_std()
-                .get_envs()
-                .any(|(key, value)| { key == std::ffi::OsStr::new(name) && value.is_none() }));
-        }
-    }
 
     #[test]
     fn star_matches_every_server() {

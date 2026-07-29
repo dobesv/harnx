@@ -290,6 +290,14 @@ impl AcpExecutionRole {
     }
 }
 
+fn should_run_local_turn(
+    remote_agent: Option<&(String, String)>,
+    execution_role: AcpExecutionRole,
+    allow_test_local: bool,
+) -> bool {
+    remote_agent.is_none() && (allow_test_local || execution_role == AcpExecutionRole::Backend)
+}
+
 pub struct HarnxAgent {
     agent_name: String,
     execution_role: AcpExecutionRole,
@@ -683,8 +691,8 @@ impl HarnxAgent {
             cancel_abort.set_ctrlc();
         });
 
-        let run_local = remote_agent.is_none()
-            && (cfg!(test) || self.execution_role == AcpExecutionRole::Backend);
+        let run_local =
+            should_run_local_turn(remote_agent.as_ref(), self.execution_role, cfg!(test));
         let turn_result = if run_local {
             local_executor::run_local_turn(local_executor::LocalTurnParams {
                 agent_name: &self.agent_name,

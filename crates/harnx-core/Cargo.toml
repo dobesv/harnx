@@ -28,6 +28,7 @@ sys-locale = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
+uuid = { workspace = true }
 
 urlencoding = { workspace = true }
 minijinja = { workspace = true }

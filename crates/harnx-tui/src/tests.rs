@@ -2576,7 +2576,15 @@ async fn test_tool_result_switch_agent_parsing() {
         harnx_hooks::PersistentHookManager::new(),
     ));
     let mut results = eval_tool_calls(
-        &harnx_runtime::tool::build_tool_eval_context(&config, None, None, &pm, None),
+        &harnx_runtime::tool::build_tool_eval_context(
+            &config,
+            &harnx_core::instance::InstanceId::new(),
+            None,
+            None,
+            &pm,
+            None,
+        )
+        .await,
         vec![call],
         &abort_signal,
     )

@@ -18,6 +18,7 @@ pub mod error;
 pub mod event;
 pub mod hooks;
 pub mod input;
+pub mod instance;
 pub mod last_message;
 pub mod llm_trace;
 pub mod macros;

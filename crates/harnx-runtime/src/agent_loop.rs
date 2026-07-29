@@ -86,6 +86,7 @@ pub type OnTextResponseFn = Arc<
 /// ACP server `LocalSet`.
 pub struct AgentLoopContext {
     pub config: GlobalConfig,
+    pub instance_id: harnx_core::instance::InstanceId,
     pub abort_signal: AbortSignal,
     /// Async hook manager (shared, mutex-protected). The CLI wraps its
     /// `&mut AsyncHookManager` into an `Arc<Mutex<...>>` for the duration of
@@ -177,6 +178,7 @@ pub async fn continue_agent_loop_from_tool_round(
     // preseeded confirm function; already-approved calls execute normally.
     let tool_results = match crate::tool::execute_tool_round_with_persistence(
         config,
+        &ctx.instance_id,
         &input,
         &crate::tool::CompletionText {
             output: &output,
@@ -493,6 +495,7 @@ async fn run_agent_loop_inner(
             config.write().record_completion_usage(&usage);
             execute_tool_round(
                 config,
+                &ctx.instance_id,
                 &input,
                 &CompletionText {
                     output: &output,
@@ -788,6 +791,7 @@ mod tests {
         });
 
         let ctx = AgentLoopContext {
+            instance_id: harnx_core::instance::InstanceId::new(),
             config: global_config.clone(),
             abort_signal: create_abort_signal(),
             async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::new())),
@@ -839,6 +843,7 @@ mod tests {
         call_fn: AgentCallFn,
     ) -> AgentLoopContext {
         AgentLoopContext {
+            instance_id: harnx_core::instance::InstanceId::new(),
             config: global_config,
             abort_signal: create_abort_signal(),
             async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::new())),

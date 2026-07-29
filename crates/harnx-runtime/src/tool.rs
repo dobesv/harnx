@@ -70,8 +70,10 @@ impl ToolApprovalInterrupt {
 /// On eval failure, synthesizes one error-output `ToolResult` per
 /// call, writes those to keep the log well-formed, and returns the
 /// original error.  Skips both writes entirely when `dry_run` is set.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_tool_round(
     config: &GlobalConfig,
+    instance_id: &harnx_core::instance::InstanceId,
     input: &Input,
     completion: &CompletionText<'_>,
     tool_calls: Vec<ToolCall>,
@@ -81,6 +83,7 @@ pub async fn execute_tool_round(
 ) -> Result<Vec<ToolResult>> {
     execute_tool_round_with_persistence(
         config,
+        instance_id,
         input,
         completion,
         tool_calls,
@@ -95,6 +98,7 @@ pub async fn execute_tool_round(
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_tool_round_with_persistence(
     config: &GlobalConfig,
+    instance_id: &harnx_core::instance::InstanceId,
     input: &Input,
     completion: &CompletionText<'_>,
     tool_calls: Vec<ToolCall>,
@@ -121,11 +125,13 @@ pub async fn execute_tool_round_with_persistence(
         harnx_core::package_namespace::pkg_from_qualified(input.agent().name()).map(str::to_string);
     let eval_ctx = build_tool_eval_context(
         config,
+        instance_id,
         agent_use_tools.as_deref(),
         current_agent_package,
         persistent_manager,
         working_dir,
-    );
+    )
+    .await;
     let results = match eval_tool_calls(&eval_ctx, tool_calls.clone(), abort_signal).await {
         Ok(results) => results,
         Err(err) => {
@@ -160,10 +166,10 @@ pub async fn execute_tool_round_with_persistence(
 /// Build a `ToolEvalContext` from the harnx `GlobalConfig`. Replaces the
 /// old inherent `ToolEvalContext::from_config` method — the struct lives
 /// in `harnx-engine::tool` now (orphan rules forbid adding inherent
-/// methods on a cross-crate type). Snapshots Config fields, constructs
-/// the provider list (ACP first, MCP second), builds the dispatch hook
-/// closure over captured `hooks.entries`, `session_id`, and `cwd`, and
-/// wires in harnx-side default UI/prompt callbacks.
+/// methods on a cross-crate type). Snapshots Config fields and the instance's
+/// NATS registrations, constructs the provider list (NATS first, then ACP/MCP),
+/// builds the dispatch hook closure over captured `hooks.entries`, `session_id`,
+/// and `cwd`, and wires in harnx-side default UI/prompt callbacks.
 ///
 /// `agent_use_tools` is the active agent's `use_tools` whitelist. The
 /// CLI/TUI flow stores the agent on the Config (via `use_agent`), so
@@ -271,27 +277,55 @@ fn build_emit_fns(
     (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn)
 }
 
-pub fn build_tool_eval_context(
+pub async fn build_tool_eval_context(
     config: &GlobalConfig,
+    instance_id: &harnx_core::instance::InstanceId,
     agent_use_tools: Option<&str>,
     current_agent_package: Option<String>,
     persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
     working_dir: Option<&std::path::Path>,
 ) -> ToolEvalContext {
-    let guard = config.read();
-    let (tool_declarations, handoff_targets) =
-        guard.tool_declarations_for_use_tools(agent_use_tools, current_agent_package.as_deref());
+    let (
+        mut tool_declarations,
+        handoff_targets,
+        hooks,
+        acp_manager,
+        mcp_manager,
+        session_name,
+        confirm_tool_use_fn,
+        config_snapshot,
+    ) = {
+        let guard = config.read();
+        let (tool_declarations, handoff_targets) = guard
+            .tool_declarations_for_use_tools(agent_use_tools, current_agent_package.as_deref());
+        (
+            tool_declarations,
+            handoff_targets,
+            guard.resolved_hooks(),
+            guard.acp_manager.clone(),
+            guard.mcp_manager.clone(),
+            guard.session.as_ref().map(|s| s.id().to_string()),
+            build_confirm_tool_use_fn(&guard),
+            guard.clone(),
+        )
+    };
+
+    let nats_provider = crate::nats_tool_provider::NatsToolProvider::discover(
+        &config_snapshot,
+        instance_id.clone(),
+        crate::nats_tool_provider::NatsInFlightCalls::for_instance(instance_id),
+    )
+    .await
+    .ok()
+    .map(Arc::new);
+    if let Some(provider) = &nats_provider {
+        tool_declarations.extend(provider.declarations_for_use_tools(agent_use_tools));
+    }
+
     let decl_map = Arc::new(build_decl_map(tool_declarations));
     let allowed_tool_names: HashSet<String> = decl_map.keys().cloned().collect();
-    let hooks = guard.resolved_hooks();
-    let acp_manager = guard.acp_manager.clone();
-    let mcp_manager = guard.mcp_manager.clone();
     let per_tool_hooks = build_per_tool_hooks(decl_map.as_ref(), mcp_manager.as_ref());
-    let session_name = guard.session.as_ref().map(|s| s.id().to_string());
-    let confirm_tool_use_fn = build_confirm_tool_use_fn(&guard);
-    drop(guard);
-
-    let providers = build_tool_providers(config, acp_manager, mcp_manager);
+    let providers = build_tool_providers(config, nats_provider, acp_manager, mcp_manager);
     let dispatch_hook_fn = build_dispatch_hook_fn(
         &hooks,
         per_tool_hooks,
@@ -301,6 +335,7 @@ pub fn build_tool_eval_context(
     );
     let (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn) = build_emit_fns(&decl_map);
     ToolEvalContext {
+        instance_id: instance_id.clone(),
         render: Some(ToolEvalRenderContext {
             decl_map: Arc::clone(&decl_map),
         }),
@@ -386,12 +421,15 @@ fn build_confirm_tool_use_fn(config: &Config) -> Arc<ConfirmToolUseFn> {
 
 fn build_tool_providers(
     config: &GlobalConfig,
+    nats_provider: Option<Arc<crate::nats_tool_provider::NatsToolProvider>>,
     acp_manager: Option<Arc<AcpManager>>,
     mcp_manager: Option<Arc<McpManager>>,
 ) -> Vec<Arc<dyn ToolProvider>> {
-    // Build provider list in ACP-first order so ACP sub-agent handoffs take
-    // priority over any namespaced MCP tool with same name.
     let mut providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
+    // Registered NATS tools win collisions during incremental stdio migrations.
+    if let Some(nats) = nats_provider {
+        providers.push(nats as Arc<dyn ToolProvider>);
+    }
     if let Some(acp) = acp_manager {
         providers.push(acp as Arc<dyn ToolProvider>);
     }
@@ -635,6 +673,21 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
+    #[tokio::test]
+    async fn instance_id_is_preserved_in_tool_eval_context() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        let instance_id = harnx_core::instance::InstanceId::new();
+        let persistent_manager = Arc::new(tokio::sync::Mutex::new(
+            harnx_hooks::PersistentHookManager::new(),
+        ));
+
+        let context =
+            build_tool_eval_context(&config, &instance_id, None, None, &persistent_manager, None)
+                .await;
+
+        assert_eq!(context.instance_id, instance_id);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_eval_tool_calls_error_handling() {
         let _guard = crate::client::TestStateGuard::new(None).await;
@@ -652,7 +705,15 @@ mod tests {
             harnx_hooks::PersistentHookManager::new(),
         ));
         let result = eval_tool_calls(
-            &build_tool_eval_context(&config, None, None, &persistent_manager, None),
+            &build_tool_eval_context(
+                &config,
+                &harnx_core::instance::InstanceId::new(),
+                None,
+                None,
+                &persistent_manager,
+                None,
+            )
+            .await,
             calls,
             &abort_signal,
         )
@@ -683,14 +744,30 @@ mod tests {
         let pkg = harnx_core::package_namespace::pkg_from_qualified("pantheon/daedalus")
             .map(str::to_string);
         assert_eq!(pkg.as_deref(), Some("pantheon"));
-        let ctx = build_tool_eval_context(&config, None, pkg, &persistent_manager, None);
+        let ctx = build_tool_eval_context(
+            &config,
+            &harnx_core::instance::InstanceId::new(),
+            None,
+            pkg,
+            &persistent_manager,
+            None,
+        )
+        .await;
         assert_eq!(ctx.current_agent_package.as_deref(), Some("pantheon"));
 
         // A bare (top-level) agent name yields no package context.
         let bare =
             harnx_core::package_namespace::pkg_from_qualified("daedalus").map(str::to_string);
         assert_eq!(bare, None);
-        let ctx = build_tool_eval_context(&config, None, bare, &persistent_manager, None);
+        let ctx = build_tool_eval_context(
+            &config,
+            &harnx_core::instance::InstanceId::new(),
+            None,
+            bare,
+            &persistent_manager,
+            None,
+        )
+        .await;
         assert_eq!(ctx.current_agent_package, None);
     }
 
@@ -706,7 +783,15 @@ mod tests {
 
         // Default (no override): the inquire-based prompt is used. In a
         // non-terminal test process it denies, so this returns Deny.
-        let ctx = build_tool_eval_context(&config, None, None, &persistent_manager, None);
+        let ctx = build_tool_eval_context(
+            &config,
+            &harnx_core::instance::InstanceId::new(),
+            None,
+            None,
+            &persistent_manager,
+            None,
+        )
+        .await;
         let call = ToolCall::new("t".to_string(), serde_json::json!({}), None, None);
         assert!(matches!(
             (ctx.confirm_tool_use_fn)(&call, &serde_json::json!({}), None),
@@ -717,7 +802,15 @@ mod tests {
         config
             .write()
             .set_tui_confirm_tool_use(Some(Arc::new(|_, _, _| ToolUseConfirmation::Approve)));
-        let ctx = build_tool_eval_context(&config, None, None, &persistent_manager, None);
+        let ctx = build_tool_eval_context(
+            &config,
+            &harnx_core::instance::InstanceId::new(),
+            None,
+            None,
+            &persistent_manager,
+            None,
+        )
+        .await;
         assert!(matches!(
             (ctx.confirm_tool_use_fn)(&call, &serde_json::json!({}), None),
             ToolUseConfirmation::Approve
@@ -1004,6 +1097,7 @@ mod tests {
             make_decl_with_templates("bash_exec", None, Some("OK: {{ result.content[0].text }}")),
         );
         let eval_ctx = ToolEvalContext {
+            instance_id: harnx_core::instance::InstanceId::new(),
             render: Some(ToolEvalRenderContext {
                 decl_map: Arc::new(decl_map),
             }),
