@@ -1252,9 +1252,26 @@ impl Config {
                 };
             agent.set_session_variables(session_variables);
             session.sync_agent(agent)?;
-        } else {
+        } else if agent.defined_variables().is_empty() {
             let variables = session.agent_variables();
             agent.set_session_variables(variables.clone());
+        } else {
+            // Restoring an existing session: re-resolve defined variables against
+            // the persisted map so newly-added variables pick up their defaults.
+            // `resolve_agent_variable` returns an existing value before falling
+            // back to a default, so previously-saved values are preserved.
+            let mut base_variables = session.agent_variables().clone();
+            if let Some(config_variables) = &self.agent_variables {
+                base_variables.extend(config_variables.clone());
+            }
+            let resolved_variables = self::agent::init_agent_variables(
+                agent.defined_variables(),
+                &base_variables,
+                self.info_flag,
+            )?;
+            agent.set_shared_variables(resolved_variables.clone());
+            agent.set_session_variables(resolved_variables);
+            session.sync_agent(agent)?;
         }
         Ok(())
     }

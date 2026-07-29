@@ -360,6 +360,125 @@ async fn test_use_agent_by_name_resolves_file_backed_variable_defaults() {
         "shared_variables should be populated from the file-backed default"
     );
 }
+
+#[tokio::test]
+async fn test_restored_sessions_resolve_new_agent_variable_defaults() {
+    use crate::client::TestStateGuard;
+    use harnx_core::input::Input;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let agents_dir = temp.path().join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+    let agent_path = agents_dir.join("restored-vars.md");
+    std::fs::write(
+        &agent_path,
+        "---\nvariables:\n  - name: existing\n    description: Existing value\n    default: prior\n---\nPrior: {{existing}}\n",
+    )
+    .unwrap();
+
+    let _guard = TestStateGuard::new(None).await;
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+
+    let mut config = Config {
+        info_flag: true,
+        model: harnx_client::Model::new("test", "model"),
+        ..Default::default()
+    };
+    config
+        .clients
+        .push(harnx_client::ClientConfig::OpenAICompatibleConfig(
+            harnx_core::provider_config::openai_compatible::OpenAICompatibleConfig {
+                name: "test".to_string(),
+                api_base: None,
+                api_key: None,
+                models: vec![],
+                patches: None,
+                extra: None,
+                system_prompt_prefix: None,
+                package: None,
+            },
+        ));
+    config.use_agent_by_name("restored-vars").unwrap();
+
+    config.use_session(Some("missing-value")).unwrap();
+    crate::config::session::add_assistant_text(
+        config.session.as_mut().unwrap(),
+        &Input::new(
+            "first turn".to_string(),
+            ("first turn".to_string(), vec![]),
+            AgentConfig::default(),
+        ),
+        "saved response",
+        None,
+    )
+    .unwrap();
+    config.save_session(None).unwrap();
+    config.exit_session().unwrap();
+
+    config.use_session(Some("saved-value")).unwrap();
+    let mut saved_variables = AgentVariables::default();
+    saved_variables.insert("existing".to_string(), "prior".to_string());
+    saved_variables.insert("greeting".to_string(), "custom".to_string());
+    config
+        .agent
+        .as_mut()
+        .unwrap()
+        .set_session_variables(saved_variables);
+    config
+        .session
+        .as_mut()
+        .unwrap()
+        .sync_agent(config.agent.as_ref().unwrap())
+        .unwrap();
+    crate::config::session::add_assistant_text(
+        config.session.as_mut().unwrap(),
+        &Input::new(
+            "first turn".to_string(),
+            ("first turn".to_string(), vec![]),
+            AgentConfig::default(),
+        ),
+        "saved response",
+        None,
+    )
+    .unwrap();
+    config.save_session(None).unwrap();
+    config.exit_session().unwrap();
+
+    std::fs::write(
+        &agent_path,
+        "---\nvariables:\n  - name: greeting\n    description: Greeting\n    default: hello\n---\nGreeting: {{greeting}}\n",
+    )
+    .unwrap();
+    config.use_agent_by_name("restored-vars").unwrap();
+
+    config.use_session(Some("missing-value")).unwrap();
+    let agent = config.agent.as_ref().unwrap();
+    assert_eq!(
+        agent.variables().get("greeting").map(String::as_str),
+        Some("hello")
+    );
+    assert_eq!(agent.system_text().unwrap(), "Greeting: hello");
+    assert_eq!(
+        config
+            .session
+            .as_ref()
+            .unwrap()
+            .agent_variables()
+            .get("greeting")
+            .map(String::as_str),
+        Some("hello"),
+        "resolved default should be synced back to the session"
+    );
+
+    config.use_session(Some("saved-value")).unwrap();
+    let agent = config.agent.as_ref().unwrap();
+    assert_eq!(
+        agent.variables().get("greeting").map(String::as_str),
+        Some("custom"),
+        "restoring should preserve a previously saved value"
+    );
+    assert_eq!(agent.system_text().unwrap(), "Greeting: custom");
+}
 // ── Tests for HOME boundary guard in reinit_managers_for_agent ──
 
 #[cfg(unix)]
