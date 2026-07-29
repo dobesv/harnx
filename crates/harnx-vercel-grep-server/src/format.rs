@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use fancy_regex::Regex;
 use serde::Serialize;
 
-use crate::server::model::{Hit, SearchResponse};
+use crate::server::model::{Bucket, Hit, SearchResponse};
 
 static HTML_TAG_REGEX: OnceLock<Result<Regex, fancy_regex::Error>> = OnceLock::new();
 static LINE_NUMBER_REGEX: OnceLock<Result<Regex, fancy_regex::Error>> = OnceLock::new();
@@ -124,9 +124,7 @@ fn cap_snippet_lines(text: &str) -> String {
             formatted_lines.push(cleaned);
         }
         if formatted_lines.len() >= 8 {
-            if index < lines.len() - 1 {
-                formatted_lines.push("... (truncated)");
-            }
+            formatted_lines.extend((index < lines.len() - 1).then_some("... (truncated)"));
             break;
         }
     }
@@ -155,40 +153,38 @@ pub fn build_output(query: &str, response: &SearchResponse) -> String {
     serialize_pretty(&output)
 }
 
-fn top_language_summaries(response: &SearchResponse) -> Vec<TopLanguage<'_>> {
-    response
-        .facets
-        .lang
-        .buckets
+fn top_summaries<'a, T>(
+    buckets: &'a [Bucket],
+    make_summary: impl Fn(FacetSummary<'a>) -> T,
+) -> Vec<T> {
+    buckets
         .iter()
         .take(5)
-        .map(|bucket| TopLanguage {
-            language: if bucket.val.is_empty() {
-                "Unknown"
-            } else {
-                &bucket.val
-            },
-            count: bucket.count,
+        .map(|bucket| {
+            make_summary(FacetSummary {
+                value: if bucket.val.is_empty() {
+                    "Unknown"
+                } else {
+                    &bucket.val
+                },
+                count: bucket.count,
+            })
         })
         .collect()
 }
 
+fn top_language_summaries(response: &SearchResponse) -> Vec<TopLanguage<'_>> {
+    top_summaries(&response.facets.lang.buckets, |summary| TopLanguage {
+        language: summary.value,
+        count: summary.count,
+    })
+}
+
 fn top_repository_summaries(response: &SearchResponse) -> Vec<TopRepository<'_>> {
-    response
-        .facets
-        .repo
-        .buckets
-        .iter()
-        .take(5)
-        .map(|bucket| TopRepository {
-            repository: if bucket.val.is_empty() {
-                "Unknown"
-            } else {
-                &bucket.val
-            },
-            count: bucket.count,
-        })
-        .collect()
+    top_summaries(&response.facets.repo.buckets, |summary| TopRepository {
+        repository: summary.value,
+        count: summary.count,
+    })
 }
 
 fn group_hits_by_repository(hits: &[Hit]) -> Vec<RepositoryResult> {
@@ -309,6 +305,11 @@ struct FileResult {
     code_snippet: String,
 }
 
+struct FacetSummary<'a> {
+    value: &'a str,
+    count: u64,
+}
+
 #[derive(Serialize)]
 struct NotFoundOutput<'a> {
     query: &'a str,
@@ -398,10 +399,14 @@ mod tests {
     }
 
     #[test]
-    fn maps_extensions_and_defaults_to_text() {
+    fn maps_known_extensions() {
         assert_eq!(language_from_extension("py"), "python");
         assert_eq!(language_from_extension("rs"), "rust");
         assert_eq!(language_from_extension("ts"), "typescript");
+    }
+
+    #[test]
+    fn defaults_unknown_extensions_to_text() {
         assert_eq!(language_from_extension("unknown"), "text");
         assert_eq!(language_from_extension("txt"), "text");
     }
