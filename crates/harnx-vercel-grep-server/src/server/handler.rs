@@ -79,9 +79,7 @@ impl ServerHandler for GrepServer {
         let output = match client::search(&self.client, &self.base_url, &params).await {
             SearchOutcome::Ok(value) => match serde_json::from_value::<SearchResponse>(value) {
                 Ok(response) => format::build_output(query, &response),
-                Err(error) => {
-                    format!("❌ Error: Network error while contacting grep.app API: {error}")
-                }
+                Err(error) => unexpected_response_error(error),
             },
             SearchOutcome::NotFound => format::build_not_found_output(query),
             SearchOutcome::RateLimited => RATE_LIMIT_ERROR.to_string(),
@@ -89,6 +87,7 @@ impl ServerHandler for GrepServer {
                 format!("❌ Error: API request failed with status {status}")
             }
             SearchOutcome::Timeout => TIMEOUT_ERROR.to_string(),
+            SearchOutcome::Malformed(error) => unexpected_response_error(error),
             SearchOutcome::Network(details) => {
                 format!("❌ Error: Network error while contacting grep.app API: {details}")
             }
@@ -96,6 +95,10 @@ impl ServerHandler for GrepServer {
 
         Ok(text_result(output))
     }
+}
+
+fn unexpected_response_error(error: impl std::fmt::Display) -> String {
+    format!("❌ Error: Unexpected response format from grep.app API: {error}")
 }
 
 fn text_result(text: impl Into<String>) -> CallToolResult {

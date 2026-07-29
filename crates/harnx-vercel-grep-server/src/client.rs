@@ -13,6 +13,7 @@ pub enum SearchOutcome {
     RateLimited,
     HttpStatus(u16),
     Timeout,
+    Malformed(String),
     Network(String),
 }
 
@@ -46,6 +47,7 @@ pub async fn search(
     match response.status().as_u16() {
         200 => match response.json::<Value>().await {
             Ok(body) => SearchOutcome::Ok(body),
+            Err(error) if error.is_decode() => SearchOutcome::Malformed(error.to_string()),
             Err(error) => classify_error(error),
         },
         429 => SearchOutcome::RateLimited,

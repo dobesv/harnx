@@ -10,65 +10,76 @@ pub struct GrepQueryParams {
 
 impl GrepQueryParams {
     pub fn validate(&self) -> Result<(), String> {
-        if self.query.is_empty() {
-            return Err(
-                "❌ Error: 'query' parameter is required and must be a non-empty string".into(),
-            );
-        }
-        if self.query.trim().is_empty() {
-            return Err("❌ Error: 'query' cannot be empty or only whitespace".into());
-        }
-        if self.query.chars().count() > 1000 {
-            return Err(
-                "❌ Error: 'query' is too long (max 1000 characters). Please use a shorter query."
-                    .into(),
-            );
-        }
-
-        if let Some(language) = &self.language {
-            if language.trim().is_empty() {
-                return Err(
-                    "❌ Error: 'language' parameter must be a non-empty string when provided"
-                        .into(),
-                );
-            }
-            if language.chars().count() > 50 {
-                return Err(
-                    "❌ Error: 'language' parameter is too long (max 50 characters)".into(),
-                );
-            }
-        }
-
-        if let Some(repo) = &self.repo {
-            if repo.trim().is_empty() {
-                return Err(
-                    "❌ Error: 'repo' parameter must be a non-empty string when provided".into(),
-                );
-            }
-            if repo.matches('/').count() != 1 {
-                return Err(
-                    "❌ Error: 'repo' parameter must be in format 'owner/repository' (e.g., 'fastapi/fastapi')"
-                        .into(),
-                );
-            }
-            if repo.chars().count() > 100 {
-                return Err("❌ Error: 'repo' parameter is too long (max 100 characters)".into());
-            }
-        }
-
-        if let Some(path) = &self.path {
-            if path.trim().is_empty() {
-                return Err(
-                    "❌ Error: 'path' parameter must be a non-empty string when provided".into(),
-                );
-            }
-            if path.chars().count() > 200 {
-                return Err("❌ Error: 'path' parameter is too long (max 200 characters)".into());
-            }
-        }
-
-        Ok(())
+        validate_query(&self.query)?;
+        validate_language(self.language.as_deref())?;
+        validate_repo(self.repo.as_deref())?;
+        validate_path(self.path.as_deref())
     }
+}
+
+fn validate_query(query: &str) -> Result<(), String> {
+    if query.is_empty() {
+        return Err(
+            "❌ Error: 'query' parameter is required and must be a non-empty string".into(),
+        );
+    }
+    if query.trim().is_empty() {
+        return Err("❌ Error: 'query' cannot be empty or only whitespace".into());
+    }
+    if query.chars().count() > 1000 {
+        return Err(
+            "❌ Error: 'query' is too long (max 1000 characters). Please use a shorter query."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_language(language: Option<&str>) -> Result<(), String> {
+    let Some(language) = language else {
+        return Ok(());
+    };
+    if language.trim().is_empty() {
+        return Err(
+            "❌ Error: 'language' parameter must be a non-empty string when provided".into(),
+        );
+    }
+    if language.chars().count() > 50 {
+        return Err("❌ Error: 'language' parameter is too long (max 50 characters)".into());
+    }
+    Ok(())
+}
+
+fn validate_repo(repo: Option<&str>) -> Result<(), String> {
+    let Some(repo) = repo else {
+        return Ok(());
+    };
+    if repo.trim().is_empty() {
+        return Err("❌ Error: 'repo' parameter must be a non-empty string when provided".into());
+    }
+    if repo.matches('/').count() != 1 {
+        return Err(
+            "❌ Error: 'repo' parameter must be in format 'owner/repository' (e.g., 'fastapi/fastapi')"
+                .into(),
+        );
+    }
+    if repo.chars().count() > 100 {
+        return Err("❌ Error: 'repo' parameter is too long (max 100 characters)".into());
+    }
+    Ok(())
+}
+
+fn validate_path(path: Option<&str>) -> Result<(), String> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if path.trim().is_empty() {
+        return Err("❌ Error: 'path' parameter must be a non-empty string when provided".into());
+    }
+    if path.chars().count() > 200 {
+        return Err("❌ Error: 'path' parameter is too long (max 200 characters)".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

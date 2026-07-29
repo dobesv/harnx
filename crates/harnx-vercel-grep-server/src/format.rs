@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use fancy_regex::Regex;
 use serde::Serialize;
 
-use crate::server::model::SearchResponse;
+use crate::server::model::{Hit, SearchResponse};
 
 static HTML_TAG_REGEX: OnceLock<Result<Regex, fancy_regex::Error>> = OnceLock::new();
 static LINE_NUMBER_REGEX: OnceLock<Result<Regex, fancy_regex::Error>> = OnceLock::new();
@@ -96,15 +96,27 @@ pub fn format_code_snippet(text: &str, language: &str) -> String {
         return String::new();
     }
 
-    let snippet = if text.chars().count() > 400 {
+    let snippet = truncate_snippet(text);
+    let capped = cap_snippet_lines(&snippet);
+    if !language.is_empty() && language != "text" {
+        format!("```{language}\n{capped}\n```")
+    } else {
+        capped
+    }
+}
+
+fn truncate_snippet(text: &str) -> String {
+    if text.chars().count() > 400 {
         let mut truncated = text.chars().take(400).collect::<String>();
         truncated.push_str("...");
         truncated
     } else {
         text.to_owned()
-    };
+    }
+}
 
-    let lines = snippet.split('\n').collect::<Vec<_>>();
+fn cap_snippet_lines(text: &str) -> String {
+    let lines = text.split('\n').collect::<Vec<_>>();
     let mut formatted_lines = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         let cleaned = line.trim_end();
@@ -118,17 +130,33 @@ pub fn format_code_snippet(text: &str, language: &str) -> String {
             break;
         }
     }
-
-    let joined = formatted_lines.join("\n");
-    if !language.is_empty() && language != "text" {
-        format!("```{language}\n{joined}\n```")
-    } else {
-        joined
-    }
+    formatted_lines.join("\n")
 }
 
 pub fn build_output(query: &str, response: &SearchResponse) -> String {
-    let top_languages = response
+    let mut results_by_repository = group_hits_by_repository(&response.hits.hits);
+    results_by_repository.sort_by_key(|repository| std::cmp::Reverse(repository.matches_count));
+
+    let output = SearchOutput {
+        query,
+        summary: Summary {
+            total_results: response.facets.count,
+            results_shown: results_by_repository
+                .iter()
+                .map(|repository| repository.files.len())
+                .sum(),
+            repositories_found: results_by_repository.len(),
+            top_languages: top_language_summaries(response),
+            top_repositories: top_repository_summaries(response),
+        },
+        results_by_repository,
+    };
+
+    serialize_pretty(&output)
+}
+
+fn top_language_summaries(response: &SearchResponse) -> Vec<TopLanguage<'_>> {
+    response
         .facets
         .lang
         .buckets
@@ -142,8 +170,11 @@ pub fn build_output(query: &str, response: &SearchResponse) -> String {
             },
             count: bucket.count,
         })
-        .collect();
-    let top_repositories = response
+        .collect()
+}
+
+fn top_repository_summaries(response: &SearchResponse) -> Vec<TopRepository<'_>> {
+    response
         .facets
         .repo
         .buckets
@@ -157,74 +188,59 @@ pub fn build_output(query: &str, response: &SearchResponse) -> String {
             },
             count: bucket.count,
         })
-        .collect();
+        .collect()
+}
 
-    let mut results_by_repository: Vec<RepositoryResult> = Vec::new();
-    for hit in response.hits.hits.iter().take(10) {
+fn group_hits_by_repository(hits: &[Hit]) -> Vec<RepositoryResult> {
+    let mut groups: Vec<RepositoryResult> = Vec::new();
+    for hit in hits.iter().take(10) {
         let repository = hit.repo();
-        let path = hit.path();
-        let raw_total_matches = hit.total_matches();
-        let total_matches = if !raw_total_matches.is_empty()
-            && raw_total_matches
-                .chars()
-                .all(|character| character.is_ascii_digit())
-        {
-            raw_total_matches.parse::<u64>().unwrap_or(0)
-        } else {
-            0
-        };
-        let raw_snippet = hit.snippet();
-        let clean_snippet = extract_text_from_html(raw_snippet);
-        let line_numbers = extract_line_numbers(raw_snippet);
-        let extension = if path.contains('.') {
-            path.rsplit('.').next().unwrap_or("txt").to_lowercase()
-        } else {
-            "txt".to_owned()
-        };
-        let language = language_from_extension(&extension);
-        let file = FileResult {
-            file_path: path.to_owned(),
-            branch: hit.branch().to_owned(),
-            total_matches,
-            line_numbers,
-            language,
-            code_snippet: format_code_snippet(&clean_snippet, language),
-        };
-
-        if let Some(group) = results_by_repository
+        let file = file_result(hit);
+        if let Some(group) = groups
             .iter_mut()
             .find(|group| group.repository == repository)
         {
-            group.matches_count = group.matches_count.saturating_add(total_matches);
+            group.matches_count = group.matches_count.saturating_add(file.total_matches);
             group.files.push(file);
         } else {
-            results_by_repository.push(RepositoryResult {
+            groups.push(RepositoryResult {
                 repository: repository.to_owned(),
-                matches_count: total_matches,
+                matches_count: file.total_matches,
                 files: vec![file],
             });
         }
     }
+    groups
+}
 
-    results_by_repository.sort_by_key(|repository| std::cmp::Reverse(repository.matches_count));
-    let results_shown = results_by_repository
-        .iter()
-        .map(|repository| repository.files.len())
-        .sum();
-    let repositories_found = results_by_repository.len();
-    let output = SearchOutput {
-        query,
-        summary: Summary {
-            total_results: response.facets.count,
-            results_shown,
-            repositories_found,
-            top_languages,
-            top_repositories,
-        },
-        results_by_repository,
+fn file_result(hit: &Hit) -> FileResult {
+    let path = hit.path();
+    let total_matches = parse_total_matches(hit.total_matches());
+    let raw_snippet = hit.snippet();
+    let clean_snippet = extract_text_from_html(raw_snippet);
+    let extension = if path.contains('.') {
+        path.rsplit('.').next().unwrap_or("txt").to_lowercase()
+    } else {
+        "txt".to_owned()
     };
+    let language = language_from_extension(&extension);
 
-    serialize_pretty(&output)
+    FileResult {
+        file_path: path.to_owned(),
+        branch: hit.branch().to_owned(),
+        total_matches,
+        line_numbers: extract_line_numbers(raw_snippet),
+        language,
+        code_snippet: format_code_snippet(&clean_snippet, language),
+    }
+}
+
+fn parse_total_matches(raw: &str) -> u64 {
+    if !raw.is_empty() && raw.chars().all(|character| character.is_ascii_digit()) {
+        raw.parse::<u64>().unwrap_or(0)
+    } else {
+        0
+    }
 }
 
 pub fn build_not_found_output(query: &str) -> String {
@@ -243,7 +259,7 @@ fn serialize_pretty<T: Serialize>(value: &T) -> String {
         Ok(output) => output,
         Err(error) => {
             log::error!("failed to serialize grep output: {error}");
-            String::new()
+            format!("❌ Error: Failed to serialize grep output: {error}")
         }
     }
 }

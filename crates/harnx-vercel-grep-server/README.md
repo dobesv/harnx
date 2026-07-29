@@ -89,7 +89,7 @@ Expected output shape (formatted as 2-space-indented JSON):
 
 **Note:** grep.app is currently behind a Vercel bot-challenge that returns HTTP 429 to some automated/datacenter clients. Depending on your network environment, a live query may return:
 
-```
+```text
 ❌ Error: Rate limit exceeded. Please wait before making another request.
 ```
 

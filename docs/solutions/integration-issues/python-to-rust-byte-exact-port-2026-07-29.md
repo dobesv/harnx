@@ -27,7 +27,7 @@ A "strict 1:1 port" of a Python MCP server to Rust requires matching not just th
 
 ## Symptoms
 
-```
+```text
 - JSON output key order differs from Python reference
 - Snippet truncation splits multi-byte UTF-8 characters
 - Sorting ties produce different ordering on repeated runs
@@ -198,7 +198,7 @@ Include test cases for `total_matches.raw` as both numeric strings (`"5"`) and n
 - Multi-byte UTF-8 truncation fixture (assert no character splitting)
 
 **Best Practices:**
-- Always fetch the verbatim upstream source when porting; plans can parphrase incorrectly
+- Always fetch the verbatim upstream source when porting; plans can paraphrase incorrectly
 - Use `.chars()` for any Python string length/slice operation
 - Use stable sorts (`sort_by_key`, `sort_by`) when Python uses `sorted()`
 - Test with golden fixtures for byte-exact contracts
