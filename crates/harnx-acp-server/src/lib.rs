@@ -747,7 +747,7 @@ impl HarnxAgent {
         let sessions = self.sessions.lock().await;
         let session = sessions
             .get(session_id.as_ref())
-            .ok_or_else(acp::Error::invalid_params)?;
+            .ok_or_else(|| unknown_session_error(session_id.as_ref()))?;
         // A cancel is direct user interaction — count it as activity so the
         // idle reaper doesn't evict a session the user is actively steering.
         session.touch();
@@ -771,7 +771,7 @@ impl HarnxAgent {
         // Session not in memory. Check if it exists on disk.
         let session_path = self.base_config.read().session_file(session_id);
         if !tokio::fs::try_exists(&session_path).await.unwrap_or(false) {
-            return Err(acp::Error::invalid_params());
+            return Err(unknown_session_error(session_id));
         }
 
         // Lazy rebuild: fork config, load session from disk.
@@ -841,6 +841,18 @@ impl HarnxAgent {
             }
         });
     }
+}
+
+/// Build the actionable ACP error returned when a caller references a session
+/// ID that isn't in memory or on disk. The message tells the calling model how
+/// to recover (use a real ID or omit it) instead of a bare "Invalid params".
+fn unknown_session_error(session_id: &str) -> acp::Error {
+    acp::Error::new(
+        -32602,
+        format!(
+            "Unknown session ID '{session_id}'. Use a session_id returned by session_new or session_prompt; omit it to start a new session."
+        ),
+    )
 }
 
 /// Build the `meta` map that `AcpNotificationClient::resolve_notification_source`

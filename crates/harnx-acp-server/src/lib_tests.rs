@@ -149,7 +149,41 @@ mod tests {
             })
             .await;
 
-        assert!(result.is_err());
+        let error = result.expect_err("unknown session must fail");
+        assert_eq!(error.code, (-32602).into());
+        assert_eq!(
+            error.message,
+            "Unknown session ID 'nonexistent'. Use a session_id returned by session_new or session_prompt; omit it to start a new session."
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_prompt_unknown_session_errors() {
+        let (_temp, _path) = setup_agent_env("test");
+        let _guard = TestStateGuard::new(None).await;
+        let config = test_config();
+        let agent = Arc::new(HarnxAgent::new("test".to_string(), config));
+
+        let local = tokio::task::LocalSet::new();
+        let result = local
+            .run_until(async {
+                agent
+                    .prompt(PromptRequest::new(
+                        agent_client_protocol::schema::v1::SessionId::new(
+                            "nonexistent".to_string(),
+                        ),
+                        vec![ContentBlock::from("hello".to_string())],
+                    ))
+                    .await
+            })
+            .await;
+
+        let error = result.expect_err("prompt on unknown session must fail");
+        assert_eq!(error.code, (-32602).into());
+        assert_eq!(
+            error.message,
+            "Unknown session ID 'nonexistent'. Use a session_id returned by session_new or session_prompt; omit it to start a new session."
+        );
     }
 
     /// A created session bound to its agent and on-disk log location. Holding
