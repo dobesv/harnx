@@ -116,12 +116,9 @@ impl ThinClientSession {
         abort_signal: AbortSignal,
     ) -> Result<Self> {
         let cluster = config.cluster.clone();
-        let server = {
-            let cfg = global_config.read();
-            cfg.nats_server(&cluster)?.clone()
-        };
-
-        let client = crate::config::Config::connect_nats_server(&server)
+        let config_snapshot = global_config.read().clone();
+        let client = config_snapshot
+            .nats_client(&cluster)
             .await
             .context("failed to connect to NATS cluster for thin client")?;
         let jetstream = async_nats::jetstream::new(client.clone());
@@ -191,7 +188,7 @@ impl ThinClientSession {
         // Render history to event sink (for resume/attach scenarios)
         let history = event_stream.history();
         // Apply mutations so retracted/edited entries are excluded from history render.
-        let effective_history =
+        let _effective_history =
             match harnx_core::session_reconstruct::apply_log_mutations_nats(history) {
                 Ok(history) => history,
                 Err(err) => {
@@ -201,13 +198,9 @@ impl ThinClientSession {
                     history.to_vec()
                 }
             };
-        let history_window = active_context_window(&effective_history);
-        replay_history_to_sink(
-            &effective_history,
-            &history_window,
-            user_msg_seq,
-            event_sink.clone(),
-        );
+        // Front-ends render resumed history through their explicit transcript
+        // loading path. Replaying it on every newly-created per-turn thin client
+        // duplicates all prior messages in interactive and continued sessions.
 
         // Step 3: Publish activation to wake a worker.
         let activation = SessionActivate::new(&self.session_id, &self.config.agent);
@@ -242,23 +235,9 @@ impl ThinClientSession {
         let mut last_completion_check = std::time::Instant::now() - COMPLETION_CHECK_INTERVAL;
         let mut completion_interval = tokio::time::interval(COMPLETION_CHECK_INTERVAL);
         completion_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Set up control command sender
-        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<ControlCommand>(16);
-        let session_id_control = self.session_id.clone();
-        let client_control = self.client.clone();
-
-        let control_task = tokio::spawn(async move {
-            while let Some(cmd) = control_rx.recv().await {
-                if let Err(e) =
-                    publish_control_command(&client_control, &session_id_control, &cmd).await
-                {
-                    log::warn!("thin client: failed to publish control command: {e}");
-                }
-            }
-        });
-
-        // Wrap channel in Option for select! handling
+        // Wrap channel in Option for select! handling.
         let mut pending_cancel_rx = pending_cancel;
+        let mut was_cancelled = false;
 
         // Main event loop with abort signal handling
         let abort_signal_clone = self.abort_signal.clone();
@@ -266,20 +245,40 @@ impl ThinClientSession {
             tokio::select! {
                 // Check for cancellation via wait_abort_signal
                 _ = wait_abort_signal(&abort_signal_clone) => {
-                    log::info!("thin client: abort signal received, sending cancel");
-                    let _ = control_tx.send(ControlCommand::Cancel).await;
+                    was_cancelled = true;
+                    log::info!("thin client: abort signal received, publishing cancel");
+                    if let Err(error) = publish_control_command(
+                        &self.client,
+                        &self.session_id,
+                        &ControlCommand::Cancel,
+                    )
+                    .await
+                    {
+                        log::warn!("thin client: failed to publish abort control command: {error:#}");
+                    }
                     break;
                 }
 
-                // Handle pending cancel requests
+                // Handle pending cancel requests. Publish synchronously so run_turn
+                // cannot tear down before the command reaches the NATS connection.
                 Some(()) = async {
                     match &mut pending_cancel_rx {
                         Some(rx) => rx.recv().await,
                         None => std::future::pending().await,
                     }
                 } => {
-                    log::info!("thin client: pending cancel received");
-                    let _ = control_tx.send(ControlCommand::Cancel).await;
+                    was_cancelled = true;
+                    log::info!("thin client: pending cancel received, publishing cancel");
+                    if let Err(error) = publish_control_command(
+                        &self.client,
+                        &self.session_id,
+                        &ControlCommand::Cancel,
+                    )
+                    .await
+                    {
+                        log::warn!("thin client: failed to publish pending cancel control command: {error:#}");
+                    }
+                    break;
                 }
 
                 // Poll durable completion independently so non-streaming workers
@@ -324,7 +323,6 @@ impl ThinClientSession {
                                     &mut emitted_logical_seqs,
                                 );
                             }
-
                             // Poll durable log for turn completion, but at most
                             // once per COMPLETION_CHECK_INTERVAL so bursty
                             // streaming advisories do not trigger full log reload
@@ -365,10 +363,6 @@ impl ThinClientSession {
             }
         }
 
-        // Cleanup: stop control task
-        drop(control_tx);
-        control_task.abort();
-
         // Re-load durable log to get final state if we haven't already
         if !turn_complete {
             let entries = self.load_durable_entries().await?;
@@ -378,7 +372,7 @@ impl ThinClientSession {
         Ok(ThinClientTurnResult {
             response: final_response,
             session_id: self.session_id.clone(),
-            was_cancelled: self.abort_signal.aborted(),
+            was_cancelled: was_cancelled || self.abort_signal.aborted(),
             user_msg_seq,
             user_msg_id,
         })
@@ -518,10 +512,12 @@ pub struct ThinClientTurnResult {
 /// Render a session log entry to an event sink.
 ///
 /// Used for rendering history when attaching to an existing session.
+#[allow(dead_code)]
 fn should_skip_replay_entry(seq: u64, user_msg_seq: u64) -> bool {
     seq == user_msg_seq
 }
 
+#[allow(dead_code)]
 fn replay_history_to_sink(
     effective_history: &[(u64, SessionLogEntry)],
     history_window: &ActiveContextWindow<'_, (u64, SessionLogEntry)>,
@@ -536,6 +532,7 @@ fn replay_history_to_sink(
     }
 }
 
+#[allow(dead_code)]
 fn render_log_entry_to_sink(
     entry: &SessionLogEntry,
     physical_seq: u64,
@@ -610,18 +607,18 @@ fn flush_pending_advisories(
         return;
     };
     let window = active_context_window(effective_entries);
-    while let Some(envelope) = pending_advisories.front() {
-        let Some(_) = emit_live_logical_seq_for_physical(
+    while let Some(envelope) = pending_advisories.pop_front() {
+        // `after_seq` may point at a physical mutation entry (for example the
+        // worker's header EditEntries append) that reconstruction intentionally
+        // removes. Sequence decoration is therefore best-effort; never hold a
+        // live streaming advisory forever merely because that physical seq has
+        // no effective logical entry.
+        let _ = emit_live_logical_seq_for_physical(
             envelope.after_seq,
             &window,
             sink,
             emitted_logical_seqs,
-        ) else {
-            break;
-        };
-        let envelope = pending_advisories
-            .pop_front()
-            .expect("front checked before pop");
+        );
         if !matches!(
             envelope.event,
             AgentEvent::Session(SessionEvent::LogSeqAssigned { .. })

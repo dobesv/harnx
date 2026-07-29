@@ -310,9 +310,9 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
 
 /// Runs agent loop, applying file-backed local handoffs until completion.
 ///
-/// Used by local frontends (CLI, TUI, ACP) that all share same file-backed
-/// handoff semantics: exit current agent, activate target agent/session,
-/// clear newly loaded session contents, then rebuild input from handoff prompt.
+/// Retained for test-only in-process frontend executors. Production frontends
+/// route turns through NATS; workers use [`run_agent_loop`] directly with
+/// NATS-backed handoff handling.
 pub async fn run_agent_loop_with_local_handoff(
     ctx: &AgentLoopContext,
     mut input: Input,

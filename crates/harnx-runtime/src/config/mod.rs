@@ -28,7 +28,17 @@ mod settings_split;
 
 pub use self::env_split::load_env_file;
 pub use self::macros_split::macro_execute;
-pub use self::nats_split::NatsServerConfig;
+pub use self::nats_split::{resolve_local_nats_server_config, NatsServerConfig};
+
+/// Reserved cluster identity for the auto-managed shared local NATS broker.
+///
+/// Dynamic resolution always wins for this key, so a user-provided
+/// `nats_servers/__local__.yaml` can never shadow the local broker.
+pub const LOCAL_CLUSTER_KEY: &str = "__local__";
+/// Worker handoff variable containing shared local NATS broker URL.
+pub const HARNX_NATS_URL_ENV: &str = "HARNX_NATS_URL";
+/// Worker handoff variable containing shared local NATS authentication token.
+pub const HARNX_NATS_TOKEN_ENV: &str = "HARNX_NATS_TOKEN";
 pub(crate) use self::persistence_split::collect_tool_calls;
 pub use self::session_dump::render_session_dump;
 pub(crate) use self::session_log_split::{

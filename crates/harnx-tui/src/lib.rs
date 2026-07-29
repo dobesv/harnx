@@ -11,6 +11,7 @@ pub mod markdown_render;
 pub mod prompt;
 pub mod render;
 pub mod render_helpers;
+mod session_history_loader;
 pub mod terminal;
 pub mod test_utils;
 pub mod types;

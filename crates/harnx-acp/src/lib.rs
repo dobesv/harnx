@@ -11,6 +11,11 @@ mod event;
 pub mod manager;
 
 pub use client::AcpClient;
+
+/// Internal process-role marker set on ACP servers spawned as worker-owned
+/// tool/sub-agent backends. Standalone ACP frontends never set this marker.
+pub const ACP_EXECUTION_ROLE_ENV: &str = "HARNX_INTERNAL_ACP_ROLE";
+pub const ACP_BACKEND_ROLE: &str = "backend";
 pub use config::AcpServerConfig;
 pub use event::NestedAcpEvent;
 pub use manager::{

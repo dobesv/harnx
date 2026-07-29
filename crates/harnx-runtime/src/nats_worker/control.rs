@@ -56,5 +56,9 @@ pub async fn publish_control_command(
         .publish(subject, payload.into())
         .await
         .context("publish control command")?;
+    client
+        .flush()
+        .await
+        .context("flush control command publish")?;
     Ok(())
 }

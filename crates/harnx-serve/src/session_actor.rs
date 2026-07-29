@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+#[path = "session_actor_test_executor.rs"]
+mod test_executor;
+
 use crate::ag_ui::AgUiSink;
 use ag_ui_core::{
     event::{BaseEvent, Event, RunErrorEvent, RunFinishedEvent, RunStartedEvent},
@@ -17,9 +20,11 @@ use harnx_core::{
     tool::{ToolCall, ToolResult},
 };
 use harnx_runtime::{
-    config::{self, Config, GlobalConfig},
-    continue_agent_loop_from_tool_round, run_agent_loop, AgentCallFn, AgentLoopContext,
-    OnToolRoundFn, ToolApprovalDecision, ToolApprovalInterrupt, ToolUseConfirmation,
+    config::{self, Config, GlobalConfig, LOCAL_CLUSTER_KEY},
+    continue_agent_loop_from_tool_round,
+    local_orchestrator::{ensure_local_worker, LocalWorkerSupervisor},
+    AgentCallFn, AgentLoopContext, OnToolRoundFn, ThinClientConfig, ThinClientSession,
+    ToolApprovalDecision, ToolApprovalInterrupt, ToolUseConfirmation,
 };
 use std::{
     collections::VecDeque,
@@ -223,13 +228,20 @@ pub struct SessionRegistry {
 struct SessionActorConfig {
     base_config: Config,
     call_fn: Option<AgentCallFn>,
+    /// One supervisor shared by every actor in this long-lived server.
+    local_worker: Arc<Mutex<Option<LocalWorkerSupervisor>>>,
 }
 
 struct ActiveRun {
     run_id: RunId,
     started_at: DateTime<Utc>,
     abort_signal: AbortSignal,
-    inject_tx: mpsc::Sender<String>,
+    inject_tx: Option<mpsc::Sender<String>>,
+}
+
+struct PendingPrompt {
+    text: String,
+    options: SessionPromptOptions,
 }
 
 struct RunFinished {
@@ -238,6 +250,21 @@ struct RunFinished {
     sink: Arc<BroadcastEventSender>,
     thread_id: ThreadId,
     attachment_refs: Vec<String>,
+}
+
+struct ActorTurnParams {
+    prompt_config: GlobalConfig,
+    call_fn: Option<AgentCallFn>,
+    abort_signal: AbortSignal,
+    inject_rx: Option<mpsc::Receiver<String>>,
+    working_dir: Option<std::path::PathBuf>,
+    event_tx: broadcast::Sender<Event>,
+    text: String,
+    attachment_refs: Vec<String>,
+    sink: Arc<BroadcastEventSender>,
+    local_worker: Arc<Mutex<Option<LocalWorkerSupervisor>>>,
+    agent: String,
+    session_id: String,
 }
 
 impl SessionRegistry {
@@ -252,6 +279,7 @@ impl SessionRegistry {
             actor_config: SessionActorConfig {
                 base_config,
                 call_fn: None,
+                local_worker: Arc::new(Mutex::new(None)),
             },
         }
     }
@@ -274,6 +302,23 @@ impl SessionRegistry {
             SessionActorConfig {
                 base_config,
                 call_fn,
+                local_worker: Arc::new(Mutex::new(None)),
+            },
+        )
+    }
+
+    // Only used by the Unix-only NATS serve tests (`nats_tests`).
+    #[cfg(all(test, unix))]
+    fn new_with_local_worker_for_tests(
+        base_config: Config,
+        supervisor: LocalWorkerSupervisor,
+    ) -> Self {
+        Self::with_options(
+            DEFAULT_REAP_TTL,
+            SessionActorConfig {
+                base_config,
+                call_fn: None,
+                local_worker: Arc::new(Mutex::new(Some(supervisor))),
             },
         )
     }
@@ -316,7 +361,7 @@ struct SessionActor {
     broadcast_tx: broadcast::Sender<Event>,
     subscribers: usize,
     state: SessionState,
-    pending: VecDeque<String>,
+    pending: VecDeque<PendingPrompt>,
     active_run: Option<ActiveRun>,
     run_done_tx: mpsc::Sender<RunFinished>,
     run_done_rx: mpsc::Receiver<RunFinished>,
@@ -358,6 +403,91 @@ fn spawn_session_actor(
     handle
 }
 
+async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime::LoopResult> {
+    if let Some(call_fn) = params.call_fn {
+        return test_executor::run_local_test_turn(test_executor::LocalTestTurnParams {
+            prompt_config: params.prompt_config,
+            call_fn,
+            abort_signal: params.abort_signal,
+            inject_rx: params
+                .inject_rx
+                .expect("test executor must have an injection receiver"),
+            working_dir: params.working_dir,
+            event_tx: params.event_tx,
+            text: params.text,
+            attachment_refs: params.attachment_refs,
+            sink: params.sink,
+        })
+        .await;
+    }
+
+    {
+        let mut supervisor = params.local_worker.lock().await;
+        ensure_local_worker(&mut supervisor).await?;
+    }
+    let session = ThinClientSession::from_global_config(
+        ThinClientConfig {
+            cluster: LOCAL_CLUSTER_KEY.to_string(),
+            agent: params.agent,
+            session_id: Some(params.session_id),
+        },
+        &params.prompt_config,
+        params.abort_signal,
+    )
+    .await?;
+    session
+        .run_turn(&params.text, params.sink, None)
+        .await
+        .map(|_| harnx_runtime::LoopResult::Completed)
+}
+
+fn configure_tool_confirmation(prompt_config: &GlobalConfig, resume: &[InterruptResume]) {
+    let decisions = Arc::new(
+        resume
+            .iter()
+            .map(|entry| ToolApprovalDecision {
+                tool_call_id: entry.interrupt_id.clone(),
+                approved: entry.payload.approved,
+                reason: entry.payload.reason.clone(),
+            })
+            .collect::<Vec<_>>(),
+    );
+    let confirm_override: Arc<harnx_runtime::ConfirmToolUseFn> = Arc::new(
+        move |call: &ToolCall, _args: &serde_json::Value, reason: Option<&str>| {
+            let Some(decision) = call.id.as_deref().and_then(|id| {
+                decisions
+                    .iter()
+                    .find(|decision| decision.tool_call_id == id)
+            }) else {
+                return ToolUseConfirmation::Defer;
+            };
+            if decision.approved {
+                ToolUseConfirmation::Approve
+            } else {
+                ToolUseConfirmation::Deny {
+                    reason: decision
+                        .reason
+                        .clone()
+                        .or_else(|| reason.map(str::to_string)),
+                }
+            }
+        },
+    );
+    prompt_config
+        .write()
+        .set_tui_confirm_tool_use(Some(confirm_override));
+}
+
+fn test_injection_channel(
+    enabled: bool,
+) -> (Option<mpsc::Sender<String>>, Option<mpsc::Receiver<String>>) {
+    if enabled {
+        let (tx, rx) = mpsc::channel(COMMAND_BUFFER);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    }
+}
 impl SessionActor {
     async fn run(mut self) {
         let far_future = Instant::now() + Duration::from_secs(FAR_FUTURE_SECS);
@@ -417,37 +547,10 @@ impl SessionActor {
                 text,
                 options,
                 reply,
-            } => match &self.active_run {
-                None => {
-                    // Check if this is a resume from an interrupt
-                    if let Some(resume) = self.build_resume_continuation(&options.resume) {
-                        let run_id = self
-                            .start_resume_run(text, options, resume, reap_sleep)
-                            .await;
-                        let _ = reply.send(PromptResult::Accepted {
-                            run_id: run_id.to_string(),
-                        });
-                    } else {
-                        let run_id = self.start_run(text, options, reap_sleep).await;
-                        let _ = reply.send(PromptResult::Accepted {
-                            run_id: run_id.to_string(),
-                        });
-                    }
-                }
-                Some(active_run) => {
-                    // COMPLETING-STATE invariant: actor stays Running until the run-done
-                    // arm fires. If `try_send` fails with Full or Closed, prompt is pushed
-                    // to `pending`. Closed covers child-task exit before done is processed,
-                    // so prompt survives finish boundary without separate Completing state.
-                    let run_id = active_run.run_id.clone();
-                    if active_run.inject_tx.try_send(text.clone()).is_err() {
-                        self.pending.push_back(text);
-                    }
-                    let _ = reply.send(PromptResult::Enqueued {
-                        run_id: run_id.to_string(),
-                    });
-                }
-            },
+            } => {
+                let result = self.handle_prompt(text, options, reap_sleep).await;
+                let _ = reply.send(result);
+            }
             SessionCommand::Cancel { reply } => {
                 self.pending.clear();
                 if let Some(active_run) = &self.active_run {
@@ -472,6 +575,39 @@ impl SessionActor {
         }
     }
 
+    async fn handle_prompt(
+        &mut self,
+        text: String,
+        options: SessionPromptOptions,
+        reap_sleep: &mut std::pin::Pin<&mut Sleep>,
+    ) -> PromptResult {
+        let Some(active_run) = &self.active_run else {
+            let run_id = if let Some(resume) = self.build_resume_continuation(&options.resume) {
+                self.start_resume_run(text, options, resume, reap_sleep)
+                    .await
+            } else {
+                self.start_run(text, options, reap_sleep).await
+            };
+            return PromptResult::Accepted {
+                run_id: run_id.to_string(),
+            };
+        };
+
+        // Test executors support same-turn injection. Production thin-client
+        // turns queue the complete prompt for a fresh turn after completion.
+        let run_id = active_run.run_id.clone();
+        let injected = active_run
+            .inject_tx
+            .as_ref()
+            .is_some_and(|tx| tx.try_send(text.clone()).is_ok());
+        if !injected {
+            self.pending.push_back(PendingPrompt { text, options });
+        }
+        PromptResult::Enqueued {
+            run_id: run_id.to_string(),
+        }
+    }
+
     async fn handle_run_done(
         &mut self,
         done: RunFinished,
@@ -481,16 +617,7 @@ impl SessionActor {
         self.active_run = None;
         self.refresh_history_snapshot();
         match &done.result {
-            Ok(harnx_runtime::LoopResult::Completed) => {
-                done.sink.sink.close_text_segment();
-                let _ = self.broadcast_tx.send(Event::RunFinished(RunFinishedEvent {
-                    base: base_event(),
-                    thread_id: done.thread_id.clone(),
-                    run_id: done.run_id.clone(),
-                    result: None,
-                }));
-                self.state = SessionState::Idle;
-            }
+            Ok(harnx_runtime::LoopResult::Completed) => self.finish_completed_run(&done),
             Ok(harnx_runtime::LoopResult::HandoffRequested {
                 agent,
                 session_id,
@@ -546,7 +673,27 @@ impl SessionActor {
                 }
             }
         }
-        if self.subscribers == 0 {
+        self.replay_pending_or_arm_reap(reap_sleep).await;
+    }
+
+    fn finish_completed_run(&mut self, done: &RunFinished) {
+        done.sink.sink.close_text_segment();
+        let _ = self.broadcast_tx.send(Event::RunFinished(RunFinishedEvent {
+            base: base_event(),
+            thread_id: done.thread_id.clone(),
+            run_id: done.run_id.clone(),
+            result: None,
+        }));
+        self.state = SessionState::Idle;
+    }
+
+    async fn replay_pending_or_arm_reap(&mut self, reap_sleep: &mut std::pin::Pin<&mut Sleep>) {
+        // Replay after every terminal outcome, including errors, interrupts, and
+        // handoffs. Explicit cancellation clears the queue before aborting.
+        if let Some(pending) = self.pending.pop_front() {
+            self.start_run(pending.text, pending.options, reap_sleep)
+                .await;
+        } else if self.subscribers == 0 {
             self.arm_reap(reap_sleep);
         }
     }
@@ -638,44 +785,12 @@ impl SessionActor {
         self.cancel_reap(reap_sleep);
         let prompt_config =
             prompt_config_for_agent_session_from_global(&self.actor_config.base_config, &self.key);
-        let decisions = std::sync::Arc::new(
-            options
-                .resume
-                .iter()
-                .map(|entry| ToolApprovalDecision {
-                    tool_call_id: entry.interrupt_id.clone(),
-                    approved: entry.payload.approved,
-                    reason: entry.payload.reason.clone(),
-                })
-                .collect::<Vec<_>>(),
-        );
-        let confirm_override: std::sync::Arc<harnx_runtime::ConfirmToolUseFn> = std::sync::Arc::new(
-            move |call: &ToolCall, _args: &serde_json::Value, reason: Option<&str>| {
-                if let Some(call_id) = call.id.as_deref() {
-                    if let Some(decision) = decisions.iter().find(|d| d.tool_call_id == call_id) {
-                        return if decision.approved {
-                            ToolUseConfirmation::Approve
-                        } else {
-                            ToolUseConfirmation::Deny {
-                                reason: decision
-                                    .reason
-                                    .clone()
-                                    .or_else(|| reason.map(str::to_string)),
-                            }
-                        };
-                    }
-                }
-                ToolUseConfirmation::Defer
-            },
-        );
-        prompt_config
-            .write()
-            .set_tui_confirm_tool_use(Some(confirm_override));
+        configure_tool_confirmation(&prompt_config, &options.resume);
         let run_id = RunId::random();
         let thread_id = derive_thread_id(&self.key.session);
         let started_at = Utc::now();
         let abort_signal = create_abort_signal();
-        let (inject_tx, inject_rx) = mpsc::channel(COMMAND_BUFFER);
+        let (inject_tx, inject_rx) = test_injection_channel(self.actor_config.call_fn.is_some());
 
         let _ = self.broadcast_tx.send(Event::RunStarted(RunStartedEvent {
             base: base_event(),
@@ -683,43 +798,39 @@ impl SessionActor {
             run_id: run_id.clone(),
         }));
 
-        let loop_ctx = build_loop_ctx(
-            prompt_config.clone(),
-            self.actor_config.call_fn.clone(),
-            abort_signal.clone(),
-            inject_rx,
-            options.working_dir.clone(),
-            self.broadcast_tx.clone(),
-        );
-        let event_tx = self.broadcast_tx.clone();
-        let input = build_input(&prompt_config, &text, &options.attachment_refs)
-            .expect("build actor input");
         let done_tx = self.run_done_tx.clone();
         let run_id_for_task = run_id.clone();
         let thread_id_for_task = thread_id.clone();
-        let session_event_context =
-            SessionEventContext::new(self.actor_config.base_config.clone(), self.key.clone());
         let sink = Arc::new(BroadcastEventSender::new(
-            event_tx,
+            self.broadcast_tx.clone(),
             MessageId::random(),
-            session_event_context,
+            SessionEventContext::new(self.actor_config.base_config.clone(), self.key.clone()),
         ));
         let sink_for_task = sink.clone();
-        let _abort_signal_for_task = abort_signal.clone();
+        let attachment_refs = options.attachment_refs.clone();
+        let turn = ActorTurnParams {
+            prompt_config,
+            call_fn: self.actor_config.call_fn.clone(),
+            abort_signal: abort_signal.clone(),
+            inject_rx,
+            working_dir: options.working_dir,
+            event_tx: self.broadcast_tx.clone(),
+            text,
+            attachment_refs: attachment_refs.clone(),
+            sink: sink_for_task.clone(),
+            local_worker: self.actor_config.local_worker.clone(),
+            agent: self.key.agent.clone(),
+            session_id: self.key.session.clone(),
+        };
         let task = tokio::spawn(async move {
-            let loop_result = with_agent_event_sink(sink_for_task.clone(), async {
-                // Serve path: run completes cleanly on HandoffRequested.
-                // The delegated turn runs on the target actor, not in-place here.
-                run_agent_loop(&loop_ctx, input).await
-            })
-            .await;
+            let loop_result = run_actor_turn(turn).await;
             let _ = done_tx
                 .send(RunFinished {
                     run_id: run_id_for_task,
                     result: loop_result,
                     sink: sink_for_task,
                     thread_id: thread_id_for_task,
-                    attachment_refs: options.attachment_refs.clone(),
+                    attachment_refs,
                 })
                 .await;
         });
@@ -1039,7 +1150,7 @@ impl SessionActor {
             run_id: run_id.clone(),
             started_at,
             abort_signal,
-            inject_tx: mpsc::channel(COMMAND_BUFFER).0,
+            inject_tx: None,
         });
         self.state = SessionState::Running {
             run_id: run_id.to_string(),
@@ -2761,4 +2872,11 @@ mod tests {
             "target session should be registered in registry after handoff dispatch"
         );
     }
+
+    // NATS-backed serve tests spawn a local worker subprocess via
+    // `LocalWorkerSupervisor` (Unix process-group management), so they are
+    // Unix-only. Gated to avoid unused-import/dead-code errors on Windows.
+    #[cfg(unix)]
+    #[path = "session_actor_nats_tests.rs"]
+    mod nats_tests;
 }

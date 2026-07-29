@@ -1,9 +1,7 @@
 mod agent_event_sink;
 mod cli;
 mod cli_event_sink;
-
-#[macro_use]
-extern crate log;
+mod oneshot_nats;
 
 /// Heap-usage guard installed as the process allocator: aborts with a backtrace
 /// if live heap exceeds `HARNX_HEAP_LIMIT_MB`. Disarmed (plain passthrough to
@@ -32,15 +30,13 @@ use crate::tui::{TranscriptItem, Tui};
 use harnx_core::agent_config::collect_agent_variables;
 use harnx_core::event::{AgentEvent, AgentSource, NoticeEvent};
 use harnx_hooks::{
-    dispatch_hooks_with_count_and_manager, dispatch_hooks_with_managers, drain_async_results,
-    inject_pending_async_context, AsyncHookManager, HookEvent, HookResultControl,
-    PersistentHookManager,
+    dispatch_hooks_with_managers, AsyncHookManager, HookEvent, PersistentHookManager,
 };
 use harnx_render::{render_error, MarkdownRender};
 use harnx_runtime::config::SessionMeta;
 use harnx_runtime::utils::*;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use parking_lot::RwLock;
 use std::{env, path::PathBuf, sync::Arc, time::Duration};
@@ -700,255 +696,61 @@ async fn start_directive(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[async_recursion::async_recursion]
 async fn start_directive_inner(
     config: &GlobalConfig,
     mut input: Input,
     abort_signal: AbortSignal,
-    async_manager: &mut AsyncHookManager,
-    persistent_manager: &Arc<tokio::sync::Mutex<PersistentHookManager>>,
-    pending_async_context: &mut Option<String>,
-    resume_count: u32,
+    _async_manager: &mut AsyncHookManager,
+    _persistent_manager: &Arc<tokio::sync::Mutex<PersistentHookManager>>,
+    _pending_async_context: &mut Option<String>,
+    _resume_count: u32,
     with_embeddings: bool,
 ) -> Result<()> {
     if with_embeddings {
         crate::config::input::use_embeddings(&mut input, config, abort_signal.clone()).await?;
     }
-    drain_async_results(async_manager, pending_async_context);
-    inject_pending_async_context(&mut input, pending_async_context);
-    config.write().before_chat_completion(&input)?;
-    let (hooks, session_id, cwd) = hook_dispatch_context(config);
-    let input_text = input.text();
-    let event = HookEvent::UserPromptSubmit {
-        prompt: input_text.clone(),
+
+    let (agent, cluster, session_id) = {
+        let cfg = config.read();
+        let (agent, cluster) = cfg.remote_agent.clone().unwrap_or_else(|| {
+            (
+                cfg.agent
+                    .as_ref()
+                    .map(|agent| agent.name().to_string())
+                    .unwrap_or_default(),
+                harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
+            )
+        });
+        let session_id = cfg.session.as_ref().map(|session| session.id().to_string());
+        (agent, cluster, session_id)
     };
-    let outcome = dispatch_hooks_with_count_and_manager(
-        &event,
-        &hooks.entries,
-        &session_id,
-        &cwd,
-        resume_count,
-        Some(async_manager),
-        Some(persistent_manager),
+
+    let mut local_worker = None;
+    if cluster == harnx_runtime::config::LOCAL_CLUSTER_KEY {
+        harnx_runtime::local_orchestrator::ensure_local_worker(&mut local_worker)
+            .await
+            .context("failed to ensure local NATS worker")?;
+    }
+
+    let session = harnx_runtime::ThinClientSession::from_global_config(
+        harnx_runtime::ThinClientConfig {
+            cluster,
+            agent,
+            session_id,
+        },
+        config,
+        abort_signal,
     )
-    .await;
-    match outcome.control {
-        HookResultControl::Block { reason } => bail!("{reason}"),
-        HookResultControl::Ask { .. } => {} // Ask is not applicable for UserPromptSubmit
-        HookResultControl::Continue => {}
-    }
-    let (output, thought, tool_calls, usage) =
-        match call_with_retry_and_fallback(&mut input, config, abort_signal.clone()).await {
-            Ok(result) => result,
-            Err(err) => {
-                let event = HookEvent::StopFailure {
-                    error: err.to_string(),
-                    error_type: "api_error".to_string(),
-                };
-                let _ = dispatch_hooks_with_managers(
-                    &event,
-                    &hooks.entries,
-                    &session_id,
-                    &cwd,
-                    Some(async_manager),
-                    Some(persistent_manager),
-                )
-                .await;
-                let _ = config.write().after_chat_completion(
-                    &input,
-                    "",
-                    None,
-                    &[],
-                    &Default::default(),
-                );
-                return Err(err);
-            }
-        };
+    .await
+    .context("failed to create thin-client session")?;
+    let sink = harnx_core::sink::current_agent_event_sink()
+        .context("CLI agent event sink is not installed")?;
+    let tracking_sink = Arc::new(oneshot_nats::AssistantTextTrackingSink::new(sink));
+    let result = session
+        .run_turn(&input.text(), tracking_sink.clone(), None)
+        .await?;
 
-    // Tool rounds use `execute_tool_round` to persist the request,
-    // run the tools, and persist the results as two separate log
-    // entries.  Plain-text rounds save once via after_chat_completion.
-    let tool_results: Vec<harnx_runtime::tool::ToolResult> = if tool_calls.is_empty() {
-        config
-            .write()
-            .after_chat_completion(&input, &output, thought.as_deref(), &[], &usage)?;
-        Vec::new()
-    } else {
-        config.write().record_completion_usage(&usage);
-        harnx_runtime::tool::execute_tool_round(
-            config,
-            &input,
-            &harnx_runtime::tool::CompletionText {
-                output: &output,
-                thought: thought.as_deref(),
-            },
-            tool_calls,
-            &abort_signal,
-            persistent_manager,
-            None,
-        )
-        .await?
-    };
-    if tool_results.is_empty() {
-        let config_read = config.read();
-        let status = config_read.render_status_line(true);
-        let session_usage = config_read
-            .session
-            .as_ref()
-            .map(|s| s.completion_usage().clone());
-        let display_usage = session_usage.as_ref().unwrap_or(&usage);
-        let context_stats = config_read
-            .session
-            .as_ref()
-            .map(|s| {
-                let (tokens, percent) = s.tokens_usage();
-                if percent > 0.0 {
-                    format!("💬 {}({:.0}%)", tokens, percent)
-                } else {
-                    format!("💬 {}", tokens)
-                }
-            })
-            .unwrap_or_default();
-        let mut line_parts = vec![];
-        if !status.is_empty() {
-            line_parts.push(status);
-        }
-        if !display_usage.is_empty() {
-            line_parts.push(format!("   {}", display_usage));
-        }
-        if !context_stats.is_empty() {
-            line_parts.push(format!("  {}", context_stats));
-        }
-        if !line_parts.is_empty() {
-            eprintln!("{}", dimmed_text(&line_parts.join("")));
-        }
-        drop(config_read);
-    }
-    let stop_outcome = if tool_results.is_empty() {
-        let event = HookEvent::Stop {
-            stop_hook_active: true,
-            last_assistant_message: Some(output.clone()),
-        };
-        let stop_outcome = dispatch_hooks_with_count_and_manager(
-            &event,
-            &hooks.entries,
-            &session_id,
-            &cwd,
-            resume_count,
-            Some(async_manager),
-            Some(persistent_manager),
-        )
-        .await;
-        if let Some(additional_context) = stop_outcome
-            .result
-            .additional_context
-            .as_deref()
-            .filter(|value| !value.is_empty())
-        {
-            debug!(
-                "Captured Stop hook additional context for later auto-continue in CMD: {additional_context}"
-            );
-        }
-        Some(stop_outcome)
-    } else {
-        None
-    };
-
-    if !tool_results.is_empty() {
-        let switch_agent = tool_results.iter().find_map(|v| v.switch_agent.clone());
-        if let Some(switch_agent) = switch_agent {
-            let merged_input = input.merge_tool_results(output, thought, tool_results.clone());
-            config.write().exit_agent()?;
-            crate::config::Config::use_agent(
-                config,
-                &switch_agent.agent,
-                switch_agent.session_id.as_deref(),
-                abort_signal.clone(),
-            )
-            .await?;
-            // Always empty the session on handoff so the new agent starts
-            // fresh — the prior agent's system prompt and messages should
-            // not bleed into the new agent's session (#291).
-            if config.read().session.is_some() {
-                config.write().empty_session()?;
-            }
-            return Box::pin(start_directive_inner(
-                config,
-                merged_input,
-                abort_signal,
-                async_manager,
-                persistent_manager,
-                pending_async_context,
-                0,
-                true,
-            ))
-            .await;
-        }
-
-        return start_directive_inner(
-            config,
-            input.merge_tool_results(output, thought, tool_results),
-            abort_signal,
-            async_manager,
-            persistent_manager,
-            pending_async_context,
-            resume_count,
-            false,
-        )
-        .await;
-    }
-
-    if let Some(stop_outcome) = stop_outcome {
-        let max_resume = hooks.max_resume.unwrap_or(5);
-        if stop_outcome.result.resume.unwrap_or(false) && resume_count < max_resume {
-            if abort_signal.aborted() {
-                return Ok(());
-            }
-
-            let context = stop_outcome
-                .result
-                .additional_context
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "Continue working on pending tasks.".to_string());
-            let new_input = crate::config::input::from_str(config, &context, None);
-            return start_directive_inner(
-                config,
-                new_input,
-                abort_signal,
-                async_manager,
-                persistent_manager,
-                pending_async_context,
-                resume_count + 1,
-                true,
-            )
-            .await;
-        }
-    }
-
-    let max_resume = hooks.max_resume.unwrap_or(5);
-    if drain_async_results(async_manager, pending_async_context) && resume_count < max_resume {
-        if abort_signal.aborted() {
-            return Ok(());
-        }
-
-        let context = pending_async_context
-            .take()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "Continue working on pending tasks.".to_string());
-        let new_input = crate::config::input::from_str(config, &context, None);
-        return start_directive_inner(
-            config,
-            new_input,
-            abort_signal,
-            async_manager,
-            persistent_manager,
-            pending_async_context,
-            resume_count + 1,
-            true,
-        )
-        .await;
-    }
-
+    tracking_sink.emit_durable_response_if_needed(result);
     Ok(())
 }
 

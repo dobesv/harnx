@@ -87,6 +87,12 @@ pub fn notify_subject(cluster: &str) -> String {
     format!("cluster.{cluster}.sessions.notify")
 }
 
+/// Core-NATS subject used by workers to announce that their activation pull
+/// consumer exists and can receive [`SessionActivate`] notifications.
+pub fn worker_ready_subject(cluster: &str) -> String {
+    format!("cluster.{cluster}.worker.ready")
+}
+
 fn notify_stream_name(cluster: &str) -> String {
     format!(
         "{WORK_NOTIFY_STREAM_PREFIX}{}",
@@ -181,13 +187,16 @@ struct TurnInputCtx<'a> {
     backend: &'a NatsSessionLogBackend,
 }
 
-/// Run a worker daemon: pull `SessionActivate` notifications, claim each via a
-/// KV lease, and execute the session (exactly one worker per session).
-pub async fn run_worker_daemon(
-    config: GlobalConfig,
-    daemon: WorkerDaemonConfig,
-    call_fn: Option<crate::agent_loop::AgentCallFn>,
-) -> Result<()> {
+struct WorkerStartup {
+    jetstream: jetstream::Context,
+    client: async_nats::Client,
+    consumer: jetstream::consumer::Consumer<pull::Config>,
+}
+
+async fn prepare_worker_startup(
+    config: &GlobalConfig,
+    daemon: &WorkerDaemonConfig,
+) -> Result<WorkerStartup> {
     let (jetstream, client) = {
         let cfg = config.read().clone();
         let jetstream = cfg.nats_jetstream(&daemon.cluster).await?;
@@ -204,7 +213,7 @@ pub async fn run_worker_daemon(
                 durable_name: Some(consumer_name.clone()),
                 deliver_policy: DeliverPolicy::All,
                 ack_wait: WORK_NOTIFY_ACK_WAIT,
-                filter_subject: subject.clone(),
+                filter_subject: subject,
                 inactive_threshold: WORK_NOTIFY_INACTIVE_THRESHOLD,
                 max_deliver: -1,
                 ..Default::default()
@@ -212,8 +221,38 @@ pub async fn run_worker_daemon(
         )
         .await
         .with_context(|| format!("create worker consumer '{consumer_name}'"))?;
+    Ok(WorkerStartup {
+        jetstream,
+        client,
+        consumer,
+    })
+}
 
-    let session_index = match nats_session_index::ensure_index_bucket(&jetstream).await {
+fn spawn_readiness_publisher(client: async_nats::Client, daemon: &WorkerDaemonConfig) {
+    let subject = worker_ready_subject(&daemon.cluster);
+    let worker_id = daemon.worker_id.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = client
+                .publish(subject.clone(), worker_id.clone().into())
+                .await
+            {
+                log::warn!("failed to publish worker readiness marker: {error}");
+                return;
+            }
+            if let Err(error) = client.flush().await {
+                log::warn!("failed to flush worker readiness marker: {error}");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
+}
+
+async fn optional_session_index(
+    jetstream: &jetstream::Context,
+) -> Option<async_nats::jetstream::kv::Store> {
+    match nats_session_index::ensure_index_bucket(jetstream).await {
         Ok(store) => Some(store),
         Err(error) => {
             log::warn!(
@@ -222,22 +261,34 @@ pub async fn run_worker_daemon(
             );
             None
         }
-    };
+    }
+}
 
+/// Run a worker daemon: pull `SessionActivate` notifications, claim each via a
+/// KV lease, and execute the session (exactly one worker per session).
+pub async fn run_worker_daemon(
+    config: GlobalConfig,
+    daemon: WorkerDaemonConfig,
+    call_fn: Option<crate::agent_loop::AgentCallFn>,
+) -> Result<()> {
+    let startup = prepare_worker_startup(&config, &daemon).await?;
+    spawn_readiness_publisher(startup.client.clone(), &daemon);
+    let session_index = optional_session_index(&startup.jetstream).await;
     let runtime = Arc::new(WorkerRuntime {
         config,
         cluster: daemon.cluster.clone(),
         worker_id: daemon.worker_id.clone(),
         lease: daemon.lease,
-        jetstream: jetstream.clone(),
+        jetstream: startup.jetstream,
         session_index,
-        client,
+        client: startup.client,
         call_fn,
         generation: AtomicU64::new(1),
         active: Mutex::new(HashMap::new()),
     });
 
-    let mut messages = consumer
+    let mut messages = startup
+        .consumer
         .messages()
         .await
         .context("worker notify message stream")?;
@@ -276,6 +327,53 @@ struct WorkerRuntime {
 }
 
 impl WorkerRuntime {
+    async fn already_running(&self, session_id: &str) -> bool {
+        let mut active = self.active.lock().await;
+        active.retain(|_, handle| !handle.is_finished());
+        active.contains_key(session_id)
+    }
+
+    async fn acquire_activation_lease(
+        &self,
+        activation: &SessionActivate,
+    ) -> Result<Option<Arc<NatsSessionLease>>> {
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst);
+        let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
+            jetstream: self.jetstream.clone(),
+            session_id: &activation.session_id,
+            worker_id: self.worker_id.clone(),
+            generation,
+            config: self.lease.clone(),
+            session_index: self.session_index.clone(),
+        })
+        .await?;
+        Ok(lease.map(Arc::new))
+    }
+
+    async fn prepare_activation_control(
+        &self,
+        activation: &SessionActivate,
+        lease: &Arc<NatsSessionLease>,
+        abort_signal: &crate::utils::AbortSignal,
+    ) -> Result<JoinHandle<()>> {
+        let backend = NatsSessionLogBackend::new(self.jetstream.clone(), &activation.session_id);
+        match Self::spawn_control_listener(ControlListenerCtx {
+            client: &self.client,
+            session_id: &activation.session_id,
+            lease,
+            backend: &backend,
+            abort_signal,
+        })
+        .await
+        {
+            Ok(task) => Ok(task),
+            Err(error) => {
+                let _ = lease.release().await;
+                Err(error)
+            }
+        }
+    }
+
     async fn handle_activation(
         self: &Arc<Self>,
         message: async_nats::jetstream::Message,
@@ -284,30 +382,14 @@ impl WorkerRuntime {
             serde_json::from_slice(&message.payload).context("decode SessionActivate")?;
 
         // Re-activation of an already-running session is a no-op.
-        {
-            let mut active = self.active.lock().await;
-            active.retain(|_, handle| !handle.is_finished());
-            if active.contains_key(&activation.session_id) {
-                let _ = message.ack().await;
-                return Ok(());
-            }
+        if self.already_running(&activation.session_id).await {
+            let _ = message.ack().await;
+            return Ok(());
         }
 
-        // Try to claim the session via the KV lease. Loser drops (does not ack,
-        // so the message stays for the holder to ack; another worker holds it).
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst);
-        let lease = match NatsSessionLease::acquire(NatsLeaseAcquireParams {
-            jetstream: self.jetstream.clone(),
-            session_id: &activation.session_id,
-            worker_id: self.worker_id.clone(),
-            generation,
-            config: self.lease.clone(),
-            session_index: self.session_index.clone(),
-        })
-        .await?
-        {
-            Some(lease) => lease,
-            None => return Ok(()),
+        // A lease loser leaves the message unacked for its current holder.
+        let Some(lease) = self.acquire_activation_lease(&activation).await? else {
+            return Ok(());
         };
         log::info!(
             "session activate claimed: session_id={} worker_id={} revision={} epoch={}",
@@ -317,12 +399,21 @@ impl WorkerRuntime {
             activation.epoch
         );
 
-        // We hold the lease: ack the activation and spawn execution.
-        let _ = message.ack().await;
+        let abort_signal = crate::utils::create_abort_signal();
+        // Core-NATS control must be subscribed before activation is acknowledged.
+        let control_task = self
+            .prepare_activation_control(&activation, &lease, &abort_signal)
+            .await?;
+
+        // We hold the lease and control is ready: ack activation and spawn execution.
+        if let Err(error) = message.ack().await {
+            control_task.abort();
+            let _ = lease.release().await;
+            return Err(anyhow::anyhow!("ack SessionActivate: {error}"));
+        }
         let worker = Arc::clone(self);
         let session_id = activation.session_id.clone();
         let task_session_id = session_id.clone();
-        let lease = Arc::new(lease);
         nats_metrics::active_session_started();
         let handle = tokio::spawn(async move {
             let snapshot = nats_metrics::snapshot();
@@ -333,7 +424,9 @@ impl WorkerRuntime {
                 lease.fence_token(),
                 snapshot.active_sessions_per_worker
             );
-            let result = worker.execute_session(activation, Arc::clone(&lease)).await;
+            let result = worker
+                .execute_session(activation, Arc::clone(&lease), abort_signal, control_task)
+                .await;
             nats_metrics::active_session_finished();
             let snapshot = nats_metrics::snapshot();
             log::info!(
@@ -508,6 +601,8 @@ impl WorkerRuntime {
         &self,
         activation: SessionActivate,
         lease: Arc<NatsSessionLease>,
+        abort_signal: crate::utils::AbortSignal,
+        control_task: JoinHandle<()>,
     ) -> Result<()> {
         // Per-session config clone with the requested agent (loaded from the
         // worker's OWN config) and the session selected.
@@ -519,8 +614,6 @@ impl WorkerRuntime {
             let mut cfg = per_session.write();
             let _ = cfg.use_agent_obj(agent);
         }
-
-        let abort_signal = crate::utils::create_abort_signal();
 
         // Create event sink for live fan-out. `new` seeds `after_seq` from stream once.
         let event_sink = crate::nats_event_sink::NatsEventSink::new(
@@ -541,15 +634,6 @@ impl WorkerRuntime {
         // Abort turns promptly if lease is lost.
         let watch_task =
             Self::spawn_lease_loss_watch(&lease, &abort_signal, &activation.session_id);
-
-        // Subscribe to control commands for this session.
-        let control_task = Self::spawn_control_listener(ControlListenerCtx {
-            client: &self.client,
-            session_id: &activation.session_id,
-            lease: &lease,
-            backend: &backend,
-            abort_signal: &abort_signal,
-        });
 
         let result = harnx_core::sink::with_agent_event_sink(event_sink, async {
             // Activation high-water cursor: max log seq of ANY user message we've fed into this
@@ -735,21 +819,27 @@ impl WorkerRuntime {
         })
     }
 
-    /// Spawn a task that listens for control commands and handles them.
-    fn spawn_control_listener(ctx: ControlListenerCtx<'_>) -> tokio::task::JoinHandle<()> {
+    /// Subscribe to control before spawning its listener task.
+    ///
+    /// Returning only after `subscribe` completes is the ordering barrier used by
+    /// activation handling before it acknowledges the non-durable work message.
+    async fn spawn_control_listener(ctx: ControlListenerCtx<'_>) -> Result<JoinHandle<()>> {
         let ctrl_subject = control_subject(ctx.session_id);
+        let subscriber = ctx
+            .client
+            .subscribe(ctrl_subject)
+            .await
+            .context("subscribe to session control subject")?;
+        // Flush the SUB protocol command so broker-side interest exists before
+        // activation is acknowledged and clients can observe that readiness.
+        ctx.client
+            .flush()
+            .await
+            .context("flush session control subscription")?;
         let ctrl_abort = ctx.abort_signal.clone();
         let ctrl_lease = Arc::clone(ctx.lease);
         let ctrl_backend = ctx.backend.clone();
-        let client = ctx.client.clone();
-        tokio::spawn(async move {
-            let subscriber = match client.subscribe(ctrl_subject).await {
-                Ok(s) => s,
-                Err(e) => {
-                    log::warn!("failed to subscribe to control subject: {e}");
-                    return;
-                }
-            };
+        Ok(tokio::spawn(async move {
             use futures_util::StreamExt;
             let mut messages = subscriber;
             while let Some(msg) = messages.next().await {
@@ -775,7 +865,7 @@ impl WorkerRuntime {
                     }
                 }
             }
-        })
+        }))
     }
 
     /// Reconstruct session state using the canonical algorithm.
