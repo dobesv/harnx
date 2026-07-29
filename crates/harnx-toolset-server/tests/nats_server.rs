@@ -39,48 +39,74 @@ async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
         eprintln!("skipping NATS integration test: nats-server binary not found");
         return Ok(None);
     };
-    let listener = TcpListener::bind("127.0.0.1:0").context("allocate NATS test port")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    let store_dir = tempfile::tempdir().context("create NATS test store")?;
-    let mut child = Command::new(binary)
-        .arg("-js")
-        .arg("-sd")
-        .arg(store_dir.path())
-        .arg("-p")
-        .arg(port.to_string())
-        .arg("--auth")
-        .arg(TOKEN)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawn nats-server")?;
-    let url = format!("nats://127.0.0.1:{port}");
+
+    const MAX_START_ATTEMPTS: usize = 5;
+    for attempt in 1..=MAX_START_ATTEMPTS {
+        let listener = TcpListener::bind("127.0.0.1:0").context("allocate NATS test port")?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        let store_dir = tempfile::tempdir().context("create NATS test store")?;
+        let mut child = Command::new(&binary)
+            .arg("-js")
+            .arg("-sd")
+            .arg(store_dir.path())
+            .arg("-p")
+            .arg(port.to_string())
+            .arg("--auth")
+            .arg(TOKEN)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn nats-server")?;
+        let url = format!("nats://127.0.0.1:{port}");
+
+        match wait_for_nats_ready(&mut child, &url).await {
+            Ok(()) => {
+                return Ok(Some(NatsServerHandle {
+                    url,
+                    _store_dir: store_dir,
+                    child,
+                }));
+            }
+            Err(error) => {
+                let exited_during_startup = child.try_wait()?.is_some();
+                let _ = child.kill();
+                let _ = child.wait();
+                if exited_during_startup && attempt < MAX_START_ATTEMPTS {
+                    eprintln!(
+                        "nats-server exited during startup attempt {attempt}; retrying with a new port: {error:#}"
+                    );
+                    continue;
+                }
+                return Err(error).context(format!(
+                    "start nats-server after {attempt} attempt{}",
+                    if attempt == 1 { "" } else { "s" }
+                ));
+            }
+        }
+    }
+
+    unreachable!("NATS startup loop always returns")
+}
+
+async fn wait_for_nats_ready(child: &mut Child, url: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        match async_nats::ConnectOptions::new()
+        let result = async_nats::ConnectOptions::new()
             .token(TOKEN.to_string())
-            .connect(&url)
-            .await
-        {
-            Ok(client) => {
-                client.flush().await?;
-                break;
+            .connect(url)
+            .await;
+        match result {
+            Ok(client) => return client.flush().await.context("flush NATS test client"),
+            Err(error) if child.try_wait()?.is_some() => {
+                anyhow::bail!("nats-server exited during startup: {error}");
             }
-            Err(error) if Instant::now() < deadline => {
+            Err(_) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                if child.try_wait()?.is_some() {
-                    anyhow::bail!("nats-server exited during startup: {error}");
-                }
             }
             Err(error) => return Err(error).context("wait for nats-server readiness"),
         }
     }
-    Ok(Some(NatsServerHandle {
-        url,
-        _store_dir: store_dir,
-        child,
-    }))
 }
 
 fn nats_server_binary() -> Option<PathBuf> {
@@ -112,6 +138,7 @@ impl Toolset for TestToolset {
             input_schema: json!({ "type": "object" }),
             idempotent_hint: false,
             read_only_hint: false,
+            timeout_secs: None,
         }]
     }
 
@@ -124,6 +151,9 @@ impl Toolset for TestToolset {
         match tool {
             "echo" => {
                 self.echo_invocations.fetch_add(1, Ordering::SeqCst);
+                if let Some(delay_ms) = args.get("delay_ms").and_then(Value::as_u64) {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
                 Ok(args)
             }
             "slow" => {
@@ -163,38 +193,69 @@ async fn wait_for_registration(
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn registers_invokes_caches_and_cancels() -> Result<()> {
-    let Some(server) = spawn_nats_server().await? else {
-        return Ok(());
-    };
-    let instance_id = InstanceId::new();
-    let toolset = TestToolset::default();
-    let server_url = server.url.clone();
-    let server_toolset = toolset.clone();
-    let server_instance_id = instance_id.clone();
-    let server_task = tokio::spawn(async move {
-        serve_over_nats(server_toolset, server_instance_id, &server_url, TOKEN).await
-    });
-    let client = async_nats::ConnectOptions::new()
-        .token(TOKEN.to_string())
-        .connect(&server.url)
-        .await?;
+struct TestHarness {
+    _server: NatsServerHandle,
+    server_task: tokio::task::JoinHandle<Result<()>>,
+    client: async_nats::Client,
+    instance_id: InstanceId,
+    toolset: TestToolset,
+}
 
-    let registration = wait_for_registration(&client, &instance_id).await?;
+impl TestHarness {
+    async fn start() -> Result<Option<Self>> {
+        let Some(server) = spawn_nats_server().await? else {
+            return Ok(None);
+        };
+        let instance_id = InstanceId::new();
+        let toolset = TestToolset::default();
+        let server_url = server.url.clone();
+        let server_toolset = toolset.clone();
+        let server_instance_id = instance_id.clone();
+        let server_task = tokio::spawn(async move {
+            serve_over_nats(server_toolset, server_instance_id, &server_url, TOKEN).await
+        });
+        let client = async_nats::ConnectOptions::new()
+            .token(TOKEN.to_string())
+            .connect(&server.url)
+            .await?;
+        Ok(Some(Self {
+            _server: server,
+            server_task,
+            client,
+            instance_id,
+            toolset,
+        }))
+    }
+
+    fn echo_subject(&self) -> String {
+        self.instance_id.tool_subject("test", "echo")
+    }
+}
+
+impl Drop for TestHarness {
+    fn drop(&mut self) {
+        self.server_task.abort();
+    }
+}
+
+async fn assert_registration(harness: &TestHarness) -> Result<()> {
+    let registration = wait_for_registration(&harness.client, &harness.instance_id).await?;
     assert_eq!(registration.server, "test");
     assert_eq!(registration.schema_version, TOOL_SCHEMA_VERSION);
+    Ok(())
+}
 
+async fn assert_idempotent_replay(harness: &TestHarness) -> Result<()> {
     let request = ToolRequest {
         call_id: "call-echo".to_string(),
         tool: "echo".to_string(),
         args: json!({ "value": 42 }),
     };
-    let subject = instance_id.tool_subject("test", "echo");
     for _ in 0..2 {
-        let message = client
+        let message = harness
+            .client
             .request_with_headers(
-                subject.clone(),
+                harness.echo_subject(),
                 request_headers(&request.call_id, "logical-echo"),
                 serde_json::to_vec(&request)?.into(),
             )
@@ -205,43 +266,157 @@ async fn registers_invokes_caches_and_cancels() -> Result<()> {
             json!({ "value": 42 })
         );
     }
-    assert_eq!(toolset.echo_invocations.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.toolset.echo_invocations.load(Ordering::SeqCst), 1);
+    Ok(())
+}
 
-    let slow = ToolRequest {
+async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
+    let args = json!({ "value": 43, "delay_ms": 100 });
+    let first = ToolRequest {
+        call_id: "call-concurrent-a".to_string(),
+        tool: "echo".to_string(),
+        args: args.clone(),
+    };
+    let second = ToolRequest {
+        call_id: "call-concurrent-b".to_string(),
+        tool: "echo".to_string(),
+        args: args.clone(),
+    };
+    let first_call = harness.client.request_with_headers(
+        harness.echo_subject(),
+        request_headers(&first.call_id, "logical-concurrent"),
+        serde_json::to_vec(&first)?.into(),
+    );
+    let second_call = harness.client.request_with_headers(
+        harness.echo_subject(),
+        request_headers(&second.call_id, "logical-concurrent"),
+        serde_json::to_vec(&second)?.into(),
+    );
+    let (first_reply, second_reply) = tokio::join!(first_call, second_call);
+    for (message, expected_id) in [
+        (first_reply?, first.call_id.as_str()),
+        (second_reply?, second.call_id.as_str()),
+    ] {
+        let reply: ToolReply = serde_json::from_slice(&message.payload)?;
+        assert_eq!(reply.call_id, expected_id);
+        assert_eq!(reply.result.expect("concurrent echo should succeed"), args);
+    }
+    assert_eq!(
+        harness.toolset.echo_invocations.load(Ordering::SeqCst),
+        2,
+        "concurrent duplicate must execute once"
+    );
+    Ok(())
+}
+
+async fn request_early_failure(
+    harness: &TestHarness,
+    headers: async_nats::HeaderMap,
+    payload: Vec<u8>,
+    expected: (&str, &str),
+) -> Result<()> {
+    let request = async_nats::Request::new()
+        .headers(headers)
+        .payload(payload.into())
+        .timeout(Some(Duration::from_secs(1)));
+    let message = tokio::time::timeout(
+        Duration::from_secs(1),
+        harness.client.send_request(harness.echo_subject(), request),
+    )
+    .await??;
+    let reply: ToolReply = serde_json::from_slice(&message.payload)?;
+    assert_eq!(reply.call_id, expected.0);
+    match reply.result {
+        Err(harnx_toolset::ToolErrorPayload::Recoverable(message)) => {
+            assert!(message.contains(expected.1), "{message}");
+        }
+        other => anyhow::bail!("expected recoverable early failure, got {other:?}"),
+    }
+    Ok(())
+}
+
+async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
+    request_early_failure(
+        harness,
+        request_headers("call-malformed", "logical-malformed"),
+        b"not-json".to_vec(),
+        ("call-malformed", "decode tool request payload"),
+    )
+    .await?;
+    let mismatched = ToolRequest {
+        call_id: "payload-call".to_string(),
+        tool: "echo".to_string(),
+        args: json!({}),
+    };
+    request_early_failure(
+        harness,
+        request_headers("header-call", "logical-mismatch"),
+        serde_json::to_vec(&mismatched)?,
+        ("header-call", "call ID header does not match payload"),
+    )
+    .await?;
+    let missing_key = ToolRequest {
+        call_id: "call-missing-key".to_string(),
+        tool: "echo".to_string(),
+        args: json!({}),
+    };
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert(HDR_CALL_ID, missing_key.call_id.as_str());
+    request_early_failure(
+        harness,
+        headers,
+        serde_json::to_vec(&missing_key)?,
+        ("call-missing-key", "missing Idempotency-Key"),
+    )
+    .await
+}
+
+async fn assert_cancellation(harness: &TestHarness) -> Result<()> {
+    let request = ToolRequest {
         call_id: "call-slow".to_string(),
         tool: "slow".to_string(),
         args: json!({}),
     };
-    let slow_request = client.request_with_headers(
-        instance_id.tool_subject("test", "slow"),
-        request_headers(&slow.call_id, "logical-slow"),
-        serde_json::to_vec(&slow)?.into(),
+    let slow_request = harness.client.request_with_headers(
+        harness.instance_id.tool_subject("test", "slow"),
+        request_headers(&request.call_id, "logical-slow"),
+        serde_json::to_vec(&request)?.into(),
     );
     tokio::pin!(slow_request);
     tokio::select! {
-        _ = toolset.slow_started.notified() => {}
+        _ = harness.toolset.slow_started.notified() => {}
         result = &mut slow_request => anyhow::bail!("slow request completed before cancellation: {result:?}"),
     }
     let control = ControlMessage {
-        call_id: slow.call_id.clone(),
+        call_id: request.call_id.clone(),
         kind: ControlKind::Cancel,
     };
-    client
+    harness
+        .client
         .publish_with_headers(
-            instance_id.control_subject(),
-            request_headers(&slow.call_id, "cancel-slow"),
+            harness.instance_id.control_subject(),
+            request_headers(&request.call_id, "cancel-slow"),
             serde_json::to_vec(&control)?.into(),
         )
         .await?;
-    client.flush().await?;
+    harness.client.flush().await?;
     let message = tokio::time::timeout(Duration::from_secs(2), &mut slow_request).await??;
     let reply: ToolReply = serde_json::from_slice(&message.payload)?;
     assert!(matches!(
         reply.result,
         Err(harnx_toolset::ToolErrorPayload::Fatal(_))
     ));
-
-    server_task.abort();
-    let _ = server_task.await;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn registers_invokes_caches_and_cancels() -> Result<()> {
+    let Some(harness) = TestHarness::start().await? else {
+        return Ok(());
+    };
+    assert_registration(&harness).await?;
+    assert_idempotent_replay(&harness).await?;
+    assert_concurrent_idempotency(&harness).await?;
+    assert_early_failure_replies(&harness).await?;
+    assert_cancellation(&harness).await
 }

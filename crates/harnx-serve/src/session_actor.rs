@@ -1323,6 +1323,24 @@ mod tests {
         reply_rx.await.expect("recv get reply")
     }
 
+    async fn wait_for_state(
+        handle: &SessionHandle,
+        description: &str,
+        predicate: impl Fn(&SessionState) -> bool,
+    ) -> SessionInfo {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let info = get_info(handle).await;
+                if predicate(&info.state) {
+                    return info;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for session to become {description}"))
+    }
+
     async fn prompt(handle: &SessionHandle, text: &str) -> PromptResult {
         prompt_with_options(handle, text, SessionPromptOptions::default()).await
     }
@@ -1568,9 +1586,11 @@ mod tests {
         release_first_tool_round.notify_one();
         tokio::task::yield_now().await;
         second_call_release.notify_one();
-        sleep(Duration::from_millis(80)).await;
 
-        assert!(event_watcher.await.expect("watcher task panicked"));
+        assert!(tokio::time::timeout(Duration::from_secs(5), event_watcher)
+            .await
+            .expect("timed out waiting for pending message event")
+            .expect("watcher task panicked"));
 
         let user_texts: Vec<String> = load_session_messages("plain", "inject")
             .iter()
@@ -1682,7 +1702,7 @@ mod tests {
         release_second_tool_round.notify_one();
         third_tool_round_started.notified().await;
         release_third_tool_round.notify_one();
-        sleep(Duration::from_millis(80)).await;
+        wait_for_state(&handle, "idle", |state| *state == SessionState::Idle).await;
 
         let seen_injected = seen_injected.lock().await.clone();
         assert_eq!(
@@ -1863,9 +1883,11 @@ mod tests {
         assert!(matches!(info.state, SessionState::Running { .. }));
         cancel(&handle).await;
         gate_release.notify_one();
-        sleep(Duration::from_millis(120)).await;
 
-        let info = get_info(&handle).await;
+        let info = wait_for_state(&handle, "idle after cancellation", |state| {
+            *state == SessionState::Idle
+        })
+        .await;
         assert_eq!(info.state, SessionState::Idle);
 
         let persisted = load_session_messages("plain", "cancel");
@@ -1925,7 +1947,10 @@ mod tests {
             PromptResult::Enqueued { .. } | PromptResult::Accepted { .. }
         ));
         second_turn_started.notified().await;
-        sleep(Duration::from_millis(80)).await;
+        wait_for_state(&handle, "idle after boundary prompt", |state| {
+            *state == SessionState::Idle
+        })
+        .await;
 
         let user_texts: Vec<String> = load_session_messages("plain", "boundary")
             .iter()
@@ -2518,9 +2543,11 @@ mod tests {
         )
         .await;
         assert!(matches!(started, PromptResult::Accepted { .. }));
-        tokio::time::sleep(Duration::from_millis(120)).await;
 
-        let info = get_info(&handle).await;
+        let info = wait_for_state(&handle, "interrupted", |state| {
+            matches!(state, SessionState::Interrupted { .. })
+        })
+        .await;
         let pending = match info.state {
             SessionState::Interrupted { pending, .. } => pending,
             other => panic!("expected interrupted state, got {other:?}"),
@@ -2544,7 +2571,10 @@ mod tests {
         )
         .await;
         assert!(matches!(resumed, PromptResult::Accepted { .. }));
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        wait_for_state(&handle, "idle after resume", |state| {
+            *state == SessionState::Idle
+        })
+        .await;
 
         let captured = seen_attachments.lock().await.clone();
         assert_eq!(
@@ -2603,9 +2633,8 @@ mod tests {
         }
 
         gate_release.notify_one();
-        sleep(Duration::from_millis(80)).await;
 
-        let idle = get_info(&handle).await;
+        let idle = wait_for_state(&handle, "idle", |state| *state == SessionState::Idle).await;
         assert_eq!(idle.state, SessionState::Idle);
     }
 

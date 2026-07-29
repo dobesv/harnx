@@ -616,6 +616,24 @@ mod tests {
         serde_json::from_slice(&body).expect("json body")
     }
 
+    async fn wait_for_state(
+        handle: &SessionHandle,
+        description: &str,
+        predicate: impl Fn(&SessionState) -> bool,
+    ) -> SessionInfo {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let info = get_info(handle).await.expect("get session state");
+                if predicate(&info.state) {
+                    return info;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for session to become {description}"))
+    }
+
     #[tokio::test]
     async fn rpc_session_get_known_session_returns_state_history_and_capabilities() {
         let _guard = TestStateGuard::new(None).await;
@@ -638,7 +656,10 @@ mod tests {
             session: "rpc-get".into(),
         });
         let _ = prompt(&handle, "seed history", SessionPromptOptions::default()).await;
-        sleep(Duration::from_millis(80)).await;
+        wait_for_state(&handle, "idle after seeding history", |state| {
+            *state == SessionState::Idle
+        })
+        .await;
 
         let response = handle_ag_ui_rpc_bytes(
             Method::POST,
@@ -761,7 +782,10 @@ mod tests {
             session: "rpc-prompt".into(),
         });
         let _ = prompt(&handle, "seed history", SessionPromptOptions::default()).await;
-        sleep(Duration::from_millis(80)).await;
+        wait_for_state(&handle, "idle after seeding history", |state| {
+            *state == SessionState::Idle
+        })
+        .await;
 
         let response = handle_ag_ui_rpc_bytes(Method::POST, "plain", "rpc-prompt", Bytes::from(json!({"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"text":"run me"}}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("rpc response");
         assert_eq!(response.status(), StatusCode::OK);
@@ -769,7 +793,10 @@ mod tests {
         assert_eq!(body["result"]["status"], "accepted");
         assert!(body["result"]["run_id"].as_str().is_some());
 
-        sleep(Duration::from_millis(80)).await;
+        wait_for_state(&handle, "idle after RPC prompt", |state| {
+            *state == SessionState::Idle
+        })
+        .await;
         let mut config = crate::session_actor::load_base_config_for_tests();
         config.use_agent_by_name("plain").expect("set agent");
         config.use_session(Some("rpc-prompt")).expect("set session");
@@ -842,7 +869,10 @@ mod tests {
         });
         let start = prompt(&handle, "resume me", SessionPromptOptions::default()).await;
         assert!(matches!(start, Ok(PromptResult::Accepted { .. })));
-        sleep(Duration::from_millis(120)).await;
+        wait_for_state(&handle, "interrupted", |state| {
+            matches!(state, SessionState::Interrupted { .. })
+        })
+        .await;
 
         let bad_id = handle_ag_ui_rpc_bytes(
             Method::POST,
@@ -918,7 +948,10 @@ mod tests {
         assert_eq!(ok.status(), StatusCode::OK);
         let ok_body = response_json(ok).await;
         assert_eq!(ok_body["result"]["status"], "accepted");
-        sleep(Duration::from_millis(120)).await;
+        wait_for_state(&handle, "idle after resume", |state| {
+            *state == SessionState::Idle
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -976,7 +1009,10 @@ mod tests {
         });
         let start = prompt(&handle, "resume me", SessionPromptOptions::default()).await;
         assert!(matches!(start, Ok(PromptResult::Accepted { .. })));
-        sleep(Duration::from_millis(120)).await;
+        wait_for_state(&handle, "interrupted", |state| {
+            matches!(state, SessionState::Interrupted { .. })
+        })
+        .await;
 
         let partial = handle_ag_ui_rpc_bytes(
             Method::POST,

@@ -21,6 +21,17 @@ use harnx::test_utils::interrupt::{
 use harnx::test_utils::mock_openai_server::{MockOpenAiScript, MockOpenAiServer, MockOpenAiTurn};
 use harnx::test_utils::tmux_harness::TmuxHarness;
 
+fn wait_for_mock_request(mock: &MockOpenAiServer) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while mock.get_request_log().is_empty() {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("harnx did not start an LLM request within 10s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
 #[test]
 fn one_shot_local_turn_runs_over_nats() -> Result<()> {
     harnx_core::require_nextest();
@@ -259,8 +270,7 @@ fn interrupt_oneshot_during_streaming() -> Result<()> {
     let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
     let mut child = spawn_oneshot(&paths, &harnx_bin, "hello")?;
 
-    // Give harnx time to make the LLM call and start streaming.
-    std::thread::sleep(Duration::from_millis(500));
+    wait_for_mock_request(&mock)?;
 
     send_sigint(&child)?;
 
