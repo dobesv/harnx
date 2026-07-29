@@ -126,20 +126,32 @@ mod tests {
         );
     }
 
+    /// Helper to test optional string param validation with:
+    /// - whitespace-only → empty error
+    /// - exact max length → ok
+    /// - one over max → too-long error
+    fn assert_param_empty_and_length_checks(
+        set_param: impl Fn(&mut GrepQueryParams, Option<String>),
+        empty_error: &str,
+        max_len: usize,
+        too_long_error: &str,
+    ) {
+        let mut value = params("query");
+        set_param(&mut value, Some("  ".into()));
+        assert_eq!(value.validate(), Err(empty_error.into()));
+        set_param(&mut value, Some("x".repeat(max_len)));
+        assert!(value.validate().is_ok());
+        set_param(&mut value, Some("x".repeat(max_len + 1)));
+        assert_eq!(value.validate(), Err(too_long_error.into()));
+    }
+
     #[test]
     fn rejects_invalid_language_with_exact_messages_and_accepts_boundary() {
-        let mut value = params("query");
-        value.language = Some("  ".into());
-        assert_eq!(
-            value.validate(),
-            Err("❌ Error: 'language' parameter must be a non-empty string when provided".into())
-        );
-        value.language = Some("l".repeat(50));
-        assert!(value.validate().is_ok());
-        value.language = Some("l".repeat(51));
-        assert_eq!(
-            value.validate(),
-            Err("❌ Error: 'language' parameter is too long (max 50 characters)".into())
+        assert_param_empty_and_length_checks(
+            |p, v| p.language = v,
+            "❌ Error: 'language' parameter must be a non-empty string when provided",
+            50,
+            "❌ Error: 'language' parameter is too long (max 50 characters)",
         );
     }
 
@@ -175,18 +187,11 @@ mod tests {
 
     #[test]
     fn rejects_invalid_path_with_exact_messages_and_accepts_boundary() {
-        let mut value = params("query");
-        value.path = Some("\n ".into());
-        assert_eq!(
-            value.validate(),
-            Err("❌ Error: 'path' parameter must be a non-empty string when provided".into())
-        );
-        value.path = Some("p".repeat(200));
-        assert!(value.validate().is_ok());
-        value.path = Some("p".repeat(201));
-        assert_eq!(
-            value.validate(),
-            Err("❌ Error: 'path' parameter is too long (max 200 characters)".into())
+        assert_param_empty_and_length_checks(
+            |p, v| p.path = v,
+            "❌ Error: 'path' parameter must be a non-empty string when provided",
+            200,
+            "❌ Error: 'path' parameter is too long (max 200 characters)",
         );
     }
 
