@@ -19,6 +19,7 @@ members = [
     "crates/harnx-mcp-hooks-proxy",
     "crates/harnx-mcp-fs",
     "crates/harnx-mcp-time",
+    "crates/harnx-vercel-grep-server",
     "crates/harnx-mcp-remote",
     "crates/harnx-mcp-plans",
     "crates/harnx-mcp-plans-core",

@@ -1,0 +1,39 @@
+{
+  "facets": {
+    "count": 987,
+    "lang": {
+      "buckets": [
+        { "val": "Rust", "count": 300 },
+        { "val": "Go", "count": 120 }
+      ]
+    },
+    "repo": {
+      "buckets": [
+        { "val": "tokio-rs/tokio", "count": 80 },
+        { "val": "hyperium/hyper", "count": 25 }
+      ]
+    }
+  },
+  "hits": {
+    "hits": [
+      {
+        "repo": { "raw": "tokio-rs/tokio" },
+        "path": { "raw": "tokio/src/runtime/mod.rs" },
+        "branch": { "raw": "master" },
+        "total_matches": { "raw": "9" },
+        "content": {
+          "snippet": "<span data-line=\"100\">pub fn spawn(future: F) -&gt; JoinHandle&lt;F::Output&gt;</span>"
+        }
+      },
+      {
+        "repo": { "raw": "hyperium/hyper" },
+        "path": { "raw": "src/client/mod.rs" },
+        "branch": { "raw": "master" },
+        "total_matches": { "raw": "4" },
+        "content": {
+          "snippet": "<span data-line=\"12\">let client = Client::new();</span>"
+        }
+      }
+    ]
+  }
+}

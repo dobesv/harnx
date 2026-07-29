@@ -1,0 +1,28 @@
+{
+  "facets": {
+    "count": 42,
+    "lang": {
+      "buckets": [
+        { "val": "Python", "count": 42 }
+      ]
+    },
+    "repo": {
+      "buckets": [
+        { "val": "fastapi/fastapi", "count": 42 }
+      ]
+    }
+  },
+  "hits": {
+    "hits": [
+      {
+        "repo": { "raw": "fastapi/fastapi" },
+        "path": { "raw": "fastapi/routing.py" },
+        "branch": { "raw": "master" },
+        "total_matches": { "raw": "8" },
+        "content": {
+          "snippet": "<span data-line=\"55\">class APIRouter(routing.Router):</span>\n<span data-line=\"56\">    def __init__(self) -&gt; None:</span>"
+        }
+      }
+    ]
+  }
+}
