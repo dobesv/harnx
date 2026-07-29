@@ -1,5 +1,6 @@
 use super::*;
 
+use super::compaction::truncate_middle;
 use crate::client::{Message, MessageRole};
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -58,9 +59,14 @@ fn build_session_dump(session: &Session) -> Result<String> {
         "tokens".to_string(),
         serde_json::Value::Object(build_session_tokens(session)),
     );
+    let agent_variables: IndexMap<String, String> = session
+        .agent_variables()
+        .iter()
+        .map(|(name, value)| (name.clone(), truncate_middle(value, 200)))
+        .collect();
     data.insert(
         "agent_variables".to_string(),
-        serde_json::to_value(session.agent_variables())?,
+        serde_json::to_value(agent_variables)?,
     );
     data.insert(
         "messages".to_string(),
@@ -312,6 +318,27 @@ content: hi there
         assert!(dump.contains("content: hi there"));
         assert!(dump.contains("snapshot:"));
         assert!(!dump.contains("SECRET SYSTEM PROMPT"));
+    }
+
+    #[test]
+    fn render_session_dump_truncates_long_agent_variables() {
+        let _lock = env_lock();
+        let env = SessionDumpTestEnv::new(SessionScope::RequestedAgent("smith"));
+        let long_value = "x".repeat(260);
+        env.write_session(
+            "variables",
+            &format!(
+                "---\ntype: header\nmodel: openai:test-model\nsession_id: variables\nworking_dir: /tmp/work\nagent_name: smith\nagent_variables:\n  long: {long_value}\n  short: forge\n",
+            ),
+        );
+
+        let dump = render_session_dump(Some("smith"), "variables").unwrap();
+        let rendered: serde_yaml::Value = serde_yaml::from_str(&dump).unwrap();
+        let truncated = rendered["agent_variables"]["long"].as_str().unwrap();
+
+        assert!(truncated.contains("…[truncated]…"));
+        assert_eq!(truncated.chars().count(), 200);
+        assert_eq!(rendered["agent_variables"]["short"], "forge");
     }
 
     #[test]

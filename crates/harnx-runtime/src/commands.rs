@@ -30,7 +30,7 @@ pub enum CommandOutcome {
     OpenSessionPicker,
 }
 
-pub static COMMANDS: LazyLock<[Command; 50]> = LazyLock::new(|| {
+pub static COMMANDS: LazyLock<[Command; 55]> = LazyLock::new(|| {
     [
         Command::new(".help", "Show this help guide"),
         Command::new(".info", "Show system info"),
@@ -43,12 +43,24 @@ pub static COMMANDS: LazyLock<[Command; 50]> = LazyLock::new(|| {
             ".info env [name]",
             "List harnx process env var names (or show one var's value)",
         ),
+        Command::new(
+            ".info variables",
+            "List session variables (values truncated)",
+        ),
+        Command::new(
+            ".info variable <name>",
+            "Show one session variable's full value",
+        ),
         Command::new(".use tool", "Add a tool or toolset to the active tools"),
         Command::new(
             ".drop tool",
             "Remove a tool or toolset from the active tools",
         ),
         Command::new(".edit config", "Modify configuration file"),
+        Command::new(
+            ".edit variable <name>",
+            "Edit a session variable in $EDITOR",
+        ),
         Command::new(".model", "Switch LLM model"),
         Command::new(".prompt", "Set a temporary agent using a prompt"),
         Command::new(".edit agent", "Modify current agent"),
@@ -101,6 +113,11 @@ pub static COMMANDS: LazyLock<[Command; 50]> = LazyLock::new(|| {
         Command::new(".regenerate", "Regenerate last response"),
         Command::new(".copy", "Copy last response"),
         Command::new(".set", "Modify runtime settings"),
+        Command::new(".set variable <name> <value>", "Set a session variable"),
+        Command::new(
+            ".load variable <name> <file>",
+            "Load a session variable value from a file",
+        ),
         Command::new(".title", "Show or (re)generate the session title"),
         Command::new(
             ".set show_sequence_numbers",
@@ -414,6 +431,19 @@ pub async fn run_command_with_output_and_local_worker(
                     let info = config.read().session_info()?;
                     write!(output, "{info}")?;
                 }
+                Some("variables") => {
+                    write!(output, "{}", config.read().list_variables()?)?;
+                }
+                Some("variable") => {
+                    bail!("Usage: .info variable <name>");
+                }
+                Some(rest) if rest.starts_with("variable ") => {
+                    let name = rest["variable ".len()..].trim();
+                    if name.is_empty() {
+                        bail!("Usage: .info variable <name>");
+                    }
+                    write!(output, "{}", config.read().get_variable(name)?)?;
+                }
                 Some("model") => {
                     let conf = config.read();
                     write_model_info_block(output, &conf, conf.current_model())?;
@@ -627,6 +657,16 @@ pub async fn run_command_with_output_and_local_worker(
                     }
                     Some("session") => {
                         config.write().edit_session()?;
+                    }
+                    Some("variable") => {
+                        bail!("Usage: .edit variable <name>");
+                    }
+                    Some(rest) if rest.starts_with("variable ") => {
+                        let name = rest["variable ".len()..].trim();
+                        if name.is_empty() {
+                            bail!("Usage: .edit variable <name>");
+                        }
+                        config.write().edit_variable(name)?;
                     }
                     Some("rag-docs") => {
                         Config::edit_rag_docs(config, abort_signal.clone()).await?;
@@ -1003,10 +1043,41 @@ Commands:
                 _ => writeln!(output, "Usage: .drop tool <name>")?,
             },
             ".set" => match args {
+                Some("variable") => {
+                    bail!("Usage: .set variable <name> <value>");
+                }
+                Some(rest) if rest.starts_with("variable ") => {
+                    let variable_args = rest["variable ".len()..].trim_start();
+                    let Some((name, value)) = variable_args.split_once(' ') else {
+                        bail!("Usage: .set variable <name> <value>");
+                    };
+                    if name.is_empty() || value.is_empty() {
+                        bail!("Usage: .set variable <name> <value>");
+                    }
+                    config.write().set_variable(name, value)?;
+                }
                 Some(args) => {
                     Config::update(config, args)?;
                 }
                 _ => writeln!(output, "Usage: .set <key> <value>...")?,
+            },
+            ".load" => match args {
+                Some("variable") => {
+                    bail!("Usage: .load variable <name> <file>");
+                }
+                Some(rest) if rest.starts_with("variable ") => {
+                    let variable_args = rest["variable ".len()..].trim_start();
+                    let Some((name, file)) = variable_args.split_once(' ') else {
+                        bail!("Usage: .load variable <name> <file>");
+                    };
+                    let file = file.trim();
+                    if name.is_empty() || file.is_empty() {
+                        bail!("Usage: .load variable <name> <file>");
+                    }
+                    config.write().load_variable(name, file)?;
+                    writeln!(output, "Loaded variable '{name}' from '{file}'")?;
+                }
+                _ => bail!("Usage: .load variable <name> <file>"),
             },
             ".delete" => match args {
                 Some(args) if args.starts_with("message ") => {

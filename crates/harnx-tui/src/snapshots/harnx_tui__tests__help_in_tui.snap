@@ -2,8 +2,6 @@
 source: crates/harnx-tui/src/tests.rs
 expression: rendered
 ---
-.attach                  Attach a file to the next message
-.detach                  Remove attached files
 .macro                   Execute a macro
 .mcp                     Manage MCP servers
 .file                    Include files, directories, URLs or commands
@@ -11,6 +9,8 @@ expression: rendered
 .regenerate              Regenerate last response
 .copy                    Copy last response
 .set                     Modify runtime settings
+.set variable <name> <value> Set a session variable
+.load variable <name> <file> Load a session variable value from a file
 .title                   Show or (re)generate the session title
 .set show_sequence_numbers Toggle [n] prefix in transcript (on/off)
 .set show_timestamps     Toggle timestamp in transcript (on/off)

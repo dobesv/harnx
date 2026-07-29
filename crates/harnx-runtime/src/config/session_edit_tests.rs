@@ -3,7 +3,7 @@
 
 use super::*;
 use harnx_core::{
-    message::{MessageContent, MessageRole},
+    message::{Message, MessageContent, MessageRole},
     session::ToolOutput,
     tool::ToolCall,
 };
@@ -101,6 +101,177 @@ fn editor_test_config(sessions_dir: std::path::PathBuf) -> Config {
     config.model = harnx_client::Model::new("test", "model");
     config.model_id = "test:model".to_string();
     config
+}
+
+fn variable_test_config(sessions_dir: std::path::PathBuf) -> Config {
+    let mut config = editor_test_config(sessions_dir);
+    let mut agent = Agent::new(AgentConfig::from_prompt(""));
+    agent.set_model(config.model.clone());
+    config.agent = Some(agent);
+    config
+}
+
+#[test]
+fn set_variable_persists_and_creates_empty_key() -> Result<()> {
+    let sessions = tempfile::TempDir::new()?;
+    let mut config = variable_test_config(sessions.path().to_path_buf());
+    config.use_session(Some("variable-persistence"))?;
+    config
+        .session
+        .as_mut()
+        .context("No active session")?
+        .messages
+        .push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("keep session active".to_string()),
+        ));
+
+    config.set_variable("persisted", "saved value")?;
+    config.set_variable("empty", "")?;
+    config.save_session(None)?;
+    drop(config);
+
+    let mut reloaded = variable_test_config(sessions.path().to_path_buf());
+    reloaded.use_session(Some("variable-persistence"))?;
+    assert_eq!(reloaded.get_variable("persisted")?, "saved value");
+    assert_eq!(reloaded.get_variable("empty")?, "");
+
+    Ok(())
+}
+
+#[test]
+fn get_variable_returns_full_long_value() -> Result<()> {
+    let sessions = tempfile::TempDir::new()?;
+    let mut config = variable_test_config(sessions.path().to_path_buf());
+    config.use_session(Some("variable-get"))?;
+    let long_value = "x".repeat(250);
+
+    config.set_variable("long", &long_value)?;
+
+    assert_eq!(config.get_variable("long")?, long_value);
+    Ok(())
+}
+
+#[test]
+fn list_variables_truncates_long_values_and_preserves_short_values() -> Result<()> {
+    let sessions = tempfile::TempDir::new()?;
+    let mut config = variable_test_config(sessions.path().to_path_buf());
+    config.use_session(Some("variable-list"))?;
+    config.set_variable("short", "small")?;
+    config.set_variable("long", &"x".repeat(250))?;
+
+    let listed = config.list_variables()?;
+    let short_line = listed
+        .lines()
+        .find(|line| line.starts_with("short = "))
+        .context("short variable missing from list")?;
+    let long_rendered = listed
+        .split_once("long = ")
+        .map(|(_, value)| value)
+        .context("long variable missing from list")?;
+
+    assert_eq!(short_line, "short = small");
+    assert!(long_rendered.contains("…[truncated]…"));
+    assert!(long_rendered.chars().count() <= 200);
+    Ok(())
+}
+
+#[test]
+fn load_variable_reads_file_and_missing_file_does_not_mutate() -> Result<()> {
+    let sessions = tempfile::TempDir::new()?;
+    let files = tempfile::TempDir::new()?;
+    let mut config = variable_test_config(sessions.path().to_path_buf());
+    config.use_session(Some("variable-load"))?;
+    config.set_variable("loaded", "original")?;
+
+    let value_path = files.path().join("value.txt");
+    std::fs::write(&value_path, "loaded from file\n")?;
+    config.load_variable(
+        "loaded",
+        value_path.to_str().context("non-UTF-8 temp path")?,
+    )?;
+    assert_eq!(config.get_variable("loaded")?, "loaded from file\n");
+
+    let before = config
+        .session
+        .as_ref()
+        .context("No active session")?
+        .agent_variables()
+        .clone();
+    let missing_path = files.path().join("missing.txt");
+    let error = config
+        .load_variable(
+            "new-key",
+            missing_path.to_str().context("non-UTF-8 temp path")?,
+        )
+        .expect_err("missing variable file should fail");
+    assert!(error.to_string().contains("Failed to read variable file"));
+    assert_eq!(
+        config
+            .session
+            .as_ref()
+            .context("No active session")?
+            .agent_variables(),
+        &before
+    );
+
+    Ok(())
+}
+
+#[test]
+fn edit_variable_round_trip_supports_content_and_empty_edits() {
+    use tempfile::TempDir;
+
+    let sessions = TempDir::new().unwrap();
+    let editor_tmp = TempDir::new().unwrap();
+    let original_editor = std::env::var_os("EDITOR");
+    std::env::set_var("EDITOR", "true");
+
+    let result = (|| -> Result<()> {
+        let mut config = variable_test_config(sessions.path().to_path_buf());
+        config.use_session(Some("variable-edit"))?;
+        config.set_variable("draft", "initial")?;
+
+        let editor_tmp_path = editor_tmp.path().to_path_buf();
+        config.temp_dir_override = Some(editor_tmp_path.clone());
+        let mut edit_count = 0;
+        config.set_tui_editor_hooks(
+            None,
+            Some(Box::new(move || {
+                let temp_path = std::fs::read_dir(&editor_tmp_path)
+                    .unwrap()
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .find(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("variable-edit-"))
+                            && path.extension().and_then(|ext| ext.to_str()) == Some("txt")
+                    })
+                    .expect("variable edit temp file");
+                let content = if edit_count == 0 {
+                    "edited variable content\n"
+                } else {
+                    ""
+                };
+                edit_count += 1;
+                std::fs::write(&temp_path, content).unwrap();
+            })),
+        );
+
+        config.edit_variable("draft")?;
+        assert_eq!(config.get_variable("draft")?, "edited variable content\n");
+        config.edit_variable("draft")?;
+        assert_eq!(config.get_variable("draft")?, "");
+
+        Ok(())
+    })();
+
+    match original_editor {
+        Some(value) => std::env::set_var("EDITOR", value),
+        None => std::env::remove_var("EDITOR"),
+    }
+
+    result.unwrap();
 }
 
 #[test]

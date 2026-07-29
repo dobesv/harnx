@@ -25,6 +25,7 @@ mod session_ops_core;
 mod session_ops_split;
 pub mod session_ops_title;
 mod settings_split;
+mod variable_split;
 
 pub use self::env_split::load_env_file;
 pub use self::macros_split::macro_execute;

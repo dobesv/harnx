@@ -2177,8 +2177,17 @@ impl Tui {
             line_cmd.starts_with(".info agent") || line_cmd.starts_with("/info agent");
         let is_info_session =
             line_cmd.starts_with(".info session") || line_cmd.starts_with("/info session");
+        let is_info_variables = line_cmd == ".info variables"
+            || line_cmd == "/info variables"
+            || line_cmd.starts_with(".info variables ")
+            || line_cmd.starts_with("/info variables ");
+        let is_info_variable = !is_info_variables
+            && (line_cmd == ".info variable"
+                || line_cmd == "/info variable"
+                || line_cmd.starts_with(".info variable ")
+                || line_cmd.starts_with("/info variable "));
 
-        if !is_info_agent && !is_info_session {
+        if !is_info_agent && !is_info_session && !is_info_variables && !is_info_variable {
             return false;
         }
 
@@ -2189,25 +2198,36 @@ impl Tui {
             return true;
         };
 
-        let result = if is_info_agent {
-            self.resolve_info_agent_target(&tokens)
+        let (result, title) = if is_info_agent {
+            let res = self
+                .resolve_info_agent_target(&tokens)
                 .and_then(|agent_name| {
                     let cfg = self.config.read();
                     harnx_runtime::config::render_agent_dump(&cfg, &agent_name)
-                })
+                });
+            (res, "Agent Info")
+        } else if is_info_session {
+            let res =
+                self.resolve_info_session_target(&tokens)
+                    .and_then(|(agent_name, session_id)| {
+                        harnx_runtime::config::render_session_dump(
+                            agent_name.as_deref(),
+                            &session_id,
+                        )
+                    });
+            (res, "Session Info")
+        } else if is_info_variables {
+            (self.config.read().list_variables(), "Session Variables")
         } else {
-            self.resolve_info_session_target(&tokens)
-                .and_then(|(agent_name, session_id)| {
-                    harnx_runtime::config::render_session_dump(agent_name.as_deref(), &session_id)
-                })
+            let res = if tokens.len() > 2 {
+                self.config.read().get_variable(&tokens[2])
+            } else {
+                Err(anyhow::anyhow!("Usage: .info variable <name>"))
+            };
+            (res, "Session Variable")
         };
 
         let display_text = result.unwrap_or_else(|err| format!("Error: {}", err));
-        let title = if is_info_agent {
-            "Agent Info"
-        } else {
-            "Session Info"
-        };
         self.open_info_overlay(display_text, title);
         true
     }
