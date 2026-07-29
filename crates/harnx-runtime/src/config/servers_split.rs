@@ -50,6 +50,14 @@ impl Config {
             }
         }
 
+        let pkg_tool_dir = pkg_path.join(paths::TOOL_SERVERS_DIR_NAME);
+        if pkg_tool_dir.is_dir() {
+            for mut server in Self::load_tool_servers_from_dir(&pkg_tool_dir).unwrap_or_default() {
+                server.package = Some(pkg_name.to_string());
+                config.tool_servers.push(server);
+            }
+        }
+
         config.clients.extend(Self::load_package_clients(
             pkg_path,
             pkg_name,

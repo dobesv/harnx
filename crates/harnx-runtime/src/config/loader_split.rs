@@ -97,6 +97,8 @@ impl Config {
             Self::load_mcp_servers_from_dir(&config_dir.join(paths::MCP_SERVERS_DIR_NAME))?;
         config.acp_servers =
             Self::load_acp_servers_from_dir(&config_dir.join(paths::ACP_SERVERS_DIR_NAME))?;
+        config.tool_servers =
+            Self::load_tool_servers_from_dir(&config_dir.join(paths::TOOL_SERVERS_DIR_NAME))?;
         let packages_dir = paths::packages_dir();
         if packages_dir.is_dir() {
             Self::load_packages(&mut config, &packages_dir)?;
@@ -110,11 +112,15 @@ impl Config {
         let Ok(entries) = std::fs::read_dir(packages_dir) else {
             return Ok(());
         };
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            let Some(pkg_name) = package_dir_name(&path) else {
-                continue;
-            };
+        let mut packages = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let path = entry.path();
+                package_dir_name(&path).map(|name| (name, path))
+            })
+            .collect::<Vec<_>>();
+        packages.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (pkg_name, path) in packages {
             Self::load_package_servers(config, &path, &pkg_name);
         }
         Ok(())
@@ -314,6 +320,8 @@ impl Config {
             Self::load_mcp_servers_from_dir(&config_dir.join(paths::MCP_SERVERS_DIR_NAME))?;
         config.acp_servers =
             Self::load_acp_servers_from_dir(&config_dir.join(paths::ACP_SERVERS_DIR_NAME))?;
+        config.tool_servers =
+            Self::load_tool_servers_from_dir(&config_dir.join(paths::TOOL_SERVERS_DIR_NAME))?;
         Self::auto_register_agents(&mut config.acp_servers)?;
         Ok(config)
     }
@@ -523,5 +531,33 @@ mod tests {
     #[cfg(not(windows))]
     fn harnx_acp_server_binary_name() -> &'static str {
         "harnx-acp-server"
+    }
+}
+
+#[cfg(test)]
+mod dynamic_tool_server_tests {
+    use super::*;
+    use crate::config::test_support::{env_lock, EnvGuard};
+
+    #[test]
+    fn load_dynamic_loads_user_tool_servers() {
+        let _guard = env_lock();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp_dir.path();
+        let tool_servers_dir = config_dir.join(paths::TOOL_SERVERS_DIR_NAME);
+        std::fs::create_dir_all(&tool_servers_dir).expect("create tool_servers dir");
+        std::fs::write(
+            tool_servers_dir.join("time.yaml"),
+            "command: harnx-time-server\n",
+        )
+        .expect("write time.yaml");
+        let _env_guard = EnvGuard::new("HARNX_CONFIG_DIR", config_dir);
+
+        let config = Config::load_dynamic("openai:gpt-4o").expect("load dynamic config");
+
+        assert_eq!(config.tool_servers.len(), 1);
+        assert_eq!(config.tool_servers[0].name, "time");
+        assert_eq!(config.tool_servers[0].command, "harnx-time-server");
+        assert!(config.tool_servers[0].package.is_none());
     }
 }

@@ -4,10 +4,11 @@ mod common;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use harnx_core::abort::create_abort_signal;
+use harnx_core::event::{AgentEvent, AgentEventSink, NoticeEvent};
 use harnx_core::instance::InstanceId;
 use harnx_core::tool::{ToolCall, ToolError, ToolProvider};
 use harnx_mcp::{McpManager, McpServerConfig};
-use harnx_runtime::config::{Config, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
+use harnx_runtime::config::{Config, ToolServerConfig, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
 use harnx_runtime::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
 use harnx_runtime::nats_worker::{
     ToolServerStartConfig, ToolServerSupervisor, HARNX_TIME_SERVER_BIN,
@@ -22,7 +23,44 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+fn time_server_config() -> ToolServerConfig {
+    ToolServerConfig {
+        name: "time".to_string(),
+        command: "harnx-time-server".to_string(),
+        args: Vec::new(),
+        env: Default::default(),
+        enabled: true,
+        description: None,
+        bin_override_env: Some(HARNX_TIME_SERVER_BIN.to_string()),
+        package: None,
+    }
+}
 const TOKEN: &str = "tool-supervisor-test-token";
+
+#[derive(Default)]
+struct RecordingEventSink {
+    events: std::sync::Mutex<Vec<AgentEvent>>,
+}
+
+impl RecordingEventSink {
+    fn warning_messages(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .expect("event sink lock")
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(NoticeEvent::Warning(message)) => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl AgentEventSink for RecordingEventSink {
+    fn emit(&self, event: AgentEvent) {
+        self.events.lock().expect("event sink lock").push(event);
+    }
+}
 
 struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
 
@@ -303,8 +341,10 @@ async fn time_over_nats_pilot_e2e_mixed_stdio_cancel_and_crash() -> Result<()> {
     let instance_id = InstanceId::new();
     let start =
         ToolServerStartConfig::new(client.clone(), instance_id.clone(), server.url(), TOKEN);
+    let servers = [time_server_config()];
     let supervisor =
-        ToolServerSupervisor::start_local_with_timeout(start, Duration::from_secs(5)).await?;
+        ToolServerSupervisor::start_local_with_timeout(start, &servers, Duration::from_secs(5))
+            .await?;
     let pid = assert_pilot_registration(&supervisor, &client, &instance_id).await?;
     let provider = NatsToolProvider::discover(
         &Config::default(),
@@ -320,7 +360,7 @@ async fn time_over_nats_pilot_e2e_mixed_stdio_cancel_and_crash() -> Result<()> {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn tool_supervisor_readiness_barrier_times_out() -> Result<()> {
+async fn tool_server_readiness_failure_warns_and_continues() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
@@ -341,16 +381,142 @@ async fn tool_supervisor_readiness_barrier_times_out() -> Result<()> {
         .connect(server.url())
         .await?;
     let instance_id = InstanceId::new();
-    let start = ToolServerStartConfig::new(client, instance_id, server.url(), TOKEN);
-    let error =
-        match ToolServerSupervisor::start_local_with_timeout(start, Duration::from_millis(250))
+    let start =
+        ToolServerStartConfig::new(client.clone(), instance_id.clone(), server.url(), TOKEN);
+    let servers = [time_server_config()];
+    let sink = Arc::new(RecordingEventSink::default());
+    let supervisor = harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+        ToolServerSupervisor::start_local_with_timeout(start, &servers, Duration::from_millis(250))
             .await
-        {
-            Ok(_) => anyhow::bail!("server that never registers must time out"),
-            Err(error) => error,
-        };
-    let message = format!("{error:#}");
-    assert!(message.contains("tool server 'time' did not register"));
-    assert!(message.contains("within 0.25s"));
+    })
+    .await?;
+
+    let store = async_nats::jetstream::new(client)
+        .get_key_value(TOOL_REGISTRY_BUCKET)
+        .await?;
+    assert!(
+        store
+            .get(registration_key(&instance_id, "time"))
+            .await?
+            .is_none(),
+        "non-registering server must not become available"
+    );
+    assert!(
+        sink.warning_messages().iter().any(|message| {
+            message.contains("tool server 'time' failed to start")
+                && message.contains("did not register")
+        }),
+        "readiness failure must emit a warning: {:?}",
+        sink.warning_messages()
+    );
+    drop(supervisor);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn readiness_waits_for_servers_concurrently() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    const STALL_BIN_ENV: &str = "HARNX_STALL_TOOL_SERVER_BIN_TEST";
+    let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
+        auth_token: Some(TOKEN.to_string()),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let directory = tempfile::tempdir()?;
+    let stall_binary = directory.path().join("stall-server");
+    std::fs::write(&stall_binary, "#!/bin/sh\nsleep 10\n")?;
+    std::fs::set_permissions(&stall_binary, std::fs::Permissions::from_mode(0o755))?;
+    let stall_binary = stall_binary.to_string_lossy().into_owned();
+    let time_binary = time_server_binary()?.to_string_lossy().into_owned();
+    let _env = EnvGuard::install(&[
+        (STALL_BIN_ENV, &stall_binary),
+        (HARNX_TIME_SERVER_BIN, &time_binary),
+    ]);
+    let client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(server.url())
+        .await?;
+    let instance_id = InstanceId::new();
+    let start =
+        ToolServerStartConfig::new(client.clone(), instance_id.clone(), server.url(), TOKEN);
+    let stall = ToolServerConfig {
+        name: "stall".to_string(),
+        command: "stall-server".to_string(),
+        bin_override_env: Some(STALL_BIN_ENV.to_string()),
+        ..time_server_config()
+    };
+    let servers = [stall, time_server_config()];
+    let sink = Arc::new(RecordingEventSink::default());
+    let supervisor = harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+        ToolServerSupervisor::start_local_with_timeout(start, &servers, Duration::from_secs(1))
+            .await
+    })
+    .await?;
+
+    let store = async_nats::jetstream::new(client)
+        .get_key_value(TOOL_REGISTRY_BUCKET)
+        .await?;
+    assert!(
+        store
+            .get(registration_key(&instance_id, "time"))
+            .await?
+            .is_some(),
+        "healthy server must register while another server stalls"
+    );
+    let warnings = sink.warning_messages();
+    assert!(warnings.iter().any(|message| message.contains("'stall'")));
+    assert!(
+        warnings.iter().all(|message| !message.contains("'time'")),
+        "healthy server must not receive a readiness warning: {warnings:?}"
+    );
+    drop(supervisor);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_tool_server_binary_warns_and_continues() -> Result<()> {
+    const MISSING_BIN_ENV: &str = "HARNX_MISSING_TOOL_SERVER_BIN_TEST";
+
+    let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
+        auth_token: Some(TOKEN.to_string()),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let missing_dir = tempfile::tempdir()?;
+    let missing = missing_dir.path().join("does-not-exist");
+    let missing = missing.to_string_lossy().into_owned();
+    let _env = EnvGuard::install(&[(MISSING_BIN_ENV, &missing)]);
+    let client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(server.url())
+        .await?;
+    let instance_id = InstanceId::new();
+    let start = ToolServerStartConfig::new(client, instance_id, server.url(), TOKEN);
+    let servers = [ToolServerConfig {
+        bin_override_env: Some(MISSING_BIN_ENV.to_string()),
+        ..time_server_config()
+    }];
+    let sink = Arc::new(RecordingEventSink::default());
+    let supervisor = harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+        ToolServerSupervisor::start_local_with_timeout(start, &servers, Duration::from_millis(250))
+            .await
+    })
+    .await?;
+
+    assert!(supervisor.server_pids().await.is_empty());
+    assert!(
+        sink.warning_messages().iter().any(|message| {
+            message.contains("tool server 'time' failed to start")
+                && message.contains("points to a missing tool-server binary")
+        }),
+        "missing binary must emit a warning: {:?}",
+        sink.warning_messages()
+    );
     Ok(())
 }

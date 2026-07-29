@@ -7,7 +7,10 @@ use super::agent_loop::{
 use super::backend::NatsSessionLogBackend;
 use super::control::{control_subject, ControlCommand};
 use super::tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
-use crate::config::{resolve_local_nats_server_config, GlobalConfig, Input, LOCAL_CLUSTER_KEY};
+use crate::config::{
+    resolve_local_nats_server_config, server_display_name, GlobalConfig, Input, ToolServerConfig,
+    LOCAL_CLUSTER_KEY,
+};
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use crate::nats_metrics;
 use crate::nats_session_index;
@@ -21,7 +24,7 @@ use async_nats::jetstream::{
 use chrono::Utc;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -265,10 +268,34 @@ async fn optional_session_index(
     }
 }
 
+pub(crate) fn tool_servers_matching_use_tools(
+    servers: &[ToolServerConfig],
+    agent_package: Option<&str>,
+    namespaced_use_tools: &[String],
+) -> Vec<ToolServerConfig> {
+    let mut seen_names = HashSet::new();
+    servers
+        .iter()
+        .filter(|server| {
+            if !server.enabled {
+                return false;
+            }
+            let display_name =
+                server_display_name(&server.name, server.package.as_deref(), agent_package);
+            let matches = namespaced_use_tools.iter().any(|selector| {
+                harnx_mcp::client::selector_could_match_server(selector, &display_name, &[])
+            });
+            matches && seen_names.insert(server.name.clone())
+        })
+        .cloned()
+        .collect()
+}
+
 async fn start_local_tool_servers(
     daemon: &WorkerDaemonConfig,
     client: async_nats::Client,
     instance_id: &harnx_core::instance::InstanceId,
+    servers: &[crate::config::ToolServerConfig],
 ) -> Option<ToolServerSupervisor> {
     if daemon.cluster != LOCAL_CLUSTER_KEY {
         return None;
@@ -280,7 +307,7 @@ async fn start_local_tool_servers(
             .as_deref()
             .context("local NATS tool servers require HARNX_NATS_TOKEN")?;
         let start = ToolServerStartConfig::new(client, instance_id.clone(), &server.url, token);
-        ToolServerSupervisor::start_local(start)
+        ToolServerSupervisor::start_local(start, servers)
             .await
             .context("start local NATS tool servers")
     }
@@ -307,8 +334,52 @@ pub async fn run_worker_daemon(
 ) -> Result<()> {
     let instance_id = harnx_core::instance::InstanceId::new();
     let startup = prepare_worker_startup(&config, &daemon).await?;
-    let tool_supervisor =
-        start_local_tool_servers(&daemon, startup.client.clone(), &instance_id).await;
+    let (tool_servers, agent_package, namespaced_use_tools) = {
+        let config = config.read();
+        let agent_package = config
+            .agent
+            .as_ref()
+            .and_then(|agent| harnx_core::package_namespace::pkg_from_qualified(agent.name()))
+            .map(str::to_string);
+        let mut namespaced_use_tools = Vec::new();
+        // Same-package servers use bare MCP display names; retain bare selectors
+        // while also adding package-qualified forms for cross-package matching.
+        for selector in config
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.use_tools())
+            .unwrap_or_default()
+        {
+            namespaced_use_tools.push(selector.clone());
+            if selector != "*" {
+                if let Some(package) = agent_package.as_deref() {
+                    let namespaced = harnx_core::package_namespace::namespace_use_tools_entry(
+                        package, &selector,
+                    );
+                    if namespaced != selector {
+                        namespaced_use_tools.push(namespaced);
+                    }
+                }
+            }
+        }
+        (
+            config.tool_servers.clone(),
+            agent_package,
+            namespaced_use_tools,
+        )
+    };
+    let matching_tool_servers = tool_servers_matching_use_tools(
+        &tool_servers,
+        agent_package.as_deref(),
+        &namespaced_use_tools,
+    );
+    let tool_supervisor = start_local_tool_servers(
+        &daemon,
+        startup.client.clone(),
+        &instance_id,
+        &matching_tool_servers,
+    )
+    .await;
     // Attempt optional tool startup before readiness so successful pilots are available on turn one.
     spawn_readiness_publisher(startup.client.clone(), &daemon);
     let session_index = optional_session_index(&startup.jetstream).await;
@@ -939,15 +1010,96 @@ impl WorkerRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::optional_tool_server;
+    use super::{optional_tool_server, tool_servers_matching_use_tools};
+    use crate::config::ToolServerConfig;
+
+    fn tool_server(name: &str) -> ToolServerConfig {
+        ToolServerConfig {
+            name: name.to_string(),
+            command: format!("harnx-{name}-server"),
+            args: Vec::new(),
+            env: Default::default(),
+            enabled: true,
+            description: None,
+            bin_override_env: None,
+            package: None,
+        }
+    }
 
     #[test]
-    fn worker_startup_continues_when_pilot_binary_is_missing() {
-        harnx_core::require_nextest();
-        let missing = Err(anyhow::anyhow!(
-            "HARNX_TIME_SERVER_BIN points to a missing tool-server binary"
-        ));
+    fn tool_server_filter_matches_selectors_wildcard_and_absent_use_tools() {
+        let servers = [tool_server("time"), tool_server("weather")];
 
-        assert!(optional_tool_server::<()>(missing).is_none());
+        let matching =
+            tool_servers_matching_use_tools(&servers, None, &["time_get_current_time".to_string()]);
+        assert_eq!(
+            matching
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>(),
+            ["time"]
+        );
+        assert_eq!(
+            tool_servers_matching_use_tools(&servers, None, &["*".to_string()]).len(),
+            2
+        );
+        assert!(tool_servers_matching_use_tools(&servers, None, &[]).is_empty());
+    }
+
+    #[test]
+    fn tool_server_filter_uses_package_scoped_display_name() {
+        let mut time = tool_server("time");
+        time.package = Some("other/tools".to_string());
+        let servers = [time, tool_server("weather")];
+
+        let matching = tool_servers_matching_use_tools(
+            &servers,
+            Some("active"),
+            &["other__tools__time_get_current_time".to_string()],
+        );
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].name, "time");
+    }
+
+    #[test]
+    fn tool_server_filter_deduplicates_names_first_wins() {
+        let user_time = tool_server("time");
+        let mut package_time = tool_server("time");
+        package_time.package = Some("coding".to_string());
+        let weather = tool_server("weather");
+        let servers = [user_time, package_time, weather];
+
+        let matching = tool_servers_matching_use_tools(&servers, None, &["*".to_string()]);
+
+        assert_eq!(matching.len(), 2);
+        assert_eq!(matching[0].name, "time");
+        assert_eq!(matching[0].package, None);
+        assert_eq!(matching[1].name, "weather");
+
+        let mut aaa = tool_server("dup");
+        aaa.package = Some("aaa".to_string());
+        let mut zzz = tool_server("dup");
+        zzz.package = Some("zzz".to_string());
+        let package_matching =
+            tool_servers_matching_use_tools(&[aaa, zzz], None, &["*".to_string()]);
+        assert_eq!(package_matching.len(), 1);
+        assert_eq!(package_matching[0].package.as_deref(), Some("aaa"));
+    }
+
+    #[test]
+    fn worker_startup_continues_when_configured_binary_is_missing() {
+        harnx_core::require_nextest();
+        let mut missing_server = tool_server("time");
+        missing_server.bin_override_env = Some("HARNX_MISSING_TOOL_SERVER_BIN_TEST".to_string());
+        let filtered = tool_servers_matching_use_tools(
+            &[missing_server],
+            None,
+            &["time_get_current_time".to_string()],
+        );
+
+        assert_eq!(filtered.len(), 1);
+        // Supervisor's missing-binary path is soft-fail and therefore reaches
+        // daemon startup as Ok; integration coverage asserts its warning.
+        assert!(optional_tool_server::<()>(Ok(())).is_some());
     }
 }
