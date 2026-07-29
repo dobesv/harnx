@@ -1282,7 +1282,7 @@ pub(crate) fn load_base_config_for_tests() -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TestConfigSandbox;
+    use crate::test_support::{wait_for_state, TestConfigSandbox};
     use anyhow::anyhow;
     use harnx_core::{
         event::{AgentEvent, ContentBlock, ModelEvent},
@@ -1321,24 +1321,6 @@ mod tests {
             .await
             .expect("send get");
         reply_rx.await.expect("recv get reply")
-    }
-
-    async fn wait_for_state(
-        handle: &SessionHandle,
-        description: &str,
-        predicate: impl Fn(&SessionState) -> bool,
-    ) -> SessionInfo {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let info = get_info(handle).await;
-                if predicate(&info.state) {
-                    return info;
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for session to become {description}"))
     }
 
     async fn prompt(handle: &SessionHandle, text: &str) -> PromptResult {
@@ -2480,71 +2462,56 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn session_actor_resume_preserves_attachment_refs() {
-        let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
-        let sandbox = TestConfigSandbox::new();
-        sandbox.write_agent_with_front_matter(
-            "plain",
-            "model: openai:gpt-4o\nuse_tools: harnx_agent_session_history_read\nhooks:\n  entries:\n    - event: PreToolUse\n      matcher: ^harnx_agent_session_history_read$\n      type: claude-command\n      command: |\n        printf '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"approval needed\"}}'",
-            "You are plain.",
-        );
-
-        let seen_attachments: Arc<tokio::sync::Mutex<Vec<Vec<String>>>> =
-            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    fn attachment_capture_call_fn(
+        seen_attachments: Arc<tokio::sync::Mutex<Vec<Vec<String>>>>,
+    ) -> AgentCallFn {
         let round = Arc::new(AtomicUsize::new(0));
-        let call_fn: AgentCallFn = {
+        Arc::new(move |input, _config, _abort| {
             let round = Arc::clone(&round);
             let seen_attachments = Arc::clone(&seen_attachments);
-            Arc::new(move |input, _config, _abort| {
-                let round = Arc::clone(&round);
-                let seen_attachments = Arc::clone(&seen_attachments);
-                Box::pin(async move {
-                    seen_attachments
-                        .lock()
-                        .await
-                        .push(input.attachment_refs.clone());
-                    let turn = round.fetch_add(1, Ordering::SeqCst);
-                    Ok(match turn {
-                        0 => (
-                            "approval required".to_string(),
+            Box::pin(async move {
+                seen_attachments
+                    .lock()
+                    .await
+                    .push(input.attachment_refs.clone());
+                let turn = round.fetch_add(1, Ordering::SeqCst);
+                Ok(match turn {
+                    0 => (
+                        "approval required".to_string(),
+                        None,
+                        vec![ToolCall::new(
+                            "harnx_agent_session_history_read".to_string(),
+                            json!({}),
+                            Some("attach-call".to_string()),
                             None,
-                            vec![ToolCall::new(
-                                "harnx_agent_session_history_read".to_string(),
-                                json!({}),
-                                Some("attach-call".to_string()),
-                                None,
-                            )],
-                            harnx_runtime::client::CompletionTokenUsage::default(),
-                        ),
-                        1 => (
-                            "resume complete".to_string(),
-                            None,
-                            vec![],
-                            harnx_runtime::client::CompletionTokenUsage::default(),
-                        ),
-                        other => panic!("unexpected LLM round {other}"),
-                    })
+                        )],
+                        harnx_runtime::client::CompletionTokenUsage::default(),
+                    ),
+                    1 => (
+                        "resume complete".to_string(),
+                        None,
+                        vec![],
+                        harnx_runtime::client::CompletionTokenUsage::default(),
+                    ),
+                    other => panic!("unexpected LLM round {other}"),
                 })
             })
-        };
+        })
+    }
 
-        let registry = registry_with_call_fn(call_fn);
-        let handle = registry.get_or_spawn(key("plain", "resume-attachments"));
-        let attachment_refs = vec!["cid:test-attachment".to_string()];
-
+    async fn assert_attachment_resume(handle: &SessionHandle, attachment_refs: &[String]) {
         let started = prompt_with_options(
-            &handle,
+            handle,
             "attachment prompt",
             SessionPromptOptions {
-                attachment_refs: attachment_refs.clone(),
+                attachment_refs: attachment_refs.to_vec(),
                 ..Default::default()
             },
         )
         .await;
         assert!(matches!(started, PromptResult::Accepted { .. }));
 
-        let info = wait_for_state(&handle, "interrupted", |state| {
+        let info = wait_for_state(handle, "interrupted", |state| {
             matches!(state, SessionState::Interrupted { .. })
         })
         .await;
@@ -2555,7 +2522,7 @@ mod tests {
         assert_eq!(pending.attachment_refs, attachment_refs);
 
         let resumed = prompt_with_options(
-            &handle,
+            handle,
             "attachment prompt",
             SessionPromptOptions {
                 resume: vec![InterruptResume {
@@ -2571,10 +2538,30 @@ mod tests {
         )
         .await;
         assert!(matches!(resumed, PromptResult::Accepted { .. }));
-        wait_for_state(&handle, "idle after resume", |state| {
+        wait_for_state(handle, "idle after resume", |state| {
             *state == SessionState::Idle
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn session_actor_resume_preserves_attachment_refs() {
+        let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent_with_front_matter(
+            "plain",
+            "model: openai:gpt-4o\nuse_tools: harnx_agent_session_history_read\nhooks:\n  entries:\n    - event: PreToolUse\n      matcher: ^harnx_agent_session_history_read$\n      type: claude-command\n      command: |\n        printf '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"approval needed\"}}'",
+            "You are plain.",
+        );
+
+        let seen_attachments: Arc<tokio::sync::Mutex<Vec<Vec<String>>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let registry =
+            registry_with_call_fn(attachment_capture_call_fn(Arc::clone(&seen_attachments)));
+        let handle = registry.get_or_spawn(key("plain", "resume-attachments"));
+        let attachment_refs = vec!["cid:test-attachment".to_string()];
+
+        assert_attachment_resume(&handle, &attachment_refs).await;
 
         let captured = seen_attachments.lock().await.clone();
         assert_eq!(
