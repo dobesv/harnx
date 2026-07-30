@@ -210,7 +210,7 @@ impl AcpManager {
             }
             "session_prompt" => {
                 let message = required_string(&arguments, "message")?.to_owned();
-                let session_id = match optional_string(&arguments, "session_id")? {
+                let session_id = match optional_nonblank_string(&arguments, "session_id")? {
                     Some(session_id) => session_id.to_owned(),
                     None => client.session_new().await?,
                 };
@@ -347,6 +347,11 @@ fn string_prop(description: &str) -> JsonSchema {
     }
 }
 
+/// Shared guidance describing how the `session_id` argument controls session
+/// continuation. Kept as one constant so the tool description and the parameter
+/// description can't drift apart.
+const SESSION_ID_GUIDANCE: &str = "To continue a conversation, pass only the exact session_id returned by session_prompt or session_new. To start a new conversation, omit session_id; empty or whitespace-only values also start a new session. Do not invent a session ID.";
+
 /// The `session_prompt` ACP tool declaration (message + optional session_id).
 fn acp_session_prompt_tool(
     server_name: &str,
@@ -358,19 +363,12 @@ fn acp_session_prompt_tool(
         "message".to_string(),
         string_prop("The prompt message to send to the agent"),
     );
-    props.insert(
-        "session_id".to_string(),
-        string_prop(
-            "Session ID returned by a prior prompt call or by session_new. Pass it to preserve context from earlier turns; if omitted, a new empty session is created and no prior context is available.",
-        ),
-    );
+    props.insert("session_id".to_string(), string_prop(SESSION_ID_GUIDANCE));
     let description = match description {
         Some(description) => format!(
-            "Send a prompt to the '{server_name}' ACP agent. To continue a prior conversation, you must pass the session_id returned by an earlier prompt call or by session_new; the remote agent keeps context under that session_id. If you omit session_id, this starts a new empty session with no prior context. — {description}"
+            "Send a prompt to the '{server_name}' ACP agent. {SESSION_ID_GUIDANCE} — {description}"
         ),
-        None => format!(
-            "Send a prompt to the '{server_name}' ACP agent. To continue a prior conversation, you must pass the session_id returned by an earlier prompt call or by session_new; the remote agent keeps context under that session_id. If you omit session_id, this starts a new empty session with no prior context."
-        ),
+        None => format!("Send a prompt to the '{server_name}' ACP agent. {SESSION_ID_GUIDANCE}"),
     };
     ToolDeclaration {
         name: format!("{server_name}_session_prompt"),
@@ -508,11 +506,12 @@ fn required_string<'a>(
         .ok_or_else(|| anyhow!("ACP tool argument '{}' must be a string", key))
 }
 
-fn optional_string<'a>(
+fn optional_nonblank_string<'a>(
     arguments: &'a serde_json::Map<String, Value>,
     key: &str,
 ) -> Result<Option<&'a str>> {
     match arguments.get(key) {
+        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.as_str())),
         Some(Value::Null) | None => Ok(None),
         Some(_) => Err(anyhow!("ACP tool argument '{}' must be a string", key)),
@@ -887,7 +886,7 @@ enabled: false
         assert_eq!(
             descriptions.get("planner_session_prompt"),
             Some(
-                &"Send a prompt to the 'planner' ACP agent. To continue a prior conversation, you must pass the session_id returned by an earlier prompt call or by session_new; the remote agent keeps context under that session_id. If you omit session_id, this starts a new empty session with no prior context."
+                &"Send a prompt to the 'planner' ACP agent. To continue a conversation, pass only the exact session_id returned by session_prompt or session_new. To start a new conversation, omit session_id; empty or whitespace-only values also start a new session. Do not invent a session ID."
             )
         );
         assert_eq!(
@@ -1130,6 +1129,38 @@ enabled: false
 
         assert!(manager.get_client("disabled").is_none());
         assert_eq!(manager.get_all_tools_blocking().len(), 0);
+    }
+
+    #[test]
+    fn optional_nonblank_string_treats_blank_values_as_omitted() {
+        let empty = serde_json::Map::from_iter([(String::from("session_id"), json!(""))]);
+        let whitespace = serde_json::Map::from_iter([(String::from("session_id"), json!(" \t "))]);
+        let session =
+            serde_json::Map::from_iter([(String::from("session_id"), json!("session-1"))]);
+
+        assert_eq!(
+            optional_nonblank_string(&empty, "session_id").unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_nonblank_string(&whitespace, "session_id").unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_nonblank_string(&session, "session_id").unwrap(),
+            Some("session-1")
+        );
+
+        let absent = serde_json::Map::new();
+        let null = serde_json::Map::from_iter([(String::from("session_id"), Value::Null)]);
+        assert_eq!(
+            optional_nonblank_string(&absent, "session_id").unwrap(),
+            None
+        );
+        assert_eq!(optional_nonblank_string(&null, "session_id").unwrap(), None);
+
+        let wrong_type = serde_json::Map::from_iter([(String::from("session_id"), json!(123))]);
+        assert!(optional_nonblank_string(&wrong_type, "session_id").is_err());
     }
 
     #[test]
