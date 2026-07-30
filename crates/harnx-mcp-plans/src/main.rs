@@ -98,6 +98,25 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+fn print_help() {
+    eprintln!("harnx-mcp-plans: File-based todo/plan management MCP server");
+    eprintln!();
+    eprintln!("Usage: harnx-mcp-plans [OPTIONS]");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --dir, -d <path>           Set the plans directory (default: .agent/plans)");
+    eprintln!("  --retention-days, -r <N>   Set retention period in days (default: 14)");
+    eprintln!("  --http                     Serve MCP over Streamable HTTP at /mcp");
+    eprintln!("  --mcp-stdio                Serve MCP over stdio (default when --http is absent)");
+    eprintln!("  --host <addr>              Bind address for HTTP mode (default: 0.0.0.0)");
+    eprintln!("  --port <N>                 Bind port for HTTP mode (default: 3000)");
+    eprintln!("  --help, -h                 Show this help message");
+    eprintln!();
+    eprintln!("Env:");
+    eprintln!("  AGENT_PLANS_PATH         Overrides the default directory.");
+    eprintln!("  AGENT_PLANS_RETENTION_DAYS  Overrides the default retention days.");
+}
+
 fn parse_args() -> anyhow::Result<Args> {
     let args: Vec<String> = std::env::args().collect();
     let mut plans_dir: Option<PathBuf> = None;
@@ -139,6 +158,11 @@ fn parse_args() -> anyhow::Result<Args> {
                 http = true;
                 i += 1;
             }
+            "--mcp-stdio" => {
+                // No-op: stdio MCP mode is the default behavior when --http is absent.
+                // This flag exists so external callers can make stdio mode explicit.
+                i += 1;
+            }
             "--host" => {
                 if i + 1 < args.len() {
                     host = Some(args[i + 1].clone());
@@ -166,27 +190,7 @@ fn parse_args() -> anyhow::Result<Args> {
                 }
             }
             "--help" | "-h" => {
-                eprintln!("harnx-mcp-plans: File-based todo/plan management MCP server");
-                eprintln!();
-                eprintln!("Usage: harnx-mcp-plans [OPTIONS]");
-                eprintln!();
-                eprintln!("Options:");
-                eprintln!(
-                    "  --dir, -d <path>           Set the plans directory (default: .agent/plans)"
-                );
-                eprintln!(
-                    "  --retention-days, -r <N>   Set retention period in days (default: 14)"
-                );
-                eprintln!("  --http                     Serve MCP over Streamable HTTP at /mcp");
-                eprintln!(
-                    "  --host <addr>              Bind address for HTTP mode (default: 0.0.0.0)"
-                );
-                eprintln!("  --port <N>                 Bind port for HTTP mode (default: 3000)");
-                eprintln!("  --help, -h                 Show this help message");
-                eprintln!();
-                eprintln!("Env:");
-                eprintln!("  AGENT_PLANS_PATH         Overrides the default directory.");
-                eprintln!("  AGENT_PLANS_RETENTION_DAYS  Overrides the default retention days.");
+                print_help();
                 std::process::exit(0);
             }
             other => {

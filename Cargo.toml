@@ -14,6 +14,7 @@ members = [
     "crates/harnx-hooks",
     "crates/harnx-mcp",
     "crates/harnx-mcp-bash",
+    "crates/harnx-mcp-bridge",
     "crates/harnx-sandbox-common",
     "crates/harnx-sandbox-run",
     "crates/harnx-mcp-hooks-proxy",

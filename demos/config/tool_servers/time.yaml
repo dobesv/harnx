@@ -1,3 +1,2 @@
 command: harnx-time-server
 description: Time and timezone utilities — lets agents check the current time and wait.
-bin_override_env: HARNX_TIME_SERVER_BIN

@@ -1021,7 +1021,6 @@ mod tests {
             env: Default::default(),
             enabled: true,
             description: None,
-            bin_override_env: None,
             package: None,
         }
     }
@@ -1089,8 +1088,13 @@ mod tests {
     #[test]
     fn worker_startup_continues_when_configured_binary_is_missing() {
         harnx_core::require_nextest();
+        let missing_dir = tempfile::tempdir().expect("create missing-binary test directory");
         let mut missing_server = tool_server("time");
-        missing_server.bin_override_env = Some("HARNX_MISSING_TOOL_SERVER_BIN_TEST".to_string());
+        missing_server.command = missing_dir
+            .path()
+            .join("harnx-missing-tool-server")
+            .to_string_lossy()
+            .into_owned();
         let filtered = tool_servers_matching_use_tools(
             &[missing_server],
             None,

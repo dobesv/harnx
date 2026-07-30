@@ -1,0 +1,12 @@
+command: harnx-mcp-bridge
+description: >-
+  File-based plan/task/note management (MCP→NATS bridge) — used by orchestrator
+  agents to track multi-step work across sessions.
+args:
+  - --name
+  - plans
+  - --
+  - harnx-mcp-plans
+  - --mcp-stdio
+  - --dir
+  - .agent/plans

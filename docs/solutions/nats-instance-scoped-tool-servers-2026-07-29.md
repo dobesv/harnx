@@ -77,7 +77,7 @@ async fn invoke(
 
 ## Worker bootstrap and coexistence
 
-Phase 2a initially used a private built-in bootstrap list (`LOCAL_BOOTSTRAP_SERVERS`). In Phase 2b (slice a), this hardcoded list was replaced with generalized, config-driven tool-server declarations loaded from `tool_servers/*.yaml` (across user config and package directories). The `time` tool server now ships via `tool_servers/time.yaml`, with `HARNX_TIME_SERVER_BIN` retained as a per-server binary override seam for integration testing.
+Phase 2a initially used a private built-in bootstrap list (`LOCAL_BOOTSTRAP_SERVERS`). In Phase 2b (slice a), this hardcoded list was replaced with generalized, config-driven tool-server declarations loaded from `tool_servers/*.yaml` (across user config and package directories). The `time` tool server now ships via `tool_servers/time.yaml`.
 
 The local worker spawns tool servers lazy-on-demand only when their tool-name prefix could match the active agent's `use_tools` selectors. Servers receive `HARNX_INSTANCE_ID`, `HARNX_NATS_URL`, and `HARNX_NATS_TOKEN`. If a declared tool-server binary is missing or exits prematurely, the worker emits a UI warning (`AgentEvent::Notice(Warning)`) and continues running rather than failing hard. Non-local workers do not start local tool servers, preserving remote `agent@cluster` behavior.
 

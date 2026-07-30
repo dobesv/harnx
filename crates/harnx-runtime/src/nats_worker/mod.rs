@@ -38,4 +38,4 @@ pub use daemon::{
     new_remote_session_id, notify_subject, publish_session_activate, run_worker_daemon,
     worker_ready_subject, SessionActivate, WorkerDaemonConfig,
 };
-pub use tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor, HARNX_TIME_SERVER_BIN};
+pub use tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};

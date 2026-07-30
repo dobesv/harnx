@@ -17,7 +17,6 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-pub const HARNX_TIME_SERVER_BIN: &str = "HARNX_TIME_SERVER_BIN";
 const TOOL_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Connection and identity shared by all tool servers spawned for one worker.
@@ -157,19 +156,6 @@ impl Drop for ToolServerSupervisor {
 }
 
 fn resolve_tool_binary(server: &ToolServerConfig) -> Result<PathBuf> {
-    if let Some(override_env) = &server.bin_override_env {
-        if let Some(path) = std::env::var_os(override_env) {
-            let path = PathBuf::from(path);
-            if path.is_file() {
-                return Ok(path);
-            }
-            bail!(
-                "{override_env} points to a missing tool-server binary: {}",
-                path.display()
-            );
-        }
-    }
-
     let current = std::env::current_exe().context("resolve current worker executable")?;
     let directory = current
         .parent()
