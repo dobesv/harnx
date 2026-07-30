@@ -397,7 +397,9 @@ impl ClientHandler for BridgeClientHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, BridgeToolset};
+    use super::Args;
+    #[cfg(unix)]
+    use super::BridgeToolset;
 
     #[test]
     fn arg_parses_child_command_and_flags_after_separator() {
