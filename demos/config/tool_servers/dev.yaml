@@ -1,9 +1,13 @@
-command: harnx-mock-mcp
-args:
-  - --script
-  - demos/scripts/agent-tools.yaml
+command: harnx-mcp-bridge
 description: >-
   Deterministic mock dev tools (read_file / apply_edit / run) for the agent
   coding-session demo. Returns canned results — nothing actually executes.
   Paths are resolved from the repo root, which render.sh cd's into before
   launching harnx.
+args:
+  - --name
+  - dev
+  - --
+  - harnx-mock-mcp
+  - --script
+  - demos/scripts/agent-tools.yaml

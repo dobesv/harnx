@@ -1,11 +1,13 @@
 # Note: set EXA_API_KEY in ~/.local/share/harnx/.env
-command: npx
-args:
-  - "-y"
-  - "exa-mcp-server"
+command: harnx-mcp-bridge
 enabled: true
 description: "Web search via Exa API"
-# If you've wrapped npx/node with a harnx sandbox, this allows the EXA_API_KEY to pass through
+args:
+  - --name
+  - exa
+  - --
+  - npx
+  - "-y"
+  - exa-mcp-server
 env:
   HARNX_BASH_ENV_PASSTHROUGH: EXA_API_KEY
-
