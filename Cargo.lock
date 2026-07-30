@@ -4430,6 +4430,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-vercel-grep-server"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "fancy-regex 0.18.0",
+ "log",
+ "reqwest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

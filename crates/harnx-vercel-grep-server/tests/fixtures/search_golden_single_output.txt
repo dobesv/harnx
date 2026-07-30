@@ -1,0 +1,39 @@
+{
+  "query": "FastAPI",
+  "summary": {
+    "total_results": 1234,
+    "results_shown": 1,
+    "repositories_found": 1,
+    "top_languages": [
+      {
+        "language": "Python",
+        "count": 500
+      }
+    ],
+    "top_repositories": [
+      {
+        "repository": "fastapi/fastapi",
+        "count": 100
+      }
+    ]
+  },
+  "results_by_repository": [
+    {
+      "repository": "fastapi/fastapi",
+      "matches_count": 5,
+      "files": [
+        {
+          "file_path": "src/main.py",
+          "branch": "main",
+          "total_matches": 5,
+          "line_numbers": [
+            10,
+            11
+          ],
+          "language": "python",
+          "code_snippet": "```python\nimport fastapi\napp = FastAPI()\n```"
+        }
+      ]
+    }
+  ]
+}

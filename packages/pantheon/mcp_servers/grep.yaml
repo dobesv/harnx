@@ -1,9 +1,7 @@
-command: uvx
-args:
-  - "grep-mcp"
+command: harnx-vercel-grep-server
 description: >-
   GitHub code search via grep.app. Used by Pytheas, Sisyphus, and Zosimus
   to find real-world usage examples of APIs and patterns in public repos.
 
-# Requires: uv / uvx  (https://docs.astral.sh/uv/)
+# Native harnx binary — no external runtime needed.
 # No API key needed.
