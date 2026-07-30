@@ -139,6 +139,11 @@ fn parse_args() -> anyhow::Result<Args> {
                 http = true;
                 i += 1;
             }
+            "--mcp-stdio" => {
+                // No-op: stdio MCP mode is the default behavior when --http is absent.
+                // This flag exists so external callers can make stdio mode explicit.
+                i += 1;
+            }
             "--host" => {
                 if i + 1 < args.len() {
                     host = Some(args[i + 1].clone());

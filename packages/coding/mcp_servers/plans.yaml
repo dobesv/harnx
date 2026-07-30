@@ -1,7 +1,0 @@
-command: harnx-mcp-plans
-description: >-
-  File-based plan/task/note management — used by orchestrator agents
-  (Sisyphus, Atlas, Daedalus) to track multi-step work across sessions.
-args:
-  - --dir
-  - .agent/plans   # plans are stored relative to the working directory

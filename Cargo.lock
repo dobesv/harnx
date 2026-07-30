@@ -3910,6 +3910,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-mcp-bridge"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "clap",
+ "harnx-core",
+ "harnx-toolset",
+ "harnx-toolset-server",
+ "libc",
+ "log",
+ "process-wrap",
+ "rmcp",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "which",
+]
+
+[[package]]
 name = "harnx-mcp-fs"
 version = "0.33.4"
 dependencies = [
@@ -3971,6 +3993,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "similar 3.1.1",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tower",

@@ -23,6 +23,7 @@ similar = { workspace = true }
 
 [dev-dependencies]
 filetime = "0.2"
+tempfile = "3"
 
 [[bin]]
 name = "harnx-mcp-plans"
