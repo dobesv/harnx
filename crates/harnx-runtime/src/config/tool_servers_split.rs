@@ -44,13 +44,6 @@ pub struct ToolServerConfig {
     #[serde(default)]
     pub description: Option<String>,
 
-    /// Optional environment variable naming an override path for the server binary.
-    ///
-    /// This provides a test/dev seam for substituting a different binary.
-    /// Replaces the older per-server override constants like `HARNX_TIME_SERVER_BIN`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bin_override_env: Option<String>,
-
     /// Package this server belongs to, set at runtime by the package loader.
     ///
     /// `None` for user-provided configs; `Some(package_name)` for servers
@@ -109,7 +102,6 @@ command: harnx-time-server
         assert!(config.env.is_empty());
         assert!(config.enabled);
         assert!(config.description.is_none());
-        assert!(config.bin_override_env.is_none());
         assert!(config.package.is_none());
     }
 

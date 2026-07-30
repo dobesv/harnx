@@ -32,7 +32,7 @@ Phase 2b generalizes tool-server bootstrap into declarative configuration:
 
 3. **Resilient process supervision**: Missing binaries or crashing tool servers emit a UI warning (`AgentEvent::Notice(Warning)`) while worker execution continues.
 
-4. **Time tool migration**: The hardcoded `LOCAL_BOOTSTRAP_SERVERS` constant and `BootstrapServer` struct were removed. `time` now ships as `harnx-time-server` in `tool_servers/time.yaml`. The `HARNX_TIME_SERVER_BIN` environment variable remains as a per-server binary override seam for integration tests.
+4. **Time tool migration**: The hardcoded `LOCAL_BOOTSTRAP_SERVERS` constant and `BootstrapServer` struct were removed. `time` now ships as `harnx-time-server` in `tool_servers/time.yaml`.
 
 ## Key Learning: KV-Key Name Collision Requires Pre-Spawn Deduplication
 
