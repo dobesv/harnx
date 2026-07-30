@@ -7,3 +7,4 @@
 *.snap.new
 target-local/
 .pnpm-store/
+__pycache__
