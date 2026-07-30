@@ -25,10 +25,12 @@ mod session_ops_core;
 mod session_ops_split;
 pub mod session_ops_title;
 mod settings_split;
+mod tool_servers_split;
 
 pub use self::env_split::load_env_file;
 pub use self::macros_split::macro_execute;
 pub use self::nats_split::{resolve_local_nats_server_config, NatsServerConfig};
+pub use self::tool_servers_split::ToolServerConfig;
 
 /// Reserved cluster identity for the auto-managed shared local NATS broker.
 ///
@@ -57,6 +59,7 @@ pub use self::attachments::{write_attachment, Base64Encoder};
 pub use self::input::Input;
 pub use self::patches_split::acp_server_display_name;
 pub use self::patches_split::mcp_server_display_name;
+pub(crate) use self::patches_split::server_display_name;
 use self::patches_split::{
     apply_client_patch, apply_mcp_server_patch, load_package_mcp_patch, package_dir_name,
 };
@@ -300,6 +303,7 @@ pub struct Config {
     pub nats_servers: Vec<NatsServerConfig>,
     pub mcp_servers: Vec<McpServerConfig>,
     pub acp_servers: Vec<AcpServerConfig>,
+    pub tool_servers: Vec<ToolServerConfig>,
 
     // Runtime state — unchanged from pre-A2:
     pub model_cooldowns: std::sync::Arc<parking_lot::Mutex<crate::client::retry::ModelCooldownMap>>,
@@ -362,6 +366,7 @@ impl std::fmt::Debug for Config {
             .field("clients", &self.clients)
             .field("mcp_servers", &self.mcp_servers)
             .field("acp_servers", &self.acp_servers)
+            .field("tool_servers", &self.tool_servers)
             .field("macro_flag", &self.macro_flag)
             .field("info_flag", &self.info_flag)
             .field("agent_variables", &self.agent_variables)
@@ -387,6 +392,7 @@ impl Clone for Config {
             nats_servers: self.nats_servers.clone(),
             mcp_servers: self.mcp_servers.clone(),
             acp_servers: self.acp_servers.clone(),
+            tool_servers: self.tool_servers.clone(),
             model_cooldowns: self.model_cooldowns.clone(),
             macro_flag: self.macro_flag,
             info_flag: self.info_flag,
@@ -435,6 +441,7 @@ impl Config {
             nats_servers: self.nats_servers.clone(),
             mcp_servers: self.mcp_servers.clone(),
             acp_servers: self.acp_servers.clone(),
+            tool_servers: self.tool_servers.clone(),
             model_cooldowns: self.model_cooldowns.clone(),
             macro_flag: self.macro_flag,
             info_flag: self.info_flag,
@@ -473,6 +480,7 @@ impl Default for Config {
             nats_servers: vec![],
             mcp_servers: vec![],
             acp_servers: vec![],
+            tool_servers: vec![],
 
             model_cooldowns: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
             macro_flag: false,

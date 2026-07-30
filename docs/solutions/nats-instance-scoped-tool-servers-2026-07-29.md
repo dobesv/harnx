@@ -77,19 +77,13 @@ async fn invoke(
 
 ## Worker bootstrap and coexistence
 
-Phase 2a intentionally uses a private built-in bootstrap list with one entry:
+Phase 2a initially used a private built-in bootstrap list (`LOCAL_BOOTSTRAP_SERVERS`). In Phase 2b (slice a), this hardcoded list was replaced with generalized, config-driven tool-server declarations loaded from `tool_servers/*.yaml` (across user config and package directories). The `time` tool server now ships via `tool_servers/time.yaml`, with `HARNX_TIME_SERVER_BIN` retained as a per-server binary override seam for integration testing.
 
-```text
-server: time
-binary: harnx-time-server
-override: HARNX_TIME_SERVER_BIN
-```
+The local worker spawns tool servers lazy-on-demand only when their tool-name prefix could match the active agent's `use_tools` selectors. Servers receive `HARNX_INSTANCE_ID`, `HARNX_NATS_URL`, and `HARNX_NATS_TOKEN`. If a declared tool-server binary is missing or exits prematurely, the worker emits a UI warning (`AgentEvent::Notice(Warning)`) and continues running rather than failing hard. Non-local workers do not start local tool servers, preserving remote `agent@cluster` behavior.
 
-The local worker starts that binary with `HARNX_INSTANCE_ID`, `HARNX_NATS_URL`, and `HARNX_NATS_TOKEN`, waits for registration, and keeps its process monitor for worker lifetime. Non-local workers don't start the pilot, so remote `agent@cluster` behavior is unchanged.
+`NatsToolProvider` snapshots registrations into declarations and is ordered before ACP, MCP, and session-history providers. NATS therefore wins a name collision during incremental migration. Tools without NATS registrations continue through their existing stdio provider. The e2e test executes a real `get_current_time` over NATS and `legacy_get_current_time` through the same binary's `--mcp-stdio` adapter in one tool-evaluation batch.
 
-`NatsToolProvider` snapshots registrations into declarations and is ordered before ACP, MCP, and session-history providers. NATS therefore wins a name collision during incremental migration. Tools without NATS registrations continue through their existing stdio provider. The Phase 2a e2e test executes a real `get_current_time` over NATS and `legacy_get_current_time` through the same binary's `--mcp-stdio` adapter in one tool-evaluation batch.
-
-Phase 2b should replace the private list with generalized tool-server configuration and migrate remaining toolsets and sub-agents. It must preserve mixed operation until each migration is complete.
+Phase 2b slice a completed replacing the hardcoded bootstrap list with `tool_servers/*.yaml`. Remaining Phase 2b future work (migrating other toolsets, sub-agent NATS integration, and eventually removing stdio) remains open while preserving mixed operation until complete.
 
 ## Trust policy and ACP recursion guard
 
@@ -114,4 +108,4 @@ The test detects `nats-server` through `NATS_SERVER_BIN` first and then `PATH`. 
 
 - GitHub issue: [#1224](https://github.com/dobesv/harnx/issues/1224)
 - Phase 1: `docs/solutions/nats-local-frontend-backend-split-2026-07-28.md`
-- Phase 2b: return to planning for remaining toolsets, sub-agents, generalized bootstrap configuration, and stdio removal.
+- Phase 2b: slice a delivered config-driven bootstrap (`tool_servers/*.yaml`). Remaining work covers other toolsets, sub-agents, and stdio removal.

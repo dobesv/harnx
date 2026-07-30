@@ -1,9 +1,11 @@
-use crate::config::{HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
+use crate::config::{ToolServerConfig, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
 use crate::nats_tool_provider::NatsInFlightCalls;
 use anyhow::{bail, Context, Result};
 use async_nats::jetstream::{self, kv, stream};
 use futures_util::StreamExt;
+use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
+use harnx_core::sink::emit_agent_event;
 use harnx_toolset::Registration;
 use harnx_toolset_server::{registration_key, TOOL_REGISTRY_BUCKET};
 use std::collections::HashMap;
@@ -17,19 +19,6 @@ use tokio::task::JoinHandle;
 
 pub const HARNX_TIME_SERVER_BIN: &str = "HARNX_TIME_SERVER_BIN";
 const TOOL_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-
-#[derive(Clone, Copy)]
-struct BootstrapServer {
-    server: &'static str,
-    binary: &'static str,
-    override_env: &'static str,
-}
-
-const LOCAL_BOOTSTRAP_SERVERS: &[BootstrapServer] = &[BootstrapServer {
-    server: "time",
-    binary: "harnx-time-server",
-    override_env: HARNX_TIME_SERVER_BIN,
-}];
 
 /// Connection and identity shared by all tool servers spawned for one worker.
 pub struct ToolServerStartConfig {
@@ -62,66 +51,95 @@ pub struct ToolServerSupervisor {
 }
 
 impl ToolServerSupervisor {
-    /// Spawn the built-in local pilot and wait for its registration.
-    pub async fn start_local(config: ToolServerStartConfig) -> Result<Self> {
-        Self::start_local_with_timeout(config, TOOL_STARTUP_TIMEOUT).await
+    /// Spawn enabled local tool servers and wait for their registrations.
+    pub async fn start_local(
+        config: ToolServerStartConfig,
+        servers: &[ToolServerConfig],
+    ) -> Result<Self> {
+        Self::start_local_with_timeout(config, servers, TOOL_STARTUP_TIMEOUT).await
     }
 
     /// Same startup path with an explicit readiness timeout for tests and callers.
     pub async fn start_local_with_timeout(
         config: ToolServerStartConfig,
+        servers: &[ToolServerConfig],
         readiness_timeout: Duration,
     ) -> Result<Self> {
-        let registry = ensure_registry_bucket(&config.client).await?;
-        let mut watches = Vec::new();
-        for bootstrap in LOCAL_BOOTSTRAP_SERVERS {
-            let key = registration_key(&config.instance_id, bootstrap.server);
-            let _ = registry.delete(&key).await;
-            let watch = registry
-                .watch_with_history(&key)
-                .await
-                .with_context(|| format!("watch tool registration '{key}'"))?;
-            watches.push((*bootstrap, key, watch));
-        }
-
         let processes = Arc::new(Mutex::new(HashMap::new()));
-        let in_flight = NatsInFlightCalls::for_instance(&config.instance_id);
         let mut supervisor = Self {
             processes: Arc::clone(&processes),
             tasks: Vec::new(),
         };
-        for bootstrap in LOCAL_BOOTSTRAP_SERVERS {
-            let child = spawn_tool_server(&config, bootstrap)?;
-            let pid = child
-                .id()
-                .with_context(|| format!("{} child has no process ID", bootstrap.binary))?;
-            processes
-                .lock()
-                .await
-                .insert(pid, bootstrap.server.to_string());
-            supervisor.tasks.push(spawn_child_monitor(
-                child,
-                pid,
-                bootstrap.server.to_string(),
-                config.instance_id.clone(),
-                config.client.clone(),
-                Arc::clone(&processes),
-                in_flight.clone(),
-            ));
+        let enabled: Vec<_> = servers.iter().filter(|server| server.enabled).collect();
+        if enabled.is_empty() {
+            return Ok(supervisor);
+        }
+
+        let registry = match ensure_registry_bucket(&config.client).await {
+            Ok(registry) => registry,
+            Err(error) => {
+                for server in enabled {
+                    warn_server_failure(&server.name, format!("prepare tool registry: {error:#}"));
+                }
+                return Ok(supervisor);
+            }
+        };
+
+        let mut watches = Vec::new();
+        for server in &enabled {
+            let key = registration_key(&config.instance_id, &server.name);
+            let _ = registry.delete(&key).await;
+            match registry.watch_with_history(&key).await {
+                Ok(watch) => watches.push((*server, key, watch)),
+                Err(error) => warn_server_failure(
+                    &server.name,
+                    format!("watch tool registration '{key}': {error:#}"),
+                ),
+            }
+        }
+
+        let in_flight = NatsInFlightCalls::for_instance(&config.instance_id);
+        for server in enabled {
+            match spawn_tool_server(&config, server) {
+                Ok(child) => {
+                    let Some(pid) = child.id() else {
+                        warn_server_failure(&server.name, "spawned child has no process ID");
+                        continue;
+                    };
+                    processes.lock().await.insert(pid, server.name.clone());
+                    supervisor.tasks.push(spawn_child_monitor(
+                        child,
+                        pid,
+                        server.name.clone(),
+                        config.instance_id.clone(),
+                        config.client.clone(),
+                        Arc::clone(&processes),
+                        in_flight.clone(),
+                    ));
+                }
+                Err(error) => warn_server_failure(&server.name, format!("{error:#}")),
+            }
         }
 
         let deadline = Instant::now() + readiness_timeout;
-        for (bootstrap, key, mut watch) in watches {
-            wait_for_registration(
-                &mut watch,
-                &processes,
-                bootstrap.server,
-                &key,
-                deadline,
-                readiness_timeout,
-            )
-            .await?;
-        }
+        let readiness = watches.into_iter().map(|(server, key, mut watch)| {
+            let processes = Arc::clone(&processes);
+            async move {
+                if let Err(error) = wait_for_registration(
+                    &mut watch,
+                    &processes,
+                    &server.name,
+                    &key,
+                    deadline,
+                    readiness_timeout,
+                )
+                .await
+                {
+                    warn_server_failure(&server.name, format!("{error:#}"));
+                }
+            }
+        });
+        futures_util::future::join_all(readiness).await;
         Ok(supervisor)
     }
 
@@ -138,46 +156,57 @@ impl Drop for ToolServerSupervisor {
     }
 }
 
-fn resolve_tool_binary(bootstrap: &BootstrapServer) -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os(bootstrap.override_env) {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Ok(path);
+fn resolve_tool_binary(server: &ToolServerConfig) -> Result<PathBuf> {
+    if let Some(override_env) = &server.bin_override_env {
+        if let Some(path) = std::env::var_os(override_env) {
+            let path = PathBuf::from(path);
+            if path.is_file() {
+                return Ok(path);
+            }
+            bail!(
+                "{override_env} points to a missing tool-server binary: {}",
+                path.display()
+            );
         }
-        bail!(
-            "{} points to a missing tool-server binary: {}",
-            bootstrap.override_env,
-            path.display()
-        );
     }
+
     let current = std::env::current_exe().context("resolve current worker executable")?;
     let directory = current
         .parent()
         .context("current worker executable has no parent directory")?;
-    let mut path = directory.join(bootstrap.binary);
-    if directory.file_name().is_some_and(|name| name == "deps") {
-        path = directory
+    let directory = if directory.file_name().is_some_and(|name| name == "deps") {
+        directory
             .parent()
             .context("test executable deps directory has no parent")?
-            .join(bootstrap.binary);
-    }
+    } else {
+        directory
+    };
+    let next_to_worker = directory.join(&server.command);
     #[cfg(windows)]
-    path.set_extension("exe");
-    if !path.is_file() {
-        bail!(
-            "{} binary not found next to worker at {}; set {}",
-            bootstrap.binary,
-            path.display(),
-            bootstrap.override_env
-        );
+    let next_to_worker = if next_to_worker.extension().is_none() {
+        next_to_worker.with_extension("exe")
+    } else {
+        next_to_worker
+    };
+    if next_to_worker.is_file() {
+        return Ok(next_to_worker);
     }
-    Ok(path)
+
+    which::which(&server.command).with_context(|| {
+        format!(
+            "tool-server command '{}' not found next to worker at {} or on PATH",
+            server.command,
+            next_to_worker.display()
+        )
+    })
 }
 
-fn spawn_tool_server(config: &ToolServerStartConfig, bootstrap: &BootstrapServer) -> Result<Child> {
-    let binary = resolve_tool_binary(bootstrap)?;
+fn spawn_tool_server(config: &ToolServerStartConfig, server: &ToolServerConfig) -> Result<Child> {
+    let binary = resolve_tool_binary(server)?;
     let mut command = Command::new(&binary);
     command
+        .args(&server.args)
+        .envs(&server.env)
         .env(HARNX_INSTANCE_ID, config.instance_id.as_str())
         .env(HARNX_NATS_URL_ENV, &config.nats_url)
         .env(HARNX_NATS_TOKEN_ENV, &config.token)
@@ -189,10 +218,21 @@ fn spawn_tool_server(config: &ToolServerStartConfig, bootstrap: &BootstrapServer
     command.spawn().with_context(|| {
         format!(
             "spawn tool server '{}' from {}",
-            bootstrap.server,
+            server.name,
             binary.display()
         )
     })
+}
+
+fn warn_server_failure(server: &str, detail: impl std::fmt::Display) {
+    emit_warning(format!("tool server '{server}' failed to start: {detail}"));
+}
+
+fn emit_warning(message: String) {
+    if !emit_agent_event(AgentEvent::Notice(NoticeEvent::Warning(message.clone()))) {
+        eprintln!("Warning: {message}");
+    }
+    log::warn!("{message}");
 }
 
 fn spawn_child_monitor(
@@ -215,6 +255,7 @@ fn spawn_child_monitor(
             Err(error) => format!("wait error: {error}"),
         };
         let message = format!("tool server '{server}' crashed, exit {exit}");
+        emit_warning(message.clone());
         in_flight.fail_server_unavailable(&server, message).await;
         remove_registration(&client, &instance_id, &server).await;
     })

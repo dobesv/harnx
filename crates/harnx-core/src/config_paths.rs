@@ -58,6 +58,9 @@ pub const MCP_SERVERS_DIR_NAME: &str = "mcp_servers";
 /// Subdirectory holding per-ACP-server YAML files.
 pub const ACP_SERVERS_DIR_NAME: &str = "acp_servers";
 
+/// Subdirectory holding per-tool-server YAML files.
+pub const TOOL_SERVERS_DIR_NAME: &str = "tool_servers";
+
 /// Canonical crate-name prefix for HARNX_* env variables and the
 /// `~/.config/harnx` subdirectory. Hardcoded as a literal because this
 /// module lives in `harnx-core` but resolves paths for the `harnx` app.
@@ -223,6 +226,11 @@ pub fn mcp_servers_dir() -> PathBuf {
 /// Subdirectory holding per-ACP-server YAML files.
 pub fn acp_servers_dir() -> PathBuf {
     config_dir_path().join(ACP_SERVERS_DIR_NAME)
+}
+
+/// Subdirectory holding per-tool-server YAML files.
+pub fn tool_servers_dir() -> PathBuf {
+    config_dir_path().join(TOOL_SERVERS_DIR_NAME)
 }
 
 /// Root directory for all installed packages: `<config_dir>/packages/`.

@@ -135,11 +135,20 @@ fn server_target_qualified(name: &str, package: Option<&str>) -> String {
 /// - Same-package servers: bare name (the yaml stem, e.g. `fs`).
 /// - Other-package servers: `<sanitized_pkg>__<bare_name>` (e.g. `otherpkg__db`).
 pub fn mcp_server_display_name(server: &McpServerConfig, agent_package: Option<&str>) -> String {
+    server_display_name(&server.name, server.package.as_deref(), agent_package)
+}
+
+/// Compute a tool-facing server name from its name and package scope.
+pub(crate) fn server_display_name(
+    name: &str,
+    package: Option<&str>,
+    agent_package: Option<&str>,
+) -> String {
     use harnx_core::package_namespace::sanitize_for_tool_name;
-    match (&server.package, agent_package) {
-        (None, _) => server.name.clone(),
-        (Some(pkg), Some(active_package)) if pkg == active_package => server.name.clone(),
-        (Some(pkg), _) => format!("{}__{}", sanitize_for_tool_name(pkg), server.name),
+    match (package, agent_package) {
+        (None, _) => name.to_string(),
+        (Some(pkg), Some(active_package)) if pkg == active_package => name.to_string(),
+        (Some(pkg), _) => format!("{}__{name}", sanitize_for_tool_name(pkg)),
     }
 }
 

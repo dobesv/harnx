@@ -13,6 +13,7 @@ COPY linux-${TARGETARCH}/harnx-mcp-bash /usr/local/bin/harnx-mcp-bash
 COPY linux-${TARGETARCH}/harnx-mcp-fs /usr/local/bin/harnx-mcp-fs
 COPY linux-${TARGETARCH}/harnx-mcp-plans /usr/local/bin/harnx-mcp-plans
 COPY linux-${TARGETARCH}/harnx-mcp-time /usr/local/bin/harnx-mcp-time
+COPY linux-${TARGETARCH}/harnx-time-server /usr/local/bin/harnx-time-server
 COPY linux-${TARGETARCH}/harnx-aws-creds /usr/local/bin/harnx-aws-creds
 COPY linux-${TARGETARCH}/harnx-k8s-creds /usr/local/bin/harnx-k8s-creds
 COPY linux-${TARGETARCH}/harnx-pkg /usr/local/bin/harnx-pkg
