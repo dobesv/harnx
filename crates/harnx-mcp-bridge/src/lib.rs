@@ -21,7 +21,7 @@ use rmcp::model::{
 use rmcp::service::{Peer, RequestContext, RoleClient, ServiceError};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio_util::sync::CancellationToken;
 
 const STDERR_TAIL_LINES: usize = 50;
@@ -29,6 +29,12 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(10);
 
 type StderrTail = Arc<Mutex<VecDeque<String>>>;
+type SpawnedChild = (
+    Box<dyn ChildWrapper>,
+    ChildStdin,
+    ChildStdout,
+    Option<ChildStderr>,
+);
 
 /// Command-line arguments for the MCP-to-NATS bridge.
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
@@ -70,6 +76,122 @@ pub struct BridgeToolset {
     stderr_tail: StderrTail,
 }
 
+fn spawn_child(server_name: &str, program: &str, args: &[String]) -> anyhow::Result<SpawnedChild> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    configure_child_process(&mut command);
+
+    // A separate process group prevents terminal SIGINT from reaching the child.
+    #[allow(unused_mut)]
+    let mut wrap = CommandWrap::from(command);
+    #[cfg(unix)]
+    wrap.wrap(ProcessGroup::leader());
+
+    let mut child = wrap
+        .spawn()
+        .with_context(|| format!("Failed to spawn MCP server '{server_name}'"))?;
+    let stdin = child
+        .stdin()
+        .take()
+        .ok_or_else(|| anyhow!("MCP server '{server_name}' stdin not piped"))?;
+    let stdout = child
+        .stdout()
+        .take()
+        .ok_or_else(|| anyhow!("MCP server '{server_name}' stdout not piped"))?;
+    let stderr = child.stderr().take();
+    Ok((child, stdin, stdout, stderr))
+}
+
+fn spawn_stderr_reader(server_name: &str, stderr: Option<ChildStderr>) -> StderrTail {
+    let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
+    if let Some(stderr) = stderr {
+        let reader_server_name = server_name.to_owned();
+        let reader_tail = Arc::clone(&stderr_tail);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                log::debug!("[mcp:{reader_server_name}] {line}");
+                let mut tail = reader_tail.lock().unwrap_or_else(|err| err.into_inner());
+                if tail.len() == STDERR_TAIL_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+        });
+    }
+    stderr_tail
+}
+
+async fn connect_and_list_tools(
+    server_name: &str,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    stderr_tail: &StderrTail,
+) -> anyhow::Result<(
+    rmcp::service::RunningService<RoleClient, BridgeClientHandler>,
+    Vec<ToolSpec>,
+)> {
+    let transport =
+        rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(stdout, stdin);
+    let service = match tokio::time::timeout(
+        INITIALIZE_TIMEOUT,
+        rmcp::service::serve_client(BridgeClientHandler, transport),
+    )
+    .await
+    {
+        Err(_) => bail!(
+            "MCP server '{}' timed out during initialization (30s){}",
+            server_name,
+            render_stderr_tail(stderr_tail)
+        ),
+        Ok(Err(err)) => {
+            return Err(anyhow::Error::from(err)).with_context(|| {
+                format!(
+                    "Failed to initialize MCP client for server '{}'{}",
+                    server_name,
+                    render_stderr_tail(stderr_tail)
+                )
+            });
+        }
+        Ok(Ok(service)) => service,
+    };
+
+    let listed = match tokio::time::timeout(
+        LIST_TOOLS_TIMEOUT,
+        service.peer().list_tools(Default::default()),
+    )
+    .await
+    {
+        Err(_) => bail!(
+            "MCP server '{}' timed out listing tools (10s){}",
+            server_name,
+            render_stderr_tail(stderr_tail)
+        ),
+        Ok(Err(err)) => {
+            return Err(anyhow::Error::from(err)).with_context(|| {
+                format!(
+                    "Failed to list tools for MCP server '{}'{}",
+                    server_name,
+                    render_stderr_tail(stderr_tail)
+                )
+            });
+        }
+        Ok(Ok(result)) => result,
+    };
+    let cached_tools = listed
+        .tools
+        .into_iter()
+        .map(|tool| map_tool(server_name, tool))
+        .collect();
+
+    Ok((service, cached_tools))
+}
+
 impl BridgeToolset {
     /// Spawns a stdio MCP server, initializes its client connection, and lists tools once.
     pub async fn new(
@@ -80,105 +202,11 @@ impl BridgeToolset {
         let (program, args) = child_argv
             .split_first()
             .ok_or_else(|| anyhow!("MCP server '{}' command is empty", server_name))?;
+        let (child, stdin, stdout, stderr) = spawn_child(&server_name, program, args)?;
+        let stderr_tail = spawn_stderr_reader(&server_name, stderr);
+        let (service, cached_tools) =
+            connect_and_list_tools(&server_name, stdin, stdout, &stderr_tail).await?;
 
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        configure_child_process(&mut command);
-
-        // A separate process group prevents terminal SIGINT from reaching the child.
-        #[allow(unused_mut)]
-        let mut wrap = CommandWrap::from(command);
-        #[cfg(unix)]
-        wrap.wrap(ProcessGroup::leader());
-
-        let mut child = wrap
-            .spawn()
-            .with_context(|| format!("Failed to spawn MCP server '{server_name}'"))?;
-        let stdin = child
-            .stdin()
-            .take()
-            .ok_or_else(|| anyhow!("MCP server '{server_name}' stdin not piped"))?;
-        let stdout = child
-            .stdout()
-            .take()
-            .ok_or_else(|| anyhow!("MCP server '{server_name}' stdout not piped"))?;
-        let stderr = child.stderr().take();
-
-        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
-        if let Some(stderr) = stderr {
-            let reader_server_name = server_name.clone();
-            let reader_tail = Arc::clone(&stderr_tail);
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    log::debug!("[mcp:{reader_server_name}] {line}");
-                    let mut tail = reader_tail.lock().unwrap_or_else(|err| err.into_inner());
-                    if tail.len() == STDERR_TAIL_LINES {
-                        tail.pop_front();
-                    }
-                    tail.push_back(line);
-                }
-            });
-        }
-
-        let transport =
-            rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(stdout, stdin);
-        let service = match tokio::time::timeout(
-            INITIALIZE_TIMEOUT,
-            rmcp::service::serve_client(BridgeClientHandler, transport),
-        )
-        .await
-        {
-            Err(_) => bail!(
-                "MCP server '{}' timed out during initialization (30s){}",
-                server_name,
-                render_stderr_tail(&stderr_tail)
-            ),
-            Ok(Err(err)) => {
-                return Err(anyhow::Error::from(err)).with_context(|| {
-                    format!(
-                        "Failed to initialize MCP client for server '{}'{}",
-                        server_name,
-                        render_stderr_tail(&stderr_tail)
-                    )
-                });
-            }
-            Ok(Ok(service)) => service,
-        };
-
-        let listed = match tokio::time::timeout(
-            LIST_TOOLS_TIMEOUT,
-            service.peer().list_tools(Default::default()),
-        )
-        .await
-        {
-            Err(_) => bail!(
-                "MCP server '{}' timed out listing tools (10s){}",
-                server_name,
-                render_stderr_tail(&stderr_tail)
-            ),
-            Ok(Err(err)) => {
-                return Err(anyhow::Error::from(err)).with_context(|| {
-                    format!(
-                        "Failed to list tools for MCP server '{}'{}",
-                        server_name,
-                        render_stderr_tail(&stderr_tail)
-                    )
-                });
-            }
-            Ok(Ok(result)) => result,
-        };
-
-        let cached_tools = listed
-            .tools
-            .into_iter()
-            .map(|tool| map_tool(&server_name, tool))
-            .collect();
         let peer = service.peer().clone();
         let child_died = CancellationToken::new();
         let watch_token = child_died.clone();

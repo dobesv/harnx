@@ -355,8 +355,22 @@ async fn time_over_nats_pilot_e2e_mixed_stdio_cancel_and_crash() -> Result<()> {
 }
 
 #[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn tool_server_readiness_failure_warns_and_continues() -> Result<()> {
+struct ReadinessTestFixture {
+    _server: common::NatsServerHandle,
+    _directory: tempfile::TempDir,
+    client: async_nats::Client,
+    instance_id: InstanceId,
+    sink: Arc<RecordingEventSink>,
+    supervisor: ToolServerSupervisor,
+}
+
+#[cfg(unix)]
+async fn start_readiness_test(
+    fake_binary_name: &str,
+    fake_server_name: &str,
+    healthy_binary: Option<String>,
+    timeout: Duration,
+) -> Result<Option<ReadinessTestFixture>> {
     use std::os::unix::fs::PermissionsExt;
 
     let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
@@ -364,13 +378,12 @@ async fn tool_server_readiness_failure_warns_and_continues() -> Result<()> {
     })
     .await?
     else {
-        return Ok(());
+        return Ok(None);
     };
     let directory = tempfile::tempdir()?;
-    let binary = directory.path().join("never-registers");
-    std::fs::write(&binary, "#!/bin/sh\nsleep 10\n")?;
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))?;
-    let binary = binary.to_string_lossy().into_owned();
+    let fake_binary = directory.path().join(fake_binary_name);
+    std::fs::write(&fake_binary, "#!/bin/sh\nsleep 10\n")?;
+    std::fs::set_permissions(&fake_binary, std::fs::Permissions::from_mode(0o755))?;
     let client = async_nats::ConnectOptions::new()
         .token(TOKEN.to_string())
         .connect(server.url())
@@ -378,90 +391,91 @@ async fn tool_server_readiness_failure_warns_and_continues() -> Result<()> {
     let instance_id = InstanceId::new();
     let start =
         ToolServerStartConfig::new(client.clone(), instance_id.clone(), server.url(), TOKEN);
-    let servers = [time_server_config(binary)];
+    let mut fake_server = time_server_config(fake_binary.to_string_lossy().into_owned());
+    fake_server.name = fake_server_name.to_string();
+    let mut servers = vec![fake_server];
+    if let Some(healthy_binary) = healthy_binary {
+        servers.push(time_server_config(healthy_binary));
+    }
     let sink = Arc::new(RecordingEventSink::default());
     let supervisor = harnx_core::sink::with_agent_event_sink(sink.clone(), async {
-        ToolServerSupervisor::start_local_with_timeout(start, &servers, Duration::from_millis(250))
-            .await
+        ToolServerSupervisor::start_local_with_timeout(start, &servers, timeout).await
     })
     .await?;
 
-    let store = async_nats::jetstream::new(client)
+    Ok(Some(ReadinessTestFixture {
+        _server: server,
+        _directory: directory,
+        client,
+        instance_id,
+        sink,
+        supervisor,
+    }))
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_server_readiness_failure_warns_and_continues() -> Result<()> {
+    let Some(fixture) =
+        start_readiness_test("never-registers", "time", None, Duration::from_millis(250)).await?
+    else {
+        return Ok(());
+    };
+
+    let store = async_nats::jetstream::new(fixture.client.clone())
         .get_key_value(TOOL_REGISTRY_BUCKET)
         .await?;
     assert!(
         store
-            .get(registration_key(&instance_id, "time"))
+            .get(registration_key(&fixture.instance_id, "time"))
             .await?
             .is_none(),
         "non-registering server must not become available"
     );
     assert!(
-        sink.warning_messages().iter().any(|message| {
+        fixture.sink.warning_messages().iter().any(|message| {
             message.contains("tool server 'time' failed to start")
                 && message.contains("did not register")
         }),
         "readiness failure must emit a warning: {:?}",
-        sink.warning_messages()
+        fixture.sink.warning_messages()
     );
-    drop(supervisor);
+    drop(fixture.supervisor);
     Ok(())
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn readiness_waits_for_servers_concurrently() -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
-        auth_token: Some(TOKEN.to_string()),
-    })
+    let time_binary = time_server_binary()?.to_string_lossy().into_owned();
+    let Some(fixture) = start_readiness_test(
+        "stall-server",
+        "stall",
+        Some(time_binary),
+        Duration::from_secs(1),
+    )
     .await?
     else {
         return Ok(());
     };
-    let directory = tempfile::tempdir()?;
-    let stall_binary = directory.path().join("stall-server");
-    std::fs::write(&stall_binary, "#!/bin/sh\nsleep 10\n")?;
-    std::fs::set_permissions(&stall_binary, std::fs::Permissions::from_mode(0o755))?;
-    let stall_binary = stall_binary.to_string_lossy().into_owned();
-    let time_binary = time_server_binary()?.to_string_lossy().into_owned();
-    let client = async_nats::ConnectOptions::new()
-        .token(TOKEN.to_string())
-        .connect(server.url())
-        .await?;
-    let instance_id = InstanceId::new();
-    let start =
-        ToolServerStartConfig::new(client.clone(), instance_id.clone(), server.url(), TOKEN);
-    let stall = ToolServerConfig {
-        name: "stall".to_string(),
-        ..time_server_config(stall_binary)
-    };
-    let servers = [stall, time_server_config(time_binary)];
-    let sink = Arc::new(RecordingEventSink::default());
-    let supervisor = harnx_core::sink::with_agent_event_sink(sink.clone(), async {
-        ToolServerSupervisor::start_local_with_timeout(start, &servers, Duration::from_secs(1))
-            .await
-    })
-    .await?;
 
-    let store = async_nats::jetstream::new(client)
+    let store = async_nats::jetstream::new(fixture.client.clone())
         .get_key_value(TOOL_REGISTRY_BUCKET)
         .await?;
     assert!(
         store
-            .get(registration_key(&instance_id, "time"))
+            .get(registration_key(&fixture.instance_id, "time"))
             .await?
             .is_some(),
         "healthy server must register while another server stalls"
     );
-    let warnings = sink.warning_messages();
+    let warnings = fixture.sink.warning_messages();
     assert!(warnings.iter().any(|message| message.contains("'stall'")));
     assert!(
         warnings.iter().all(|message| !message.contains("'time'")),
         "healthy server must not receive a readiness warning: {warnings:?}"
     );
-    drop(supervisor);
+    drop(fixture.supervisor);
     Ok(())
 }
 
