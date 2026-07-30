@@ -29,7 +29,7 @@ If an MCP server — e.g. the Exa web-search server run via `npx` — reports a 
 Forward the specific variable through the sandbox from the server's config:
 
 ```yaml
-# mcp_servers/exa.yaml
+# tool_servers/exa.yaml
 env:
   HARNX_BASH_ENV_PASSTHROUGH: EXA_API_KEY
 ```

@@ -1,10 +1,12 @@
-command: npx
-args:
-  - "-y"
-  - "@upstash/context7-mcp@2.1.6"
+command: harnx-mcp-bridge
 description: >-
   Library and framework documentation lookup via Context7. Used by
   Librarian and Sisyphus to answer API and usage questions without
   hallucinating.
-
-# Requires: Node.js / npx. No API key needed.
+args:
+  - --name
+  - context7
+  - --
+  - npx
+  - "-y"
+  - "@upstash/context7-mcp@2.1.6"

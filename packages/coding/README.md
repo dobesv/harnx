@@ -82,14 +82,14 @@ or symlink anything.
 | `plans.yaml` | `plans_*` | Plan/task tracking, stored in `.agent/plans/` relative to the working directory. |
 | `time.yaml` | `time_*` | Current time and wait utilities. |
 
-### External servers (require install)
+### Tool servers (bridge-run, under tool_servers/)
 
 | Server | Namespace | Requires | Notes |
 |--------|-----------|----------|-------|
 | `fetch.yaml` | `fetch_*` | Node.js / npx | Fetches URLs as markdown or text. No API key. |
 | `exa.yaml` | `exa_*` | Node.js / npx | Web search via Exa. Requires `EXA_API_KEY`. |
 | `context7.yaml` | `context7_*` | Node.js / npx | Library docs lookup. No API key. |
-| `grep.yaml` | `grep_*` | uv / uvx | GitHub code search via grep.app. No API key. |
+| `grep.yaml` | `grep_*` | None (bundled binary) | GitHub code search via grep.app. No API key. |
 
 Add your Exa key to `~/.local/share/harnx/.env`:
 

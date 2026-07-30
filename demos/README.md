@@ -25,7 +25,7 @@ demos/
 │   ├── agents/                 Demo agent definitions (demo/code/tool-confirm)
 │   ├── clients/                openai-compatible client pointed at :3829
 │   │   └── mock.yaml
-│   └── mcp_servers/
+│   └── tool_servers/
 │       ├── dev.yaml            Wires harnx-mock-mcp for the agent demo
 │       └── time.yaml           Time MCP server (tool-confirm demo)
 └── scripts/                    Mock-LLM turns (*-flow) + mock-MCP results (*-tools)
@@ -59,7 +59,7 @@ On Linux you'll also need `ttyd` and `ffmpeg`.
 2. To show tool use without running anything real, have the mock LLM emit tool
    calls and serve faked results from `harnx-mock-mcp`: add a
    `demos/scripts/<name>-tools.yaml` (tools + ordered `responses`, see
-   `agent-tools.yaml`), wire it via a `demos/config/mcp_servers/<server>.yaml`
+   `agent-tools.yaml`), wire it via a `demos/config/tool_servers/<server>.yaml`
    (`command: harnx-mock-mcp`, `args: [--script, demos/scripts/<name>-tools.yaml]`),
    and list the `<server>_<tool>` names in the agent's `use_tools`. Schema lives
    in `crates/harnx-test-bins/src/bin/harnx-mock-mcp/server.rs`.

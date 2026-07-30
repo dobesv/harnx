@@ -1,9 +1,11 @@
-command: npx
-args:
-  - "-y"
-  - "mcp-fetch-server"
+command: harnx-mcp-bridge
 description: >-
   Fetch web pages as markdown, plain text, or JSON. Used by Pytheas,
   Zosimus, Hephaestus, and other agents to read documentation and URLs.
-
-# Requires: Node.js / npx
+args:
+  - --name
+  - fetch
+  - --
+  - npx
+  - "-y"
+  - mcp-fetch-server
