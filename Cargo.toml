@@ -16,7 +16,7 @@ members = [
     "crates/harnx-sandbox-common",
     "crates/harnx-sandbox-run",
     "crates/harnx-mcp-hooks-proxy",
-    "crates/harnx-mcp-fs",
+    "crates/harnx-fs-tools",
     "crates/harnx-mcp-time",
     "crates/harnx-vercel-grep-server",
     "crates/harnx-mcp-remote",

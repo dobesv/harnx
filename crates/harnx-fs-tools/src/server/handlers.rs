@@ -303,7 +303,7 @@ impl FsServer {
         paths
     }
 
-    async fn seed_default_root_if_empty(&self) {
+    pub(crate) async fn seed_default_root_if_empty(&self) {
         if !self.default_root_cwd {
             return;
         }
@@ -317,7 +317,7 @@ impl FsServer {
             roots.push(root);
         } else {
             eprintln!(
-                "harnx-mcp-fs: warning: --default-root-cwd: refusing to seed root from CWD \
+                "harnx-fs-tools: warning: --default-root-cwd: refusing to seed root from CWD \
                  (equals/ancestor of $HOME, HOME unset, or unresolvable) — all filesystem access denied"
             );
         }
@@ -450,7 +450,7 @@ impl FsServer {
             ContentBlock::text(summary).with_audience(vec![Role::User]),
         ])))
     }
-    pub(crate) async fn read_file_impl(
+    pub async fn read_file_impl(
         &self,
         params: ReadFileParams,
     ) -> Result<CallToolResult, ErrorData> {
@@ -809,7 +809,7 @@ impl FsServer {
         ))
     }
 
-    pub(crate) async fn list_directory_impl(
+    pub async fn list_directory_impl(
         &self,
         params: ListDirectoryParams,
     ) -> Result<CallToolResult, ErrorData> {

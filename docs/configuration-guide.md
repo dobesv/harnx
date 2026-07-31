@@ -30,7 +30,7 @@ Harnx organizes configuration into the following structure:
 │   └── claude.yaml
 ├── mcp_servers/         # MCP server configurations (user stdio servers)
 │   └── custom.yaml
-├── tool_servers/        # NATS tool servers (bridged MCP servers)
+├── tool_servers/        # Tool servers (native toolsets and bridged MCP servers)
 │   ├── fs.yaml
 │   └── bash.yaml
 └── agents/              # Agent definitions (.md files)
@@ -110,15 +110,15 @@ patches:
     - 'if (.body.model | test("gpt-5.*")) then .body.reasoning_effort = "high" end'
 ```
 
-## MCP Servers (`mcp_servers/`)
+## Tool Servers (`tool_servers/`) and MCP Servers (`mcp_servers/`)
 
-Model Context Protocol (MCP) servers provide external tools. Each server is defined in a file like `mcp_servers/custom.yaml` or `tool_servers/fs.yaml`.
+Tool servers provide external tools. Toolset servers (such as `harnx-fs-tools`) run directly without a bridge wrapper, while MCP servers run directly or via `harnx-mcp-bridge`. Each server is defined in a file like `tool_servers/fs.yaml` or `mcp_servers/custom.yaml`.
 
 The **filename** (without `.yaml`) is used as the server name.
 
 ```yaml
-command: harnx-mcp-fs     # Executable command
-args: ["--root", "."]     # Optional arguments
+command: harnx-fs-tools    # Executable command
+args: ["--default-root-cwd"] # Optional arguments
 env:                      # Environment variables
   API_KEY: "..."
 roots:                    # Directories the server can access

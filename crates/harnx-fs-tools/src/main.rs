@@ -1,22 +1,6 @@
-//! harnx-mcp-fs: High-performance MCP filesystem server.
-//!
-//! Provides read_file, write_file, edit_file, list_directory, search_files,
-//! and find_files tools over the Model Context Protocol (MCP) via stdio transport.
-//!
-//! Supports the MCP roots feature: roots can be set via CLI flags and are
-//! dynamically updated when the client sends roots/list_changed notifications.
-//!
-//! Usage:
-//!   harnx-mcp-fs [--root <path>]... [--default-root-cwd]
-//!
-//! If no roots are specified (via CLI or MCP client), all operations are denied
-//! unless `--default-root-cwd` can safely seed the process CWD.
+//! harnx-fs-tools: Filesystem toolset server, with MCP stdio back-compat.
 
-mod server;
-mod summary;
-
-use rmcp::ServiceExt;
-use server::FsServer;
+use harnx_fs_tools::FsToolset;
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -24,28 +8,21 @@ async fn main() -> anyhow::Result<()> {
     let (roots, default_root_cwd) = parse_args();
 
     eprintln!(
-        "harnx-mcp-fs v{}: starting ({} root{})",
+        "harnx-fs-tools v{}: starting ({} CLI root{})",
         env!("CARGO_PKG_VERSION"),
-        if roots.is_empty() {
-            "no CLI roots, awaiting client roots".to_string()
-        } else {
-            roots.len().to_string()
-        },
+        roots.len(),
         if roots.len() == 1 { "" } else { "s" }
     );
     for root in &roots {
         eprintln!("  root: {}", root.display());
     }
 
-    let server = FsServer::new(roots, default_root_cwd);
-    let transport = rmcp::transport::stdio();
-    let service = server.serve(transport).await?;
-    service.waiting().await?;
-
-    Ok(())
+    let toolset = FsToolset::new(roots, default_root_cwd).await;
+    harnx_toolset_server::run_toolset_main(toolset).await
 }
 
-/// Parse CLI arguments.
+/// Parse filesystem-specific CLI arguments. The shared server runner consumes
+/// `--mcp-stdio`, so this parser accepts it without changing filesystem setup.
 fn parse_args() -> (Vec<PathBuf>, bool) {
     let args: Vec<String> = std::env::args().collect();
     let mut roots = Vec::new();
@@ -63,17 +40,17 @@ fn parse_args() -> (Vec<PathBuf>, bool) {
                             Ok(canonical) => roots.push(canonical),
                             Err(err) => {
                                 eprintln!(
-                                    "warning: failed to canonicalize root '{}': {}",
+                                    "harnx-fs-tools: warning: failed to canonicalize root '{}': {}",
                                     raw, err
                                 );
                             }
                         }
                     } else {
-                        eprintln!("harnx-mcp-fs: warning: root path does not exist: {}", raw);
+                        eprintln!("harnx-fs-tools: warning: root path does not exist: {}", raw);
                     }
                     i += 2;
                 } else {
-                    eprintln!("harnx-mcp-fs: --root requires a path argument");
+                    eprintln!("harnx-fs-tools: --root requires a path argument");
                     std::process::exit(1);
                 }
             }
@@ -81,24 +58,24 @@ fn parse_args() -> (Vec<PathBuf>, bool) {
                 default_root_cwd = true;
                 i += 1;
             }
+            "--mcp-stdio" => {
+                i += 1;
+            }
             "--help" | "-h" => {
-                eprintln!("harnx-mcp-fs: High-performance MCP filesystem server");
+                eprintln!("harnx-fs-tools: Filesystem toolset server");
                 eprintln!();
-                eprintln!("Usage: harnx-mcp-fs [OPTIONS]");
+                eprintln!("Usage: harnx-fs-tools [OPTIONS]");
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  --root, -r <path>   Add an allowed root directory (repeatable)");
                 eprintln!("  --default-root-cwd  Use CWD when no other roots are available");
+                eprintln!("  --mcp-stdio         Serve MCP over stdio instead of the default toolset mode");
                 eprintln!("  --help, -h          Show this help message");
-                eprintln!();
-                eprintln!("The server communicates via stdio using the MCP protocol.");
-                eprintln!("If no roots are specified, operations are denied until the client provides roots.");
-                eprintln!("Roots can also be provided dynamically by the MCP client.");
                 std::process::exit(0);
             }
             other => {
-                eprintln!("harnx-mcp-fs: unknown argument: {}", other);
-                eprintln!("Try: harnx-mcp-fs --help");
+                eprintln!("harnx-fs-tools: unknown argument: {}", other);
+                eprintln!("Try: harnx-fs-tools --help");
                 std::process::exit(1);
             }
         }

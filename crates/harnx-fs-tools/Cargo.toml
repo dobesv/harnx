@@ -1,29 +1,38 @@
 [package]
-name = "harnx-mcp-fs"
+name = "harnx-fs-tools"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "MCP server that exposes filesystem operations with safety guards"
+description = "Toolset server that exposes filesystem operations with safety guards (also supports MCP stdio via --mcp-stdio)"
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 fancy-regex = { workspace = true }
 gix = { workspace = true }
 glob = { workspace = true }
 harnx-mcp = { path = "../harnx-mcp" }
 harnx-mcp-history = { workspace = true }
+harnx-toolset = { path = "../harnx-toolset" }
+harnx-toolset-server = { path = "../harnx-toolset-server" }
 log = { workspace = true }
 rmcp = { workspace = true }
 serde = { workspace = true }
 base64 = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
+async-nats = { workspace = true }
+harnx-core = { path = "../harnx-core" }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 uuid = { workspace = true }
+which = { workspace = true }
 
 [[bin]]
-name = "harnx-mcp-fs"
+name = "harnx-fs-tools"
 path = "src/main.rs"

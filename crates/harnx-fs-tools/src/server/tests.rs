@@ -17,7 +17,7 @@ use tokio::io::duplex;
 use uuid::Uuid;
 
 #[cfg(unix)]
-async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+pub(crate) async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
     use std::sync::OnceLock;
 
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -27,11 +27,11 @@ async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
 }
 
 #[cfg(unix)]
-struct HomeGuard(Option<std::ffi::OsString>);
+pub(crate) struct HomeGuard(Option<std::ffi::OsString>);
 
 #[cfg(unix)]
 impl HomeGuard {
-    fn set(path: &Path) -> Self {
+    pub(crate) fn set(path: &Path) -> Self {
         let previous = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", path) };
         Self(previous)
@@ -49,11 +49,11 @@ impl Drop for HomeGuard {
 }
 
 #[cfg(unix)]
-struct CwdGuard(PathBuf);
+pub(crate) struct CwdGuard(PathBuf);
 
 #[cfg(unix)]
 impl CwdGuard {
-    fn set(path: &Path) -> Self {
+    pub(crate) fn set(path: &Path) -> Self {
         let previous = std::env::current_dir().unwrap();
         std::env::set_current_dir(path).unwrap();
         Self(previous)
@@ -73,7 +73,7 @@ struct TestDir {
 
 impl TestDir {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("harnx-mcp-fs-test-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("harnx-fs-tools-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
         Self { path }
     }
@@ -162,7 +162,7 @@ fn fixture_path(dir: &TestDir, name: &str) -> PathBuf {
     dir.path().join(name)
 }
 
-fn path_string(path: &Path) -> String {
+pub(crate) fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
@@ -231,10 +231,10 @@ async fn fs_tools_advertise_call_template_only() {
             tool.name
         );
         assert!(
-                !meta.0.contains_key("result_template"),
-                "tool '{}' must not pin result_template — let the client fall back to its generic audience-aware renderer",
-                tool.name
-            );
+            !meta.0.contains_key("result_template"),
+            "tool '{}' must not pin result_template — let the client fall back to its generic audience-aware renderer",
+            tool.name
+        );
     }
 }
 
@@ -474,7 +474,7 @@ async fn edit_file_emits_unaudienced_diff_content() {
     assert!(audience(&result.content[1]).is_none(), "diff audience");
 }
 
-/// Production launch path: harnx-mcp-fs starts with empty
+/// Production launch path: harnx-fs-tools starts with empty
 /// `initial_roots` (no `--root` CLI args) and only learns its roots
 /// later via the MCP `roots/list` protocol. `HistoryManager` was
 /// constructed with the empty initial roots and never refreshed, so

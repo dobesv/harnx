@@ -126,7 +126,7 @@ jobs:
       run: |
         $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }} \
           -p harnx -p harnx-serve -p harnx-acp-server \
-          -p harnx-mcp-bash -p harnx-mcp-fs -p harnx-mcp-plans -p harnx-mcp-plans-github -p harnx-mcp-time \
+          -p harnx-mcp-bash -p harnx-fs-tools -p harnx-mcp-plans -p harnx-mcp-plans-github -p harnx-mcp-time \
           -p harnx-aws-creds -p harnx-k8s-creds -p harnx-pkg -p harnx-proxy-auth -p harnx-mcp-hooks-proxy \
           -p harnx-sandbox-run \
           -p harnx-sandbox-common
@@ -151,7 +151,7 @@ jobs:
           "harnx-serve:harnx-serve"
           "harnx-acp-server:harnx-acp-server"
           "harnx-mcp-bash:harnx-mcp-bash"
-          "harnx-mcp-fs:harnx-mcp-fs"
+          "harnx-fs-tools:harnx-fs-tools"
           "harnx-mcp-plans:harnx-mcp-plans"
           "harnx-mcp-plans-github:harnx-mcp-plans-github"
           "harnx-mcp-time:harnx-mcp-time"
@@ -326,7 +326,7 @@ jobs:
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-mcp-bash-$V-x86_64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
-            --pattern "harnx-mcp-fs-$V-x86_64-unknown-linux-musl.tar.gz" || true
+            --pattern "harnx-fs-tools-$V-x86_64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-mcp-plans-$V-x86_64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
@@ -355,7 +355,7 @@ jobs:
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-mcp-bash-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
-            --pattern "harnx-mcp-fs-$V-aarch64-unknown-linux-musl.tar.gz" || true
+            --pattern "harnx-fs-tools-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-mcp-plans-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
@@ -389,7 +389,7 @@ jobs:
         run: |
           missing=0
           for dir in linux-amd64 linux-arm64; do
-            for bin in harnx harnx-serve harnx-acp-server harnx-mcp-bash harnx-mcp-fs harnx-mcp-plans harnx-mcp-plans-github harnx-mcp-time harnx-aws-creds harnx-k8s-creds harnx-pkg harnx-proxy-auth harnx-mcp-hooks-proxy harnx-sandbox-run harnx-sandbox-exec; do
+            for bin in harnx harnx-serve harnx-acp-server harnx-mcp-bash harnx-fs-tools harnx-mcp-plans harnx-mcp-plans-github harnx-mcp-time harnx-aws-creds harnx-k8s-creds harnx-pkg harnx-proxy-auth harnx-mcp-hooks-proxy harnx-sandbox-run harnx-sandbox-exec; do
               if [ ! -f "$dir/$bin" ]; then
                 echo "ERROR: missing $dir/$bin"
                 missing=1

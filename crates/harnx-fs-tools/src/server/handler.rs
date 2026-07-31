@@ -5,7 +5,7 @@ impl ServerHandler for FsServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
-                "harnx-mcp-fs",
+                "harnx-fs-tools",
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
@@ -74,7 +74,10 @@ impl ServerHandler for FsServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Err(err) = self.ensure_roots_initialized(&context.peer).await {
-            eprintln!("harnx-mcp-fs: failed to initialize roots: {}", err.message);
+            eprintln!(
+                "harnx-fs-tools: failed to initialize roots: {}",
+                err.message
+            );
         }
 
         match request.name.as_ref() {
@@ -130,7 +133,7 @@ impl ServerHandler for FsServer {
             let peer = context.peer.clone();
             tokio::spawn(async move {
                 if let Err(err) = this.refresh_roots(&peer).await {
-                    eprintln!("harnx-mcp-fs: failed to refresh roots: {}", err.message);
+                    eprintln!("harnx-fs-tools: failed to refresh roots: {}", err.message);
                 }
             });
         }
