@@ -133,6 +133,10 @@ pub enum TurnEvent {
         agent: String,
         session_id: Option<String>,
     },
+    SubAgentStarted {
+        agent: String,
+        session_id: String,
+    },
     Ended {
         outcome: TurnOutcome,
     },

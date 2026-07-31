@@ -111,6 +111,7 @@ impl NatsInFlightCalls {
 pub struct NatsToolProvider {
     client: async_nats::Client,
     instance_id: InstanceId,
+    parent_session_id: Option<String>,
     tools: HashMap<String, RegisteredTool>,
     declarations: Vec<ToolDeclaration>,
     // Owning this subscription establishes the progress/cancel channel before requests start.
@@ -134,10 +135,15 @@ impl NatsToolProvider {
             .await
             .unwrap_or_default();
         let (tools, declarations) = build_registered_tools(registrations);
+        let parent_session_id = config
+            .session
+            .as_ref()
+            .map(|session| session.id().to_string());
 
         Ok(Self {
             client,
             instance_id,
+            parent_session_id,
             tools,
             declarations,
             _control_subscription: Mutex::new(control_subscription),
@@ -211,6 +217,7 @@ impl NatsToolProvider {
             call_id: call_id.clone(),
             tool: tool_name.to_string(),
             args: arguments,
+            parent_session_id: self.parent_session_id.clone(),
         };
         let mut headers = async_nats::HeaderMap::new();
         headers.insert(HDR_IDEMPOTENCY_KEY, Uuid::new_v4().to_string());

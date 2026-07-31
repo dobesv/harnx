@@ -200,10 +200,18 @@ async fn process_tool_request(
         .lock()
         .await
         .insert(request.call_id.clone(), cancel.clone());
-    let result = context
-        .toolset
-        .invoke(&request.tool, request.args, cancel)
-        .await;
+    let mut args = request.args;
+    if request.tool.ends_with("_session_prompt") || request.tool.ends_with("_session_new") {
+        if let (Some(parent_session_id), Some(args)) =
+            (request.parent_session_id, args.as_object_mut())
+        {
+            args.insert(
+                "__harnx_parent_session_id".to_string(),
+                Value::String(parent_session_id),
+            );
+        }
+    }
+    let result = context.toolset.invoke(&request.tool, args, cancel).await;
     context.in_flight.lock().await.remove(&request.call_id);
 
     let reply = ToolReply {

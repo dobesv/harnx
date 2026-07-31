@@ -6,11 +6,11 @@ use super::agent_loop::{
 };
 use super::backend::NatsSessionLogBackend;
 use super::control::{control_subject, ControlCommand};
-use super::subagent_toolset::SubagentPromptToolset;
+use super::subagent_toolset::SubagentToolset;
 use super::tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
 use crate::config::{
-    resolve_local_nats_server_config, server_display_name, GlobalConfig, Input, ToolServerConfig,
-    LOCAL_CLUSTER_KEY,
+    list_agents, resolve_local_nats_server_config, server_display_name, GlobalConfig, Input,
+    ToolServerConfig, LOCAL_CLUSTER_KEY,
 };
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use crate::nats_metrics;
@@ -326,7 +326,7 @@ fn optional_tool_server<T>(result: Result<T>) -> Option<T> {
     }
 }
 
-async fn start_subagent_prompt_toolset(
+async fn start_subagent_toolset(
     agent: String,
     cluster: String,
     instance_id: harnx_core::instance::InstanceId,
@@ -334,7 +334,7 @@ async fn start_subagent_prompt_toolset(
     jetstream: jetstream::Context,
 ) -> Result<JoinHandle<Result<()>>> {
     let registration_context = jetstream.clone();
-    let toolset = Arc::new(SubagentPromptToolset::new(
+    let toolset = Arc::new(SubagentToolset::new(
         agent,
         cluster,
         client.clone(),
@@ -433,14 +433,10 @@ pub async fn run_worker_daemon(
         &matching_tool_servers,
     )
     .await;
-    let subagent_agent = config
-        .read()
-        .agent
-        .as_ref()
-        .map(|agent| agent.name().to_string());
-    let subagent_tool_server = match subagent_agent {
-        Some(agent) => Some(
-            start_subagent_prompt_toolset(
+    let mut subagent_tool_servers = Vec::new();
+    for agent in list_agents() {
+        subagent_tool_servers.push(
+            start_subagent_toolset(
                 agent,
                 daemon.cluster.clone(),
                 instance_id.clone(),
@@ -448,10 +444,9 @@ pub async fn run_worker_daemon(
                 startup.jetstream.clone(),
             )
             .await
-            .context("start sub-agent prompt toolset")?,
-        ),
-        None => None,
-    };
+            .context("start sub-agent toolset")?,
+        );
+    }
     // Attempt optional tool startup before readiness so successful pilots are available on turn one.
     spawn_readiness_publisher(startup.client.clone(), &daemon);
     let session_index = optional_session_index(&startup.jetstream).await;
@@ -459,7 +454,7 @@ pub async fn run_worker_daemon(
         config,
         instance_id,
         _tool_supervisor: tool_supervisor,
-        _subagent_tool_server: subagent_tool_server,
+        _subagent_tool_servers: subagent_tool_servers,
         cluster: daemon.cluster.clone(),
         worker_id: daemon.worker_id.clone(),
         lease: daemon.lease,
@@ -498,7 +493,7 @@ struct WorkerRuntime {
     config: GlobalConfig,
     instance_id: harnx_core::instance::InstanceId,
     _tool_supervisor: Option<ToolServerSupervisor>,
-    _subagent_tool_server: Option<JoinHandle<Result<()>>>,
+    _subagent_tool_servers: Vec<JoinHandle<Result<()>>>,
     #[allow(dead_code)]
     cluster: String,
     worker_id: String,
