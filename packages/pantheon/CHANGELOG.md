@@ -64,14 +64,11 @@ All notable changes to the `pantheon` agent package will be documented here.
 
 ### Breaking Changes
 
-- The --acp <agent> flag has been removed from the harnx
-binary. Use the standalone harnx-acp-server <agent> binary instead.
 - derive client name from filename stem and ignore in-file name field (#824)
 
 ### Features
 
 - auto-whitelist Go caches and support arbitrary $VAR expansion (#800)
-- extract ACP server and fix same-package delegation (#810)
 - add llama-server LLM provider for local GGUF models (#817)
 - support per-model GGUF configuration and HuggingFace auto-download (#821)
 - view compaction result details (#828)
@@ -93,7 +90,6 @@ binary. Use the standalone harnx-acp-server <agent> binary instead.
 - stop leaking unfiltered tool list into agent system prompt (#863)
 - preserve whitespace-only streaming chunks (#867)
 - append-mode log file (#880) + heap-usage guard for the #842 OOM (#881)
-- add LLM read timeout so stalled requests fail clearly instead of false ACP idle timeout (#874) (#887)
 - Grant the `harnx_agent_session_history_read` tool to every bundled agent configured with a `compaction_agent`, so they can search their pre-compaction session history after a compaction.
 
 ## 0.2.4 (2026-06-10)
@@ -155,9 +151,7 @@ binary. Use the standalone harnx-acp-server <agent> binary instead.
 ### Features
 
 - built-in MCP servers, roots support, REPL tool management (#31)
-- add ACP (Agent Client Protocol) support (#67)
 - support Anthropic OAuth tokens with Bearer auth for Claude client (#89)
-- wire --acp server to real agent execution (#87)
 - file-sourced agent variables, prompt cleanup, and comprehensive docs (#96)
 - add `harnx-mcp-todo` as a file-based todo management MCP server (#112)
 - add `exa` and `wet` MCP servers for enhanced web search and ext… (#118)
@@ -172,7 +166,6 @@ binary. Use the standalone harnx-acp-server <agent> binary instead.
 - support Gemini 2.0 thought signatures and thinking blocks (#172)
 - add key, dependencies fields and plan_get_todo tool (#174)
 - append-only session logging with always-save default (#225)
-- split clients, mcp_servers, and acp_servers into separate subdirectory files (#260)
 - model fallback and retry with exponential backoff (#261)
 - submit pending message after tool round (#267)
 - replace convert_time with flexible timestamp conversion utility (#279)
@@ -226,20 +219,17 @@ binary. Use the standalone harnx-acp-server <agent> binary instead.
 - Remove unused dead code (#3)
 - update in-memory agent name after save (#62)
 - improve unresolved patch variable error message with actionable guidance (#88)
-- resolve ACP server hang and MCP transport death on Ctrl+C (#104)
 - update rust crate inquire to 0.9.0 (#111)
 - update rust crate fancy-regex to 0.17.0 (#109)
 - update rust crate schemars to 0.9 (#121)
 - update rust crate scraper to 0.26.0 (#124)
 - set stdin to null to prevent command hangs (#158)
-- cancel ACP sub-agent session on Ctrl+C to stop stale output (#163)
 - improve streaming output chunk boundaries (#191)
 - correct transcript scrolling when content is wrapped (#202)
 - update rust crate ratatui-textarea to 0.9.0 (#209)
 - persist exec output logs for recovery (#218)
 - isolate spawned bash processes in groups/jobs (#219)
 - enable word wrap on input textarea (#223)
-- show full error chain in ACP delegation and tool error messages (#228)
 - update rust crate reqwest to 0.13.0 (#114)
 - update rust crate bincode to v3 (#127)
 - persist sub-agent sessions to disk (#235)
@@ -260,7 +250,6 @@ binary. Use the standalone harnx-acp-server <agent> binary instead.
 - fix scroll dead-zone and tall-item content clipping (#264) (#325)
 - anchor front-matter regex and propagate YAML parse errors (#56) (#327)
 - echo thinking block + signature on multi-turn tool calls (#328) (#330)
-- resolve file-backed agent variables before ACP session start (#331)
 - correct lines_above for partial-bottom tall items so scroll moves the right way (#333)
 - write response_text before forwarding to close prompt-task race (#341)
 - fix input token count missing cache_creation_input_tokens (#337)

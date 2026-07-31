@@ -310,13 +310,13 @@ fn after_chat_completion_saves_intermediate_tool_rounds() {
     );
 }
 
-/// Regression test for the ACP-server failure where `use_agent_by_name`
+/// Regression test for the non-interactive failure where `use_agent_by_name`
 /// followed by `use_session` bailed with "agent variables are required"
 /// for an agent whose variables use `path:` (file-backed defaults).  The
 /// async `agent::init` resolves these defaults, but the synchronous
 /// `retrieve_agent` does not — `use_agent_by_name` must do so itself,
 /// otherwise `init_agent_session_variables` (called from `use_session`)
-/// finds no defaults and bails in non-interactive contexts like ACP.
+/// finds no defaults and bails in non-interactive contexts.
 #[tokio::test]
 async fn test_use_agent_by_name_resolves_file_backed_variable_defaults() {
     use crate::client::TestStateGuard;
@@ -969,76 +969,6 @@ fn dynamic_provider_model_init_sets_client_name_from_provider() {
     assert_eq!(config.clients.len(), 1);
     assert_eq!(config.clients[0].effective_name(), "claude");
 }
-
-// ── Regression tests for #826: package agent delegation/MCP tools must be
-//    scoped to the active agent's package ───────────────────────────────────
-
-#[test]
-fn package_agent_acp_delegation_tool_uses_bare_name_when_scoped() {
-    let mut config = Config {
-        acp_servers: vec![PackageServer::new("atlas", "pantheon").into_acp()],
-        ..Config::default()
-    };
-
-    // Scope managers to the active agent's package, as the agent-activation
-    // path must do before tools are read.
-    config.reinit_managers_for_agent(Some("pantheon"));
-
-    let manager = config
-        .acp_manager
-        .as_ref()
-        .expect("acp_manager should be initialized for a package ACP server");
-    let names: Vec<String> = manager
-        .get_all_tools_blocking()
-        .into_iter()
-        .map(|t| t.name)
-        .collect();
-
-    assert!(
-        names.contains(&"atlas_session_prompt".to_string()),
-        "same-package ACP server must surface bare `atlas_session_prompt`; got {names:?}"
-    );
-    assert!(
-        !names.iter().any(|n| n.starts_with("pantheon__")),
-        "same-package ACP tools must NOT be prefixed with `pantheon__`; got {names:?}"
-    );
-}
-
-/// #826 regression: documents the BROKEN scope. When the managers are left in
-/// the global (`None`) scope — as the async `use_agent` path does, because it
-/// never calls `reinit_managers_for_agent` — a `pantheon` package ACP server is
-/// emitted under the prefixed name `pantheon__atlas_session_prompt`. This is the
-/// mismatch that makes delegation tools "disappear" for a package agent. This
-/// test pins the contrast so a future change that fixes the async path (by
-/// scoping the managers) is matched by the scoped-name assertion above.
-#[test]
-fn unscoped_managers_emit_prefixed_acp_tool_name() {
-    let mut config = Config {
-        acp_servers: vec![PackageServer::new("atlas", "pantheon").into_acp()],
-        ..Config::default()
-    };
-
-    // Global scope — exactly the state left by `Config::init` /
-    // `init_mcp_manager()` before any package-scoped reinit.
-    config.reinit_managers_for_agent(None);
-
-    let manager = config.acp_manager.as_ref().expect("acp_manager");
-    let names: Vec<String> = manager
-        .get_all_tools_blocking()
-        .into_iter()
-        .map(|t| t.name)
-        .collect();
-
-    assert!(
-        names.contains(&"pantheon__atlas_session_prompt".to_string()),
-        "unscoped managers prefix the package ACP tool; got {names:?}"
-    );
-    assert!(
-        !names.contains(&"atlas_session_prompt".to_string()),
-        "unscoped managers must NOT emit the bare name; got {names:?}"
-    );
-}
-
 /// #826 regression (MCP side): when scoped to the active agent's package,
 /// same-package MCP servers use bare names while OTHER packages stay prefixed.
 /// In the broken (`None`) scope every package server is prefixed, so the agent
@@ -1071,99 +1001,6 @@ fn package_agent_mcp_tools_scoped_to_active_package() {
     assert!(
         !servers.contains(&"pantheon__fs".to_string()),
         "same-package MCP server must NOT be prefixed `pantheon__fs`; got {servers:?}"
-    );
-}
-
-/// #826 end-to-end regression: activating a package agent through the ASYNC
-/// `Config::use_agent` path (used by `--agent`, handoff `switch_agent`, and the
-/// ACP server) must scope the MCP/ACP managers to the agent's package, so the
-/// agent's own auto-registered ACP delegation tool is surfaced under the BARE
-/// name `atlas_session_prompt` (matching its `use_tools` allow-list) — not the
-/// `pantheon__atlas_session_prompt` form that gets filtered out, leaving the
-/// agent unable to delegate.
-///
-/// Before the fix, `use_agent` never called `reinit_managers_for_agent`, so the
-/// managers stayed in the global (`None`) scope left by `Config::init` and the
-/// tool was emitted prefixed.
-#[tokio::test]
-async fn use_agent_scopes_managers_to_package_for_delegation_tools() {
-    use crate::client::TestStateGuard;
-    use harnx_core::abort::create_abort_signal;
-
-    // Serialize on the shared test state lock (guards HARNX_* env vars).
-    let _guard = TestStateGuard::new(None).await;
-
-    let temp = tempfile::TempDir::new().unwrap();
-    // Package layout: packages/pantheon/agents/{atlas,hermes}.md
-    let pkg_agents = temp.path().join("packages/pantheon/agents");
-    std::fs::create_dir_all(&pkg_agents).unwrap();
-    std::fs::write(
-        pkg_agents.join("atlas.md"),
-        "---\nuse_tools: hermes_session_prompt\n---\nYou are Atlas. Delegate to hermes.\n",
-    )
-    .unwrap();
-    std::fs::write(pkg_agents.join("hermes.md"), "---\n---\nYou are Hermes.\n").unwrap();
-
-    let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
-    let provider_prev = std::env::var_os("HARNX_PROVIDER");
-    // SAFETY: test-only; the shared test lock is held for the duration.
-    unsafe { std::env::set_var("HARNX_PROVIDER", "claude:some-model") };
-
-    let config = Config::init(WorkingMode::Cmd, false, vec![])
-        .await
-        .expect("config init");
-    let config = std::sync::Arc::new(parking_lot::RwLock::new(config));
-
-    // Sanity: the package agent was auto-registered as an ACP server, and at
-    // this point (no agent active) the managers are in the global scope so the
-    // tool name is prefixed.
-    {
-        let cfg = config.read();
-        let manager = cfg.acp_manager.as_ref().expect("acp_manager after init");
-        let names: Vec<String> = manager
-            .get_all_tools_blocking()
-            .into_iter()
-            .map(|t| t.name)
-            .collect();
-        assert!(
-            names.contains(&"pantheon__atlas_session_prompt".to_string()),
-            "pre-activation (global scope) should expose the prefixed tool; got {names:?}"
-        );
-    }
-
-    // Activate the package agent through the async path.
-    Config::use_agent(&config, "pantheon/atlas", None, create_abort_signal())
-        .await
-        .expect("use_agent should activate the package agent");
-
-    // After activation the managers must be scoped to `pantheon`, so the
-    // sibling `hermes` delegation tool is surfaced under its bare name.
-    let cfg = config.read();
-    let manager = cfg
-        .acp_manager
-        .as_ref()
-        .expect("acp_manager should remain initialized after use_agent");
-    let names: Vec<String> = manager
-        .get_all_tools_blocking()
-        .into_iter()
-        .map(|t| t.name)
-        .collect();
-
-    // SAFETY: test-only; restore provider env.
-    unsafe {
-        match &provider_prev {
-            Some(v) => std::env::set_var("HARNX_PROVIDER", v),
-            None => std::env::remove_var("HARNX_PROVIDER"),
-        }
-    }
-
-    assert!(
-        names.contains(&"hermes_session_prompt".to_string()),
-        "after use_agent, same-package delegation tool must be bare `hermes_session_prompt`; got {names:?}"
-    );
-    assert!(
-        !names.iter().any(|n| n.starts_with("pantheon__")),
-        "after use_agent, same-package ACP tools must NOT be `pantheon__`-prefixed; got {names:?}"
     );
 }
 

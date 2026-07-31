@@ -1,5 +1,5 @@
 //! Shared startup helpers used by the `harnx`, `harnx-serve`, and
-//! `harnx-acp-server` binaries — logger init, env-file loading, etc.
+//! server binaries — logger init, env-file loading, etc.
 //! Extracted from `harnx/src/main.rs` so the thin-wrapper bins don't
 //! have to duplicate the boilerplate.
 
@@ -12,7 +12,7 @@ use harnx_core::path::ensure_parent_exists;
 
 /// Initialise the process-wide `log` facade. Reads log level + path from
 /// `Config::log_config` and applies an optional `HARNX_LOG_FILTER` env
-/// override. Both server modes (HTTP serve, ACP) and CLI/TUI use `harnx`
+/// override. Server mode and CLI/TUI use `harnx`
 /// as the default filter, matching all `harnx_*` crate targets via prefix
 /// matching (simplelog 0.12 uses `path.starts_with(filter)`). Use
 /// `HARNX_LOG_FILTER` to narrow to a specific crate/module.
@@ -33,7 +33,7 @@ pub fn setup_logger(is_server: bool) -> Result<()> {
         return Ok(());
     }
     // Hardcode "harnx" — avoids CARGO_CRATE_NAME drift across the 3 bins
-    // (harnx, harnx-serve, harnx-acp-server). The crate-name-as-filter
+    // (harnx and harnx-serve). The crate-name-as-filter
     // trick was fragile anyway; anything that wants crate-specific
     // filtering can override via HARNX_LOG_FILTER.
     const LOG_CRATE_NAME: &str = "harnx";
@@ -59,7 +59,7 @@ pub fn setup_logger(is_server: bool) -> Result<()> {
         Some(log_path) => {
             ensure_parent_exists(&log_path)?;
             // Open in append mode (not truncate). Several harnx processes — the
-            // interactive binary plus every `harnx-acp-server` sub-agent it
+            // interactive binary plus every child process it
             // spawns — inherit the same `HARNX_LOG_PATH` and write to one file.
             // `File::create` gives each process an independent offset starting
             // at 0, so they clobber each other and the kernel zero-fills the
@@ -114,8 +114,8 @@ mod tests {
 
         // All harnx_* crate targets should match the "harnx" prefix.
         assert!(
-            "harnx_acp::client".starts_with(&filter),
-            "harnx_acp::client should match filter {:?}",
+            "harnx_runtime::client".starts_with(&filter),
+            "harnx_runtime::client should match filter {:?}",
             filter
         );
         assert!(
@@ -129,8 +129,8 @@ mod tests {
             filter
         );
         assert!(
-            "harnx_acp_server::server".starts_with(&filter),
-            "harnx_acp_server::server should match filter {:?}",
+            "harnx_serve::server".starts_with(&filter),
+            "harnx_serve::server should match filter {:?}",
             filter
         );
     }
@@ -142,8 +142,8 @@ mod tests {
         let buggy_filter = "harnx::serve";
 
         assert!(
-            !"harnx_acp::client".starts_with(buggy_filter),
-            "harnx_acp::client should NOT match buggy filter {:?}",
+            !"harnx_runtime::client".starts_with(buggy_filter),
+            "harnx_runtime::client should NOT match buggy filter {:?}",
             buggy_filter
         );
         assert!(
@@ -157,8 +157,8 @@ mod tests {
             buggy_filter
         );
         assert!(
-            !"harnx_acp_server::server".starts_with(buggy_filter),
-            "harnx_acp_server::server should NOT match buggy filter {:?}",
+            !"harnx_serve::server".starts_with(buggy_filter),
+            "harnx_serve::server should NOT match buggy filter {:?}",
             buggy_filter
         );
     }

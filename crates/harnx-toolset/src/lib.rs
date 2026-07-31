@@ -65,6 +65,8 @@ pub struct ToolRequest {
     pub call_id: String,
     pub tool: String,
     pub args: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
 }
 
 /// Serializable error returned in a [`ToolReply`].
@@ -194,6 +196,7 @@ mod tests {
             call_id: "call-1".to_string(),
             tool: "time_now".to_string(),
             args: json!({ "timezone": "UTC" }),
+            parent_session_id: Some("parent-session".to_string()),
         });
         assert_round_trip(ToolReply {
             call_id: "call-1".to_string(),

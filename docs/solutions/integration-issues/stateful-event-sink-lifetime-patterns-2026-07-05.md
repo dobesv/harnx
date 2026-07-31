@@ -72,7 +72,6 @@ let error_result = json!({"is_error": true, "error": error_display});
 output.push(ToolResult::new(call, error_result)); // NO EMIT!
 ```
 
-Recoverable errors persisted to session but never reached any event sink (AG-UI, ACP, CLI/TUI).
 
 ### 3. Test Helper Silent Failure
 

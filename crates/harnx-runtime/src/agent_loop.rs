@@ -1,13 +1,12 @@
 //! Unified agent loop — `run_agent_loop` is the single canonical
 //! implementation of the LLM-call → tool-round → merge → repeat cycle
-//! that every front-end (CLI, TUI, ACP server) drives through.
+//! that every front-end (CLI, TUI, and HTTP server) drives through.
 //!
 //! Previously this logic lived in three places:
 //! - `harnx-runtime/src/commands.rs::ask_inner` (CLI)
 //! - `harnx-tui/src/prompt.rs::run_prompt_inner` (TUI)
-//! - `harnx-acp-server/src/lib.rs::HarnxAgent::prompt` (ACP server)
 //!
-//! Those diverged over time; the ACP variant had a bug (#305) where
+//! Those diverged over time; an older frontend had a bug (#305) where
 //! recoverable tool errors ended the session instead of being fed back
 //! to the LLM. This module provides the canonical loop that all three
 //! front-ends now delegate to.
@@ -83,7 +82,7 @@ pub type OnTextResponseFn = Arc<
 ///
 /// Construct one and pass to [`run_agent_loop`]. All fields are `Send` so
 /// the loop can be called from any async context, including from within an
-/// ACP server `LocalSet`.
+/// frontend `LocalSet`.
 pub struct AgentLoopContext {
     pub config: GlobalConfig,
     pub instance_id: harnx_core::instance::InstanceId,
@@ -109,7 +108,7 @@ pub struct AgentLoopContext {
     pub max_resume: Option<u32>,
     pub pending_async_context: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
     /// Optional per-session working directory. When unset, runtime falls back
-    /// to process cwd for CLI/ACP compatibility.
+    /// to process cwd for CLI compatibility.
     pub working_dir: Option<PathBuf>,
     /// Optional session lock held across the agent loop (T6).
     /// When set, passed through to exit paths to avoid re-entrancy deadlock.
@@ -441,9 +440,9 @@ async fn run_agent_loop_inner(
             // streaming (call_chat_completions_streaming) when enabled, or
             // non-streaming (call_chat_completions) otherwise. Critically,
             // call_chat_completions_streaming does NOT write to stdout, which
-            // matters for ACP server mode where stdout is the JSON-RPC
+            // matters for server mode where stdout is a protocol
             // transport. The old hardcoded call_chat_completions(inp, true, ...)
-            // always printed to stdout, corrupting the ACP connection.
+            // always printed to stdout, corrupting the connection.
             call_with_retry_and_fallback(&mut input, config, abort_signal.clone()).await
         };
 
@@ -512,7 +511,7 @@ async fn run_agent_loop_inner(
         input.injected_user_text = None;
 
         // Emit status/usage line for text-only turns. CLI-only: fires when
-        // no on_text_response callback is set. TUI and ACP handle their own
+        // no on_text_response callback is set. TUI and server frontends handle their own
         // display via on_text_response or their own UI.
         if ctx.on_text_response.is_none() && tool_results.is_empty() {
             let config_read = config.read();
@@ -925,7 +924,7 @@ mod tests {
 
         // Register our mock provider. We need to inject it into the tool
         // evaluation context. The providers are built by build_tool_providers
-        // from Config.mcp_manager/acp_manager. For this test, we'll use the
+        // from Config.mcp_manager. For this test, we'll use the
         // handoff's built-in dispatch path which checks allowed_tool_names
         // and handoff_targets. The mock provider is an alternative but the
         // dispatch path for _session_handoff tools in dispatch_tool_call
@@ -937,7 +936,7 @@ mod tests {
         // With HARNX_CONFIG_DIR set, list_agents() will find our test agent.
         //
         // However the problem is that build_tool_eval_context creates the
-        // context from Config which doesn't have mcp/acp managers. We need to
+        // context from Config which doesn't have MCP managers. We need to
         // make the handoff tool be recognized. The dispatch path checks:
         // 1. Name ends with "_session_handoff"
         // 2. Name is in allowed_tool_names

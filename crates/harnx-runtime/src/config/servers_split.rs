@@ -1,22 +1,10 @@
-//! MCP/ACP server management extracted from config/mod.rs for code health.
+//! MCP server management extracted from config/mod.rs for code health.
 use super::*;
-use harnx_core::package_namespace::qualify_agent_name;
 #[cfg(unix)]
 use harnx_mcp::safety::path_is_home_or_ancestor;
 use std::env;
-
-fn normalize_package_acp_server_args(server: &mut AcpServerConfig, pkg_name: &str) {
-    let stem = server.name.as_str();
-    let qualified = qualify_agent_name(pkg_name, stem);
-    for arg in &mut server.args {
-        if arg == stem {
-            *arg = qualified.clone();
-        }
-    }
-}
-
 impl Config {
-    /// Load MCP and ACP servers from a single package directory.
+    /// Load MCP servers from a single package directory.
     ///
     /// Servers are stored with their bare names (the yaml stem) and tagged with
     /// `package = Some(pkg_name)`.  The actual display name used with the LLM
@@ -40,15 +28,6 @@ impl Config {
                     }
                 }
                 config.mcp_servers.push(server);
-            }
-        }
-
-        let pkg_acp_dir = pkg_path.join(paths::ACP_SERVERS_DIR_NAME);
-        if pkg_acp_dir.is_dir() {
-            for mut server in Self::load_acp_servers_from_dir(&pkg_acp_dir).unwrap_or_default() {
-                server.package = Some(pkg_name.to_string());
-                normalize_package_acp_server_args(&mut server, pkg_name);
-                config.acp_servers.push(server);
             }
         }
 
@@ -90,41 +69,16 @@ impl Config {
         }
         Ok(servers)
     }
-
-    pub(super) fn load_acp_servers_from_dir(dir: &Path) -> Result<Vec<AcpServerConfig>> {
-        if !dir.exists() {
-            return Ok(vec![]);
-        }
-        let mut servers = Vec::new();
-        for path in Self::sorted_yaml_files(dir)? {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_string();
-            let content = read_to_string(&path).with_context(|| {
-                format!("Failed to read ACP server config '{}'", path.display())
-            })?;
-            let mut server: AcpServerConfig =
-                serde_yaml::from_str(&content).with_context(|| {
-                    format!("Failed to parse ACP server config '{}'", path.display())
-                })?;
-            server.name = stem;
-            servers.push(server);
-        }
-        Ok(servers)
-    }
-
     pub(super) fn needs_mcp_tools(&self) -> bool {
         self.mcp_manager.is_some()
     }
 
-    /// (Re)initialize the MCP and ACP managers for the given active agent.
+    /// (Re)initialize the MCP manager for the given active agent.
     ///
     /// `agent_package` is `Some("mypkg")` when the active agent belongs to
     /// an installed package, or `None` for top-level agents.
     ///
-    /// Package MCP/ACP servers that belong to the **same** package as the
+    /// Package MCP servers that belong to the **same** package as the
     /// active agent are registered under their **bare name** (e.g. `fs`),
     /// so the LLM sees tools as `fs_read_file`.  Servers from other packages
     /// keep their prefixed name (e.g. `otherpkg__db`), and top-level servers
@@ -193,35 +147,11 @@ impl Config {
             manager.initialize(mcp_servers);
             Some(Arc::new(manager))
         };
-
-        // ── ACP ──────────────────────────────────────────────────────────────
-        self.acp_manager = if self.acp_servers.is_empty() {
-            None
-        } else {
-            let acp_servers: Vec<AcpServerConfig> = self
-                .acp_servers
-                .iter()
-                .map(|s| {
-                    let mut s = s.clone();
-                    s.name = acp_server_display_name(&s, agent_package);
-                    s
-                })
-                .collect();
-            let manager = AcpManager::new();
-            manager.initialize(acp_servers);
-            Some(Arc::new(manager))
-        };
     }
 
     pub fn init_mcp_manager(&mut self) {
         self.reinit_managers_for_agent(None);
     }
-
-    pub(super) fn init_acp_manager(&mut self) {
-        // ACP init is folded into reinit_managers_for_agent; this stub exists
-        // so the call-site in Config::init() continues to compile unchanged.
-    }
-
     pub fn mcp_list_servers(config: &GlobalConfig) -> Vec<String> {
         let mcp_manager = config.read().mcp_manager.clone();
         match mcp_manager {

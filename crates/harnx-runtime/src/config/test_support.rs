@@ -59,22 +59,6 @@ impl<'a> PackageServer<'a> {
     pub(super) fn new(stem: &'a str, package: &'a str) -> Self {
         Self { stem, package }
     }
-
-    /// Build an ACP server config for this package server.
-    pub(super) fn into_acp(self) -> AcpServerConfig {
-        AcpServerConfig {
-            name: self.stem.to_string(),
-            command: "echo".to_string(),
-            args: vec![],
-            env: HashMap::new(),
-            enabled: true,
-            description: None,
-            idle_timeout_secs: 300,
-            operation_timeout_secs: 3600,
-            package: Some(self.package.to_string()),
-        }
-    }
-
     /// Build an MCP server config for this package server.
     ///
     /// Built inline (rather than via the `#[cfg(unix)]` `make_test_mcp_server`

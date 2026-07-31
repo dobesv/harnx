@@ -1142,7 +1142,7 @@ impl Tui {
                 // `<think>` tag). Whitespace-only chunks (a lone "\n" between
                 // streamed thought lines) must be preserved so the accumulated
                 // thought keeps its line breaks — same class of bug as #862 in
-                // the ACP client's message/thought chunk handling.
+                // nested message/thought chunk handling.
                 if clean.is_empty() {
                     vec![]
                 } else {

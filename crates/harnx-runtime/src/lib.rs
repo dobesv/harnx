@@ -4,7 +4,7 @@
 //! (`call_chat_completions`, retry/fallback), dot-commands dispatch,
 //! and the `ToolEvalContext` bridge to `harnx-engine`.
 //!
-//! Downstream front-end crates (`harnx-serve`, `harnx-acp-server`,
+//! Downstream front-end crates (`harnx-serve`,
 //! `harnx-tui`) depend on this crate rather than on `harnx` directly.
 
 #[macro_use]
@@ -49,7 +49,5 @@ pub use agent_loop::{
 
 pub use tool::{ConfirmToolUseFn, ToolApprovalInterrupt, ToolUseConfirmation};
 
-/// Re-export for integration tests — verifies scoped-ACP display naming logic.
-pub use config::acp_server_display_name as acp_server_display_name_for_test;
 /// Re-export for integration tests — verifies the scoped-MCP naming logic.
 pub use config::mcp_server_display_name as mcp_server_display_name_for_test;

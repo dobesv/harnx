@@ -20,7 +20,6 @@ plan_ref: "harnx-issue-1091-agent-handoff"
 
 ## Problem
 
-Agent handoff (`xxx_session_handoff` tool) required three distinct frontend behaviors but `run_agent_loop` switched agents inline via `continue`. NATS worker needed new lease/backend for the target session; serve needed to re-dispatch to a separate actor; TUI/CLI/ACP needed in-place continuation. The inline `continue` pattern made per-caller context handling impossible. Additionally, the Web UI needed to auto-navigate on handoff only during live runs (not history replay), and NATS tests failed due to session-id vs durable-id confusion.
 
 ## Symptoms
 
@@ -40,7 +39,6 @@ Analyzed inline `continue` pattern in `run_agent_loop`. The loop called `Config:
 
 Serve sessions are URL-addressable and separately-subscribable. When handoff occurs, the browser must open a new SSE stream for the target session. If serve continues in-place, the target actor sits idle while the original actor broadcasts to a stream the browser has abandoned. Solution: serve finishes its run cleanly (`RUN_FINISHED`) and re-dispatches the handoff prompt to the target `SessionActor` via `SessionRegistry::get_or_spawn`.
 
-TUI/CLI/ACP have a single continuous stream — they correctly continue the delegated turn in-place on the same stdout/tty.
 
 ### 3. Session-id vs durable-id mismatch
 
@@ -95,7 +93,6 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, input: Input) -> Result<Loop
 Each caller wraps in an outer loop:
 
 ```rust
-// TUI/CLI/ACP pattern (continue in-place)
 loop {
     match run_agent_loop(&ctx, input).await? {
         LoopResult::Completed => break,
@@ -219,7 +216,6 @@ class HarnxHttpAgent extends HttpAgent {
 
 ## Why This Works
 
-1. **Return-vs-continue**: Each caller controls re-entry. NATS acquires lease/backend before re-entry; serve re-dispatches; TUI/CLI/ACP continue in-place. Same `LoopResult` contract, different handling.
 
 2. **Serve re-dispatch**: Browser subscribes to target actor's SSE before the delegated run starts. Broadcast channel buffers early events; history snapshot on subscribe catches any missed events.
 

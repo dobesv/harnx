@@ -30,7 +30,6 @@ Compaction in the TUI (`Cmd+. compact session`) drove a stdout spinner using `ha
 ## Investigation Steps
 
 1. Traced the `.compact session` path in `harnx-runtime/src/commands.rs` — used `abortable_run_with_spinner()` which writes directly to stdout via `crossterm`
-2. Confirmed harnx has a process-level `AgentEvent` sink system (`harnx_core::sink`) used for TUI/CLI/ACP frontends
 3. Found `harnx_core::sink::has_agent_event_sink()` predicate that returns `true` when a sink is installed
 4. Discovered `SessionEvent` variants are rendered in `harnx-tui/src/input.rs` via `render_agent_event()`
 5. Noted the catch-all `_ => vec![]` silently drops unhandled event variants — missing explicit arms

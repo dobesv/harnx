@@ -43,7 +43,6 @@ patches:
 2. Reviewed provider config structs — confirmed `#[serde(skip)] pub name: String` on all 9 client providers
 3. Compared with MCP server patch — `apply_mcp_server_patch` already saves/restores `package` (also skip), but only `package` because `McpServerConfig.name` uses `#[serde(default)]` (serialized)
 4. Identified two impacts: (a) `.name` filters don't match, (b) package client names become `pkg/` after patch qualification
-5. Found test helpers in `harnx-acp-server`, `harnx-client` tests that parse YAML directly without `set_name` calls — they produced empty-named configs
 
 ## Root Cause
 

@@ -57,7 +57,6 @@ pub use self::agent::{
 pub(crate) use self::attachments::attachments_dir_for;
 pub use self::attachments::{write_attachment, Base64Encoder};
 pub use self::input::Input;
-pub use self::patches_split::acp_server_display_name;
 pub use self::patches_split::mcp_server_display_name;
 pub(crate) use self::patches_split::server_display_name;
 use self::patches_split::{
@@ -90,7 +89,6 @@ use crate::client::{
 use crate::commands::{run_command, split_args_text};
 use crate::tool::{ToolDeclaration, ToolResult, Tools};
 use crate::utils::*;
-use harnx_acp::{AcpManager, AcpServerConfig};
 use harnx_hooks::{AsyncHookManager, HooksConfig};
 use harnx_mcp::{McpManager, McpServerConfig};
 use harnx_rag::Rag;
@@ -302,7 +300,6 @@ pub struct Config {
     pub clients: Vec<ClientConfig>,
     pub nats_servers: Vec<NatsServerConfig>,
     pub mcp_servers: Vec<McpServerConfig>,
-    pub acp_servers: Vec<AcpServerConfig>,
     pub tool_servers: Vec<ToolServerConfig>,
 
     // Runtime state — unchanged from pre-A2:
@@ -317,7 +314,6 @@ pub struct Config {
     pub model: Model,
     pub tools: Tools,
     pub mcp_manager: Option<Arc<McpManager>>,
-    pub acp_manager: Option<Arc<AcpManager>>,
     pub working_mode: WorkingMode,
     pub last_message: Option<LastMessage>,
 
@@ -365,7 +361,6 @@ impl std::fmt::Debug for Config {
             .field("data", &self.data)
             .field("clients", &self.clients)
             .field("mcp_servers", &self.mcp_servers)
-            .field("acp_servers", &self.acp_servers)
             .field("tool_servers", &self.tool_servers)
             .field("macro_flag", &self.macro_flag)
             .field("info_flag", &self.info_flag)
@@ -374,7 +369,6 @@ impl std::fmt::Debug for Config {
             .field("model", &self.model)
             .field("tools", &self.tools)
             .field("mcp_manager", &self.mcp_manager)
-            .field("acp_manager", &self.acp_manager)
             .field("working_mode", &self.working_mode)
             .field("last_message", &self.last_message)
             .field("session", &self.session)
@@ -391,7 +385,6 @@ impl Clone for Config {
             clients: self.clients.clone(),
             nats_servers: self.nats_servers.clone(),
             mcp_servers: self.mcp_servers.clone(),
-            acp_servers: self.acp_servers.clone(),
             tool_servers: self.tool_servers.clone(),
             model_cooldowns: self.model_cooldowns.clone(),
             macro_flag: self.macro_flag,
@@ -403,7 +396,6 @@ impl Clone for Config {
             model: self.model.clone(),
             tools: self.tools.clone(),
             mcp_manager: self.mcp_manager.clone(),
-            acp_manager: self.acp_manager.clone(),
             working_mode: self.working_mode.clone(),
             last_message: self.last_message.clone(),
             session: self.session.clone(),
@@ -424,14 +416,14 @@ impl Config {
     /// its own session, without disturbing the original.
     ///
     /// SHARED (cheap `Arc`/value clones — the fork sees the same underlying
-    /// runtime resources): `mcp_manager`, `acp_manager`, `rag`,
+    /// runtime resources): `mcp_manager`, `rag`,
     /// `model_cooldowns`, plus config data, clients, model, tools, agent, and
     /// all flags/overrides.
     ///
     /// ISOLATED / RESET: `session` is `None` so the caller can attach its own
     /// session (via `use_session`) without racing the source config's active
     /// session. The two `tui_*_editor` hooks are dropped to `None` — they are
-    /// non-`Clone` `FnMut` trait objects and the ACP server prompt path never
+    /// non-`Clone` `FnMut` trait objects and server prompt paths never
     /// invokes interactive editor hooks, so dropping them is both safe and
     /// required.
     pub fn fork_session_scope(&self) -> Config {
@@ -440,7 +432,6 @@ impl Config {
             clients: self.clients.clone(),
             nats_servers: self.nats_servers.clone(),
             mcp_servers: self.mcp_servers.clone(),
-            acp_servers: self.acp_servers.clone(),
             tool_servers: self.tool_servers.clone(),
             model_cooldowns: self.model_cooldowns.clone(),
             macro_flag: self.macro_flag,
@@ -452,14 +443,13 @@ impl Config {
             model: self.model.clone(),
             tools: self.tools.clone(),
             mcp_manager: self.mcp_manager.clone(),
-            acp_manager: self.acp_manager.clone(),
             working_mode: self.working_mode.clone(),
             last_message: self.last_message.clone(),
             session: None,
             rag: self.rag.clone(),
             agent: self.agent.clone(),
             remote_agent: self.remote_agent.clone(),
-            // ACP server prompt path never invokes editor hooks. Drop them so
+            // Server prompt paths never invoke editor hooks. Drop them so
             // forked prompt configs can own isolated session state without
             // trying to clone `FnMut` trait objects.
             tui_before_editor: None,
@@ -479,7 +469,6 @@ impl Default for Config {
             clients: vec![],
             nats_servers: vec![],
             mcp_servers: vec![],
-            acp_servers: vec![],
             tool_servers: vec![],
 
             model_cooldowns: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
@@ -493,7 +482,6 @@ impl Default for Config {
             model: Default::default(),
             tools: Default::default(),
             mcp_manager: None,
-            acp_manager: None,
             working_mode: WorkingMode::Cmd,
             last_message: None,
 
@@ -595,11 +583,10 @@ impl Config {
             edit_file(&editor, &config_path)
         })?;
         crate::utils::emit_info(format!(
-            "NOTE: Remember to restart harnx if there are changes made.\nConfig files:\n  {}\n  {}/\n  {}/\n  {}/",
+            "NOTE: Remember to restart harnx if there are changes made.\nConfig files:\n  {}\n  {}/\n  {}/",
             config_path.display(),
             Self::clients_dir().display(),
             Self::mcp_servers_dir().display(),
-            Self::acp_servers_dir().display(),
         ));
         Ok(())
     }
@@ -742,9 +729,7 @@ impl Config {
         if let Some(hooks) = &self.hooks {
             items.push(("hooks", hooks.entries.len().to_string()));
         }
-        if let Ok((_, Some(log_path))) =
-            Self::log_config(self.working_mode.is_serve() || self.working_mode.is_acp())
-        {
+        if let Ok((_, Some(log_path))) = Self::log_config(self.working_mode.is_serve()) {
             items.push(("log_path", display_path(&log_path)));
         }
         let output = items
@@ -1320,7 +1305,7 @@ impl Config {
             .filter(|declaration| {
                 // Accept if explicitly selected by name
                 selected_names.contains(declaration.name.as_str()) ||
-                // Accept runtime-injected tools (MCP/ACP tools not in original builtin list)
+                // Accept runtime-injected tools (external tools not in original builtin list)
                 declaration.mcp_server_name.is_some() ||
                 declaration.mcp_tool_name.is_some()
             })
@@ -1355,7 +1340,6 @@ impl Config {
                     }
                 }
             }
-            declarations.extend(self.acp_tool_declarations_for_selectors(&selectors));
             let (filtered_handoff_declarations, filtered_handoff_targets) =
                 self.filtered_handoff_declarations(&selectors, active_pkg);
             declarations.extend(filtered_handoff_declarations);
@@ -1372,27 +1356,6 @@ impl Config {
         declarations.retain(|declaration| seen.insert(declaration.name.clone()));
         (declarations, handoff_targets)
     }
-
-    fn acp_tool_declarations_for_selectors(&self, selectors: &[String]) -> Vec<ToolDeclaration> {
-        let Some(manager) = &self.acp_manager else {
-            return Vec::new();
-        };
-        if selectors.iter().any(|selector| selector == "*") {
-            return manager.get_all_tools_blocking();
-        }
-
-        let mut acp_selectors = selectors.to_vec();
-        acp_selectors.extend(
-            selectors
-                .iter()
-                .map(|selector| harnx_core::package_namespace::sanitize_for_tool_name(selector))
-                .filter(|selector| !selector.is_empty()),
-        );
-        acp_selectors.sort();
-        acp_selectors.dedup();
-        manager.get_tools_for_selectors_blocking(&acp_selectors)
-    }
-
     fn filtered_handoff_declarations(
         &self,
         selectors: &[String],

@@ -1501,7 +1501,7 @@ impl McpManager {
     /// Services that were already connected before the snapshot (warm
     /// subprocesses established on the caller's persistent runtime by real
     /// tool calls) are preserved. Blanket-invalidating those was the cause of
-    /// per-tool-round MCP subprocess churn on the single-threaded ACP server
+    /// per-tool-round MCP subprocess churn on the single-threaded frontend
     /// runtime (#988): each completion request reads the cached tool list via
     /// blocking discovery, and the old blanket invalidation tore down every
     /// live connection as a side effect, forcing a respawn on the next call.
@@ -1539,7 +1539,7 @@ impl McpManager {
                     tokio::task::block_in_place(|| handle.block_on(fut()))
                 }
                 _ => {
-                    // On a single-threaded runtime (e.g., the ACP server),
+                    // On a single-threaded runtime (e.g., a single-threaded frontend),
                     // block_in_place panics. Run the async operation on a
                     // dedicated thread with its own runtime instead.
                     let previously_connected = self.connected_client_names();

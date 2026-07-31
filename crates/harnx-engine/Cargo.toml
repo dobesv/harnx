@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Unified LLM + tool-call loop for harnx, emitting AgentEvent streams consumed by every front-end (TUI, CLI, HTTP, ACP)"
+description = "Unified LLM + tool-call loop for harnx, emitting AgentEvent streams consumed by every front-end (TUI, CLI, and HTTP)"
 
 [dependencies]
 anyhow = { workspace = true }

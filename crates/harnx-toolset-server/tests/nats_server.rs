@@ -250,6 +250,7 @@ async fn assert_idempotent_replay(harness: &TestHarness) -> Result<()> {
         call_id: "call-echo".to_string(),
         tool: "echo".to_string(),
         args: json!({ "value": 42 }),
+        parent_session_id: None,
     };
     for _ in 0..2 {
         let message = harness
@@ -276,11 +277,13 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
         call_id: "call-concurrent-a".to_string(),
         tool: "echo".to_string(),
         args: args.clone(),
+        parent_session_id: None,
     };
     let second = ToolRequest {
         call_id: "call-concurrent-b".to_string(),
         tool: "echo".to_string(),
         args: args.clone(),
+        parent_session_id: None,
     };
     let first_call = harness.client.request_with_headers(
         harness.echo_subject(),
@@ -347,6 +350,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
         call_id: "payload-call".to_string(),
         tool: "echo".to_string(),
         args: json!({}),
+        parent_session_id: None,
     };
     request_early_failure(
         harness,
@@ -359,6 +363,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
         call_id: "call-missing-key".to_string(),
         tool: "echo".to_string(),
         args: json!({}),
+        parent_session_id: None,
     };
     let mut headers = async_nats::HeaderMap::new();
     headers.insert(HDR_CALL_ID, missing_key.call_id.as_str());
@@ -376,6 +381,7 @@ async fn assert_cancellation(harness: &TestHarness) -> Result<()> {
         call_id: "call-slow".to_string(),
         tool: "slow".to_string(),
         args: json!({}),
+        parent_session_id: None,
     };
     let slow_request = harness.client.request_with_headers(
         harness.instance_id.tool_subject("test", "slow"),

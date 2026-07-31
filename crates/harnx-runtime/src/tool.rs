@@ -3,7 +3,6 @@ use crate::{
     utils::*,
 };
 use anyhow::Result;
-use harnx_acp::manager::AcpManager;
 use harnx_core::hooks::HookConfig;
 use harnx_hooks::{HookEvent, PersistentHookManager};
 use harnx_mcp::client::McpManager;
@@ -154,13 +153,13 @@ pub async fn execute_tool_round_with_persistence(
 /// old inherent `ToolEvalContext::from_config` method — the struct lives
 /// in `harnx-engine::tool` now (orphan rules forbid adding inherent
 /// methods on a cross-crate type). Snapshots Config fields and the instance's
-/// NATS registrations, constructs the provider list (NATS first, then ACP/MCP),
+/// NATS registrations, constructs the provider list (NATS first, then MCP),
 /// builds the dispatch hook closure over captured `hooks.entries`, `session_id`,
 /// and `cwd`, and wires in harnx-side default UI/prompt callbacks.
 ///
 /// `agent_use_tools` is the active agent's `use_tools` whitelist. The
 /// CLI/TUI flow stores the agent on the Config (via `use_agent`), so
-/// `Config::extract_agent()` would yield the right value, but the ACP
+/// `Config::extract_agent()` would yield the right value, but the previous frontend
 /// server holds the agent only on the per-prompt `Input` (because each
 /// `prompt` call may target a different agent on the same Config).
 /// Passing the use_tools list explicitly keeps both paths correct.
@@ -277,7 +276,6 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
         mut tool_declarations,
         handoff_targets,
         hooks,
-        acp_manager,
         mcp_manager,
         session_name,
         confirm_tool_use_fn,
@@ -290,7 +288,6 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
             tool_declarations,
             handoff_targets,
             guard.resolved_hooks(),
-            guard.acp_manager.clone(),
             guard.mcp_manager.clone(),
             guard.session.as_ref().map(|s| s.id().to_string()),
             build_confirm_tool_use_fn(&guard),
@@ -306,7 +303,7 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
     let decl_map = Arc::new(build_decl_map(tool_declarations));
     let allowed_tool_names: HashSet<String> = decl_map.keys().cloned().collect();
     let per_tool_hooks = build_per_tool_hooks(decl_map.as_ref(), mcp_manager.as_ref());
-    let providers = build_tool_providers(config, nats_provider, acp_manager, mcp_manager);
+    let providers = build_tool_providers(config, nats_provider, mcp_manager);
     let dispatch_hook_fn = build_dispatch_hook_fn(
         &hooks,
         per_tool_hooks,
@@ -403,16 +400,12 @@ fn build_confirm_tool_use_fn(config: &Config) -> Arc<ConfirmToolUseFn> {
 fn build_tool_providers(
     config: &GlobalConfig,
     nats_provider: Option<Arc<crate::nats_tool_provider::NatsToolProvider>>,
-    acp_manager: Option<Arc<AcpManager>>,
     mcp_manager: Option<Arc<McpManager>>,
 ) -> Vec<Arc<dyn ToolProvider>> {
     let mut providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
-    // Registered NATS tools win collisions during incremental stdio migrations.
+    // NATS is the runtime provider for configured sub-agent and tool-server tools.
     if let Some(nats) = nats_provider {
         providers.push(nats as Arc<dyn ToolProvider>);
-    }
-    if let Some(acp) = acp_manager {
-        providers.push(acp as Arc<dyn ToolProvider>);
     }
     if let Some(mcp) = mcp_manager {
         providers.push(mcp as Arc<dyn ToolProvider>);

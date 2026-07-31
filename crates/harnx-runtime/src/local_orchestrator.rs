@@ -55,7 +55,7 @@ pub async fn ensure_local_worker(supervisor: &mut Option<LocalWorkerSupervisor>)
 impl LocalWorkerSupervisor {
     /// Ensure the shared broker and local worker using the `harnx` executable.
     /// Unified CLI callers use their current executable; standalone frontends
-    /// (`harnx-serve`, `harnx-acp-server`) resolve `HARNX_BIN` or a sibling
+    /// such as `harnx-serve` resolve `HARNX_BIN` or a sibling
     /// `harnx` binary because they do not expose the `worker` subcommand.
     pub async fn start() -> Result<Self> {
         let current = std::env::current_exe().context("resolve current frontend executable")?;

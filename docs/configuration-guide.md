@@ -1,6 +1,6 @@
 # Configuration Guide
 
-Harnx uses a modular configuration structure. Global settings are defined in a main `config.yaml`, while LLM providers, MCP servers, and ACP servers are defined in separate YAML files within dedicated subdirectories.
+Harnx uses a modular configuration structure. Global settings are defined in a main `config.yaml`, while LLM providers and MCP servers are defined in separate YAML files within dedicated subdirectories.
 
 ## Configuration Directory
 
@@ -33,8 +33,6 @@ Harnx organizes configuration into the following structure:
 ├── tool_servers/        # NATS tool servers (bridged MCP servers)
 │   ├── fs.yaml
 │   └── bash.yaml
-├── acp_servers/         # ACP server overrides (optional)
-│   └── custom.yaml
 └── agents/              # Agent definitions (.md files)
     └── coder.md
 ```
@@ -85,7 +83,7 @@ patches:                  # Patch API requests using jq expressions
     - '.body.cache_control = {"type":"ephemeral"}'
 ```
 
-`extra.connect_timeout` sets how long Harnx waits to establish TCP/TLS connection before request fails. `extra.read_timeout` is per-read inactivity timeout, not cap on total stream duration, so long-but-progressing streaming responses are allowed to continue. Use it so stalled LLM provider surfaces clear error instead of hanging until ACP idle backstop fires.
+`extra.connect_timeout` sets how long Harnx waits to establish TCP/TLS connection before request fails. `extra.read_timeout` is per-read inactivity timeout, not cap on total stream duration, so long-but-progressing streaming responses are allowed to continue. Use it so stalled LLM provider surfaces clear error instead of hanging.
 
 ### Per-Model Patches
 
@@ -141,26 +139,6 @@ description: "Filesystem access tools"
 >
 >   Set the actual secret (`EXA_API_KEY=…`) in `~/.local/share/harnx/.env`.
 
-## ACP Servers (`acp_servers/`)
-
-Agent Client Protocol (ACP) servers allow Harnx to delegate tasks to other agents.
-
-### Auto-Registration
-
-All agents defined in the `agents/` directory are **automatically registered** as ACP servers. You can call them from any other agent without manual configuration.
-
-### Overrides
-
-If you need to customize an agent's ACP settings (e.g., add environment variables or change timeouts), create a file in `acp_servers/` with the same name as the agent (e.g., `acp_servers/coder.yaml`).
-
-```yaml
-command: harnx-acp-server
-args: ["coder"]
-env:
-  DEBUG: "true"
-idle_timeout_secs: 600
-```
-
 ## NATS Servers (`nats_servers/`)
 
 Harnx supports high-availability distributed mode via NATS. Each cluster is defined in a file like `nats_servers/local.yaml`.
@@ -188,7 +166,7 @@ This directory includes:
 - `config.yaml` with recommended global settings.
 - `clients/` examples for OpenAI, Claude, Gemini, Bedrock, Azure, Vertex AI, and more.
 - `mcp_servers/` and `tool_servers/` examples for filesystem, shell, and web search.
-- `agents/` and `acp_servers/` usage documentation.
+- `agents/` examples for interactive assistants and sub-agents (auto-registered as NATS delegation toolsets).
 
 ---
 

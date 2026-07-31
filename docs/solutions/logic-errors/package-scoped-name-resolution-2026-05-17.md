@@ -29,13 +29,11 @@ Package agents referenced bare names (`compaction_agent: compactor`, `model: ope
 
 ## Investigation Steps
 
-1. Reviewed existing MCP/ACP server namespacing precedent: servers loaded from a package are prefixed with `pkg/` on the global registry, and `reinit_managers_for_agent()` filters by package prefix.
 
 2. Identified two resolution sites:
    - **Compaction agent**: `Config::compact_session()` reads `agent.compaction_agent()` and looks up the agent
    - **Model/client**: `apply_package_agent_transforms()` processes `model_id` and `model_fallbacks` fields
 
-3. Designed resolution rules matching MCP/ACP convention:
    - Bare `foo` → `pkg/foo` (package-relative)
    - `/foo` → `foo` (top-level escape, leading slash stripped)
    - `other/foo` → `other/foo` (already qualified, unchanged)

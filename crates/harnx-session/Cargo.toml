@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Shared session management machinery for harnx-serve and harnx-acp-server"
+description = "Shared session management machinery for harnx frontends"
 repository.workspace = true
 
 [dependencies]

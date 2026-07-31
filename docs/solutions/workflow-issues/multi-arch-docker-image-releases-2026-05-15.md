@@ -145,7 +145,6 @@ docker:
       run: |
         missing=0
         for dir in linux-amd64 linux-arm64; do
-          for bin in harnx harnx-serve harnx-acp-server harnx-mcp-bash harnx-mcp-bash-sandbox-run harnx-mcp-fs harnx-mcp-plans harnx-mcp-time; do
             if [ ! -f "$dir/$bin" ]; then
               echo "ERROR: missing $dir/$bin"
               missing=1

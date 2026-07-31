@@ -1,8 +1,6 @@
 //! Extracted from config/mod.rs for code health.
 use crate::client::ClientConfig;
 use anyhow::{Context, Result};
-use harnx_acp::AcpServerConfig;
-use harnx_core::package_namespace::{handoff_display_name, pkg_from_qualified, qualify_agent_name};
 use harnx_mcp::McpServerConfig;
 
 /// Extract a valid package name from a directory path entry.
@@ -113,22 +111,6 @@ pub(super) fn apply_client_patch(client: &mut ClientConfig, patches: &[String]) 
 
     Ok(())
 }
-
-/// Reconstruct the target's qualified name (`pkg/agent`) from a server config.
-///
-/// Auto-registered package agents already carry a qualified `server.name`, so it
-/// is returned as-is. Manual package servers carry a bare stem and are qualified
-/// against their package. Top-level servers (no package) stay bare.
-fn server_target_qualified(name: &str, package: Option<&str>) -> String {
-    if pkg_from_qualified(name).is_some() {
-        name.to_string()
-    } else if let Some(pkg) = package {
-        qualify_agent_name(pkg, name)
-    } else {
-        name.to_string()
-    }
-}
-
 /// Compute display name for MCP server given active agent package.
 ///
 /// - Top-level servers (`package == None`): unchanged name.
@@ -151,37 +133,11 @@ pub(crate) fn server_display_name(
         (Some(pkg), _) => format!("{}__{name}", sanitize_for_tool_name(pkg)),
     }
 }
-
-/// Compute display name for ACP server given active agent package.
-pub fn acp_server_display_name(server: &AcpServerConfig, agent_package: Option<&str>) -> String {
-    handoff_display_name(
-        &server_target_qualified(&server.name, server.package.as_deref()),
-        agent_package,
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{acp_server_display_name, mcp_server_display_name, server_target_qualified};
-    use harnx_acp::AcpServerConfig;
-    use harnx_core::package_namespace::handoff_display_name;
+    use super::mcp_server_display_name;
     use harnx_mcp::McpServerConfig;
     use std::collections::HashMap;
-
-    fn acp_server(name: &str, package: Option<&str>) -> AcpServerConfig {
-        AcpServerConfig {
-            name: name.to_string(),
-            command: "acp-server".to_string(),
-            args: Vec::new(),
-            env: HashMap::new(),
-            enabled: true,
-            description: None,
-            idle_timeout_secs: 300,
-            operation_timeout_secs: 3600,
-            package: package.map(str::to_string),
-        }
-    }
-
     fn mcp_server(name: &str, package: Option<&str>) -> McpServerConfig {
         McpServerConfig {
             name: name.to_string(),
@@ -197,84 +153,6 @@ mod tests {
             package: package.map(str::to_string),
         }
     }
-
-    fn assert_display_name_matches_handoff(
-        target_qualified: &str,
-        active_pkg: Option<&str>,
-        actual: &str,
-    ) {
-        assert_eq!(actual, handoff_display_name(target_qualified, active_pkg));
-        assert!(
-            !actual.contains('/'),
-            "display name leaked slash for {target_qualified}: {actual}"
-        );
-    }
-
-    #[test]
-    fn acp_auto_registered_same_package_uses_bare_stem() {
-        let server = acp_server("pantheon/atlas", Some("pantheon"));
-        let actual = acp_server_display_name(&server, Some("pantheon"));
-
-        assert_eq!(actual, "atlas");
-        assert_display_name_matches_handoff(
-            &server_target_qualified(&server.name, server.package.as_deref()),
-            Some("pantheon"),
-            &actual,
-        );
-    }
-
-    #[test]
-    fn acp_cross_package_uses_namespaced_display() {
-        let server = acp_server("other/helper", Some("other"));
-        let actual = acp_server_display_name(&server, Some("pantheon"));
-
-        assert_eq!(actual, "other__helper");
-        assert_display_name_matches_handoff(
-            &server_target_qualified(&server.name, server.package.as_deref()),
-            Some("pantheon"),
-            &actual,
-        );
-    }
-
-    #[test]
-    fn acp_top_level_from_package_gets_explicit_prefix() {
-        let server = acp_server("global", None);
-        let actual = acp_server_display_name(&server, Some("pantheon"));
-
-        assert_eq!(actual, "__global");
-        assert_display_name_matches_handoff(
-            &server_target_qualified(&server.name, server.package.as_deref()),
-            Some("pantheon"),
-            &actual,
-        );
-    }
-
-    #[test]
-    fn acp_manual_same_package_bare_name_stays_bare() {
-        let server = acp_server("fs", Some("pantheon"));
-        let actual = acp_server_display_name(&server, Some("pantheon"));
-
-        assert_eq!(actual, "fs");
-        assert_display_name_matches_handoff(
-            &server_target_qualified(&server.name, server.package.as_deref()),
-            Some("pantheon"),
-            &actual,
-        );
-    }
-
-    #[test]
-    fn acp_manual_top_level_bare_name_stays_bare_at_top_level() {
-        let server = acp_server("fs", None);
-        let actual = acp_server_display_name(&server, None);
-
-        assert_eq!(actual, "fs");
-        assert_display_name_matches_handoff(
-            &server_target_qualified(&server.name, server.package.as_deref()),
-            None,
-            &actual,
-        );
-    }
-
     #[test]
     fn mcp_same_package_uses_bare_name() {
         let server = mcp_server("fs", Some("pantheon"));

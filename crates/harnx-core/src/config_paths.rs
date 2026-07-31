@@ -55,9 +55,6 @@ pub const NATS_RUNTIME_DIR: &str = "nats/v1";
 /// Subdirectory holding per-MCP-server YAML files.
 pub const MCP_SERVERS_DIR_NAME: &str = "mcp_servers";
 
-/// Subdirectory holding per-ACP-server YAML files.
-pub const ACP_SERVERS_DIR_NAME: &str = "acp_servers";
-
 /// Subdirectory holding per-tool-server YAML files.
 pub const TOOL_SERVERS_DIR_NAME: &str = "tool_servers";
 
@@ -176,7 +173,7 @@ pub fn macros_dir() -> PathBuf {
 }
 
 /// Parent directory of the config file. If `HARNX_CONFIG_FILE` points
-/// elsewhere, subdirectories (clients/, mcp_servers/, acp_servers/) are
+/// elsewhere, subdirectories (clients/ and mcp_servers/) are
 /// resolved relative to that file's parent rather than `config_dir()`.
 pub fn config_dir_path() -> PathBuf {
     config_file()
@@ -222,12 +219,6 @@ pub fn nats_runtime_store_dir() -> PathBuf {
 pub fn mcp_servers_dir() -> PathBuf {
     config_dir_path().join(MCP_SERVERS_DIR_NAME)
 }
-
-/// Subdirectory holding per-ACP-server YAML files.
-pub fn acp_servers_dir() -> PathBuf {
-    config_dir_path().join(ACP_SERVERS_DIR_NAME)
-}
-
 /// Subdirectory holding per-tool-server YAML files.
 pub fn tool_servers_dir() -> PathBuf {
     config_dir_path().join(TOOL_SERVERS_DIR_NAME)
@@ -320,7 +311,7 @@ pub fn agent_rag_file(agent_name: &str, rag_name: &str) -> PathBuf {
 ///
 /// Resolves relative to `config_dir_path()` (i.e. the parent of the active
 /// config file) so that `HARNX_CONFIG_FILE` redirections are honoured, exactly
-/// as `clients_dir()`, `mcp_servers_dir()`, and `acp_servers_dir()` do.
+/// as `clients_dir()` and `mcp_servers_dir()` do.
 pub fn agents_config_dir() -> PathBuf {
     config_dir_path().join(AGENTS_DIR_NAME)
 }

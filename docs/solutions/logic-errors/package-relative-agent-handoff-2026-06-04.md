@@ -42,7 +42,6 @@ A package agent (`pantheon/daedalus`) using a bare `_session_handoff` tool (`atl
    - `foo` + `Some(pkg)` → `pkg/foo` (same-package)
    - `foo` + `None` → `foo` (top-level context)
 
-5. Verified the package context lives on `Input.agent().name()` per-prompt, NOT global Config — ACP server path may target different agents per prompt.
 
 ## Root Cause
 
@@ -160,7 +159,6 @@ Added 6 unit tests in `crates/harnx-engine/src/tool.rs`:
 
 1. **`strip_suffix` vs `trim_end_matches`**: `trim_end_matches` removes *all* trailing matches of the pattern. For `_session_handoff`, this could misresolve an agent literally named `atlas_session_handoff` (tool `atlas_session_handoff_session_handoff` would resolve to `atlas` instead of `atlas_session_handoff`). Use `strip_suffix()` for exact single-suffix removal.
 
-2. **Package context from Input, not Config**: The active agent is per-prompt (`input.agent().name()`), not global. ACP server paths may target different agents for different prompts. Mirror this in any similar context derivation.
 
 3. **Declarations were also wrong (invalid tool names)**: The initial fix corrected *resolution* but left the declaration layer emitting `format!("{agent_name}_session_handoff")` from `list_agents()` — which returns `pkg/stem`. That produced literal `pantheon/atlas_session_handoff` tool names containing a `/`, which is **invalid** for OpenAI/Anthropic function-name schemas (`^[a-zA-Z0-9_-]+$`) and harnx does no client-side sanitization. See the follow-up below.
 

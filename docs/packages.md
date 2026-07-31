@@ -1,6 +1,6 @@
 # Package System
 
-The harnx package system lets you install agent/MCP/ACP/client config bundles from git repositories or OCI registries using `harnx-pkg`.
+The harnx package system lets you install agent/MCP/client config bundles from git repositories or OCI registries using `harnx-pkg`.
 
 ## Installation
 
@@ -94,7 +94,6 @@ This deletes the package directory. Session transcripts referencing the package'
     agents/                # .md files — one per agent
     mcp_servers/           # .yaml files — stdio MCP server configs
     tool_servers/          # .yaml files — NATS-bridged tool server configs
-    acp_servers/           # .yaml files — ACP server configs
     clients/               # .yaml files — client configs
   my-agents.patch.yaml     # Optional local overrides (sibling to the dir)
 ```
@@ -107,7 +106,6 @@ Package agents and servers are automatically namespaced to avoid collisions with
 |------|-------------|-------------|-----------|
 | Agent `coder.md` in `my-pkg` | `packages/my-pkg/agents/coder.md` | `my-pkg/coder` | `my-pkg__coder_session_prompt` |
 | MCP server `fs.yaml` in `my-pkg` | `packages/my-pkg/tool_servers/fs.yaml` | `my-pkg__fs` | `my-pkg__fs_read` |
-| ACP server `helper.yaml` in `my-pkg` | `packages/my-pkg/acp_servers/helper.yaml` | `my-pkg__helper` | `my-pkg__helper_session_prompt` |
 
 The `/` in agent names is replaced with `__` in tool names.
 

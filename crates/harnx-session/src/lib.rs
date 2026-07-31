@@ -1,10 +1,10 @@
-//! harnx-session — Shared session management machinery for harnx-serve and harnx-acp-server.
+//! harnx-session — Shared session management machinery for harnx frontends.
 //!
 //! Provides unified per-session state management that both servers consume:
 //! - Config forking: `fork_prompt_config` unifies the fork pattern from both servers
 //! - AgentLoopContext building: `build_context` constructs context for agent loop runs
 //!
-//! Transport-specific concerns (broadcast/SSE/ACP notification, session registry/reap)
+//! Transport-specific concerns (broadcast/SSE notification, session registry/reap)
 //! remain in the respective server crates behind adapter traits.
 
 use harnx_core::abort::AbortSignal;

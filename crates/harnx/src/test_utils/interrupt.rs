@@ -6,25 +6,8 @@
 use crate::test_utils::mock_openai_server::{MockOpenAiScript, MockOpenAiTurn};
 use crate::test_utils::tmux_harness::TmuxHarness;
 use anyhow::{Context, Result};
-use harnx_acp::AcpServerConfig;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-/// Locate the `harnx-acp-server` binary given the already-resolved `harnx`
-/// binary path.
-///
-/// The `harnx-acp-server` binary lives in its own crate, so
-/// `CARGO_BIN_EXE_harnx-acp-server` isn't visible from `harnx`'s test
-/// context. Because Cargo builds every workspace member into the same target
-/// dir, the binary sits next to the `harnx` binary. Callers are responsible
-/// for ensuring it has been built (e.g. via `cargo build --workspace` or
-/// `cargo nextest run --workspace`, which is what CI uses).
-pub fn harnx_acp_server_bin(harnx_bin: &Path) -> PathBuf {
-    let ext = std::env::consts::EXE_SUFFIX;
-    harnx_bin.with_file_name(format!("harnx-acp-server{ext}"))
-}
-
 /// Spinner frames used by the TUI when an LLM/tool/hook call is in flight.
 /// Mirrors `SPINNER_FRAMES` in `src/tui/types.rs`. Used to detect whether
 /// the TUI is currently busy.
@@ -357,95 +340,6 @@ pub fn wait_for_cmd_exit(tmux: &TmuxHarness, budget: Duration) -> Result<bool> {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
-
-/// A mock-LLM response that emits one short text chunk and immediately
-/// issues a `<agent_name>_session_prompt` tool call to delegate to a
-/// sub-agent via ACP.
-pub fn script_call_sub_agent(agent_name: &str) -> MockOpenAiScript {
-    use crate::test_utils::mock_openai_server::MockOpenAiToolCall;
-    MockOpenAiScript {
-        turns: vec![MockOpenAiTurn {
-            text_chunks: vec!["Delegating...".to_string()],
-            tool_calls: vec![MockOpenAiToolCall {
-                encrypted_content: None,
-                name: format!("{agent_name}_session_prompt"),
-                arguments: serde_json::json!({ "message": "do the thing" }),
-                id: None,
-            }],
-            expect: None,
-            error: None,
-        }],
-        fallback_text: "sub-agent script exhausted".to_string(),
-        chunk_delay_ms: 0,
-    }
-}
-
-/// Sets up two config dirs (child and parent) for a sub-agent delegation test.
-///
-/// - Child dir: `dir/child` — minimal config pointing at `child_mock_url`,
-///   plus an agent file at `agents/child.md` (required by `harnx-acp-server child`).
-/// - Parent dir: `dir/parent` — minimal config pointing at `parent_mock_url`,
-///   plus an `acp_servers/child.yaml` that spawns another harnx with
-///   `harnx-acp-server child` and `HARNX_CONFIG_DIR` pointing at the child config dir.
-///
-/// Returns the PARENT's `ConfigPaths` so `spawn_tui` launches the parent.
-pub fn write_with_sub_agent(
-    dir: &Path,
-    parent_mock_url: &str,
-    child_mock_url: &str,
-    harnx_bin: &Path,
-) -> Result<ConfigPaths> {
-    // Child config (lives in <dir>/child/harnx-config).
-    let child_paths = write_minimal_config(&dir.join("child"), child_mock_url)?;
-    // The child needs an agent file matching agent name passed to harnx-acp-server.
-    std::fs::create_dir_all(child_paths.harnx_config_dir.join("agents"))?;
-    std::fs::write(
-        child_paths.harnx_config_dir.join("agents/child.md"),
-        "---\nname: child\nmodel: mock-llm:test\nuse_tools: '*'\n---\nYou are the child.\n",
-    )?;
-
-    // Parent config (lives in <dir>/parent/harnx-config).
-    let parent_paths = write_minimal_config(&dir.join("parent"), parent_mock_url)?;
-
-    // ACP server entry on parent — points at sibling harnx-acp-server child
-    // with the child's HARNX_CONFIG_DIR.
-    let acp_servers_dir = parent_paths.harnx_config_dir.join("acp_servers");
-    std::fs::create_dir_all(&acp_servers_dir)?;
-    let mut env = HashMap::new();
-    env.insert(
-        "HARNX_CONFIG_DIR".to_string(),
-        child_paths.harnx_config_dir.to_string_lossy().into_owned(),
-    );
-    env.insert(
-        "HARNX_DATA_DIR".to_string(),
-        child_paths.harnx_data_dir.to_string_lossy().into_owned(),
-    );
-    env.insert(
-        "HARNX_STATE_DIR".to_string(),
-        child_paths.harnx_state_dir.to_string_lossy().into_owned(),
-    );
-    let acp_server = AcpServerConfig {
-        name: "child".to_string(),
-        command: harnx_acp_server_bin(harnx_bin)
-            .to_string_lossy()
-            .into_owned(),
-        args: vec!["child".to_string()],
-        env,
-        enabled: true,
-        description: None,
-        idle_timeout_secs: 60,
-        operation_timeout_secs: 60,
-        package: None,
-    };
-    std::fs::write(
-        acp_servers_dir.join("child.yaml"),
-        serde_yaml::to_string(&acp_server)
-            .context("failed to serialize child ACP server config")?,
-    )?;
-
-    Ok(parent_paths)
-}
-
 /// Polls the pane until no SPINNER_FRAME char is visible in the most
 /// recent ~10 lines, indicating the harness is idle and ready for new
 /// input. Returns Err if the budget elapses while a spinner is still
@@ -504,63 +398,6 @@ pub fn send_sigint(child: &std::process::Child) -> Result<()> {
     }
     Ok(())
 }
-
-/// Writes an agent markdown file under `<harnx_config_dir>/agents/<name>.md`
-/// pointing at the `mock-llm:test` model with `use_tools: '*'`. Required
-/// before launching `harnx-acp-server <name>`.
-pub fn write_acp_agent(paths: &ConfigPaths, name: &str) -> Result<()> {
-    let agents = paths.harnx_config_dir.join("agents");
-    std::fs::create_dir_all(&agents).context("failed to create agents dir")?;
-    std::fs::write(
-        agents.join(format!("{name}.md")),
-        format!("---\nname: {name}\nmodel: mock-llm:test\nuse_tools: '*'\n---\nYou are {name}.\n"),
-    )
-    .context("failed to write agent file")?;
-    Ok(())
-}
-
-/// Builds connected `AcpClient` against `harnx-acp-server <agent>` child
-/// using the given config dir.
-pub async fn spawn_acp_client(
-    paths: &ConfigPaths,
-    harnx_bin: &Path,
-    agent: &str,
-) -> Result<harnx_acp::AcpClient> {
-    harnx_core::require_nextest();
-    let mut env = HashMap::new();
-    env.insert(
-        "HARNX_CONFIG_DIR".to_string(),
-        paths.harnx_config_dir.to_string_lossy().into_owned(),
-    );
-    env.insert(
-        "HARNX_DATA_DIR".to_string(),
-        paths.harnx_data_dir.to_string_lossy().into_owned(),
-    );
-    env.insert(
-        "HARNX_STATE_DIR".to_string(),
-        paths.harnx_state_dir.to_string_lossy().into_owned(),
-    );
-    let config = AcpServerConfig {
-        name: format!("test-{agent}"),
-        command: harnx_acp_server_bin(harnx_bin)
-            .to_string_lossy()
-            .into_owned(),
-        args: vec![agent.to_string()],
-        env,
-        enabled: true,
-        description: None,
-        idle_timeout_secs: 300,
-        operation_timeout_secs: 60,
-        package: None,
-    };
-    let client = harnx_acp::AcpClient::new(config);
-    client
-        .connect()
-        .await
-        .context("failed to connect test ACP client")?;
-    Ok(client)
-}
-
 /// Polls `Child::try_wait` until the child exits or the budget elapses.
 pub fn wait_for_exit(
     child: &mut std::process::Child,

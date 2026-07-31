@@ -625,6 +625,12 @@ impl harnx_core::event::AgentEventSink for AgUiSink {
             AgentEvent::Turn(TurnEvent::HandoffRequested { agent, session_id }) => {
                 self.emit_handoff(agent, session_id);
             }
+            AgentEvent::Turn(TurnEvent::SubAgentStarted { agent, session_id }) => {
+                self.emit_custom(
+                    "sub_agent_started",
+                    json!({ "agent": agent, "session_id": session_id }),
+                );
+            }
             AgentEvent::Session(SessionEvent::CompactingStarted) => {
                 self.emit_custom("session_compacting_started", json!({}));
             }

@@ -17,18 +17,15 @@ plan_ref: "fix-anonymous-session-short-id-449"
 ---
 ## Problem
 
-PR #456 introduced 6-char base64url session IDs via `generate_session_id()` for named sessions, but `Config::use_session(None)` — the anonymous session path used by the ACP server — still called `Uuid::now_v7()` directly. New ACP sessions got full UUIDs instead of short IDs, breaking consistency.
 
 ## Symptoms
 
-- ACP server sessions had 36-char UUID filenames instead of 6-char short IDs
 - Named sessions (via `-s name`) correctly used short IDs
 - Session picker showed mixed ID formats
 - Test `test_new_session_has_uuid7_filename` passed but validated wrong behavior
 
 ## Investigation Steps
 
-1. Ran ACP server integration tests — session IDs were UUIDs
 2. Traced `Config::use_session(None)` path — found direct `Uuid::now_v7()` call
 3. Reviewed PR #456 changes — `session::new()` used `generate_session_id()` but anonymous path bypassed it
 4. Analyzed collision avoidance: `generate_session_id` checks file existence, but file isn't written until after ID returned
@@ -40,7 +37,6 @@ Two separate issues:
 
 1. **Code path inconsistency**: `use_session(None)` bypassed the new `generate_session_id()` logic that `session::new()` uses for named sessions.
 
-2. **Race condition in collision avoidance**: The collision check in `generate_session_id` uses `exists(candidate)`, but works correctly only if file is created atomically before another caller can generate the same ID. For the ACP server's `new_session` workflow:
    - Exits previous session (deletes its file)
    - Creates new session
    - If two rapid calls happen in same second with no existing files, both get same ID

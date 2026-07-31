@@ -147,4 +147,3 @@ harnx info session <agent> <id>  # State-only, NO MCP init
 - **GitHub:** [#622](https://github.com/dobesv/harnx/issues/622) — Dump fully-rendered agent config
 - **Related Solution:** [logic-errors/minijinja-system-prompt-templating-2026-04-25.md](../logic-errors/minijinja-system-prompt-templating-2026-04-25.md) — MiniJinja context construction
 - **Related Solution:** [logic-errors/extract-agent-precedence-2026-05-03.md](../logic-errors/extract-agent-precedence-2026-05-03.md) — Agent config precedence
-- **Related Solution:** [integration-issues/mcp-tool-template-acp-propagation-2026-04-30.md](../integration-issues/mcp-tool-template-acp-propagation-2026-04-30.md) — MCP tool template rendering

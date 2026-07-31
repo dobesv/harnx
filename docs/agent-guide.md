@@ -68,6 +68,7 @@ The current OS is {{__os__}} and the shell is {{__shell__}}.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `model` | `string` | global default | LLM model ID (e.g. `openai:gpt-4o`, `claude:claude-3-5-sonnet`). If omitted, uses the globally configured model. |
+| `role` | `string` | `assistant` | Agent purpose: `assistant` (interactive agent shown in menus), `subagent` (internal agent invoked via delegation), or `compaction` (session compaction agent). |
 | `temperature` | `float` | global default | Controls randomness (0 = deterministic, 1 = creative). Inherited from global config when `model` is omitted. |
 | `top_p` | `float` | global default | Nucleus sampling parameter. Alternative to temperature. Inherited from global config when `model` is omitted. |
 | `use_tools` | `list` | none | YAML list of tool specifiers. Also accepts a comma-separated string for backward compatibility. See [Tools](#tools). |
@@ -310,6 +311,64 @@ Use `--prompt` to create a temporary agent without a file:
 ```sh
 harnx --prompt "You are a helpful translator" "translate hello to French"
 ```
+
+## Sub-Agents & Agent Delegation
+
+Harnx supports agent delegation, allowing a parent agent to run nested sub-agents for specialized tasks (such as code analysis, research, or execution planning).
+
+### NATS-Based Session Model
+
+Sub-agents in Harnx execute as standard NATS agent sessions (`ThinClientSession`). ACP (Agent Client Protocol) and its stdio child process architecture have been removed.
+
+- **Markdown-only agent definitions**: Agents are defined solely by Markdown files with YAML front-matter in `<config-dir>/agents/*.md` (or package agents). ACP server configuration (`acp_servers/*.yaml`) and ACP stdio child processes no longer exist.
+- **Auto-registered toolsets**: For every configured agent, the worker daemon registers a NATS-backed 4-tool toolset:
+  - `{agent}_session_new`: Creates a new sub-agent session and returns its initial response along with session metadata.
+  - `{agent}_session_prompt`: Sends a prompt message (`message`, optional `session_id`, optional `parent_session_id`) to a sub-agent session, returning the sub-agent's final text response.
+  - `{agent}_session_load`: Reads prior event history for an existing sub-agent session log.
+  - `{agent}_session_cancel`: Cancels an in-flight prompt on a sub-agent session.
+- **Worker-agnostic execution**: Sub-agent turns route via standard NATS JetStream WorkQueue subjects (`WORK_NOTIFY_<cluster>`) and acquire distributed KV locks (`harnx_leases`). Execution can run on any available worker in a cluster.
+- **Timeout protection**: Sub-agent tool calls run synchronously from the parent agent's perspective. Turn execution is bounded by idle and operation timeouts (`HARNX_SUBAGENT_IDLE_TIMEOUT_SECS` defaulting to 300s, `HARNX_SUBAGENT_OPERATION_TIMEOUT_SECS` defaulting to 3600s).
+
+### Sub-Agent Tool Result Marker
+
+When `{agent}_session_new` or `{agent}_session_prompt` completes, the tool returns a JSON object containing the sub-agent response text and a structured identification marker (`sub_agent`):
+
+```json
+{
+  "session_id": "01948a3f-7b1c-7123-8901-abcdef123456",
+  "response": "Analysis complete. Here are the findings...",
+  "sub_agent": {
+    "agent": "researcher",
+    "session_id": "01948a3f-7b1c-7123-8901-abcdef123456"
+  }
+}
+```
+
+The `sub_agent` marker carries the exact `AgentSource` structure (`agent`, `session_id`), giving client interfaces explicit sub-agent identity without requiring tool-name heuristics.
+
+### Live Event Streaming for User Interfaces
+
+Because sub-agents run as standard NATS agent sessions, their execution events (LLM streaming chunks, tool invocations, notices) publish in real time to NATS:
+
+```
+sessions.{session_id}.events
+```
+
+Client interfaces (TUI, web UI, CLI) can attach to a child session's stream to render activity live.
+
+To allow interfaces to attach before the sub-agent prompt completes, an early advisory event is emitted on the parent session's stream (`sessions.{parent_session_id}.events`) immediately when delegation begins:
+
+```rust
+AgentEvent::SubAgent {
+    source: AgentSource { agent: "researcher", session_id: Some("01948..."), model: None },
+    event: Box::new(AgentEvent::Turn(TurnEvent::SubAgentStarted {
+        agent: "researcher",
+        session_id: "01948...",
+    })),
+}
+```
+
+When a UI receives `TurnEvent::SubAgentStarted` on the parent stream, it can immediately subscribe to `sessions.{child_session_id}.events` for real-time progress before `{agent}_session_prompt` returns its final output.
 
 ## Examples
 

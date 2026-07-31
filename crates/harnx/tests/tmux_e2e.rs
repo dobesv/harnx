@@ -1,38 +1,16 @@
-use harnx::mcp::McpServerConfig;
 use harnx::test_utils::{
-    harnx_mcp_repro249_bin, MockOpenAiError, MockOpenAiScript, MockOpenAiServer,
-    MockOpenAiToolCall, MockOpenAiTurn, MockTurnExpectation, TmuxHarness,
+    MockOpenAiError, MockOpenAiScript, MockOpenAiServer, MockOpenAiToolCall, MockOpenAiTurn,
+    TmuxHarness,
 };
-use harnx_acp::AcpServerConfig;
 use harnx_core::message::MessageRole;
 use harnx_core::session::SessionLogEntry;
 
 use anyhow::{Context, Result};
-use harnx::test_utils::interrupt::harnx_acp_server_bin;
 use insta::assert_snapshot;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
-
-const REPRO_249_MCP_TOOL_NAME: &str = "repro249_unique_mcp_tool";
-const REPRO_249_MCP_TOOL_RESPONSE: &str = "repro249 fixed tool response";
-const TEST_AGENT_NAME: &str = "test-agent";
-const TEST_SUB_AGENT_NAME: &str = "test-sub-agent";
-#[cfg(unix)]
-const PACKAGE_DELEGATION_PACKAGE_NAME: &str = "same-package-delegation";
-#[cfg(unix)]
-const PACKAGE_DELEGATION_CALLER_NAME: &str = "package-caller";
-#[cfg(unix)]
-const PACKAGE_DELEGATION_PEER_NAME: &str = "package-peer";
-#[cfg(unix)]
-const PACKAGE_DELEGATION_USER_PROMPT: &str = "delegate to your package peer";
-#[cfg(unix)]
-const PACKAGE_DELEGATION_PEER_RESPONSE: &str =
-    "Package peer response: same-package delegation succeeded.";
-#[cfg(unix)]
-const PACKAGE_DELEGATION_CALLER_RESPONSE: &str =
-    "Package caller final response: Package peer response: same-package delegation succeeded.";
 
 #[test]
 #[cfg(unix)]
@@ -148,237 +126,6 @@ fn wait_for_proxy_injection_or_skip(tmux: &TmuxHarness) -> Option<String> {
         }
     }
 }
-#[test]
-fn repro_249_top_level_delegation_markers() -> Result<()> {
-    if !TmuxHarness::is_available() {
-        eprintln!("skipping repro_249_top_level_delegation_markers: tmux is unavailable");
-        return Ok(());
-    }
-
-    let repo_root = repo_root()?;
-    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
-
-    let temp = TempDir::new().context("failed to create temp dir")?;
-    let mock = MockOpenAiServer::start(script())?;
-    let paths = TestPaths::new(temp.path(), mock.port())?;
-    write_fixture_files(&paths)?;
-
-    let path_env = format!(
-        "{}:{}",
-        harnx_bin
-            .parent()
-            .context("harnx binary missing parent directory")?
-            .display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-
-    let tmux = match TmuxHarness::new(&repo_root, 120, 35) {
-        Ok(tmux) => tmux,
-        Err(err) => {
-            eprintln!(
-                "skipping repro_249_top_level_delegation_markers: tmux is unavailable or unusable ({err:#})"
-            );
-            return Ok(());
-        }
-    };
-    tmux.send_keys(&["C-l"])?;
-
-    // Step 1: Export HARNX_CONFIG_DIR, HARNX_DATA_DIR, HARNX_STATE_DIR
-    tmux.send_text(&format!(
-        "export HARNX_CONFIG_DIR={} HARNX_DATA_DIR={} HARNX_STATE_DIR={}",
-        shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref()),
-        shell_escape(paths.harnx_data_dir.to_string_lossy().as_ref()),
-        shell_escape(paths.harnx_state_dir.to_string_lossy().as_ref())
-    ))?;
-    tmux.send_keys(&["Enter"])?;
-
-    // Step 2: Export PATH and cd to repo root for subsequent commands
-    //
-    // Each step uses a unique marker. The wait_for predicate requires the
-    // marker to appear at least twice in the pane: once in the echoed command
-    // line and once as actual output, ensuring the command has finished.
-    tmux.send_text(&format!(
-        "export PATH={} && cd {}; printf '__READY_2__\\n'",
-        shell_escape(&path_env),
-        shell_escape(repo_root.to_string_lossy().as_ref())
-    ))?;
-    tmux.send_keys(&["Enter"])?;
-    tmux.wait_for(Duration::from_secs(5), |screen| {
-        count_occurrences(screen, "__READY_2__") >= 2
-    })?;
-
-    // Step 3: Run diagnostics - list agents
-    tmux.send_text(&format!(
-        "{} --list-agents; printf '__READY_3__\\n'",
-        shell_escape(harnx_bin.to_string_lossy().as_ref())
-    ))?;
-    tmux.send_keys(&["Enter"])?;
-    let agents_screen = tmux.wait_for(Duration::from_secs(10), |screen| {
-        count_occurrences(screen, "__READY_3__") >= 2
-    })?;
-    assert!(
-        agents_screen.contains(TEST_AGENT_NAME),
-        "main agent not listed in --list-agents output:\n{agents_screen}"
-    );
-    assert!(
-        agents_screen.contains(TEST_SUB_AGENT_NAME),
-        "sub-agent not listed in --list-agents output:\n{agents_screen}"
-    );
-
-    // Step 5: Start interactive TUI session
-    tmux.send_text(&format!(
-        "{} -a {} --session || echo HARNX_EXIT:$?",
-        shell_escape(harnx_bin.to_string_lossy().as_ref()),
-        TEST_AGENT_NAME
-    ))?;
-    tmux.send_keys(&["Enter"])?;
-
-    tmux.wait_for_contains("Welcome to harnx", Duration::from_secs(15))?;
-    tmux.send_text("call repro249 through the sub-agent")?;
-    tmux.send_keys(&["Enter"])?;
-
-    let screen = tmux.wait_for(Duration::from_secs(30), |screen| {
-        screen.contains(REPRO_249_MCP_TOOL_RESPONSE)
-    })?;
-
-    assert_eq!(
-        count_occurrences(&screen, &format!("@ {}", TEST_SUB_AGENT_NAME)),
-        1,
-        "expected exactly one top-level delegation marker, got screen:\n{screen}"
-    );
-    assert!(
-        count_occurrences(&screen, REPRO_249_MCP_TOOL_NAME) >= 1,
-        "expected MCP tool marker to appear at least once, got screen:\n{screen}"
-    );
-    // The response phrase appears in three legitimate places once the
-    // delegated session completes end-to-end: the sub-agent's streamed
-    // text, the parent's `Tool::Completed` rendering of the
-    // `_session_prompt` result (which echoes the sub-agent's accumulated
-    // output), and the parent's own final reply that references it.
-    // None of those are duplicates of the same render — they are three
-    // distinct events whose payload happens to share a substring. The
-    // earlier `count == 1` assertion was an artifact of OLD-code
-    // behavior where the sub-agent's MCP tool errored out (so the
-    // response phrase only appeared in the sub-agent's mock text). The
-    // function-name assertion above already verifies the actual #249
-    // invariant: exactly one top-level delegation marker.
-    assert!(
-        count_occurrences(&screen, REPRO_249_MCP_TOOL_RESPONSE) >= 1,
-        "expected MCP tool response to appear at least once, got screen:\n{screen}"
-    );
-    assert!(
-        !screen.contains("HARNX_EXIT:"),
-        "harnx exited unexpectedly:\n{screen}"
-    );
-
-    drop(tmux);
-    drop(mock);
-    Ok(())
-}
-
-#[cfg(unix)]
-#[test]
-fn same_package_session_prompt_delegation_uses_qualified_spawn() -> Result<()> {
-    if option_env!("CARGO_BIN_NAME") == Some("harnx") {
-        eprintln!(
-            "skipping same_package_session_prompt_delegation_uses_qualified_spawn in binary test target"
-        );
-        return Ok(());
-    }
-    if !TmuxHarness::is_available() {
-        eprintln!("skipping same_package_session_prompt_delegation_uses_qualified_spawn: tmux is unavailable");
-        return Ok(());
-    }
-
-    let repo_root = repo_root()?;
-    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
-
-    let temp = TempDir::new().context("failed to create temp dir")?;
-    let mock = MockOpenAiServer::start(package_delegation_script())?;
-    let paths = TestPaths::new(temp.path(), mock.port())?;
-    write_same_package_delegation_fixture_files(&paths)?;
-
-    let path_env = format!(
-        "{}:{}",
-        harnx_bin
-            .parent()
-            .context("harnx binary missing parent directory")?
-            .display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-
-    let tmux = match TmuxHarness::new(&repo_root, 120, 35) {
-        Ok(tmux) => tmux,
-        Err(err) => {
-            eprintln!(
-                "skipping same_package_session_prompt_delegation_uses_qualified_spawn: \
-                 tmux is unavailable or unusable ({err:#})"
-            );
-            return Ok(());
-        }
-    };
-    tmux.send_keys(&["C-l"])?;
-
-    tmux.send_text(&format!(
-        "export HARNX_CONFIG_DIR={} HARNX_DATA_DIR={} HARNX_STATE_DIR={}",
-        shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref()),
-        shell_escape(paths.harnx_data_dir.to_string_lossy().as_ref()),
-        shell_escape(paths.harnx_state_dir.to_string_lossy().as_ref())
-    ))?;
-    tmux.send_keys(&["Enter"])?;
-
-    tmux.send_text(&format!(
-        "export PATH={} && cd {}; printf '__PKG_DELEGATION_READY__\\n'",
-        shell_escape(&path_env),
-        shell_escape(repo_root.to_string_lossy().as_ref())
-    ))?;
-    tmux.send_keys(&["Enter"])?;
-    tmux.wait_for(Duration::from_secs(5), |screen| {
-        count_occurrences(screen, "__PKG_DELEGATION_READY__") >= 2
-    })?;
-
-    tmux.send_text(&format!(
-        "{} -a {PACKAGE_DELEGATION_PACKAGE_NAME}/{PACKAGE_DELEGATION_CALLER_NAME} --session || echo HARNX_EXIT:$?",
-        shell_escape(harnx_bin.to_string_lossy().as_ref()),
-    ))?;
-    tmux.send_keys(&["Enter"])?;
-
-    tmux.wait_for_contains("Welcome to harnx", Duration::from_secs(15))?;
-
-    tmux.send_text(PACKAGE_DELEGATION_USER_PROMPT)?;
-    tmux.send_keys(&["Enter"])?;
-
-    let screen = tmux.wait_for_stable(
-        Duration::from_secs(30),
-        Duration::from_millis(300),
-        |screen| screen.contains(PACKAGE_DELEGATION_PEER_RESPONSE),
-    )?;
-
-    // #804 regression repro: caller + peer exist only inside package. Before fix,
-    // spawned ACP subagent could lose package prefix and fail once top-level agents
-    // with same bare names were absent. This e2e test covers success path; exact
-    // qualified spawn args are unit-covered in harnx-runtime package_loading tests.
-    //
-    // #826: once the same-package ACP delegation tool resolves under its bare
-    // name, the TUI renders the tool's `call_template` ("@ <peer> …") as the
-    // tool-call header instead of the raw `<peer>_session_prompt` name, so we
-    // assert on the rendered delegation header. (Before #826 was fixed the bare
-    // tool failed to resolve to a registered ACP server, so the raw name leaked
-    // through as a fallback header — that incidental display is no longer used.)
-    assert!(
-        screen.contains(&format!("@ {PACKAGE_DELEGATION_PEER_NAME}")),
-        "same-package delegation tool call missing from TUI transcript:\n{screen}"
-    );
-    assert!(
-        screen.contains(PACKAGE_DELEGATION_PEER_RESPONSE),
-        "peer delegated response not visible in TUI transcript:\n{screen}"
-    );
-
-    drop(tmux);
-    drop(mock);
-    Ok(())
-}
-
 // Normalizes screen output for snapshot tests.
 fn normalize_screen(screen: &str) -> String {
     let trimmed = screen
@@ -460,32 +207,6 @@ fn is_uuid_at(chars: &[char], i: usize) -> bool {
     }
     true
 }
-
-/// Replace variable context-token counts in the TUI status bar (e.g.
-/// `Context: 72(0%)`) with a stable placeholder so snapshots are
-/// deterministic across runs where mock timing varies.
-fn normalize_context_counts(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut remaining = text;
-    while let Some(pos) = remaining.find("Context: ") {
-        out.push_str(&remaining[..pos]);
-        let after = &remaining[pos + "Context: ".len()..];
-        // Consume digits, then literal "(0%)"
-        let digit_end = after
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(after.len());
-        if after[digit_end..].starts_with("(0%)") {
-            out.push_str("Context: [N](0%)");
-            remaining = &after[digit_end + "(0%)".len()..];
-        } else {
-            out.push_str("Context: ");
-            remaining = after;
-        }
-    }
-    out.push_str(remaining);
-    out
-}
-
 /// Replace worker status token counts (for example, `💬 65` or
 /// `💬 65(12%)`) with a stable placeholder. Session IDs affect model
 /// tokenization before the snapshot's ID normalization runs.
@@ -517,27 +238,6 @@ fn message_token_count_normalization_preserves_surrounding_status_text() {
         "🤖 agent ▸   💬 [N]\n💬 [N](12%)\n💬 unknown"
     );
 }
-
-/// Normalize `response:` lines in sub-agent tool-result output so that
-/// timing-dependent trailing chunks don't cause snapshot flakiness.  The TUI
-/// may or may not have received the last streaming chunk by the time the screen
-/// is captured, making the concatenated response non-deterministic.
-fn normalize_response_lines(text: &str) -> String {
-    text.lines()
-        .map(|line| {
-            if let Some(rest) = line.strip_prefix("response: ") {
-                // Keep only up to and including the first complete sentence
-                // boundary to drop timing-dependent trailing chunks.
-                let trimmed = rest.split_inclusive(['.', '!']).next().unwrap_or(rest);
-                format!("response: {trimmed}")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Replace 6-char base64url session IDs (e.g. `afgkKA`) with `[SID]` so
 /// snapshots are deterministic across runs.  A valid short session ID consists
 /// of exactly 6 characters from the URL-safe base64 alphabet `[A-Za-z0-9_-]`.
@@ -608,45 +308,6 @@ fn repo_root() -> Result<PathBuf> {
         .map(Path::to_path_buf)
         .context("failed to determine workspace root")
 }
-
-#[cfg(unix)]
-fn package_delegation_script() -> MockOpenAiScript {
-    // Turn order across caller + peer package agents:
-    //   Turn 0 (caller): delegate to same-package peer via bare tool name.
-    //   Turn 1 (peer)  : respond and end delegated session.
-    //   Turn 2 (caller): final summary after delegated session returns.
-    MockOpenAiScript {
-        turns: vec![
-            MockOpenAiTurn {
-                text_chunks: vec!["I'll delegate this to my package peer.".to_string()],
-                tool_calls: vec![MockOpenAiToolCall {
-                    name: format!("{}_session_prompt", PACKAGE_DELEGATION_PEER_NAME),
-                    arguments: json!({
-                        "message": "Explain whether same-package delegation succeeded."
-                    }),
-                    id: Some("call_package_peer_1".to_string()),
-                    ..Default::default()
-                }],
-                error: None,
-                expect: None,
-            },
-            MockOpenAiTurn {
-                text_chunks: vec![PACKAGE_DELEGATION_PEER_RESPONSE.to_string()],
-                tool_calls: vec![],
-                error: None,
-                expect: None,
-            },
-            MockOpenAiTurn {
-                text_chunks: vec![PACKAGE_DELEGATION_CALLER_RESPONSE.to_string()],
-                tool_calls: vec![],
-                error: None,
-                expect: None,
-            },
-        ],
-        fallback_text: "No more scripted responses.".to_string(),
-        chunk_delay_ms: 0,
-    }
-}
 struct TestPaths {
     harnx_config_dir: PathBuf,
     harnx_data_dir: PathBuf,
@@ -676,68 +337,6 @@ impl TestPaths {
         })
     }
 }
-
-fn script() -> MockOpenAiScript {
-    // The mock LLM is shared between the parent and sub-agent processes.
-    // Turns are consumed in order across both processes:
-    //   Turn 0 (parent)    : delegate to the sub-agent via ACP tool call
-    //   Turn 1 (sub-agent) : call the MCP tool repro249_unique_mcp_tool
-    //   Turn 2 (sub-agent) : summarize the MCP tool result (ends the sub-agent)
-    //   Turn 3 (parent)    : final summary after delegation returns
-    MockOpenAiScript {
-        turns: vec![
-            // Turn 0: parent delegates to sub-agent
-            MockOpenAiTurn {
-                text_chunks: vec!["I'll delegate this to the sub-agent.".to_string()],
-                tool_calls: vec![MockOpenAiToolCall {
-                    name: format!("{}_session_prompt", TEST_SUB_AGENT_NAME),
-                    arguments: json!({
-                        "message": format!(
-                            "Call the MCP tool named {REPRO_249_MCP_TOOL_NAME} and report its result."
-                        )
-                    }),
-                    id: Some("call_delegate_1".to_string()),
-                    ..Default::default()
-                }],
-                error: None,
-                expect: None,
-            },
-            // Turn 1: sub-agent calls the MCP tool
-            MockOpenAiTurn {
-                text_chunks: vec!["I'll use the MCP tool now.".to_string()],
-                tool_calls: vec![MockOpenAiToolCall {
-                    name: REPRO_249_MCP_TOOL_NAME.to_string(),
-                    arguments: json!({}),
-                    id: Some("call_mcp_1".to_string()),
-                    ..Default::default()
-                }],
-                error: None,
-                expect: None,
-            },
-            // Turn 2: sub-agent summarizes and returns
-            MockOpenAiTurn {
-                text_chunks: vec![format!(
-                    "Sub-agent saw MCP result: {REPRO_249_MCP_TOOL_RESPONSE}"
-                )],
-                tool_calls: vec![],
-                error: None,
-                expect: None,
-            },
-            // Turn 3: parent final reply after delegated task completes
-            MockOpenAiTurn {
-                text_chunks: vec![format!(
-                    "Done. Delegated task completed with: {REPRO_249_MCP_TOOL_RESPONSE}"
-                )],
-                tool_calls: vec![],
-                error: None,
-                expect: None,
-            },
-        ],
-        fallback_text: "No more scripted responses.".to_string(),
-        chunk_delay_ms: 0,
-    }
-}
-
 #[cfg(unix)]
 fn proxy_auth_hook_script() -> MockOpenAiScript {
     MockOpenAiScript {
@@ -819,134 +418,6 @@ fn write_mock_llm_client(config_dir: &Path, port: u16) -> Result<()> {
         }),
     )
 }
-
-fn write_fixture_files(paths: &TestPaths) -> Result<()> {
-    std::fs::create_dir_all(&paths.harnx_config_dir)?;
-    std::fs::write(&paths.config_path, "save: false\n")?;
-
-    let clients_dir = paths.harnx_config_dir.join("clients");
-    let mcp_servers_dir = paths.harnx_config_dir.join("mcp_servers");
-    std::fs::create_dir_all(&clients_dir)?;
-    std::fs::create_dir_all(&mcp_servers_dir)?;
-
-    let client = serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
-        (
-            serde_yaml::Value::String("type".to_string()),
-            serde_yaml::Value::String("openai-compatible".to_string()),
-        ),
-        (
-            serde_yaml::Value::String("name".to_string()),
-            serde_yaml::Value::String("mock-llm".to_string()),
-        ),
-        (
-            serde_yaml::Value::String("api_base".to_string()),
-            serde_yaml::Value::String(format!("http://127.0.0.1:{}/v1", paths.port)),
-        ),
-        (
-            serde_yaml::Value::String("api_key".to_string()),
-            serde_yaml::Value::String("dummy".to_string()),
-        ),
-        (
-            serde_yaml::Value::String("models".to_string()),
-            serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(
-                serde_yaml::Mapping::from_iter([
-                    (
-                        serde_yaml::Value::String("name".to_string()),
-                        serde_yaml::Value::String("test".to_string()),
-                    ),
-                    (
-                        serde_yaml::Value::String("max_input_tokens".to_string()),
-                        serde_yaml::Value::Number(32000.into()),
-                    ),
-                    (
-                        serde_yaml::Value::String("max_output_tokens".to_string()),
-                        serde_yaml::Value::Number(4096.into()),
-                    ),
-                    (
-                        serde_yaml::Value::String("supports_tool_use".to_string()),
-                        serde_yaml::Value::Bool(true),
-                    ),
-                ]),
-            )]),
-        ),
-    ]));
-    std::fs::write(
-        clients_dir.join("mock-llm.yaml"),
-        serde_yaml::to_string(&client)?,
-    )?;
-
-    let repro249_bin = harnx_mcp_repro249_bin(&PathBuf::from(env!("CARGO_BIN_EXE_harnx")));
-    let mcp_server = McpServerConfig {
-        name: REPRO_249_MCP_TOOL_NAME.to_string(),
-        command: repro249_bin.to_string_lossy().into_owned(),
-        args: vec![],
-        env: Default::default(),
-        enabled: true,
-        roots: vec![],
-        description: None,
-        rename_tools: Default::default(),
-        tool_templates: Default::default(),
-        package: None,
-        hooks: None,
-    };
-    std::fs::write(
-        mcp_servers_dir.join("repro249.yaml"),
-        serde_yaml::to_string(&mcp_server)?,
-    )?;
-
-    std::fs::write(
-        paths.agents_dir.join(format!("{}.md", TEST_AGENT_NAME)),
-        format!(
-            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}_session_prompt\n---\nYou are {}. Delegate work to {}.\n",
-            TEST_AGENT_NAME, TEST_SUB_AGENT_NAME, TEST_AGENT_NAME, TEST_SUB_AGENT_NAME
-        ),
-    )?;
-    std::fs::write(
-        paths.agents_dir.join(format!("{}.md", TEST_SUB_AGENT_NAME)),
-        format!(
-            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}\n---\nYou are {}. Use the MCP tool and report the result.\n",
-            TEST_SUB_AGENT_NAME,
-            REPRO_249_MCP_TOOL_NAME,
-            TEST_SUB_AGENT_NAME
-        ),
-    )?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn write_same_package_delegation_fixture_files(paths: &TestPaths) -> Result<()> {
-    std::fs::create_dir_all(&paths.harnx_config_dir)?;
-    std::fs::write(&paths.config_path, "save: false\n")?;
-    write_mock_llm_client(&paths.harnx_config_dir, paths.port)?;
-
-    let package_agents_dir = paths
-        .harnx_config_dir
-        .join("packages")
-        .join(PACKAGE_DELEGATION_PACKAGE_NAME)
-        .join("agents");
-    std::fs::create_dir_all(&package_agents_dir)?;
-
-    std::fs::write(
-        package_agents_dir.join(format!("{PACKAGE_DELEGATION_CALLER_NAME}.md")),
-        format!(
-            "---\nname: {}\nmodel: /mock-llm:test\nuse_tools: {}_session_prompt\n---\nYou are {}. Delegate to {} in same package.\n",
-            PACKAGE_DELEGATION_CALLER_NAME,
-            PACKAGE_DELEGATION_PEER_NAME,
-            PACKAGE_DELEGATION_CALLER_NAME,
-            PACKAGE_DELEGATION_PEER_NAME,
-        ),
-    )?;
-    std::fs::write(
-        package_agents_dir.join(format!("{PACKAGE_DELEGATION_PEER_NAME}.md")),
-        format!(
-            "---\nname: {}\nmodel: /mock-llm:test\n---\nYou are {}. Answer delegated request.\n",
-            PACKAGE_DELEGATION_PEER_NAME, PACKAGE_DELEGATION_PEER_NAME,
-        ),
-    )?;
-
-    Ok(())
-}
-
 // ── Planning → Execution handoff scenario ─────────────────────────────────────
 //
 // Scenario: Planner asks clarifying question → User answers → Planner creates
@@ -1083,12 +554,13 @@ fn interactive_handoff_planner_to_executor() -> Result<()> {
 
 #[test]
 #[ignore = "NATS cross-session handoff follow-up is deferred"]
-fn handoff_without_acp_server_config() -> Result<()> {
-    let session =
-        match setup_handoff_tmux_session_no_acp_server("handoff_without_acp_server_config")? {
-            Some(session) => session,
-            None => return Ok(()),
-        };
+fn handoff_without_legacy_server_config() -> Result<()> {
+    let session = match setup_handoff_tmux_session_no_legacy_server(
+        "handoff_without_legacy_server_config",
+    )? {
+        Some(session) => session,
+        None => return Ok(()),
+    };
 
     let HandoffTmuxSession {
         tmux,
@@ -1101,7 +573,7 @@ fn handoff_without_acp_server_config() -> Result<()> {
     send_handoff_user_prompt(&tmux)?;
 
     let screen = wait_for_handoff_completion(&tmux)?;
-    assert_handoff_screen(&screen, "no-ACP transcript")?;
+    assert_handoff_screen(&screen, "no-legacy transcript")?;
 
     drop(tmux);
     drop(mock);
@@ -1303,7 +775,9 @@ fn setup_handoff_tmux_session(test_name: &str) -> Result<Option<HandoffTmuxSessi
     setup_handoff_tmux_session_with_script(test_name, handoff_script(), None, true)
 }
 
-fn setup_handoff_tmux_session_no_acp_server(test_name: &str) -> Result<Option<HandoffTmuxSession>> {
+fn setup_handoff_tmux_session_no_legacy_server(
+    test_name: &str,
+) -> Result<Option<HandoffTmuxSession>> {
     setup_handoff_tmux_session_with_script(
         test_name,
         simple_handoff_script(),
@@ -1316,7 +790,7 @@ fn setup_handoff_tmux_session_with_script(
     test_name: &str,
     script: MockOpenAiScript,
     parent_use_tools: Option<&str>,
-    write_acp_server: bool,
+    _write_legacy_server: bool,
 ) -> Result<Option<HandoffTmuxSession>> {
     if option_env!("CARGO_BIN_NAME") == Some("harnx") {
         eprintln!("skipping {test_name} in binary test target to avoid duplicate tmux sessions");
@@ -1333,7 +807,7 @@ fn setup_handoff_tmux_session_with_script(
     let temp = TempDir::new().context("failed to create temp dir")?;
     let mock = MockOpenAiServer::start(script)?;
     let paths = TestPaths::new(temp.path(), mock.port())?;
-    match (parent_use_tools, write_acp_server) {
+    match (parent_use_tools, _write_legacy_server) {
         (Some(parent_use_tools), true) => {
             write_handoff_fixture_files_with_parent_use_tools(
                 &paths,
@@ -1342,14 +816,14 @@ fn setup_handoff_tmux_session_with_script(
             )?;
         }
         (Some(parent_use_tools), false) => {
-            write_handoff_fixture_files_no_acp_server_with_parent_use_tools(
+            write_handoff_fixture_files_no_legacy_server_with_parent_use_tools(
                 &paths,
                 &harnx_bin,
                 parent_use_tools,
             )?;
         }
         (None, true) => write_handoff_fixture_files(&paths, &harnx_bin)?,
-        (None, false) => write_handoff_fixture_files_no_acp_server(&paths, &harnx_bin)?,
+        (None, false) => write_handoff_fixture_files_no_legacy_server(&paths, &harnx_bin)?,
     }
 
     let path_env = format!(
@@ -1533,8 +1007,8 @@ fn write_handoff_fixture_files(paths: &TestPaths, harnx_bin: &Path) -> Result<()
     )
 }
 
-fn write_handoff_fixture_files_no_acp_server(paths: &TestPaths, harnx_bin: &Path) -> Result<()> {
-    write_handoff_fixture_files_no_acp_server_with_parent_use_tools(
+fn write_handoff_fixture_files_no_legacy_server(paths: &TestPaths, harnx_bin: &Path) -> Result<()> {
+    write_handoff_fixture_files_no_legacy_server_with_parent_use_tools(
         paths,
         harnx_bin,
         &format!("{}_session_handoff", HANDOFF_SUB_AGENT_NAME),
@@ -1549,7 +1023,7 @@ fn write_handoff_fixture_files_with_parent_use_tools(
     write_handoff_fixture_files_inner(paths, harnx_bin, parent_use_tools, true)
 }
 
-fn write_handoff_fixture_files_no_acp_server_with_parent_use_tools(
+fn write_handoff_fixture_files_no_legacy_server_with_parent_use_tools(
     paths: &TestPaths,
     harnx_bin: &Path,
     parent_use_tools: &str,
@@ -1559,9 +1033,9 @@ fn write_handoff_fixture_files_no_acp_server_with_parent_use_tools(
 
 fn write_handoff_fixture_files_inner(
     paths: &TestPaths,
-    harnx_bin: &Path,
+    _harnx_bin: &Path,
     parent_use_tools: &str,
-    write_acp_server: bool,
+    _write_legacy_server: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(&paths.harnx_config_dir)?;
 
@@ -1615,28 +1089,6 @@ fn write_handoff_fixture_files_inner(
         clients_dir.join("mock-llm.yaml"),
         serde_yaml::to_string(&client)?,
     )?;
-
-    if write_acp_server {
-        let acp_servers_dir = paths.harnx_config_dir.join("acp_servers");
-        std::fs::create_dir_all(&acp_servers_dir)?;
-        let acp_server = AcpServerConfig {
-            name: HANDOFF_SUB_AGENT_NAME.to_string(),
-            command: harnx_acp_server_bin(harnx_bin)
-                .to_string_lossy()
-                .into_owned(),
-            args: vec![HANDOFF_SUB_AGENT_NAME.to_string()],
-            env: Default::default(),
-            enabled: true,
-            description: None,
-            idle_timeout_secs: 300,
-            operation_timeout_secs: 3600,
-            package: None,
-        };
-        std::fs::write(
-            acp_servers_dir.join(format!("{}.yaml", HANDOFF_SUB_AGENT_NAME)),
-            serde_yaml::to_string(&acp_server)?,
-        )?;
-    }
 
     std::fs::write(
         paths.agents_dir.join(format!("{}.md", HANDOFF_AGENT_NAME)),
@@ -1665,269 +1117,6 @@ fn write_handoff_fixture_files_inner(
 // Parent → sub-agent (researcher) → sub-sub-agent (analyst).
 // Each level streams text, makes tool calls, and delegates further.
 // The test captures the final screen and asserts that no activity is duplicated.
-
-const NESTED_PARENT_AGENT: &str = "nested-parent";
-const NESTED_SUB_AGENT: &str = "nested-researcher";
-const NESTED_SUB_SUB_AGENT: &str = "nested-analyst";
-
-#[test]
-fn nested_sub_agent_activity_no_duplicates() -> Result<()> {
-    if option_env!("CARGO_BIN_NAME") == Some("harnx") {
-        eprintln!("skipping nested_sub_agent_activity_no_duplicates in binary test target");
-        return Ok(());
-    }
-    if !TmuxHarness::is_available() {
-        eprintln!("skipping nested_sub_agent_activity_no_duplicates: tmux is unavailable");
-        return Ok(());
-    }
-
-    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
-
-    let temp = TempDir::new().context("failed to create temp dir")?;
-    let mock = MockOpenAiServer::start(nested_script())?;
-    let paths = TestPaths::new(temp.path(), mock.port())?;
-    write_nested_fixture_files(&paths)?;
-
-    let path_env = format!(
-        "{}:{}",
-        harnx_bin
-            .parent()
-            .context("harnx binary missing parent directory")?
-            .display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-
-    let root = repo_root()?;
-    let tmux = match TmuxHarness::new(&root, 120, 80) {
-        Ok(tmux) => tmux,
-        Err(err) => {
-            eprintln!("skipping nested_sub_agent_activity_no_duplicates: tmux unusable ({err:#})");
-            return Ok(());
-        }
-    };
-    tmux.send_keys(&["C-l"])?;
-
-    // Export HARNX_CONFIG_DIR, HARNX_DATA_DIR, HARNX_STATE_DIR
-    tmux.send_text(&format!(
-        "export HARNX_CONFIG_DIR={} HARNX_DATA_DIR={} HARNX_STATE_DIR={}",
-        shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref()),
-        shell_escape(paths.harnx_data_dir.to_string_lossy().as_ref()),
-        shell_escape(paths.harnx_state_dir.to_string_lossy().as_ref())
-    ))?;
-    tmux.send_keys(&["Enter"])?;
-
-    // Export PATH
-    tmux.send_text(&format!(
-        "export PATH={} && cd {}; printf '__NESTED_READY__\\n'",
-        shell_escape(&path_env),
-        shell_escape(root.to_string_lossy().as_ref())
-    ))?;
-    tmux.send_keys(&["Enter"])?;
-    tmux.wait_for(Duration::from_secs(5), |screen| {
-        count_occurrences(screen, "__NESTED_READY__") >= 2
-    })?;
-
-    // Start interactive session
-    tmux.send_text(&format!(
-        "{} -a {} --session || echo HARNX_EXIT:$?",
-        shell_escape(harnx_bin.to_string_lossy().as_ref()),
-        NESTED_PARENT_AGENT
-    ))?;
-    tmux.send_keys(&["Enter"])?;
-
-    tmux.wait_for_contains("Welcome to harnx", Duration::from_secs(15))?;
-    tmux.send_text("do nested delegation")?;
-    tmux.send_keys(&["Enter"])?;
-
-    let screen = tmux.wait_for_stable(
-        Duration::from_secs(60),
-        Duration::from_millis(500),
-        |screen| {
-            screen.contains("Nested task complete")
-                && screen.contains("No more scripted responses.")
-        },
-    )?;
-
-    assert_eq!(
-        count_occurrences(&screen, &format!("@ {}", NESTED_SUB_AGENT)),
-        1,
-        "expected exactly one parent→sub-agent marker:\n{screen}"
-    );
-    assert_eq!(
-        count_occurrences(&screen, &format!("@ {}", NESTED_SUB_SUB_AGENT)),
-        1,
-        "expected exactly one sub-agent→sub-sub-agent marker:\n{screen}"
-    );
-    assert!(
-        count_occurrences(&screen, "Analyst complete") >= 1,
-        "expected analyst final message to appear:\n{screen}"
-    );
-    assert!(
-        count_occurrences(&screen, "Researcher complete") >= 1,
-        "expected researcher final message to appear:\n{screen}"
-    );
-    assert_eq!(
-        count_occurrences(&screen, "Nested task complete"),
-        1,
-        "expected exactly one parent final message:\n{screen}"
-    );
-
-    let normalized = normalize_response_lines(&normalize_message_token_counts(
-        &normalize_context_counts(&normalize_short_session_ids(&normalize_spinner_chars(
-            &normalize_uuids(&normalize_screen(&screen)),
-        ))),
-    ));
-    assert_snapshot!("nested_sub_agent_activity_no_duplicates", normalized);
-
-    drop(tmux);
-    drop(mock);
-    Ok(())
-}
-
-fn nested_script() -> MockOpenAiScript {
-    // Turn order across all agent sessions:
-    // 0 parent     → delegate to researcher
-    // 1 researcher → delegate to analyst
-    // 2 analyst    → final text
-    // 3 researcher → final text after analyst returns
-    // 4 parent     → final text after researcher returns
-    MockOpenAiScript {
-        turns: vec![
-            MockOpenAiTurn {
-                text_chunks: vec!["Parent delegating to researcher.".to_string()],
-                tool_calls: vec![MockOpenAiToolCall {
-                    name: format!("{}_session_prompt", NESTED_SUB_AGENT),
-                    arguments: json!({"message": "Research this deeply and delegate analysis."}),
-                    id: Some("call_nested_parent_1".to_string()),
-                    ..Default::default()
-                }],
-                expect: Some(MockTurnExpectation {
-                    system_contains: Some("nested-parent".to_string()),
-                }),
-                error: None,
-            },
-            MockOpenAiTurn {
-                text_chunks: vec!["Researcher delegating to analyst.".to_string()],
-                tool_calls: vec![MockOpenAiToolCall {
-                    name: format!("{}_session_prompt", NESTED_SUB_SUB_AGENT),
-                    arguments: json!({"message": "Analyze data and report back."}),
-                    id: Some("call_nested_researcher_1".to_string()),
-                    ..Default::default()
-                }],
-                expect: Some(MockTurnExpectation {
-                    system_contains: Some("nested-researcher".to_string()),
-                }),
-                error: None,
-            },
-            MockOpenAiTurn {
-                text_chunks: vec!["Analyst complete".to_string()],
-                tool_calls: vec![],
-                expect: Some(MockTurnExpectation {
-                    system_contains: Some("nested-analyst".to_string()),
-                }),
-                error: None,
-            },
-            MockOpenAiTurn {
-                text_chunks: vec!["Researcher complete".to_string()],
-                tool_calls: vec![],
-                expect: Some(MockTurnExpectation {
-                    system_contains: Some("nested-researcher".to_string()),
-                }),
-                error: None,
-            },
-            MockOpenAiTurn {
-                text_chunks: vec!["Nested task complete".to_string()],
-                tool_calls: vec![],
-                expect: Some(MockTurnExpectation {
-                    system_contains: Some("nested-parent".to_string()),
-                }),
-                error: None,
-            },
-        ],
-        fallback_text: "No more scripted responses.".to_string(),
-        chunk_delay_ms: 0,
-    }
-}
-
-fn write_nested_fixture_files(paths: &TestPaths) -> Result<()> {
-    std::fs::create_dir_all(&paths.harnx_config_dir)?;
-
-    std::fs::write(&paths.config_path, "save: false\n")?;
-
-    let clients_dir = paths.harnx_config_dir.join("clients");
-    std::fs::create_dir_all(&clients_dir)?;
-
-    let client = serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
-        (
-            serde_yaml::Value::String("type".to_string()),
-            serde_yaml::Value::String("openai-compatible".to_string()),
-        ),
-        (
-            serde_yaml::Value::String("name".to_string()),
-            serde_yaml::Value::String("mock-llm".to_string()),
-        ),
-        (
-            serde_yaml::Value::String("api_base".to_string()),
-            serde_yaml::Value::String(format!("http://127.0.0.1:{}/v1", paths.port)),
-        ),
-        (
-            serde_yaml::Value::String("api_key".to_string()),
-            serde_yaml::Value::String("dummy".to_string()),
-        ),
-        (
-            serde_yaml::Value::String("models".to_string()),
-            serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(
-                serde_yaml::Mapping::from_iter([
-                    (
-                        serde_yaml::Value::String("name".to_string()),
-                        serde_yaml::Value::String("test".to_string()),
-                    ),
-                    (
-                        serde_yaml::Value::String("max_input_tokens".to_string()),
-                        serde_yaml::Value::Number(32000.into()),
-                    ),
-                    (
-                        serde_yaml::Value::String("max_output_tokens".to_string()),
-                        serde_yaml::Value::Number(4096.into()),
-                    ),
-                    (
-                        serde_yaml::Value::String("supports_tool_use".to_string()),
-                        serde_yaml::Value::Bool(true),
-                    ),
-                ]),
-            )]),
-        ),
-    ]));
-    std::fs::write(
-        clients_dir.join("mock-llm.yaml"),
-        serde_yaml::to_string(&client)?,
-    )?;
-
-    std::fs::write(
-        paths.agents_dir.join(format!("{}.md", NESTED_PARENT_AGENT)),
-        format!(
-            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}_session_prompt\n---\nYou are {}. Delegate to {}.\n",
-            NESTED_PARENT_AGENT, NESTED_SUB_AGENT, NESTED_PARENT_AGENT, NESTED_SUB_AGENT
-        ),
-    )?;
-    std::fs::write(
-        paths.agents_dir.join(format!("{}.md", NESTED_SUB_AGENT)),
-        format!(
-            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}_session_prompt\n---\nYou are {}. Delegate to {}.\n",
-            NESTED_SUB_AGENT, NESTED_SUB_SUB_AGENT, NESTED_SUB_AGENT, NESTED_SUB_SUB_AGENT
-        ),
-    )?;
-    std::fs::write(
-        paths
-            .agents_dir
-            .join(format!("{}.md", NESTED_SUB_SUB_AGENT)),
-        format!(
-            "---\nname: {}\nmodel: mock-llm:test\n---\nYou are {}. Analyze and respond.\n",
-            NESTED_SUB_SUB_AGENT, NESTED_SUB_SUB_AGENT
-        ),
-    )?;
-    Ok(())
-}
 
 // ── Retry / fallback TUI tests ──────────────────────────────────────────────
 //

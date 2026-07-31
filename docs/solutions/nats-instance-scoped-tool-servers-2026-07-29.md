@@ -21,7 +21,6 @@ plan_ref: "nats-tool-servers-phase2a"
 
 Phase 1 routed local front ends through a shared NATS broker and worker, but tools still ran through in-process or stdio providers. Moving every tool at once would have mixed protocol design, process supervision, and many tool migrations in one change.
 
-Phase 2a establishes the transport with one low-risk pilot, `harnx-time-server`. Existing MCP and ACP stdio tools remain available in the same worker turn. Phase 2b will generalize bootstrap configuration, migrate remaining toolsets and sub-agents, and eventually remove stdio.
 
 ## Instance identity and subjects
 
@@ -81,15 +80,12 @@ Phase 2a initially used a private built-in bootstrap list (`LOCAL_BOOTSTRAP_SERV
 
 The local worker spawns tool servers lazy-on-demand only when their tool-name prefix could match the active agent's `use_tools` selectors. Servers receive `HARNX_INSTANCE_ID`, `HARNX_NATS_URL`, and `HARNX_NATS_TOKEN`. If a declared tool-server binary is missing or exits prematurely, the worker emits a UI warning (`AgentEvent::Notice(Warning)`) and continues running rather than failing hard. Non-local workers do not start local tool servers, preserving remote `agent@cluster` behavior.
 
-`NatsToolProvider` snapshots registrations into declarations and is ordered before ACP, MCP, and session-history providers. NATS therefore wins a name collision during incremental migration. Tools without NATS registrations continue through their existing stdio provider. The e2e test executes a real `get_current_time` over NATS and `legacy_get_current_time` through the same binary's `--mcp-stdio` adapter in one tool-evaluation batch.
 
 Phase 2b slice a completed replacing the hardcoded bootstrap list with `tool_servers/*.yaml`. Remaining Phase 2b future work (migrating other toolsets, sub-agent NATS integration, and eventually removing stdio) remains open while preserving mixed operation until complete.
 
-## Trust policy and ACP recursion guard
 
 All configured tool and sub-agent children are trusted broker principals in local mode. They inherit `HARNX_NATS_URL` and `HARNX_NATS_TOKEN` by design; `scrub_local_nats_env` and its call sites were removed.
 
-Broker credentials don't determine ACP execution role. ACP children still receive `HARNX_INTERNAL_ACP_ROLE=backend`, which prevents a worker-owned local ACP backend from re-entering front-end NATS orchestration. Backend local refs execute in-process, while `agent@cluster` refs continue through the thin-client path.
 
 ## Verification coverage
 

@@ -1,5 +1,5 @@
 //! Canonical event stream emitted during an agent turn. Every front-end
-//! (TUI, one-shot CLI, HTTP/SSE server, ACP server, future MCP/A2A servers)
+//! (TUI, one-shot CLI, HTTP/SSE server, and future MCP/A2A servers)
 //! consumes this type via an `AgentEventSink`. See the spec at
 //! `docs/superpowers/specs/2026-04-19-monorepo-refactor-design.md` for the
 //! full rationale; the quick version is that these events are the single
@@ -133,6 +133,10 @@ pub enum TurnEvent {
         agent: String,
         session_id: Option<String>,
     },
+    SubAgentStarted {
+        agent: String,
+        session_id: String,
+    },
     Ended {
         outcome: TurnOutcome,
     },
@@ -202,8 +206,8 @@ pub enum ContentBlock {
     },
     /// Forward-compat passthrough for protocol content kinds this crate
     /// doesn't model directly. The `kind` is the originating protocol's
-    /// discriminator; `value` is the original structured payload. `harnx-acp`
-    /// uses this to round-trip unknown ACP content variants without loss.
+    /// discriminator; `value` is the original structured payload. Protocol adapters
+    /// use this to round-trip unknown content variants without loss.
     Opaque {
         kind: String,
         value: serde_json::Value,

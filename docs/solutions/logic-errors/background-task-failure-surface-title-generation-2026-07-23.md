@@ -161,4 +161,3 @@ Crossterm `SetTitle` (OSC `ESC]0;...BEL`) reaches terminal under ratatui alterna
 
 - **GitHub:** [issue #103](https://github.com/dobesv/harnx/issues/103) — Terminal title not updating
 - **Related Solution:** [feature-implementation/session-title-generation-pipeline-2026-07-15.md](../feature-implementation/session-title-generation-pipeline-2026-07-15.md) — Original title generation feature implementation
-- **Related Solution:** [async-patterns/acp-io-task-supervision-2026-05-07.md](../async-patterns/acp-io-task-supervision-2026-05-07.md) — Supervision for spawned background tasks

@@ -182,25 +182,6 @@ fn print_install_summary(name: &str, pkg_dir: &Path, source: &PackageSource, tag
             }
         }
     }
-
-    let acp_dir = pkg_dir.join("acp_servers");
-    if acp_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(&acp_dir) {
-            let servers: Vec<_> = entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("yaml"))
-                .filter_map(|e| {
-                    e.path()
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .map(str::to_string)
-                })
-                .collect();
-            if !servers.is_empty() {
-                println!("  ACP servers: {}", servers.join(", "));
-            }
-        }
-    }
 }
 
 #[cfg(test)]

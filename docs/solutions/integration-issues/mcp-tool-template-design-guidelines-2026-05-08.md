@@ -138,7 +138,6 @@ pub struct AppendTaskParams {
 
 Wrong field names silently produce empty output (MiniJinja Lenient mode).
 
-### 6. ACP session_prompt Template
 
 Show full delegation message on its own line — no truncation. The full prompt is valuable context:
 
@@ -209,5 +208,4 @@ Unicode icons are acceptable (Issue #498 explicitly allows):
 - **Issue:** #498 — MCP tool templates less terse, better context
 - **Issue:** #434 — Multi-line bash commands rendering (code fence constraint)
 - **Related Solution:** [logic-errors/tui-triple-tick-code-fences-2026-05-03.md](../logic-errors/tui-triple-tick-code-fences-2026-05-03.md) — Code fence rendering
-- **Related Solution:** [integration-issues/mcp-tool-template-acp-propagation-2026-04-30.md](../integration-issues/mcp-tool-template-acp-propagation-2026-04-30.md) — Template rendering and ACP propagation
 - **Related Solution:** [logic-errors/minijinja-system-prompt-templating-2026-04-25.md](../logic-errors/minijinja-system-prompt-templating-2026-04-25.md) — MiniJinja fundamentals

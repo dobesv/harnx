@@ -3,7 +3,6 @@ title: "Short session ID collision prevention via immediate file claim"
 date: 2026-05-03
 category: "logic-errors"
 problem_type: logic_error
-component: "harnx-runtime/config, harnx-acp-server"
 root_cause: "Collision check uses file existence; rapid session creation within same second produces duplicate IDs before file is written"
 resolution_type: code_fix
 severity: medium
@@ -21,7 +20,6 @@ Replacing UUID-based session IDs with shorter 6-character base64url timestamps c
 
 ## Symptoms
 
-- Duplicate session IDs created when `new_session` called in quick succession (e.g., automated tests, ACP server batch operations)
 - Session files overwritten or lost
 - Race condition: both sessions write to the same file path
 
@@ -81,11 +79,8 @@ pub fn new(config: &Config, name: &str) -> Result<Session> {
 }
 ```
 
-For ACP server's `new_session`, the pattern is:
 
 ```rust
-// crates/harnx-acp-server/src/lib.rs
-async fn new_session(&self, _args: acp::NewSessionRequest) -> acp::Result<acp::NewSessionResponse> {
     let mut config = self.config.write();
     config.use_agent_by_name(&self.agent_name)?;
     config.use_session(None)?;  // This calls session::new() which claims ID

@@ -53,9 +53,9 @@ pub const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 type AppResponse = Response<BoxBody<Bytes, Infallible>>;
 
 /// Log a redacted snapshot of the process environment relevant to credential
-/// and config-path resolution for spawned ACP sub-agents.
+/// and config-path resolution for child processes.
 ///
-/// harnx-serve does not clear or filter the environment it hands to ACP child
+/// harnx-serve does not clear or filter the inherited process environment
 /// processes — they inherit it exactly like the TUI does. When sub-agents fail
 /// with "missing credentials" only under harnx-serve, the usual cause is that
 /// the *service* environment (systemd unit, container, launcher) lacks the
@@ -92,7 +92,7 @@ fn log_startup_environment_diagnostics() {
         info!("  env {var}: {}", present(var));
     }
 
-    // The `.env` file the runtime loads at startup; ACP children resolve the
+    // The `.env` file the runtime loads at startup; child processes resolve the
     // same path, so a missing file here means neither inherits its credentials.
     let env_file = harnx_core::config_paths::env_file();
     let env_file_status = if env_file.is_file() {
