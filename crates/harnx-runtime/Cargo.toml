@@ -28,7 +28,6 @@ fuzzy-matcher = { workspace = true }
 futures-util = { workspace = true }
 fs4 = { workspace = true }
 globset = { workspace = true }
-harnx-acp = { workspace = true }
 harnx-client = { path = "../harnx-client" }
 harnx-core = { path = "../harnx-core" }
 harnx-engine = { path = "../harnx-engine" }
@@ -65,6 +64,7 @@ terminal-colorsaurus = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 uuid = { workspace = true }

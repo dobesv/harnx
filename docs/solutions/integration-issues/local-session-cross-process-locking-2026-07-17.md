@@ -21,7 +21,6 @@ plan_ref: "harnx-848-local-session-concurrency"
 
 ## Problem
 
-Multiple HarnX processes (TUI, Web UI, CLI, ACP server) sharing a local filesystem session file could corrupt data by interleaving appends or truncating concurrent writes. The LOCAL session path lacked any cross-process serialization mechanism.
 
 ## Symptoms
 
@@ -128,9 +127,6 @@ After acquiring lock, `reload_session_from_disk` runs before the turn starts. Se
 
 ### 6. Testing: Full Workspace/e2e Catches Per-Crate Misses
 
-All these bugs surfaced only in `harnx-acp-server`/`harnx-tui`/tmux e2e tests, NOT in `harnx-runtime` unit tests:
-- Parent dir creation regression (ACP tests)
-- Reload on empty stub breakage (ACP tests)
 - Re-entrancy deadlock (TUI cancellation tests)
 - Model resolution failure on mock clients (TUI tests)
 

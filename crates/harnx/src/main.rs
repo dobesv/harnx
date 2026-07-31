@@ -219,7 +219,7 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     // Install a process-wide SIGINT watcher ONLY for one-shot (Cmd) mode:
     // set the abort flag that `eval_tool_calls` and sibling async sites
     // poll, letting the in-flight work exit cleanly with a non-zero status.
-    // TUI has its own Ctrl-C path via the terminal; ACP server runs on a
+    // TUI has its own Ctrl-C path via the terminal; server processes run on a
     // separate thread with its own runtime — for it we let SIGINT use the
     // default handler (kill the process) so the parent sees a terminated
     // child within the expected window.

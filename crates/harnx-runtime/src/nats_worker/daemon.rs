@@ -6,10 +6,11 @@ use super::agent_loop::{
 };
 use super::backend::NatsSessionLogBackend;
 use super::control::{control_subject, ControlCommand};
+use super::subagent_toolset::SubagentToolset;
 use super::tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
 use crate::config::{
-    resolve_local_nats_server_config, server_display_name, GlobalConfig, Input, ToolServerConfig,
-    LOCAL_CLUSTER_KEY,
+    list_agents, resolve_local_nats_server_config, server_display_name, GlobalConfig, Input,
+    ToolServerConfig, LOCAL_CLUSTER_KEY,
 };
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use crate::nats_metrics;
@@ -325,6 +326,58 @@ fn optional_tool_server<T>(result: Result<T>) -> Option<T> {
     }
 }
 
+async fn start_subagent_toolset(
+    agent: String,
+    cluster: String,
+    instance_id: harnx_core::instance::InstanceId,
+    client: async_nats::Client,
+    jetstream: jetstream::Context,
+) -> Result<JoinHandle<Result<()>>> {
+    let registration_context = jetstream.clone();
+    let toolset = Arc::new(SubagentToolset::new(
+        agent,
+        cluster,
+        client.clone(),
+        jetstream,
+    ));
+    let server_name = harnx_toolset::Toolset::name(toolset.as_ref()).to_string();
+    let registration_key = harnx_toolset_server::registration_key(&instance_id, &server_name);
+    let server = tokio::spawn(harnx_toolset_server::serve_with_client(
+        toolset,
+        instance_id,
+        client,
+    ));
+
+    let registration = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if server.is_finished() {
+                anyhow::bail!("sub-agent tool server exited before registering");
+            }
+            match registration_context
+                .get_key_value(harnx_toolset_server::TOOL_REGISTRY_BUCKET)
+                .await
+            {
+                Ok(registry) if registry.get(&registration_key).await?.is_some() => break,
+                Ok(_) | Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+        Result::<()>::Ok(())
+    })
+    .await;
+
+    match registration {
+        Ok(Ok(())) => Ok(server),
+        Ok(Err(error)) => {
+            server.abort();
+            Err(error)
+        }
+        Err(_) => {
+            server.abort();
+            anyhow::bail!("sub-agent tool server did not register within 5s")
+        }
+    }
+}
+
 /// Run a worker daemon: pull `SessionActivate` notifications, claim each via a
 /// KV lease, and execute the session (exactly one worker per session).
 pub async fn run_worker_daemon(
@@ -380,6 +433,20 @@ pub async fn run_worker_daemon(
         &matching_tool_servers,
     )
     .await;
+    let mut subagent_tool_servers = Vec::new();
+    for agent in list_agents() {
+        subagent_tool_servers.push(
+            start_subagent_toolset(
+                agent,
+                daemon.cluster.clone(),
+                instance_id.clone(),
+                startup.client.clone(),
+                startup.jetstream.clone(),
+            )
+            .await
+            .context("start sub-agent toolset")?,
+        );
+    }
     // Attempt optional tool startup before readiness so successful pilots are available on turn one.
     spawn_readiness_publisher(startup.client.clone(), &daemon);
     let session_index = optional_session_index(&startup.jetstream).await;
@@ -387,6 +454,7 @@ pub async fn run_worker_daemon(
         config,
         instance_id,
         _tool_supervisor: tool_supervisor,
+        _subagent_tool_servers: subagent_tool_servers,
         cluster: daemon.cluster.clone(),
         worker_id: daemon.worker_id.clone(),
         lease: daemon.lease,
@@ -425,6 +493,7 @@ struct WorkerRuntime {
     config: GlobalConfig,
     instance_id: harnx_core::instance::InstanceId,
     _tool_supervisor: Option<ToolServerSupervisor>,
+    _subagent_tool_servers: Vec<JoinHandle<Result<()>>>,
     #[allow(dead_code)]
     cluster: String,
     worker_id: String,

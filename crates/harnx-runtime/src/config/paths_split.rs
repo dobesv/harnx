@@ -25,11 +25,6 @@ impl Config {
     pub fn mcp_servers_dir() -> PathBuf {
         paths::mcp_servers_dir()
     }
-
-    pub fn acp_servers_dir() -> PathBuf {
-        paths::acp_servers_dir()
-    }
-
     pub fn macro_file(name: &str) -> PathBuf {
         paths::macro_file(name)
     }

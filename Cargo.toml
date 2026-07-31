@@ -5,8 +5,6 @@ members = [
     "crates/harnx-client",
     "crates/harnx-core",
     "crates/harnx-engine",
-    "crates/harnx-acp",
-    "crates/harnx-acp-server",
     "crates/harnx-session",
     "crates/harnx-aws-creds",
     "crates/harnx-k8s-creds",
@@ -154,7 +152,6 @@ duct = "1.0.0"
 rmcp = { version = "2.0", features = ["client", "server", "transport-child-process", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }
 process-wrap = { version = "9", features = ["tokio1"] }
 libc = "0.2"
-agent-client-protocol = { git = "https://github.com/agentclientprotocol/rust-sdk", rev = "7d21931823e9515465794aaf000b61f427c6a595" }
 async-nats = { version = "0.49", default-features = false, features = ["server_2_10", "server_2_11", "ring", "jetstream", "kv"] }
 glob = "0.3"
 globset = "0.4"
@@ -167,8 +164,6 @@ jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs", "use_pem"] }
 reqwest = { version = "0.13.0", features = ["json", "multipart", "socks", "rustls", "stream"], default-features = false }
 syntect = { version = "5.0.0", features = ["parsing", "regex-onig", "plist-load"], default-features = false }
 arboard = { version = "3.3.0", default-features = false }
-harnx-acp = { path = "crates/harnx-acp" }
-harnx-acp-server = { path = "crates/harnx-acp-server" }
 harnx-session = { path = "crates/harnx-session" }
 minijinja = { version = "2.21.0", default-features = false, features = ["builtins", "debug", "serde"] }
 harnx-mcp-history = { path = "crates/harnx-mcp-history" }

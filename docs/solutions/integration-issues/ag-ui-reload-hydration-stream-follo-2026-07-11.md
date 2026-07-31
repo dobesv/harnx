@@ -103,7 +103,6 @@ The refactor ensured EXACTLY ONE `RUN_STARTED` at stream head.
 
 ### 4. Credential failures — service context env inheritance
 
-harnx-serve does NOT clear env. ACP children inherit process env on spawn.
 Failures occur when service launch context (systemd/container) is missing:
 
 - `HOME` / `XDG_DATA_HOME` / `HARNX_DATA_DIR` → `~/.local/share/harnx/.env` not found

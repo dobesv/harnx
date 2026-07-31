@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Harnx is a modular command-line LLM agent harness written in **Rust**. It lets users build custom agents from the ground up with full control over prompts, tools, models, and sub-agents. It integrates with 20+ LLM providers (OpenAI, Claude, Gemini, Ollama, Bedrock, etc.) and supports MCP (Model Context Protocol) and ACP (Agent Client Protocol) servers.
+Harnx is a modular command-line LLM agent harness written in **Rust**. It lets users build custom agents from the ground up with full control over prompts, tools, models, and sub-agents. It integrates with 20+ LLM providers (OpenAI, Claude, Gemini, Ollama, Bedrock, etc.) and supports MCP (Model Context Protocol) servers.
 
 ## Technology Stack
 
@@ -24,7 +24,7 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 ```
 ├── Cargo.toml                  # [workspace] manifest — shared dep versions live here
 ├── crates/
-│   ├── harnx/                  # Main crate: CLI, TUI, serve, ACP server, client, config, …
+│   ├── harnx/                  # Main CLI and TUI crate
 │   │   ├── Cargo.toml
 │   │   ├── assets/             # Bundled assets (syntax/theme .bin, HTML playgrounds)
 │   │   ├── models.yaml         # Model catalog (providers, pricing, capabilities)
@@ -43,13 +43,12 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 │   │       ├── commands.rs     # Dot-command handlers (.help, .model, .session, …)
 │   │       ├── rag/            # RAG pipeline
 │   │       ├── mcp/            # MCP client/server integration
-│   │       ├── acp/            # ACP client/server integration
 │   │       ├── hooks/          # Event hook system
 │   │       ├── utils/          # Shared utilities
 │   │       └── bin/            # Bins that share harnx library code (mcp-bash, mcp-fs)
 │   ├── harnx-mcp-plans/        # MCP server: file-based plan and todo management (standalone crate)
 │   ├── harnx-mcp-time/         # MCP server: time/timezone utilities (standalone crate)
-│   └── harnx-test-bins/        # Internal dev/test binaries: mock-llm, acp-test, repro249, test-ratatui (publish = false)
+│   └── harnx-test-bins/        # Internal dev/test binaries (publish = false)
 ├── example_config/             # Example user configuration
 ├── docs/                       # User-facing documentation
 ├── scripts/                    # Shell completions and shell-integration scripts
@@ -103,7 +102,6 @@ Common types:
 Examples from the project history:
 ```
 feat: add harnx-mcp-plans as a file-based plan and todo management MCP server
-fix(acp): resolve ACP server hang and MCP transport death on Ctrl+C
 chore(deps): update rust crate syntect to v5.3.0
 ```
 
@@ -136,7 +134,7 @@ them.
 - **Error handling:** Use `anyhow::Result` / `anyhow::bail!` throughout.
 - **Async:** All I/O is async via Tokio. Use `async fn` and `.await`.
 - **Client modules:** Each LLM provider lives in `crates/harnx/src/client/` and follows the patterns in `client/common.rs` and `client/macros.rs`.
-- **Configuration:** YAML-based; `config.yaml` holds global settings. Clients, MCP servers, and ACP servers each live in their own subdirectory (`clients/`, `mcp_servers/`, `acp_servers/`) as individual `<name>.yaml` files. Agents are Markdown files with YAML front matter in `agents/`. All agents are auto-registered as ACP servers.
+- **Configuration:** `config.yaml` holds global settings. Clients and MCP servers use individual YAML files; agents are Markdown files with YAML front matter in `agents/`.
 - **Dual license:** MIT OR Apache-2.0. Preserve license headers where present.
 
 ## Issue/task tracker

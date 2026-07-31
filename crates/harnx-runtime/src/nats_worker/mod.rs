@@ -25,6 +25,7 @@ mod agent_loop;
 mod backend;
 mod control;
 mod daemon;
+mod subagent_toolset;
 mod tool_supervisor;
 
 #[cfg(test)]

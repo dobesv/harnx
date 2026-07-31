@@ -1,5 +1,5 @@
 //! Tool data types (schemas and invocations) shared across the client,
-//! engine, and future MCP/ACP layers. The engine-level logic that
+//! engine, and future external tool layers. The engine-level logic that
 //! actually evaluates tool calls lives in `harnx/src/tool.rs`; this
 //! module is deliberately side-effect-free so it can be linked into any
 //! crate that needs to speak the schema.
@@ -62,7 +62,7 @@ pub enum ToolError {
     Fatal(anyhow::Error),
 }
 
-/// Dispatch interface for external tool providers (MCP, ACP, or any
+/// Dispatch interface for external tool providers (MCP or any
 /// future transport). Implementations encapsulate their own client
 /// lookup, abort-racing, and UI plumbing — the tool-call loop only
 /// asks "do you handle this tool?" and "call it".

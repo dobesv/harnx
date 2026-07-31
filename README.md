@@ -16,7 +16,6 @@ what you need:
 |-------------------------|---------------------------------------------------------------------------------|--------------------------------------------------|
 | `harnx`                 | Terminal interface, TUI or non-interactive                                      | [Command-Line Guide](docs/command-line-guide.md) |
 | `harnx-serve`           | HTTP-only server, no TUI deps                                                   | [README](crates/harnx-serve/README.md)           |
-| `harnx-acp-server`      | ACP-only headless agent over stdio, no TUI deps                                 | [README](crates/harnx-acp-server/README.md)      |
 | `harnx-pkg`             | Package manager for harnx agent configurations                                  | [Package System](docs/packages.md)               |
 | `harnx-mcp-bash`        | MCP server exposing bash/subprocess execution with safety guards                | [Bash MCP Server](docs/bash-mcp-server.md)       |
 | `harnx-mcp-fs`          | MCP server exposing filesystem operations with safety guards                    | [README](crates/harnx-mcp-fs/README.md)          |
@@ -31,9 +30,8 @@ what you need:
 | `harnx-proxy-auth`      | TLS-intercepting auth proxy that injects credentials and runs hooks             | [README](crates/harnx-proxy-auth/README.md)      |
 
 Install whichever you need. Most users want just `harnx`; headless server
-deployments can skip the TUI deps by picking `harnx-serve` or
-`harnx-acp-server` directly. The MCP server binaries (`harnx-mcp-*`) are only
-needed if you wire them up as external MCP servers.
+deployments can skip the TUI deps by picking `harnx-serve` directly. MCP server
+binaries (`harnx-mcp-*`) are needed only when configured as external servers.
 
 ### Install using asdf
 
@@ -48,7 +46,6 @@ asdf set -u harnx latest
 ```sh
 cargo install --git https://github.com/dobesv/harnx harnx
 cargo install --git https://github.com/dobesv/harnx harnx-serve
-cargo install --git https://github.com/dobesv/harnx harnx-acp-server
 cargo install --git https://github.com/dobesv/harnx harnx-sandbox-run
 ```
 
@@ -66,12 +63,10 @@ cargo xtask install
 
 # ...or pick one or more:
 cargo xtask install harnx
-cargo xtask install harnx-serve harnx-acp-server
 
 # Raw cargo also works:
 cargo install --path crates/harnx
 cargo install --path crates/harnx-serve
-cargo install --path crates/harnx-acp-server
 ```
 
 The `cargo xtask install` helper accepts `--debug` (build unoptimized for

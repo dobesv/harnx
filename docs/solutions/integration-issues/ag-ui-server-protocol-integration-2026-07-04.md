@@ -268,7 +268,6 @@ pub fn add_assistant_text(...) {
 }
 ```
 
-TUI/ACP/CLI unchanged (pass `None` → existing UUID generation).
 
 ### 6. RunAgentInput Parsing: Lenient for Envelope
 

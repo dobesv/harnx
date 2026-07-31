@@ -1,6 +1,6 @@
 //! Config forking utilities for session-scoped prompt configs.
 //!
-//! Provides a unified config fork function used by both harnx-serve and harnx-acp-server
+//! Provides a unified config fork function used by harnx frontends
 //! to create isolated per-prompt GlobalConfig instances from a shared base Config.
 
 use harnx_runtime::config::{Config, GlobalConfig};

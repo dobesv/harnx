@@ -275,7 +275,7 @@ fn sub_agent_source() -> AgentSource {
 }
 
 /// A nested sub-agent's error (e.g. a transient LLM failure inside a
-/// delegated ACP session) arrives as a `SubAgent`-wrapped `ModelEvent::Error`.
+/// delegated agent session) arrives as a `SubAgent`-wrapped `ModelEvent::Error`.
 /// It must NOT be mistaken for the end of the main prompt task: the
 /// delegating tool call is still in flight, so busy state and the queued
 /// pending message must survive. Otherwise the TUI shows idle (no spinner)
@@ -1638,7 +1638,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
             entries: vec![
                 PlanEntry {
                     status: "in_progress".to_string(),
-                    content: "Refactor ACP formatting".to_string(),
+                    content: "Refactor sub-agent formatting".to_string(),
                 },
                 PlanEntry {
                     status: "pending".to_string(),
@@ -1703,7 +1703,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
     assert!(system_entries.contains(&"<think>thinking hard</think>".to_string()));
     assert!(system_entries.contains(&"-> argus_session_prompt completed".to_string()));
     assert!(system_entries.contains(&"Plan:".to_string()));
-    assert!(system_entries.contains(&"  [in_progress] Refactor ACP formatting".to_string()));
+    assert!(system_entries.contains(&"  [in_progress] Refactor sub-agent formatting".to_string()));
     assert!(system_entries.contains(&"> argus ▸ session-1   in 12   out 34   cache 5".to_string()));
     assert!(system_entries.contains(&"→ bash".to_string()));
     assert!(system_entries.contains(&"command: ls".to_string()));
@@ -1865,7 +1865,7 @@ async fn consecutive_usage_updates_replace_previous_usage_row_for_same_source() 
 }
 
 #[tokio::test]
-async fn acp_message_chunks_coalesce_like_direct_llm_streaming() {
+async fn subagent_message_chunks_coalesce_like_direct_llm_streaming() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
@@ -2533,92 +2533,6 @@ async fn test_sub_agent_delegation_tool_appears() {
 
     harness.drain_and_settle().await.unwrap();
 }
-
-fn apply_switch_agent_data(result: &mut harnx_runtime::tool::ToolResult) {
-    let Some(obj) = result.output.as_object() else {
-        return;
-    };
-    if obj.get("action").and_then(|value| value.as_str()) != Some("switch_agent") {
-        return;
-    }
-    let Some(agent) = obj.get("agent").and_then(|value| value.as_str()) else {
-        return;
-    };
-    let Some(prompt) = obj.get("prompt").and_then(|value| value.as_str()) else {
-        return;
-    };
-    result.switch_agent = Some(harnx_runtime::tool::SwitchAgentData {
-        agent: agent.to_string(),
-        prompt: prompt.to_string(),
-        session_id: obj
-            .get("session_id")
-            .and_then(|value| value.as_str())
-            .map(ToString::to_string),
-    });
-}
-#[tokio::test(flavor = "multi_thread")]
-async fn test_tool_result_switch_agent_parsing() {
-    use harnx_acp::{AcpManager, AcpServerConfig};
-    use harnx_runtime::tool::{eval_tool_calls, ToolCall};
-    let _guard = TestStateGuard::new(None).await;
-    let config = test_config();
-    let manager = AcpManager::new();
-    manager.initialize(vec![AcpServerConfig {
-        name: "specialist".to_string(),
-        command: "ignored".to_string(),
-        args: vec![],
-        env: std::collections::HashMap::new(),
-        enabled: true,
-        description: None,
-        idle_timeout_secs: 300,
-        operation_timeout_secs: 3600,
-        package: None,
-    }]);
-    config.write().acp_manager = Some(Arc::new(manager));
-    let call = ToolCall::new(
-        "specialist_session_handoff".to_string(),
-        serde_json::json!({
-            "prompt": "Help!",
-            "session_id": "sess-123"
-        }),
-        Some("tool-123".to_string()),
-        Some("thought-sig".to_string()),
-    );
-    // No agent file means this call errors; set output to exercise switch-agent parsing.
-    let abort_signal = harnx_runtime::utils::create_abort_signal();
-    let pm = std::sync::Arc::new(tokio::sync::Mutex::new(
-        harnx_hooks::PersistentHookManager::new(),
-    ));
-    let mut results = eval_tool_calls(
-        &harnx_runtime::tool::build_tool_eval_context(
-            harnx_runtime::tool::BuildToolEvalContextParams::new(
-                &config,
-                &harnx_core::instance::InstanceId::new(),
-                &pm,
-            ),
-        )
-        .await,
-        vec![call],
-        &abort_signal,
-    )
-    .await
-    .unwrap();
-    results[0].output = serde_json::json!({
-        "action": "switch_agent",
-        "agent": "specialist",
-        "prompt": "Help!",
-        "session_id": "sess-123"
-    });
-    apply_switch_agent_data(&mut results[0]);
-    let data = results[0]
-        .switch_agent
-        .as_ref()
-        .expect("switch_agent should be set");
-    assert_eq!(data.agent, "specialist");
-    assert_eq!(data.prompt, "Help!");
-    assert_eq!(data.session_id.as_deref(), Some("sess-123"));
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn test_screen_overflow_and_word_wrap() {
     let config =

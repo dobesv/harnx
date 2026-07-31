@@ -123,7 +123,6 @@ The `source_heading(AgentSource) -> String` function is duplicated in:
 - `crates/harnx/src/main.rs:356`
 - `crates/harnx/src/cli_event_sink.rs:40`
 - `crates/harnx-tui/src/render_helpers.rs:41` (`pub(crate)`)
-- `crates/harnx-acp/src/client.rs:1068`
 
 All implementations are identical. Future refactor should move to shared location (e.g., method on `AgentSource` in `harnx-core`).
 

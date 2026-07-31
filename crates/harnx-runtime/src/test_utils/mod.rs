@@ -4,7 +4,7 @@
 //! this crate.
 //!
 //! TUI-specific harnesses (`tui_harness`, `tmux_harness`, `interrupt`,
-//! `mock_openai_server`, `mock_acp`) stay in `harnx::test_utils` and
+//! `mock_openai_server` stay in `harnx::test_utils` and
 //! re-export these types via a glob shim.
 
 pub mod mock_client;

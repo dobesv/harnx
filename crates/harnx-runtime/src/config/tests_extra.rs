@@ -82,7 +82,7 @@ fn expand_use_tools_mcp_failure_logs_warning_and_continues() {
 
 /// Regression test for #886: explicit selector must return ONLY that tool,
 /// not ALL builtin tools (the bug was that tool_declarations_for_use_tools
-/// starts from ALL builtins and only ADDS MCP/ACP/handoff tools, never filtering).
+/// starts from ALL builtins and only ADDS MCP/handoff tools, never filtering).
 #[test]
 fn expand_use_tools_explicit_selector_returns_only_that_tool() {
     let config = Config {

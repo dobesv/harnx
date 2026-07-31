@@ -21,7 +21,8 @@ use harnx_core::session::{SessionLogEntry, ToolOutput};
 use harnx_core::session_reconstruct::{
     active_context_window, reconstruct_state_from_nats, TurnStatus,
 };
-use harnx_core::tool::{ToolCall, ToolDeclaration};
+use harnx_core::tool::{ToolCall, ToolDeclaration, ToolProvider};
+use harnx_toolset::Toolset;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,6 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio_util::sync::CancellationToken;
 
 /// Spawn a local JetStream-enabled nats-server on a free port with an isolated
 /// temp store dir, returning the connect URL, the child process, and the temp
@@ -100,23 +102,26 @@ async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
 }
 
 struct TestEnvGuard {
+    key: String,
     prev: Option<std::ffi::OsString>,
 }
 
 impl TestEnvGuard {
-    fn new(key: &str, value: &Path) -> Self {
+    fn new(key: &str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let prev = std::env::var_os(key);
         unsafe { std::env::set_var(key, value) };
-        let _ = key;
-        Self { prev }
+        Self {
+            key: key.to_string(),
+            prev,
+        }
     }
 }
 
 impl Drop for TestEnvGuard {
     fn drop(&mut self) {
         match &self.prev {
-            Some(value) => unsafe { std::env::set_var("HARNX_CONFIG_DIR", value) },
-            None => unsafe { std::env::remove_var("HARNX_CONFIG_DIR") },
+            Some(value) => unsafe { std::env::set_var(&self.key, value) },
+            None => unsafe { std::env::remove_var(&self.key) },
         }
     }
 }
@@ -128,10 +133,8 @@ fn load_config_via_internal_pipeline(config_path: &Path) -> Config {
         .expect("config path must have parent directory");
     let _config_guard = TestEnvGuard::new("HARNX_CONFIG_DIR", config_dir);
     let mut config = Config::load_from_file(config_path).unwrap();
-    // Initialize acp_manager from the auto-registered ACP servers; without this
-    // the delegation tool family is never materialized and only the handoff
-    // path contributes to tool_declarations_for_use_tools. Mirrors the config
-    // tests' `remote_use_tools_selectors_match_full_sanitized_family`.
+    // Keep explicit MCP configs initialized for tests that exercise them.
+    // Configured agents themselves are no longer auto-registered through the old backend.
     config.reinit_managers_for_agent(None);
     drop(_config_guard);
     match prev {
@@ -153,13 +156,7 @@ impl SeededRemoteParentConfig {
 }
 
 fn expected_metis_remote_tool_names() -> Vec<String> {
-    vec![
-        "metis__at__local_session_cancel".to_string(),
-        "metis__at__local_session_handoff".to_string(),
-        "metis__at__local_session_load".to_string(),
-        "metis__at__local_session_new".to_string(),
-        "metis__at__local_session_prompt".to_string(),
-    ]
+    vec!["metis__at__local_session_handoff".to_string()]
 }
 
 fn seed_remote_config(url: &str) -> SeededRemoteParentConfig {
@@ -219,19 +216,13 @@ fn assert_remote_tool_descriptions(parent_config: &mut Config) {
     wildcard_names.sort();
     assert_eq!(wildcard_names, expected_metis_remote_tool_names());
 
-    let prompt_tool = wildcard_tools
+    let handoff_tool = wildcard_tools
         .iter()
-        .find(|tool| tool.name == "metis__at__local_session_prompt")
-        .expect("prompt tool must exist");
-    let prompt_description = &prompt_tool.description;
-    assert!(
-        prompt_description.contains("Remote planner over NATS"),
-        "prompt tool description must include seeded catalog description: {prompt_description}"
-    );
-    assert!(
-        prompt_description.ends_with("Remote planner over NATS"),
-        "prompt tool description must end with seeded catalog description: {prompt_description}"
-    );
+        .find(|tool| tool.name == "metis__at__local_session_handoff")
+        .expect("handoff tool must exist");
+    assert!(handoff_tool
+        .description
+        .contains("Remote planner over NATS"));
 }
 
 async fn seed_remote_dispatch_session_log(
@@ -349,7 +340,9 @@ fn spawn_metis_worker_with_call_fn_and_daemon(
     call_fn: crate::agent_loop::AgentCallFn,
     daemon: crate::nats_worker::WorkerDaemonConfig,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-    let worker_agent = AgentConfig::from_markdown("metis", "stub worker prompt").unwrap();
+    let worker_agent =
+        AgentConfig::from_markdown("metis", "---\nuse_tools: \"*\"\n---\nstub worker prompt")
+            .unwrap();
     let worker_config = Config {
         data: harnx_core::config_data::ConfigData {
             model_id: "test:test-model".to_string(),
@@ -840,6 +833,33 @@ fn echoing_call_fn(captured: Arc<AsyncMutex<Vec<String>>>) -> crate::agent_loop:
             ))
         })
     })
+}
+
+async fn test_subagent_toolset(
+    url: &str,
+    timeouts: super::subagent_toolset::SubagentTimeouts,
+) -> Arc<super::subagent_toolset::SubagentToolset> {
+    let client = async_nats::connect(url)
+        .await
+        .expect("connect sub-agent toolset to test nats");
+    Arc::new(super::subagent_toolset::SubagentToolset::with_timeouts(
+        "metis",
+        "local",
+        client.clone(),
+        async_nats::jetstream::new(client),
+        timeouts,
+    ))
+}
+
+fn subagent_test_env<'a>(
+    url: &'a str,
+    seeded: &'a SeededRemoteParentConfig,
+) -> (TestEnvGuard, TestEnvGuard, TestEnvGuard) {
+    (
+        TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir()),
+        TestEnvGuard::new("HARNX_NATS_URL", url),
+        TestEnvGuard::new("HARNX_NATS_TOKEN", "test-token"),
+    )
 }
 
 async fn run_remote_turn_returning_reply(
@@ -1474,6 +1494,778 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
         TurnStatus::InFlightCancelled,
         "durable log should reconstruct to InFlightCancelled after remote cancel when no assistant message follows cancel; cancel fence={cancel_fence_token:?}, assistant fence={first_assistant_fence_token:?}, entries={final_entries:#?}"
     );
+
+    daemon.abort();
+    let _ = daemon.await;
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_registers_and_delegates_to_every_configured_agent() {
+    let _env_guard = env_lock().await;
+    let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
+        return;
+    };
+    let seeded = seed_remote_config(&url);
+    let _env = subagent_test_env(&url, &seeded);
+    let agents_dir = seeded.config_dir().join("agents");
+    std::fs::create_dir_all(&agents_dir).expect("create configured agents directory");
+    for agent in ["alpha", "beta", "metis"] {
+        std::fs::write(
+            agents_dir.join(format!("{agent}.md")),
+            "---\nmodel: test:test-model\n---\nConfigured sub-agent\n",
+        )
+        .expect("write configured agent");
+    }
+
+    let captured = Arc::new(AsyncMutex::new(Vec::new()));
+    let daemon = spawn_metis_worker_with_call_fn(&url, echoing_call_fn(Arc::clone(&captured)));
+    let client = async_nats::connect(&url)
+        .await
+        .expect("connect registry observer");
+    let jetstream = async_nats::jetstream::new(client);
+    let (instance_id, registrations) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let Ok(registry) = jetstream
+                .get_key_value(harnx_toolset_server::TOOL_REGISTRY_BUCKET)
+                .await
+            else {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            };
+            let mut keys = registry.keys().await.expect("list registry keys");
+            let mut values = Vec::new();
+            while let Some(key) = keys.next().await {
+                let key = key.expect("read registry key");
+                let Some(value) = registry.get(&key).await.expect("read registration") else {
+                    continue;
+                };
+                let registration: harnx_toolset::Registration =
+                    serde_json::from_slice(&value).expect("decode registration");
+                values.push((key, registration));
+            }
+            let alpha_key = values
+                .iter()
+                .find(|(_, registration)| registration.server == "alpha")
+                .map(|(key, _)| key.clone());
+            let has_remaining_agents = ["beta", "metis"].iter().all(|agent| {
+                values
+                    .iter()
+                    .any(|(_, registration)| registration.server == *agent)
+            });
+            if let (Some(alpha_key), true) = (alpha_key, has_remaining_agents) {
+                let instance = alpha_key
+                    .strip_suffix(".alpha")
+                    .expect("registry key uses {instance}.{agent}")
+                    .to_string();
+                break (instance, values);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("configured agent toolsets did not register");
+
+    // Old auto-registration included the active agent; preserve self-delegation parity.
+    for agent in ["alpha", "beta", "metis"] {
+        let (key, registration) = registrations
+            .iter()
+            .find(|(_, registration)| registration.server == agent)
+            .expect("configured agent registration exists");
+        assert_eq!(key, &format!("{instance_id}.{agent}"));
+        assert_eq!(registration.tools.len(), 4);
+        assert!(registration
+            .tools
+            .iter()
+            .all(|tool| tool.name.starts_with(&format!("{agent}_session_"))));
+    }
+
+    let provider = crate::nats_tool_provider::NatsToolProvider::discover(
+        &seeded.parent_config,
+        harnx_core::instance::InstanceId::from_string(instance_id),
+        crate::nats_tool_provider::NatsInFlightCalls::default(),
+    )
+    .await
+    .expect("parent discovers configured sub-agent toolsets");
+    let declarations = provider.declarations_for_use_tools(Some("*"));
+    for agent in ["alpha", "beta"] {
+        assert!(declarations
+            .iter()
+            .any(|tool| tool.name == format!("{agent}_session_prompt")));
+        let result = provider
+            .call_tool(
+                &format!("{agent}_session_prompt"),
+                json!({ "message": format!("delegate to {agent}") }),
+                &harnx_core::abort::create_abort_signal(),
+            )
+            .await
+            .unwrap_or_else(|error| match error {
+                harnx_core::tool::ToolError::Recoverable(error)
+                | harnx_core::tool::ToolError::Fatal(error) => {
+                    panic!("parent delegates to configured agent: {error:#}")
+                }
+            });
+        assert_eq!(
+            result["response"],
+            format!("stub remote reply over nats: delegate to {agent}")
+        );
+    }
+
+    daemon.abort();
+    let _ = daemon.await;
+    let _ = nats.kill();
+    let _ = nats.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subagent_new_and_prompt_results_include_agent_source_marker() {
+    let _env_guard = env_lock().await;
+    let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
+        return;
+    };
+    let seeded = seed_remote_config(&url);
+    let _env = subagent_test_env(&url, &seeded);
+    let daemon = spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("marker response"));
+    let toolset = test_subagent_toolset(
+        &url,
+        super::subagent_toolset::SubagentTimeouts::new(
+            Duration::from_secs(2),
+            Duration::from_secs(10),
+        ),
+    )
+    .await;
+
+    let created = toolset
+        .invoke("metis_session_new", json!({}), CancellationToken::new())
+        .await
+        .expect("create marked child session");
+    let session_id = created["session_id"]
+        .as_str()
+        .expect("new result session id")
+        .to_string();
+    assert_eq!(created["sub_agent"]["agent"], "metis");
+    assert_eq!(created["sub_agent"]["session_id"], session_id);
+    assert!(created["sub_agent"].get("model").is_none());
+
+    let prompted = toolset
+        .invoke(
+            "metis_session_prompt",
+            json!({ "message": "continue marked session", "session_id": session_id }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("prompt marked child session");
+    assert_eq!(prompted["sub_agent"]["agent"], "metis");
+    assert_eq!(prompted["sub_agent"]["session_id"], session_id);
+    assert_eq!(prompted["session_id"], session_id);
+
+    daemon.abort();
+    let _ = daemon.await;
+    let _ = nats.kill();
+    let _ = nats.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subagent_started_reaches_parent_stream_before_prompt_result() {
+    let _env_guard = env_lock().await;
+    let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
+        return;
+    };
+    let mut seeded = seed_remote_config(&url);
+    let _env = subagent_test_env(&url, &seeded);
+    let agents_dir = seeded.config_dir().join("agents");
+    std::fs::create_dir_all(&agents_dir).expect("create agents directory");
+    std::fs::write(
+        agents_dir.join("metis.md"),
+        "---\nmodel: test:test-model\n---\nConfigured metis agent\n",
+    )
+    .expect("write metis agent");
+    let parent_session =
+        crate::config::session::new(&seeded.parent_config, "parent-subagent-start", None)
+            .expect("create parent session");
+    let parent_session_id = parent_session.id().to_string();
+    seeded.parent_config.session = Some(parent_session);
+
+    let daemon = spawn_metis_worker_with_call_fn(
+        &url,
+        slow_prompt_call_fn("early event child response", Duration::from_millis(300)),
+    );
+    let client = async_nats::connect(&url)
+        .await
+        .expect("connect parent event observer");
+    let mut parent_events = client
+        .subscribe(crate::nats_event_sink::events_subject(&parent_session_id))
+        .await
+        .expect("subscribe parent event stream");
+    client
+        .flush()
+        .await
+        .expect("flush parent event subscription");
+    let jetstream = async_nats::jetstream::new(client);
+    let instance_id = tokio::time::timeout(Duration::from_secs(5), async {
+        'registration: loop {
+            if let Ok(registry) = jetstream
+                .get_key_value(harnx_toolset_server::TOOL_REGISTRY_BUCKET)
+                .await
+            {
+                let mut keys = registry.keys().await.expect("list registry keys");
+                while let Some(key) = keys.next().await {
+                    let key = key.expect("read registry key");
+                    if let Some(instance) = key.strip_suffix(".metis") {
+                        break 'registration instance.to_string();
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("metis toolset registration missing");
+    let provider = Arc::new(
+        crate::nats_tool_provider::NatsToolProvider::discover(
+            &seeded.parent_config,
+            harnx_core::instance::InstanceId::from_string(instance_id),
+            crate::nats_tool_provider::NatsInFlightCalls::default(),
+        )
+        .await
+        .expect("discover metis toolset for parent"),
+    );
+    let prompt_call = tokio::spawn({
+        let provider = Arc::clone(&provider);
+        async move {
+            provider
+                .call_tool(
+                    "metis_session_prompt",
+                    json!({ "message": "emit start before finishing" }),
+                    &harnx_core::abort::create_abort_signal(),
+                )
+                .await
+        }
+    });
+
+    let (event_agent, child_session_id) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let message = parent_events
+                .next()
+                .await
+                .expect("parent event stream closed");
+            let envelope = crate::nats_event_sink::AdvisoryEnvelope::from_bytes(&message.payload)
+                .expect("decode parent advisory");
+            if let AgentEvent::SubAgent { source, event } = envelope.event {
+                if let AgentEvent::Turn(harnx_core::event::TurnEvent::SubAgentStarted {
+                    agent,
+                    session_id,
+                }) = *event
+                {
+                    assert_eq!(source.agent, agent);
+                    assert_eq!(source.session_id.as_deref(), Some(session_id.as_str()));
+                    break (agent, session_id);
+                }
+            }
+        }
+    })
+    .await
+    .expect("parent did not receive early SubAgentStarted");
+    assert_eq!(event_agent, "metis");
+    assert!(
+        !prompt_call.is_finished(),
+        "SubAgentStarted must arrive before final tool result"
+    );
+    let result = prompt_call
+        .await
+        .expect("join prompt tool call")
+        .unwrap_or_else(|error| match error {
+            harnx_core::tool::ToolError::Recoverable(error)
+            | harnx_core::tool::ToolError::Fatal(error) => {
+                panic!("prompt tool call failed: {error:#}")
+            }
+        });
+    assert_eq!(result["response"], "early event child response");
+    assert_eq!(result["sub_agent"]["agent"], "metis");
+    assert_eq!(result["sub_agent"]["session_id"], child_session_id);
+
+    daemon.abort();
+    let _ = daemon.await;
+    let _ = nats.kill();
+    let _ = nats.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subagent_new_prompt_reuse_and_load_share_one_session_log() {
+    let _env_guard = env_lock().await;
+    let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
+        return;
+    };
+    let seeded = seed_remote_config(&url);
+    let _env = subagent_test_env(&url, &seeded);
+    let captured = Arc::new(AsyncMutex::new(Vec::new()));
+    let daemon = spawn_metis_worker_with_call_fn(&url, echoing_call_fn(Arc::clone(&captured)));
+    let toolset = test_subagent_toolset(
+        &url,
+        super::subagent_toolset::SubagentTimeouts::new(
+            Duration::from_secs(2),
+            Duration::from_secs(10),
+        ),
+    )
+    .await;
+
+    let created = toolset
+        .invoke("metis_session_new", json!({}), CancellationToken::new())
+        .await
+        .expect("create and initialize child session");
+    let session_id = created["session_id"]
+        .as_str()
+        .expect("session_new returns session_id")
+        .to_string();
+    let log = NatsSessionLog::new(
+        seeded
+            .parent_config
+            .nats_jetstream("local")
+            .await
+            .expect("child log jetstream"),
+        session_id.clone(),
+    );
+    let after_new = log
+        .load_events_async()
+        .await
+        .expect("load child log after session_new")
+        .len();
+
+    for (message, expected) in [
+        (
+            "first continuation",
+            "stub remote reply over nats: first continuation",
+        ),
+        (
+            "second continuation",
+            "stub remote reply over nats: second continuation",
+        ),
+    ] {
+        let result = toolset
+            .invoke(
+                "metis_session_prompt",
+                json!({ "message": message, "session_id": session_id }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("continue child session");
+        assert_eq!(result["session_id"], session_id);
+        assert_eq!(result["response"], expected);
+    }
+
+    let loaded = toolset
+        .invoke(
+            "metis_session_load",
+            json!({ "session_id": session_id }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("load child session through tool");
+    let loaded_events = loaded["events"]
+        .as_array()
+        .expect("session_load returns serialized events");
+    assert!(loaded_events.len() > after_new);
+    let final_entries = log
+        .load_events_async()
+        .await
+        .expect("load final reused child log");
+    assert!(final_entries.len() > after_new);
+    assert_eq!(
+        captured.lock().await.as_slice(),
+        [
+            "Start a new session.",
+            "first continuation",
+            "second continuation"
+        ]
+    );
+
+    daemon.abort();
+    let _ = daemon.await;
+    let _ = nats.kill();
+    let _ = nats.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subagent_explicit_cancel_stops_in_flight_child_turn() {
+    run_subagent_cancel_case(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subagent_parent_abort_stops_in_flight_child_turn() {
+    run_subagent_cancel_case(true).await;
+}
+
+async fn run_subagent_cancel_case(parent_abort: bool) {
+    let _env_guard = env_lock().await;
+    let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
+        return;
+    };
+    let seeded = seed_remote_config(&url);
+    let _env = subagent_test_env(&url, &seeded);
+    let entered = Arc::new(Notify::new());
+    let entered_call = Arc::clone(&entered);
+    let call_fn: crate::agent_loop::AgentCallFn = Arc::new(move |_input, _config, abort| {
+        let entered = Arc::clone(&entered_call);
+        Box::pin(async move {
+            entered.notify_one();
+            harnx_core::abort::wait_abort_signal(&abort).await;
+            bail!("child call cancelled")
+        })
+    });
+    let daemon = spawn_metis_worker_with_call_fn(&url, call_fn);
+    let toolset = test_subagent_toolset(
+        &url,
+        super::subagent_toolset::SubagentTimeouts::new(
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+        ),
+    )
+    .await;
+    let session_id = crate::nats_worker::new_remote_session_id();
+    let parent_cancel = CancellationToken::new();
+    let prompt = tokio::spawn({
+        let toolset = Arc::clone(&toolset);
+        let parent_cancel = parent_cancel.clone();
+        let session_id = session_id.clone();
+        async move {
+            toolset
+                .invoke(
+                    "metis_session_prompt",
+                    json!({ "message": "block until cancelled", "session_id": session_id }),
+                    parent_cancel,
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("child worker did not enter model call");
+
+    if parent_abort {
+        parent_cancel.cancel();
+    } else {
+        toolset
+            .invoke(
+                "metis_session_cancel",
+                json!({ "session_id": session_id }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("explicit child cancel tool succeeds");
+    }
+    let error = tokio::time::timeout(Duration::from_secs(5), prompt)
+        .await
+        .expect("cancelled prompt tool did not return")
+        .expect("join cancelled prompt task")
+        .expect_err("cancelled prompt must return an error");
+    assert!(
+        error.to_string().contains("cancel") || error.to_string().contains("abort"),
+        "unexpected cancellation error: {error}"
+    );
+    let log = NatsSessionLog::new(
+        seeded
+            .parent_config
+            .nats_jetstream("local")
+            .await
+            .expect("cancel log jetstream"),
+        session_id,
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let entries = log.load_events_async().await.expect("load cancel entries");
+            if entries
+                .iter()
+                .any(|(_, entry)| matches!(entry, SessionLogEntry::Cancel { .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("child cancel tombstone was not persisted");
+
+    daemon.abort();
+    let _ = daemon.await;
+    let _ = nats.kill();
+    let _ = nats.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subagent_operation_timeout_returns_error_and_cancels_child() {
+    let _env_guard = env_lock().await;
+    let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
+        return;
+    };
+    let seeded = seed_remote_config(&url);
+    let _env = subagent_test_env(&url, &seeded);
+    let call_fn = slow_prompt_call_fn("too late", Duration::from_secs(30));
+    let daemon = spawn_metis_worker_with_call_fn(&url, call_fn);
+    let toolset = test_subagent_toolset(
+        &url,
+        super::subagent_toolset::SubagentTimeouts::new(
+            Duration::from_secs(5),
+            Duration::from_millis(150),
+        ),
+    )
+    .await;
+    let session_id = crate::nats_worker::new_remote_session_id();
+    let error = toolset
+        .invoke(
+            "metis_session_prompt",
+            json!({ "message": "time out", "session_id": session_id }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("operation timeout must return an error");
+    assert!(error.to_string().contains("overall timeout"));
+    let log = NatsSessionLog::new(
+        seeded
+            .parent_config
+            .nats_jetstream("local")
+            .await
+            .expect("timeout log jetstream"),
+        session_id,
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let entries = log.load_events_async().await.expect("load timeout entries");
+            if entries
+                .iter()
+                .any(|(_, entry)| matches!(entry, SessionLogEntry::Cancel { .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("operation timeout did not cancel child");
+
+    daemon.abort();
+    let _ = daemon.await;
+    let _ = nats.kill();
+    let _ = nats.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subagent_idle_timeout_resets_on_child_activity() {
+    let _env_guard = env_lock().await;
+    let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
+        return;
+    };
+    let seeded = seed_remote_config(&url);
+    let _env = subagent_test_env(&url, &seeded);
+    let call_fn: crate::agent_loop::AgentCallFn = Arc::new(move |_input, _config, _abort| {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(225)).await;
+            Ok((
+                "active child completed".to_string(),
+                None,
+                vec![],
+                crate::client::CompletionTokenUsage::default(),
+            ))
+        })
+    });
+    let daemon = spawn_metis_worker_with_call_fn(&url, call_fn);
+    let toolset = test_subagent_toolset(
+        &url,
+        super::subagent_toolset::SubagentTimeouts::new(
+            Duration::from_millis(75),
+            Duration::from_secs(2),
+        ),
+    )
+    .await;
+    let session_id = crate::nats_worker::new_remote_session_id();
+    let activity_publisher = tokio::spawn({
+        let url = url.clone();
+        let session_id = session_id.clone();
+        async move {
+            let client = async_nats::connect(url)
+                .await
+                .expect("connect activity publisher");
+            let subject = crate::nats_event_sink::events_subject(&session_id);
+            for _ in 0..15 {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                let envelope = crate::nats_event_sink::AdvisoryEnvelope::new(
+                    u64::MAX,
+                    AgentEvent::Turn(harnx_core::event::TurnEvent::Started),
+                );
+                client
+                    .publish(
+                        subject.clone(),
+                        envelope.to_bytes().expect("encode activity").into(),
+                    )
+                    .await
+                    .expect("publish child activity");
+                client.flush().await.expect("flush child activity");
+            }
+        }
+    });
+    let result = toolset
+        .invoke(
+            "metis_session_prompt",
+            json!({ "message": "stay active", "session_id": session_id }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("activity must keep idle timeout from false-firing");
+    assert_eq!(result["response"], "active child completed");
+    activity_publisher.await.expect("join activity publisher");
+
+    daemon.abort();
+    let _ = daemon.await;
+    let _ = nats.kill();
+    let _ = nats.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nested_subagent_prompt_returns_final_message_over_nats() {
+    const CHILD_PROMPT: &str = "complete the delegated child work";
+    const CHILD_FINAL: &str = "child final message over nats";
+    const PARENT_FINAL: &str = "parent received child result";
+
+    let _env_guard = env_lock().await;
+    let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
+        return;
+    };
+    let seeded = seed_remote_config(&url);
+    let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
+    let _nats_url = TestEnvGuard::new("HARNX_NATS_URL", &url);
+    let _nats_token = TestEnvGuard::new("HARNX_NATS_TOKEN", "test-token");
+    let agents_dir = seeded.config_dir().join("agents");
+    std::fs::create_dir_all(&agents_dir).expect("create agents directory");
+    std::fs::write(
+        agents_dir.join("metis.md"),
+        "---\nmodel: test:test-model\n---\nConfigured metis agent\n",
+    )
+    .expect("write metis agent");
+    let parent_session_id = crate::nats_worker::new_remote_session_id();
+    let call_fn: crate::agent_loop::AgentCallFn = Arc::new(move |input, _config, _abort| {
+        let has_tool_result = input.tool_calls.is_some();
+        let prompt = input.text();
+        Box::pin(async move {
+            if has_tool_result {
+                return Ok((
+                    PARENT_FINAL.to_string(),
+                    None,
+                    vec![],
+                    crate::client::CompletionTokenUsage::default(),
+                ));
+            }
+            if prompt == CHILD_PROMPT {
+                return Ok((
+                    CHILD_FINAL.to_string(),
+                    None,
+                    vec![],
+                    crate::client::CompletionTokenUsage::default(),
+                ));
+            }
+            Ok((
+                "delegating to child".to_string(),
+                None,
+                vec![ToolCall::new(
+                    "metis_session_prompt".to_string(),
+                    json!({ "message": CHILD_PROMPT }),
+                    Some("nested-subagent-call".to_string()),
+                    None,
+                )],
+                crate::client::CompletionTokenUsage::default(),
+            ))
+        })
+    });
+    let daemon = spawn_metis_worker_with_call_fn(&url, call_fn);
+
+    let client = async_nats::connect(&url)
+        .await
+        .expect("connect event observer to test nats");
+    let mut child_events = client
+        .subscribe("sessions.*.events")
+        .await
+        .expect("subscribe to session events");
+    client.flush().await.expect("flush event subscription");
+    let thin = ThinClientSession::new(
+        crate::ThinClientConfig {
+            cluster: "local".to_string(),
+            agent: "metis".to_string(),
+            session_id: Some(parent_session_id.clone()),
+        },
+        client.clone(),
+        async_nats::jetstream::new(client.clone()),
+        harnx_core::abort::create_abort_signal(),
+    )
+    .await
+    .expect("create parent thin-client session");
+    let parent_result = tokio::time::timeout(
+        Duration::from_secs(15),
+        thin.run_turn(
+            "delegate this request through the nested tool",
+            Arc::new(NoopEventSink),
+            None,
+        ),
+    )
+    .await
+    .expect("nested parent turn timed out")
+    .expect("nested parent turn failed");
+    assert_eq!(parent_result.response.as_deref(), Some(PARENT_FINAL));
+
+    let parent_log = NatsSessionLog::new(
+        async_nats::jetstream::new(client.clone()),
+        parent_session_id.clone(),
+    );
+    let parent_entries = parent_log
+        .load_events_async()
+        .await
+        .expect("load parent session log");
+    let tool_output = parent_entries.iter().find_map(|(_, entry)| match entry {
+        SessionLogEntry::ToolResults { results, .. } => results
+            .iter()
+            .find(|result| result.name == "metis_session_prompt")
+            .map(|result| result.output.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        tool_output
+            .as_ref()
+            .and_then(|value| value["response"].as_str()),
+        Some(CHILD_FINAL),
+        "nested tool result must contain the sub-agent's exact final message"
+    );
+
+    let child_session_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = child_events
+                .next()
+                .await
+                .expect("session event subscription closed");
+            let subject = event.subject.as_str();
+            let session_id = subject
+                .strip_prefix("sessions.")
+                .and_then(|value| value.strip_suffix(".events"))
+                .expect("session event subject shape");
+            if session_id != parent_session_id {
+                break session_id.to_string();
+            }
+        }
+    })
+    .await
+    .expect("no child session event was visible on sessions.{child_id}.events");
+    let child_stream_name = crate::nats_session_log::stream_name_for_session(&child_session_id);
+    let jetstream = async_nats::jetstream::new(client);
+    jetstream
+        .get_stream(&child_stream_name)
+        .await
+        .expect("child SESSION_<id> JetStream log must exist");
+    let child_entries = NatsSessionLog::new(jetstream, child_session_id)
+        .load_events_async()
+        .await
+        .expect("load child session log");
+    assert!(child_entries.iter().any(|(_, entry)| matches!(
+        entry,
+        SessionLogEntry::Message { role, content, .. }
+            if role.is_assistant() && content.to_text() == CHILD_FINAL
+    )));
 
     daemon.abort();
     let _ = daemon.await;

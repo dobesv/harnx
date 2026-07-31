@@ -151,5 +151,4 @@ async fn run_cleanup_pass(dir: &Path, retention: Duration) {
 
 ## Related Issues
 
-- **Related Solution:** [acp-io-task-supervision-2026-05-07.md](../async-patterns/acp-io-task-supervision-2026-05-07.md) — JoinHandle supervision in LocalSet command loop
 - **GitHub:** [issue #652](https://github.com/dobesv/harnx/issues/652) — Plan cleanup background task

@@ -226,5 +226,3 @@ fn prompt_config_for_agent_session(base_config: &Config, key: &SessionKey) -> Gl
 ## Related Issues
 
 - **GitHub:** [issue #959](https://github.com/dobesv/harnx/issues/959) — AG-UI Phase 2: per-session actor control plane
-- **Related Solution:** [concurrent-session-prompt-isolation-2026-06-09.md](../logic-errors/concurrent-session-prompt-isolation-2026-06-09.md) — ACP concurrency isolation patterns
-- **Related Solution:** [acp-idle-timeout-false-negative-2026-06-18.md](acp-idle-timeout-false-negative-2026-06-18.md) — Tokio select/patterns for timeout handling

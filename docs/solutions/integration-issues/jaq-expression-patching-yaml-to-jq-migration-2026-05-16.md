@@ -229,7 +229,6 @@ No save/restore logic needed — JSON round-trip is lossless for `ClientConfig`.
 
 ### Package Loading Integration
 
-In `load_package_servers`, the same pattern used for MCP/ACP servers applies to clients:
 
 ```rust
 let pkg_clients_dir = pkg_path.join(paths::CLIENTS_DIR_NAME);
@@ -248,7 +247,6 @@ Note: `load_package_mcp_patch()` loads the full `PackagePatch` (not just MCP). T
 
 ### Design Gap: ClientConfig Lacks Package Attribution
 
-MCP/ACP server configs have `package: Option<String>` (runtime-only, skip-serialized) for origin tracking. `ClientConfig` lacks this field. Clients loaded from packages are anonymous re: their origin. Not a bug, but a design asymmetry to be aware of for future work.
 
 ### Tests
 

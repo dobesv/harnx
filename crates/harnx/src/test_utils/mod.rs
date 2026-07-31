@@ -1,7 +1,6 @@
 //! Test utilities for end-to-end and integration tests.
 //!
 //! This module provides shared helpers for test-only infrastructure, including
-//! mock clients, TUI harnesses, synchronization primitives, and ACP test servers.
 //!
 //! # Overview
 //!
@@ -11,7 +10,6 @@
 //! - [`tui_harness`] - Test harness for TUI rendering tests without a real terminal
 //! - [`tmux_harness`] - Minimal tmux-backed harness for driving the real TUI locally
 //! - [`sync`] - Synchronization primitives for async test coordination
-//! - [`mock_acp`] - Mock ACP server for testing sub-agent delegation
 //!
 //! # Quick Start
 //!
@@ -58,7 +56,6 @@
 //! ```
 
 pub mod interrupt;
-pub mod mock_acp;
 pub mod mock_openai_server;
 pub mod tmux_harness;
 
@@ -68,6 +65,5 @@ pub use harnx_runtime::test_utils::{mock_client, sync};
 
 pub use harnx_tui::test_utils::TuiTestHarness;
 pub use interrupt::*;
-pub use mock_acp::*;
 pub use mock_openai_server::*;
 pub use tmux_harness::*;

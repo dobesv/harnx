@@ -194,6 +194,7 @@ async fn bridge_registers_plans_and_round_trips_an_invoke() -> Result<()> {
         call_id: call_id.to_owned(),
         tool: "plans_list_plans".to_owned(),
         args: json!({}),
+        parent_session_id: None,
     };
     let mut headers = async_nats::HeaderMap::new();
     headers.insert(HDR_CALL_ID, call_id);

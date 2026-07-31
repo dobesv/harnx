@@ -3,7 +3,6 @@ title: "Tool output header suppression and template-driven display"
 date: 2026-05-02
 category: "logic-errors"
 problem_type: logic_error
-component: "harnx-tui, harnx-cli, harnx-acp, harnx-mcp-bash, harnx-mcp-fs, harnx-mcp-time, harnx-mcp-todo"
 root_cause: "redundant tool name headers cluttered output when markdown templates already described the action"
 resolution_type: code_fix
 severity: medium
@@ -121,12 +120,9 @@ All tool declarations updated with terse ASCII icon prefixes:
 | `-` | Delete | `- todo {{ args.id }}` |
 | `>>` | Append | `>> todo {{ args.id }}` |
 
-### ACP dynamic templates via `format!()`
 
-`generate_acp_tools(server_name)` builds templates programmatically:
 
 ```rust
-fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
     let session_new_call_template = format!("@ {} new session", server_name);
     let session_prompt_call_template = format!("@ {} {{{{ args.message | truncate(60) }}}}", server_name);
     // ...
@@ -168,4 +164,3 @@ Server name interpolated at tool generation time; result is valid MiniJinja temp
 ## Related Issues
 
 - **GitHub:** [issue #396](https://github.com/dobesv/harnx/issues/396) — Improve tool output appearance
-- **Related Solution:** [mcp-tool-template-acp-propagation-2026-04-30.md](../integration-issues/mcp-tool-template-acp-propagation-2026-04-30.md) — Template rendering and ACP propagation

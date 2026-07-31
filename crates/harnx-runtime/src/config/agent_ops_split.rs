@@ -90,7 +90,7 @@ impl Config {
         self.use_agent_obj(agent)
     }
 
-    /// Reinitialize the MCP/ACP managers so they are scoped to the package of
+    /// Reinitialize the MCP manager so it is scoped to the package of
     /// the agent named `agent_name` (or to the global, no-package view for a
     /// top-level agent).
     ///
@@ -125,7 +125,7 @@ impl Config {
             self.exit_agent()?;
         }
 
-        // Scope MCP/ACP managers to the incoming agent's package (or None for
+        // Scope MCP manager to the incoming agent's package (or None for
         // top-level agents) so same-package MCP servers appear under their bare
         // names and others stay prefixed.
         self.scope_managers_for_agent(agent.name());
@@ -296,7 +296,7 @@ impl Config {
         if config.read().agent.is_some() {
             config.write().exit_agent()?;
         }
-        // Scope the MCP/ACP managers to the incoming agent's package BEFORE
+        // Scope the MCP manager to the incoming agent's package BEFORE
         // `agent::init` snapshots selector-filtered MCP tool declarations (it
         // reads `mcp_manager.get_tools_for_selectors(...)` during init).
         // Without this the agent would inherit the global (`None`) scope left

@@ -33,7 +33,7 @@ pub fn qualify_agent_name(pkg: &str, agent_stem: &str) -> String {
 
 /// Given a qualified agent name like "mypkg/coder", return tool name prefix.
 /// "mypkg/coder" → "mypkg__coder"
-/// Used so ACP tool names become "mypkg__coder_session_prompt".
+/// Used so agent tool names become "mypkg__coder_session_prompt".
 pub fn agent_tool_prefix(qualified_agent_name: &str) -> String {
     sanitize_for_tool_name(qualified_agent_name)
 }

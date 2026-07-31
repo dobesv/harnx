@@ -137,7 +137,7 @@ impl ThinClientSession {
 
     /// Run a turn: append user message, activate worker, stream events until completion.
     ///
-    /// This is the main entry point for all frontends (CLI, TUI, ACP).
+    /// This is the main entry point for all frontends (CLI and TUI).
     ///
     /// # Arguments
     /// * `user_message` - The user's prompt text.

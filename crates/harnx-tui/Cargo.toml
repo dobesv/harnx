@@ -18,7 +18,6 @@ chrono = { workspace = true }
 crossterm = { workspace = true }
 fancy-regex = { workspace = true }
 futures-util = { workspace = true }
-harnx-acp = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 harnx-hooks = { path = "../harnx-hooks" }
 harnx-mcp = { path = "../harnx-mcp" }
