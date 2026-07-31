@@ -1,6 +1,6 @@
 use harnx_mcp::safety::{
-    file_uri_to_path, format_size, sanitize_output_text, truncate_output, validate_path,
-    TruncateOpts,
+    default_root_from_cwd, file_uri_to_path, format_size, sanitize_output_text, truncate_output,
+    validate_path, TruncateOpts,
 };
 
 use fancy_regex::Regex;
@@ -81,7 +81,9 @@ pub(crate) struct SpawnedProcess {
 
 struct BashServerInner {
     roots: RwLock<Vec<PathBuf>>,
+    initial_roots: Vec<PathBuf>,
     roots_initialized: AtomicBool,
+    default_root_cwd: bool,
     spawned: Mutex<HashMap<String, SpawnedProcess>>,
     log_dir: PathBuf,
     history: Arc<HistoryManager>,

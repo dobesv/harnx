@@ -1,0 +1,80 @@
+command: harnx-mcp-bridge
+description: Shell execution — lets agents run commands and scripts
+
+# Runs bridged over NATS: harnx-mcp-bridge wraps harnx-mcp-hooks-proxy, which
+# applies the GitHub/Atlassian auth-injection hook (via harnx-proxy-auth) around
+# exec/spawn, then wraps harnx-mcp-bash itself. --default-root-cwd binds the
+# sandbox to the process CWD (the user's repo), keeping the $HOME guard.
+#
+# NOTE: Many home-directory paths are already whitelisted by default and do NOT
+# need to be added here. See docs/bash-mcp-server.md for the full list, which
+# includes: ~/.gitconfig, ~/.gitignore, ~/.gitignore_global, ~/.tool-versions
+# (read), ~/.local/bin, ~/.local/lib, ~/.bun, ~/.asdf, ~/go/bin, ~/.cargo
+# (read+exec), ~/.cache, ~/go/pkg (read+write), ~/.npm, ~/.yarn, ~/.nvm,
+# ~/.cargo/bin, ~/.cargo/registry, ~/.cargo/git, ~/.mono, ~/.bun/install/cache,
+# ~/.pyenv, ~/.rye (read+write+exec).
+
+args:
+  - --name
+  - bash
+  - --
+  # Wrap bash with the hooks proxy so PreToolUse auth injection still runs on the
+  # NATS path (ToolServerConfig has no hooks: field). The proxy-auth command is
+  # passed as `sh -c <script>` so $HARNX_PACKAGE_DIR expands at runtime inside the
+  # shell (hooks-proxy single-quotes each argv token, which would otherwise block
+  # expansion). $temp_file_root stays literal — harnx-proxy-auth substitutes it
+  # from each request's vars. The hook spec ends at the literal ";".
+  - harnx-mcp-hooks-proxy
+  - --pre-tool-use
+  - claude-command-persistent
+  - --matcher
+  - exec|spawn
+  - sh
+  - -c
+  - "harnx-proxy-auth --hook 'if .host == \"github.com\" and (env.GITHUB_TOKEN // env.GH_TOKEN) != null then .headers.authorization = \"Basic \\([\"x-access-token\", (env.GITHUB_TOKEN // env.GH_TOKEN)] | join(\":\") | @base64)\" end' --hook 'if (.host == \"api.github.com\" or .host == \"uploads.github.com\" or .host == \"objects.githubusercontent.com\") and (env.GITHUB_TOKEN // env.GH_TOKEN) != null then .headers.authorization = \"Bearer \\(env.GITHUB_TOKEN // env.GH_TOKEN)\" end' --fs '{\"harnx-fs-acli/acli/.keep\": \"\"}' --env '{\"ACLI_CONFIG_DIR\": \"\\($temp_file_root)/harnx-fs-acli\"}' --hook \"$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py\""
+  - ";"
+  # End of hooks-proxy spec; the wrapped harnx-mcp-bash and its sandbox args follow.
+  - --
+  - harnx-mcp-bash
+  - --default-root-cwd
+  # Allow access to detected project root (when run in a subdirectory) and git metadata (when in a git worktree)
+  - --extra-rwx
+  - $GIT_ROOT
+  - --extra-write
+  - $GIT_COMMON_DIR
+  - --extra-rwx
+  - $NODE_PROJECT_ROOT
+  - --extra-rwx
+  - $CARGO_ROOT
+  - --extra-rwx
+  - $GO_ROOT
+  # Allow access to various config files
+  - --extra-write
+  - ~/.config/chromium
+  - --extra-read
+  - ~/.config/dcg
+  - --extra-read
+  - ~/.config/git
+  - --extra-rwx
+  - ~/.config/go
+  - --extra-read
+  - ~/.config/rtk
+  # Allow access to ruff's cache
+  - --extra-rwx
+  - ~/.ruff_cache
+  # Allow access to rustup-managed toolchains
+  - --extra-exec
+  - ~/.rustup
+  # Upgrade ~/.cache from default read+write to read+write+exec (needed by some
+  # build tools that run executables out of the cache directory)
+  - --extra-rwx
+  - ~/.cache
+  # Allow access to google chrome binaries
+  - --extra-exec
+  - /opt/google/chrome
+  # Disable interactive editor
+  - --env
+  - EDITOR=true
+  # Tell puppeteer not to use sandbox
+  - --env
+  - PUPPETEER_NO_SANDBOX=1

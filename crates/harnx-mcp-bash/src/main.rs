@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (roots, sandbox_config) = parse_args()?;
+    let (roots, sandbox_config, default_root_cwd) = parse_args()?;
 
     eprintln!(
         "harnx-mcp-bash v{}: starting ({} root{})",
@@ -39,7 +39,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let server = BashServer::new_with_sandbox(roots, sandbox_config);
+    let server =
+        BashServer::new_with_sandbox_and_default_root(roots, sandbox_config, default_root_cwd);
     let cleanup_server = server.clone();
     let transport = rmcp::transport::stdio();
     let service = server.serve(transport).await?;
@@ -101,11 +102,36 @@ fn push_root(roots: &mut Vec<PathBuf>, raw: &str) {
     }
 }
 
+fn parse_env_option(args: &[String], i: &mut usize, sandbox_config: &mut SandboxConfig) {
+    let Some(raw) = args.get(*i + 1) else {
+        eprintln!("harnx-mcp-bash: --env requires an argument");
+        std::process::exit(1);
+    };
+
+    if let Some((key, value)) = raw.split_once('=') {
+        if key.is_empty() {
+            eprintln!("harnx-mcp-bash: --env requires a non-empty variable name");
+            std::process::exit(1);
+        }
+        sandbox_config
+            .env_overrides
+            .push((key.to_string(), value.to_string()));
+    } else {
+        if raw.is_empty() {
+            eprintln!("harnx-mcp-bash: --env requires a non-empty variable name");
+            std::process::exit(1);
+        }
+        sandbox_config.extra_env_passthrough.push(raw.clone());
+    }
+    *i += 2;
+}
+
 #[cfg(unix)]
-fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
+fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig, bool)> {
     let args: Vec<String> = std::env::args().collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut roots = Vec::new();
+    let mut default_root_cwd = false;
     let mut sandbox_enabled = true;
     let mut sandbox_config = SandboxConfig {
         enabled: true,
@@ -130,6 +156,10 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
                     eprintln!("harnx-mcp-bash: --root requires a path argument");
                     std::process::exit(1);
                 }
+            }
+            "--default-root-cwd" => {
+                default_root_cwd = true;
+                i += 1;
             }
             "--no-sandbox" => {
                 sandbox_enabled = false;
@@ -191,30 +221,7 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
                     std::process::exit(1);
                 }
             }
-            "--env" | "-e" => {
-                if i + 1 < args.len() {
-                    let raw = &args[i + 1];
-                    if let Some((key, value)) = raw.split_once('=') {
-                        if key.is_empty() {
-                            eprintln!("harnx-mcp-bash: --env requires a non-empty variable name");
-                            std::process::exit(1);
-                        }
-                        sandbox_config
-                            .env_overrides
-                            .push((key.to_string(), value.to_string()));
-                    } else {
-                        if raw.is_empty() {
-                            eprintln!("harnx-mcp-bash: --env requires a non-empty variable name");
-                            std::process::exit(1);
-                        }
-                        sandbox_config.extra_env_passthrough.push(raw.clone());
-                    }
-                    i += 2;
-                } else {
-                    eprintln!("harnx-mcp-bash: --env requires an argument");
-                    std::process::exit(1);
-                }
-            }
+            "--env" | "-e" => parse_env_option(&args, &mut i, &mut sandbox_config),
             "--help" | "-h" => {
                 eprintln!("harnx-mcp-bash: MCP shell command server");
                 eprintln!();
@@ -222,6 +229,9 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  --root, -r <path>        Add an allowed root directory (repeatable)");
+                eprintln!(
+                    "  --default-root-cwd       Use canonical CWD when no roots are available"
+                );
                 eprintln!("  --no-sandbox            Disable filesystem sandboxing explicitly");
                 eprintln!("  --extra-read <path> Add sandbox read-only path (repeatable)");
                 eprintln!("  --extra-exec <path>     Add sandbox execute path (repeatable)");
@@ -294,7 +304,7 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
             resolved_sandbox_run_path.unwrap_or_else(|| PathBuf::from("harnx-sandbox-exec"));
     }
 
-    Ok((roots, sandbox_config))
+    Ok((roots, sandbox_config, default_root_cwd))
 }
 
 #[cfg(not(unix))]
@@ -309,9 +319,10 @@ fn parse_env_passthrough() -> Vec<String> {
 }
 
 #[cfg(not(unix))]
-fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
+fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig, bool)> {
     let args: Vec<String> = std::env::args().collect();
     let mut roots = Vec::new();
+    let mut default_root_cwd = false;
     let mut sandbox_config = SandboxConfig {
         // Sandbox itself is Unix-only; on Windows these fields are unused.
         enabled: false,
@@ -368,6 +379,10 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
                     std::process::exit(1);
                 }
             }
+            "--default-root-cwd" => {
+                default_root_cwd = true;
+                i += 1;
+            }
             "--no-sandbox" => {
                 i += 1;
             }
@@ -379,30 +394,7 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
                     std::process::exit(1);
                 }
             }
-            "--env" | "-e" => {
-                if i + 1 < args.len() {
-                    let raw = &args[i + 1];
-                    if let Some((key, value)) = raw.split_once('=') {
-                        if key.is_empty() {
-                            eprintln!("harnx-mcp-bash: --env requires a non-empty variable name");
-                            std::process::exit(1);
-                        }
-                        sandbox_config
-                            .env_overrides
-                            .push((key.to_string(), value.to_string()));
-                    } else {
-                        if raw.is_empty() {
-                            eprintln!("harnx-mcp-bash: --env requires a non-empty variable name");
-                            std::process::exit(1);
-                        }
-                        sandbox_config.extra_env_passthrough.push(raw.clone());
-                    }
-                    i += 2;
-                } else {
-                    eprintln!("harnx-mcp-bash: --env requires an argument");
-                    std::process::exit(1);
-                }
-            }
+            "--env" | "-e" => parse_env_option(&args, &mut i, &mut sandbox_config),
             "--help" | "-h" => {
                 eprintln!("harnx-mcp-bash: MCP shell command server");
                 eprintln!();
@@ -410,6 +402,9 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  --root, -r <path>       Add an allowed root directory (repeatable)");
+                eprintln!(
+                    "  --default-root-cwd      Use canonical CWD when no roots are available"
+                );
                 eprintln!("  --extra-read <path> Accept sandbox read-only path flag (ignored on this platform)");
                 eprintln!("  --extra-exec <path>     Accept sandbox execute path flag (ignored on this platform)");
                 eprintln!("  --extra-write <path>    Accept sandbox writable path flag (ignored on this platform)");
@@ -438,7 +433,7 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
         }
     }
 
-    Ok((roots, sandbox_config))
+    Ok((roots, sandbox_config, default_root_cwd))
 }
 
 #[cfg(test)]

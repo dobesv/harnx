@@ -7,9 +7,10 @@
 //! dynamically updated when the client sends roots/list_changed notifications.
 //!
 //! Usage:
-//!   harnx-mcp-fs [--root <path>]...
+//!   harnx-mcp-fs [--root <path>]... [--default-root-cwd]
 //!
-//! If no roots are specified (via CLI or MCP client), all operations are denied.
+//! If no roots are specified (via CLI or MCP client), all operations are denied
+//! unless `--default-root-cwd` can safely seed the process CWD.
 
 mod server;
 mod summary;
@@ -20,7 +21,7 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let roots = parse_args();
+    let (roots, default_root_cwd) = parse_args();
 
     eprintln!(
         "harnx-mcp-fs v{}: starting ({} root{})",
@@ -36,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("  root: {}", root.display());
     }
 
-    let server = FsServer::new(roots);
+    let server = FsServer::new(roots, default_root_cwd);
     let transport = rmcp::transport::stdio();
     let service = server.serve(transport).await?;
     service.waiting().await?;
@@ -44,10 +45,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Parse CLI arguments. Supports `--root <path>` (repeatable) and `--help`.
-fn parse_args() -> Vec<PathBuf> {
+/// Parse CLI arguments.
+fn parse_args() -> (Vec<PathBuf>, bool) {
     let args: Vec<String> = std::env::args().collect();
     let mut roots = Vec::new();
+    let mut default_root_cwd = false;
     let mut i = 1;
 
     while i < args.len() {
@@ -75,14 +77,19 @@ fn parse_args() -> Vec<PathBuf> {
                     std::process::exit(1);
                 }
             }
+            "--default-root-cwd" => {
+                default_root_cwd = true;
+                i += 1;
+            }
             "--help" | "-h" => {
                 eprintln!("harnx-mcp-fs: High-performance MCP filesystem server");
                 eprintln!();
                 eprintln!("Usage: harnx-mcp-fs [OPTIONS]");
                 eprintln!();
                 eprintln!("Options:");
-                eprintln!("  --root, -r <path>  Add an allowed root directory (repeatable)");
-                eprintln!("  --help, -h         Show this help message");
+                eprintln!("  --root, -r <path>   Add an allowed root directory (repeatable)");
+                eprintln!("  --default-root-cwd  Use CWD when no other roots are available");
+                eprintln!("  --help, -h          Show this help message");
                 eprintln!();
                 eprintln!("The server communicates via stdio using the MCP protocol.");
                 eprintln!("If no roots are specified, operations are denied until the client provides roots.");
@@ -97,5 +104,5 @@ fn parse_args() -> Vec<PathBuf> {
         }
     }
 
-    roots
+    (roots, default_root_cwd)
 }

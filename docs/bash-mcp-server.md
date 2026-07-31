@@ -38,9 +38,13 @@ You can add extra environment variables to the child process in three ways. Thes
 Use the `-e` or `--env` flags in your MCP server configuration. This is useful for passing specific variables or setting explicit values.
 
 ```yaml
-# mcp_servers/bash.yaml
-command: harnx-mcp-bash
+# tool_servers/bash.yaml
+command: harnx-mcp-bridge
 args:
+  - --name
+  - bash
+  - --
+  - harnx-mcp-bash
   - -e
   - GITHUB_TOKEN              # Pass through from host env
   - -e
@@ -52,7 +56,7 @@ args:
 Use `HARNX_BASH_ENV_PASSTHROUGH` to specify a comma-separated list of host environment variable names to pass through.
 
 ```yaml
-# mcp_servers/bash.yaml
+# tool_servers/bash.yaml
 env:
   HARNX_BASH_ENV_PASSTHROUGH: GITHUB_TOKEN,SSH_AUTH_SOCK
 ```
@@ -139,7 +143,7 @@ You can grant additional filesystem access using CLI flags or environment variab
 Use the `--no-sandbox` flag to disable filesystem restrictions entirely.
 
 ```yaml
-# mcp_servers/bash.yaml
+# tool_servers/bash.yaml
 args:
   - --no-sandbox
 ```

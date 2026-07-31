@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
+use harnx_hooks::executor::HARNX_PACKAGE_DIR_ENV;
 use process_wrap::tokio::{CommandWrap, KillOnDrop, ProcessGroup};
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
@@ -262,6 +263,80 @@ async fn post_tool_use_mutation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn inherited_package_dir_reaches_persistent_hook_process() {
+    let Some(proxy_bin) = proxy_binary_path() else {
+        eprintln!(
+            "SKIP inherited_package_dir_reaches_persistent_hook_process: harnx-mcp-hooks-proxy binary not found; build package first"
+        );
+        return;
+    };
+    let Some(bash_bin) = mcp_bash_binary_path() else {
+        eprintln!(
+            "SKIP inherited_package_dir_reaches_persistent_hook_process: harnx-mcp-bash binary not found; build package first"
+        );
+        return;
+    };
+
+    let repo_root = repo_root();
+    let temp_dir = TempDir::new().expect("temp dir");
+    let package_dir = temp_dir.path().join("package");
+    std::fs::create_dir(&package_dir).expect("create package dir");
+    let marker_path = temp_dir.path().join("observed-package-dir.txt");
+    let script_path = temp_dir.path().join("package-dir-hook.sh");
+    std::fs::write(
+        &script_path,
+        format!(
+            r#"#!/bin/sh
+printf '%s' "$HARNX_PACKAGE_DIR" > '{}'
+while IFS= read -r line; do
+  id=${{line#*\"id\":\"}}; id=${{id%%\"*}}
+  printf '{{"id":"%s"}}\n' "$id"
+done
+"#,
+            marker_path.to_string_lossy()
+        ),
+    )
+    .expect("write package-dir hook script");
+    chmod_script(&script_path);
+
+    let script_path_str = script_path.to_str().expect("utf-8 script path");
+    let service = spawn_proxy_with_package_dir(ProxySpawnParams {
+        proxy_bin: &proxy_bin,
+        bash_bin: &bash_bin,
+        repo_root: &repo_root,
+        hook_args: &[&[
+            "--pre-tool-use",
+            "claude-command-persistent",
+            "--matcher",
+            "exec",
+            script_path_str,
+            ";",
+        ]],
+        package_dir: Some(&package_dir),
+    })
+    .await
+    .expect("spawn proxy with inherited package dir");
+
+    service
+        .peer()
+        .call_tool(
+            CallToolRequestParams::new("exec").with_arguments(
+                json!({ "command": "printf package-dir-smoke" })
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("persistent hook and child command succeed");
+
+    let observed = tokio::fs::read_to_string(&marker_path)
+        .await
+        .expect("hook wrote package-dir marker");
+    assert_eq!(observed, package_dir.to_string_lossy());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn post_tool_use_failure() {
     let Some(proxy_bin) = proxy_binary_path() else {
         eprintln!("SKIP post_tool_use_failure: harnx-mcp-hooks-proxy binary not found; build package first");
@@ -336,7 +411,38 @@ async fn spawn_proxy(
     repo_root: &Path,
     hook_args: &[&[&str]],
 ) -> anyhow::Result<rmcp::service::RunningService<RoleClient, TestClientHandler>> {
+    spawn_proxy_with_package_dir(ProxySpawnParams {
+        proxy_bin,
+        bash_bin,
+        repo_root,
+        hook_args,
+        package_dir: None,
+    })
+    .await
+}
+
+struct ProxySpawnParams<'a> {
+    proxy_bin: &'a Path,
+    bash_bin: &'a Path,
+    repo_root: &'a Path,
+    hook_args: &'a [&'a [&'a str]],
+    package_dir: Option<&'a Path>,
+}
+
+async fn spawn_proxy_with_package_dir(
+    params: ProxySpawnParams<'_>,
+) -> anyhow::Result<rmcp::service::RunningService<RoleClient, TestClientHandler>> {
+    let ProxySpawnParams {
+        proxy_bin,
+        bash_bin,
+        repo_root,
+        hook_args,
+        package_dir,
+    } = params;
     let mut command = tokio::process::Command::new(proxy_bin);
+    if let Some(package_dir) = package_dir {
+        command.env(HARNX_PACKAGE_DIR_ENV, package_dir);
+    }
     for hook_group in hook_args {
         for token in *hook_group {
             command.arg(token);

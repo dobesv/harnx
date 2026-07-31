@@ -58,6 +58,14 @@ impl BashServer {
     }
 
     pub fn new_with_sandbox(initial_roots: Vec<PathBuf>, sandbox_config: SandboxConfig) -> Self {
+        Self::new_with_sandbox_and_default_root(initial_roots, sandbox_config, false)
+    }
+
+    pub fn new_with_sandbox_and_default_root(
+        initial_roots: Vec<PathBuf>,
+        sandbox_config: SandboxConfig,
+        default_root_cwd: bool,
+    ) -> Self {
         let log_dir = std::env::temp_dir().join(format!(
             "harnx-bash-{}-{}",
             std::process::id(),
@@ -66,7 +74,9 @@ impl BashServer {
         Self {
             inner: Arc::new(BashServerInner {
                 roots: RwLock::new(initial_roots.clone()),
+                initial_roots: initial_roots.clone(),
                 roots_initialized: AtomicBool::new(false),
+                default_root_cwd,
                 spawned: Mutex::new(HashMap::new()),
                 log_dir,
                 history: Arc::new(HistoryManager::new(&initial_roots)),
@@ -81,8 +91,8 @@ impl BashServer {
     ) -> Result<(), ErrorData> {
         if !peer_supports_roots(peer) {
             // The client never advertised the `roots` capability, so it can't
-            // answer a `roots/list` request. Keep the CLI-provided roots and
-            // mark initialization done so we don't keep retrying.
+            // answer a `roots/list` request. Keep the CLI-provided roots.
+            self.apply_default_root_cwd_if_empty().await;
             self.inner.roots_initialized.store(true, Ordering::SeqCst);
             return Ok(());
         }
@@ -91,16 +101,38 @@ impl BashServer {
             ErrorData::internal_error(format!("failed to fetch roots from peer: {err}"), None)
         })?;
 
-        let roots = result
+        let peer_roots = result
             .roots
             .into_iter()
             .filter_map(|root| file_uri_to_path(root.uri.as_ref()))
             .collect::<Vec<_>>();
 
-        let mut guard = self.inner.roots.write().await;
-        *guard = roots;
+        {
+            let mut roots = self.inner.roots.write().await;
+            *roots = if peer_roots.is_empty() {
+                self.inner.initial_roots.clone()
+            } else {
+                peer_roots
+            };
+        }
+        self.apply_default_root_cwd_if_empty().await;
         self.inner.roots_initialized.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    pub(crate) async fn apply_default_root_cwd_if_empty(&self) {
+        let mut roots = self.inner.roots.write().await;
+        if !roots.is_empty() || !self.inner.default_root_cwd {
+            return;
+        }
+
+        match default_root_from_cwd() {
+            Some(root) => roots.push(root),
+            None => eprintln!(
+                "harnx-mcp-bash: --default-root-cwd: refusing to seed root from CWD \
+                 (HOME guard or path resolution failed) — filesystem/exec access denied"
+            ),
+        }
     }
 
     pub(crate) async fn ensure_roots_initialized(

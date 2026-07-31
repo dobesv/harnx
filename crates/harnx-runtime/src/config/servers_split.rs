@@ -1,6 +1,8 @@
 //! MCP/ACP server management extracted from config/mod.rs for code health.
 use super::*;
 use harnx_core::package_namespace::qualify_agent_name;
+#[cfg(unix)]
+use harnx_mcp::safety::path_is_home_or_ancestor;
 use std::env;
 
 fn normalize_package_acp_server_args(server: &mut AcpServerConfig, pkg_name: &str) {

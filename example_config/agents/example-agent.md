@@ -6,12 +6,13 @@ model: openai:gpt-4o             # Specify the LLM to use
 temperature: null                # Set default temperature parameter, range (0, 1)
 top_p: null                      # Set default top-p parameter
 use_tools:                       # Which MCP tools to allow
-  - Bash
-  - Glob
-  - Grep
-  - ListDirectory
-  - Read
-  - Write
+  - bash_exec
+  - fs_read
+  - fs_write
+  - fs_edit
+  - fs_ls
+  - fs_grep
+  - fs_find
   - harnx_agent_session_history_read
 description: ""                  # Short description of the agent
 version: ""                      # Agent version string
