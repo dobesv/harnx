@@ -88,7 +88,7 @@ where
     serve_with_client(Arc::new(toolset), instance_id, client).await
 }
 
-async fn serve_with_client(
+pub async fn serve_with_client(
     toolset: Arc<dyn Toolset>,
     instance_id: InstanceId,
     client: async_nats::Client,

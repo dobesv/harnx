@@ -65,6 +65,7 @@ terminal-colorsaurus = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 uuid = { workspace = true }

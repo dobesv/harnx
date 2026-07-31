@@ -100,23 +100,26 @@ async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
 }
 
 struct TestEnvGuard {
+    key: String,
     prev: Option<std::ffi::OsString>,
 }
 
 impl TestEnvGuard {
-    fn new(key: &str, value: &Path) -> Self {
+    fn new(key: &str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let prev = std::env::var_os(key);
         unsafe { std::env::set_var(key, value) };
-        let _ = key;
-        Self { prev }
+        Self {
+            key: key.to_string(),
+            prev,
+        }
     }
 }
 
 impl Drop for TestEnvGuard {
     fn drop(&mut self) {
         match &self.prev {
-            Some(value) => unsafe { std::env::set_var("HARNX_CONFIG_DIR", value) },
-            None => unsafe { std::env::remove_var("HARNX_CONFIG_DIR") },
+            Some(value) => unsafe { std::env::set_var(&self.key, value) },
+            None => unsafe { std::env::remove_var(&self.key) },
         }
     }
 }
@@ -349,7 +352,9 @@ fn spawn_metis_worker_with_call_fn_and_daemon(
     call_fn: crate::agent_loop::AgentCallFn,
     daemon: crate::nats_worker::WorkerDaemonConfig,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-    let worker_agent = AgentConfig::from_markdown("metis", "stub worker prompt").unwrap();
+    let worker_agent =
+        AgentConfig::from_markdown("metis", "---\nuse_tools: \"*\"\n---\nstub worker prompt")
+            .unwrap();
     let worker_config = Config {
         data: harnx_core::config_data::ConfigData {
             model_id: "test:test-model".to_string(),
@@ -1474,6 +1479,150 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
         TurnStatus::InFlightCancelled,
         "durable log should reconstruct to InFlightCancelled after remote cancel when no assistant message follows cancel; cancel fence={cancel_fence_token:?}, assistant fence={first_assistant_fence_token:?}, entries={final_entries:#?}"
     );
+
+    daemon.abort();
+    let _ = daemon.await;
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nested_subagent_prompt_returns_final_message_over_nats() {
+    const CHILD_PROMPT: &str = "complete the delegated child work";
+    const CHILD_FINAL: &str = "child final message over nats";
+    const PARENT_FINAL: &str = "parent received child result";
+
+    let _env_guard = env_lock().await;
+    let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
+        return;
+    };
+    let seeded = seed_remote_config(&url);
+    let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
+    let _nats_url = TestEnvGuard::new("HARNX_NATS_URL", &url);
+    let _nats_token = TestEnvGuard::new("HARNX_NATS_TOKEN", "test-token");
+    let parent_session_id = crate::nats_worker::new_remote_session_id();
+    let call_fn: crate::agent_loop::AgentCallFn = Arc::new(move |input, _config, _abort| {
+        let has_tool_result = input.tool_calls.is_some();
+        let prompt = input.text();
+        Box::pin(async move {
+            if has_tool_result {
+                return Ok((
+                    PARENT_FINAL.to_string(),
+                    None,
+                    vec![],
+                    crate::client::CompletionTokenUsage::default(),
+                ));
+            }
+            if prompt == CHILD_PROMPT {
+                return Ok((
+                    CHILD_FINAL.to_string(),
+                    None,
+                    vec![],
+                    crate::client::CompletionTokenUsage::default(),
+                ));
+            }
+            Ok((
+                "delegating to child".to_string(),
+                None,
+                vec![ToolCall::new(
+                    "metis_session_prompt".to_string(),
+                    json!({ "message": CHILD_PROMPT }),
+                    Some("nested-subagent-call".to_string()),
+                    None,
+                )],
+                crate::client::CompletionTokenUsage::default(),
+            ))
+        })
+    });
+    let daemon = spawn_metis_worker_with_call_fn(&url, call_fn);
+
+    let client = async_nats::connect(&url)
+        .await
+        .expect("connect event observer to test nats");
+    let mut child_events = client
+        .subscribe("sessions.*.events")
+        .await
+        .expect("subscribe to session events");
+    client.flush().await.expect("flush event subscription");
+    let thin = ThinClientSession::new(
+        crate::ThinClientConfig {
+            cluster: "local".to_string(),
+            agent: "metis".to_string(),
+            session_id: Some(parent_session_id.clone()),
+        },
+        client.clone(),
+        async_nats::jetstream::new(client.clone()),
+        harnx_core::abort::create_abort_signal(),
+    )
+    .await
+    .expect("create parent thin-client session");
+    let parent_result = tokio::time::timeout(
+        Duration::from_secs(15),
+        thin.run_turn(
+            "delegate this request through the nested tool",
+            Arc::new(NoopEventSink),
+            None,
+        ),
+    )
+    .await
+    .expect("nested parent turn timed out")
+    .expect("nested parent turn failed");
+    assert_eq!(parent_result.response.as_deref(), Some(PARENT_FINAL));
+
+    let parent_log = NatsSessionLog::new(
+        async_nats::jetstream::new(client.clone()),
+        parent_session_id.clone(),
+    );
+    let parent_entries = parent_log
+        .load_events_async()
+        .await
+        .expect("load parent session log");
+    let tool_output = parent_entries.iter().find_map(|(_, entry)| match entry {
+        SessionLogEntry::ToolResults { results, .. } => results
+            .iter()
+            .find(|result| result.name == "metis_session_prompt")
+            .map(|result| result.output.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        tool_output,
+        Some(json!({ "response": CHILD_FINAL })),
+        "nested tool result must contain the sub-agent's exact final message"
+    );
+
+    let child_session_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = child_events
+                .next()
+                .await
+                .expect("session event subscription closed");
+            let subject = event.subject.as_str();
+            let session_id = subject
+                .strip_prefix("sessions.")
+                .and_then(|value| value.strip_suffix(".events"))
+                .expect("session event subject shape");
+            if session_id != parent_session_id {
+                break session_id.to_string();
+            }
+        }
+    })
+    .await
+    .expect("no child session event was visible on sessions.{child_id}.events");
+    let child_stream_name = crate::nats_session_log::stream_name_for_session(&child_session_id);
+    let jetstream = async_nats::jetstream::new(client);
+    jetstream
+        .get_stream(&child_stream_name)
+        .await
+        .expect("child SESSION_<id> JetStream log must exist");
+    let child_entries = NatsSessionLog::new(jetstream, child_session_id)
+        .load_events_async()
+        .await
+        .expect("load child session log");
+    assert!(child_entries.iter().any(|(_, entry)| matches!(
+        entry,
+        SessionLogEntry::Message { role, content, .. }
+            if role.is_assistant() && content.to_text() == CHILD_FINAL
+    )));
 
     daemon.abort();
     let _ = daemon.await;
