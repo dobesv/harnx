@@ -16,6 +16,57 @@ use std::path::Path;
 use tokio::io::duplex;
 use uuid::Uuid;
 
+#[cfg(unix)]
+async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    use std::sync::OnceLock;
+
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
+#[cfg(unix)]
+struct HomeGuard(Option<std::ffi::OsString>);
+
+#[cfg(unix)]
+impl HomeGuard {
+    fn set(path: &Path) -> Self {
+        let previous = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", path) };
+        Self(previous)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+}
+
+#[cfg(unix)]
+struct CwdGuard(PathBuf);
+
+#[cfg(unix)]
+impl CwdGuard {
+    fn set(path: &Path) -> Self {
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(path).unwrap();
+        Self(previous)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.0).unwrap();
+    }
+}
+
 struct TestDir {
     path: PathBuf,
 }
@@ -98,7 +149,7 @@ fn text_content(result: &CallToolResult) -> String {
 }
 
 fn make_server(dir: &Path) -> FsServer {
-    FsServer::new(vec![dir.to_path_buf()])
+    FsServer::new(vec![dir.to_path_buf()], false)
 }
 
 fn write_fixture(dir: &TestDir, name: &str, contents: impl AsRef<[u8]>) -> PathBuf {
@@ -440,7 +491,7 @@ async fn edit_file_emits_diff_when_roots_only_set_via_protocol() {
     }
 
     // Mimic the production launch: empty initial_roots.
-    let server = FsServer::new(vec![]);
+    let server = FsServer::new(vec![], false);
     // Mimic `refresh_roots` populating roots after the MCP handshake.
     *server.roots.write().await = vec![dir.to_path_buf()];
 
@@ -498,7 +549,7 @@ impl ClientHandler for NoRootsClientHandler {
 async fn does_not_request_roots_when_client_lacks_capability() {
     let temp_dir = TestDir::new();
     let initial_root = temp_dir.path().to_path_buf();
-    let server = FsServer::new(vec![initial_root.clone()]);
+    let server = FsServer::new(vec![initial_root.clone()], false);
     let server_clone = server.clone();
 
     let (client_transport, server_transport) = duplex(65_536);
@@ -537,6 +588,109 @@ async fn does_not_request_roots_when_client_lacks_capability() {
     );
 }
 
+async fn initialize_without_roots_capability(server: FsServer) -> FsServer {
+    let server_clone = server.clone();
+    let (client_transport, server_transport) = duplex(65_536);
+    let client_handler = NoRootsClientHandler {
+        list_roots_called: Arc::new(AtomicBool::new(false)),
+    };
+    let (server_res, client_res) = tokio::join!(
+        serve_server(server, server_transport),
+        serve_client(client_handler, client_transport)
+    );
+    let server_service = server_res.unwrap();
+    let client_service = client_res.unwrap();
+    let server_peer = server_service.peer().clone();
+    let _client_task = tokio::spawn(async move {
+        let _ = client_service.waiting().await;
+    });
+
+    server_clone
+        .ensure_roots_initialized(&server_peer)
+        .await
+        .expect("initialization succeeds without roots support");
+    server_clone
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn default_root_cwd_seeds_bridged_startup_without_roots_capability() {
+    let _lock = env_lock().await;
+    let base = TestDir::new();
+    let cwd = base.path().join("repo");
+    let home = base.path().join("home");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let _home = HomeGuard::set(&home);
+    let _cwd = CwdGuard::set(&cwd);
+    let expected = cwd.canonicalize().unwrap();
+
+    let server = initialize_without_roots_capability(FsServer::new(vec![], true)).await;
+
+    assert_eq!(*server.roots.read().await, vec![expected]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn default_root_cwd_seeds_when_peer_returns_empty_roots() {
+    let _lock = env_lock().await;
+    let base = TestDir::new();
+    let cwd = base.path().join("repo");
+    let home = base.path().join("home");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let _home = HomeGuard::set(&home);
+    let _cwd = CwdGuard::set(&cwd);
+    let expected = cwd.canonicalize().unwrap();
+    let server = FsServer::new(vec![], true);
+    let server_clone = server.clone();
+    let connection = connect_server(server, vec![]).await;
+    let server_peer = connection._server_service.peer().clone();
+
+    server_clone
+        .ensure_roots_initialized(&server_peer)
+        .await
+        .expect("initialization succeeds with empty peer roots");
+
+    assert_eq!(*server_clone.roots.read().await, vec![expected]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn default_root_cwd_refuses_home_and_leaves_roots_empty() {
+    let _lock = env_lock().await;
+    let home = TestDir::new();
+    let _home = HomeGuard::set(home.path());
+    let _cwd = CwdGuard::set(home.path());
+
+    let server = initialize_without_roots_capability(FsServer::new(vec![], true)).await;
+
+    assert!(server.roots.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn empty_roots_remain_empty_without_default_root_cwd() {
+    let server = initialize_without_roots_capability(FsServer::new(vec![], false)).await;
+
+    assert!(server.roots.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn explicit_root_takes_precedence_over_default_root_cwd() {
+    let root = TestDir::new();
+    let expected = root.path().to_path_buf();
+    let server = FsServer::new(vec![expected.clone()], true);
+    let server_clone = server.clone();
+    let connection = connect_server(server, vec![]).await;
+    let server_peer = connection._server_service.peer().clone();
+
+    server_clone
+        .ensure_roots_initialized(&server_peer)
+        .await
+        .expect("initialization succeeds with an explicit root");
+
+    assert_eq!(*server_clone.roots.read().await, vec![expected]);
+}
 #[tokio::test]
 async fn test_read_file_with_offset_limit() {
     let temp_dir = TestDir::new();
@@ -755,7 +909,7 @@ async fn test_edit_file_unique_match() {
     let temp_dir = TestDir::new();
     let file_path = temp_dir.path().join("unique.txt");
     std::fs::write(&file_path, "alpha\nbeta\n").unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .edit_file_impl(EditFileParams {
@@ -779,7 +933,7 @@ async fn test_edit_file_multiple_matches() {
     let temp_dir = TestDir::new();
     let file_path = temp_dir.path().join("multiple.txt");
     std::fs::write(&file_path, "value\nvalue\n").unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .edit_file_impl(EditFileParams {
@@ -801,7 +955,7 @@ async fn test_list_directory_flat() {
     std::fs::create_dir_all(temp_dir.path().join("nested")).unwrap();
     std::fs::write(temp_dir.path().join("root.txt"), "root").unwrap();
     std::fs::write(temp_dir.path().join("nested").join("child.txt"), "child").unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .list_directory_impl(ListDirectoryParams {
@@ -822,7 +976,7 @@ async fn test_search_files_basic() {
     let temp_dir = TestDir::new();
     std::fs::write(temp_dir.path().join("one.txt"), "alpha\nneedle\nomega\n").unwrap();
     std::fs::write(temp_dir.path().join("two.txt"), "nothing here\n").unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .search_files_impl(SearchFilesParams {
@@ -850,7 +1004,7 @@ async fn test_read_file_summary_limited_on_pagination() {
     let temp_dir = TestDir::new();
     let file_path = temp_dir.path().join("paginated.txt");
     std::fs::write(&file_path, "one\ntwo\nthree\nfour\n").unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .read_file_impl(ReadFileParams {
@@ -879,7 +1033,7 @@ async fn test_list_directory_summary_not_limited_when_small() {
     for i in 0..3 {
         std::fs::write(temp_dir.path().join(format!("f{i}.txt")), "x").unwrap();
     }
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .list_directory_impl(ListDirectoryParams {
@@ -908,7 +1062,7 @@ async fn test_list_directory_summary_limited_when_over_default_limit() {
     for i in 0..=DEFAULT_LS_LIMIT {
         std::fs::write(temp_dir.path().join(format!("f{i:04}.txt")), "x").unwrap();
     }
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .list_directory_impl(ListDirectoryParams {
@@ -974,7 +1128,7 @@ async fn test_search_files_summary_variants() {
         for (name, content) in case.files {
             std::fs::write(temp_dir.path().join(name), content).unwrap();
         }
-        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
         let result = server
             .search_files_impl(SearchFilesParams {
@@ -998,7 +1152,7 @@ async fn test_find_files_basic() {
     // the glob crate expects Unix separators on all platforms.
     let temp_dir = TestDir::new();
     std::fs::write(temp_dir.path().join("hello.txt"), "").unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .find_files_impl(FindFilesParams {
@@ -1056,7 +1210,7 @@ async fn test_find_files_summary_variants() {
         for name in case.files {
             std::fs::write(temp_dir.path().join(name), "").unwrap();
         }
-        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
         let result = server
             .find_files_impl(FindFilesParams {
@@ -1082,7 +1236,7 @@ gamma
 ",
     )
     .unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .insert_impl(InsertParams {
@@ -1117,7 +1271,7 @@ beta
 ",
     )
     .unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .insert_impl(InsertParams {
@@ -1147,7 +1301,7 @@ async fn test_insert_append_omit_line() {
     let temp_dir = TestDir::new();
     let file_path = temp_dir.path().join("append_omit.txt");
     std::fs::write(&file_path, "alpha\nbeta\n").unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .insert_impl(InsertParams {
@@ -1173,7 +1327,7 @@ async fn test_insert_append_omit_line_ignores_column() {
     let temp_dir = TestDir::new();
     let file_path = temp_dir.path().join("append_col.txt");
     std::fs::write(&file_path, "alpha\nbeta\n").unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .insert_impl(InsertParams {
@@ -1205,7 +1359,7 @@ four
 ",
     )
     .unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .insert_impl(InsertParams {
@@ -1242,7 +1396,7 @@ xyz
 ",
     )
     .unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .insert_impl(InsertParams {
@@ -1272,7 +1426,7 @@ async fn test_insert_column_utf8_boundary() {
 ",
     )
     .unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let ok_result = server
         .insert_impl(InsertParams {
@@ -1322,7 +1476,7 @@ beta
 ",
     )
     .unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .insert_impl(InsertParams {
@@ -1348,7 +1502,7 @@ async fn test_insert_column_out_of_range() {
         "abcd
 ",
     );
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .insert_impl(InsertParams {
@@ -1372,7 +1526,7 @@ async fn test_re_replace_basic() {
         "foo123
 ",
     );
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .re_replace_impl(ReReplaceParams {
@@ -1401,7 +1555,7 @@ async fn test_re_replace_all() {
         "foo1 foo2 foo3
 ",
     );
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .re_replace_impl(ReReplaceParams {
@@ -1431,7 +1585,7 @@ async fn test_re_replace_no_match() {
 beta
 ",
     );
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .re_replace_impl(ReReplaceParams {
@@ -1456,7 +1610,7 @@ async fn test_re_replace_multiple_no_flag() {
         "foo1 foo2
 ",
     );
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let result = server
         .re_replace_impl(ReReplaceParams {
@@ -1481,7 +1635,7 @@ async fn test_re_replace_invalid_pattern() {
         "foo1
 ",
     );
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let err = server
         .re_replace_impl(ReReplaceParams {
@@ -1500,7 +1654,7 @@ async fn test_re_replace_invalid_pattern() {
 async fn test_insert_impl_serializes_concurrent_same_file_updates() {
     let temp_dir = TestDir::new();
     let file_path = write_fixture(&temp_dir, "concurrent_insert.txt", "start\n");
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
 
     let task_count = 32usize;
     let mut tasks = tokio::task::JoinSet::new();
@@ -1548,7 +1702,7 @@ async fn test_repo_lock_for_paths_in_same_repo_share_lock() {
     std::fs::create_dir_all(&nested_dir).unwrap();
     let file_b = repo_root.join("nested/b.txt");
     std::fs::write(&file_b, "b\n").unwrap();
-    let server = FsServer::new(vec![repo_root.clone()]);
+    let server = FsServer::new(vec![repo_root.clone()], false);
 
     let repo_guard = server.repo_write_guard_for_path(&file_a).await;
     let same_repo_try = tokio::time::timeout(
@@ -1582,7 +1736,7 @@ async fn test_rollback_excludes_concurrent_edits_in_same_repo() {
 
     let tracked_path = repo_root.join("tracked.txt");
     std::fs::write(&tracked_path, "tracked-v1\n").unwrap();
-    let server = FsServer::new(vec![repo_root.clone()]);
+    let server = FsServer::new(vec![repo_root.clone()], false);
 
     let tracked_before = server
         .snapshot_before(&tracked_path, "before tracked change")

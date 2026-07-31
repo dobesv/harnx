@@ -11,6 +11,32 @@ pub const DEFAULT_LS_LIMIT: usize = 500;
 pub const LS_SCAN_HARD_LIMIT: usize = 20_000;
 pub const SEARCH_FILE_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
+/// Returns `true` if `path` equals `$HOME` or is an ancestor of `$HOME`.
+///
+/// Returns `false` when `$HOME` is unset.
+pub fn path_is_home_or_ancestor(path: &Path) -> bool {
+    let home_os = match std::env::var_os("HOME") {
+        Some(home) => home,
+        None => return false,
+    };
+    let home = std::fs::canonicalize(&home_os).unwrap_or_else(|_| PathBuf::from(&home_os));
+    let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    home.starts_with(&candidate)
+}
+
+/// Returns the canonical process CWD when it is safe to use as a default root.
+///
+/// Missing `$HOME`, an unavailable CWD, canonicalization failure, and a CWD
+/// equal to or above `$HOME` all deny the default.
+pub fn default_root_from_cwd() -> Option<PathBuf> {
+    std::env::var_os("HOME")?;
+    let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+    if path_is_home_or_ancestor(&cwd) {
+        return None;
+    }
+    Some(cwd)
+}
+
 pub fn path_to_file_uri(path: &Path) -> String {
     let s = path.to_string_lossy();
     let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
@@ -513,6 +539,152 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    struct HomeGuard(Option<std::ffi::OsString>);
+
+    impl HomeGuard {
+        fn set(value: Option<&Path>) -> Self {
+            let previous = std::env::var_os("HOME");
+            match value {
+                Some(path) => unsafe { std::env::set_var("HOME", path) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => unsafe { std::env::set_var("HOME", value) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+        }
+    }
+
+    struct CwdGuard(PathBuf);
+
+    impl CwdGuard {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self(previous)
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).unwrap();
+        }
+    }
+
+    fn with_default_root_environment(
+        setup: impl FnOnce(&Path) -> (Option<PathBuf>, PathBuf),
+        test: impl FnOnce(&Path),
+    ) {
+        let _lock = env_lock();
+        let temp = TestDir::new();
+        let (home, cwd) = setup(&temp.path);
+        let _home = HomeGuard::set(home.as_deref());
+        let _cwd = CwdGuard::set(&cwd);
+        test(&temp.path);
+    }
+
+    /// Create each named subdirectory under `base` and return their paths, so
+    /// tests don't repeat the `join` + `create_dir_all` scaffolding.
+    fn make_dirs<const N: usize>(base: &Path, names: [&str; N]) -> [PathBuf; N] {
+        names.map(|name| {
+            let path = base.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        })
+    }
+
+    #[test]
+    fn default_root_uses_canonical_repo_cwd() {
+        with_default_root_environment(
+            |temp| {
+                let [repo, home] = make_dirs(temp, ["repo", "home"]);
+                (Some(home), repo)
+            },
+            |temp| {
+                assert_eq!(
+                    default_root_from_cwd(),
+                    Some(temp.join("repo").canonicalize().unwrap())
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn default_root_denies_home_cwd() {
+        with_default_root_environment(
+            |temp| (Some(temp.to_path_buf()), temp.to_path_buf()),
+            |_| assert_eq!(default_root_from_cwd(), None),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_root_canonicalizes_symlinked_cwd() {
+        use std::os::unix::fs::symlink;
+
+        with_default_root_environment(
+            |temp| {
+                let [target, home] = make_dirs(temp, ["target", "home"]);
+                let link = temp.join("link");
+                symlink(&target, &link).unwrap();
+                (Some(home), link)
+            },
+            |temp| {
+                assert_eq!(
+                    default_root_from_cwd(),
+                    Some(temp.join("target").canonicalize().unwrap())
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn default_root_denies_when_home_is_unset() {
+        with_default_root_environment(
+            |temp| (None, temp.to_path_buf()),
+            |_| assert_eq!(default_root_from_cwd(), None),
+        );
+    }
+
+    #[test]
+    fn default_root_denies_home_ancestor_cwd() {
+        with_default_root_environment(
+            |temp| {
+                let [home] = make_dirs(temp, ["user"]);
+                (Some(home), temp.to_path_buf())
+            },
+            |_| assert_eq!(default_root_from_cwd(), None),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_root_denies_unresolvable_cwd() {
+        with_default_root_environment(
+            |temp| {
+                let [removed_cwd, home] = make_dirs(temp, ["removed", "home"]);
+                (Some(home), removed_cwd)
+            },
+            |temp| {
+                std::fs::remove_dir(temp.join("removed")).unwrap();
+                assert_eq!(default_root_from_cwd(), None);
+            },
+        );
     }
 
     #[test]

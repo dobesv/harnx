@@ -28,7 +28,9 @@ Harnx organizes configuration into the following structure:
 ├── clients/             # LLM provider configurations
 │   ├── openai.yaml
 │   └── claude.yaml
-├── mcp_servers/         # MCP server configurations
+├── mcp_servers/         # MCP server configurations (user stdio servers)
+│   └── custom.yaml
+├── tool_servers/        # NATS tool servers (bridged MCP servers)
 │   ├── fs.yaml
 │   └── bash.yaml
 ├── acp_servers/         # ACP server overrides (optional)
@@ -112,7 +114,7 @@ patches:
 
 ## MCP Servers (`mcp_servers/`)
 
-Model Context Protocol (MCP) servers provide external tools. Each server is defined in a file like `mcp_servers/fs.yaml`.
+Model Context Protocol (MCP) servers provide external tools. Each server is defined in a file like `mcp_servers/custom.yaml` or `tool_servers/fs.yaml`.
 
 The **filename** (without `.yaml`) is used as the server name.
 
@@ -185,7 +187,7 @@ A comprehensive reference for the new folder structure and common provider/serve
 This directory includes:
 - `config.yaml` with recommended global settings.
 - `clients/` examples for OpenAI, Claude, Gemini, Bedrock, Azure, Vertex AI, and more.
-- `mcp_servers/` examples for filesystem, shell, and web search.
+- `mcp_servers/` and `tool_servers/` examples for filesystem, shell, and web search.
 - `agents/` and `acp_servers/` usage documentation.
 
 ---

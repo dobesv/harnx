@@ -1,12 +1,8 @@
-command: harnx-mcp-bash
-roots:
-  - "$HOME"
+command: harnx-mcp-bridge
 description: >-
   Allow the agent to run commands or script snippets
-rename_tools:
-  exec: Bash
-
-# Sandbox configuration examples (uncomment as needed):
+# Runs bridged over NATS. --default-root-cwd binds the sandbox to the process
+# CWD (the user's repo), keeping the $HOME guard; the sandbox stays enabled.
 #
 # NOTE: Many home-directory paths are already whitelisted by default and do NOT
 # need to be added here. See docs/bash-mcp-server.md for the full list, which
@@ -18,9 +14,12 @@ rename_tools:
 # ~/.nvm, ~/.pyenv, ~/.rye, etc.) are read+exec only — use --extra-rwx to
 # grant write access for operations like cargo install, nvm install, pyenv
 # install, rye sync, or claude update.
-#
 args:
-#   - --no-sandbox                                          # Disable sandboxing entirely
+  - --name
+  - bash
+  - --
+  - harnx-mcp-bash
+  - --default-root-cwd
   # Allow access to rustup-managed toolchains
   - --extra-exec
   - ~/.rustup
@@ -52,20 +51,3 @@ args:
   - GH_TOKEN
   - --env
   - CS_ACCESS_TOKEN
-#   - --sandbox-run                                         # Override sandbox helper binary
-#   - /opt/harnx/harnx-sandbox-exec
-#   - --env                                                 # Allow git push over SSH
-#   - SSH_AUTH_SOCK
-#
-# env:
-#   HARNX_BASH_EXTRA_READABLE: /opt/sdk      # Extra readable path via environment
-#   HARNX_BASH_EXTRA_EXEC: /opt/tools/bin    # Extra executable path via environment
-#   HARNX_BASH_ENV_PASSTHROUGH: GITHUB_TOKEN,SSH_AUTH_SOCK  # Comma-separated list to pass through
-# hooks:
-#   entries:
-#   - event: PreToolUse
-#     type: claude-command
-#     command: /path/to/my-bash-hook.sh
-#     # matcher applies to the bare (server-side) tool name, e.g. "exec" not "bash_exec".
-#     # This means renaming the server doesn't require updating hook matchers.
-#     # matcher: "exec"

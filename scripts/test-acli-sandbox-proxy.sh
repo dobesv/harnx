@@ -5,7 +5,7 @@
 # End-to-end smoke test for the acli/Jira sandbox credential-isolation setup.
 #
 # It runs ONE command: harnx-sandbox-run with the harnx-proxy-auth hook attached
-# (exactly as packages/*/mcp_servers/bash.yaml wires it in production), and the
+# (exactly as packages/*/tool_servers/bash.yaml wires it in production), and the
 # sandboxed payload simply dumps its env and runs acli:
 #
 #   harnx-sandbox-run \

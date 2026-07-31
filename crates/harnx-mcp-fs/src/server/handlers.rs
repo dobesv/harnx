@@ -10,10 +10,12 @@ use super::*;
 type ReadLinesPage<'a> = (Vec<(usize, &'a str)>, usize, usize);
 
 impl FsServer {
-    pub fn new(initial_roots: Vec<PathBuf>) -> Self {
+    pub fn new(initial_roots: Vec<PathBuf>, default_root_cwd: bool) -> Self {
         Self {
             roots: Arc::new(RwLock::new(initial_roots.clone())),
+            configured_roots: Arc::new(initial_roots.clone()),
             roots_initialized: Arc::new(AtomicBool::new(false)),
+            default_root_cwd,
             history: Arc::new(HistoryManager::new(&initial_roots)),
             repo_locks: Arc::new(Mutex::new(HashMap::new())),
             file_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -301,6 +303,26 @@ impl FsServer {
         paths
     }
 
+    async fn seed_default_root_if_empty(&self) {
+        if !self.default_root_cwd {
+            return;
+        }
+
+        let mut roots = self.roots.write().await;
+        if !roots.is_empty() {
+            return;
+        }
+
+        if let Some(root) = harnx_mcp::safety::default_root_from_cwd() {
+            roots.push(root);
+        } else {
+            eprintln!(
+                "harnx-mcp-fs: warning: --default-root-cwd: refusing to seed root from CWD \
+                 (equals/ancestor of $HOME, HOME unset, or unresolvable) — all filesystem access denied"
+            );
+        }
+    }
+
     pub(crate) async fn refresh_roots(
         &self,
         peer: &rmcp::service::Peer<RoleServer>,
@@ -309,6 +331,7 @@ impl FsServer {
             // The client never advertised the `roots` capability, so it can't
             // answer a `roots/list` request. Keep the CLI-provided roots and
             // mark initialization done so we don't keep retrying.
+            self.seed_default_root_if_empty().await;
             self.roots_initialized.store(true, Ordering::SeqCst);
             return Ok(());
         }
@@ -317,14 +340,22 @@ impl FsServer {
             ErrorData::internal_error(format!("failed to fetch roots from peer: {err}"), None)
         })?;
 
-        let roots = result
+        let peer_roots = result
             .roots
             .into_iter()
             .filter_map(|root| file_uri_to_path(root.uri.as_ref()))
             .collect::<Vec<_>>();
+        let resolved_roots = if peer_roots.is_empty() && !self.configured_roots.is_empty() {
+            self.configured_roots.as_ref().clone()
+        } else {
+            peer_roots
+        };
 
-        let mut guard = self.roots.write().await;
-        *guard = roots;
+        {
+            let mut guard = self.roots.write().await;
+            *guard = resolved_roots;
+        }
+        self.seed_default_root_if_empty().await;
         self.roots_initialized.store(true, Ordering::SeqCst);
         Ok(())
     }

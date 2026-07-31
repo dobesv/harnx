@@ -145,7 +145,7 @@ through a shell, and Harnx injects one extra environment variable:
 
 | Variable | Value |
 |---|---|
-| `HARNX_PACKAGE_DIR` | The directory of the package that owns the hook, when the hook is defined by a packaged MCP server (`<config>/packages/<name>/`). For hooks defined outside a package (the global `config.yaml`, or an MCP server under `<config>/mcp_servers/`), it falls back to the config directory (`~/.config/harnx` by default). |
+| `HARNX_PACKAGE_DIR` | The directory of the package that owns the hook or tool server (`<config>/packages/<name>/`). For hooks or tool servers defined outside a package (the global `config.yaml`, or servers under `<config>/mcp_servers/` or `<config>/tool_servers/`), it falls back to the config directory (`~/.config/harnx` by default). |
 
 This lets a package bundle helper scripts alongside its config and reference
 them without hardcoding an absolute path. For example, a packaged MCP server can
@@ -160,6 +160,11 @@ Because the command runs through a shell, `$HARNX_PACKAGE_DIR` (along with `~`
 and other `$VARS`) is expanded before the hook binary sees it. Note this
 expansion applies to the hook `command` only — an MCP server's own `command`
 and `args` are spawned directly and are **not** shell-expanded.
+
+This variable is also ambiently exported by the NATS tool-server supervisor to
+all spawned tool-server processes (and inherited by child process chains), allowing
+bundled hooks to resolve `$HARNX_PACKAGE_DIR/...` paths when tool servers run
+bridged over NATS (e.g. `bash` wrapped in `harnx-mcp-hooks-proxy`).
 
 ## 7. Permissions
 

@@ -173,6 +173,144 @@ async fn does_not_request_roots_when_client_lacks_capability() {
     );
 }
 
+#[cfg(unix)]
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "current_thread")]
+async fn no_roots_capability_seeds_canonical_cwd_when_enabled() {
+    let _env_guard = env_lock();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::create_dir_all(&home).expect("create home");
+    let _home = EnvVar::set("HOME", &home);
+    let _cwd = CwdGuard::set(&cwd);
+    let server =
+        BashServer::new_with_sandbox_and_default_root(vec![], disabled_sandbox_config(), true);
+    let server_clone = server.clone();
+
+    let (client_transport, server_transport) = duplex(65_536);
+    let client_handler = NoRootsClientHandler {
+        list_roots_called: Arc::new(AtomicBool::new(false)),
+    };
+    let (server_res, client_res) = tokio::join!(
+        serve_server(server, server_transport),
+        serve_client(client_handler, client_transport)
+    );
+    let server_service = server_res.expect("serve server");
+    let client_service = client_res.expect("serve client");
+    let server_peer = server_service.peer().clone();
+    let _client_task = tokio::spawn(async move {
+        let _ = client_service.waiting().await;
+    });
+
+    server_clone
+        .ensure_roots_initialized(&server_peer)
+        .await
+        .expect("initialize roots");
+
+    assert_eq!(
+        *server_clone.inner.roots.read().await,
+        vec![cwd.canonicalize().expect("canonical cwd")]
+    );
+}
+
+#[cfg(unix)]
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "current_thread")]
+async fn empty_peer_roots_seed_canonical_cwd_when_enabled() {
+    let _env_guard = env_lock();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::create_dir_all(&home).expect("create home");
+    let _home = EnvVar::set("HOME", &home);
+    let _cwd = CwdGuard::set(&cwd);
+    let server =
+        BashServer::new_with_sandbox_and_default_root(vec![], disabled_sandbox_config(), true);
+    let server_clone = server.clone();
+
+    let (client_transport, server_transport) = duplex(65_536);
+    let (server_res, client_res) = tokio::join!(
+        serve_server(server, server_transport),
+        serve_client(TestClientHandler::new(vec![]), client_transport)
+    );
+    let server_service = server_res.expect("serve server");
+    let client_service = client_res.expect("serve client");
+    let server_peer = server_service.peer().clone();
+    let _client_task = tokio::spawn(async move {
+        let _ = client_service.waiting().await;
+    });
+
+    server_clone
+        .ensure_roots_initialized(&server_peer)
+        .await
+        .expect("initialize roots");
+
+    assert_eq!(
+        *server_clone.inner.roots.read().await,
+        vec![cwd.canonicalize().expect("canonical cwd")]
+    );
+}
+
+#[cfg(unix)]
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "current_thread")]
+async fn default_root_cwd_refuses_home_and_leaves_roots_empty() {
+    let _env_guard = env_lock();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let _home = EnvVar::set("HOME", home.path());
+    let _cwd = CwdGuard::set(home.path());
+    let server =
+        BashServer::new_with_sandbox_and_default_root(vec![], disabled_sandbox_config(), true);
+
+    server.apply_default_root_cwd_if_empty().await;
+
+    assert!(server.inner.roots.read().await.is_empty());
+}
+
+#[cfg(unix)]
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "current_thread")]
+async fn empty_roots_stay_denied_without_default_root_cwd() {
+    let _env_guard = env_lock();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+    let _home = EnvVar::set("HOME", &home);
+    let _cwd = CwdGuard::set(temp.path());
+    let server = BashServer::new_with_sandbox(vec![], disabled_sandbox_config());
+
+    server.apply_default_root_cwd_if_empty().await;
+
+    assert!(server.inner.roots.read().await.is_empty());
+}
+
+#[cfg(unix)]
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_root_is_not_overridden_by_default_root_cwd() {
+    let _env_guard = env_lock();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("explicit");
+    let cwd = temp.path().join("cwd");
+    let home = temp.path().join("home");
+    for path in [&root, &cwd, &home] {
+        std::fs::create_dir_all(path).expect("create directory");
+    }
+    let _home = EnvVar::set("HOME", &home);
+    let _cwd = CwdGuard::set(&cwd);
+    let server = BashServer::new_with_sandbox_and_default_root(
+        vec![root.clone()],
+        disabled_sandbox_config(),
+        true,
+    );
+
+    server.apply_default_root_cwd_if_empty().await;
+
+    assert_eq!(*server.inner.roots.read().await, vec![root]);
+}
 #[tokio::test]
 async fn bash_tools_advertise_call_template_only() {
     // Each tool ships a `_meta.call_template` for the TUI's call header.
@@ -230,7 +368,7 @@ fn collect_arg_pairs(args: &[OsString]) -> Vec<(String, String)> {
 }
 
 #[cfg(unix)]
-use crate::test_support::{env_lock, EnvVar};
+use crate::test_support::{env_lock, CwdGuard, EnvVar};
 
 #[cfg(unix)]
 fn enabled_sandbox_config() -> SandboxConfig {
@@ -672,6 +810,32 @@ mod sandbox_args {
 
         assert!(pairs.contains(&("--write".into(), "/test/root".into())));
         assert!(pairs.contains(&("--exec".into(), "/test/root".into())));
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn sandbox_args_include_seeded_cwd_root() {
+        let _env_guard = env_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("repo");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::create_dir_all(&home).expect("create home");
+        let _home = EnvVar::set("HOME", &home);
+        let _cwd = CwdGuard::set(&cwd);
+        let server =
+            BashServer::new_with_sandbox_and_default_root(vec![], enabled_sandbox_config(), true);
+        server.apply_default_root_cwd_if_empty().await;
+        let roots = server.inner.roots.read().await.clone();
+
+        let args = server.build_sandbox_args(&cwd, &roots);
+        let pairs = collect_arg_pairs(&args);
+        let canonical_cwd = cwd.canonicalize().expect("canonical cwd");
+        let canonical_cwd = canonical_cwd.to_string_lossy().into_owned();
+
+        assert!(pairs.contains(&("--write".into(), canonical_cwd.clone())));
+        assert!(pairs.contains(&("--exec".into(), canonical_cwd)));
     }
 
     #[cfg(all(unix, target_os = "linux"))]

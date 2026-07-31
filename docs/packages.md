@@ -92,7 +92,8 @@ This deletes the package directory. Session transcripts referencing the package'
     manifest.yaml          # Written by harnx-pkg at install time
     package.yaml           # Optional metadata from the package itself
     agents/                # .md files — one per agent
-    mcp_servers/           # .yaml files — MCP server configs
+    mcp_servers/           # .yaml files — stdio MCP server configs
+    tool_servers/          # .yaml files — NATS-bridged tool server configs
     acp_servers/           # .yaml files — ACP server configs
     clients/               # .yaml files — client configs
   my-agents.patch.yaml     # Optional local overrides (sibling to the dir)
@@ -105,7 +106,7 @@ Package agents and servers are automatically namespaced to avoid collisions with
 | What | On-disk name | Runtime name | Tool name |
 |------|-------------|-------------|-----------|
 | Agent `coder.md` in `my-pkg` | `packages/my-pkg/agents/coder.md` | `my-pkg/coder` | `my-pkg__coder_session_prompt` |
-| MCP server `fs.yaml` in `my-pkg` | `packages/my-pkg/mcp_servers/fs.yaml` | `my-pkg__fs` | `my-pkg__fs_read_file` |
+| MCP server `fs.yaml` in `my-pkg` | `packages/my-pkg/tool_servers/fs.yaml` | `my-pkg__fs` | `my-pkg__fs_read` |
 | ACP server `helper.yaml` in `my-pkg` | `packages/my-pkg/acp_servers/helper.yaml` | `my-pkg__helper` | `my-pkg__helper_session_prompt` |
 
 The `/` in agent names is replaced with `__` in tool names.
@@ -115,7 +116,7 @@ The `/` in agent names is replaced with `__` in tool names.
 The names of agents, servers, and clients are derived from their **filename stems** (extension stripped):
 
 - **Agents**: `agents/coder.md` becomes `coder`.
-- **MCP Servers**: `mcp_servers/fs.yaml` becomes `fs`.
+- **MCP/tool Servers**: `mcp_servers/fs.yaml` or `tool_servers/fs.yaml` becomes `fs`.
 - **Clients**: `clients/openai.yaml` becomes `openai`.
 
 For package-provided entities, the name is prefixed with the package name: `<package>/<stem>`. For example, `my-pkg/openai`. Any `name:` field inside the configuration file is ignored.
@@ -127,16 +128,16 @@ When an agent inside a package references tools from the same package, write the
 ```yaml
 # packages/my-pkg/agents/coder.md frontmatter:
 use_tools:
-  - fs_read_file   # refers to my-pkg's own mcp_servers/fs.yaml — no prefix needed
+  - fs_read   # refers to my-pkg's own tool_servers/fs.yaml — no prefix needed
 ```
 
-When the agent is active, harnx scopes the MCP manager to that agent's package: same-package servers are registered under their bare names, so `fs_read_file` matches correctly. The LLM sees the tool as `fs_read_file`, not `my-pkg__fs_read_file`.
+When the agent is active, harnx scopes the MCP manager to that agent's package: same-package servers are registered under their bare names, so `fs_read` matches correctly. The LLM sees the tool as `fs_read`, not `my-pkg__fs_read`.
 
 To reference a tool from a **different** package, use the full prefixed name:
 
 ```yaml
 use_tools:
-  - fs_read_file            # own package's fs server
+  - fs_read            # own package's fs server
   - other-pkg__db_query     # another package's db server
 ```
 
@@ -150,7 +151,7 @@ You can override any package's configuration by creating a patch file next to th
 
 ### Patch file format
 
-Patch files use **jq filter strings** to modify package configurations. Each entry in `agents`, `clients`, and `mcp_servers` is an array of filters. Each filter receives the full configuration object for the respective entity and must return the modified version.
+Patch files use **jq filter strings** to modify package configurations. Each entry in `agents`, `clients`, and `mcp_servers` is an array of filters. (Patching `tool_servers` is not currently supported.) Each filter receives the full configuration object for the respective entity and must return the modified version.
 
 ```yaml
 agents:

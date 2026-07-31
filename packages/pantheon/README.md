@@ -177,30 +177,23 @@ local `~/.config/harnx/agents/shared/` directory.
 
 ---
 
-## MCP servers
+## Tool servers
 
-The package includes ready-to-use MCP server configs in `mcp_servers/`. These
-are automatically active when the package is installed — you don't need to copy
-or symlink anything.
+The package includes ready-to-use tool server configs in `tool_servers/`. All servers run bridged over NATS via `harnx-mcp-bridge` and are automatically active when the package is installed — you don't need to copy or symlink anything.
 
 > **Don't edit files inside the package directory.** They will be overwritten
 > when you run `harnx-pkg update`. To customise a server, create a file with
-> the same name in `~/.config/harnx/mcp_servers/` — your top-level config
+> the same name in `~/.config/harnx/tool_servers/` — your top-level config
 > takes precedence over the package's copy.
 
-### Bundled with harnx (no extra install)
-
-| Server | Namespace | Notes |
-|--------|-----------|-------|
-| `bash.yaml` | `bash_*` | Shell execution. Rooted at `.` (working directory). Common toolchain exec paths (asdf, bun, cargo, nvm, pyenv, rustup, yarn, etc.) are pre-configured — non-existent paths are silently ignored. |
-| `fs.yaml` | `fs_*` | Filesystem read/write. Rooted at `.` (working directory) to avoid exposing credentials in `~`. |
-| `plans.yaml` | `plans_*` | Plan/task/note management, stored in `.agent/plans/` relative to the working directory. |
-| `time.yaml` | `time_*` | Current time and wait/sleep utilities. |
-
-### Tool servers (bridge-run, under tool_servers/)
+### Bundled tool servers (under tool_servers/)
 
 | Server | Namespace | Requires | Notes |
 |--------|-----------|----------|-------|
+| `bash.yaml` | `bash_*` | None (bundled binary) | Shell execution. Runs bridged over NATS with `--default-root-cwd` (seeds CWD as allowed root with `$HOME` protection). Wrapped with `harnx-mcp-hooks-proxy` so GitHub/Atlassian auth injection hooks run before tool execution. Pre-configured toolchain paths. |
+| `fs.yaml` | `fs_*` | None (bundled binary) | Filesystem read/write. Runs bridged over NATS with `--default-root-cwd` to bound access to the repository CWD. |
+| `plans.yaml` | `plans_*` | None (bundled binary) | Plan/task/note management, stored in `.agent/plans/` relative to the working directory. |
+| `time.yaml` | `time_*` | None (bundled binary) | Current time and wait/sleep utilities. |
 | `fetch.yaml` | `fetch_*` | Node.js / npx | Fetches URLs as markdown or text. No API key. |
 | `exa.yaml` | `exa_*` | Node.js / npx | Web search via Exa. Requires `EXA_API_KEY`. |
 | `context7.yaml` | `context7_*` | Node.js / npx | Library docs lookup. No API key. |
@@ -214,21 +207,18 @@ EXA_API_KEY=...
 
 Get a key at [exa.ai](https://exa.ai).
 
-### Customising MCP server config
+### Customising tool server config
 
-Since package files are read-only, use the patch file to customise MCP servers:
+Since package files are read-only, use the patch file to customise tool servers:
 
 ```yaml
 # ~/.config/harnx/packages/pantheon.patch.yaml
-mcp_servers:
+tool_servers:
   # Each entry is a jq expression; .name is the server name.
   # The expression receives the full server config as JSON and returns it modified.
 
   # Append extra args to the bash server (for sandbox filesystem access):
-  - 'if .name == "bash" then .args += ["--extra-exec", "/opt/company-tools/bin", "--extra-rwx", "~/.codescene", "--env", "CS_ACCESS_TOKEN"] end'
-
-  # Add an extra root (keep the package's existing roots):
-  - 'if .name == "bash" then .roots += ["/opt/company-sdk"] end'
+  - 'if .name == "bash" then .args += ["--extra-exec", "/opt/company-tools/bin", "--extra-rwx", "~/.codescene"] end'
 
   # Disable a server you don't want:
   - 'if .name == "exa" then .enabled = false end'
@@ -242,6 +232,4 @@ Available fields you can set per server with jq:
 | `.args` | Replace the args list entirely |
 | `.args += [...]` | Append args after the existing args |
 | `.env.KEY = "value"` | Set an environment variable on the server process |
-| `.roots += [...]` | Append to the roots list |
-| `.roots` | Replace the roots list entirely |
 

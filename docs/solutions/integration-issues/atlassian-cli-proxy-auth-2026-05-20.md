@@ -76,7 +76,7 @@ To support this without `acli`-specific logic in the Rust proxy, `harnx-proxy-au
 
 ## acli Wiring (bash.yaml)
 
-The following configuration in `packages/coding/mcp_servers/bash.yaml` sources the API token from the host OS keyring and synthesizes a private `jira_config.yaml` for `acli` to use:
+The following configuration in `packages/coding/tool_servers/bash.yaml` sources the API token from the host OS keyring and synthesizes a private `jira_config.yaml` for `acli` to use:
 
 ```yaml
 # Load host config to extract current_profile

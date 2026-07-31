@@ -75,3 +75,11 @@ A simple agent might only have a system prompt. A more advanced agent can includ
 - **Documents** for RAG (retrieval-augmented generation)
 
 See the [Agent Guide](agent-guide.md) for full details.
+
+## How do `fs` and `bash` tool servers handle path roots and directory access?
+
+`fs` and `bash` run bridged over NATS via `tool_servers/`. Because the MCP roots protocol is deprecated (spec 2026-07-28), directory bounding relies on CLI flags and explicit config:
+
+- **CWD root default (`--default-root-cwd`):** In `tool_servers/`, `harnx-mcp-fs` and `harnx-mcp-bash` use `--default-root-cwd`. When no explicit roots are specified, this seeds an allowed root from the process working directory (which inherits the workspace CWD).
+- **`$HOME` guard:** If the working directory is `$HOME` or an ancestor of `$HOME` (or if `$HOME` is unset or unresolvable), CWD seeding is skipped. Access is denied with a stderr warning to prevent exposing your home directory.
+- **Explicit paths:** For specific directory access, pass `--root <PATH>` to `fs` or `bash`. `harnx-mcp-bash` also supports `--extra-read`, `--extra-write`, `--extra-exec`, and `--extra-rwx` flags (or `HARNX_BASH_EXTRA_*` environment variables). Explicit path options take precedence over `--default-root-cwd`.

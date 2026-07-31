@@ -47,7 +47,9 @@ pub(crate) use walk::*;
 #[derive(Clone)]
 pub struct FsServer {
     roots: Arc<RwLock<Vec<PathBuf>>>,
+    configured_roots: Arc<Vec<PathBuf>>,
     roots_initialized: Arc<AtomicBool>,
+    default_root_cwd: bool,
     history: Arc<HistoryManager>,
     repo_locks: Arc<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>>,
     file_locks: Arc<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>>,

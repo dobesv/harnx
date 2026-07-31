@@ -4,7 +4,7 @@
 
 ## Overview
 
-The server communicates via stdio using the Model Context Protocol (MCP). It restricts all filesystem operations to a set of allowed "roots." If no roots are specified via CLI or provided dynamically by the MCP client, all operations are denied.
+The server communicates via stdio using the Model Context Protocol (MCP) or bridged over NATS. It restricts all filesystem operations to a set of allowed "roots." If no roots are specified via CLI or provided dynamically by the MCP client, all operations are denied by default.
 
 ## Installation
 
@@ -19,6 +19,7 @@ cargo install --path crates/harnx-mcp-fs
 | Option | Short | Description |
 | :--- | :--- | :--- |
 | `--root <PATH>` | `-r` | Add an allowed root directory. This flag can be repeated to allow multiple roots. |
+| `--default-root-cwd` | | Seed an allowed root from process CWD when no explicit roots are specified. Protects against home exposure: if CWD is `$HOME` or an ancestor of `$HOME` (or if `$HOME` is unset/unresolvable), seeding is skipped and access is denied with a stderr warning. Explicit `--root` or client roots take precedence. |
 | `--help` | `-h` | Show the help message. |
 
 ## Tools

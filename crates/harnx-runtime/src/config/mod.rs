@@ -512,20 +512,6 @@ impl Default for Config {
 
 pub type GlobalConfig = Arc<RwLock<Config>>;
 
-/// Returns `true` if `path` equals `$HOME` or is an ancestor of `$HOME`
-/// (e.g. `/home` or `/`). Used to prevent over-broad paths from becoming MCP
-/// roots. Returns `false` when `$HOME` is unset.
-#[cfg(unix)]
-pub(super) fn path_is_home_or_ancestor(path: &Path) -> bool {
-    let home_os = match std::env::var_os("HOME") {
-        Some(h) => h,
-        None => return false,
-    };
-    let home = std::fs::canonicalize(&home_os).unwrap_or_else(|_| PathBuf::from(&home_os));
-    let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    home.starts_with(&candidate)
-}
-
 impl Config {
     /// Set remote agent metadata for NATS thin-client mode.
     pub fn set_remote_agent(&mut self, agent: String, cluster: String) {

@@ -6,6 +6,7 @@ use futures_util::StreamExt;
 use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
 use harnx_core::sink::emit_agent_event;
+use harnx_hooks::executor::HARNX_PACKAGE_DIR_ENV;
 use harnx_toolset::Registration;
 use harnx_toolset_server::{registration_key, TOOL_REGISTRY_BUCKET};
 use std::collections::HashMap;
@@ -187,11 +188,20 @@ fn resolve_tool_binary(server: &ToolServerConfig) -> Result<PathBuf> {
     })
 }
 
+fn tool_server_package_dir(server: &ToolServerConfig) -> PathBuf {
+    server
+        .package
+        .as_deref()
+        .map(harnx_core::config_paths::package_dir)
+        .unwrap_or_else(harnx_core::config_paths::config_dir)
+}
+
 fn spawn_tool_server(config: &ToolServerStartConfig, server: &ToolServerConfig) -> Result<Child> {
     let binary = resolve_tool_binary(server)?;
     let mut command = Command::new(&binary);
     command
         .args(&server.args)
+        .env(HARNX_PACKAGE_DIR_ENV, tool_server_package_dir(server))
         .envs(&server.env)
         .env(HARNX_INSTANCE_ID, config.instance_id.as_str())
         .env(HARNX_NATS_URL_ENV, &config.nats_url)
@@ -357,3 +367,40 @@ fn configure_tool_process(command: &mut Command) {
 
 #[cfg(not(unix))]
 fn configure_tool_process(_command: &mut Command) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_server(package: Option<&str>) -> ToolServerConfig {
+        ToolServerConfig {
+            name: "test".to_string(),
+            command: "test".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            enabled: true,
+            description: None,
+            package: package.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn package_owned_tool_server_uses_package_dir() {
+        let server = tool_server(Some("coding"));
+
+        assert_eq!(
+            tool_server_package_dir(&server),
+            harnx_core::config_paths::packages_dir().join("coding")
+        );
+    }
+
+    #[test]
+    fn user_tool_server_uses_config_dir() {
+        let server = tool_server(None);
+
+        assert_eq!(
+            tool_server_package_dir(&server),
+            harnx_core::config_paths::config_dir()
+        );
+    }
+}
