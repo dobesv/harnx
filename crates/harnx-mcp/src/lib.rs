@@ -1,6 +1,6 @@
 //! `harnx-mcp` — MCP (Model Context Protocol) support for the harnx
 //! workspace. Provides the safety/validation utilities used by the
-//! harnx-mcp-bash and harnx-mcp-fs helper bins, plus the in-process MCP
+//! harnx-mcp-bash and harnx-fs-tools helper bins, plus the in-process MCP
 //! client (`McpManager`) that the harnx runtime uses to talk to
 //! external MCP servers.
 

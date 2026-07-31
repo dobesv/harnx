@@ -38,7 +38,7 @@ mod handler;
 mod handlers;
 mod params;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod walk;
 
 pub use params::*;

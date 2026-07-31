@@ -1,0 +1,322 @@
+use crate::server::{
+    EditFileParams, FindFilesParams, FsServer, InsertParams, ListDirectoryParams, ReReplaceParams,
+    ReadFileParams, RollbackParams, SearchFilesParams, WriteFileParams,
+};
+use async_trait::async_trait;
+use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
+use rmcp::model::{CallToolResult, ErrorData, Tool};
+use rmcp::schemars::JsonSchema;
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value};
+use std::path::PathBuf;
+use tokio_util::sync::CancellationToken;
+
+/// Toolset exposing the filesystem tools (read, write, edit, insert,
+/// re_replace, ls, grep, find, rollback_file) backed by [`FsServer`].
+/// Wraps the shared handler logic so the same `*_impl` methods serve both the
+/// toolset path and the `--mcp-stdio` back-compat path.
+#[derive(Clone)]
+pub struct FsToolset {
+    server: FsServer,
+}
+
+impl FsToolset {
+    /// Build a toolset bounded to `initial_roots`. When `default_root_cwd` is
+    /// set and no roots are given, seeds a single root from the process CWD
+    /// (subject to the `$HOME`-ancestor guard); otherwise access is denied
+    /// until a root is configured.
+    pub async fn new(initial_roots: Vec<PathBuf>, default_root_cwd: bool) -> Self {
+        let server = FsServer::new(initial_roots, default_root_cwd);
+        server.seed_default_root_if_empty().await;
+        Self { server }
+    }
+}
+
+fn input_schema<T: JsonSchema + 'static>() -> Value {
+    Tool::new("schema", "schema", Map::new())
+        .with_input_schema::<T>()
+        .schema_as_json_value()
+}
+
+fn spec<T: JsonSchema + 'static>(name: &str, description: &str, read_only_hint: bool) -> ToolSpec {
+    ToolSpec {
+        name: name.to_string(),
+        description: description.to_string(),
+        input_schema: input_schema::<T>(),
+        idempotent_hint: false,
+        read_only_hint,
+        timeout_secs: None,
+    }
+}
+
+fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T, ToolInvokeError> {
+    serde_json::from_value(args)
+        .map_err(|err| ToolInvokeError::Recoverable(format!("invalid tool arguments: {err}")))
+}
+
+fn map_result(result: Result<CallToolResult, ErrorData>) -> Result<Value, ToolInvokeError> {
+    match result {
+        Ok(result) => serde_json::to_value(result).map_err(|err| {
+            ToolInvokeError::Fatal(format!("failed to serialize tool result: {err}"))
+        }),
+        Err(err) => Err(ToolInvokeError::Recoverable(err.message.to_string())),
+    }
+}
+
+#[async_trait]
+impl Toolset for FsToolset {
+    fn name(&self) -> &str {
+        "fs"
+    }
+
+    fn tools(&self) -> Vec<ToolSpec> {
+        vec![
+            spec::<ReadFileParams>(
+                "read",
+                "Read a text file with line numbers, pagination, grep filtering, and smart truncation. Prefer this tool over shell commands like sed, cat, head, tail. Use offset+limit to read specific line ranges instead of sed -n. Also reads local image files (PNG, JPEG, GIF, WebP, up to 5MB) and returns them as viewable images for vision-capable models — use this to view/inspect an image file by its path.",
+                true,
+            ),
+            spec::<WriteFileParams>(
+                "write",
+                "Write or create a file, replacing its contents.",
+                false,
+            ),
+            spec::<EditFileParams>("edit", "Replace exact text within an existing file.", false),
+            spec::<InsertParams>(
+                "insert",
+                "Insert text into a file at a specific line position.      insert_line: 0 prepends before line 1; insert_line: N inserts after line N; omit insert_line (or set N = total lines) to append to the end of the file. Optional column (1-indexed byte offset within      the line, default 1 = start of line) for mid-line insertion.      For exact-text replacement use edit; for regex replacement use re_replace.",
+                false,
+            ),
+            spec::<ReReplaceParams>(
+                "re_replace",
+                "Replace text in a file using a regular expression.      Uses fancy_regex syntax (supports lookahead/lookbehind).      Use $0 for the full match, $1/$2 etc. for capture groups in replacement.      Errors if pattern matches nothing. If pattern matches more than once,      set replace_all=true; otherwise only the first match is replaced.      For exact-text replacement use edit instead.",
+                false,
+            ),
+            spec::<ListDirectoryParams>(
+                "ls",
+                "List directory contents, optionally recursively. Prefer this tool over running bash ls.",
+                true,
+            ),
+            spec::<SearchFilesParams>(
+                "grep",
+                "Search file contents with regex and optional context lines. Prefer this tool over running bash grep.",
+                true,
+            ),
+            spec::<FindFilesParams>(
+                "find",
+                "Find files by glob pattern. Prefer this tool over running bash find.",
+                true,
+            ),
+            spec::<RollbackParams>(
+                "rollback_file",
+                "Restore a repository to a prior harnx history snapshot. Pass the commit SHA from the 'commit <sha>' line at the top of a prior tool response's diff as the commit_id parameter.",
+                false,
+            ),
+        ]
+    }
+
+    async fn invoke(
+        &self,
+        tool: &str,
+        args: Value,
+        _cancel: CancellationToken,
+    ) -> Result<Value, ToolInvokeError> {
+        let result = match tool {
+            "read" => self.server.read_file_impl(parse_args(args)?).await,
+            "write" => self.server.write_file_impl(parse_args(args)?).await,
+            "edit" => self.server.edit_file_impl(parse_args(args)?).await,
+            "insert" => self.server.insert_impl(parse_args(args)?).await,
+            "re_replace" => self.server.re_replace_impl(parse_args(args)?).await,
+            "ls" => self.server.list_directory_impl(parse_args(args)?).await,
+            "grep" => self.server.search_files_impl(parse_args(args)?).await,
+            "find" => self.server.find_files_impl(parse_args(args)?).await,
+            "rollback_file" => self.server.rollback_file_impl(parse_args(args)?).await,
+            _ => {
+                return Err(ToolInvokeError::Recoverable(format!(
+                    "unknown fs tool: {tool}"
+                )));
+            }
+        };
+        map_result(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::Path;
+    use uuid::Uuid;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("harnx-fs-toolset-test-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed with {status}");
+    }
+
+    fn assert_success_shape(result: &Value) {
+        assert!(result.get("content").and_then(Value::as_array).is_some());
+        assert_ne!(result.get("isError"), Some(&Value::Bool(true)));
+    }
+
+    async fn invoke(toolset: &FsToolset, tool: &str, args: Value) -> Value {
+        let result = toolset
+            .invoke(tool, args, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_success_shape(&result);
+        result
+    }
+
+    async fn invoke_content_tools(toolset: &FsToolset, file_arg: &str, root_arg: &str) {
+        invoke(
+            toolset,
+            "write",
+            json!({"path": file_arg, "content": "one\n"}),
+        )
+        .await;
+        invoke(toolset, "read", json!({"path": file_arg})).await;
+        invoke(
+            toolset,
+            "edit",
+            json!({"path": file_arg, "old_text": "one", "new_text": "two"}),
+        )
+        .await;
+        invoke(
+            toolset,
+            "insert",
+            json!({"path": file_arg, "insert_text": "three\n"}),
+        )
+        .await;
+        invoke(
+            toolset,
+            "re_replace",
+            json!({"path": file_arg, "pattern": "two", "replacement": "TWO"}),
+        )
+        .await;
+        invoke(toolset, "ls", json!({"path": root_arg})).await;
+        invoke(toolset, "grep", json!({"pattern": "TWO", "path": root_arg})).await;
+        invoke(
+            toolset,
+            "find",
+            json!({"pattern": "**/*.txt", "path": root_arg}),
+        )
+        .await;
+    }
+
+    async fn invoke_rollback(toolset: &FsToolset, file: &Path, root_arg: &str) {
+        let before = toolset
+            .server
+            .snapshot_before(file, "before rollback test")
+            .await;
+        std::fs::write(file, "changed outside tool\n").unwrap();
+        let diff = toolset
+            .server
+            .snapshot_after_diff(file, before, "after rollback test")
+            .await
+            .unwrap();
+        let commit_id = diff
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("commit "))
+            .unwrap();
+        invoke(
+            toolset,
+            "rollback_file",
+            json!({"commit_id": commit_id, "repo_path": root_arg}),
+        )
+        .await;
+    }
+
+    fn assert_tool_specs(toolset: &FsToolset) {
+        let tools = toolset.tools();
+        assert_eq!(tools.len(), 9);
+        for tool in tools {
+            assert_eq!(
+                tool.read_only_hint,
+                matches!(tool.name.as_str(), "read" | "ls" | "grep" | "find")
+            );
+            assert_eq!(tool.input_schema.get("type"), Some(&json!("object")));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_default_root_cwd_bounds_repo_and_denies_home() {
+        use crate::server::tests::{env_lock, path_string, CwdGuard, HomeGuard};
+
+        let _lock = env_lock().await;
+        let base = TestDir::new();
+        let repo = base.0.join("repo");
+        let home = base.0.join("home");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let repo_file = repo.join("allowed.txt");
+        let home_file = home.join("denied.txt");
+        std::fs::write(&repo_file, "allowed\n").unwrap();
+        std::fs::write(&home_file, "denied\n").unwrap();
+        let _home = HomeGuard::set(&home);
+
+        {
+            let _cwd = CwdGuard::set(&repo);
+            let toolset = FsToolset::new(vec![], true).await;
+            let result = toolset
+                .invoke(
+                    "read",
+                    json!({"path": path_string(&repo_file)}),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_success_shape(&result);
+        }
+
+        let _cwd = CwdGuard::set(&home);
+        let toolset = FsToolset::new(vec![], true).await;
+        let result = toolset
+            .invoke(
+                "read",
+                json!({"path": path_string(&home_file)}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(ToolInvokeError::Recoverable(_))));
+    }
+
+    #[tokio::test]
+    async fn invokes_all_fs_tools() {
+        let root = TestDir::new();
+        git(&root.0, &["init"]);
+        git(&root.0, &["config", "user.name", "harnx test"]);
+        git(&root.0, &["config", "user.email", "harnx@example.com"]);
+        let root_path = root.0.canonicalize().unwrap();
+        let file = root_path.join("sample.txt");
+        let file_arg = file.to_string_lossy().into_owned();
+        let root_arg = root_path.to_string_lossy().into_owned();
+        let toolset = FsToolset::new(vec![root_path], false).await;
+
+        invoke_content_tools(&toolset, &file_arg, &root_arg).await;
+        invoke_rollback(&toolset, &file, &root_arg).await;
+        assert_tool_specs(&toolset);
+    }
+}

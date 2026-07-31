@@ -1,12 +1,9 @@
-command: harnx-mcp-bridge
+command: harnx-fs-tools
 description: >-
   Agent filesystem access
-# Runs bridged over NATS. --default-root-cwd binds access to the process CWD
-# (the user's repo), keeping the $HOME guard. To allow other paths, shadow this
-# file at ~/.config/harnx/tool_servers/fs.yaml and add --root /path in args.
+# Runs directly as a toolset server. --default-root-cwd binds access to the
+# process CWD (the user's repo), keeping the $HOME guard. To allow other paths,
+# shadow this file at ~/.config/harnx/tool_servers/fs.yaml and add --root /path
+# in args.
 args:
-  - --name
-  - fs
-  - --
-  - harnx-mcp-fs
   - --default-root-cwd

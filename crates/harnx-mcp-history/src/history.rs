@@ -181,7 +181,7 @@ impl HistoryManager {
 
     pub async fn snapshot_file(&self, file_path: &Path, label: &str) -> Result<gix::ObjectId> {
         // Lazily discover and track a repo covering this file path. This is
-        // load-bearing in production: harnx-mcp-fs / harnx-mcp-bash launch
+        // load-bearing in production: harnx-fs-tools / harnx-mcp-bash launch
         // with empty `--root` args and only learn their roots later via the
         // MCP `roots/list` protocol, so `HistoryManager::new(&[])` finds no
         // repos at construction. Without this fallback every snapshot would
@@ -854,7 +854,7 @@ mod tests {
     }
 
     /// When `HistoryManager` is constructed with empty initial roots (the
-    /// production launch path for harnx-mcp-fs and harnx-mcp-bash, which
+    /// production launch path for harnx-fs-tools and harnx-mcp-bash, which
     /// receive their roots later via the MCP `roots/list` protocol),
     /// `snapshot_file` must still discover and track the git repo
     /// containing the file rather than silently failing with "no tracked

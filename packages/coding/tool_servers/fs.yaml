@@ -1,10 +1,6 @@
-command: harnx-mcp-bridge
+command: harnx-fs-tools
 description: Filesystem read/write access for agents
 args:
-  - --name
-  - fs
-  - --
-  - harnx-mcp-fs
   - --default-root-cwd
 
 # To allow access to additional paths, shadow this file with your own copy at

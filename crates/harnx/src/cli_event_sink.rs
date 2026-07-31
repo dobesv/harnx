@@ -209,7 +209,7 @@ impl CliSinkState {
 
     /// Stderr render for `ToolEvent::Completed`. Always routes through the
     /// multi-line `MarkdownRender::render` so block-level constructs work
-    /// — fenced code (e.g. the ```diff blocks emitted by harnx-mcp-fs /
+    /// — fenced code (e.g. the ```diff blocks emitted by harnx-fs-tools /
     /// harnx-mcp-bash for history diffs) gets syntect highlighting,
     /// inline emphasis from a templated MCP `result_template` still
     /// renders, and plain text passes through unchanged. Falls back to

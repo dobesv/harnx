@@ -18,7 +18,7 @@ what you need:
 | `harnx-serve`           | HTTP-only server, no TUI deps                                                   | [README](crates/harnx-serve/README.md)           |
 | `harnx-pkg`             | Package manager for harnx agent configurations                                  | [Package System](docs/packages.md)               |
 | `harnx-mcp-bash`        | MCP server exposing bash/subprocess execution with safety guards                | [Bash MCP Server](docs/bash-mcp-server.md)       |
-| `harnx-mcp-fs`          | MCP server exposing filesystem operations with safety guards                    | [README](crates/harnx-mcp-fs/README.md)          |
+| `harnx-fs-tools`        | Toolset server exposing filesystem operations with safety guards                 | [README](crates/harnx-fs-tools/README.md)       |
 | `harnx-mcp-plans`       | MCP server exposing file-based plan/task/note management                        | [README](crates/harnx-mcp-plans/README.md)       |
 | `harnx-mcp-plans-github` | MCP server exposing GitHub Issues-backed plan/task/note management              | [README](crates/harnx-mcp-plans-github/README.md)|
 | `harnx-mcp-time`        | MCP server exposing time and timezone utilities                                 | [README](crates/harnx-mcp-time/README.md)        |
@@ -157,7 +157,7 @@ within your workflow.
 Harnx ships with several built-in MCP servers ready to enable in your config. See 
 `example_config/mcp_servers/` for ready-to-use templates.
 
-*   **`harnx-mcp-fs`** — Filesystem access (`read`, `write`, `edit`, `ls`, `grep`, `find`, `rollback_file`)
+*   **`harnx-fs-tools`** — Filesystem toolset (`read`, `write`, `edit`, `insert`, `re_replace`, `ls`, `grep`, `find`, `rollback_file`)
     *   Path validation against allowed roots; smart output truncation; binary detection.
     *   [Local history snapshots](docs/local-history-guide.md) before and after every mutation.
 *   **`harnx-mcp-bash`** — Bash command execution (`exec`, `spawn`, `wait`, `terminate`, `read_exec_log`)

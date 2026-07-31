@@ -3613,6 +3613,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-fs-tools"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "base64 0.23.0",
+ "fancy-regex 0.19.0",
+ "gix",
+ "glob",
+ "harnx-core",
+ "harnx-mcp",
+ "harnx-mcp-history",
+ "harnx-toolset",
+ "harnx-toolset-server",
+ "log",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "which",
+]
+
+[[package]]
 name = "harnx-hooks"
 version = "0.33.4"
 dependencies = [
@@ -3714,25 +3741,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "which",
-]
-
-[[package]]
-name = "harnx-mcp-fs"
-version = "0.33.4"
-dependencies = [
- "anyhow",
- "base64 0.23.0",
- "fancy-regex 0.19.0",
- "gix",
- "glob",
- "harnx-mcp",
- "harnx-mcp-history",
- "log",
- "rmcp",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
 ]
 
 [[package]]

@@ -154,7 +154,7 @@ fn tool_call_body(
 /// Convert a `Completed` event's `output` + `markdown` into transcript items.
 /// The whole multi-line text is wrapped in a single `ToolResultMarkdown`
 /// item so `markdown_lines` can parse block-level constructs — fenced
-/// code (e.g. the ```diff blocks emitted by harnx-mcp-fs / harnx-mcp-bash
+/// code (e.g. the ```diff blocks emitted by harnx-fs-tools / harnx-mcp-bash
 /// for history diffs), inline emphasis from a templated MCP
 /// `result_template`, and plain text alike. Strips ANSI escapes from
 /// string outputs before extraction so pre-dimmed test inputs render
