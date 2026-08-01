@@ -116,9 +116,8 @@ impl Tui {
 
         let event_tx = ctx.event_tx.clone();
         let shared_pending = ctx.shared_pending_message.clone();
-        let on_tool_round: harnx_runtime::OnToolRoundFn = Arc::new(
-            move |merged_input: &mut harnx_runtime::config::Input,
-                  _tool_results: &[harnx_runtime::tool::ToolResult]| {
+        let on_tool_round: harnx_runtime::OnToolRoundFn =
+            Arc::new(move |merged_input, _tool_results| {
                 let event_tx = event_tx.clone();
                 let shared_pending = shared_pending.clone();
                 Box::pin(async move {
@@ -134,8 +133,7 @@ impl Tui {
                         }
                     }
                 })
-            },
-        );
+            });
 
         let event_tx = ctx.event_tx.clone();
         let on_text_response: harnx_runtime::OnTextResponseFn = Arc::new(
@@ -150,7 +148,6 @@ impl Tui {
                 })
             },
         );
-
         let loop_ctx = harnx_runtime::AgentLoopContext {
             instance_id: harnx_core::instance::InstanceId::new(),
             config: ctx.config.clone(),
@@ -163,6 +160,7 @@ impl Tui {
             initial_with_embeddings: true,
             initial_resume_count: 0,
             max_resume: None,
+            nats_hook_provider: None,
             pending_async_context: None,
             working_dir: None,
             session_lock: None,

@@ -32,6 +32,11 @@ impl InstanceId {
     pub fn control_subject(&self) -> String {
         format!("harnx.v1.{self}.tools.control")
     }
+
+    /// Build the Core NATS subject for a hook event.
+    pub fn hook_subject(&self, server: &str, event: &str) -> String {
+        format!("harnx.v1.{self}.hook.{server}.{event}")
+    }
 }
 
 impl Default for InstanceId {
@@ -72,6 +77,10 @@ mod tests {
         assert_eq!(
             instance_id.control_subject(),
             format!("harnx.v1.{instance_id}.tools.control")
+        );
+        assert_eq!(
+            instance_id.hook_subject("proxy-auth", "PreToolUse"),
+            format!("harnx.v1.{instance_id}.hook.proxy-auth.PreToolUse")
         );
     }
 }

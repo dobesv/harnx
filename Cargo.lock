@@ -3654,6 +3654,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-hookset"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "harnx-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "harnx-hookset-server"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "futures-util",
+ "harnx-core",
+ "harnx-hookset",
+ "log",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "which",
+]
+
+[[package]]
 name = "harnx-k8s-creds"
 version = "0.33.4"
 dependencies = [
@@ -4009,6 +4037,8 @@ dependencies = [
  "harnx-engine",
  "harnx-fetch",
  "harnx-hooks",
+ "harnx-hookset",
+ "harnx-hookset-server",
  "harnx-mcp",
  "harnx-rag",
  "harnx-render",

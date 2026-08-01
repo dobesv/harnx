@@ -244,7 +244,8 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         initial_with_embeddings: false,
         initial_resume_count: 0,
         max_resume: None,
-        pending_async_context: None,
+        nats_hook_provider: None,
+        pending_async_context: Some(Arc::new(tokio::sync::Mutex::new(None))),
         working_dir,
         session_lock: None,
     };
@@ -727,6 +728,8 @@ async fn build_orphan_tool_eval_context(
         current_agent_package: repair.current_agent_package.clone(),
         persistent_manager: &repair.persistent_manager,
         working_dir: None,
+        nats_hook_provider: None,
+        pending_async_context: None,
     })
     .await
 }

@@ -106,6 +106,7 @@ pub struct AgentLoopContext {
     pub initial_with_embeddings: bool,
     pub initial_resume_count: u32,
     pub max_resume: Option<u32>,
+    pub nats_hook_provider: Option<Arc<crate::nats_hook_provider::NatsHookProvider>>,
     pub pending_async_context: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
     /// Optional per-session working directory. When unset, runtime falls back
     /// to process cwd for CLI compatibility.
@@ -735,9 +736,7 @@ mod tests {
     async fn injected_user_text_is_not_replayed_across_rounds() {
         let _guard = crate::client::TestStateGuard::new(None).await;
         let tmp = TempDir::new().unwrap();
-
         let global_config = replay_test_config(&tmp);
-
         // Mock LLM: round 1 → tool call, round 2 → tool call, round 3 → text-only.
         // No real tool provider is registered, so eval_tool_calls returns
         // is_error results. That's fine — the loop still proceeds round by
@@ -785,22 +784,7 @@ mod tests {
             })
         });
 
-        let ctx = AgentLoopContext {
-            instance_id: harnx_core::instance::InstanceId::new(),
-            config: global_config.clone(),
-            abort_signal: create_abort_signal(),
-            async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::new())),
-            persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new())),
-            call_fn: Some(call_fn),
-            on_tool_round: Some(on_tool_round),
-            on_text_response: None,
-            working_dir: None,
-            initial_with_embeddings: false,
-            initial_resume_count: 0,
-            max_resume: Some(0),
-            pending_async_context: None,
-            session_lock: None,
-        };
+        let ctx = make_test_context(global_config.clone(), call_fn, on_tool_round);
 
         let input = crate::config::input::from_str(&global_config, "do work", None);
         run_agent_loop(&ctx, input).await.unwrap();
@@ -833,9 +817,10 @@ mod tests {
         })
     }
 
-    fn make_handoff_test_context(
+    fn make_test_context(
         global_config: GlobalConfig,
         call_fn: AgentCallFn,
+        on_tool_round: OnToolRoundFn,
     ) -> AgentLoopContext {
         AgentLoopContext {
             instance_id: harnx_core::instance::InstanceId::new(),
@@ -844,12 +829,13 @@ mod tests {
             async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::new())),
             persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new())),
             call_fn: Some(call_fn),
-            on_tool_round: Some(handoff_on_tool_round()),
+            on_tool_round: Some(on_tool_round),
             on_text_response: None,
             working_dir: None,
             initial_with_embeddings: false,
             initial_resume_count: 0,
             max_resume: Some(0),
+            nats_hook_provider: None,
             pending_async_context: None,
             session_lock: None,
         }
@@ -969,7 +955,7 @@ mod tests {
             })
         });
 
-        let ctx = make_handoff_test_context(global_config.clone(), call_fn);
+        let ctx = make_test_context(global_config.clone(), call_fn, handoff_on_tool_round());
 
         assert!(!global_config.read().is_compacting_session());
         let sink = Arc::new(CollectingSink::default());

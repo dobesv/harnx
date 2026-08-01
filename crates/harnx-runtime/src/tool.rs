@@ -1,5 +1,6 @@
 use crate::{
     config::{Config, GlobalConfig},
+    nats_hook_provider::{HookDispatchMeta, NatsHookProvider},
     utils::*,
 };
 use anyhow::Result;
@@ -30,7 +31,8 @@ pub struct CompletionText<'a> {
     pub thought: Option<&'a str>,
 }
 
-use crate::tool_context::discover_nats_tool_provider;
+use crate::nats_tool_provider::NatsToolProvider;
+use crate::tool_context::{discover_nats_hook_provider_cached, discover_nats_tool_provider};
 pub use crate::tool_context::{BuildToolEvalContextParams, ToolRoundParams};
 
 #[derive(Debug, Clone)]
@@ -92,6 +94,8 @@ pub async fn execute_tool_round_with_persistence(
         abort_signal,
         persistent_manager,
         working_dir,
+        nats_hook_provider,
+        pending_async_context,
     } = params;
     let dry_run = config.read().dry_run;
 
@@ -116,6 +120,8 @@ pub async fn execute_tool_round_with_persistence(
         current_agent_package,
         persistent_manager,
         working_dir,
+        nats_hook_provider,
+        pending_async_context,
     })
     .await;
     let results = match eval_tool_calls(&eval_ctx, tool_calls.clone(), abort_signal).await {
@@ -149,22 +155,90 @@ pub async fn execute_tool_round_with_persistence(
     Ok(results)
 }
 
-/// Build a `ToolEvalContext` from the harnx `GlobalConfig`. Replaces the
-/// old inherent `ToolEvalContext::from_config` method — the struct lives
-/// in `harnx-engine::tool` now (orphan rules forbid adding inherent
-/// methods on a cross-crate type). Snapshots Config fields and the instance's
-/// NATS registrations, constructs the provider list (NATS first, then MCP),
-/// builds the dispatch hook closure over captured `hooks.entries`, `session_id`,
-/// and `cwd`, and wires in harnx-side default UI/prompt callbacks.
-///
-/// `agent_use_tools` is the active agent's `use_tools` whitelist. The
-/// CLI/TUI flow stores the agent on the Config (via `use_agent`), so
-/// `Config::extract_agent()` would yield the right value, but the previous frontend
-/// server holds the agent only on the per-prompt `Input` (because each
-/// `prompt` call may target a different agent on the same Config).
-/// Passing the use_tools list explicitly keeps both paths correct.
-/// Build the hook dispatch closure, capturing hooks config and the persistent
-/// manager so `ToolEvalContext` can fire PreToolUse/PostToolUse hooks.
+/// Run configured inline hooks for one event.
+async fn dispatch_inline_hooks(
+    event: &HookEvent,
+    hooks_entries: &[HookConfig],
+    per_tool_hooks: &HashMap<String, (String, Vec<HookConfig>)>,
+    session_id: &str,
+    cwd: &std::path::Path,
+    persistent_manager: &Arc<tokio::sync::Mutex<PersistentHookManager>>,
+) -> harnx_core::hooks::HookOutcome {
+    let display_tool_name = match event {
+        HookEvent::PreToolUse { tool_name, .. }
+        | HookEvent::PostToolUse { tool_name, .. }
+        | HookEvent::PostToolUseFailure { tool_name, .. } => Some(tool_name.as_str()),
+        _ => None,
+    };
+
+    // For server-scoped hooks, match the hook's `matcher` against the bare
+    // (unprefixed) tool name. Strip the matcher from entries we add to the
+    // merged list so the global dispatcher doesn't re-check against the
+    // prefixed display name and accidentally reject them.
+    let mut merged_entries: Vec<HookConfig> = if let Some(display_name) = display_tool_name {
+        per_tool_hooks
+            .get(display_name)
+            .map(|(bare_name, entries)| {
+                entries
+                    .iter()
+                    .filter(|hook| {
+                        harnx_hooks::CompiledMatcher::compile(&hook.matcher)
+                            .map(|m| m.matches_str(bare_name))
+                            .unwrap_or(false)
+                    })
+                    .map(|hook| HookConfig {
+                        matcher: None,
+                        ..hook.clone()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    merged_entries.extend_from_slice(hooks_entries);
+
+    harnx_hooks::dispatch::dispatch_hooks_with_count_and_manager(
+        event,
+        &merged_entries,
+        session_id,
+        cwd,
+        0,
+        None,
+        Some(persistent_manager),
+    )
+    .await
+}
+
+fn with_pre_tool_input(event: &HookEvent, tool_input: Value) -> HookEvent {
+    match event {
+        HookEvent::PreToolUse {
+            tool_name,
+            tool_input: _,
+            tool_use_id,
+        } => HookEvent::PreToolUse {
+            tool_name: tool_name.clone(),
+            tool_input,
+            tool_use_id: tool_use_id.clone(),
+        },
+        _ => event.clone(),
+    }
+}
+
+fn compose_pre_tool_use_outcome(
+    nats_mutated_tool_input: Option<Value>,
+    mut inline_outcome: harnx_core::hooks::HookOutcome,
+) -> harnx_core::hooks::HookOutcome {
+    if matches!(
+        inline_outcome.control,
+        harnx_core::hooks::HookResultControl::Continue
+    ) && inline_outcome.result.mutated_tool_input.is_none()
+    {
+        inline_outcome.result.mutated_tool_input = nats_mutated_tool_input;
+    }
+    inline_outcome
+}
+
 fn build_dispatch_hook_fn(
     hooks: &harnx_hooks::HooksConfig,
     // Value is (bare_server_tool_name, hook_entries). The matcher in each entry is
@@ -172,8 +246,10 @@ fn build_dispatch_hook_fn(
     // an MCP server doesn't require updating hook matchers.
     per_tool_hooks: HashMap<String, (String, Vec<HookConfig>)>,
     session_name: Option<&str>,
-    persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
+    persistent_manager: &Arc<tokio::sync::Mutex<PersistentHookManager>>,
     working_dir: Option<&std::path::Path>,
+    nats_hook_provider: Option<Arc<NatsHookProvider>>,
+    pending_async_context: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
 ) -> Arc<DispatchHookFn> {
     let hooks_entries = hooks.entries.clone();
     let session_id = session_name.unwrap_or("cmd").to_string();
@@ -187,52 +263,78 @@ fn build_dispatch_hook_fn(
         let session_id = session_id.clone();
         let cwd = cwd.clone();
         let persistent_manager = persistent_manager.clone();
+        let nats_hook_provider = nats_hook_provider.clone();
+        let pending_async_context = pending_async_context.clone();
         Box::pin(async move {
-            let display_tool_name = match &event {
-                HookEvent::PreToolUse { tool_name, .. }
-                | HookEvent::PostToolUse { tool_name, .. }
-                | HookEvent::PostToolUseFailure { tool_name, .. } => Some(tool_name.as_str()),
-                _ => None,
+            let meta = HookDispatchMeta {
+                session_id: session_id.clone(),
+                cwd: cwd.clone(),
             };
-
-            // For server-scoped hooks, match the hook's `matcher` against the bare
-            // (unprefixed) tool name. Strip the matcher from entries we add to the
-            // merged list so the global dispatcher doesn't re-check against the
-            // prefixed display name and accidentally reject them.
-            let mut merged_entries: Vec<HookConfig> = if let Some(display_name) = display_tool_name
-            {
-                per_tool_hooks
-                    .get(display_name)
-                    .map(|(bare_name, entries)| {
-                        entries
-                            .iter()
-                            .filter(|hook| {
-                                harnx_hooks::CompiledMatcher::compile(&hook.matcher)
-                                    .map(|m| m.matches_str(bare_name))
-                                    .unwrap_or(false)
-                            })
-                            .map(|hook| HookConfig {
-                                matcher: None,
-                                ..hook.clone()
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            merged_entries.extend(hooks_entries.clone());
-
-            harnx_hooks::dispatch::dispatch_hooks_with_count_and_manager(
-                &event,
-                &merged_entries,
-                &session_id,
-                &cwd,
-                0,
-                None,
-                Some(&persistent_manager),
-            )
-            .await
+            match &event {
+                HookEvent::PreToolUse { .. } => {
+                    let Some(provider) = nats_hook_provider else {
+                        return dispatch_inline_hooks(
+                            &event,
+                            &hooks_entries,
+                            &per_tool_hooks,
+                            &session_id,
+                            &cwd,
+                            &persistent_manager,
+                        )
+                        .await;
+                    };
+                    let nats_outcome = provider.dispatch_pre_tool_use(&event, meta).await;
+                    match &nats_outcome.control {
+                        harnx_core::hooks::HookResultControl::Block { .. } => return nats_outcome,
+                        harnx_core::hooks::HookResultControl::Ask { .. } => {
+                            // NOTE: Ask follows the existing ToolApprovalRequiredError path.
+                            // Headless-worker resolution over NATS is deferred to a later slice.
+                            return nats_outcome;
+                        }
+                        harnx_core::hooks::HookResultControl::Continue => {}
+                    }
+                    let nats_mutation = nats_outcome.result.mutated_tool_input;
+                    let inline_event = nats_mutation
+                        .clone()
+                        .map(|input| with_pre_tool_input(&event, input))
+                        .unwrap_or(event);
+                    let inline_outcome = dispatch_inline_hooks(
+                        &inline_event,
+                        &hooks_entries,
+                        &per_tool_hooks,
+                        &session_id,
+                        &cwd,
+                        &persistent_manager,
+                    )
+                    .await;
+                    compose_pre_tool_use_outcome(nats_mutation, inline_outcome)
+                }
+                HookEvent::PostToolUse { .. } => {
+                    if let Some(provider) = nats_hook_provider {
+                        provider.dispatch_post_tool_use(event.clone(), pending_async_context, meta);
+                    }
+                    dispatch_inline_hooks(
+                        &event,
+                        &hooks_entries,
+                        &per_tool_hooks,
+                        &session_id,
+                        &cwd,
+                        &persistent_manager,
+                    )
+                    .await
+                }
+                _ => {
+                    dispatch_inline_hooks(
+                        &event,
+                        &hooks_entries,
+                        &per_tool_hooks,
+                        &session_id,
+                        &cwd,
+                        &persistent_manager,
+                    )
+                    .await
+                }
+            }
         })
     })
 }
@@ -263,6 +365,20 @@ fn build_emit_fns(
     (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn)
 }
 
+async fn resolve_nats_providers(
+    config: &Config,
+    instance_id: &harnx_core::instance::InstanceId,
+    injected_hook_provider: Option<Arc<NatsHookProvider>>,
+) -> (Option<Arc<NatsToolProvider>>, Option<Arc<NatsHookProvider>>) {
+    let tool_provider = discover_nats_tool_provider(config, instance_id).await;
+    let hook_provider = match injected_hook_provider {
+        Some(provider) => Some(provider),
+        None => discover_nats_hook_provider_cached(config, instance_id).await,
+    };
+    (tool_provider, hook_provider)
+}
+
+/// Build tool providers, hook dispatch, and rendering state for one tool round.
 pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> ToolEvalContext {
     let BuildToolEvalContextParams {
         config,
@@ -271,6 +387,8 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
         current_agent_package,
         persistent_manager,
         working_dir,
+        nats_hook_provider,
+        pending_async_context,
     } = params;
     let (
         mut tool_declarations,
@@ -295,7 +413,8 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
         )
     };
 
-    let nats_provider = discover_nats_tool_provider(&config_snapshot, instance_id).await;
+    let (nats_provider, nats_hook_provider) =
+        resolve_nats_providers(&config_snapshot, instance_id, nats_hook_provider).await;
     if let Some(provider) = &nats_provider {
         tool_declarations.extend(provider.declarations_for_use_tools(agent_use_tools));
     }
@@ -310,6 +429,8 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
         session_name.as_deref(),
         persistent_manager,
         working_dir,
+        nats_hook_provider,
+        pending_async_context,
     );
     let (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn) = build_emit_fns(&decl_map);
     ToolEvalContext {
@@ -1140,8 +1261,94 @@ mod tests {
         let pm = Arc::new(tokio::sync::Mutex::new(
             harnx_hooks::PersistentHookManager::new(),
         ));
-        let dispatch_fn = build_dispatch_hook_fn(&hooks_config, per_tool_hooks, None, &pm, None);
+        let dispatch_fn =
+            build_dispatch_hook_fn(&hooks_config, per_tool_hooks, None, &pm, None, None, None);
         (dispatch_fn)(event).await
+    }
+
+    fn continue_outcome(mutated_tool_input: Option<Value>) -> harnx_core::hooks::HookOutcome {
+        harnx_core::hooks::HookOutcome {
+            control: harnx_core::hooks::HookResultControl::Continue,
+            result: harnx_core::hooks::HookResult {
+                mutated_tool_input,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn compose_pre_tool_use_outcome_preserves_nats_then_inline_mutation() {
+        let nats_mutation = json!({"nats": true});
+        let nats_only =
+            compose_pre_tool_use_outcome(Some(nats_mutation.clone()), continue_outcome(None));
+        assert_eq!(
+            nats_only.result.mutated_tool_input,
+            Some(nats_mutation),
+            "NATS mutation must survive when inline hooks don't mutate"
+        );
+
+        let inline_mutation = json!({"nats": true, "inline": true});
+        let inline_wins = compose_pre_tool_use_outcome(
+            Some(json!({"nats": true})),
+            continue_outcome(Some(inline_mutation.clone())),
+        );
+        assert_eq!(
+            inline_wins.result.mutated_tool_input,
+            Some(inline_mutation),
+            "inline mutation already includes its NATS-mutated starting input"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_none_matches_pure_inline_for_pre_and_post_tool_use() {
+        let hooks = harnx_hooks::HooksConfig {
+            entries: Vec::new(),
+            max_resume: None,
+        };
+        let per_tool_hooks = HashMap::new();
+        let persistent_manager = Arc::new(tokio::sync::Mutex::new(
+            harnx_hooks::PersistentHookManager::new(),
+        ));
+        let cwd = std::env::current_dir().unwrap();
+        let dispatch = build_dispatch_hook_fn(
+            &hooks,
+            per_tool_hooks.clone(),
+            Some("session"),
+            &persistent_manager,
+            Some(&cwd),
+            None,
+            None,
+        );
+        let events = [
+            HookEvent::PreToolUse {
+                tool_name: "tool".to_string(),
+                tool_input: json!({"input": true}),
+                tool_use_id: "pre".to_string(),
+            },
+            HookEvent::PostToolUse {
+                tool_name: "tool".to_string(),
+                tool_input: json!({"input": true}),
+                tool_response: json!({"output": true}),
+                tool_use_id: "post".to_string(),
+            },
+        ];
+
+        for event in events {
+            let expected = dispatch_inline_hooks(
+                &event,
+                &hooks.entries,
+                &per_tool_hooks,
+                "session",
+                &cwd,
+                &persistent_manager,
+            )
+            .await;
+            let actual = dispatch(event).await;
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
     }
 
     /// A no-matcher server hook applies to all tools on that server.
@@ -1316,6 +1523,8 @@ mod tests {
             Some("session-a"),
             &persistent_manager,
             Some(root_a.path()),
+            None,
+            None,
         );
         let dispatch_b = build_dispatch_hook_fn(
             &hooks,
@@ -1323,6 +1532,8 @@ mod tests {
             Some("session-b"),
             &persistent_manager,
             Some(root_b.path()),
+            None,
+            None,
         );
 
         let (outcome_a, outcome_b) = tokio::join!(

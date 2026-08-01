@@ -297,6 +297,8 @@ async fn hook_injected_env_reaches_bash_exec_command() {
         current_agent_package: None,
         persistent_manager: &persistent_manager,
         working_dir: None,
+        nats_hook_provider: None,
+        pending_async_context: None,
     })
     .await;
 

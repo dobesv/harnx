@@ -32,6 +32,8 @@ members = [
     "crates/harnx-spinner",
     "crates/harnx-test-bins",
     "crates/harnx-time-server",
+    "crates/harnx-hookset",
+    "crates/harnx-hookset-server",
     "crates/harnx-toolset",
     "crates/harnx-toolset-server",
     "crates/harnx-tui",
