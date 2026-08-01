@@ -18,10 +18,7 @@ use crate::{
     utils::dimmed_text,
 };
 use anyhow::{bail, Context, Result};
-use harnx_hooks::{
-    dispatch_hooks_with_count_and_manager, drain_async_results, inject_pending_async_context,
-    AsyncHookManager, HookEvent, HookResultControl, PersistentHookManager,
-};
+use harnx_hooks::{inject_pending_async_context, HookEvent, HookResultControl};
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
 use crate::client::retry::call_with_retry_and_fallback;
@@ -87,12 +84,6 @@ pub struct AgentLoopContext {
     pub config: GlobalConfig,
     pub instance_id: harnx_core::instance::InstanceId,
     pub abort_signal: AbortSignal,
-    /// Async hook manager (shared, mutex-protected). The CLI wraps its
-    /// `&mut AsyncHookManager` into an `Arc<Mutex<...>>` for the duration of
-    /// the call.
-    pub async_manager: Arc<tokio::sync::Mutex<AsyncHookManager>>,
-    /// Persistent hook manager (shared, mutex-protected).
-    pub persistent_manager: Arc<tokio::sync::Mutex<PersistentHookManager>>,
     /// Optional custom LLM call function. `None` → uses the default
     /// non-streaming `call_with_retry_and_fallback`.
     pub call_fn: Option<AgentCallFn>,
@@ -352,7 +343,6 @@ async fn apply_local_handoff(
 struct AgentHookDispatch<'a> {
     ctx: &'a AgentLoopContext,
     event: HookEvent,
-    hooks: &'a harnx_hooks::HooksConfig,
     session_id: &'a str,
     cwd: &'a std::path::Path,
     resume_count: u32,
@@ -362,36 +352,382 @@ async fn dispatch_agent_loop_hook(params: AgentHookDispatch<'_>) -> harnx_core::
     let AgentHookDispatch {
         ctx,
         event,
-        hooks,
         session_id,
         cwd,
         resume_count,
     } = params;
-    let async_guard = ctx.async_manager.lock().await;
-    let inline_event = event.clone();
-    let inline_fallback = dispatch_hooks_with_count_and_manager(
-        &inline_event,
-        &hooks.entries,
-        session_id,
-        cwd,
-        resume_count,
-        Some(&async_guard),
-        Some(&ctx.persistent_manager),
-    );
-    dispatch_hook_event(
-        HookEventDispatch {
-            event,
-            provider: ctx.nats_hook_provider.as_deref(),
-            meta: HookDispatchMeta {
-                session_id: session_id.to_string(),
-                cwd: cwd.to_path_buf(),
-                resume_count,
-            },
-            pending_async_context: ctx.pending_async_context.clone(),
+    dispatch_hook_event(HookEventDispatch {
+        event,
+        provider: ctx.nats_hook_provider.as_deref(),
+        meta: HookDispatchMeta {
+            session_id: session_id.to_string(),
+            cwd: cwd.to_path_buf(),
+            resume_count,
         },
-        inline_fallback,
+        pending_async_context: ctx.pending_async_context.clone(),
+    })
+    .await
+}
+
+async fn inject_shared_pending_context(
+    input: &mut Input,
+    shared_pending: Option<&Arc<tokio::sync::Mutex<Option<String>>>>,
+) {
+    if let Some(shared_pending) = shared_pending {
+        let mut pending_guard = shared_pending.lock().await;
+        let mut pending = pending_guard.take();
+        inject_pending_async_context(input, &mut pending);
+        *pending_guard = pending;
+    }
+}
+
+struct TurnHookContext {
+    session_id: String,
+    cwd: PathBuf,
+    max_resume: u32,
+}
+
+fn turn_hook_context(ctx: &AgentLoopContext) -> TurnHookContext {
+    let config = ctx.config.read();
+    let hooks = config.resolved_hooks();
+    TurnHookContext {
+        session_id: config
+            .session
+            .as_ref()
+            .map(|session| session.id().to_string())
+            .unwrap_or_else(|| "default".to_string()),
+        cwd: ctx
+            .working_dir
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
+        max_resume: ctx
+            .max_resume
+            .unwrap_or_else(|| hooks.max_resume.unwrap_or(5)),
+    }
+}
+
+async fn wait_for_session_compaction(config: &GlobalConfig) {
+    while config.read().is_compacting_session() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+async fn apply_round_embeddings(
+    input: &mut Input,
+    config: &GlobalConfig,
+    abort_signal: &AbortSignal,
+    enabled: bool,
+) -> Result<()> {
+    if enabled {
+        crate::config::input::use_embeddings(input, config, abort_signal.clone()).await?;
+    }
+    Ok(())
+}
+
+async fn user_prompt_blocked(
+    ctx: &AgentLoopContext,
+    input: &Input,
+    turn: &TurnHookContext,
+    resume_count: u32,
+) -> bool {
+    let outcome = dispatch_agent_loop_hook(AgentHookDispatch {
+        ctx,
+        event: HookEvent::UserPromptSubmit {
+            prompt: input.text().to_string(),
+        },
+        session_id: &turn.session_id,
+        cwd: &turn.cwd,
+        resume_count,
+    })
+    .await;
+    matches!(outcome.control, HookResultControl::Block { .. })
+}
+
+type AgentModelResult = Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)>;
+
+async fn call_agent_model(ctx: &AgentLoopContext, input: &mut Input) -> AgentModelResult {
+    if let Some(call_fn) = &ctx.call_fn {
+        call_fn(input, &ctx.config, ctx.abort_signal.clone()).await
+    } else {
+        call_with_retry_and_fallback(input, &ctx.config, ctx.abort_signal.clone()).await
+    }
+}
+
+struct FailedModelTurn<'a> {
+    ctx: &'a AgentLoopContext,
+    input: &'a Input,
+    turn: &'a TurnHookContext,
+    resume_count: u32,
+    error: anyhow::Error,
+}
+
+async fn fail_model_turn(params: FailedModelTurn<'_>) -> Result<LoopResult> {
+    let FailedModelTurn {
+        ctx,
+        input,
+        turn,
+        resume_count,
+        error,
+    } = params;
+    let _ = dispatch_agent_loop_hook(AgentHookDispatch {
+        ctx,
+        event: HookEvent::StopFailure {
+            error: error.to_string(),
+            error_type: "api_error".to_string(),
+        },
+        session_id: &turn.session_id,
+        cwd: &turn.cwd,
+        resume_count,
+    })
+    .await;
+    let _ = ctx
+        .config
+        .write()
+        .after_chat_completion(input, "", None, &[], &Default::default());
+    Err(error)
+}
+
+struct CompletionOutput<'a> {
+    output: &'a str,
+    thought: Option<&'a str>,
+    tool_calls: Vec<ToolCall>,
+    usage: &'a CompletionTokenUsage,
+}
+
+async fn complete_model_turn(
+    ctx: &AgentLoopContext,
+    input: &Input,
+    completion: CompletionOutput<'_>,
+) -> Result<Vec<ToolResult>> {
+    if completion.tool_calls.is_empty() {
+        ctx.config.write().after_chat_completion(
+            input,
+            completion.output,
+            completion.thought,
+            &[],
+            completion.usage,
+        )?;
+        return Ok(Vec::new());
+    }
+    ctx.config.write().record_completion_usage(completion.usage);
+    execute_tool_round(
+        ctx.tool_round_params(
+            &ctx.config,
+            input,
+            CompletionText {
+                output: completion.output,
+                thought: completion.thought,
+            },
+        ),
+        completion.tool_calls,
     )
     .await
+}
+
+fn emit_text_turn_status(
+    ctx: &AgentLoopContext,
+    usage: &CompletionTokenUsage,
+    text_only: bool,
+    emitted_text_turns: u32,
+) {
+    if ctx.on_text_response.is_some() || !text_only {
+        return;
+    }
+    let config = ctx.config.read();
+    let macro_flag = config.macro_flag;
+    let status = config.render_status_line(true);
+    let session_usage = config
+        .session
+        .as_ref()
+        .map(|session| session.completion_usage().clone());
+    let display_usage = session_usage.as_ref().unwrap_or(usage);
+    let context_stats = config
+        .session
+        .as_ref()
+        .map(|session| format_context_stats(session.tokens_usage()))
+        .unwrap_or_default();
+    drop(config);
+
+    let mut line_parts = Vec::new();
+    push_status_part(&mut line_parts, status);
+    push_status_part(
+        &mut line_parts,
+        (!display_usage.is_empty()).then(|| format!("   {display_usage}")),
+    );
+    push_status_part(
+        &mut line_parts,
+        (!context_stats.is_empty()).then(|| format!("  {context_stats}")),
+    );
+    emit_status_parts(line_parts, macro_flag, emitted_text_turns);
+}
+
+fn format_context_stats((tokens, percent): (usize, f32)) -> String {
+    if percent > 0.0 {
+        format!("💬 {}({:.0}%)", tokens, percent)
+    } else {
+        format!("💬 {tokens}")
+    }
+}
+
+fn push_status_part(parts: &mut Vec<String>, part: impl Into<Option<String>>) {
+    if let Some(part) = part.into().filter(|value| !value.is_empty()) {
+        parts.push(part);
+    }
+}
+
+fn emit_status_parts(parts: Vec<String>, macro_flag: bool, emitted_text_turns: u32) {
+    if parts.is_empty() {
+        return;
+    }
+    let prefix = if macro_flag || emitted_text_turns == 0 {
+        ""
+    } else {
+        "\n"
+    };
+    crate::utils::emit_info(format!("{prefix}{}", dimmed_text(&parts.join(""))));
+}
+
+struct TextStopDispatch<'a> {
+    ctx: &'a AgentLoopContext,
+    turn: &'a TurnHookContext,
+    resume_count: u32,
+    output: &'a str,
+    has_tool_results: bool,
+}
+
+async fn dispatch_text_stop(
+    params: TextStopDispatch<'_>,
+) -> Option<harnx_core::hooks::HookOutcome> {
+    if params.has_tool_results {
+        return None;
+    }
+    let outcome = dispatch_agent_loop_hook(AgentHookDispatch {
+        ctx: params.ctx,
+        event: HookEvent::Stop {
+            stop_hook_active: true,
+            last_assistant_message: Some(params.output.to_string()),
+        },
+        session_id: &params.turn.session_id,
+        cwd: &params.turn.cwd,
+        resume_count: params.resume_count,
+    })
+    .await;
+    if let Some(context) = outcome
+        .result
+        .additional_context
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        debug!("Captured Stop hook additional context for later auto-continue: {context}");
+    }
+    Some(outcome)
+}
+
+struct ToolRoundOutput {
+    output: String,
+    thought: Option<String>,
+    tool_results: Vec<ToolResult>,
+}
+
+enum ToolRoundAdvance {
+    Continue(Box<Input>),
+    Handoff(LoopResult),
+}
+
+async fn advance_tool_round(
+    ctx: &AgentLoopContext,
+    input: Input,
+    round: ToolRoundOutput,
+) -> ToolRoundAdvance {
+    let switch_agent = round
+        .tool_results
+        .iter()
+        .find_map(|result| result.switch_agent.clone());
+    let mut merged_input =
+        input.merge_tool_results(round.output, round.thought, round.tool_results.clone());
+    if let Some(callback) = &ctx.on_tool_round {
+        callback(&mut merged_input, &round.tool_results).await;
+    }
+    if let Some(switch) = switch_agent {
+        emit_handoff_request(ctx, &switch);
+        return ToolRoundAdvance::Handoff(LoopResult::HandoffRequested {
+            agent: switch.agent,
+            session_id: switch.session_id,
+            prompt: switch.prompt,
+        });
+    }
+    ToolRoundAdvance::Continue(Box::new(merged_input))
+}
+
+fn emit_handoff_request(ctx: &AgentLoopContext, switch: &harnx_core::tool::SwitchAgentData) {
+    let source = harnx_core::event::AgentSource {
+        agent: switch.agent.clone(),
+        session_id: switch.session_id.clone(),
+        model: ctx.config.read().current_model_id(),
+    };
+    harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::sub_agent(
+        source,
+        harnx_core::event::AgentEvent::Turn(harnx_core::event::TurnEvent::HandoffRequested {
+            agent: switch.agent.clone(),
+            session_id: switch.session_id.clone(),
+        }),
+    ));
+}
+
+enum ResumeAction {
+    None,
+    Abort,
+    Context(String),
+}
+
+fn stop_resume_action(
+    ctx: &AgentLoopContext,
+    turn: &TurnHookContext,
+    resume_count: u32,
+    outcome: Option<harnx_core::hooks::HookOutcome>,
+) -> ResumeAction {
+    let Some(outcome) = outcome else {
+        return ResumeAction::None;
+    };
+    if !outcome.result.resume.unwrap_or(false) || resume_count >= turn.max_resume {
+        return ResumeAction::None;
+    }
+    if ctx.abort_signal.aborted() {
+        return ResumeAction::Abort;
+    }
+    ResumeAction::Context(
+        outcome
+            .result
+            .additional_context
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "Continue working on pending tasks.".to_string()),
+    )
+}
+
+async fn pending_resume_action(
+    ctx: &AgentLoopContext,
+    turn: &TurnHookContext,
+    resume_count: u32,
+) -> ResumeAction {
+    if resume_count >= turn.max_resume {
+        return ResumeAction::None;
+    }
+    let Some(shared_pending) = &ctx.pending_async_context else {
+        return ResumeAction::None;
+    };
+    let Some(context) = shared_pending
+        .lock()
+        .await
+        .take()
+        .filter(|value| !value.is_empty())
+    else {
+        return ResumeAction::None;
+    };
+    if ctx.abort_signal.aborted() {
+        ResumeAction::Abort
+    } else {
+        ResumeAction::Context(context)
+    }
 }
 
 async fn run_agent_loop_inner(
@@ -411,138 +747,46 @@ async fn run_agent_loop_inner(
             break;
         }
 
-        // Wait for any ongoing session compaction to finish.
-        while config.read().is_compacting_session() {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
+        wait_for_session_compaction(config).await;
+        apply_round_embeddings(&mut input, config, abort_signal, with_embeddings).await?;
 
-        // Apply embeddings on the first round and after agent switches.
-        if with_embeddings {
-            crate::config::input::use_embeddings(&mut input, config, abort_signal.clone()).await?;
-        }
-
-        // Drain completed async hooks and inject any pending context.
-        {
-            let mut async_guard = ctx.async_manager.lock().await;
-            let mut pending: Option<String> = None;
-            if let Some(shared_pending) = &ctx.pending_async_context {
-                let mut pending_guard = shared_pending.lock().await;
-                pending = pending_guard.take();
-            }
-            drain_async_results(&mut async_guard, &mut pending);
-            inject_pending_async_context(&mut input, &mut pending);
-            if let Some(shared_pending) = &ctx.pending_async_context {
-                let mut pending_guard = shared_pending.lock().await;
-                *pending_guard = pending;
-            }
-        }
+        // Inject context queued directly by the NATS hook provider.
+        inject_shared_pending_context(&mut input, ctx.pending_async_context.as_ref()).await;
 
         config.write().before_chat_completion(&input)?;
 
-        let (hooks, session_id, cwd) = {
-            let cfg = config.read();
-            (
-                cfg.resolved_hooks(),
-                cfg.session
-                    .as_ref()
-                    .map(|s| s.id().to_string())
-                    .unwrap_or_else(|| "default".to_string()),
-                ctx.working_dir
-                    .clone()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
-            )
-        };
-
-        let max_resume = ctx
-            .max_resume
-            .unwrap_or_else(|| hooks.max_resume.unwrap_or(5));
-
-        // Dispatch UserPromptSubmit hook (was previously TUI-only; now unified).
-        {
-            let event = HookEvent::UserPromptSubmit {
-                prompt: input.text().to_string(),
-            };
-            let outcome = dispatch_agent_loop_hook(AgentHookDispatch {
-                ctx,
-                event,
-                hooks: &hooks,
-                session_id: &session_id,
-                cwd: &cwd,
-                resume_count,
-            })
-            .await;
-            if matches!(outcome.control, HookResultControl::Block { .. }) {
-                break;
-            }
+        let turn = turn_hook_context(ctx);
+        if user_prompt_blocked(ctx, &input, &turn, resume_count).await {
+            break;
         }
 
-        // LLM call (with retry + fallback).
-        let llm_result = if let Some(ref call_fn) = ctx.call_fn {
-            call_fn(&mut input, config, abort_signal.clone()).await
-        } else {
-            // Use the default call function, which respects config.stream:
-            // streaming (call_chat_completions_streaming) when enabled, or
-            // non-streaming (call_chat_completions) otherwise. Critically,
-            // call_chat_completions_streaming does NOT write to stdout, which
-            // matters for server mode where stdout is a protocol
-            // transport. The old hardcoded call_chat_completions(inp, true, ...)
-            // always printed to stdout, corrupting the connection.
-            call_with_retry_and_fallback(&mut input, config, abort_signal.clone()).await
-        };
+        let llm_result = call_agent_model(ctx, &mut input).await;
 
         let (output, thought, tool_calls, usage) = match llm_result {
             Ok(result) => result,
             Err(err) => {
-                // LLM error — dispatch StopFailure hook and persist empty turn.
-                let event = HookEvent::StopFailure {
-                    error: err.to_string(),
-                    error_type: "api_error".to_string(),
-                };
-                let _ = dispatch_agent_loop_hook(AgentHookDispatch {
+                return fail_model_turn(FailedModelTurn {
                     ctx,
-                    event,
-                    hooks: &hooks,
-                    session_id: &session_id,
-                    cwd: &cwd,
+                    input: &input,
+                    turn: &turn,
                     resume_count,
+                    error: err,
                 })
                 .await;
-                let _ = config.write().after_chat_completion(
-                    &input,
-                    "",
-                    None,
-                    &[],
-                    &Default::default(),
-                );
-                return Err(err);
             }
         };
 
-        // Persist + run tools (if any), or persist plain text response.
-        let tool_results = if tool_calls.is_empty() {
-            config.write().after_chat_completion(
-                &input,
-                &output,
-                thought.as_deref(),
-                &[],
-                &usage,
-            )?;
-            Vec::new()
-        } else {
-            config.write().record_completion_usage(&usage);
-            execute_tool_round(
-                ctx.tool_round_params(
-                    config,
-                    &input,
-                    CompletionText {
-                        output: &output,
-                        thought: thought.as_deref(),
-                    },
-                ),
+        let tool_results = complete_model_turn(
+            ctx,
+            &input,
+            CompletionOutput {
+                output: &output,
+                thought: thought.as_deref(),
                 tool_calls,
-            )
-            .await?
-        };
+                usage: &usage,
+            },
+        )
+        .await?;
 
         // `injected_user_text` is a one-shot field — it was written to the
         // session by `begin_turn` (inside `add_assistant_text` /
@@ -551,119 +795,32 @@ async fn run_agent_loop_inner(
         // injection from the next pending user message below.
         input.injected_user_text = None;
 
-        // Emit status/usage line for text-only turns. CLI-only: fires when
-        // no on_text_response callback is set. TUI and server frontends handle their own
-        // display via on_text_response or their own UI.
-        if ctx.on_text_response.is_none() && tool_results.is_empty() {
-            let config_read = config.read();
-            let macro_flag = config_read.macro_flag;
-            let status = config_read.render_status_line(true);
-            let session_usage = config_read
-                .session
-                .as_ref()
-                .map(|s| s.completion_usage().clone());
-            let display_usage = session_usage.as_ref().unwrap_or(&usage);
-            let context_stats = config_read
-                .session
-                .as_ref()
-                .map(|s| {
-                    let (tokens, percent) = s.tokens_usage();
-                    if percent > 0.0 {
-                        format!("💬 {}({:.0}%)", tokens, percent)
-                    } else {
-                        format!("💬 {}", tokens)
-                    }
-                })
-                .unwrap_or_default();
-            drop(config_read);
-            let mut line_parts = vec![];
-            if !status.is_empty() {
-                line_parts.push(status);
-            }
-            if !display_usage.is_empty() {
-                line_parts.push(format!("   {}", display_usage));
-            }
-            if !context_stats.is_empty() {
-                line_parts.push(format!("  {}", context_stats));
-            }
-            if !line_parts.is_empty() {
-                let prefix = if macro_flag || emitted_text_turns == 0 {
-                    ""
-                } else {
-                    "\n"
-                };
-                crate::utils::emit_info(format!("{prefix}{}", dimmed_text(&line_parts.join(""))));
-            }
-        }
+        emit_text_turn_status(ctx, &usage, tool_results.is_empty(), emitted_text_turns);
 
-        // Dispatch Stop hook for pure-text turns (no tools).
-        let stop_outcome = if tool_results.is_empty() {
-            let event = HookEvent::Stop {
-                stop_hook_active: true,
-                last_assistant_message: Some(output.clone()),
-            };
-            let outcome = dispatch_agent_loop_hook(AgentHookDispatch {
-                ctx,
-                event,
-                hooks: &hooks,
-                session_id: &session_id,
-                cwd: &cwd,
-                resume_count,
-            })
-            .await;
-            if let Some(additional_context) = outcome
-                .result
-                .additional_context
-                .as_deref()
-                .filter(|v| !v.is_empty())
-            {
-                debug!(
-                    "Captured Stop hook additional context for later auto-continue: \
-                     {additional_context}"
-                );
-            }
-            Some(outcome)
-        } else {
-            None
-        };
+        let stop_outcome = dispatch_text_stop(TextStopDispatch {
+            ctx,
+            turn: &turn,
+            resume_count,
+            output: &output,
+            has_tool_results: !tool_results.is_empty(),
+        })
+        .await;
 
         if !tool_results.is_empty() {
-            // Check for agent switch request.
-            let switch_agent = tool_results.iter().find_map(|v| v.switch_agent.clone());
-
-            // Merge tool results into input for the next round.
-            let mut merged_input = input.merge_tool_results(output, thought, tool_results.clone());
-
-            // Invoke the on_tool_round callback (TUI uses this for
-            // ToolRoundComplete + pending message injection).
-            if let Some(ref cb) = ctx.on_tool_round {
-                cb(&mut merged_input, &tool_results).await;
+            match advance_tool_round(
+                ctx,
+                input,
+                ToolRoundOutput {
+                    output,
+                    thought,
+                    tool_results,
+                },
+            )
+            .await
+            {
+                ToolRoundAdvance::Continue(next_input) => input = *next_input,
+                ToolRoundAdvance::Handoff(result) => return Ok(result),
             }
-
-            if let Some(switch) = switch_agent {
-                let source = harnx_core::event::AgentSource {
-                    agent: switch.agent.clone(),
-                    session_id: switch.session_id.clone(),
-                    model: ctx.config.read().current_model_id(),
-                };
-                harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::sub_agent(
-                    source,
-                    harnx_core::event::AgentEvent::Turn(
-                        harnx_core::event::TurnEvent::HandoffRequested {
-                            agent: switch.agent.clone(),
-                            session_id: switch.session_id.clone(),
-                        },
-                    ),
-                ));
-                return Ok(LoopResult::HandoffRequested {
-                    agent: switch.agent.clone(),
-                    session_id: switch.session_id.clone(),
-                    prompt: switch.prompt.clone(),
-                });
-            }
-
-            // Normal tool round: loop with merged input.
-            input = merged_input;
             with_embeddings = false;
             continue;
         }
@@ -674,45 +831,26 @@ async fn run_agent_loop_inner(
         }
         emitted_text_turns += 1;
 
-        // Check if stop hook wants to auto-resume.
-        if let Some(outcome) = stop_outcome {
-            if outcome.result.resume.unwrap_or(false) && resume_count < max_resume {
-                if abort_signal.aborted() {
-                    break;
-                }
-                let context = outcome
-                    .result
-                    .additional_context
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or_else(|| "Continue working on pending tasks.".to_string());
+        match stop_resume_action(ctx, &turn, resume_count, stop_outcome) {
+            ResumeAction::Context(context) => {
                 input = crate::config::input::from_str(config, &context, None);
                 resume_count += 1;
                 with_embeddings = true;
                 continue;
             }
+            ResumeAction::Abort => break,
+            ResumeAction::None => {}
         }
 
-        // Check async hook results for auto-continue.
-        let async_resume_context = {
-            let mut async_guard = ctx.async_manager.lock().await;
-            let mut pending: Option<String> = None;
-            if drain_async_results(&mut async_guard, &mut pending) && resume_count < max_resume {
-                pending
-                    .take()
-                    .filter(|v| !v.is_empty())
-                    .or(Some("Continue working on pending tasks.".to_string()))
-            } else {
-                None
+        match pending_resume_action(ctx, &turn, resume_count).await {
+            ResumeAction::Context(context) => {
+                input = crate::config::input::from_str(config, &context, None);
+                resume_count += 1;
+                with_embeddings = true;
+                continue;
             }
-        };
-        if let Some(context) = async_resume_context {
-            if abort_signal.aborted() {
-                break;
-            }
-            input = crate::config::input::from_str(config, &context, None);
-            resume_count += 1;
-            with_embeddings = true;
-            continue;
+            ResumeAction::Abort => break,
+            ResumeAction::None => {}
         }
 
         // Done.
@@ -732,7 +870,6 @@ mod tests {
     use crate::client::MessageRole;
     use crate::utils::create_abort_signal;
     use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, TurnEvent};
-    use harnx_hooks::{AsyncHookManager, PersistentHookManager};
     use parking_lot::RwLock;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -864,8 +1001,6 @@ mod tests {
             instance_id: harnx_core::instance::InstanceId::new(),
             config: global_config,
             abort_signal: create_abort_signal(),
-            async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::new())),
-            persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new())),
             call_fn: Some(call_fn),
             on_tool_round: Some(on_tool_round),
             on_text_response: None,
@@ -877,6 +1012,25 @@ mod tests {
             pending_async_context: None,
             session_lock: None,
         }
+    }
+
+    #[tokio::test]
+    async fn shared_pending_context_is_taken_and_injected_into_next_input() {
+        let config = Arc::new(RwLock::new(crate::config::Config::default()));
+        let mut input = crate::config::input::from_str(&config, "user prompt", None);
+        let pending = Arc::new(tokio::sync::Mutex::new(Some(
+            "context queued over NATS".to_string(),
+        )));
+
+        inject_shared_pending_context(&mut input, Some(&pending)).await;
+
+        assert_eq!(
+            input.text(),
+            "context queued over NATS
+
+user prompt"
+        );
+        assert!(pending.lock().await.is_none());
     }
 
     fn handoff_event_matches_expected((event, source): &(AgentEvent, Option<AgentSource>)) -> bool {

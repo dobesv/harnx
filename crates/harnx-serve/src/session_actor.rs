@@ -1190,13 +1190,76 @@ fn build_loop_ctx(
             }
         })
     });
-    harnx_session::build_context(
-        prompt_config,
+    let context = harnx_session::build_context(
+        prompt_config.clone(),
         call_fn,
         abort_signal,
         Some(on_tool_round),
         working_dir,
-    )
+    );
+    #[cfg(test)]
+    let context = {
+        let mut context = context;
+        context.nats_hook_provider = test_hook_provider(&prompt_config);
+        context
+    };
+    context
+}
+
+#[cfg(test)]
+fn test_hook_provider(
+    config: &GlobalConfig,
+) -> Option<Arc<harnx_runtime::nats_hook_provider::NatsHookProvider>> {
+    use harnx_core::hooks::{HookOutcome, HookResult, HookResultControl};
+    use harnx_hookset::{FailPolicy, HookSpec};
+    use harnx_runtime::nats_hook_provider::{DiscoveredHook, NatsHookProvider};
+
+    let hooks = config.read().resolved_hooks().entries;
+    if hooks.is_empty() {
+        return None;
+    }
+    let outcomes = hooks
+        .iter()
+        .enumerate()
+        .map(|(index, hook)| {
+            let reason = hook
+                .command
+                .split("permissionDecisionReason\":\"")
+                .nth(1)
+                .and_then(|tail| tail.split('\"').next())
+                .map(str::to_string);
+            (format!("test-hook-{index}"), reason)
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let discovered = hooks
+        .into_iter()
+        .enumerate()
+        .map(|(index, hook)| DiscoveredHook {
+            server: format!("test-hook-{index}"),
+            spec: HookSpec {
+                event: hook.event,
+                matcher: hook.matcher,
+                priority: index as i32,
+                timeout_secs: hook.timeout,
+                fail_policy: FailPolicy::Closed,
+            },
+        })
+        .collect();
+    let handler = Arc::new(move |subject: &str, _payload| {
+        let reason = outcomes
+            .iter()
+            .find(|(server, _)| subject.split('.').nth(4) == Some(server.as_str()))
+            .and_then(|(_, reason)| reason.clone());
+        HookOutcome {
+            control: HookResultControl::Ask { reason },
+            result: HookResult::default(),
+        }
+    });
+    Some(Arc::new(NatsHookProvider::from_request_handler(
+        harnx_core::instance::InstanceId::from_string("session-actor-test"),
+        discovered,
+        handler,
+    )))
 }
 
 fn prompt_config_for_agent_session_from_global(

@@ -5,7 +5,6 @@
 //! rendered output.
 
 use crate::types::Tui;
-use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use harnx_runtime::config::{Config, GlobalConfig};
 use harnx_runtime::test_utils::SyncHarness;
 
@@ -13,7 +12,6 @@ use parking_lot::RwLock;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 /// A test harness for TUI rendering tests.
 ///
@@ -58,10 +56,7 @@ impl TuiTestHarness {
     }
 
     async fn with_config_and_size(config: GlobalConfig, width: u16, height: u16) -> Self {
-        let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-        let tui = Tui::init(&config, AsyncHookManager::new(), persistent)
-            .await
-            .unwrap();
+        let tui = Tui::init(&config).await.unwrap();
 
         let backend = TestBackend::new(width, height);
         let terminal = Terminal::new(backend).unwrap();

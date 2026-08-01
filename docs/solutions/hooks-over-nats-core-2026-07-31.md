@@ -15,6 +15,7 @@ tags:
   - testing
 plan_ref: "hooks-over-nats-core"
 last_updated: 2026-08-01
+superseded_by: "hooks-nats-launch-dispatch-complete-2026-08-01"
 ---
 
 # Solution: Hooks over NATS Core
@@ -195,15 +196,17 @@ let mut accumulated = guard.take().unwrap_or_default();
 
 1. **PostToolUse mutated_tool_response dropped**: NATS PostToolUse hooks cannot mutate the tool response. Logged and ignored. Restoring this is deferred.
 
-2. **PreToolUse additional_context/system_message not yet injected**: NATS PreToolUse hooks can return these fields, but they're not routed. PostToolUse is. Deferred to config-migration slice.
+2. **~~PreToolUse additional_context/system_message not yet injected~~ — RESOLVED**: NATS PreToolUse hooks now route these fields via `ContinueResultAccumulator`. See `hooks-nats-launch-dispatch-complete-2026-08-01.md`.
 
 3. **Ask-over-NATS headless edge**: `Ask` routes through `ToolApprovalRequiredError`, but headless-worker resolution needs design. Deferred.
 
-4. **Discovery-error → inline-only**: If registry read fails, worker continues with inline hooks only. Safe because no NATS-only security hook exists yet.
+4. **~~Discovery-error → inline-only~~ — RESOLVED (Phase 4)**: Inline path removed. `dispatch_hook_event` with no provider returns Continue and logs warning. Frontends without `HARNX_INSTANCE_ID` get no hook enforcement by design.
 
 5. **Registry trust model**: Mirrors tool registry — any process with the NATS token can register. Trust is per-broker, not per-hook.
 
 6. **Matcher uses bare tool name**: Hook specs match `bash_exec` or `fs_read`, not prefixed display names. Renaming an MCP server doesn't require updating matchers.
+
+7. **~~FailPolicy::Closed fail-open on crash~~ — RESOLVED (Phase 4)**: Expectations manifest (`harnx_hook_expectations` KV bucket) ensures missing required Closed hooks fail closed. See `hooks-nats-launch-dispatch-complete-2026-08-01.md`.
 
 ## Prevention Strategies
 
@@ -214,9 +217,8 @@ let mut accumulated = guard.take().unwrap_or_default();
 
 **Code review checklist:**
 - [ ] Are shared contexts (`Arc<Mutex<...>>`) allocated before dispatch?
-- [ ] Does the NATS client have a fallback path for non-NATS callers?
-- [ ] Does NATS dispatch preserve inline hook execution?
 - [ ] Are matcher comparisons against bare tool names?
+- [ ] Does expectations manifest cover all required Closed hooks?
 
 **Monitoring:**
 - Hook registry bucket exists and contains expected keys.
@@ -227,4 +229,4 @@ let mut accumulated = guard.take().unwrap_or_default();
 
 - **GitHub:** [#1224](https://github.com/dobesv/harnx/issues/1224) — Native migration umbrella.
 - **Prior solution:** `nats-instance-scoped-tool-servers-2026-07-29.md` — Instance-scoped tool servers and registration pattern.
-- **Deferred:** `HookServerSupervisor`, `hooks/*.yaml` config loading, proxy-auth → NATS, bash native (S4).
+- **Deferred:** InstructionsLoaded/CwdChanged firing, PostToolUse response mutation.

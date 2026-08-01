@@ -220,7 +220,7 @@ Ask returns as `HookResultControl::Ask`. Engine's `confirm_tool_use_fn` converts
 
 ## Accepted Behavior Changes / Known Gaps
 
-1. **FailPolicy::Closed crash/startup handling:** This branch can treat a missing Closed-policy hook as no match. The Phase 4 follow-up closes that gap with the `harnx_hook_expectations` manifest, which tracks required hooks when registrations disappear.
+1. **~~FailPolicy::Closed fail-open on crash/startup failure~~ — RESOLVED (Phase 4):** Now uses `harnx_hook_expectations` KV manifest. Supervisor publishes required fail-closed hook specs before spawning; `NatsHookProvider::discover` merges any expected-but-unregistered hook into the discovery result. A missing or crashed hook configured with `FailPolicy::Closed` that the supervisor was asked to launch makes its matched PreToolUse dispatch fail closed (Block) rather than silently continuing. Genuine KV read failure (distinguished via JetStream `STREAM_NOT_FOUND` 10059) also installs a fail-closed guard instead of failing open.
 
 2. **Handoff stop-then-start window:** Brief gap where zero agent hooks registered. Sequential stop-then-start is atomic for swap semantics. Acceptable.
 
@@ -259,4 +259,4 @@ Ask returns as `HookResultControl::Ask`. Engine's `confirm_tool_use_fn` converts
 
 - **GitHub:** [#1224](https://github.com/dobesv/harnx/issues/1224) — Umbrella issue
 - **Prior solution:** `hooks-over-nats-core-2026-07-31.md` — Initial NATS dispatch path
-- **Deferred:** Phase 4 inline removal, InstructionsLoaded/CwdChanged firing, native proxy-auth config migration
+- **Completed (Phase 4):** Inline runtime dispatch removed; bash proxy-auth migrated to launched NATS hook via `hooks:` on tool-server config; expectations manifest closes fail-open gap

@@ -1,13 +1,16 @@
 use crate::config::{Config, LOCAL_CLUSTER_KEY};
 use anyhow::{Context, Result};
+use async_nats::jetstream::{context::GetStreamErrorKind, ErrorCode};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResult, HookResultControl};
 use harnx_core::instance::InstanceId;
-use harnx_hookset::{FailPolicy, HookRegistration, HookSpec, HOOK_REGISTRY_BUCKET};
+use harnx_hookset::{
+    FailPolicy, HookRegistration, HookSpec, HOOK_EXPECTATIONS_BUCKET, HOOK_REGISTRY_BUCKET,
+};
 use harnx_hookset_server::hook_registration_key;
-use std::future::Future;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,28 +34,30 @@ pub struct HookEventDispatch<'a> {
     pub pending_async_context: Option<Arc<Mutex<Option<String>>>>,
 }
 
-/// Dispatch one hook event through NATS, or use the inline runtime while no
-/// NATS provider is available. The inline future is lazy and isn't polled when
-/// NATS owns dispatch.
-pub async fn dispatch_hook_event<F>(
-    params: HookEventDispatch<'_>,
-    inline_fallback: F,
-) -> HookOutcome
-where
-    F: Future<Output = HookOutcome>,
-{
+/// Dispatch one hook event through NATS.
+///
+/// A missing provider is a valid state for unit contexts and frontends that do
+/// not carry worker identity. In that case hooks are unavailable, so dispatch
+/// is a no-op rather than a panic or an inline subprocess fallback.
+pub async fn dispatch_hook_event(params: HookEventDispatch<'_>) -> HookOutcome {
     match params.provider {
         Some(provider) => {
             provider
                 .dispatch_event(params.event, params.pending_async_context, params.meta)
                 .await
         }
-        None => inline_fallback.await,
+        None => {
+            log::warn!(
+                "NATS hook provider unavailable; continuing without hook enforcement for {}",
+                params.event.event_name()
+            );
+            continue_outcome(None)
+        }
     }
 }
 
 /// Discover hooks for binaries launched inside a worker process tree.
-/// Frontends without `HARNX_INSTANCE_ID` keep the inline fallback.
+/// Frontends without `HARNX_INSTANCE_ID` use no-op hook dispatch.
 pub async fn discover_process_nats_hook_provider(config: &Config) -> Option<Arc<NatsHookProvider>> {
     let instance_id = std::env::var(harnx_core::instance::HARNX_INSTANCE_ID).ok()?;
     NatsHookProvider::discover(config, InstanceId::from_string(instance_id))
@@ -97,6 +102,25 @@ impl HookRequestDispatcher for NatsHookRequester {
     }
 }
 
+type HookRequestHandler = dyn Fn(&str, HookPayload) -> HookOutcome + Send + Sync;
+
+struct HandlerHookRequester {
+    handler: Arc<HookRequestHandler>,
+}
+
+#[async_trait]
+impl HookRequestDispatcher for HandlerHookRequester {
+    async fn request(
+        &self,
+        subject: String,
+        payload: Vec<u8>,
+        _timeout: Duration,
+    ) -> Result<HookOutcome> {
+        let payload = serde_json::from_slice(&payload).context("deserialize test hook payload")?;
+        Ok((self.handler)(&subject, payload))
+    }
+}
+
 /// Discovers and dispatches hooks registered for one worker instance.
 pub struct NatsHookProvider {
     client: Option<async_nats::Client>,
@@ -108,14 +132,17 @@ pub struct NatsHookProvider {
 impl NatsHookProvider {
     pub async fn discover(config: &Config, instance_id: InstanceId) -> Result<Self> {
         let client = config.nats_client(LOCAL_CLUSTER_KEY).await?;
-        let hooks = match registration_snapshot(&client, &instance_id).await {
-            Ok(hooks) => hooks,
-            Err(error) => {
-                // Hook servers create the registry lazily, so a fresh instance has no bucket.
-                log::debug!("NATS hook registry is not available yet: {error:#}");
-                Vec::new()
-            }
-        };
+        let hooks = hooks_or_fail_closed_guard(registration_snapshot(&client, &instance_id).await);
+        Ok(Self::from_hooks(client, instance_id, hooks))
+    }
+
+    /// Discover hooks using an existing client. Used by live-NATS lifecycle tests.
+    #[doc(hidden)]
+    pub async fn discover_with_client(
+        client: async_nats::Client,
+        instance_id: InstanceId,
+    ) -> Result<Self> {
+        let hooks = hooks_or_fail_closed_guard(registration_snapshot(&client, &instance_id).await);
         Ok(Self::from_hooks(client, instance_id, hooks))
     }
 
@@ -132,6 +159,22 @@ impl NatsHookProvider {
             instance_id,
             hooks,
             dispatcher,
+        }
+    }
+
+    /// Construct a provider backed by an in-process request handler.
+    /// Used by consumers that test NATS-only dispatch without a broker.
+    #[doc(hidden)]
+    pub fn from_request_handler(
+        instance_id: InstanceId,
+        hooks: Vec<DiscoveredHook>,
+        handler: Arc<HookRequestHandler>,
+    ) -> Self {
+        Self {
+            client: None,
+            instance_id,
+            hooks,
+            dispatcher: Arc::new(HandlerHookRequester { handler }),
         }
     }
 
@@ -585,12 +628,83 @@ fn emit_post_notice(message: String) {
     harnx_core::sink::emit_agent_event(AgentEvent::Notice(NoticeEvent::Error(message)));
 }
 
+fn hooks_or_fail_closed_guard(snapshot: Result<Vec<DiscoveredHook>>) -> Vec<DiscoveredHook> {
+    match snapshot {
+        Ok(hooks) => hooks,
+        Err(error) => {
+            log::warn!(
+                "NATS hook discovery failed; installing fail-closed PreToolUse guard: {error:#}"
+            );
+            vec![DiscoveredHook {
+                server: "hook-registry-unavailable".to_string(),
+                spec: HookSpec {
+                    event: "PreToolUse".to_string(),
+                    matcher: Some(".*".to_string()),
+                    priority: i32::MIN,
+                    timeout_secs: Some(1),
+                    fail_policy: FailPolicy::Closed,
+                },
+            }]
+        }
+    }
+}
 async fn registration_snapshot(
     client: &async_nats::Client,
     instance_id: &InstanceId,
 ) -> Result<Vec<DiscoveredHook>> {
+    let registrations = optional_bucket_snapshot(client, instance_id, HOOK_REGISTRY_BUCKET)
+        .await?
+        .unwrap_or_default();
+    let active_servers: HashSet<_> = registrations
+        .iter()
+        .map(|hook| hook.server.clone())
+        .collect();
+    let mut hooks = registrations;
+
+    // Expectations remain while their local supervisor owns the hook. If the
+    // child never registered or crashed, dispatch still reaches that route and
+    // the request failure applies FailPolicy::Closed instead of disappearing.
+    // Only STREAM_NOT_FOUND means a fresh instance has no expectations. Any
+    // other read failure propagates so callers can't cache an empty provider.
+    let expected = optional_bucket_snapshot(client, instance_id, HOOK_EXPECTATIONS_BUCKET)
+        .await?
+        .unwrap_or_default();
+    hooks.extend(
+        expected
+            .into_iter()
+            .filter(|hook| !active_servers.contains(&hook.server)),
+    );
+    Ok(hooks)
+}
+
+async fn optional_bucket_snapshot(
+    client: &async_nats::Client,
+    instance_id: &InstanceId,
+    bucket: &str,
+) -> Result<Option<Vec<DiscoveredHook>>> {
     let jetstream = async_nats::jetstream::new(client.clone());
-    let store = jetstream.get_key_value(HOOK_REGISTRY_BUCKET).await?;
+    match jetstream.get_stream(format!("KV_{bucket}")).await {
+        Ok(_) => bucket_snapshot(client, instance_id, bucket).await.map(Some),
+        Err(error)
+            if matches!(
+                error.kind(),
+                GetStreamErrorKind::JetStream(ref error)
+                    if error.kind() == ErrorCode::STREAM_NOT_FOUND
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error).with_context(|| format!("read hook KV bucket '{bucket}'")),
+    }
+}
+
+async fn bucket_snapshot(
+    client: &async_nats::Client,
+    instance_id: &InstanceId,
+    bucket: &str,
+) -> Result<Vec<DiscoveredHook>> {
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let store = jetstream.get_key_value(bucket).await?;
     let mut keys = store.keys().await?;
     let prefix = format!("{instance_id}.");
     let mut hooks = Vec::new();
@@ -604,7 +718,7 @@ async fn registration_snapshot(
         let registration = match serde_json::from_slice::<HookRegistration>(&value) {
             Ok(registration) => registration,
             Err(error) => {
-                log::warn!("ignoring invalid NATS hook registration '{key}': {error}");
+                log::warn!("ignoring invalid NATS hook entry '{bucket}.{key}': {error}");
                 continue;
             }
         };
@@ -1076,32 +1190,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unified_entrypoint_uses_inline_fallback_without_provider() {
-        let outcome = HookOutcome {
-            control: HookResultControl::Block {
-                reason: "inline".to_string(),
+    async fn unified_entrypoint_without_provider_is_noop() {
+        let actual = dispatch_hook_event(HookEventDispatch {
+            event: HookEvent::SessionEnd {
+                reason: "test".to_string(),
             },
-            result: HookResult::default(),
-        };
-        let actual = dispatch_hook_event(
-            HookEventDispatch {
-                event: HookEvent::SessionEnd {
-                    reason: "test".to_string(),
-                },
-                provider: None,
-                meta: HookDispatchMeta {
-                    session_id: "session".to_string(),
-                    cwd: PathBuf::from("/tmp"),
-                    resume_count: 0,
-                },
-                pending_async_context: None,
+            provider: None,
+            meta: HookDispatchMeta {
+                session_id: "session".to_string(),
+                cwd: PathBuf::from("/tmp"),
+                resume_count: 0,
             },
-            std::future::ready(outcome.clone()),
-        )
+            pending_async_context: None,
+        })
         .await;
+        assert_eq!(actual.control, HookResultControl::Continue);
         assert_eq!(
-            serde_json::to_value(actual).unwrap(),
-            serde_json::to_value(outcome).unwrap()
+            serde_json::to_value(actual.result).unwrap(),
+            serde_json::to_value(HookResult::default()).unwrap()
         );
     }
 
@@ -1269,5 +1375,26 @@ mod tests {
             HookResultControl::Ask { reason }
                 if reason.as_deref() == Some("approval needed")
         ));
+    }
+
+    #[tokio::test]
+    async fn discovery_read_failure_guard_blocks_pre_tool_use() {
+        let hooks = hooks_or_fail_closed_guard(Err(anyhow::anyhow!("KV read failed")));
+        let dispatcher = stub(Vec::new());
+        let provider =
+            NatsHookProvider::from_dispatcher(InstanceId::from_string("test"), hooks, dispatcher);
+        let outcome = provider
+            .dispatch_event(
+                pre_event(json!({"command": "true"})),
+                None,
+                HookDispatchMeta {
+                    session_id: "session".to_string(),
+                    cwd: PathBuf::from("/tmp"),
+                    resume_count: 0,
+                },
+            )
+            .await;
+
+        assert!(matches!(outcome.control, HookResultControl::Block { .. }));
     }
 }

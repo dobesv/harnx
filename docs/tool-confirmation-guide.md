@@ -4,7 +4,7 @@ Tool confirmation allows you to inspect and approve tool calls before they execu
 
 ## 1. Quick Start
 
-The fastest way to enable manual confirmation for all tools is to add an inline hook to your `config.yaml`:
+The fastest way to enable manual confirmation for all tools is to add a hook entry to your `config.yaml`:
 
 ```yaml
 hooks:

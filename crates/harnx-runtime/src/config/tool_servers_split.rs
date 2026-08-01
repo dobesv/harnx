@@ -140,6 +140,36 @@ hooks:
     }
 
     #[test]
+    fn shipped_bash_config_launches_proxy_auth_as_tool_hook() {
+        let coding = include_str!("../../../../packages/coding/tool_servers/bash.yaml");
+        let pantheon = include_str!("../../../../packages/pantheon/tool_servers/bash.yaml");
+        assert_eq!(coding, pantheon);
+
+        let config: ToolServerConfig = serde_yaml::from_str(coding).expect("parse bash config");
+        assert_eq!(
+            config.args[..5],
+            [
+                "--name",
+                "bash",
+                "--",
+                "harnx-mcp-bash",
+                "--default-root-cwd"
+            ]
+        );
+        let hooks = config.hooks.expect("bash hooks");
+        assert_eq!(hooks.entries.len(), 1);
+        let hook = &hooks.entries[0];
+        assert_eq!(hook.event, "PreToolUse");
+        assert_eq!(hook.matcher.as_deref(), Some("exec|spawn"));
+        assert_eq!(hook.hook_type, "claude-command-persistent");
+        assert!(hook.command.starts_with("harnx-proxy-auth --hook "));
+        assert!(hook
+            .command
+            .contains("$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py"));
+        assert!(hook.command.contains("$temp_file_root"));
+    }
+
+    #[test]
     fn loads_from_user_config_dir() {
         let _guard = env_lock();
         let temp_dir = tempfile::tempdir().expect("temp dir");

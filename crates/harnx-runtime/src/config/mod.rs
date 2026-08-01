@@ -89,7 +89,7 @@ use crate::client::{
 use crate::commands::{run_command, split_args_text};
 use crate::tool::{ToolDeclaration, ToolResult, Tools};
 use crate::utils::*;
-use harnx_hooks::{AsyncHookManager, HooksConfig};
+use harnx_hooks::HooksConfig;
 use harnx_mcp::{McpManager, McpServerConfig};
 use harnx_rag::Rag;
 use harnx_render::{MarkdownRender, RenderOptions};

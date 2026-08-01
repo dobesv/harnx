@@ -1530,11 +1530,6 @@ impl Tui {
             config: self.config.clone(),
             abort_signal: new_abort,
             #[cfg(test)]
-            async_manager: self.async_manager.clone(),
-            #[cfg(test)]
-            persistent_manager: self.persistent_manager.clone(),
-            #[cfg(test)]
-            #[cfg(test)]
             shared_pending_message: self.shared_pending_message.clone(),
             local_worker: self.local_worker.clone(),
             event_tx: event_tx.clone(),
@@ -2292,17 +2287,12 @@ impl Tui {
         let (result, captured) = {
             let config = self.config.clone();
             let abort_signal = self.abort_signal.clone();
-            let mut async_manager = self.async_manager.lock().await;
-            let mut pending_async_context = self.pending_async_context.lock().await;
             let mut output = Vec::<u8>::new();
 
             let result = harnx_runtime::commands::run_command_with_output_and_local_worker(
                 &config,
                 abort_signal,
                 line,
-                &mut async_manager,
-                &self.persistent_manager,
-                &mut pending_async_context,
                 &mut output,
                 &self.local_worker,
             )
@@ -2310,7 +2300,6 @@ impl Tui {
 
             let captured = String::from_utf8_lossy(&output).into_owned();
             (result, captured)
-            // async_manager + pending_async_context guards drop here
         };
 
         let clean = strip_ansi(&captured).trim_end_matches('\n').to_string();
