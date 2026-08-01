@@ -110,7 +110,7 @@ impl JsonSchema for ReadFileParams {
                 ("path", "Absolute path to the file to read. Prefer this tool over shell commands like sed, cat, head, tail for reading files. If the path is an image file (PNG/JPEG/GIF/WebP), it is returned as viewable image content.", path),
                 ("offset", "Start reading at this line number (1-indexed). Use to read a specific line range instead of `sed -n 'N,Mp'`.", offset),
                 ("limit", "Maximum number of lines to return from offset. Combine with offset to read a range.", limit),
-                ("tail", "Return only the last N lines of the file.", tail),
+                ("tail", "Return only the last N lines of the file. Can be combined with offset to tail from a starting line (skip to offset, then take the last N lines after it).", tail),
                 ("grep", "Filter lines by regex pattern before returning.", grep),
                 ("head_lines", "Return only the first N lines. Prefer this over piping through head.", head_lines),
                 ("tail_lines", "Return only the last N lines. Prefer this over piping through tail.", tail_lines),

@@ -12,17 +12,21 @@ impl BashServer {
         let total_lines = line_matches.len();
         let mut notices = Vec::new();
         let selected = if let Some(tail_n) = tail {
-            if tail_n < total_lines {
+            // When combined with `offset`, first skip to the offset line, then
+            // tail the remaining window. `offset` is 1-indexed; offset=1 (or
+            // absent) means "no skip".
+            let skip = offset.unwrap_or(1).saturating_sub(1).min(total_lines);
+            let window_len = total_lines - skip;
+            if tail_n < window_len {
                 notices.push(format!(
                     "showing last {} of {} matching lines",
-                    tail_n, total_lines
+                    tail_n, window_len
                 ));
-                line_matches[total_lines - tail_n..].to_vec()
-            } else {
-                line_matches
             }
+            let start = total_lines.saturating_sub(tail_n).max(skip);
+            line_matches[start..].to_vec()
         } else {
-            let start = offset.unwrap_or(1).saturating_sub(1);
+            let start = offset.unwrap_or(1).saturating_sub(1).min(total_lines);
             let end = (start + limit).min(total_lines);
             line_matches[start..end].to_vec()
         };
@@ -131,12 +135,6 @@ impl BashServer {
     pub(crate) fn validate_read_exec_log_params(
         params: &ReadExecLogParams,
     ) -> Result<(), ErrorData> {
-        if params.offset.is_some() && params.tail.is_some() {
-            return Err(ErrorData::invalid_params(
-                "offset and tail are mutually exclusive",
-                None,
-            ));
-        }
         if params.stream != "stdout" && params.stream != "stderr" {
             return Err(ErrorData::invalid_params(
                 format!(
@@ -218,7 +216,10 @@ impl BashServer {
         let limit = params.limit.unwrap_or(200).max(1);
         let (lines, mut notices) =
             Self::select_log_lines(numbered_lines, params.offset, limit, params.tail);
-        if let Some(offset) = params.offset {
+        // The offset-based "more lines" pagination notice only applies to
+        // forward reads. When `tail` is set the selection is anchored to the
+        // end of the window, so there are never more lines after it.
+        if let (Some(offset), None) = (params.offset, params.tail) {
             let shown_count = lines.len();
             let end = (offset - 1 + shown_count).min(total_matching_lines);
             if end < total_matching_lines {

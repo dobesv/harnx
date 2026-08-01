@@ -128,29 +128,16 @@ impl FsServer {
         notices: &mut Vec<String>,
     ) -> Result<ReadLinesPage<'a>, ErrorData> {
         let total_matching_lines = numbered_lines.len();
-        if let Some(tail) = params.tail {
-            if tail == 0 {
-                return Err(ErrorData::internal_error(
-                    "tail must be at least 1".to_string(),
-                    None,
-                ));
-            }
 
-            if tail < total_matching_lines {
-                notices.push(format!(
-                    "showing last {} of {} matching lines",
-                    tail, total_matching_lines
-                ));
-            }
-
-            let start = total_matching_lines.saturating_sub(tail);
-            numbered_lines = numbered_lines.into_iter().skip(start).collect();
-            return Ok((numbered_lines, start + 1, total_matching_lines));
+        // `offset` is 1-indexed. Reject an explicit 0 rather than silently
+        // coercing it, matching read_exec_log's contract.
+        if params.offset == Some(0) {
+            return Err(ErrorData::invalid_params("offset must be >= 1", None));
         }
+        let offset = params.offset.unwrap_or(1);
 
-        let offset = params.offset.unwrap_or(1).max(1);
-        let limit = params.limit.unwrap_or(DEFAULT_MAX_LINES);
-
+        // Validate the offset once, regardless of whether `tail` is also set,
+        // so both code paths reject an offset past the end of the result set.
         if offset > total_matching_lines {
             return Err(ErrorData::internal_error(
                 format!(
@@ -160,6 +147,33 @@ impl FsServer {
                 None,
             ));
         }
+
+        if let Some(tail) = params.tail {
+            if tail == 0 {
+                return Err(ErrorData::internal_error(
+                    "tail must be at least 1".to_string(),
+                    None,
+                ));
+            }
+
+            // When combined with `offset`, first skip to the offset line, then
+            // tail the remaining window. `offset` is 1-indexed; offset=1 (or
+            // absent) means "no skip".
+            let skip = offset - 1;
+            let window_len = total_matching_lines - skip;
+            if tail < window_len {
+                notices.push(format!(
+                    "showing last {} of {} matching lines",
+                    tail, window_len
+                ));
+            }
+
+            let start = total_matching_lines.saturating_sub(tail).max(skip);
+            numbered_lines = numbered_lines.into_iter().skip(start).collect();
+            return Ok((numbered_lines, start + 1, total_matching_lines));
+        }
+
+        let limit = params.limit.unwrap_or(DEFAULT_MAX_LINES);
 
         if limit == 0 {
             return Err(ErrorData::internal_error(
@@ -454,13 +468,6 @@ impl FsServer {
         &self,
         params: ReadFileParams,
     ) -> Result<CallToolResult, ErrorData> {
-        if params.offset.is_some() && params.tail.is_some() {
-            return Err(ErrorData::invalid_params(
-                "offset and tail are mutually exclusive",
-                None,
-            ));
-        }
-
         let roots = self.roots.read().await;
         let path = validate_path(&params.path, &roots).map_err(invalid_params)?;
         drop(roots);
