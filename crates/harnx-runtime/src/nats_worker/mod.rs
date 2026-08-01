@@ -25,6 +25,7 @@ mod agent_loop;
 mod backend;
 mod control;
 mod daemon;
+mod hook_supervisor;
 mod subagent_toolset;
 mod tool_supervisor;
 
@@ -32,11 +33,15 @@ mod tool_supervisor;
 mod tests;
 
 // Re-export public items to preserve the `crate::nats_worker::X` path
-pub use agent_loop::{run_agent_loop_with_nats, run_agent_loop_with_nats_inner, RunAgentLoopArgs};
+pub use agent_loop::{
+    reconcile_hook_supervisor, run_agent_loop_with_nats, run_agent_loop_with_nats_inner,
+    RunAgentLoopArgs,
+};
 pub use backend::{FencedSessionLogSink, NatsSessionLogBackend};
 pub use control::{control_subject, publish_control_command, ControlCommand};
 pub use daemon::{
     new_remote_session_id, notify_subject, publish_session_activate, run_worker_daemon,
     worker_ready_subject, SessionActivate, WorkerDaemonConfig,
 };
+pub use hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 pub use tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};

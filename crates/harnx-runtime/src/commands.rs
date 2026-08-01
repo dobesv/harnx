@@ -5,6 +5,9 @@ use syntect::highlighting::{Color, Theme};
 use crate::config::{
     macro_execute, remote_session_ops, AgentVariables, Config, GlobalConfig, Input, LastMessage,
 };
+use crate::nats_hook_provider::{
+    discover_process_nats_hook_provider, dispatch_hook_event, HookDispatchMeta, HookEventDispatch,
+};
 use crate::utils::{dimmed_text, set_text, AbortSignal};
 use harnx_hooks::{
     dispatch_hooks_with_managers, AsyncHookManager, HookEvent, HookResultControl,
@@ -1068,7 +1071,7 @@ Commands:
             _ => unknown_command()?,
         },
         None => {
-            let (hooks, session_id) = {
+            let (hooks, session_id, config_snapshot) = {
                 let config = config.read();
                 (
                     config.resolved_hooks(),
@@ -1078,19 +1081,36 @@ Commands:
                         .map(|session| session.id())
                         .unwrap_or("default")
                         .to_string(),
+                    config.clone(),
                 )
             };
+            let nats_hook_provider =
+                discover_process_nats_hook_provider(&config_snapshot).await;
             let cwd = env::current_dir().unwrap_or_default();
             let event = HookEvent::UserPromptSubmit {
                 prompt: line.to_string(),
             };
-            let outcome = dispatch_hooks_with_managers(
-                &event,
+            let inline_event = event.clone();
+            let inline_fallback = dispatch_hooks_with_managers(
+                &inline_event,
                 &hooks.entries,
                 &session_id,
                 &cwd,
                 Some(async_manager),
                 Some(persistent_manager),
+            );
+            let outcome = dispatch_hook_event(
+                HookEventDispatch {
+                    event,
+                    provider: nats_hook_provider.as_deref(),
+                    meta: HookDispatchMeta {
+                        session_id: session_id.clone(),
+                        cwd: cwd.clone(),
+                        resume_count: 0,
+                    },
+                    pending_async_context: None,
+                },
+                inline_fallback,
             )
             .await;
             match outcome.control {

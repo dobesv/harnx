@@ -162,6 +162,7 @@ async fn nats_hooks_deny_mutate_and_deliver_post_results() -> Result<()> {
     let meta = HookDispatchMeta {
         session_id: "nats-hooks-e2e".to_string(),
         cwd: std::env::current_dir()?,
+        resume_count: 0,
     };
 
     let denied = provider

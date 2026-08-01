@@ -34,6 +34,9 @@ use harnx_hooks::{
 };
 use harnx_render::{render_error, MarkdownRender};
 use harnx_runtime::config::SessionMeta;
+use harnx_runtime::nats_hook_provider::{
+    discover_process_nats_hook_provider, dispatch_hook_event, HookDispatchMeta, HookEventDispatch,
+};
 use harnx_runtime::utils::*;
 
 use anyhow::{bail, Context, Result};
@@ -510,18 +513,34 @@ async fn dispatch_session_start(
     persistent_manager: &Arc<tokio::sync::Mutex<PersistentHookManager>>,
 ) {
     let (hooks, session_id, cwd) = hook_dispatch_context(config);
+    let config_snapshot = config.read().clone();
+    let nats_hook_provider = discover_process_nats_hook_provider(&config_snapshot).await;
     let model_id = config.read().current_model().id().to_string();
     let event = HookEvent::SessionStart {
         source: source.to_string(),
         model: model_id,
     };
-    let _ = dispatch_hooks_with_managers(
-        &event,
+    let inline_event = event.clone();
+    let inline_fallback = dispatch_hooks_with_managers(
+        &inline_event,
         &hooks.entries,
         &session_id,
         &cwd,
         Some(async_manager),
         Some(persistent_manager),
+    );
+    let _ = dispatch_hook_event(
+        HookEventDispatch {
+            event,
+            provider: nats_hook_provider.as_deref(),
+            meta: HookDispatchMeta {
+                session_id: session_id.clone(),
+                cwd: cwd.clone(),
+                resume_count: 0,
+            },
+            pending_async_context: None,
+        },
+        inline_fallback,
     )
     .await;
 }
@@ -645,19 +664,35 @@ async fn exit_session_with_hook(
 ) -> Result<()> {
     let resume_cmd = session_resume_command(config);
     let (hooks, session_id, cwd) = hook_dispatch_context(config);
+    let config_snapshot = config.read().clone();
+    let nats_hook_provider = discover_process_nats_hook_provider(&config_snapshot).await;
     config.write().exit_session()?;
     let event = HookEvent::SessionEnd {
         reason: "session_exit".to_string(),
     };
+    let inline_event = event.clone();
+    let inline_fallback = dispatch_hooks_with_managers(
+        &inline_event,
+        &hooks.entries,
+        &session_id,
+        &cwd,
+        Some(async_manager),
+        Some(persistent_manager),
+    );
     let _ = tokio::time::timeout(
         Duration::from_secs(5),
-        dispatch_hooks_with_managers(
-            &event,
-            &hooks.entries,
-            &session_id,
-            &cwd,
-            Some(async_manager),
-            Some(persistent_manager),
+        dispatch_hook_event(
+            HookEventDispatch {
+                event,
+                provider: nats_hook_provider.as_deref(),
+                meta: HookDispatchMeta {
+                    session_id: session_id.clone(),
+                    cwd: cwd.clone(),
+                    resume_count: 0,
+                },
+                pending_async_context: None,
+            },
+            inline_fallback,
         ),
     )
     .await;

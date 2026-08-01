@@ -1,6 +1,8 @@
 use crate::{
     config::{Config, GlobalConfig},
-    nats_hook_provider::{HookDispatchMeta, NatsHookProvider},
+    nats_hook_provider::{
+        dispatch_hook_event, HookDispatchMeta, HookEventDispatch, NatsHookProvider,
+    },
     utils::*,
 };
 use anyhow::Result;
@@ -210,35 +212,6 @@ async fn dispatch_inline_hooks(
     .await
 }
 
-fn with_pre_tool_input(event: &HookEvent, tool_input: Value) -> HookEvent {
-    match event {
-        HookEvent::PreToolUse {
-            tool_name,
-            tool_input: _,
-            tool_use_id,
-        } => HookEvent::PreToolUse {
-            tool_name: tool_name.clone(),
-            tool_input,
-            tool_use_id: tool_use_id.clone(),
-        },
-        _ => event.clone(),
-    }
-}
-
-fn compose_pre_tool_use_outcome(
-    nats_mutated_tool_input: Option<Value>,
-    mut inline_outcome: harnx_core::hooks::HookOutcome,
-) -> harnx_core::hooks::HookOutcome {
-    if matches!(
-        inline_outcome.control,
-        harnx_core::hooks::HookResultControl::Continue
-    ) && inline_outcome.result.mutated_tool_input.is_none()
-    {
-        inline_outcome.result.mutated_tool_input = nats_mutated_tool_input;
-    }
-    inline_outcome
-}
-
 fn build_dispatch_hook_fn(
     hooks: &harnx_hooks::HooksConfig,
     // Value is (bare_server_tool_name, hook_entries). The matcher in each entry is
@@ -269,72 +242,31 @@ fn build_dispatch_hook_fn(
             let meta = HookDispatchMeta {
                 session_id: session_id.clone(),
                 cwd: cwd.clone(),
+                resume_count: 0,
             };
-            match &event {
-                HookEvent::PreToolUse { .. } => {
-                    let Some(provider) = nats_hook_provider else {
-                        return dispatch_inline_hooks(
-                            &event,
-                            &hooks_entries,
-                            &per_tool_hooks,
-                            &session_id,
-                            &cwd,
-                            &persistent_manager,
-                        )
-                        .await;
-                    };
-                    let nats_outcome = provider.dispatch_pre_tool_use(&event, meta).await;
-                    match &nats_outcome.control {
-                        harnx_core::hooks::HookResultControl::Block { .. } => return nats_outcome,
-                        harnx_core::hooks::HookResultControl::Ask { .. } => {
-                            // NOTE: Ask follows the existing ToolApprovalRequiredError path.
-                            // Headless-worker resolution over NATS is deferred to a later slice.
-                            return nats_outcome;
-                        }
-                        harnx_core::hooks::HookResultControl::Continue => {}
-                    }
-                    let nats_mutation = nats_outcome.result.mutated_tool_input;
-                    let inline_event = nats_mutation
-                        .clone()
-                        .map(|input| with_pre_tool_input(&event, input))
-                        .unwrap_or(event);
-                    let inline_outcome = dispatch_inline_hooks(
-                        &inline_event,
-                        &hooks_entries,
-                        &per_tool_hooks,
-                        &session_id,
-                        &cwd,
-                        &persistent_manager,
-                    )
-                    .await;
-                    compose_pre_tool_use_outcome(nats_mutation, inline_outcome)
-                }
-                HookEvent::PostToolUse { .. } => {
-                    if let Some(provider) = nats_hook_provider {
-                        provider.dispatch_post_tool_use(event.clone(), pending_async_context, meta);
-                    }
-                    dispatch_inline_hooks(
-                        &event,
-                        &hooks_entries,
-                        &per_tool_hooks,
-                        &session_id,
-                        &cwd,
-                        &persistent_manager,
-                    )
-                    .await
-                }
-                _ => {
-                    dispatch_inline_hooks(
-                        &event,
-                        &hooks_entries,
-                        &per_tool_hooks,
-                        &session_id,
-                        &cwd,
-                        &persistent_manager,
-                    )
-                    .await
-                }
-            }
+            let inline_event = event.clone();
+            let inline_fallback = dispatch_inline_hooks(
+                &inline_event,
+                &hooks_entries,
+                &per_tool_hooks,
+                &session_id,
+                &cwd,
+                &persistent_manager,
+            );
+            // Ask is returned unchanged. eval_tool_calls turns a deferred
+            // confirmation into ToolApprovalRequiredError. Headless workers
+            // can't prompt, so their existing confirmation callback decides
+            // whether the error is surfaced or the call is denied.
+            dispatch_hook_event(
+                HookEventDispatch {
+                    event,
+                    provider: nats_hook_provider.as_deref(),
+                    meta,
+                    pending_async_context,
+                },
+                inline_fallback,
+            )
+            .await
         })
     })
 }
@@ -1264,39 +1196,6 @@ mod tests {
         let dispatch_fn =
             build_dispatch_hook_fn(&hooks_config, per_tool_hooks, None, &pm, None, None, None);
         (dispatch_fn)(event).await
-    }
-
-    fn continue_outcome(mutated_tool_input: Option<Value>) -> harnx_core::hooks::HookOutcome {
-        harnx_core::hooks::HookOutcome {
-            control: harnx_core::hooks::HookResultControl::Continue,
-            result: harnx_core::hooks::HookResult {
-                mutated_tool_input,
-                ..Default::default()
-            },
-        }
-    }
-
-    #[test]
-    fn compose_pre_tool_use_outcome_preserves_nats_then_inline_mutation() {
-        let nats_mutation = json!({"nats": true});
-        let nats_only =
-            compose_pre_tool_use_outcome(Some(nats_mutation.clone()), continue_outcome(None));
-        assert_eq!(
-            nats_only.result.mutated_tool_input,
-            Some(nats_mutation),
-            "NATS mutation must survive when inline hooks don't mutate"
-        );
-
-        let inline_mutation = json!({"nats": true, "inline": true});
-        let inline_wins = compose_pre_tool_use_outcome(
-            Some(json!({"nats": true})),
-            continue_outcome(Some(inline_mutation.clone())),
-        );
-        assert_eq!(
-            inline_wins.result.mutated_tool_input,
-            Some(inline_mutation),
-            "inline mutation already includes its NATS-mutated starting input"
-        );
     }
 
     #[tokio::test]

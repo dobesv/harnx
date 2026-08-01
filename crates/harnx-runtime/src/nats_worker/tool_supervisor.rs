@@ -1,3 +1,4 @@
+use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use crate::config::{ToolServerConfig, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
 use crate::nats_tool_provider::NatsInFlightCalls;
 use anyhow::{bail, Context, Result};
@@ -42,12 +43,22 @@ impl ToolServerStartConfig {
             token: token.into(),
         }
     }
+
+    fn hook_start_config(&self) -> HookServerStartConfig {
+        HookServerStartConfig::new(
+            self.client.clone(),
+            self.instance_id.clone(),
+            self.nats_url.clone(),
+            self.token.clone(),
+        )
+    }
 }
 
 /// Owns local tool-server children for one worker process.
 pub struct ToolServerSupervisor {
     processes: Arc<Mutex<HashMap<u32, String>>>,
     tasks: Vec<JoinHandle<()>>,
+    hook_supervisors: Vec<HookServerSupervisor>,
 }
 
 impl ToolServerSupervisor {
@@ -69,6 +80,7 @@ impl ToolServerSupervisor {
         let mut supervisor = Self {
             processes: Arc::clone(&processes),
             tasks: Vec::new(),
+            hook_supervisors: Vec::new(),
         };
         let enabled: Vec<_> = servers.iter().filter(|server| server.enabled).collect();
         if enabled.is_empty() {
@@ -98,28 +110,7 @@ impl ToolServerSupervisor {
             }
         }
 
-        let in_flight = NatsInFlightCalls::for_instance(&config.instance_id);
-        for server in enabled {
-            match spawn_tool_server(&config, server) {
-                Ok(child) => {
-                    let Some(pid) = child.id() else {
-                        warn_server_failure(&server.name, "spawned child has no process ID");
-                        continue;
-                    };
-                    processes.lock().await.insert(pid, server.name.clone());
-                    supervisor.tasks.push(spawn_child_monitor(
-                        child,
-                        pid,
-                        server.name.clone(),
-                        config.instance_id.clone(),
-                        config.client.clone(),
-                        Arc::clone(&processes),
-                        in_flight.clone(),
-                    ));
-                }
-                Err(error) => warn_server_failure(&server.name, format!("{error:#}")),
-            }
-        }
+        spawn_enabled_tool_servers(&mut supervisor, &config, &enabled, &processes).await;
 
         let deadline = Instant::now() + readiness_timeout;
         let readiness = watches.into_iter().map(|(server, key, mut watch)| {
@@ -140,11 +131,70 @@ impl ToolServerSupervisor {
             }
         });
         futures_util::future::join_all(readiness).await;
+
+        start_co_located_hooks(&mut supervisor, &config, enabled).await;
         Ok(supervisor)
     }
 
     pub async fn server_pids(&self) -> HashMap<u32, String> {
         self.processes.lock().await.clone()
+    }
+}
+
+async fn spawn_enabled_tool_servers(
+    supervisor: &mut ToolServerSupervisor,
+    config: &ToolServerStartConfig,
+    servers: &[&ToolServerConfig],
+    processes: &Arc<Mutex<HashMap<u32, String>>>,
+) {
+    let in_flight = NatsInFlightCalls::for_instance(&config.instance_id);
+    for server in servers {
+        match spawn_tool_server(config, server) {
+            Ok(child) => {
+                let Some(pid) = child.id() else {
+                    warn_server_failure(&server.name, "spawned child has no process ID");
+                    continue;
+                };
+                processes.lock().await.insert(pid, server.name.clone());
+                supervisor.tasks.push(spawn_child_monitor(
+                    child,
+                    pid,
+                    server.name.clone(),
+                    config.instance_id.clone(),
+                    config.client.clone(),
+                    Arc::clone(processes),
+                    in_flight.clone(),
+                ));
+            }
+            Err(error) => warn_server_failure(&server.name, format!("{error:#}")),
+        }
+    }
+}
+
+async fn start_co_located_hooks(
+    supervisor: &mut ToolServerSupervisor,
+    config: &ToolServerStartConfig,
+    servers: Vec<&ToolServerConfig>,
+) {
+    for server in servers {
+        let Some(hooks) = &server.hooks else {
+            continue;
+        };
+        let mut hooks = hooks.clone();
+        let package_dir = tool_server_package_dir(server);
+        for hook in &mut hooks.entries {
+            if hook.package_dir.is_none() {
+                hook.package_dir = Some(package_dir.clone());
+            }
+        }
+        let scope = format!("tool-{}", server.name);
+        match HookServerSupervisor::start_local(config.hook_start_config(), &hooks, &scope).await {
+            Ok(hooks) => supervisor.hook_supervisors.push(hooks),
+            Err(error) => warn_server_failure(
+                &server.name,
+                format!("start co-located hook servers: {error:#}"),
+            ),
+        }
     }
 }
 
@@ -381,6 +431,7 @@ mod tests {
             enabled: true,
             description: None,
             package: package.map(str::to_string),
+            hooks: None,
         }
     }
 

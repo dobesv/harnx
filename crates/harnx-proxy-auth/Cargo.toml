@@ -16,8 +16,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 base64.workspace = true
 clap.workspace = true
+harnx-core = { path = "../harnx-core" }
+harnx-hookset = { path = "../harnx-hookset" }
+harnx-hookset-server = { path = "../harnx-hookset-server" }
 hudsucker = { workspace = true, features = ["rustls-client"] }
 hyper.workspace = true
 hyper-rustls = { workspace = true }
@@ -37,7 +41,7 @@ jaq-core.workspace = true
 jaq-std.workspace = true
 
 [dev-dependencies]
-harnx-core = { path = "../harnx-core" }
+async-nats.workspace = true
 harnx-engine = { path = "../harnx-engine" }
 harnx-hooks = { path = "../harnx-hooks" }
 harnx-mcp = { path = "../harnx-mcp" }
@@ -53,3 +57,4 @@ tokio-rustls = { workspace = true }
 serde_json.workspace = true
 serde_yaml.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "time", "io-util"] }
+which.workspace = true
