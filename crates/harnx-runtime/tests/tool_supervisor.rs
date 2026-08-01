@@ -30,6 +30,7 @@ fn time_server_config(command: impl Into<String>) -> ToolServerConfig {
         enabled: true,
         description: None,
         package: None,
+        hooks: None,
     }
 }
 const TOKEN: &str = "tool-supervisor-test-token";

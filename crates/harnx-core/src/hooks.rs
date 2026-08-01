@@ -33,6 +33,15 @@ pub enum HookEvent {
         error: String,
         error_type: String,
     },
+    InstructionsLoaded {
+        file_path: PathBuf,
+        memory_type: String,
+        load_reason: String,
+    },
+    CwdChanged {
+        old_cwd: PathBuf,
+        new_cwd: PathBuf,
+    },
     PreToolUse {
         tool_name: String,
         tool_input: Value,
@@ -60,6 +69,8 @@ impl HookEvent {
             Self::UserPromptSubmit { .. } => "UserPromptSubmit",
             Self::Stop { .. } => "Stop",
             Self::StopFailure { .. } => "StopFailure",
+            Self::InstructionsLoaded { .. } => "InstructionsLoaded",
+            Self::CwdChanged { .. } => "CwdChanged",
             Self::PreToolUse { .. } => "PreToolUse",
             Self::PostToolUse { .. } => "PostToolUse",
             Self::PostToolUseFailure { .. } => "PostToolUseFailure",
@@ -542,9 +553,20 @@ entries:
         assert!(result.resume.is_none());
     }
 
+    fn assert_event_names(events: Vec<(HookEvent, &str)>) {
+        for (event, expected_name) in events {
+            assert_eq!(event.event_name(), expected_name);
+            let serialized = serde_json::to_value(&event).expect("serialize hook event");
+            assert_eq!(serialized["hook_event_name"], expected_name);
+            let decoded: HookEvent =
+                serde_json::from_value(serialized).expect("deserialize hook event");
+            assert_eq!(decoded.event_name(), expected_name);
+        }
+    }
+
     #[test]
-    fn test_event_name() {
-        let events = vec![
+    fn lifecycle_event_names_round_trip() {
+        assert_event_names(vec![
             (
                 HookEvent::SessionStart {
                     source: "cli".to_string(),
@@ -578,6 +600,27 @@ entries:
                 },
                 "StopFailure",
             ),
+        ]);
+    }
+
+    #[test]
+    fn file_and_tool_event_names_round_trip() {
+        assert_event_names(vec![
+            (
+                HookEvent::InstructionsLoaded {
+                    file_path: PathBuf::from("/tmp/CLAUDE.md"),
+                    memory_type: "Project".to_string(),
+                    load_reason: "session_start".to_string(),
+                },
+                "InstructionsLoaded",
+            ),
+            (
+                HookEvent::CwdChanged {
+                    old_cwd: PathBuf::from("/tmp/old"),
+                    new_cwd: PathBuf::from("/tmp/new"),
+                },
+                "CwdChanged",
+            ),
             (
                 HookEvent::PreToolUse {
                     tool_name: "shell".to_string(),
@@ -604,11 +647,7 @@ entries:
                 },
                 "PostToolUseFailure",
             ),
-        ];
-
-        for (event, expected_name) in events {
-            assert_eq!(event.event_name(), expected_name);
-        }
+        ]);
     }
 
     #[test]

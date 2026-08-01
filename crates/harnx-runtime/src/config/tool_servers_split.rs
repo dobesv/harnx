@@ -2,7 +2,7 @@
 //!
 //! These configs specify which NATS tool servers to spawn as separate processes.
 //! Similar in shape to `McpServerConfig` but without MCP-specific fields like
-//! `rename_tools`, `tool_templates`, `hooks`, and `roots`.
+//! `rename_tools`, `tool_templates`, and `roots`.
 
 use super::*;
 use anyhow::Context as _;
@@ -50,6 +50,13 @@ pub struct ToolServerConfig {
     /// installed from packages.
     #[serde(skip)]
     pub package: Option<String>,
+
+    /// Per-tool-server hooks configuration.
+    ///
+    /// Hooks defined here apply only to tools provided by this tool server.
+    /// Merged with global and agent hooks at runtime.
+    #[serde(default)]
+    pub hooks: Option<HooksConfig>,
 }
 
 impl Config {
@@ -103,6 +110,33 @@ command: harnx-time-server
         assert!(config.enabled);
         assert!(config.description.is_none());
         assert!(config.package.is_none());
+        assert!(config.hooks.is_none());
+    }
+
+    #[test]
+    fn deserializes_config_with_hooks() {
+        let yaml = r#"
+command: harnx-time-server
+hooks:
+  max_resume: 3
+  entries:
+    - event: PreToolUse
+      matcher: "time"
+      command: "/path/to/hook.sh"
+      timeout: 30
+      type: claude-command
+"#;
+        let config: ToolServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.command, "harnx-time-server");
+        let hooks = config.hooks.as_ref().expect("hooks should be parsed");
+        assert_eq!(hooks.max_resume, Some(3));
+        assert_eq!(hooks.entries.len(), 1);
+        let entry = &hooks.entries[0];
+        assert_eq!(entry.event, "PreToolUse");
+        assert_eq!(entry.matcher, Some("time".to_string()));
+        assert_eq!(entry.command, "/path/to/hook.sh");
+        assert_eq!(entry.timeout, Some(30));
+        assert_eq!(entry.hook_type, "claude-command");
     }
 
     #[test]

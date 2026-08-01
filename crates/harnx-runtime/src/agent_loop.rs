@@ -13,14 +13,14 @@
 
 use crate::{
     config::{session_lock::SessionLock, Config, GlobalConfig, Input},
+    nats_hook_provider::{dispatch_hook_event, HookDispatchMeta, HookEventDispatch},
     tool::{execute_tool_round, CompletionText, ToolResult},
     utils::dimmed_text,
 };
 use anyhow::{bail, Context, Result};
 use harnx_hooks::{
-    dispatch_hooks_with_count_and_manager, dispatch_hooks_with_managers, drain_async_results,
-    inject_pending_async_context, AsyncHookManager, HookEvent, HookResultControl,
-    PersistentHookManager,
+    dispatch_hooks_with_count_and_manager, drain_async_results, inject_pending_async_context,
+    AsyncHookManager, HookEvent, HookResultControl, PersistentHookManager,
 };
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
@@ -349,6 +349,51 @@ async fn apply_local_handoff(
     Ok(())
 }
 
+struct AgentHookDispatch<'a> {
+    ctx: &'a AgentLoopContext,
+    event: HookEvent,
+    hooks: &'a harnx_hooks::HooksConfig,
+    session_id: &'a str,
+    cwd: &'a std::path::Path,
+    resume_count: u32,
+}
+
+async fn dispatch_agent_loop_hook(params: AgentHookDispatch<'_>) -> harnx_core::hooks::HookOutcome {
+    let AgentHookDispatch {
+        ctx,
+        event,
+        hooks,
+        session_id,
+        cwd,
+        resume_count,
+    } = params;
+    let async_guard = ctx.async_manager.lock().await;
+    let inline_event = event.clone();
+    let inline_fallback = dispatch_hooks_with_count_and_manager(
+        &inline_event,
+        &hooks.entries,
+        session_id,
+        cwd,
+        resume_count,
+        Some(&async_guard),
+        Some(&ctx.persistent_manager),
+    );
+    dispatch_hook_event(
+        HookEventDispatch {
+            event,
+            provider: ctx.nats_hook_provider.as_deref(),
+            meta: HookDispatchMeta {
+                session_id: session_id.to_string(),
+                cwd: cwd.to_path_buf(),
+                resume_count,
+            },
+            pending_async_context: ctx.pending_async_context.clone(),
+        },
+        inline_fallback,
+    )
+    .await
+}
+
 async fn run_agent_loop_inner(
     ctx: &AgentLoopContext,
     initial_input: Input,
@@ -417,16 +462,14 @@ async fn run_agent_loop_inner(
             let event = HookEvent::UserPromptSubmit {
                 prompt: input.text().to_string(),
             };
-            let async_guard = ctx.async_manager.lock().await;
-            let outcome = dispatch_hooks_with_count_and_manager(
-                &event,
-                &hooks.entries,
-                &session_id,
-                &cwd,
+            let outcome = dispatch_agent_loop_hook(AgentHookDispatch {
+                ctx,
+                event,
+                hooks: &hooks,
+                session_id: &session_id,
+                cwd: &cwd,
                 resume_count,
-                Some(&async_guard),
-                Some(&ctx.persistent_manager),
-            )
+            })
             .await;
             if matches!(outcome.control, HookResultControl::Block { .. }) {
                 break;
@@ -455,18 +498,15 @@ async fn run_agent_loop_inner(
                     error: err.to_string(),
                     error_type: "api_error".to_string(),
                 };
-                {
-                    let async_guard = ctx.async_manager.lock().await;
-                    let _ = dispatch_hooks_with_managers(
-                        &event,
-                        &hooks.entries,
-                        &session_id,
-                        &cwd,
-                        Some(&async_guard),
-                        Some(&ctx.persistent_manager),
-                    )
-                    .await;
-                }
+                let _ = dispatch_agent_loop_hook(AgentHookDispatch {
+                    ctx,
+                    event,
+                    hooks: &hooks,
+                    session_id: &session_id,
+                    cwd: &cwd,
+                    resume_count,
+                })
+                .await;
                 let _ = config.write().after_chat_completion(
                     &input,
                     "",
@@ -562,16 +602,14 @@ async fn run_agent_loop_inner(
                 stop_hook_active: true,
                 last_assistant_message: Some(output.clone()),
             };
-            let async_guard = ctx.async_manager.lock().await;
-            let outcome = dispatch_hooks_with_count_and_manager(
-                &event,
-                &hooks.entries,
-                &session_id,
-                &cwd,
+            let outcome = dispatch_agent_loop_hook(AgentHookDispatch {
+                ctx,
+                event,
+                hooks: &hooks,
+                session_id: &session_id,
+                cwd: &cwd,
                 resume_count,
-                Some(&async_guard),
-                Some(&ctx.persistent_manager),
-            )
+            })
             .await;
             if let Some(additional_context) = outcome
                 .result

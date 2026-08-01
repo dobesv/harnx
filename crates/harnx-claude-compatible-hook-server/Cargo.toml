@@ -1,0 +1,24 @@
+[package]
+name = "harnx-claude-compatible-hook-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NATS server for Claude Code-compatible command hooks"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+harnx-core = { path = "../harnx-core" }
+harnx-hooks = { path = "../harnx-hooks" }
+harnx-hookset = { path = "../harnx-hookset" }
+harnx-hookset-server = { path = "../harnx-hookset-server" }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+async-nats = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+which = { workspace = true }

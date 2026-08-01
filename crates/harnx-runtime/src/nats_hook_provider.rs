@@ -7,6 +7,7 @@ use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResult, HookRes
 use harnx_core::instance::InstanceId;
 use harnx_hookset::{FailPolicy, HookRegistration, HookSpec, HOOK_REGISTRY_BUCKET};
 use harnx_hookset_server::hook_registration_key;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,45 @@ const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct HookDispatchMeta {
     pub session_id: String,
     pub cwd: PathBuf,
+    pub resume_count: u32,
+}
+
+/// Parameters for one unified hook dispatch.
+pub struct HookEventDispatch<'a> {
+    pub event: HookEvent,
+    pub provider: Option<&'a NatsHookProvider>,
+    pub meta: HookDispatchMeta,
+    pub pending_async_context: Option<Arc<Mutex<Option<String>>>>,
+}
+
+/// Dispatch one hook event through NATS, or use the inline runtime while no
+/// NATS provider is available. The inline future is lazy and isn't polled when
+/// NATS owns dispatch.
+pub async fn dispatch_hook_event<F>(
+    params: HookEventDispatch<'_>,
+    inline_fallback: F,
+) -> HookOutcome
+where
+    F: Future<Output = HookOutcome>,
+{
+    match params.provider {
+        Some(provider) => {
+            provider
+                .dispatch_event(params.event, params.pending_async_context, params.meta)
+                .await
+        }
+        None => inline_fallback.await,
+    }
+}
+
+/// Discover hooks for binaries launched inside a worker process tree.
+/// Frontends without `HARNX_INSTANCE_ID` keep the inline fallback.
+pub async fn discover_process_nats_hook_provider(config: &Config) -> Option<Arc<NatsHookProvider>> {
+    let instance_id = std::env::var(harnx_core::instance::HARNX_INSTANCE_ID).ok()?;
+    NatsHookProvider::discover(config, InstanceId::from_string(instance_id))
+        .await
+        .ok()
+        .map(Arc::new)
 }
 
 /// One hook route flattened from a hook server registration.
@@ -59,7 +99,7 @@ impl HookRequestDispatcher for NatsHookRequester {
 
 /// Discovers and dispatches hooks registered for one worker instance.
 pub struct NatsHookProvider {
-    client: async_nats::Client,
+    client: Option<async_nats::Client>,
     instance_id: InstanceId,
     hooks: Vec<DiscoveredHook>,
     dispatcher: Arc<dyn HookRequestDispatcher>,
@@ -88,7 +128,7 @@ impl NatsHookProvider {
             client: client.clone(),
         });
         Self {
-            client,
+            client: Some(client),
             instance_id,
             hooks,
             dispatcher,
@@ -101,7 +141,66 @@ impl NatsHookProvider {
 
     /// Returns the client used for discovery and requests.
     pub fn client(&self) -> &async_nats::Client {
-        &self.client
+        self.client
+            .as_ref()
+            .expect("production NATS hook providers always carry a client")
+    }
+
+    #[cfg(test)]
+    fn from_dispatcher(
+        instance_id: InstanceId,
+        hooks: Vec<DiscoveredHook>,
+        dispatcher: Arc<dyn HookRequestDispatcher>,
+    ) -> Self {
+        Self {
+            client: None,
+            instance_id,
+            hooks,
+            dispatcher,
+        }
+    }
+
+    /// Dispatches any hook event using its event-specific blocking policy.
+    ///
+    /// PreToolUse, session boundary, and turn-control events run sequentially.
+    /// File-change and post-tool events start in background and return immediately.
+    pub async fn dispatch_event(
+        &self,
+        event: HookEvent,
+        pending: Option<Arc<Mutex<Option<String>>>>,
+        meta: HookDispatchMeta,
+    ) -> HookOutcome {
+        match event {
+            HookEvent::PreToolUse { .. } => {
+                let outcome = self.dispatch_pre_tool_use(&event, meta).await;
+                append_outcome_context(pending.as_ref(), &outcome).await;
+                outcome
+            }
+            HookEvent::SessionStart { .. }
+            | HookEvent::SessionEnd { .. }
+            | HookEvent::UserPromptSubmit { .. }
+            | HookEvent::Stop { .. }
+            | HookEvent::StopFailure { .. } => {
+                dispatch_blocking_event_with(
+                    EventDispatch {
+                        dispatcher: self.dispatcher.as_ref(),
+                        instance_id: &self.instance_id,
+                        hooks: &self.hooks,
+                        meta: &meta,
+                        pending,
+                    },
+                    &event,
+                )
+                .await
+            }
+            HookEvent::InstructionsLoaded { .. }
+            | HookEvent::CwdChanged { .. }
+            | HookEvent::PostToolUse { .. }
+            | HookEvent::PostToolUseFailure { .. } => {
+                self.dispatch_best_effort(event, pending, meta);
+                continue_outcome(None)
+            }
+        }
     }
 
     pub async fn dispatch_pre_tool_use(
@@ -128,6 +227,15 @@ impl NatsHookProvider {
         pending: Option<Arc<Mutex<Option<String>>>>,
         meta: HookDispatchMeta,
     ) {
+        self.dispatch_best_effort(event, pending, meta);
+    }
+
+    fn dispatch_best_effort(
+        &self,
+        event: HookEvent,
+        pending: Option<Arc<Mutex<Option<String>>>>,
+        meta: HookDispatchMeta,
+    ) {
         for hook in matching_hooks(&self.hooks, event.event_name(), event.matcher_text()) {
             let dispatcher = Arc::clone(&self.dispatcher);
             let subject = self
@@ -136,16 +244,16 @@ impl NatsHookProvider {
             let payload = HookPayload {
                 session_id: meta.session_id.clone(),
                 cwd: meta.cwd.clone(),
-                resume_count: 0,
+                resume_count: meta.resume_count,
                 hook_event: event.clone(),
             };
-            let params = PostHookDispatch {
+            let params = BestEffortHookDispatch {
                 subject,
                 payload,
                 hook: hook.clone(),
                 pending: pending.clone(),
             };
-            tokio::spawn(dispatch_one_post_hook(dispatcher, params));
+            tokio::spawn(dispatch_one_best_effort_hook(dispatcher, params));
         }
     }
 }
@@ -186,6 +294,45 @@ struct PreHookDispatch<'a> {
     meta: &'a HookDispatchMeta,
 }
 
+#[derive(Default)]
+struct ContinueResultAccumulator {
+    additional_contexts: Vec<String>,
+    system_messages: Vec<String>,
+    resume: bool,
+}
+
+impl ContinueResultAccumulator {
+    fn push(&mut self, result: &HookResult) {
+        if let Some(context) = result
+            .additional_context
+            .as_ref()
+            .filter(|context| !context.is_empty())
+        {
+            self.additional_contexts.push(context.clone());
+        }
+        if let Some(message) = result
+            .system_message
+            .as_ref()
+            .filter(|message| !message.is_empty())
+        {
+            self.system_messages.push(message.clone());
+        }
+        self.resume |= result.resume.unwrap_or(false);
+    }
+
+    fn into_result(self, mutated_tool_input: Option<serde_json::Value>) -> HookResult {
+        HookResult {
+            additional_context: (!self.additional_contexts.is_empty())
+                .then(|| self.additional_contexts.join("\n")),
+            system_message: (!self.system_messages.is_empty())
+                .then(|| self.system_messages.join("\n")),
+            mutated_tool_input,
+            resume: self.resume.then_some(true),
+            ..HookResult::default()
+        }
+    }
+}
+
 async fn dispatch_pre_tool_use_with(params: PreHookDispatch<'_>, event: &HookEvent) -> HookOutcome {
     if !matches!(event, HookEvent::PreToolUse { .. }) {
         return continue_outcome(None);
@@ -193,11 +340,12 @@ async fn dispatch_pre_tool_use_with(params: PreHookDispatch<'_>, event: &HookEve
 
     let mut running_event = event.clone();
     let mut final_mutation = None;
+    let mut accumulated = ContinueResultAccumulator::default();
     for hook in matching_hooks(params.hooks, event.event_name(), event.matcher_text()) {
         let payload = HookPayload {
             session_id: params.meta.session_id.clone(),
             cwd: params.meta.cwd.clone(),
-            resume_count: 0,
+            resume_count: params.meta.resume_count,
             hook_event: running_event.clone(),
         };
         let payload = match serde_json::to_vec(&payload) {
@@ -224,6 +372,7 @@ async fn dispatch_pre_tool_use_with(params: PreHookDispatch<'_>, event: &HookEve
         match outcome.control {
             HookResultControl::Block { .. } | HookResultControl::Ask { .. } => return outcome,
             HookResultControl::Continue => {
+                accumulated.push(&outcome.result);
                 if let Some(tool_input) = outcome.result.mutated_tool_input {
                     running_event = with_pre_tool_input(&running_event, tool_input.clone());
                     final_mutation = Some(tool_input);
@@ -231,21 +380,84 @@ async fn dispatch_pre_tool_use_with(params: PreHookDispatch<'_>, event: &HookEve
             }
         }
     }
-    continue_outcome(final_mutation)
+    HookOutcome {
+        control: HookResultControl::Continue,
+        result: accumulated.into_result(final_mutation),
+    }
 }
 
-struct PostHookDispatch {
+struct EventDispatch<'a> {
+    dispatcher: &'a dyn HookRequestDispatcher,
+    instance_id: &'a InstanceId,
+    hooks: &'a [DiscoveredHook],
+    meta: &'a HookDispatchMeta,
+    pending: Option<Arc<Mutex<Option<String>>>>,
+}
+
+async fn dispatch_blocking_event_with(params: EventDispatch<'_>, event: &HookEvent) -> HookOutcome {
+    let mut accumulated = ContinueResultAccumulator::default();
+    for hook in matching_hooks(params.hooks, event.event_name(), event.matcher_text()) {
+        let payload = HookPayload {
+            session_id: params.meta.session_id.clone(),
+            cwd: params.meta.cwd.clone(),
+            resume_count: params.meta.resume_count,
+            hook_event: event.clone(),
+        };
+        let payload = match serde_json::to_vec(&payload) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return unavailable_outcome(&hook.server, hook.spec.fail_policy, error);
+            }
+        };
+        let subject = params
+            .instance_id
+            .hook_subject(&hook.server, event.event_name());
+        let timeout = hook
+            .spec
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_HOOK_TIMEOUT);
+        let outcome = match params.dispatcher.request(subject, payload, timeout).await {
+            Ok(outcome) => outcome,
+            Err(error) if hook.spec.fail_policy == FailPolicy::Open => {
+                log::warn!("{} hook unavailable; continuing: {error:#}", hook.server);
+                continue;
+            }
+            Err(error) => return unavailable_outcome(&hook.server, FailPolicy::Closed, error),
+        };
+
+        let texts = [
+            outcome.result.additional_context.clone(),
+            outcome.result.system_message.clone(),
+        ];
+        if let Some(pending) = params.pending.as_deref() {
+            append_pending_context(pending, texts).await;
+        }
+        match outcome.control {
+            HookResultControl::Block { .. } | HookResultControl::Ask { .. } => return outcome,
+            HookResultControl::Continue => accumulated.push(&outcome.result),
+        }
+    }
+
+    HookOutcome {
+        control: HookResultControl::Continue,
+        result: accumulated.into_result(None),
+    }
+}
+
+struct BestEffortHookDispatch {
     subject: String,
     payload: HookPayload,
     hook: DiscoveredHook,
     pending: Option<Arc<Mutex<Option<String>>>>,
 }
 
-async fn dispatch_one_post_hook(
+async fn dispatch_one_best_effort_hook(
     dispatcher: Arc<dyn HookRequestDispatcher>,
-    params: PostHookDispatch,
+    params: BestEffortHookDispatch,
 ) {
     let server = &params.hook.server;
+    let event_name = params.payload.hook_event.event_name();
     let timeout = params
         .hook
         .spec
@@ -275,12 +487,13 @@ async fn dispatch_one_post_hook(
 
     if !matches!(outcome.control, HookResultControl::Continue) {
         emit_post_notice(format!(
-            "{server} hook returned {:?} after tool completion",
+            "{server} hook returned {:?} during best-effort {event_name} dispatch",
             outcome.control
         ));
     }
-    if outcome.result.mutated_tool_response.is_some() {
-        log::debug!("ignoring mutated tool response from asynchronous {server} hook");
+    if outcome.result.mutated_tool_input.is_some() || outcome.result.mutated_tool_response.is_some()
+    {
+        log::debug!("ignoring mutation from asynchronous {server} {event_name} hook");
     }
     if let Some(pending) = params.pending {
         append_pending_context(
@@ -305,6 +518,22 @@ async fn append_pending_context(pending: &Mutex<Option<String>>, texts: [Option<
     }
     if !accumulated.is_empty() {
         *guard = Some(accumulated);
+    }
+}
+
+async fn append_outcome_context(
+    pending: Option<&Arc<Mutex<Option<String>>>>,
+    outcome: &HookOutcome,
+) {
+    if let Some(pending) = pending {
+        append_pending_context(
+            pending.as_ref(),
+            [
+                outcome.result.additional_context.clone(),
+                outcome.result.system_message.clone(),
+            ],
+        )
+        .await;
     }
 }
 
@@ -401,6 +630,8 @@ mod tests {
     struct StubDispatcher {
         outcomes: Mutex<VecDeque<HookOutcome>>,
         seen_inputs: Mutex<Vec<Value>>,
+        seen_subjects: Mutex<Vec<String>>,
+        seen_resume_counts: Mutex<Vec<u32>>,
         delay: Option<Duration>,
         completed: Option<Arc<Notify>>,
         calls: AtomicUsize,
@@ -410,12 +641,17 @@ mod tests {
     impl HookRequestDispatcher for StubDispatcher {
         async fn request(
             &self,
-            _subject: String,
+            subject: String,
             payload: Vec<u8>,
             _timeout: Duration,
         ) -> Result<HookOutcome> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.seen_subjects.lock().await.push(subject);
             let payload: HookPayload = serde_json::from_slice(&payload)?;
+            self.seen_resume_counts
+                .lock()
+                .await
+                .push(payload.resume_count);
             if let HookEvent::PreToolUse { tool_input, .. } = payload.hook_event {
                 self.seen_inputs.lock().await.push(tool_input);
             }
@@ -464,10 +700,44 @@ mod tests {
         Arc::new(StubDispatcher {
             outcomes: Mutex::new(outcomes.into()),
             seen_inputs: Mutex::new(Vec::new()),
+            seen_subjects: Mutex::new(Vec::new()),
+            seen_resume_counts: Mutex::new(Vec::new()),
             delay: None,
             completed: None,
             calls: AtomicUsize::new(0),
         })
+    }
+
+    fn non_tool_events() -> Vec<HookEvent> {
+        vec![
+            HookEvent::SessionStart {
+                source: "cli".to_string(),
+                model: "model".to_string(),
+            },
+            HookEvent::SessionEnd {
+                reason: "exit".to_string(),
+            },
+            HookEvent::UserPromptSubmit {
+                prompt: "hello".to_string(),
+            },
+            HookEvent::Stop {
+                stop_hook_active: true,
+                last_assistant_message: Some("done".to_string()),
+            },
+            HookEvent::StopFailure {
+                error: "failed".to_string(),
+                error_type: "api_error".to_string(),
+            },
+            HookEvent::InstructionsLoaded {
+                file_path: PathBuf::from("/tmp/CLAUDE.md"),
+                memory_type: "Project".to_string(),
+                load_reason: "session_start".to_string(),
+            },
+            HookEvent::CwdChanged {
+                old_cwd: PathBuf::from("/tmp/old"),
+                new_cwd: PathBuf::from("/tmp/new"),
+            },
+        ]
     }
 
     #[test]
@@ -482,7 +752,14 @@ mod tests {
         let selected = matching_hooks(&hooks, "PreToolUse", Some("exec"));
         let servers: Vec<_> = selected.iter().map(|hook| hook.server.as_str()).collect();
         assert_eq!(servers, ["all-tools", "exact"]);
-        assert!(matching_hooks(&hooks, "SessionStart", None).is_empty());
+
+        let non_tool_hooks = vec![
+            hook("unmatched", "SessionStart", Some("cli"), 0),
+            hook("matched", "SessionStart", None, 0),
+        ];
+        let selected = matching_hooks(&non_tool_hooks, "SessionStart", None);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].server, "matched");
     }
 
     #[test]
@@ -533,6 +810,7 @@ mod tests {
         let meta = HookDispatchMeta {
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
+            resume_count: 0,
         };
         let outcome = dispatch_pre_tool_use_with(
             PreHookDispatch {
@@ -568,6 +846,7 @@ mod tests {
         let meta = HookDispatchMeta {
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
+            resume_count: 0,
         };
         let outcome = dispatch_pre_tool_use_with(
             PreHookDispatch {
@@ -591,6 +870,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_non_tool_event_dispatches_to_its_nats_subject() {
+        let instance_id = InstanceId::from_string("test");
+        let meta = HookDispatchMeta {
+            session_id: "session".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            resume_count: 0,
+        };
+
+        for event in non_tool_events() {
+            let event_name = event.event_name();
+            let dispatcher = stub(vec![continue_outcome(None)]);
+            let hooks = vec![hook("server", event_name, None, 0)];
+            let outcome = dispatch_blocking_event_with(
+                EventDispatch {
+                    dispatcher: dispatcher.as_ref(),
+                    instance_id: &instance_id,
+                    hooks: &hooks,
+                    meta: &meta,
+                    pending: None,
+                },
+                &event,
+            )
+            .await;
+
+            assert!(matches!(outcome.control, HookResultControl::Continue));
+            assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1, "{event_name}");
+            let subjects = dispatcher.seen_subjects.lock().await;
+            assert_eq!(subjects.len(), 1);
+            assert!(subjects[0].ends_with(&format!(".hook.server.{event_name}")));
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_event_block_short_circuits_later_hooks() {
+        let dispatcher = stub(vec![HookOutcome {
+            control: HookResultControl::Block {
+                reason: "denied".to_string(),
+            },
+            result: HookResult::default(),
+        }]);
+        let hooks = vec![
+            hook("one", "UserPromptSubmit", None, 0),
+            hook("two", "UserPromptSubmit", None, 1),
+        ];
+        let instance_id = InstanceId::from_string("test");
+        let meta = HookDispatchMeta {
+            session_id: "session".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            resume_count: 0,
+        };
+
+        let outcome = dispatch_blocking_event_with(
+            EventDispatch {
+                dispatcher: dispatcher.as_ref(),
+                instance_id: &instance_id,
+                hooks: &hooks,
+                meta: &meta,
+                pending: None,
+            },
+            &HookEvent::UserPromptSubmit {
+                prompt: "hello".to_string(),
+            },
+        )
+        .await;
+
+        assert!(matches!(outcome.control, HookResultControl::Block { .. }));
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn blocking_event_preserves_context_channels_and_appends_both_to_pending() {
+        let dispatcher = stub(vec![HookOutcome {
+            control: HookResultControl::Continue,
+            result: HookResult {
+                additional_context: Some("context".to_string()),
+                system_message: Some("system".to_string()),
+                ..HookResult::default()
+            },
+        }]);
+        let hooks = vec![hook("server", "Stop", None, 0)];
+        let instance_id = InstanceId::from_string("test");
+        let meta = HookDispatchMeta {
+            session_id: "session".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            resume_count: 0,
+        };
+        let pending = Arc::new(Mutex::new(Some("existing".to_string())));
+
+        let outcome = dispatch_blocking_event_with(
+            EventDispatch {
+                dispatcher: dispatcher.as_ref(),
+                instance_id: &instance_id,
+                hooks: &hooks,
+                meta: &meta,
+                pending: Some(Arc::clone(&pending)),
+            },
+            &HookEvent::Stop {
+                stop_hook_active: true,
+                last_assistant_message: Some("done".to_string()),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            outcome.result.additional_context.as_deref(),
+            Some("context")
+        );
+        assert_eq!(outcome.result.system_message.as_deref(), Some("system"));
+        assert_eq!(
+            pending.lock().await.as_deref(),
+            Some("existing\ncontext\nsystem")
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_event_fires_without_blocking() {
+        let completed = Arc::new(Notify::new());
+        let dispatcher = Arc::new(StubDispatcher {
+            outcomes: Mutex::new(vec![continue_outcome(None)].into()),
+            seen_inputs: Mutex::new(Vec::new()),
+            seen_subjects: Mutex::new(Vec::new()),
+            seen_resume_counts: Mutex::new(Vec::new()),
+            delay: Some(Duration::from_millis(100)),
+            completed: Some(Arc::clone(&completed)),
+            calls: AtomicUsize::new(0),
+        });
+        let payload = HookPayload {
+            session_id: "session".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            resume_count: 0,
+            hook_event: HookEvent::SessionStart {
+                source: "cli".to_string(),
+                model: "model".to_string(),
+            },
+        };
+
+        let started = tokio::time::Instant::now();
+        tokio::spawn(dispatch_one_best_effort_hook(
+            dispatcher,
+            BestEffortHookDispatch {
+                subject: "test.hook.server.SessionStart".to_string(),
+                payload,
+                hook: hook("server", "SessionStart", None, 0),
+                pending: None,
+            },
+        ));
+        assert!(started.elapsed() < Duration::from_millis(50));
+        completed.notified().await;
+    }
+
+    #[tokio::test]
     async fn post_dispatch_returns_before_hook_and_appends_shared_context() {
         let completed = Arc::new(Notify::new());
         let dispatcher = Arc::new(StubDispatcher {
@@ -606,6 +1036,8 @@ mod tests {
                 .into(),
             ),
             seen_inputs: Mutex::new(Vec::new()),
+            seen_subjects: Mutex::new(Vec::new()),
+            seen_resume_counts: Mutex::new(Vec::new()),
             delay: Some(Duration::from_millis(100)),
             completed: Some(Arc::clone(&completed)),
             calls: AtomicUsize::new(0),
@@ -624,9 +1056,9 @@ mod tests {
         };
 
         let started = tokio::time::Instant::now();
-        tokio::spawn(dispatch_one_post_hook(
+        tokio::spawn(dispatch_one_best_effort_hook(
             dispatcher,
-            PostHookDispatch {
+            BestEffortHookDispatch {
                 subject: "subject".to_string(),
                 payload,
                 hook: hook("server", "PostToolUse", None, 0),
@@ -641,5 +1073,201 @@ mod tests {
             pending.lock().await.as_deref(),
             Some("existing\ncontext\nsystem")
         );
+    }
+
+    #[tokio::test]
+    async fn unified_entrypoint_uses_inline_fallback_without_provider() {
+        let outcome = HookOutcome {
+            control: HookResultControl::Block {
+                reason: "inline".to_string(),
+            },
+            result: HookResult::default(),
+        };
+        let actual = dispatch_hook_event(
+            HookEventDispatch {
+                event: HookEvent::SessionEnd {
+                    reason: "test".to_string(),
+                },
+                provider: None,
+                meta: HookDispatchMeta {
+                    session_id: "session".to_string(),
+                    cwd: PathBuf::from("/tmp"),
+                    resume_count: 0,
+                },
+                pending_async_context: None,
+            },
+            std::future::ready(outcome.clone()),
+        )
+        .await;
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(outcome).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_event_queues_aggregated_pre_tool_context_for_next_turn() {
+        let dispatcher = stub(vec![
+            HookOutcome {
+                control: HookResultControl::Continue,
+                result: HookResult {
+                    additional_context: Some("context-one".to_string()),
+                    system_message: Some("system-one".to_string()),
+                    mutated_tool_input: Some(json!({"step": 1})),
+                    resume: Some(true),
+                    ..HookResult::default()
+                },
+            },
+            HookOutcome {
+                control: HookResultControl::Continue,
+                result: HookResult {
+                    additional_context: Some("context-two".to_string()),
+                    system_message: Some("system-two".to_string()),
+                    mutated_tool_input: Some(json!({"step": 2})),
+                    ..HookResult::default()
+                },
+            },
+        ]);
+        let provider = NatsHookProvider::from_dispatcher(
+            InstanceId::from_string("test"),
+            vec![
+                hook("first", "PreToolUse", Some("exec"), 0),
+                hook("second", "PreToolUse", Some("exec"), 1),
+            ],
+            dispatcher.clone(),
+        );
+        let pending = Arc::new(Mutex::new(Some("existing".to_string())));
+
+        let outcome = provider
+            .dispatch_event(
+                pre_event(json!({"initial": true})),
+                Some(Arc::clone(&pending)),
+                HookDispatchMeta {
+                    session_id: "session".to_string(),
+                    cwd: PathBuf::from("/tmp"),
+                    resume_count: 0,
+                },
+            )
+            .await;
+
+        assert_eq!(
+            outcome.result.additional_context.as_deref(),
+            Some("context-one\ncontext-two")
+        );
+        assert_eq!(
+            outcome.result.system_message.as_deref(),
+            Some("system-one\nsystem-two")
+        );
+        assert_eq!(outcome.result.mutated_tool_input, Some(json!({"step": 2})));
+        assert_eq!(outcome.result.resume, Some(true));
+        assert_eq!(
+            dispatcher.seen_inputs.lock().await.as_slice(),
+            [json!({"initial": true}), json!({"step": 1})]
+        );
+        assert_eq!(
+            pending.lock().await.as_deref(),
+            Some("existing\ncontext-one\ncontext-two\nsystem-one\nsystem-two")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_end_is_delivered_before_dispatch_returns() {
+        let dispatcher = Arc::new(StubDispatcher {
+            outcomes: Mutex::new(vec![continue_outcome(None)].into()),
+            seen_inputs: Mutex::new(Vec::new()),
+            seen_subjects: Mutex::new(Vec::new()),
+            seen_resume_counts: Mutex::new(Vec::new()),
+            delay: Some(Duration::from_millis(100)),
+            completed: None,
+            calls: AtomicUsize::new(0),
+        });
+        let provider = NatsHookProvider::from_dispatcher(
+            InstanceId::from_string("test"),
+            vec![hook("lifecycle", "SessionEnd", None, 0)],
+            dispatcher.clone(),
+        );
+
+        let started = tokio::time::Instant::now();
+        let outcome = provider
+            .dispatch_event(
+                HookEvent::SessionEnd {
+                    reason: "exit".to_string(),
+                },
+                None,
+                HookDispatchMeta {
+                    session_id: "session".to_string(),
+                    cwd: PathBuf::from("/tmp"),
+                    resume_count: 4,
+                },
+            )
+            .await;
+
+        assert!(matches!(outcome.control, HookResultControl::Continue));
+        assert!(started.elapsed() >= Duration::from_millis(75));
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            dispatcher.seen_subjects.lock().await.as_slice(),
+            ["harnx.v1.test.hook.lifecycle.SessionEnd"]
+        );
+        assert_eq!(dispatcher.seen_resume_counts.lock().await.as_slice(), [4]);
+    }
+
+    #[tokio::test]
+    async fn resume_count_is_serialized_for_pre_tool_dispatch() {
+        let dispatcher = stub(vec![continue_outcome(None)]);
+        let instance_id = InstanceId::from_string("test");
+        let hooks = vec![hook("server", "PreToolUse", Some("exec"), 0)];
+        let meta = HookDispatchMeta {
+            session_id: "session".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            resume_count: 7,
+        };
+
+        dispatch_pre_tool_use_with(
+            PreHookDispatch {
+                dispatcher: dispatcher.as_ref(),
+                instance_id: &instance_id,
+                hooks: &hooks,
+                meta: &meta,
+            },
+            &pre_event(json!({})),
+        )
+        .await;
+
+        assert_eq!(dispatcher.seen_resume_counts.lock().await.as_slice(), [7]);
+    }
+
+    #[tokio::test]
+    async fn pre_tool_ask_survives_nats_dispatch_for_approval_flow() {
+        let dispatcher = stub(vec![HookOutcome {
+            control: HookResultControl::Ask {
+                reason: Some("approval needed".to_string()),
+            },
+            result: HookResult::default(),
+        }]);
+        let hooks = vec![hook("approval", "PreToolUse", Some("exec"), 0)];
+        let instance_id = InstanceId::from_string("test");
+        let meta = HookDispatchMeta {
+            session_id: "session".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            resume_count: 0,
+        };
+
+        let outcome = dispatch_pre_tool_use_with(
+            PreHookDispatch {
+                dispatcher: dispatcher.as_ref(),
+                instance_id: &instance_id,
+                hooks: &hooks,
+                meta: &meta,
+            },
+            &pre_event(json!({})),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome.control,
+            HookResultControl::Ask { reason }
+                if reason.as_deref() == Some("approval needed")
+        ));
     }
 }

@@ -23,12 +23,7 @@ async fn main() -> Result<()> {
     // surface structured notices that the JSONL loop drains to stdout.
     let notice_rx = notice::init_channel();
     let sentinels = Arc::new(sentinel::Sentinels::generate());
-    let load_specs = load::parse_load_specs(&args.load_yaml, &args.load_json, &args.load_raw)?;
-    let loaded_vars: Vec<(String, jaq_all::json::Val)> = load_specs
-        .iter()
-        .map(|spec| (spec.name.clone(), load::load_value(spec)))
-        .collect();
-
+    let loaded_vars = load_variables(&args)?;
     let fs_temp_dir = if args.fs.is_empty() {
         None
     } else {
@@ -38,22 +33,6 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|dir| dir.path().to_string_lossy().into_owned())
         .unwrap_or_default();
-
-    let mut loaded_vars = loaded_vars
-        .into_iter()
-        .map(|(name, value)| Ok((name, filter::jaq_value_to_json(value)?)))
-        .collect::<Result<Vec<_>>>()?;
-    let exec_specs = exec_load::parse_exec_specs(
-        &args.load_exec,
-        &loaded_vars
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect::<Vec<_>>(),
-    )?;
-    for spec in &exec_specs {
-        let value = exec_load::run_exec_value(spec, &exec_load::ShellRunner);
-        loaded_vars.push((spec.name.clone(), value));
-    }
 
     let jaq_vars = Arc::new(filter::JaqVars::new_from_values(
         &sentinels,
@@ -96,32 +75,98 @@ async fn main() -> Result<()> {
         extra_env.insert(key, value);
     }
 
-    // Write readiness lines then explicitly drop the lock before entering the
-    // async JSONL loop. Holding a std::io::StdoutLock across an .await would
-    // deadlock: tokio's async stdout shares the same fd and any tracing output
-    // or response write that tries to acquire the lock would block forever.
-    {
-        let mut stdout = std::io::stdout().lock();
-        writeln!(stdout, "PROXY_PORT={port}")?;
-        writeln!(stdout, "CA_CERT_PATH={}", ca_cert_path.display())?;
-        use base64::Engine as _;
-        let ca_cert_b64 = base64::engine::general_purpose::STANDARD.encode(ca_cert_pem.as_bytes());
-        writeln!(stdout, "CA_CERT_PEM_B64={ca_cert_b64}")?;
-        stdout.flush()?;
-    } // lock dropped here
+    write_readiness(port, &ca_cert_path, &ca_cert_pem)?;
 
+    run_dispatch_mode(DispatchRuntime {
+        port,
+        ca_cert_path,
+        extra_env,
+        notice_rx,
+        fs_temp_dir,
+    })
+    .await
+}
+
+fn load_variables(args: &cli::Args) -> Result<Vec<(String, serde_json::Value)>> {
+    let load_specs = load::parse_load_specs(&args.load_yaml, &args.load_json, &args.load_raw)?;
+    let loaded_vars: Vec<(String, jaq_all::json::Val)> = load_specs
+        .iter()
+        .map(|spec| (spec.name.clone(), load::load_value(spec)))
+        .collect();
+    let mut loaded_vars = loaded_vars
+        .into_iter()
+        .map(|(name, value)| Ok((name, filter::jaq_value_to_json(value)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let names = loaded_vars
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    for spec in exec_load::parse_exec_specs(&args.load_exec, &names)? {
+        let value = exec_load::run_exec_value(&spec, &exec_load::ShellRunner);
+        loaded_vars.push((spec.name, value));
+    }
+    Ok(loaded_vars)
+}
+
+fn write_readiness(port: u16, ca_cert_path: &std::path::Path, ca_cert_pem: &str) -> Result<()> {
+    // Drop stdout lock before async dispatch; Tokio stdout uses same descriptor.
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "PROXY_PORT={port}")?;
+    writeln!(stdout, "CA_CERT_PATH={}", ca_cert_path.display())?;
+    use base64::Engine as _;
+    let ca_cert_b64 = base64::engine::general_purpose::STANDARD.encode(ca_cert_pem.as_bytes());
+    writeln!(stdout, "CA_CERT_PEM_B64={ca_cert_b64}")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+struct DispatchRuntime {
+    port: u16,
+    ca_cert_path: std::path::PathBuf,
+    extra_env: serde_json::Map<String, serde_json::Value>,
+    notice_rx: notice::HookNoticeReceiver,
+    fs_temp_dir: Option<tempfile::TempDir>,
+}
+
+async fn run_dispatch_mode(runtime: DispatchRuntime) -> Result<()> {
+    let DispatchRuntime {
+        port,
+        ca_cert_path,
+        extra_env,
+        notice_rx,
+        fs_temp_dir,
+    } = runtime;
+    if nats_mode_enabled() {
+        // Keep generated credentials and notice channel alive for hook-server lifetime.
+        let _temp_dir_guard = fs_temp_dir;
+        let _notice_rx_guard = notice_rx;
+        return harnx_hookset_server::run_hookset_main(hook::ProxyAuthHook::new(
+            port,
+            ca_cert_path,
+            extra_env,
+        ))
+        .await;
+    }
     if let Some(temp_dir) = fs_temp_dir {
-        tokio::select! {
+        return tokio::select! {
             result = hook::run_jsonl_loop(port, ca_cert_path, extra_env, notice_rx) => result,
             _ = shutdown_signal() => {
-                // `TempDir`'s Drop removes the directory on the way out.
                 drop(temp_dir);
                 Ok(())
             }
-        }
-    } else {
-        hook::run_jsonl_loop(port, ca_cert_path, extra_env, notice_rx).await
+        };
     }
+    hook::run_jsonl_loop(port, ca_cert_path, extra_env, notice_rx).await
+}
+
+fn nats_mode_enabled() -> bool {
+    [
+        harnx_core::instance::HARNX_INSTANCE_ID,
+        "HARNX_NATS_URL",
+        "HARNX_NATS_TOKEN",
+    ]
+    .iter()
+    .all(|name| std::env::var_os(name).is_some())
 }
 
 async fn shutdown_signal() {

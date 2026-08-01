@@ -1,12 +1,14 @@
 //! Agent loop entrypoint for NATS-backed sessions.
 
 use super::backend::{FencedSessionLogSink, NatsSessionLogBackend};
+use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use crate::agent_loop::OnToolRoundFn;
-use crate::config::{GlobalConfig, Input};
+use crate::config::{resolve_local_nats_server_config, GlobalConfig, Input, LOCAL_CLUSTER_KEY};
 use crate::nats_event_sink::NatsEventSink;
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use crate::nats_metrics;
 use crate::nats_session_index::{put_record, SessionIndexRecord};
+use crate::tool_context::discover_nats_hook_provider_cached;
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result};
 use async_nats::jetstream;
@@ -198,57 +200,41 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         on_tool_round,
         working_dir,
     } = args;
-    // Get JetStream context from config (extract URL before await)
-    // Connect through the config-driven helper so per-cluster auth/TLS
-    // (token, require_tls, client cert, custom CA) is applied. Connecting with
-    // a bare `async_nats::connect(url)` here would silently drop all auth/TLS
-    // settings, breaking secure clusters. Snapshot the Config first so we don't
-    // hold the lock across the await.
-    let cfg_snapshot = config.read().clone();
-    let jetstream_ctx = cfg_snapshot.nats_jetstream(cluster_key).await?;
-
-    // Load or create session from NATS
-    let mut backend = NatsSessionLogBackend::new(jetstream_ctx.clone(), session_id);
-    if let Some(observer) = after_seq_observer {
-        backend = backend.with_after_seq_observer(observer);
-    }
-
-    abort_resume_if_fenced(&backend, lease.as_deref())?;
-
-    let session = load_or_repair_session(LoadOrRepairSessionParams {
-        backend: &backend,
+    let jetstream_ctx = prepare_agent_session(PrepareAgentSessionParams {
+        cluster_key,
+        session_id,
         config: &config,
         instance_id: &instance_id,
-        input: &initial_input,
-        lease: lease.as_deref(),
-        session_index,
-        session_id,
-        working_dir: working_dir.as_deref(),
+        initial_input: &initial_input,
         abort_signal: &abort_signal,
+        lease: lease.as_ref(),
+        after_seq_observer,
         header_insert_observer: header_insert_observer.as_ref(),
+        session_index,
+        working_dir: working_dir.as_deref(),
     })
     .await?;
 
-    attach_session_to_config(&config, session, &backend, lease.as_ref());
+    let hook_start_config =
+        agent_hook_start_config(cluster_key, &jetstream_ctx, &instance_id).await;
+    let mut hook_supervisor = None;
+    reconcile_agent_hooks(
+        &mut hook_supervisor,
+        hook_start_config.as_ref(),
+        &config,
+        session_id,
+    )
+    .await;
 
-    // Build AgentLoopContext
-    let ctx = crate::agent_loop::AgentLoopContext {
+    let ctx = build_agent_loop_context(AgentContextParams {
         config: config.clone(),
         instance_id,
         abort_signal: abort_signal.clone(),
-        async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::new())),
-        persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new())),
         call_fn,
         on_tool_round,
-        on_text_response: None,
-        initial_with_embeddings: false,
-        initial_resume_count: 0,
-        max_resume: None,
-        nats_hook_provider: None,
-        pending_async_context: Some(Arc::new(tokio::sync::Mutex::new(None))),
         working_dir,
-        session_lock: None,
-    };
+    })
+    .await;
 
     // Run unified agent loop
     // Persistence goes through shared Config.save_message entry construction; append_event routes sink
@@ -261,8 +247,85 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         lease,
         lease_config,
         session_index: session_index.cloned(),
+        hook_start_config,
+        hook_supervisor,
     })
     .await
+}
+
+struct PrepareAgentSessionParams<'a> {
+    cluster_key: &'a str,
+    session_id: &'a str,
+    config: &'a GlobalConfig,
+    instance_id: &'a harnx_core::instance::InstanceId,
+    initial_input: &'a Input,
+    abort_signal: &'a AbortSignal,
+    lease: Option<&'a Arc<NatsSessionLease>>,
+    after_seq_observer: Option<Arc<AtomicU64>>,
+    header_insert_observer: Option<&'a Arc<AtomicU64>>,
+    session_index: Option<&'a async_nats::jetstream::kv::Store>,
+    working_dir: Option<&'a std::path::Path>,
+}
+
+async fn prepare_agent_session(
+    params: PrepareAgentSessionParams<'_>,
+) -> Result<jetstream::Context> {
+    let cfg_snapshot = params.config.read().clone();
+    let jetstream = cfg_snapshot.nats_jetstream(params.cluster_key).await?;
+    let mut backend = NatsSessionLogBackend::new(jetstream.clone(), params.session_id);
+    if let Some(observer) = params.after_seq_observer {
+        backend = backend.with_after_seq_observer(observer);
+    }
+    abort_resume_if_fenced(&backend, params.lease.map(Arc::as_ref))?;
+    let session = load_or_repair_session(LoadOrRepairSessionParams {
+        backend: &backend,
+        config: params.config,
+        instance_id: params.instance_id,
+        input: params.initial_input,
+        lease: params.lease.map(Arc::as_ref),
+        session_index: params.session_index,
+        session_id: params.session_id,
+        working_dir: params.working_dir,
+        abort_signal: params.abort_signal,
+        header_insert_observer: params.header_insert_observer,
+    })
+    .await?;
+    attach_session_to_config(params.config, session, &backend, params.lease);
+    Ok(jetstream)
+}
+
+struct AgentContextParams {
+    config: GlobalConfig,
+    instance_id: harnx_core::instance::InstanceId,
+    abort_signal: AbortSignal,
+    call_fn: Option<crate::agent_loop::AgentCallFn>,
+    on_tool_round: Option<OnToolRoundFn>,
+    working_dir: Option<std::path::PathBuf>,
+}
+
+async fn build_agent_loop_context(
+    params: AgentContextParams,
+) -> crate::agent_loop::AgentLoopContext {
+    let config_snapshot = params.config.read().clone();
+    let nats_hook_provider =
+        discover_nats_hook_provider_cached(&config_snapshot, &params.instance_id).await;
+    crate::agent_loop::AgentLoopContext {
+        config: params.config,
+        instance_id: params.instance_id,
+        abort_signal: params.abort_signal,
+        async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::new())),
+        persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new())),
+        call_fn: params.call_fn,
+        on_tool_round: params.on_tool_round,
+        on_text_response: None,
+        initial_with_embeddings: false,
+        initial_resume_count: 0,
+        max_resume: None,
+        nats_hook_provider,
+        pending_async_context: Some(Arc::new(tokio::sync::Mutex::new(None))),
+        working_dir: params.working_dir,
+        session_lock: None,
+    }
 }
 
 struct AgentLoopSegmentArgs {
@@ -274,6 +337,38 @@ struct AgentLoopSegmentArgs {
     lease: Option<Arc<NatsSessionLease>>,
     lease_config: NatsLeaseConfig,
     session_index: Option<async_nats::jetstream::kv::Store>,
+    hook_start_config: Option<HookServerStartConfig>,
+    hook_supervisor: Option<HookServerSupervisor>,
+}
+
+async fn agent_hook_start_config(
+    cluster_key: &str,
+    jetstream: &jetstream::Context,
+    instance_id: &harnx_core::instance::InstanceId,
+) -> Option<HookServerStartConfig> {
+    if cluster_key != LOCAL_CLUSTER_KEY {
+        return None;
+    }
+    let result = async {
+        let server = resolve_local_nats_server_config().await?;
+        let token = server
+            .token
+            .context("local NATS agent hooks require HARNX_NATS_TOKEN")?;
+        Result::<_>::Ok(HookServerStartConfig::new(
+            jetstream.client().clone(),
+            instance_id.clone(),
+            server.url,
+            token,
+        ))
+    }
+    .await;
+    match result {
+        Ok(config) => Some(config),
+        Err(error) => {
+            log::warn!("session NATS hook servers disabled: {error:#}");
+            None
+        }
+    }
 }
 
 fn run_agent_loop_segment(
@@ -289,6 +384,8 @@ fn run_agent_loop_segment(
             lease,
             lease_config,
             session_index,
+            hook_start_config,
+            hook_supervisor,
         } = args;
         let loop_result = crate::agent_loop::run_agent_loop(&ctx, input).await?;
         match loop_result {
@@ -308,6 +405,8 @@ fn run_agent_loop_segment(
                     lease,
                     lease_config,
                     session_index,
+                    hook_start_config,
+                    hook_supervisor,
                 };
                 let (handoff_args, new_event_sink) =
                     prepare_nats_handoff(handoff_args, agent, session_id).await?;
@@ -378,7 +477,59 @@ async fn prepare_nats_handoff(
         .context("NATS handoff missing session after activation")?;
     attach_session_to_config(&args.config, new_session, &new_backend, Some(&new_lease));
     args.lease = Some(new_lease);
+    reconcile_agent_hooks(
+        &mut args.hook_supervisor,
+        args.hook_start_config.as_ref(),
+        &args.config,
+        &new_session_id,
+    )
+    .await;
     Ok((args, new_event_sink))
+}
+
+fn agent_resolved_hooks(config: &GlobalConfig) -> harnx_core::hooks::HooksConfig {
+    config
+        .read()
+        .agent
+        .as_ref()
+        .and_then(|agent| agent.hooks().cloned())
+        .unwrap_or_default()
+}
+
+async fn reconcile_agent_hooks(
+    current: &mut Option<HookServerSupervisor>,
+    start: Option<&HookServerStartConfig>,
+    config: &GlobalConfig,
+    session_id: &str,
+) {
+    let hooks = agent_resolved_hooks(config);
+    let scope = format!("session-{session_id}");
+    reconcile_hook_supervisor(current, start, &hooks, &scope).await;
+}
+
+/// Replace one session's hook processes only after its previous registrations
+/// have been removed. Public for lifecycle integration coverage.
+#[doc(hidden)]
+pub async fn reconcile_hook_supervisor(
+    current: &mut Option<HookServerSupervisor>,
+    start: Option<&HookServerStartConfig>,
+    hooks: &harnx_core::hooks::HooksConfig,
+    scope: &str,
+) {
+    // Stop first so old registrations and processes are gone before new hooks register.
+    if let Some(mut previous) = current.take() {
+        previous.shutdown().await;
+    }
+    let Some(start) = start else {
+        return;
+    };
+    if hooks.entries.is_empty() {
+        return;
+    }
+    match HookServerSupervisor::start_local(start.clone(), hooks, scope).await {
+        Ok(supervisor) => *current = Some(supervisor),
+        Err(error) => log::warn!("session NATS hook servers disabled: {error:#}"),
+    }
 }
 
 /// Fence-on-resume fail-safe: if the persisted tail carries a worker fence
@@ -1044,7 +1195,8 @@ pub(crate) async fn write_header_and_load_session(
 
 #[cfg(test)]
 mod tests {
-    use super::fold_new_user_messages_since;
+    use super::{agent_resolved_hooks, fold_new_user_messages_since};
+    use crate::config::Config;
     use chrono::{TimeZone, Utc};
     use harnx_core::message::{MessageContent, MessageRole};
     use harnx_core::session::SessionLogEntry;
@@ -1057,6 +1209,67 @@ mod tests {
             timestamp: Some(timestamp),
             fence_token: None,
         }
+    }
+
+    #[test]
+    fn session_hook_resolution_excludes_instance_hooks() {
+        let config = Config {
+            data: harnx_core::config_data::ConfigData {
+                hooks: Some(harnx_core::hooks::HooksConfig {
+                    max_resume: None,
+                    entries: vec![harnx_core::hooks::HookConfig {
+                        event: "SessionStart".to_string(),
+                        matcher: None,
+                        command: "echo global".to_string(),
+                        timeout: Some(30),
+                        status_message: None,
+                        async_hook: None,
+                        hook_type: "claude-command".to_string(),
+                        package_dir: None,
+                    }],
+                }),
+                ..harnx_core::config_data::ConfigData::default()
+            },
+            ..Config::default()
+        };
+        let config = std::sync::Arc::new(parking_lot::RwLock::new(config));
+
+        assert!(agent_resolved_hooks(&config).entries.is_empty());
+    }
+
+    #[test]
+    fn session_hook_resolution_keeps_agent_override_of_global_hook() {
+        let global_hook = harnx_core::hooks::HookConfig {
+            event: "SessionStart".to_string(),
+            matcher: None,
+            command: "echo global".to_string(),
+            timeout: Some(30),
+            status_message: None,
+            async_hook: None,
+            hook_type: "claude-command".to_string(),
+            package_dir: None,
+        };
+        let agent_config = harnx_core::agent_config::AgentConfig::from_markdown(
+            "override-agent",
+            "---\nhooks:\n  entries:\n    - event: SessionStart\n      command: echo agent\n      type: claude-command\n---\nprompt",
+        )
+        .expect("agent config");
+        let config = Config {
+            data: harnx_core::config_data::ConfigData {
+                hooks: Some(harnx_core::hooks::HooksConfig {
+                    max_resume: None,
+                    entries: vec![global_hook],
+                }),
+                ..harnx_core::config_data::ConfigData::default()
+            },
+            agent: Some(crate::config::Agent::new(agent_config)),
+            ..Config::default()
+        };
+        let config = std::sync::Arc::new(parking_lot::RwLock::new(config));
+
+        let hooks = agent_resolved_hooks(&config);
+        assert_eq!(hooks.entries.len(), 1);
+        assert_eq!(hooks.entries[0].command, "echo agent");
     }
 
     #[test]

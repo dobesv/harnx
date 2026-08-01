@@ -14,6 +14,7 @@ tags:
   - fire-and-forget
   - testing
 plan_ref: "hooks-over-nats-core"
+last_updated: 2026-08-01
 ---
 
 # Solution: Hooks over NATS Core

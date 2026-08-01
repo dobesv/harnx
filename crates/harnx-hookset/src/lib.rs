@@ -36,6 +36,16 @@ pub enum FailPolicy {
     Open,
 }
 
+impl FailPolicy {
+    /// Lowercase value accepted by hook-server command-line arguments.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+        }
+    }
+}
+
 /// Hook implementation served by a transport adapter.
 #[async_trait]
 pub trait Hook: Send + Sync {
@@ -85,6 +95,8 @@ mod tests {
 
         assert_eq!(decoded, registration);
         assert_eq!(FailPolicy::default(), FailPolicy::Closed);
+        assert_eq!(FailPolicy::Closed.as_str(), "closed");
+        assert_eq!(FailPolicy::Open.as_str(), "open");
         Ok(())
     }
 }

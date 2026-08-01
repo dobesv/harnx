@@ -1,9 +1,14 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use async_trait::async_trait;
+use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResult, HookResultControl};
+use harnx_hookset::{FailPolicy, Hook, HookSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+pub const SERVER_NAME: &str = "proxy-auth";
 
 #[derive(Deserialize)]
 struct HookRequest {
@@ -24,6 +29,60 @@ struct HookResponse {
 struct HookSpecificOutput {
     #[serde(rename = "toolInput")]
     tool_input: Value,
+}
+
+/// Persistent proxy and startup environment exposed as a NATS PreToolUse hook.
+pub struct ProxyAuthHook {
+    proxy_port: u16,
+    ca_cert_path: String,
+    extra_env: Map<String, Value>,
+}
+
+impl ProxyAuthHook {
+    pub fn new(proxy_port: u16, ca_cert_path: PathBuf, extra_env: Map<String, Value>) -> Self {
+        Self {
+            proxy_port,
+            ca_cert_path: ca_cert_path.to_string_lossy().into_owned(),
+            extra_env,
+        }
+    }
+}
+
+#[async_trait]
+impl Hook for ProxyAuthHook {
+    fn name(&self) -> &str {
+        SERVER_NAME
+    }
+
+    fn hooks(&self) -> Vec<HookSpec> {
+        vec![HookSpec {
+            event: "PreToolUse".to_string(),
+            matcher: Some("exec|spawn".to_string()),
+            priority: 0,
+            timeout_secs: None,
+            fail_policy: FailPolicy::Closed,
+        }]
+    }
+
+    async fn handle_hook(&self, payload: HookPayload) -> HookOutcome {
+        let mutated_tool_input = match payload.hook_event {
+            HookEvent::PreToolUse { tool_input, .. } => Some(augment_tool_input(
+                Some(tool_input),
+                self.proxy_port,
+                &self.ca_cert_path,
+                &self.extra_env,
+            )),
+            _ => None,
+        };
+
+        HookOutcome {
+            control: HookResultControl::Continue,
+            result: HookResult {
+                mutated_tool_input,
+                ..HookResult::default()
+            },
+        }
+    }
 }
 
 pub async fn run_jsonl_loop(

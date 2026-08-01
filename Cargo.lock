@@ -3500,6 +3500,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-claude-compatible-hook-server"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "clap",
+ "harnx-core",
+ "harnx-hooks",
+ "harnx-hookset",
+ "harnx-hookset-server",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "which",
+]
+
+[[package]]
 name = "harnx-client"
 version = "0.33.4"
 dependencies = [
@@ -3937,11 +3955,15 @@ name = "harnx-proxy-auth"
 version = "0.33.4"
 dependencies = [
  "anyhow",
+ "async-nats",
+ "async-trait",
  "base64 0.23.0",
  "clap",
  "harnx-core",
  "harnx-engine",
  "harnx-hooks",
+ "harnx-hookset",
+ "harnx-hookset-server",
  "harnx-mcp",
  "harnx-runtime",
  "http 1.5.0",
@@ -3966,6 +3988,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "which",
 ]
 
 [[package]]

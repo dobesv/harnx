@@ -34,6 +34,7 @@ members = [
     "crates/harnx-time-server",
     "crates/harnx-hookset",
     "crates/harnx-hookset-server",
+    "crates/harnx-claude-compatible-hook-server",
     "crates/harnx-toolset",
     "crates/harnx-toolset-server",
     "crates/harnx-tui",

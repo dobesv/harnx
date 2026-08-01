@@ -6,6 +6,7 @@ use super::agent_loop::{
 };
 use super::backend::NatsSessionLogBackend;
 use super::control::{control_subject, ControlCommand};
+use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use super::subagent_toolset::SubagentToolset;
 use super::tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
 use crate::config::{
@@ -316,6 +317,36 @@ async fn start_local_tool_servers(
     optional_tool_server(result)
 }
 
+async fn start_global_hooks(
+    daemon: &WorkerDaemonConfig,
+    client: async_nats::Client,
+    instance_id: &harnx_core::instance::InstanceId,
+    hooks: &harnx_core::hooks::HooksConfig,
+) -> Option<HookServerSupervisor> {
+    if daemon.cluster != LOCAL_CLUSTER_KEY || hooks.entries.is_empty() {
+        return None;
+    }
+    let result = async {
+        let server = resolve_local_nats_server_config().await?;
+        let token = server
+            .token
+            .as_deref()
+            .context("local NATS hook servers require HARNX_NATS_TOKEN")?;
+        let start = HookServerStartConfig::new(client, instance_id.clone(), &server.url, token);
+        HookServerSupervisor::start_local(start, hooks, "global")
+            .await
+            .context("start global NATS hook servers")
+    }
+    .await;
+    match result {
+        Ok(supervisor) => Some(supervisor),
+        Err(error) => {
+            log::warn!("global NATS hook servers disabled: {error:#}");
+            None
+        }
+    }
+}
+
 fn optional_tool_server<T>(result: Result<T>) -> Option<T> {
     match result {
         Ok(supervisor) => Some(supervisor),
@@ -378,61 +409,56 @@ async fn start_subagent_toolset(
     }
 }
 
-/// Run a worker daemon: pull `SessionActivate` notifications, claim each via a
-/// KV lease, and execute the session (exactly one worker per session).
-pub async fn run_worker_daemon(
-    config: GlobalConfig,
-    daemon: WorkerDaemonConfig,
-    call_fn: Option<crate::agent_loop::AgentCallFn>,
-) -> Result<()> {
-    let instance_id = harnx_core::instance::InstanceId::new();
-    let startup = prepare_worker_startup(&config, &daemon).await?;
-    let (tool_servers, agent_package, namespaced_use_tools) = {
-        let config = config.read();
-        let agent_package = config
-            .agent
-            .as_ref()
-            .and_then(|agent| harnx_core::package_namespace::pkg_from_qualified(agent.name()))
-            .map(str::to_string);
-        let mut namespaced_use_tools = Vec::new();
-        // Same-package servers use bare MCP display names; retain bare selectors
-        // while also adding package-qualified forms for cross-package matching.
-        for selector in config
-            .agent
-            .as_ref()
-            .and_then(|agent| agent.use_tools())
-            .unwrap_or_default()
-        {
-            namespaced_use_tools.push(selector.clone());
-            if selector != "*" {
-                if let Some(package) = agent_package.as_deref() {
-                    let namespaced = harnx_core::package_namespace::namespace_use_tools_entry(
-                        package, &selector,
-                    );
-                    if namespaced != selector {
-                        namespaced_use_tools.push(namespaced);
-                    }
-                }
-            }
+struct WorkerServices {
+    tool_supervisor: Option<ToolServerSupervisor>,
+    global_hook_supervisor: Option<HookServerSupervisor>,
+    subagent_tool_servers: Vec<JoinHandle<Result<()>>>,
+    session_index: Option<async_nats::jetstream::kv::Store>,
+}
+
+fn configured_worker_services(
+    config: &GlobalConfig,
+) -> (Vec<ToolServerConfig>, harnx_core::hooks::HooksConfig) {
+    let config = config.read();
+    let agent_package = config
+        .agent
+        .as_ref()
+        .and_then(|agent| harnx_core::package_namespace::pkg_from_qualified(agent.name()));
+    let mut selectors = Vec::new();
+    for selector in config
+        .agent
+        .as_ref()
+        .and_then(|agent| agent.use_tools())
+        .unwrap_or_default()
+    {
+        if let Some(namespaced) = namespaced_selector(&selector, agent_package) {
+            selectors.push(namespaced);
         }
-        (
-            config.tool_servers.clone(),
-            agent_package,
-            namespaced_use_tools,
-        )
-    };
-    let matching_tool_servers = tool_servers_matching_use_tools(
-        &tool_servers,
-        agent_package.as_deref(),
-        &namespaced_use_tools,
-    );
-    let tool_supervisor = start_local_tool_servers(
-        &daemon,
-        startup.client.clone(),
-        &instance_id,
-        &matching_tool_servers,
-    )
-    .await;
+        selectors.push(selector);
+    }
+    let servers = tool_servers_matching_use_tools(&config.tool_servers, agent_package, &selectors);
+    (servers, config.hooks.clone().unwrap_or_default())
+}
+
+fn namespaced_selector(selector: &str, package: Option<&str>) -> Option<String> {
+    if selector == "*" {
+        return None;
+    }
+    let namespaced = harnx_core::package_namespace::namespace_use_tools_entry(package?, selector);
+    (namespaced != selector).then_some(namespaced)
+}
+
+async fn launch_worker_services(
+    config: &GlobalConfig,
+    daemon: &WorkerDaemonConfig,
+    startup: &WorkerStartup,
+    instance_id: &harnx_core::instance::InstanceId,
+) -> Result<WorkerServices> {
+    let (tool_servers, global_hooks) = configured_worker_services(config);
+    let tool_supervisor =
+        start_local_tool_servers(daemon, startup.client.clone(), instance_id, &tool_servers).await;
+    let global_hook_supervisor =
+        start_global_hooks(daemon, startup.client.clone(), instance_id, &global_hooks).await;
     let mut subagent_tool_servers = Vec::new();
     for agent in list_agents() {
         subagent_tool_servers.push(
@@ -447,19 +473,37 @@ pub async fn run_worker_daemon(
             .context("start sub-agent toolset")?,
         );
     }
-    // Attempt optional tool startup before readiness so successful pilots are available on turn one.
-    spawn_readiness_publisher(startup.client.clone(), &daemon);
+    spawn_readiness_publisher(startup.client.clone(), daemon);
     let session_index = optional_session_index(&startup.jetstream).await;
+    Ok(WorkerServices {
+        tool_supervisor,
+        global_hook_supervisor,
+        subagent_tool_servers,
+        session_index,
+    })
+}
+
+/// Run a worker daemon: pull `SessionActivate` notifications, claim each via a
+/// KV lease, and execute the session (exactly one worker per session).
+pub async fn run_worker_daemon(
+    config: GlobalConfig,
+    daemon: WorkerDaemonConfig,
+    call_fn: Option<crate::agent_loop::AgentCallFn>,
+) -> Result<()> {
+    let instance_id = harnx_core::instance::InstanceId::new();
+    let startup = prepare_worker_startup(&config, &daemon).await?;
+    let services = launch_worker_services(&config, &daemon, &startup, &instance_id).await?;
     let runtime = Arc::new(WorkerRuntime {
         config,
         instance_id,
-        _tool_supervisor: tool_supervisor,
-        _subagent_tool_servers: subagent_tool_servers,
+        _tool_supervisor: services.tool_supervisor,
+        _global_hook_supervisor: services.global_hook_supervisor,
+        _subagent_tool_servers: services.subagent_tool_servers,
         cluster: daemon.cluster.clone(),
         worker_id: daemon.worker_id.clone(),
         lease: daemon.lease,
         jetstream: startup.jetstream,
-        session_index,
+        session_index: services.session_index,
         client: startup.client,
         call_fn,
         generation: AtomicU64::new(1),
@@ -493,6 +537,7 @@ struct WorkerRuntime {
     config: GlobalConfig,
     instance_id: harnx_core::instance::InstanceId,
     _tool_supervisor: Option<ToolServerSupervisor>,
+    _global_hook_supervisor: Option<HookServerSupervisor>,
     _subagent_tool_servers: Vec<JoinHandle<Result<()>>>,
     #[allow(dead_code)]
     cluster: String,
@@ -1091,6 +1136,7 @@ mod tests {
             enabled: true,
             description: None,
             package: None,
+            hooks: None,
         }
     }
 
