@@ -772,6 +772,119 @@ async fn test_read_file_with_tail() {
     assert!(text.contains("showing last 2 of 4 matching lines"));
 }
 
+/// Read `content` with combined `offset`+`tail` and return the rendered text.
+async fn read_offset_tail(content: &str, offset: usize, tail: usize) -> String {
+    let temp_dir = TestDir::new();
+    let file_path = temp_dir.path().join("offset_tail.txt");
+    std::fs::write(&file_path, content).unwrap();
+    let server = make_server(temp_dir.path());
+
+    let result = server
+        .read_file_impl(ReadFileParams {
+            path: path_string(&file_path),
+            offset: Some(offset),
+            limit: None,
+            tail: Some(tail),
+            grep: None,
+            head_lines: None,
+            tail_lines: None,
+            max_output_bytes: None,
+        })
+        .await
+        .unwrap();
+
+    text_content(&result)
+}
+
+#[tokio::test]
+async fn test_read_file_offset_and_tail_combinations() {
+    let six = "one\ntwo\nthree\nfour\nfive\nsix\n";
+
+    // Skip to line 3, then tail the last 2 lines of the remaining window
+    // (lines 3..6) → lines 5 and 6. Tail is anchored to the end, so no
+    // forward "more matching lines" notice.
+    let text = read_offset_tail(six, 3, 2).await;
+    for expect in ["5: five", "6: six", "showing last 2 of 4 matching lines"] {
+        assert!(text.contains(expect), "expected {expect:?} in: {text}");
+    }
+    for absent in ["4: four", "more matching lines"] {
+        assert!(!text.contains(absent), "unexpected {absent:?} in: {text}");
+    }
+
+    // tail == window_len (offset=3 leaves a 4-line window): whole window, no
+    // "showing last" notice.
+    let text = read_offset_tail(six, 3, 4).await;
+    assert_window_without_notice(&text);
+
+    // tail > window_len (offset=3 leaves a 2-line window on a 4-line file):
+    // whole window, no notice.
+    let text = read_offset_tail("one\ntwo\nthree\nfour\n", 3, 5).await;
+    assert_window_without_notice(&text);
+}
+
+/// Asserts a post-offset window starting at line 3 was returned in full with
+/// no truncation notice.
+fn assert_window_without_notice(text: &str) {
+    assert!(text.contains("3: three"), "got: {text}");
+    assert!(!text.contains("2: two"), "got: {text}");
+    assert!(!text.contains("showing last"), "got: {text}");
+}
+
+#[tokio::test]
+async fn test_read_file_offset_beyond_eof_with_tail_errors() {
+    let temp_dir = TestDir::new();
+    let file_path = temp_dir.path().join("offset_tail_eof.txt");
+    std::fs::write(&file_path, "one\ntwo\nthree\n").unwrap();
+    let server = make_server(temp_dir.path());
+
+    // offset one past EOF (total=3, offset=4) with tail must error, matching
+    // the non-tail path.
+    let result = server
+        .read_file_impl(ReadFileParams {
+            path: path_string(&file_path),
+            offset: Some(4),
+            limit: None,
+            tail: Some(2),
+            grep: None,
+            head_lines: None,
+            tail_lines: None,
+            max_output_bytes: None,
+        })
+        .await;
+
+    let message = result.expect_err("expected error").message;
+    assert!(
+        message.contains("beyond end of result set"),
+        "got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn test_read_file_offset_zero_rejected() {
+    let temp_dir = TestDir::new();
+    let file_path = temp_dir.path().join("offset_zero.txt");
+    std::fs::write(&file_path, "one\ntwo\n").unwrap();
+    let server = make_server(temp_dir.path());
+
+    // Explicit offset=0 is invalid (offset is 1-indexed), matching
+    // read_exec_log's contract rather than silently coercing to 1.
+    let result = server
+        .read_file_impl(ReadFileParams {
+            path: path_string(&file_path),
+            offset: Some(0),
+            limit: None,
+            tail: None,
+            grep: None,
+            head_lines: None,
+            tail_lines: None,
+            max_output_bytes: None,
+        })
+        .await;
+
+    let message = result.expect_err("expected error").message;
+    assert!(message.contains("offset must be >= 1"), "got: {message}");
+}
+
 #[tokio::test]
 async fn test_read_file_binary_detection() {
     let temp_dir = TestDir::new();

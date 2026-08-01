@@ -1609,6 +1609,79 @@ async fn test_read_exec_log_rejects_invalid_stream() {
 }
 
 #[tokio::test]
+async fn test_read_exec_log_offset_and_tail_combined() {
+    let temp_dir = TestDir::new();
+    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+    let result = server
+        .exec_command_impl(ExecCommandParams {
+            command: "printf 'l1\\nl2\\nl3\\nl4\\nl5\\nl6\\n'".to_string(),
+            working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+            timeout_secs: Some(5),
+            head_lines: None,
+            tail_lines: None,
+            max_output_bytes: None,
+            env: None,
+        })
+        .await
+        .unwrap();
+
+    let execution_id = extract_field(&text_content(&result), "execution_id");
+
+    // Skip to line 3, then tail the last 2 lines of the remaining window
+    // (lines 3..6) → lines 5 and 6.
+    let read = server
+        .read_exec_log_impl(ReadExecLogParams {
+            execution_id,
+            stream: "stdout".to_string(),
+            offset: Some(3),
+            limit: None,
+            tail: Some(2),
+            grep: None,
+            head_lines: None,
+            tail_lines: None,
+            max_output_bytes: None,
+        })
+        .await
+        .unwrap();
+
+    let text = text_content(&read);
+    assert!(text.contains("5: l5"), "got: {text}");
+    assert!(text.contains("6: l6"), "got: {text}");
+    assert!(!text.contains("4: l4"), "got: {text}");
+    // Window after offset is 4 lines (3..6), tail 2 of those.
+    assert!(
+        text.contains("showing last 2 of 4 matching lines"),
+        "got: {text}"
+    );
+    // Tail is anchored to the end, so no "more matching lines" pagination notice.
+    assert!(!text.contains("more matching lines"), "got: {text}");
+}
+
+#[test]
+fn test_select_log_lines_offset_and_tail() {
+    let lines: Vec<(usize, String)> = (1..=6).map(|n| (n, format!("line{n}"))).collect();
+
+    // offset=3 (skip 2), tail=2 → last 2 of window [3..6] = lines 5,6.
+    let (selected, notices) = BashServer::select_log_lines(lines.clone(), Some(3), 200, Some(2));
+    assert_eq!(
+        selected,
+        vec![(5, "line5".to_string()), (6, "line6".to_string())]
+    );
+    assert!(notices
+        .iter()
+        .any(|n| n.contains("showing last 2 of 4 matching lines")));
+
+    // tail larger than the post-offset window returns the whole window.
+    let (selected, notices) = BashServer::select_log_lines(lines, Some(5), 200, Some(10));
+    assert_eq!(
+        selected,
+        vec![(5, "line5".to_string()), (6, "line6".to_string())]
+    );
+    assert!(notices.is_empty());
+}
+
+#[tokio::test]
 async fn test_cleanup_log_dir_removes_temp_logs() {
     let temp_dir = TestDir::new();
     let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);

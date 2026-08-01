@@ -96,7 +96,7 @@ impl JsonSchema for ReadExecLogParams {
                     offset,
                 ),
                 ("limit", "Return at most N lines.", limit),
-                ("tail", "Return only the last N lines.", tail),
+                ("tail", "Return only the last N lines. Can be combined with offset to tail from a starting line (skip to offset, then take the last N lines after it).", tail),
                 ("grep", "Filter lines by regex before truncating.", grep),
                 ("head_lines", "Return only the first N lines.", head_lines),
                 ("tail_lines", "Return only the last N lines.", tail_lines),
