@@ -611,3 +611,55 @@ When the hook runs, it injects the following variables into the tool's environme
 *   **User Precedence**: If the agent or user already defined any of these environment variables in the tool call, `harnx-proxy-auth` will **not** overwrite them. This allows for manual overrides.
 *   **Ephemeral CA**: The proxy CA certificate is generated on startup and deleted immediately upon the hook's exit. It is only trusted by the processes spawned during a single harnx run.
 *   **Scoped Injection**: Request mutation scope is defined by your jaq filter. Requests that do not match your condition should return `.`, leaving traffic unchanged.
+
+
+## 12. Serving Hooks over NATS (experimental)
+
+Harnx supports running hook handlers as decoupled NATS microservices using the `harnx-hookset` and `harnx-hookset-server` crates.
+
+### Architecture and Discovery
+
+NATS hook servers register their capabilities in a JetStream Key-Value bucket and handle hook invocation requests over NATS subjects.
+
+* **Registry Bucket**: `harnx_hook_registry` (constant `HOOK_REGISTRY_BUCKET`).
+* **Registration**: On startup, hook servers publish a `HookRegistration` payload containing `server` ID, `hooks` list (`Vec<HookSpec>`), `schema_version`, and `proto_version`. The registration is refreshed every 30 seconds (TTL).
+* **Subject Scheme**: Hook servers subscribe to `harnx.v1.{instance}.hook.{server}.{event}` subjects.
+* **Request/Reply**: The worker posts a `HookPayload` request and awaits a `HookOutcome` reply.
+
+### Hook Specifications and Fail Policy
+
+Each hook registers one or more `HookSpec` structures:
+
+* `event`: Triggering event type (e.g., `PreToolUse`, `PostToolUse`).
+* `matcher`: Regex matched against the bare tool name (for example, `bash_exec` or `fs_read`).
+* `priority`: Integer priority (lower values execute first).
+* `timeout_secs`: Execution timeout in seconds.
+* `fail_policy`: Determines behavior if the hook times out or returns an error.
+  * `Closed` (default, serialized as `"closed"`): Treats hook failure as a blocking error.
+  * `Open` (serialized as `"open"`): Logs the error and continues execution.
+
+### Worker Discovery and Execution
+
+The worker's `NatsHookProvider` reads active registrations from `harnx_hook_registry`, filters hooks matching the event and bare tool name, and orders them by priority ascending.
+
+* **`PreToolUse` Hooks**: Executed sequentially. Output mutations (`mutated_tool_input`) chain from one hook to the next. If any hook returns a `Block` or `Ask` outcome, execution short-circuits immediately.
+* **`PostToolUse` Hooks**: Executed asynchronously (`tokio::spawn` fire-and-forget). Errors emit an `AgentEvent::Notice(Error)`. Returned `additional_context` or `system_message` values route to the shared `pending_async_context` and inject into the next agent turn. Tool response mutations (`mutated_tool_response`) are dropped in this slice.
+
+### Dual Dispatch
+
+The worker's hook dispatcher (`build_dispatch_hook_fn`) executes NATS hooks first, followed sequentially by existing inline hooks:
+
+1. NATS hooks run sequentially.
+2. If a NATS hook blocks or requests approval (`Ask`), the request short-circuits.
+3. If NATS hooks pass, the resulting mutated payload passes to the inline hook runner.
+4. NATS and inline mutations are composed together.
+
+Inline hooks still run after NATS hooks, ensuring existing configurations (such as `harnx-proxy-auth`) function without modification. Non-NATS callers fall back to inline-only dispatch.
+
+### Known Edges and Deferred Items
+
+* **`Ask` Outcome over NATS**: A `PreToolUse` hook returning `Ask` routes through the worker's existing `ToolApprovalRequiredError` path. Interactive resolution of `Ask` outcomes over NATS for headless workers is deferred to a future slice.
+* **`PreToolUse` context injection**: In this slice the worker composes only `mutated_tool_input` from NATS `PreToolUse` hooks. `additional_context` and `system_message` returned by a NATS `PreToolUse` hook are not yet injected (unlike `PostToolUse`, which routes them to `pending_async_context`). Deferred to a future slice.
+* **Deferred Goals**: Hook process supervision, config-driven `hooks/*.yaml` loading, migrating existing inline hooks to NATS, converting `harnx-proxy-auth` to a native NATS hook, and restoring `PostToolUse` response mutations will be implemented in subsequent slices.
+
+References #1224.

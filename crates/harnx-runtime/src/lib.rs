@@ -20,6 +20,7 @@ pub mod local_orchestrator;
 pub mod nats_admin;
 pub mod nats_client_session;
 pub mod nats_event_sink;
+pub mod nats_hook_provider;
 pub mod nats_lease;
 pub mod nats_local_server;
 pub mod nats_metrics;

@@ -42,6 +42,7 @@ pub fn build_context(
         initial_with_embeddings: true,
         initial_resume_count: 0,
         max_resume: None,
+        nats_hook_provider: None,
         pending_async_context: None,
         working_dir,
         session_lock: None,

@@ -33,6 +33,8 @@ harnx-core = { path = "../harnx-core" }
 harnx-engine = { path = "../harnx-engine" }
 harnx-fetch = { path = "../harnx-fetch" }
 harnx-hooks = { path = "../harnx-hooks" }
+harnx-hookset = { path = "../harnx-hookset" }
+harnx-hookset-server = { path = "../harnx-hookset-server" }
 harnx-toolset = { path = "../harnx-toolset" }
 harnx-toolset-server = { path = "../harnx-toolset-server" }
 harnx-mcp = { path = "../harnx-mcp" }

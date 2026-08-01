@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookPayload {
     pub session_id: String,
     pub cwd: PathBuf,
@@ -12,7 +12,7 @@ pub struct HookPayload {
     pub hook_event: HookEvent,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "hook_event_name", rename_all = "PascalCase")]
 pub enum HookEvent {
     SessionStart {
@@ -76,14 +76,14 @@ impl HookEvent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HookResultControl {
     Continue,
     Block { reason: String },
     Ask { reason: Option<String> },
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HookSpecificOutput {
     #[serde(default)]
@@ -96,7 +96,7 @@ pub struct HookSpecificOutput {
     pub tool_response: Option<Value>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HookResult {
     #[serde(default)]
@@ -113,7 +113,7 @@ pub struct HookResult {
     pub mutated_tool_response: Option<Value>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookOutcome {
     pub control: HookResultControl,
     pub result: HookResult,
@@ -226,7 +226,10 @@ impl HooksConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{HookConfig, HookEvent, HookPayload, HookResult, HookSpecificOutput, HooksConfig};
+    use super::{
+        HookConfig, HookEvent, HookOutcome, HookPayload, HookResult, HookResultControl,
+        HookSpecificOutput, HooksConfig,
+    };
     use serde_json::{json, Value};
     use std::path::PathBuf;
 
@@ -446,6 +449,79 @@ entries:
         );
         assert_eq!(value["cwd"], Value::String("/tmp/project".to_string()));
         assert_eq!(value["resume_count"], Value::from(2));
+    }
+
+    #[test]
+    fn test_hook_payload_json_round_trip() {
+        let payload = HookPayload {
+            session_id: "session-123".to_string(),
+            cwd: PathBuf::from("/tmp/project"),
+            resume_count: 2,
+            hook_event: HookEvent::PreToolUse {
+                tool_name: "shell".to_string(),
+                tool_input: json!({"command": "echo hi"}),
+                tool_use_id: "call-1".to_string(),
+            },
+        };
+
+        let json = serde_json::to_string(&payload).expect("serialize hook payload");
+        let decoded: HookPayload = serde_json::from_str(&json).expect("deserialize hook payload");
+
+        assert_eq!(decoded.session_id, payload.session_id);
+        assert_eq!(decoded.cwd, payload.cwd);
+        assert_eq!(decoded.resume_count, payload.resume_count);
+        match decoded.hook_event {
+            HookEvent::PreToolUse {
+                tool_name,
+                tool_input,
+                tool_use_id,
+            } => {
+                assert_eq!(tool_name, "shell");
+                assert_eq!(tool_input, json!({"command": "echo hi"}));
+                assert_eq!(tool_use_id, "call-1");
+            }
+            event => panic!("expected PreToolUse, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn test_hook_outcome_json_round_trip() {
+        let outcome = HookOutcome {
+            control: HookResultControl::Block {
+                reason: "dangerous command".to_string(),
+            },
+            result: HookResult {
+                mutated_tool_input: Some(json!({"command": "echo safe"})),
+                ..HookResult::default()
+            },
+        };
+
+        let json = serde_json::to_string(&outcome).expect("serialize hook outcome");
+        let decoded: HookOutcome = serde_json::from_str(&json).expect("deserialize hook outcome");
+
+        assert_eq!(decoded.control, outcome.control);
+        assert_eq!(
+            decoded.result.mutated_tool_input,
+            Some(json!({"command": "echo safe"}))
+        );
+    }
+
+    #[test]
+    fn test_hook_result_control_json_round_trip() {
+        let controls = [
+            HookResultControl::Continue,
+            HookResultControl::Block {
+                reason: "blocked".to_string(),
+            },
+            HookResultControl::Ask { reason: None },
+        ];
+
+        for control in controls {
+            let json = serde_json::to_string(&control).expect("serialize hook result control");
+            let decoded: HookResultControl =
+                serde_json::from_str(&json).expect("deserialize hook result control");
+            assert_eq!(decoded, control);
+        }
     }
 
     #[test]
