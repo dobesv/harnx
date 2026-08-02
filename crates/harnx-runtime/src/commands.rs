@@ -9,10 +9,7 @@ use crate::nats_hook_provider::{
     discover_process_nats_hook_provider, dispatch_hook_event, HookDispatchMeta, HookEventDispatch,
 };
 use crate::utils::{dimmed_text, set_text, AbortSignal};
-use harnx_hooks::{
-    dispatch_hooks_with_managers, AsyncHookManager, HookEvent, HookResultControl,
-    PersistentHookManager,
-};
+use harnx_hooks::{HookEvent, HookResultControl};
 use harnx_render::render_error;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -149,21 +146,9 @@ pub async fn run_command(
     config: &GlobalConfig,
     abort_signal: AbortSignal,
     line: &str,
-    async_manager: &mut AsyncHookManager,
-    persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
-    pending_async_context: &mut Option<String>,
 ) -> Result<CommandOutcome> {
     let mut stdout_sink = std::io::stdout();
-    run_command_with_output(
-        config,
-        abort_signal,
-        line,
-        async_manager,
-        persistent_manager,
-        pending_async_context,
-        &mut stdout_sink,
-    )
-    .await
+    run_command_with_output(config, abort_signal, line, &mut stdout_sink).await
 }
 
 /// Write the harnx process environment. With `name = None`, lists variable
@@ -200,7 +185,6 @@ async fn write_mcp_info(
     output: &mut (dyn Write + Send),
     config: &GlobalConfig,
     name: Option<&str>,
-    persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
 ) -> Result<()> {
     let Some(manager) = config.read().mcp_manager.clone() else {
         writeln!(output, "MCP is not configured")?;
@@ -273,7 +257,6 @@ async fn write_mcp_info(
     match cfg.hooks.as_ref() {
         Some(hooks) if !hooks.entries.is_empty() => {
             writeln!(output, "  hooks:")?;
-            let pm = persistent_manager.lock().await;
             for (i, hook) in hooks.entries.iter().enumerate() {
                 writeln!(
                     output,
@@ -284,12 +267,7 @@ async fn write_mcp_info(
                     hook.matcher.as_deref().unwrap_or("*"),
                 )?;
                 writeln!(output, "        command: {}", hook.command)?;
-                if hook.hook_type == "claude-command-persistent" {
-                    match pm.pid_for(&hook.command) {
-                        Some(pid) => writeln!(output, "        hook pid: {pid} (running)")?,
-                        None => writeln!(output, "        hook pid: (not started)")?,
-                    }
-                }
+                writeln!(output, "        transport: NATS")?;
             }
         }
         _ => writeln!(output, "  hooks: (none)")?,
@@ -301,23 +279,11 @@ pub async fn run_command_with_output(
     config: &GlobalConfig,
     abort_signal: AbortSignal,
     line: &str,
-    async_manager: &mut AsyncHookManager,
-    persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
-    pending_async_context: &mut Option<String>,
     output: &mut (dyn Write + Send),
 ) -> Result<CommandOutcome> {
     let local_worker = Arc::new(tokio::sync::Mutex::new(None));
-    run_command_with_output_and_local_worker(
-        config,
-        abort_signal,
-        line,
-        async_manager,
-        persistent_manager,
-        pending_async_context,
-        output,
-        &local_worker,
-    )
-    .await
+    run_command_with_output_and_local_worker(config, abort_signal, line, output, &local_worker)
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -325,15 +291,11 @@ pub async fn run_command_with_output_and_local_worker(
     config: &GlobalConfig,
     abort_signal: AbortSignal,
     mut line: &str,
-    async_manager: &mut AsyncHookManager,
-    persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
-    pending_async_context: &mut Option<String>,
     output: &mut (dyn Write + Send),
     local_worker: &Arc<
         tokio::sync::Mutex<Option<crate::local_orchestrator::LocalWorkerSupervisor>>,
     >,
 ) -> Result<CommandOutcome> {
-    let max_resume = config.read().resolved_hooks().max_resume.unwrap_or(5);
     if let Ok(Some(captures)) = MULTILINE_RE.captures(line) {
         if let Some(text_match) = captures.get(1) {
             line = text_match.as_str();
@@ -503,7 +465,7 @@ pub async fn run_command_with_output_and_local_worker(
                 }
                 Some(rest) if rest == "mcp" || rest.starts_with("mcp ") => {
                     let name = rest.strip_prefix("mcp").map(str::trim).filter(|s| !s.is_empty());
-                    write_mcp_info(output, config, name, persistent_manager).await?;
+                    write_mcp_info(output, config, name).await?;
                 }
                 Some(rest) if rest == "env" || rest.starts_with("env ") => {
                     let name = rest.strip_prefix("env").map(str::trim).filter(|s| !s.is_empty());
@@ -591,10 +553,6 @@ pub async fn run_command_with_output_and_local_worker(
                                 abort_signal.clone(),
                                 input,
                                 true,
-                                async_manager,
-                                persistent_manager,
-                                pending_async_context,
-                                max_resume,
                             )
                             .await?;
                         }
@@ -885,10 +843,6 @@ Commands:
                         abort_signal.clone(),
                         input,
                         true,
-                        async_manager,
-                        persistent_manager,
-                        pending_async_context,
-                        max_resume,
                     )
                     .await?;
                 }
@@ -925,10 +879,6 @@ Commands:
                     abort_signal.clone(),
                     input,
                     true,
-                    async_manager,
-                    persistent_manager,
-                    pending_async_context,
-                    max_resume,
                 )
                 .await?;
             }
@@ -950,10 +900,6 @@ Commands:
                     abort_signal.clone(),
                     input,
                     true,
-                    async_manager,
-                    persistent_manager,
-                    pending_async_context,
-                    max_resume,
                 )
                 .await?;
             }
@@ -1071,10 +1017,9 @@ Commands:
             _ => unknown_command()?,
         },
         None => {
-            let (hooks, session_id, config_snapshot) = {
+            let (session_id, config_snapshot) = {
                 let config = config.read();
                 (
-                    config.resolved_hooks(),
                     config
                         .session
                         .as_ref()
@@ -1090,15 +1035,6 @@ Commands:
             let event = HookEvent::UserPromptSubmit {
                 prompt: line.to_string(),
             };
-            let inline_event = event.clone();
-            let inline_fallback = dispatch_hooks_with_managers(
-                &inline_event,
-                &hooks.entries,
-                &session_id,
-                &cwd,
-                Some(async_manager),
-                Some(persistent_manager),
-            );
             let outcome = dispatch_hook_event(
                 HookEventDispatch {
                     event,
@@ -1110,7 +1046,6 @@ Commands:
                     },
                     pending_async_context: None,
                 },
-                inline_fallback,
             )
             .await;
             match outcome.control {
@@ -1134,10 +1069,6 @@ Commands:
                         abort_signal.clone(),
                         input,
                         true,
-                        async_manager,
-                        persistent_manager,
-                        pending_async_context,
-                        hooks.max_resume.unwrap_or(5),
                     )
                     .await?;
                 }
@@ -1157,10 +1088,6 @@ async fn ask(
     abort_signal: AbortSignal,
     mut input: Input,
     with_embeddings: bool,
-    _async_manager: &mut AsyncHookManager,
-    _persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
-    _pending_async_context: &mut Option<String>,
-    _max_resume: u32,
 ) -> Result<()> {
     if with_embeddings {
         crate::config::input::use_embeddings(&mut input, config, abort_signal.clone()).await?;
@@ -1545,10 +1472,8 @@ hooks:
       command: "harnx-proxy-auth --hook 'if .host == \"api.github.com\" then . end'"
 "#,
         );
-
-        let pm = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
         let mut out: Vec<u8> = Vec::new();
-        write_mcp_info(&mut out, &config, Some("bash"), &pm)
+        write_mcp_info(&mut out, &config, Some("bash"))
             .await
             .expect("write mcp info");
         let text = String::from_utf8(out).expect("utf8");
@@ -1564,16 +1489,14 @@ hooks:
         assert!(text.contains("harnx-proxy-auth --hook"), "{text}");
         assert!(text.contains("api.github.com"), "{text}");
         // Persistent hook is not spawned in this test → reported as not started.
-        assert!(text.contains("hook pid: (not started)"), "{text}");
+        assert!(text.contains("transport: NATS"), "{text}");
     }
 
     #[tokio::test]
     async fn test_mcp_info_unknown_server_lists_available() {
         let config = test_config_with_mcp("name: bash\ncommand: harnx-mcp-bash\n");
-
-        let pm = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
         let mut out: Vec<u8> = Vec::new();
-        write_mcp_info(&mut out, &config, Some("nope"), &pm)
+        write_mcp_info(&mut out, &config, Some("nope"))
             .await
             .expect("write mcp info");
         let text = String::from_utf8(out).expect("utf8");
@@ -1629,21 +1552,10 @@ hooks:
         let config = Arc::new(RwLock::new(config));
         let mut output = Vec::new();
         let abort_signal = crate::utils::create_abort_signal();
-        let mut async_manager = AsyncHookManager::default();
-        let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
-        let mut pending_async_context = None;
 
-        let outcome = run_command_with_output(
-            &config,
-            abort_signal,
-            ".title",
-            &mut async_manager,
-            &persistent_manager,
-            &mut pending_async_context,
-            &mut output,
-        )
-        .await
-        .expect("command succeeds");
+        let outcome = run_command_with_output(&config, abort_signal, ".title", &mut output)
+            .await
+            .expect("command succeeds");
 
         assert_eq!(outcome, CommandOutcome::Continue);
         assert_eq!(
@@ -1673,21 +1585,10 @@ hooks:
         let config = Arc::new(RwLock::new(config));
         let mut output = Vec::new();
         let abort_signal = crate::utils::create_abort_signal();
-        let mut async_manager = AsyncHookManager::default();
-        let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
-        let mut pending_async_context = None;
 
-        run_command_with_output(
-            &config,
-            abort_signal,
-            ".title",
-            &mut async_manager,
-            &persistent_manager,
-            &mut pending_async_context,
-            &mut output,
-        )
-        .await
-        .expect("command succeeds");
+        run_command_with_output(&config, abort_signal, ".title", &mut output)
+            .await
+            .expect("command succeeds");
 
         let out = String::from_utf8(output).expect("utf8 output");
         assert!(
@@ -1719,21 +1620,11 @@ hooks:
         let config = Arc::new(RwLock::new(config));
         let mut output = Vec::new();
         let abort_signal = crate::utils::create_abort_signal();
-        let mut async_manager = AsyncHookManager::default();
-        let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
-        let mut pending_async_context = None;
 
-        let outcome = run_command_with_output(
-            &config,
-            abort_signal,
-            ".title generate",
-            &mut async_manager,
-            &persistent_manager,
-            &mut pending_async_context,
-            &mut output,
-        )
-        .await
-        .expect("command succeeds");
+        let outcome =
+            run_command_with_output(&config, abort_signal, ".title generate", &mut output)
+                .await
+                .expect("command succeeds");
 
         assert_eq!(outcome, CommandOutcome::Continue);
         let out = String::from_utf8(output).expect("utf8 output");
@@ -1752,21 +1643,10 @@ hooks:
         let config = Arc::new(RwLock::new(config));
         let mut output = Vec::new();
         let abort_signal = crate::utils::create_abort_signal();
-        let mut async_manager = AsyncHookManager::default();
-        let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
-        let mut pending_async_context = None;
 
-        run_command_with_output(
-            &config,
-            abort_signal,
-            ".title bogus",
-            &mut async_manager,
-            &persistent_manager,
-            &mut pending_async_context,
-            &mut output,
-        )
-        .await
-        .expect("command succeeds");
+        run_command_with_output(&config, abort_signal, ".title bogus", &mut output)
+            .await
+            .expect("command succeeds");
 
         assert_eq!(
             String::from_utf8(output).expect("utf8 output"),
@@ -1798,21 +1678,10 @@ hooks:
         let config = Arc::new(RwLock::new(config));
         let mut output = Vec::new();
         let abort_signal = crate::utils::create_abort_signal();
-        let mut async_manager = AsyncHookManager::default();
-        let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
-        let mut pending_async_context = None;
 
-        let outcome = run_command_with_output(
-            &config,
-            abort_signal,
-            ".info model",
-            &mut async_manager,
-            &persistent_manager,
-            &mut pending_async_context,
-            &mut output,
-        )
-        .await
-        .expect("command succeeds");
+        let outcome = run_command_with_output(&config, abort_signal, ".info model", &mut output)
+            .await
+            .expect("command succeeds");
 
         assert_eq!(outcome, CommandOutcome::Continue);
         let output = String::from_utf8(output).expect("utf8 output");
@@ -1827,21 +1696,10 @@ hooks:
             test_config_with_model(model_with_data("test-client", "fallback-model", false));
         let mut output = Vec::new();
         let abort_signal = crate::utils::create_abort_signal();
-        let mut async_manager = AsyncHookManager::default();
-        let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
-        let mut pending_async_context = None;
 
-        run_command_with_output(
-            &config,
-            abort_signal,
-            ".info model",
-            &mut async_manager,
-            &persistent_manager,
-            &mut pending_async_context,
-            &mut output,
-        )
-        .await
-        .expect("command succeeds");
+        run_command_with_output(&config, abort_signal, ".info model", &mut output)
+            .await
+            .expect("command succeeds");
 
         let output = String::from_utf8(output).expect("utf8 output");
         assert!(output.contains("model: test-client:fallback-model"));
@@ -1866,21 +1724,10 @@ hooks:
     async fn run_info_theme(config: &GlobalConfig) -> String {
         let mut output = Vec::new();
         let abort_signal = crate::utils::create_abort_signal();
-        let mut async_manager = AsyncHookManager::default();
-        let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
-        let mut pending_async_context = None;
 
-        let outcome = run_command_with_output(
-            config,
-            abort_signal,
-            ".info theme",
-            &mut async_manager,
-            &persistent_manager,
-            &mut pending_async_context,
-            &mut output,
-        )
-        .await
-        .expect("command succeeds");
+        let outcome = run_command_with_output(config, abort_signal, ".info theme", &mut output)
+            .await
+            .expect("command succeeds");
 
         assert_eq!(outcome, CommandOutcome::Continue);
         String::from_utf8(output).expect("utf8 output")

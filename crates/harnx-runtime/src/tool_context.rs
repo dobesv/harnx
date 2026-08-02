@@ -5,7 +5,6 @@ use crate::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
 use crate::tool::CompletionText;
 use crate::utils::AbortSignal;
 use harnx_core::instance::InstanceId;
-use harnx_hooks::PersistentHookManager;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -19,7 +18,6 @@ pub struct ToolRoundParams<'a> {
     pub input: &'a Input,
     pub completion: CompletionText<'a>,
     pub abort_signal: &'a AbortSignal,
-    pub persistent_manager: &'a Arc<Mutex<PersistentHookManager>>,
     pub working_dir: Option<&'a Path>,
     pub nats_hook_provider: Option<Arc<NatsHookProvider>>,
     pub pending_async_context: Option<Arc<Mutex<Option<String>>>>,
@@ -31,24 +29,18 @@ pub struct BuildToolEvalContextParams<'a> {
     pub instance_id: &'a InstanceId,
     pub agent_use_tools: Option<&'a str>,
     pub current_agent_package: Option<String>,
-    pub persistent_manager: &'a Arc<Mutex<PersistentHookManager>>,
     pub working_dir: Option<&'a Path>,
     pub nats_hook_provider: Option<Arc<NatsHookProvider>>,
     pub pending_async_context: Option<Arc<Mutex<Option<String>>>>,
 }
 
 impl<'a> BuildToolEvalContextParams<'a> {
-    pub fn new(
-        config: &'a GlobalConfig,
-        instance_id: &'a InstanceId,
-        persistent_manager: &'a Arc<Mutex<PersistentHookManager>>,
-    ) -> Self {
+    pub fn new(config: &'a GlobalConfig, instance_id: &'a InstanceId) -> Self {
         Self {
             config,
             instance_id,
             agent_use_tools: None,
             current_agent_package: None,
-            persistent_manager,
             working_dir: None,
             nats_hook_provider: None,
             pending_async_context: None,
@@ -79,7 +71,6 @@ impl AgentLoopContext {
             input,
             completion,
             abort_signal: &self.abort_signal,
-            persistent_manager: &self.persistent_manager,
             working_dir: self.working_dir.as_deref(),
             nats_hook_provider: self.nats_hook_provider.clone(),
             pending_async_context: self.pending_async_context.clone(),

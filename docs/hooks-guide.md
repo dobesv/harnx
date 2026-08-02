@@ -14,7 +14,11 @@ Hooks are external programs or scripts that Harnx executes when specific events 
 
 ## 2. Configuration
 
-Hooks are configured in the `hooks` section of the global `config.yaml` or within an agent's front-matter.
+Hooks can be configured in three places depending on their intended scope:
+
+1. **Global Hooks** (`config.yaml` under `hooks:`): Apply across all sessions and agents for the lifetime of the Harnx worker daemon.
+2. **Tool-Server Hooks** (`tool_servers/*.yaml` under `hooks:`): Co-launched alongside a specific tool server and attached directly to tool calls handled by that server (e.g., attaching authentication proxies to `bash.yaml`).
+3. **Agent Hooks** (agent `.md` front-matter under `hooks:`): Session-scoped hooks managed dynamically by the worker. When an agent handoff occurs mid-session, old agent hooks are safely stopped and the new agent's hooks are started.
 
 ### Configuration Fields
 
@@ -22,7 +26,7 @@ Hooks are configured in the `hooks` section of the global `config.yaml` or withi
 | :--- | :--- | :--- |
 | `event` | string | **Required.** The event that triggers the hook (e.g., `PreToolUse`). |
 | `type` | string | **Required.** The execution protocol: `claude-command` or `claude-command-persistent`. |
-| `matcher` | string | **Optional.** A regex matched against the `tool_name` for tool-related events. |
+| `matcher` | string | **Optional.** A regex matched against the bare `tool_name` for tool-related events. |
 | `command` | string | **Required.** The shell command or path to the executable to run. |
 | `timeout` | integer | **Optional.** Execution timeout in seconds (default: 30). |
 | `status_message` | string | **Optional.** A message displayed to the user while the hook is running. |
@@ -31,10 +35,9 @@ Hooks are configured in the `hooks` section of the global `config.yaml` or withi
 
 ### Hook Location and Merging
 
-Hooks can be defined globally in `config.yaml` or per-agent in the agent's front-matter.
-
-*   **Global Hooks**: Apply to all agents and sessions.
-*   **Agent Hooks**: Defined in an agent's YAML front-matter.
+*   **Global Hooks**: Apply to all agents and sessions across the Harnx instance.
+*   **Tool-Server Hooks**: Attached directly to tool-server configuration files and co-launched with the tool server.
+*   **Agent Hooks**: Defined in an agent's YAML front-matter and scoped to the active session.
 *   **Merging**: Agent hooks extend the global list. If an agent hook has the same `event` and `matcher` as a global hook, the agent hook **replaces** the global one.
 *   **max_resume**: If set in an agent's front-matter, it overrides the global `max_resume` value.
 
@@ -49,15 +52,19 @@ Harnx supports the following events. Each event sends a JSON payload to the hook
 | `UserPromptSubmit` | When the user sends a prompt. | `session_id`, `cwd`, `prompt` | Observe |
 | `Stop` | When the agent finishes its turn. | `session_id`, `cwd`, `stop_hook_active`, `last_assistant_message` | Resume |
 | `StopFailure` | When an agent turn fails. | `session_id`, `cwd`, `error`, `error_type` | Observe |
-| `PreToolUse` | Before a tool is executed. | `session_id`, `cwd`, `tool_name`, `tool_input`, `tool_use_id` | Block, Ask, Mutate |
-| `PostToolUse` | After a tool successfully runs. | `session_id`, `cwd`, `tool_name`, `tool_input`, `tool_response`, `tool_use_id` | Mutate |
+| `PreToolUse` | Before a tool is executed. | `session_id`, `cwd`, `tool_name`, `tool_input`, `tool_use_id` | Block, Ask, Mutate, Context |
+| `PostToolUse` | After a tool successfully runs. | `session_id`, `cwd`, `tool_name`, `tool_input`, `tool_response`, `tool_use_id` | Context |
 | `PostToolUseFailure`| When a tool execution fails. | `session_id`, `cwd`, `tool_name`, `tool_input`, `tool_use_id`, `error` | Observe |
+| `InstructionsLoaded`| When system/agent instructions are loaded. | `session_id`, `cwd`, `file_path`, `memory_type`, `load_reason` | Observe |
+| `CwdChanged` | When working directory changes. | `session_id`, `cwd`, `old_cwd`, `new_cwd` | Observe |
 
 ## 4. Hook Types
 
+Hooks run as NATS hook services launched and managed by the worker-side `HookServerSupervisor`.
+
 ### `claude-command` (One-shot)
 
-The most common hook type. Harnx spawns the command as a subprocess for every event match.
+The default one-shot hook type. Served over NATS using the generic `harnx-claude-compatible-hook-server` binary wrapper.
 *   **Input**: The event payload is sent to the command's `stdin` as a single JSON object.
 *   **Output**: Harnx reads `stdout` for a JSON response (see Protocol below).
 *   **Control**:
@@ -67,9 +74,13 @@ The most common hook type. Harnx spawns the command as a subprocess for every ev
 
 ### `claude-command-persistent` (Persistent)
 
-Useful for hooks that need to maintain state or have high startup overhead. The process is started at the beginning of the session and kept alive.
+Useful for hooks that maintain state or have high startup overhead. The persistent process is started by `HookServerSupervisor` and served over NATS via `harnx-claude-compatible-hook-server`.
 *   **Protocol**: JSONL (JSON Lines) over `stdin` and `stdout`.
 *   **Correlation**: Each request from Harnx includes a unique `id` field. The hook must include the same `id` in its response line.
+
+### Native Auth Proxy (`harnx-proxy-auth`)
+
+When a persistent hook specifies `harnx-proxy-auth` as its command executable, `HookServerSupervisor` detects the binary name and launches `harnx-proxy-auth` directly as a native NATS `PreToolUse` hook (matcher `exec|spawn`, default `FailPolicy::Closed`). It serves over NATS without requiring an external proxy wrapper.
 
 ### Async Hooks (`async: true`)
 
@@ -163,8 +174,8 @@ and `args` are spawned directly and are **not** shell-expanded.
 
 This variable is also ambiently exported by the NATS tool-server supervisor to
 all spawned tool-server processes (and inherited by child process chains), allowing
-bundled hooks to resolve `$HARNX_PACKAGE_DIR/...` paths when tool servers run
-bridged over NATS (e.g. `bash` wrapped in `harnx-mcp-hooks-proxy`).
+bundled hooks to resolve `$HARNX_PACKAGE_DIR/...` paths when hooks are attached to
+tool servers running over NATS (e.g. `harnx-proxy-auth` co-launched with `bash.yaml`).
 
 ## 7. Permissions
 
@@ -553,7 +564,7 @@ The same command applies to other `acli` products: replace `jira` with `confluen
 
 Add the following to your `config.yaml`. The bundled `jira-auth-hook.py` does all the work: it reads your host `acli` profile, sources the real token from the OS keyring, writes a synthetic `jira_config.yaml` — holding only a sentinel token, written as a YAML `!!binary` scalar so `acli` accepts it — into the proxy's per-run temp dir, and replaces the sentinel with the real token on outbound `api.atlassian.com` / site requests. The `--fs`/`--env` lines allocate that temp dir and point `ACLI_CONFIG_DIR` at it.
 
-The hook ships with the `harnx` **pantheon** and **coding** packages at `~/.config/harnx/packages/<pkg>/hooks/jira-auth-hook.py` (swap `pantheon` below for `coding` if that's the package you use). For a standalone `harnx-sandbox-run` install, see the download-and-verify step in [sandbox-run.md](./sandbox-run.md).
+The hook ships with the `harnx` **pantheon** and **coding** packages at `$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py`. For a standalone `harnx-sandbox-run` install, see the download-and-verify step in [sandbox-run.md](./sandbox-run.md).
 
 No manual environment variables are required as long as you have logged in with an **API token** (Step 1) on your host — OAuth (`--web`) is not supported.
 
@@ -562,35 +573,33 @@ hooks:
   entries:
   - event: PreToolUse
     type: claude-command-persistent
-    matcher: "bash_exec|bash_spawn"
+    matcher: "exec|spawn"
     command: >-
       harnx-proxy-auth
       --fs '{"harnx-fs-acli/acli/.keep": ""}'
       --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
-      --hook ~/.config/harnx/packages/pantheon/hooks/jira-auth-hook.py
+      --hook "$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py"
 ```
 
 The hook sources the token from the platform keyring automatically (`secret-tool` on Linux, `security find-generic-password` on macOS); set `HARNX_JIRA_TOKEN_CMD` to use a different secret store.
 
 > **Security note:** The hook injects the token only for the site in your active `acli` profile (plus `api.atlassian.com`), preventing credentials from being accidentally forwarded to other Atlassian tenants.
 
-You can combine Atlassian and GitHub auth in a single `harnx-proxy-auth` invocation:
+You can combine Atlassian and GitHub auth in a single `harnx-proxy-auth` invocation attached directly to a tool server (such as `tool_servers/bash.yaml`):
 
 ```yaml
 hooks:
   entries:
   - event: PreToolUse
     type: claude-command-persistent
-    matcher: "bash_exec|bash_spawn"
+    matcher: "exec|spawn"
     command: >-
       harnx-proxy-auth
-      --env 'if (env.GITHUB_TOKEN // env.GH_TOKEN) then .GITHUB_TOKEN = "ghs_\($fake_base64_key)" else . end'
-      --hook 'if (.host == "api.github.com") and (.headers.authorization == "Bearer ghs_\($fake_base64_key)")
-          then .headers.authorization = bearer(env.GITHUB_TOKEN // env.GH_TOKEN)
-          else . end'
+      --hook 'if .host == "github.com" and (env.GITHUB_TOKEN // env.GH_TOKEN) != null then .headers.authorization = "Basic \(["x-access-token", (env.GITHUB_TOKEN // env.GH_TOKEN)] | join(":") | @base64)" end'
+      --hook 'if (.host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com") and (env.GITHUB_TOKEN // env.GH_TOKEN) != null then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)" end'
       --fs '{"harnx-fs-acli/acli/.keep": ""}'
       --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
-      --hook ~/.config/harnx/packages/pantheon/hooks/jira-auth-hook.py
+      --hook "$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py"
 ```
 
 ### Injected Environment Variables
@@ -613,53 +622,51 @@ When the hook runs, it injects the following variables into the tool's environme
 *   **Scoped Injection**: Request mutation scope is defined by your jaq filter. Requests that do not match your condition should return `.`, leaving traffic unchanged.
 
 
-## 12. Serving Hooks over NATS (experimental)
+## 12. Hook Architecture & Execution over NATS
 
-Harnx supports running hook handlers as decoupled NATS microservices using the `harnx-hookset` and `harnx-hookset-server` crates.
+Harnx dispatches all hook events natively over NATS microservices using the `harnx-hookset` and `harnx-hookset-server` infrastructure. There is no inline/dual-dispatch runtime path or intermediate wrapper proxy (`harnx-mcp-hooks-proxy`).
 
-### Architecture and Discovery
+### Hook Server Supervision and Scopes
 
-NATS hook servers register their capabilities in a JetStream Key-Value bucket and handle hook invocation requests over NATS subjects.
+Hook processes are managed by a worker-side `HookServerSupervisor`. On startup, the supervisor injects NATS transport identity (`HARNX_INSTANCE_ID`, `HARNX_NATS_URL`, `HARNX_NATS_TOKEN`) and package context (`HARNX_PACKAGE_DIR`), spawns the hook process, awaits JetStream Key-Value registry readiness, and ensures processes terminate cleanly when their scope ends.
+
+Hooks are scoped according to where they are configured:
+
+* **Global Hooks** (`config.yaml`): Instance-scoped lifetime, launched by the worker daemon during worker startup.
+* **Tool-Server Hooks** (`tool_servers/*.yaml`): Co-launched alongside the specific tool server by `ToolServerSupervisor` and bound to that tool server's lifecycle.
+* **Agent Hooks** (agent `.md` front-matter): Session-scoped, launched when an agent binds to a session. When an agent handoff occurs mid-session, `reconcile_agent_hooks` tears down the old agent's hook processes and registers the new agent's hook processes seamlessly.
+
+### Registry Discovery and Routing
+
+NATS hook servers register their capabilities in a JetStream Key-Value bucket and handle event invocation requests over dedicated NATS subjects.
 
 * **Registry Bucket**: `harnx_hook_registry` (constant `HOOK_REGISTRY_BUCKET`).
-* **Registration**: On startup, hook servers publish a `HookRegistration` payload containing `server` ID, `hooks` list (`Vec<HookSpec>`), `schema_version`, and `proto_version`. The registration is refreshed every 30 seconds (TTL).
-* **Subject Scheme**: Hook servers subscribe to `harnx.v1.{instance}.hook.{server}.{event}` subjects.
-* **Request/Reply**: The worker posts a `HookPayload` request and awaits a `HookOutcome` reply.
+* **Registration**: Hook servers publish a `HookRegistration` payload containing their server ID, registered `HookSpec` list, `schema_version`, and `proto_version`. Registrations feature a 60-second TTL refreshed every 30 seconds.
+* **Subject Scheme**: `{instance}.hook.{server}.{event}`.
+* **Request/Reply**: `NatsHookProvider` queries active registrations, matches events against configured matchers (regex on bare tool names like `bash_exec`), orders matching hooks by priority ascending (with registration-timestamp tiebreaks), and posts `HookPayload` requests to collect `HookOutcome` replies.
 
-### Hook Specifications and Fail Policy
+### Event Processing and Capabilities
 
-Each hook registers one or more `HookSpec` structures:
+`NatsHookProvider` handles all `HookEvent` variants (`SessionStart`, `SessionEnd`, `UserPromptSubmit`, `Stop`, `StopFailure`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `InstructionsLoaded`, `CwdChanged`):
 
-* `event`: Triggering event type (e.g., `PreToolUse`, `PostToolUse`).
-* `matcher`: Regex matched against the bare tool name (for example, `bash_exec` or `fs_read`).
-* `priority`: Integer priority (lower values execute first).
-* `timeout_secs`: Execution timeout in seconds.
-* `fail_policy`: Determines behavior if the hook times out or returns an error.
-  * `Closed` (default, serialized as `"closed"`): Treats hook failure as a blocking error.
-  * `Open` (serialized as `"open"`): Logs the error and continues execution.
+* **`PreToolUse` Hooks**: Executed sequentially in priority order.
+  * *Input Mutation*: `mutated_tool_input` chains from hook to hook (e.g., sequentially augmenting environment variables).
+  * *Short-Circuiting*: Returning `Block` or `Ask` immediately halts execution and returns that control decision.
+  * *Context Injection*: `additional_context` and `system_message` strings are aggregated across matching hooks and enqueued into `pending_async_context` for injection into the next agent turn.
+* **`Ask` Outcome & Headless Limitation**: A `PreToolUse` hook returning `Ask` surfaces as a tool confirmation request (`ToolApprovalRequiredError`). In headless worker environments where interactive prompts are unavailable, the caller's confirmation callback or approval handler determines whether the request proceeds or fails.
+* **`PostToolUse` Hooks**: Executed asynchronously (`tokio::spawn` fire-and-forget). Errors emit an `AgentEvent::Notice(Error)`. Returned `additional_context` or `system_message` values route to `pending_async_context`. Note: `mutated_tool_response` is logged and dropped in the NATS dispatch path.
+* **Non-Tool Blocking Events** (`UserPromptSubmit`, `Stop`, `StopFailure`): Executed sequentially; short-circuits on `Block` or `Ask`; appends returned context to `pending_async_context`.
+* **Best-Effort Events** (`SessionStart`, `SessionEnd`, `InstructionsLoaded`, `CwdChanged`, `PostToolUseFailure`): Dispatched as asynchronous background tasks.
 
-### Worker Discovery and Execution
+### Fail-Closed Behavior & Expectation Tracking
 
-The worker's `NatsHookProvider` reads active registrations from `harnx_hook_registry`, filters hooks matching the event and bare tool name, and orders them by priority ascending.
+Each hook specification registers a `fail_policy`:
 
-* **`PreToolUse` Hooks**: Executed sequentially. Output mutations (`mutated_tool_input`) chain from one hook to the next. If any hook returns a `Block` or `Ask` outcome, execution short-circuits immediately.
-* **`PostToolUse` Hooks**: Executed asynchronously (`tokio::spawn` fire-and-forget). Errors emit an `AgentEvent::Notice(Error)`. Returned `additional_context` or `system_message` values route to the shared `pending_async_context` and inject into the next agent turn. Tool response mutations (`mutated_tool_response`) are dropped in this slice.
+* `Closed` (default, `"closed"`): Treats execution timeouts, NATS request failures, or unresponsiveness as a blocking error (`Block` outcome).
+* `Open` (`"open"`): Logs errors and permits execution to continue.
 
-### Dual Dispatch
+To prevent fail-open security gaps if a required closed hook fails to start or crashes mid-session, Harnx uses an expectation manifest bucket (`harnx_hook_expectations`). `HookServerSupervisor` registers required closed hooks in the expectations manifest upon launch. If a required closed hook server process fails to start or exits unexpectedly, `NatsHookProvider` checks expectations against live registry entries and **blocks** tool execution rather than silently bypassing the missing hook.
 
-The worker's hook dispatcher (`build_dispatch_hook_fn`) executes NATS hooks first, followed sequentially by existing inline hooks:
+### Standalone Utility Exception (`harnx-sandbox-run`)
 
-1. NATS hooks run sequentially.
-2. If a NATS hook blocks or requests approval (`Ask`), the request short-circuits.
-3. If NATS hooks pass, the resulting mutated payload passes to the inline hook runner.
-4. NATS and inline mutations are composed together.
-
-Inline hooks still run after NATS hooks, ensuring existing configurations (such as `harnx-proxy-auth`) function without modification. Non-NATS callers fall back to inline-only dispatch.
-
-### Known Edges and Deferred Items
-
-* **`Ask` Outcome over NATS**: A `PreToolUse` hook returning `Ask` routes through the worker's existing `ToolApprovalRequiredError` path. Interactive resolution of `Ask` outcomes over NATS for headless workers is deferred to a future slice.
-* **`PreToolUse` context injection**: In this slice the worker composes only `mutated_tool_input` from NATS `PreToolUse` hooks. `additional_context` and `system_message` returned by a NATS `PreToolUse` hook are not yet injected (unlike `PostToolUse`, which routes them to `pending_async_context`). Deferred to a future slice.
-* **Deferred Goals**: Hook process supervision, config-driven `hooks/*.yaml` loading, migrating existing inline hooks to NATS, converting `harnx-proxy-auth` to a native NATS hook, and restoring `PostToolUse` response mutations will be implemented in subsequent slices.
-
-References #1224.
+Note that while Harnx agent loops and tool servers dispatch hooks exclusively over NATS, the standalone `harnx-sandbox-run` birdcage CLI utility continues to use `harnx-hooks` inline parsing for standalone subprocess sandboxing outside the worker process daemon.

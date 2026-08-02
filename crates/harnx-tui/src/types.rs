@@ -1,5 +1,4 @@
 use harnx_core::event::{AgentSource, PlanEntry};
-use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use harnx_runtime::config::GlobalConfig;
 use harnx_runtime::config::SessionMeta;
 use harnx_runtime::local_orchestrator::LocalWorkerSupervisor;
@@ -32,8 +31,6 @@ pub struct Tui {
     /// (see `current_prompt_abort` below) so that resetting the Tui-level
     /// signal on a new submission can never un-abort an old prompt task.
     pub(super) abort_signal: AbortSignal,
-    pub(super) async_manager: Arc<Mutex<AsyncHookManager>>,
-    pub(super) persistent_manager: Arc<Mutex<PersistentHookManager>>,
     pub(super) pending_async_context: Arc<Mutex<Option<String>>>,
     /// Shared state so the prompt task can consume a pending message mid-tool-loop.
     pub(super) shared_pending_message: Arc<Mutex<Option<PendingMessage>>>,

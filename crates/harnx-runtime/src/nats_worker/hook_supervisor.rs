@@ -5,7 +5,10 @@ use futures_util::StreamExt;
 use harnx_core::hooks::{HookConfig, HooksConfig};
 use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
 use harnx_hooks::executor::HARNX_PACKAGE_DIR_ENV;
-use harnx_hookset::{FailPolicy, HookRegistration, HOOK_REGISTRY_BUCKET};
+use harnx_hookset::{
+    FailPolicy, HookRegistration, HookSpec, HOOK_EXPECTATIONS_BUCKET, HOOK_PROTOCOL_VERSION,
+    HOOK_REGISTRY_BUCKET, HOOK_SCHEMA_VERSION,
+};
 use harnx_hookset_server::hook_registration_key;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -87,49 +90,15 @@ impl HookServerSupervisor {
             return Ok(supervisor);
         }
 
-        let registry = ensure_registry_bucket(&config.client).await?;
-        let mut watches = Vec::new();
-        for (index, hook) in &enabled {
-            let name = hook_server_name(scope, *index, hook);
-            let key = hook_registration_key(&config.instance_id, &name);
-            let _ = registry.delete(&key).await;
-            let watch = registry
-                .watch_with_history(&key)
-                .await
-                .with_context(|| format!("watch hook registration '{key}'"))?;
-            supervisor.registrations.push(name.clone());
-            watches.push((name, key, watch));
-        }
-
-        for (index, hook) in enabled {
-            let name = hook_server_name(scope, index, hook);
-            let child = spawn_hook_server(&config, hook, &name)?;
-            let pid = child
-                .id()
-                .with_context(|| format!("hook server '{name}' has no process ID"))?;
-            processes.lock().await.insert(pid, name.clone());
-            supervisor.tasks.push(spawn_child_monitor(
-                child,
-                pid,
-                name,
-                config.instance_id.clone(),
-                config.client.clone(),
-                Arc::clone(&processes),
-            ));
-        }
-
-        let deadline = Instant::now() + readiness_timeout;
-        for (name, key, mut watch) in watches {
-            wait_for_registration(
-                &mut watch,
-                &processes,
-                &name,
-                &key,
-                deadline,
-                readiness_timeout,
-            )
-            .await?;
-        }
+        let watches = prepare_hook_registrations(&config, &enabled, scope, &mut supervisor).await?;
+        spawn_enabled_hooks(&config, enabled, scope, &mut supervisor).await;
+        wait_for_hook_registrations(
+            watches,
+            &processes,
+            Instant::now() + readiness_timeout,
+            readiness_timeout,
+        )
+        .await;
         Ok(supervisor)
     }
 
@@ -143,9 +112,96 @@ impl HookServerSupervisor {
             task.abort();
         }
         for server in std::mem::take(&mut self.registrations) {
-            remove_registration(&self.client, &self.instance_id, &server).await;
+            remove_registration_and_expectation(&self.client, &self.instance_id, &server).await;
         }
     }
+}
+
+type RegistrationWatch = (String, String, kv::Watch);
+
+async fn prepare_hook_registrations(
+    config: &HookServerStartConfig,
+    enabled: &[(usize, &HookConfig)],
+    scope: &str,
+    supervisor: &mut HookServerSupervisor,
+) -> Result<Vec<RegistrationWatch>> {
+    let registry = ensure_bucket(&config.client, HOOK_REGISTRY_BUCKET).await?;
+    let expectations = ensure_bucket(&config.client, HOOK_EXPECTATIONS_BUCKET).await?;
+    let mut watches = Vec::new();
+    for (index, hook) in enabled {
+        let name = hook_server_name(scope, *index, hook);
+        let key = hook_registration_key(&config.instance_id, &name);
+        let _ = registry.delete(&key).await;
+        let watch = registry
+            .watch_with_history(&key)
+            .await
+            .with_context(|| format!("watch hook registration '{key}'"))?;
+        publish_expectation(&expectations, &key, &name, hook).await?;
+        supervisor.registrations.push(name.clone());
+        watches.push((name, key, watch));
+    }
+    Ok(watches)
+}
+
+async fn spawn_enabled_hooks(
+    config: &HookServerStartConfig,
+    enabled: Vec<(usize, &HookConfig)>,
+    scope: &str,
+    supervisor: &mut HookServerSupervisor,
+) {
+    for (index, hook) in enabled {
+        let name = hook_server_name(scope, index, hook);
+        let child = match spawn_hook_server(config, hook, &name) {
+            Ok(child) => child,
+            Err(error) => {
+                log::warn!(
+                    "hook server '{name}' failed to start; fail-closed expectation remains: {error:#}"
+                );
+                continue;
+            }
+        };
+        let Some(pid) = child.id() else {
+            log::warn!("hook server '{name}' has no process ID; fail-closed expectation remains");
+            continue;
+        };
+        supervisor.processes.lock().await.insert(pid, name.clone());
+        supervisor.tasks.push(spawn_child_monitor(
+            child,
+            pid,
+            name,
+            config.instance_id.clone(),
+            config.client.clone(),
+            Arc::clone(&supervisor.processes),
+        ));
+    }
+}
+
+async fn wait_for_hook_registrations(
+    watches: Vec<RegistrationWatch>,
+    processes: &Arc<Mutex<HashMap<u32, String>>>,
+    deadline: Instant,
+    readiness_timeout: Duration,
+) {
+    let readiness = watches.into_iter().map(|(name, key, mut watch)| {
+        let processes = Arc::clone(processes);
+        async move {
+            if let Err(error) = wait_for_registration(
+                &mut watch,
+                &processes,
+                &name,
+                &key,
+                deadline,
+                readiness_timeout,
+            )
+            .await
+            {
+                log::warn!(
+                    "hook server '{name}' unavailable; fail-closed expectation remains: {error:#}"
+                );
+            }
+        }
+    });
+    futures_util::future::join_all(readiness).await;
 }
 
 impl Drop for HookServerSupervisor {
@@ -159,7 +215,7 @@ impl Drop for HookServerSupervisor {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 for server in registrations {
-                    remove_registration(&client, &instance_id, &server).await;
+                    remove_registration_and_expectation(&client, &instance_id, &server).await;
                 }
             });
         }
@@ -196,7 +252,7 @@ fn spawn_hook_server(
         .package_dir
         .clone()
         .unwrap_or_else(harnx_core::config_paths::config_dir);
-    let mut command = if let Some(args) = proxy_auth_args(&hook.command)? {
+    let mut command = if let Some(args) = proxy_auth_args(&hook.command, &package_dir)? {
         let binary = resolve_binary(PROXY_AUTH_BINARY)?;
         let mut command = Command::new(&binary);
         command.args(args);
@@ -245,9 +301,21 @@ fn spawn_hook_server(
 
 /// A command whose executable basename is `harnx-proxy-auth` is already a
 /// native hook server. Its remaining words are forwarded as normal CLI flags.
-fn proxy_auth_args(command: &str) -> Result<Option<Vec<String>>> {
+fn proxy_auth_args(command: &str, package_dir: &Path) -> Result<Option<Vec<String>>> {
     let words = shell_words::split(command).context("parse hook command")?;
-    Ok(is_proxy_auth_words(&words).then(|| words.into_iter().skip(1).collect()))
+    if !is_proxy_auth_words(&words) {
+        return Ok(None);
+    }
+    let package_dir = package_dir.to_string_lossy();
+    let args = words
+        .into_iter()
+        .skip(1)
+        .map(|word| {
+            word.replace("${HARNX_PACKAGE_DIR}", &package_dir)
+                .replace("$HARNX_PACKAGE_DIR", &package_dir)
+        })
+        .collect();
+    Ok(Some(args))
 }
 
 fn is_proxy_auth_command(command: &str) -> bool {
@@ -300,6 +368,8 @@ fn spawn_child_monitor(
         let status = child.wait().await;
         processes.lock().await.remove(&pid);
         remove_registration(&client, &instance_id, &server).await;
+        // Keep the supervisor's expectation after an unexpected exit. Discovery
+        // will route to the absent server and apply its fail-closed policy.
         match status {
             Ok(status) if status.success() => log::debug!("hook server '{server}' exited"),
             Ok(status) => log::warn!("hook server '{server}' exited with {status}"),
@@ -348,11 +418,11 @@ async fn wait_for_registration(
     }
 }
 
-async fn ensure_registry_bucket(client: &async_nats::Client) -> Result<kv::Store> {
+async fn ensure_bucket(client: &async_nats::Client, bucket: &str) -> Result<kv::Store> {
     let jetstream = jetstream::new(client.clone());
     match jetstream
         .create_key_value(kv::Config {
-            bucket: HOOK_REGISTRY_BUCKET.to_string(),
+            bucket: bucket.to_string(),
             history: 1,
             num_replicas: 1,
             storage: stream::StorageType::File,
@@ -362,11 +432,37 @@ async fn ensure_registry_bucket(client: &async_nats::Client) -> Result<kv::Store
     {
         Ok(store) => Ok(store),
         Err(_) => jetstream
-            .get_key_value(HOOK_REGISTRY_BUCKET)
+            .get_key_value(bucket)
             .await
             .map_err(anyhow::Error::from)
-            .context("open hook registry bucket"),
+            .with_context(|| format!("open hook KV bucket '{bucket}'")),
     }
+}
+
+async fn publish_expectation(
+    store: &kv::Store,
+    key: &str,
+    server: &str,
+    hook: &HookConfig,
+) -> Result<()> {
+    let registration = HookRegistration {
+        server: server.to_string(),
+        hooks: vec![HookSpec {
+            event: hook.event.clone(),
+            matcher: hook.matcher.clone(),
+            priority: 0,
+            timeout_secs: hook.timeout,
+            fail_policy: FailPolicy::Closed,
+        }],
+        schema_version: HOOK_SCHEMA_VERSION,
+        proto_version: HOOK_PROTOCOL_VERSION,
+    };
+    let payload = serde_json::to_vec(&registration).context("encode hook expectation")?;
+    store
+        .put(key.to_string(), payload.into())
+        .await
+        .with_context(|| format!("publish fail-closed hook expectation '{key}'"))?;
+    Ok(())
 }
 
 async fn remove_registration(client: &async_nats::Client, instance_id: &InstanceId, server: &str) {
@@ -377,6 +473,21 @@ async fn remove_registration(client: &async_nats::Client, instance_id: &Instance
     let _ = store
         .delete(hook_registration_key(instance_id, server))
         .await;
+}
+
+async fn remove_registration_and_expectation(
+    client: &async_nats::Client,
+    instance_id: &InstanceId,
+    server: &str,
+) {
+    let jetstream = jetstream::new(client.clone());
+    let key = hook_registration_key(instance_id, server);
+    for bucket in [HOOK_REGISTRY_BUCKET, HOOK_EXPECTATIONS_BUCKET] {
+        let Ok(store) = jetstream.get_key_value(bucket).await else {
+            continue;
+        };
+        let _ = store.delete(key.clone()).await;
+    }
 }
 
 #[cfg(unix)]
@@ -412,11 +523,23 @@ mod tests {
 
     #[test]
     fn detects_proxy_auth_and_forwards_flags() {
+        let package_dir = Path::new("/packages/coding");
         assert_eq!(
-            proxy_auth_args("harnx-proxy-auth --hook 'token helper'").unwrap(),
-            Some(vec!["--hook".to_string(), "token helper".to_string()])
+            proxy_auth_args(
+                "harnx-proxy-auth --hook 'token helper' --hook '$HARNX_PACKAGE_DIR/hooks/jira.py' --env '$temp_file_root'",
+                package_dir,
+            )
+            .unwrap(),
+            Some(vec![
+                "--hook".to_string(),
+                "token helper".to_string(),
+                "--hook".to_string(),
+                "/packages/coding/hooks/jira.py".to_string(),
+                "--env".to_string(),
+                "$temp_file_root".to_string(),
+            ])
         );
-        assert_eq!(proxy_auth_args("echo hello").unwrap(), None);
+        assert_eq!(proxy_auth_args("echo hello", package_dir).unwrap(), None);
     }
 
     #[test]

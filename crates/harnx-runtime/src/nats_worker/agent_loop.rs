@@ -14,7 +14,6 @@ use anyhow::{Context, Result};
 use async_nats::jetstream;
 use harnx_core::message::Message;
 use harnx_core::session::SessionLogEntry;
-use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -313,8 +312,6 @@ async fn build_agent_loop_context(
         config: params.config,
         instance_id: params.instance_id,
         abort_signal: params.abort_signal,
-        async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::new())),
-        persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new())),
         call_fn: params.call_fn,
         on_tool_round: params.on_tool_round,
         on_text_response: None,
@@ -836,7 +833,6 @@ struct ToolRepairContext {
     decl_map: std::collections::HashMap<String, harnx_core::tool::ToolDeclaration>,
     agent_use_tools: Option<String>,
     current_agent_package: Option<String>,
-    persistent_manager: Arc<tokio::sync::Mutex<PersistentHookManager>>,
 }
 
 fn build_tool_repair_context(config: &GlobalConfig) -> ToolRepairContext {
@@ -863,7 +859,6 @@ fn build_tool_repair_context(config: &GlobalConfig) -> ToolRepairContext {
         decl_map,
         agent_use_tools,
         current_agent_package,
-        persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new())),
     }
 }
 
@@ -877,7 +872,6 @@ async fn build_orphan_tool_eval_context(
         instance_id,
         agent_use_tools: repair.agent_use_tools.as_deref(),
         current_agent_package: repair.current_agent_package.clone(),
-        persistent_manager: &repair.persistent_manager,
         working_dir: None,
         nats_hook_provider: None,
         pending_async_context: None,

@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 /// JetStream KV bucket containing hook server registrations.
 pub const HOOK_REGISTRY_BUCKET: &str = "harnx_hook_registry";
+/// JetStream KV bucket containing hooks local supervisors require to be available.
+pub const HOOK_EXPECTATIONS_BUCKET: &str = "harnx_hook_expectations";
 /// Current hook registration schema version.
 pub const HOOK_SCHEMA_VERSION: u32 = 1;
 /// Current hook request protocol version.

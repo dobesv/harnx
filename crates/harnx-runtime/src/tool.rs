@@ -6,8 +6,7 @@ use crate::{
     utils::*,
 };
 use anyhow::Result;
-use harnx_core::hooks::HookConfig;
-use harnx_hooks::{HookEvent, PersistentHookManager};
+use harnx_hooks::HookEvent;
 use harnx_mcp::client::McpManager;
 
 use serde_json::Value;
@@ -94,7 +93,6 @@ pub async fn execute_tool_round_with_persistence(
         input,
         completion,
         abort_signal,
-        persistent_manager,
         working_dir,
         nats_hook_provider,
         pending_async_context,
@@ -120,7 +118,6 @@ pub async fn execute_tool_round_with_persistence(
         instance_id,
         agent_use_tools: agent_use_tools.as_deref(),
         current_agent_package,
-        persistent_manager,
         working_dir,
         nats_hook_provider,
         pending_async_context,
@@ -157,115 +154,36 @@ pub async fn execute_tool_round_with_persistence(
     Ok(results)
 }
 
-/// Run configured inline hooks for one event.
-async fn dispatch_inline_hooks(
-    event: &HookEvent,
-    hooks_entries: &[HookConfig],
-    per_tool_hooks: &HashMap<String, (String, Vec<HookConfig>)>,
-    session_id: &str,
-    cwd: &std::path::Path,
-    persistent_manager: &Arc<tokio::sync::Mutex<PersistentHookManager>>,
-) -> harnx_core::hooks::HookOutcome {
-    let display_tool_name = match event {
-        HookEvent::PreToolUse { tool_name, .. }
-        | HookEvent::PostToolUse { tool_name, .. }
-        | HookEvent::PostToolUseFailure { tool_name, .. } => Some(tool_name.as_str()),
-        _ => None,
-    };
-
-    // For server-scoped hooks, match the hook's `matcher` against the bare
-    // (unprefixed) tool name. Strip the matcher from entries we add to the
-    // merged list so the global dispatcher doesn't re-check against the
-    // prefixed display name and accidentally reject them.
-    let mut merged_entries: Vec<HookConfig> = if let Some(display_name) = display_tool_name {
-        per_tool_hooks
-            .get(display_name)
-            .map(|(bare_name, entries)| {
-                entries
-                    .iter()
-                    .filter(|hook| {
-                        harnx_hooks::CompiledMatcher::compile(&hook.matcher)
-                            .map(|m| m.matches_str(bare_name))
-                            .unwrap_or(false)
-                    })
-                    .map(|hook| HookConfig {
-                        matcher: None,
-                        ..hook.clone()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    merged_entries.extend_from_slice(hooks_entries);
-
-    harnx_hooks::dispatch::dispatch_hooks_with_count_and_manager(
-        event,
-        &merged_entries,
-        session_id,
-        cwd,
-        0,
-        None,
-        Some(persistent_manager),
-    )
-    .await
-}
-
 fn build_dispatch_hook_fn(
-    hooks: &harnx_hooks::HooksConfig,
-    // Value is (bare_server_tool_name, hook_entries). The matcher in each entry is
-    // evaluated against the bare name, not the prefixed display name, so renaming
-    // an MCP server doesn't require updating hook matchers.
-    per_tool_hooks: HashMap<String, (String, Vec<HookConfig>)>,
     session_name: Option<&str>,
-    persistent_manager: &Arc<tokio::sync::Mutex<PersistentHookManager>>,
     working_dir: Option<&std::path::Path>,
     nats_hook_provider: Option<Arc<NatsHookProvider>>,
     pending_async_context: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
 ) -> Arc<DispatchHookFn> {
-    let hooks_entries = hooks.entries.clone();
     let session_id = session_name.unwrap_or("cmd").to_string();
     let cwd = working_dir
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let persistent_manager = persistent_manager.clone();
     Arc::new(move |event: HookEvent| {
-        let hooks_entries = hooks_entries.clone();
-        let per_tool_hooks = per_tool_hooks.clone();
         let session_id = session_id.clone();
         let cwd = cwd.clone();
-        let persistent_manager = persistent_manager.clone();
         let nats_hook_provider = nats_hook_provider.clone();
         let pending_async_context = pending_async_context.clone();
         Box::pin(async move {
-            let meta = HookDispatchMeta {
-                session_id: session_id.clone(),
-                cwd: cwd.clone(),
-                resume_count: 0,
-            };
-            let inline_event = event.clone();
-            let inline_fallback = dispatch_inline_hooks(
-                &inline_event,
-                &hooks_entries,
-                &per_tool_hooks,
-                &session_id,
-                &cwd,
-                &persistent_manager,
-            );
             // Ask is returned unchanged. eval_tool_calls turns a deferred
             // confirmation into ToolApprovalRequiredError. Headless workers
-            // can't prompt, so their existing confirmation callback decides
-            // whether the error is surfaced or the call is denied.
-            dispatch_hook_event(
-                HookEventDispatch {
-                    event,
-                    provider: nats_hook_provider.as_deref(),
-                    meta,
-                    pending_async_context,
+            // cannot prompt, so their confirmation callback decides whether
+            // the error is surfaced or the call is denied.
+            dispatch_hook_event(HookEventDispatch {
+                event,
+                provider: nats_hook_provider.as_deref(),
+                meta: HookDispatchMeta {
+                    session_id,
+                    cwd,
+                    resume_count: 0,
                 },
-                inline_fallback,
-            )
+                pending_async_context,
+            })
             .await
         })
     })
@@ -317,7 +235,6 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
         instance_id,
         agent_use_tools,
         current_agent_package,
-        persistent_manager,
         working_dir,
         nats_hook_provider,
         pending_async_context,
@@ -325,7 +242,6 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
     let (
         mut tool_declarations,
         handoff_targets,
-        hooks,
         mcp_manager,
         session_name,
         confirm_tool_use_fn,
@@ -337,7 +253,6 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
         (
             tool_declarations,
             handoff_targets,
-            guard.resolved_hooks(),
             guard.mcp_manager.clone(),
             guard.session.as_ref().map(|s| s.id().to_string()),
             build_confirm_tool_use_fn(&guard),
@@ -353,13 +268,9 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
 
     let decl_map = Arc::new(build_decl_map(tool_declarations));
     let allowed_tool_names: HashSet<String> = decl_map.keys().cloned().collect();
-    let per_tool_hooks = build_per_tool_hooks(decl_map.as_ref(), mcp_manager.as_ref());
     let providers = build_tool_providers(config, nats_provider, mcp_manager);
     let dispatch_hook_fn = build_dispatch_hook_fn(
-        &hooks,
-        per_tool_hooks,
         session_name.as_deref(),
-        persistent_manager,
         working_dir,
         nats_hook_provider,
         pending_async_context,
@@ -388,58 +299,6 @@ fn build_decl_map(tool_declarations: Vec<ToolDeclaration>) -> HashMap<String, To
         .into_iter()
         .map(|declaration| (declaration.name.clone(), declaration))
         .collect()
-}
-
-fn build_per_tool_hooks(
-    decl_map: &HashMap<String, ToolDeclaration>,
-    mcp_manager: Option<&Arc<McpManager>>,
-) -> HashMap<String, (String, Vec<HookConfig>)> {
-    // Build a map from display tool name → (bare_tool_name, server_hook_entries).
-    // Look up hooks via McpManager (stores clients keyed by display name) so
-    // packaged/prefixed servers are found correctly. Server hooks are filtered to
-    // only tool-use events; matchers run against bare name so renaming server does
-    // not require updating hook matchers.
-    decl_map
-        .iter()
-        .filter_map(|(tool_name, decl)| {
-            let server_name = decl.mcp_server_name.as_ref()?;
-            let bare_name = decl
-                .mcp_tool_name
-                .clone()
-                .unwrap_or_else(|| tool_name.clone());
-            let hook_entries = tool_use_hook_entries(mcp_manager?, server_name)?;
-            (!hook_entries.is_empty()).then(|| (tool_name.clone(), (bare_name, hook_entries)))
-        })
-        .collect()
-}
-
-fn tool_use_hook_entries(
-    mcp_manager: &Arc<McpManager>,
-    server_name: &str,
-) -> Option<Vec<HookConfig>> {
-    let client = mcp_manager.get_client(server_name)?;
-    // Hooks bundled by a package can reference scripts relative to their package
-    // via `$HARNX_PACKAGE_DIR`; stamp the resolved dir onto each entry so the
-    // hook dispatcher can inject it into the hook process environment.
-    let package_dir = client.package().map(harnx_core::config_paths::package_dir);
-    Some(
-        client
-            .hooks()
-            .cloned()?
-            .entries
-            .into_iter()
-            .filter(|hook| {
-                matches!(
-                    hook.event.as_str(),
-                    "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
-                )
-            })
-            .map(|hook| HookConfig {
-                package_dir: package_dir.clone(),
-                ..hook
-            })
-            .collect(),
-    )
 }
 
 fn build_confirm_tool_use_fn(config: &Config) -> Arc<ConfirmToolUseFn> {
@@ -704,16 +563,9 @@ mod tests {
     async fn instance_id_is_preserved_in_tool_eval_context() {
         let config = Arc::new(RwLock::new(Config::default()));
         let instance_id = harnx_core::instance::InstanceId::new();
-        let persistent_manager = Arc::new(tokio::sync::Mutex::new(
-            harnx_hooks::PersistentHookManager::new(),
-        ));
 
-        let context = build_tool_eval_context(BuildToolEvalContextParams::new(
-            &config,
-            &instance_id,
-            &persistent_manager,
-        ))
-        .await;
+        let context =
+            build_tool_eval_context(BuildToolEvalContextParams::new(&config, &instance_id)).await;
 
         assert_eq!(context.instance_id, instance_id);
     }
@@ -731,14 +583,10 @@ mod tests {
         let calls = vec![call];
 
         let abort_signal = create_abort_signal();
-        let persistent_manager = std::sync::Arc::new(tokio::sync::Mutex::new(
-            harnx_hooks::PersistentHookManager::new(),
-        ));
         let result = eval_tool_calls(
             &build_tool_eval_context(BuildToolEvalContextParams::new(
                 &config,
                 &harnx_core::instance::InstanceId::new(),
-                &persistent_manager,
             ))
             .await,
             calls,
@@ -763,21 +611,14 @@ mod tests {
         // same-package handoff targets (#709).
         let _guard = crate::client::TestStateGuard::new(None).await;
         let config = Arc::new(RwLock::new(Config::default()));
-        let persistent_manager = std::sync::Arc::new(tokio::sync::Mutex::new(
-            harnx_hooks::PersistentHookManager::new(),
-        ));
 
         // Mirror the derivation done in `execute_tool_round`.
         let pkg = harnx_core::package_namespace::pkg_from_qualified("pantheon/daedalus")
             .map(str::to_string);
         assert_eq!(pkg.as_deref(), Some("pantheon"));
         let ctx = build_tool_eval_context(
-            BuildToolEvalContextParams::new(
-                &config,
-                &harnx_core::instance::InstanceId::new(),
-                &persistent_manager,
-            )
-            .with_current_agent_package(pkg),
+            BuildToolEvalContextParams::new(&config, &harnx_core::instance::InstanceId::new())
+                .with_current_agent_package(pkg),
         )
         .await;
         assert_eq!(ctx.current_agent_package.as_deref(), Some("pantheon"));
@@ -787,12 +628,8 @@ mod tests {
             harnx_core::package_namespace::pkg_from_qualified("daedalus").map(str::to_string);
         assert_eq!(bare, None);
         let ctx = build_tool_eval_context(
-            BuildToolEvalContextParams::new(
-                &config,
-                &harnx_core::instance::InstanceId::new(),
-                &persistent_manager,
-            )
-            .with_current_agent_package(bare),
+            BuildToolEvalContextParams::new(&config, &harnx_core::instance::InstanceId::new())
+                .with_current_agent_package(bare),
         )
         .await;
         assert_eq!(ctx.current_agent_package, None);
@@ -804,16 +641,12 @@ mod tests {
         // use it instead of the default inquire prompt (#695).
         let _guard = crate::client::TestStateGuard::new(None).await;
         let config = Arc::new(RwLock::new(Config::default()));
-        let persistent_manager = std::sync::Arc::new(tokio::sync::Mutex::new(
-            harnx_hooks::PersistentHookManager::new(),
-        ));
 
         // Default (no override): the inquire-based prompt is used. In a
         // non-terminal test process it denies, so this returns Deny.
         let ctx = build_tool_eval_context(BuildToolEvalContextParams::new(
             &config,
             &harnx_core::instance::InstanceId::new(),
-            &persistent_manager,
         ))
         .await;
         let call = ToolCall::new("t".to_string(), serde_json::json!({}), None, None);
@@ -829,7 +662,6 @@ mod tests {
         let ctx = build_tool_eval_context(BuildToolEvalContextParams::new(
             &config,
             &harnx_core::instance::InstanceId::new(),
-            &persistent_manager,
         ))
         .await;
         assert!(matches!(
@@ -1075,41 +907,6 @@ mod tests {
         assert!(result.is_none(), "no result_template => should return None");
     }
 
-    // --- Server-scoped hook dispatch tests -----------------------------------
-    //
-    // These tests exercise `build_dispatch_hook_fn` directly to verify that
-    // per-server hooks use bare-name matching and are correctly merged with
-    // global hooks.
-
-    fn make_hook_config(event: &str, matcher: Option<&str>, command: &str) -> HookConfig {
-        HookConfig {
-            event: event.to_string(),
-            matcher: matcher.map(|s| s.to_string()),
-            command: command.to_string(),
-            timeout: Some(5),
-            status_message: None,
-            async_hook: None,
-            hook_type: "claude-command".to_string(),
-            package_dir: None,
-        }
-    }
-
-    #[cfg(unix)]
-    fn pre_tool_use_event_with_name(tool_name: &str) -> HookEvent {
-        HookEvent::PreToolUse {
-            tool_name: tool_name.to_string(),
-            tool_input: serde_json::json!({}),
-            tool_use_id: "test-id".to_string(),
-        }
-    }
-
-    fn session_start_event() -> HookEvent {
-        HookEvent::SessionStart {
-            source: "test".to_string(),
-            model: "test-model".to_string(),
-        }
-    }
-
     #[test]
     fn populate_result_markdown_renders_templates_and_leaves_missing_templates_none() {
         let mut decl_map = HashMap::new();
@@ -1169,210 +966,6 @@ mod tests {
         assert!(results[1].markdown.is_none());
     }
 
-    fn make_per_tool_hooks(
-        display_name: &str,
-        bare_name: &str,
-        hooks: Vec<HookConfig>,
-    ) -> HashMap<String, (String, Vec<HookConfig>)> {
-        let mut map = HashMap::new();
-        map.insert(display_name.to_string(), (bare_name.to_string(), hooks));
-        map
-    }
-
-    async fn dispatch_and_collect_context(
-        global_hooks: Vec<HookConfig>,
-        per_tool_hooks: HashMap<String, (String, Vec<HookConfig>)>,
-        event: HookEvent,
-    ) -> harnx_hooks::HookOutcome {
-        use harnx_hooks::HooksConfig;
-
-        let hooks_config = HooksConfig {
-            max_resume: None,
-            entries: global_hooks,
-        };
-        let pm = Arc::new(tokio::sync::Mutex::new(
-            harnx_hooks::PersistentHookManager::new(),
-        ));
-        let dispatch_fn =
-            build_dispatch_hook_fn(&hooks_config, per_tool_hooks, None, &pm, None, None, None);
-        (dispatch_fn)(event).await
-    }
-
-    #[tokio::test]
-    async fn provider_none_matches_pure_inline_for_pre_and_post_tool_use() {
-        let hooks = harnx_hooks::HooksConfig {
-            entries: Vec::new(),
-            max_resume: None,
-        };
-        let per_tool_hooks = HashMap::new();
-        let persistent_manager = Arc::new(tokio::sync::Mutex::new(
-            harnx_hooks::PersistentHookManager::new(),
-        ));
-        let cwd = std::env::current_dir().unwrap();
-        let dispatch = build_dispatch_hook_fn(
-            &hooks,
-            per_tool_hooks.clone(),
-            Some("session"),
-            &persistent_manager,
-            Some(&cwd),
-            None,
-            None,
-        );
-        let events = [
-            HookEvent::PreToolUse {
-                tool_name: "tool".to_string(),
-                tool_input: json!({"input": true}),
-                tool_use_id: "pre".to_string(),
-            },
-            HookEvent::PostToolUse {
-                tool_name: "tool".to_string(),
-                tool_input: json!({"input": true}),
-                tool_response: json!({"output": true}),
-                tool_use_id: "post".to_string(),
-            },
-        ];
-
-        for event in events {
-            let expected = dispatch_inline_hooks(
-                &event,
-                &hooks.entries,
-                &per_tool_hooks,
-                "session",
-                &cwd,
-                &persistent_manager,
-            )
-            .await;
-            let actual = dispatch(event).await;
-            assert_eq!(
-                serde_json::to_value(actual).unwrap(),
-                serde_json::to_value(expected).unwrap()
-            );
-        }
-    }
-
-    /// A no-matcher server hook applies to all tools on that server.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn server_hook_no_matcher_matches_any_tool() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let script_path = dir.path().join("hook.sh");
-        let mut f = std::fs::File::create(&script_path).expect("create script");
-        writeln!(f, "#!/bin/sh").unwrap();
-        writeln!(f, "cat > /dev/null").unwrap();
-        writeln!(f, "echo '{{\"additionalContext\":\"server-hook-ran\"}}'").unwrap();
-        drop(f);
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let server_hook = make_hook_config(
-            "PreToolUse",
-            None, // no matcher — should match all tools
-            script_path.to_str().unwrap(),
-        );
-        let per_tool = make_per_tool_hooks(
-            "myserver_exec", // display name
-            "exec",          // bare name
-            vec![server_hook],
-        );
-        let outcome = dispatch_and_collect_context(
-            vec![],
-            per_tool,
-            pre_tool_use_event_with_name("myserver_exec"),
-        )
-        .await;
-        assert!(
-            outcome.result.additional_context.as_deref() == Some("server-hook-ran"),
-            "no-matcher server hook should run for any tool on the server, got: {:?}",
-            outcome.result.additional_context
-        );
-    }
-
-    /// A server hook with `matcher: "exec"` matches the bare name `exec`,
-    /// NOT the prefixed display name `myserver_exec`.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn server_hook_matcher_uses_bare_name_not_display_name() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let script_path = dir.path().join("hook.sh");
-        let mut f = std::fs::File::create(&script_path).expect("create script");
-        writeln!(f, "#!/bin/sh").unwrap();
-        writeln!(f, "cat > /dev/null").unwrap();
-        writeln!(f, "echo '{{\"additionalContext\":\"bare-match\"}}'").unwrap();
-        drop(f);
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // matcher = "^exec$" — matches bare name "exec" but NOT "myserver_exec"
-        let server_hook =
-            make_hook_config("PreToolUse", Some("^exec$"), script_path.to_str().unwrap());
-        let per_tool = make_per_tool_hooks(
-            "myserver_exec", // display name (what the event carries)
-            "exec",          // bare name (what the matcher runs against)
-            vec![server_hook],
-        );
-        let outcome = dispatch_and_collect_context(
-            vec![],
-            per_tool,
-            pre_tool_use_event_with_name("myserver_exec"),
-        )
-        .await;
-        assert_eq!(
-            outcome.result.additional_context.as_deref(),
-            Some("bare-match"),
-            "matcher 'exec' should match bare name 'exec', even though display name is 'myserver_exec'"
-        );
-    }
-
-    /// A server hook whose matcher doesn't match the bare name is excluded.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn server_hook_matcher_excludes_non_matching_bare_name() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let script_path = dir.path().join("hook.sh");
-        let mut f = std::fs::File::create(&script_path).expect("create script");
-        writeln!(f, "#!/bin/sh").unwrap();
-        writeln!(f, "cat > /dev/null").unwrap();
-        writeln!(f, "echo '{{\"additionalContext\":\"should-not-run\"}}'").unwrap();
-        drop(f);
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // matcher = "^list$" does NOT match bare name "exec"
-        let server_hook =
-            make_hook_config("PreToolUse", Some("^list$"), script_path.to_str().unwrap());
-        let per_tool = make_per_tool_hooks("myserver_exec", "exec", vec![server_hook]);
-        let outcome = dispatch_and_collect_context(
-            vec![],
-            per_tool,
-            pre_tool_use_event_with_name("myserver_exec"),
-        )
-        .await;
-        assert!(
-            outcome.result.additional_context.is_none(),
-            "hook with matcher '^list$' should not run for bare name 'exec'"
-        );
-    }
-
-    /// Non-tool events (e.g. SessionStart) don't pick up server hooks
-    /// because `per_tool_hooks` is keyed by display tool name.
-    #[tokio::test]
-    async fn server_hooks_not_applied_to_non_tool_events() {
-        // No script needed — we just verify the hook doesn't fire.
-        // A hook entry that would normally match is in per_tool_hooks, but
-        // the event is SessionStart which yields no display_tool_name.
-        let server_hook = make_hook_config("SessionStart", None, "echo hi");
-        let per_tool = make_per_tool_hooks("myserver_exec", "exec", vec![server_hook]);
-        let outcome = dispatch_and_collect_context(vec![], per_tool, session_start_event()).await;
-        // SessionStart is not in the filtered tool-use events list so it
-        // would have been stripped at build_tool_eval_context time, but
-        // even if it were present, display_tool_name is None for non-tool
-        // events so no per_tool_hooks lookup happens.
-        assert!(outcome.result.additional_context.is_none());
-    }
-
     #[test]
     fn emit_tool_result_without_template_leaves_markdown_none() {
         let decl = make_decl_with_templates("plain_tool", None, None);
@@ -1400,72 +993,5 @@ mod tests {
                 other => panic!("expected Completed event, got {other:?}"),
             }
         });
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn build_dispatch_hook_fn_uses_explicit_working_dir_per_run() {
-        use std::fs;
-        use tempfile::TempDir;
-
-        let hooks = harnx_hooks::HooksConfig {
-            entries: vec![make_hook_config("SessionStart", None, "pwd > hook-cwd.txt")],
-            max_resume: None,
-        };
-        let persistent_manager =
-            std::sync::Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
-        let root_a = TempDir::new().unwrap();
-        let root_b = TempDir::new().unwrap();
-
-        let dispatch_a = build_dispatch_hook_fn(
-            &hooks,
-            HashMap::new(),
-            Some("session-a"),
-            &persistent_manager,
-            Some(root_a.path()),
-            None,
-            None,
-        );
-        let dispatch_b = build_dispatch_hook_fn(
-            &hooks,
-            HashMap::new(),
-            Some("session-b"),
-            &persistent_manager,
-            Some(root_b.path()),
-            None,
-            None,
-        );
-
-        let (outcome_a, outcome_b) = tokio::join!(
-            dispatch_a(session_start_event()),
-            dispatch_b(session_start_event())
-        );
-        assert!(matches!(
-            outcome_a.control,
-            harnx_core::hooks::HookResultControl::Continue
-        ));
-        assert!(matches!(
-            outcome_b.control,
-            harnx_core::hooks::HookResultControl::Continue
-        ));
-
-        let cwd_a = fs::read_to_string(root_a.path().join("hook-cwd.txt")).unwrap();
-        let cwd_b = fs::read_to_string(root_b.path().join("hook-cwd.txt")).unwrap();
-        // Each hook's `pwd` is captured by the shell, so its exact string form
-        // is platform/shell dependent (macOS resolves /var -> /private/var;
-        // git-bash on Windows emits Unix-style /c/... paths that Rust's
-        // fs::canonicalize can't resolve). Assert per-run isolation by the
-        // TempDir's unique basename rather than full-path equality: each hook
-        // ran in its own root, and the two dirs differ.
-        let name_a = root_a.path().file_name().unwrap().to_str().unwrap();
-        let name_b = root_b.path().file_name().unwrap().to_str().unwrap();
-        assert!(
-            cwd_a.trim().ends_with(name_a),
-            "hook A cwd {cwd_a:?} should end with its root {name_a:?}"
-        );
-        assert!(
-            cwd_b.trim().ends_with(name_b),
-            "hook B cwd {cwd_b:?} should end with its root {name_b:?}"
-        );
-        assert_ne!(cwd_a, cwd_b);
     }
 }

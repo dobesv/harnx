@@ -46,5 +46,6 @@ tokio-stream = { workspace = true }
 uuid = { workspace = true, features = ["v5"] }
 
 [dev-dependencies]
+harnx-hookset = { path = "../harnx-hookset" }
 futures = "0.3"
 tempfile = { workspace = true }

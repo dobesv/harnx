@@ -29,9 +29,7 @@ use crate::config::{
 use crate::tui::{TranscriptItem, Tui};
 use harnx_core::agent_config::collect_agent_variables;
 use harnx_core::event::{AgentEvent, AgentSource, NoticeEvent};
-use harnx_hooks::{
-    dispatch_hooks_with_managers, AsyncHookManager, HookEvent, PersistentHookManager,
-};
+use harnx_core::hooks::HookEvent;
 use harnx_render::{render_error, MarkdownRender};
 use harnx_runtime::config::SessionMeta;
 use harnx_runtime::nats_hook_provider::{
@@ -461,23 +459,10 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
                 }
             }
             let input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
-            let mut async_manager = AsyncHookManager::new();
-            let persistent_manager =
-                Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
-            let mut pending_async_context = None;
-            dispatch_session_start(&config, "cmd", &async_manager, &persistent_manager).await;
+            dispatch_session_start(&config, "cmd").await;
             let aborted_check = abort_signal.clone();
-            let result = start_directive(
-                &config,
-                input,
-                abort_signal,
-                &mut async_manager,
-                &persistent_manager,
-                &mut pending_async_context,
-            )
-            .await;
-            exit_session_with_hook(&config, &async_manager, &persistent_manager).await?;
-            persistent_manager.lock().await.shutdown();
+            let result = start_directive(&config, input, abort_signal).await;
+            exit_session_with_hook(&config).await?;
             if aborted_check.aborted() {
                 bail!("interrupted by user");
             }
@@ -492,10 +477,9 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     }
 }
 
-fn hook_dispatch_context(config: &GlobalConfig) -> (harnx_hooks::HooksConfig, String, PathBuf) {
+fn hook_dispatch_context(config: &GlobalConfig) -> (String, PathBuf) {
     let config = config.read();
     (
-        config.resolved_hooks(),
         config
             .session
             .as_ref()
@@ -506,13 +490,8 @@ fn hook_dispatch_context(config: &GlobalConfig) -> (harnx_hooks::HooksConfig, St
     )
 }
 
-async fn dispatch_session_start(
-    config: &GlobalConfig,
-    source: &str,
-    async_manager: &AsyncHookManager,
-    persistent_manager: &Arc<tokio::sync::Mutex<PersistentHookManager>>,
-) {
-    let (hooks, session_id, cwd) = hook_dispatch_context(config);
+async fn dispatch_session_start(config: &GlobalConfig, source: &str) {
+    let (session_id, cwd) = hook_dispatch_context(config);
     let config_snapshot = config.read().clone();
     let nats_hook_provider = discover_process_nats_hook_provider(&config_snapshot).await;
     let model_id = config.read().current_model().id().to_string();
@@ -520,28 +499,16 @@ async fn dispatch_session_start(
         source: source.to_string(),
         model: model_id,
     };
-    let inline_event = event.clone();
-    let inline_fallback = dispatch_hooks_with_managers(
-        &inline_event,
-        &hooks.entries,
-        &session_id,
-        &cwd,
-        Some(async_manager),
-        Some(persistent_manager),
-    );
-    let _ = dispatch_hook_event(
-        HookEventDispatch {
-            event,
-            provider: nats_hook_provider.as_deref(),
-            meta: HookDispatchMeta {
-                session_id: session_id.clone(),
-                cwd: cwd.clone(),
-                resume_count: 0,
-            },
-            pending_async_context: None,
+    let _ = dispatch_hook_event(HookEventDispatch {
+        event,
+        provider: nats_hook_provider.as_deref(),
+        meta: HookDispatchMeta {
+            session_id: session_id.clone(),
+            cwd: cwd.clone(),
+            resume_count: 0,
         },
-        inline_fallback,
-    )
+        pending_async_context: None,
+    })
     .await;
 }
 
@@ -657,43 +624,27 @@ fn print_session_breakdown(
     }
 }
 
-async fn exit_session_with_hook(
-    config: &GlobalConfig,
-    async_manager: &AsyncHookManager,
-    persistent_manager: &Arc<tokio::sync::Mutex<PersistentHookManager>>,
-) -> Result<()> {
+async fn exit_session_with_hook(config: &GlobalConfig) -> Result<()> {
     let resume_cmd = session_resume_command(config);
-    let (hooks, session_id, cwd) = hook_dispatch_context(config);
+    let (session_id, cwd) = hook_dispatch_context(config);
     let config_snapshot = config.read().clone();
     let nats_hook_provider = discover_process_nats_hook_provider(&config_snapshot).await;
     config.write().exit_session()?;
     let event = HookEvent::SessionEnd {
         reason: "session_exit".to_string(),
     };
-    let inline_event = event.clone();
-    let inline_fallback = dispatch_hooks_with_managers(
-        &inline_event,
-        &hooks.entries,
-        &session_id,
-        &cwd,
-        Some(async_manager),
-        Some(persistent_manager),
-    );
     let _ = tokio::time::timeout(
         Duration::from_secs(5),
-        dispatch_hook_event(
-            HookEventDispatch {
-                event,
-                provider: nats_hook_provider.as_deref(),
-                meta: HookDispatchMeta {
-                    session_id: session_id.clone(),
-                    cwd: cwd.clone(),
-                    resume_count: 0,
-                },
-                pending_async_context: None,
+        dispatch_hook_event(HookEventDispatch {
+            event,
+            provider: nats_hook_provider.as_deref(),
+            meta: HookDispatchMeta {
+                session_id: session_id.clone(),
+                cwd: cwd.clone(),
+                resume_count: 0,
             },
-            inline_fallback,
-        ),
+            pending_async_context: None,
+        }),
     )
     .await;
 
@@ -713,21 +664,8 @@ async fn start_directive(
     config: &GlobalConfig,
     input: Input,
     abort_signal: AbortSignal,
-    async_manager: &mut AsyncHookManager,
-    persistent_manager: &Arc<tokio::sync::Mutex<PersistentHookManager>>,
-    pending_async_context: &mut Option<String>,
 ) -> Result<()> {
-    start_directive_inner(
-        config,
-        input,
-        abort_signal,
-        async_manager,
-        persistent_manager,
-        pending_async_context,
-        0,
-        true,
-    )
-    .await
+    start_directive_inner(config, input, abort_signal, 0, true).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -735,9 +673,6 @@ async fn start_directive_inner(
     config: &GlobalConfig,
     mut input: Input,
     abort_signal: AbortSignal,
-    _async_manager: &mut AsyncHookManager,
-    _persistent_manager: &Arc<tokio::sync::Mutex<PersistentHookManager>>,
-    _pending_async_context: &mut Option<String>,
     _resume_count: u32,
     with_embeddings: bool,
 ) -> Result<()> {
@@ -790,10 +725,8 @@ async fn start_directive_inner(
 }
 
 async fn start_interactive(config: &GlobalConfig) -> Result<()> {
-    let async_manager = AsyncHookManager::new();
-    let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
-    dispatch_session_start(config, "tui", &async_manager, &persistent_manager).await;
-    let mut tui: Tui = Tui::init(config, async_manager, persistent_manager.clone()).await?;
+    dispatch_session_start(config, "tui").await;
+    let mut tui: Tui = Tui::init(config).await?;
     let result = tui.run().await;
     let source = {
         let cfg = config.read();
@@ -804,9 +737,7 @@ async fn start_interactive(config: &GlobalConfig) -> Result<()> {
         }
     };
     print_session_breakdown(tui.transcript(), &source, config);
-    let async_manager = tui.async_manager().lock().await;
-    exit_session_with_hook(config, &async_manager, &persistent_manager).await?;
-    persistent_manager.lock().await.shutdown();
+    exit_session_with_hook(config).await?;
     result
 }
 

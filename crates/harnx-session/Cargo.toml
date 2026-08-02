@@ -10,7 +10,6 @@ repository.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 harnx-core = { path = "../harnx-core" }
-harnx-hooks = { path = "../harnx-hooks" }
 harnx-runtime = { path = "../harnx-runtime" }
 parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }

@@ -15,7 +15,6 @@ use crossterm::event::{
 use crossterm::terminal::{enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen};
 use crossterm::ExecutableCommand;
 use harnx_core::message::Message;
-use harnx_hooks::{drain_async_results, AsyncHookManager, PersistentHookManager};
 use harnx_runtime::config::GlobalConfig;
 use harnx_runtime::config::{
     build_picker_context, list_assistant_agents, sort_sessions_for_picker,
@@ -192,11 +191,7 @@ impl Tui {
         Ok(())
     }
 
-    pub async fn init(
-        config: &GlobalConfig,
-        async_manager: AsyncHookManager,
-        persistent_manager: Arc<Mutex<PersistentHookManager>>,
-    ) -> Result<Self> {
+    pub async fn init(config: &GlobalConfig) -> Result<Self> {
         let agents = list_assistant_agents().await;
         // Skip agents check in tests: test configs use a bare `Config::default()`
         // with no agents directory populated, but the production check is covered
@@ -222,8 +217,6 @@ impl Tui {
             config: config.clone(),
             code_theme,
             abort_signal: create_abort_signal(),
-            async_manager: Arc::new(Mutex::new(async_manager)),
-            persistent_manager,
             pending_async_context: Arc::new(Mutex::new(None)),
             shared_pending_message: Arc::new(Mutex::new(None)),
             local_worker: Arc::new(Mutex::new(None)),
@@ -343,10 +336,6 @@ impl Tui {
         }
 
         entries
-    }
-
-    pub fn async_manager(&self) -> &Arc<Mutex<AsyncHookManager>> {
-        &self.async_manager
     }
 
     /// Returns a reference to the transcript items collected during the session.
@@ -547,11 +536,7 @@ impl Tui {
     /// Check if an async hook has signalled a resume and automatically start the follow-up prompt.
     async fn try_resume_async_hooks(&mut self) -> Result<()> {
         let max_resume = self.config.read().resolved_hooks().max_resume.unwrap_or(5);
-        let should_resume = {
-            let mut async_guard = self.async_manager.lock().await;
-            let mut pending_guard = self.pending_async_context.lock().await;
-            drain_async_results(&mut async_guard, &mut pending_guard)
-        };
+        let should_resume = self.pending_async_context.lock().await.is_some();
         if !should_resume {
             return Ok(());
         }

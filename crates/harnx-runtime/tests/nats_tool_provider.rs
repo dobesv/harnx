@@ -232,16 +232,9 @@ async fn assert_per_call_timeout_enforced(provider: &NatsToolProvider) -> Result
 
 async fn assert_context_declarations_and_precedence(instance_id: &InstanceId) {
     let config = Arc::new(RwLock::new(Config::default()));
-    let persistent_manager = Arc::new(tokio::sync::Mutex::new(
-        harnx_hooks::PersistentHookManager::new(),
-    ));
     let context = harnx_runtime::tool::build_tool_eval_context(
-        harnx_runtime::tool::BuildToolEvalContextParams::new(
-            &config,
-            instance_id,
-            &persistent_manager,
-        )
-        .with_agent_use_tools(Some("*")),
+        harnx_runtime::tool::BuildToolEvalContextParams::new(&config, instance_id)
+            .with_agent_use_tools(Some("*")),
     )
     .await;
     let declarations = &context.render.as_ref().expect("render context").decl_map;

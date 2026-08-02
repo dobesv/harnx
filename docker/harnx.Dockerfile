@@ -17,7 +17,6 @@ COPY linux-${TARGETARCH}/harnx-mcp-bridge /usr/local/bin/harnx-mcp-bridge
 COPY linux-${TARGETARCH}/harnx-aws-creds /usr/local/bin/harnx-aws-creds
 COPY linux-${TARGETARCH}/harnx-k8s-creds /usr/local/bin/harnx-k8s-creds
 COPY linux-${TARGETARCH}/harnx-pkg /usr/local/bin/harnx-pkg
-COPY linux-${TARGETARCH}/harnx-mcp-hooks-proxy /usr/local/bin/harnx-mcp-hooks-proxy
 COPY linux-${TARGETARCH}/harnx-proxy-auth /usr/local/bin/harnx-proxy-auth
 COPY linux-${TARGETARCH}/harnx-sandbox-run /usr/local/bin/harnx-sandbox-run
 COPY linux-${TARGETARCH}/harnx-sandbox-exec /usr/local/bin/harnx-sandbox-exec

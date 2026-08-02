@@ -3421,7 +3421,6 @@ dependencies = [
  "harnx-core",
  "harnx-engine",
  "harnx-fetch",
- "harnx-hooks",
  "harnx-mcp",
  "harnx-rag",
  "harnx-render",
@@ -3802,23 +3801,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "harnx-mcp-hooks-proxy"
-version = "0.33.4"
-dependencies = [
- "anyhow",
- "harnx-core",
- "harnx-hooks",
- "parking_lot",
- "process-wrap",
- "rmcp",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "harnx-mcp-plans"
 version = "0.33.4"
 dependencies = [
@@ -4150,6 +4132,7 @@ dependencies = [
  "futures-util",
  "harnx-core",
  "harnx-hooks",
+ "harnx-hookset",
  "harnx-rag",
  "harnx-render",
  "harnx-runtime",
@@ -4178,7 +4161,6 @@ version = "0.33.4"
 dependencies = [
  "anyhow",
  "harnx-core",
- "harnx-hooks",
  "harnx-runtime",
  "parking_lot",
  "tokio",
@@ -4267,7 +4249,6 @@ dependencies = [
  "fancy-regex 0.19.0",
  "futures-util",
  "harnx-core",
- "harnx-hooks",
  "harnx-mcp",
  "harnx-render",
  "harnx-runtime",

@@ -8,9 +8,8 @@
 //! remain in the respective server crates behind adapter traits.
 
 use harnx_core::abort::AbortSignal;
-use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use harnx_runtime::{config::GlobalConfig, AgentLoopContext, OnToolRoundFn};
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
 pub mod config;
 
@@ -19,7 +18,6 @@ pub use config::fork_prompt_config;
 /// Build an AgentLoopContext suitable for running the agent loop.
 ///
 /// This function constructs the context with:
-/// - Default async/persistent hook managers (fresh per-run)
 /// - Optional call_fn override (None → use default client call)
 /// - Optional on_tool_round callback for injecting text mid-turn
 /// - Optional working_dir for per-session CWD isolation
@@ -34,8 +32,6 @@ pub fn build_context(
         instance_id: harnx_core::instance::InstanceId::new(),
         config: prompt_config,
         abort_signal,
-        async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::default())),
-        persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::default())),
         call_fn,
         on_tool_round,
         on_text_response: None,

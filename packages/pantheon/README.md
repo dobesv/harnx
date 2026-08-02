@@ -190,7 +190,7 @@ The package includes ready-to-use tool server configs in `tool_servers/`. All se
 
 | Server | Namespace | Requires | Notes |
 |--------|-----------|----------|-------|
-| `bash.yaml` | `bash_*` | None (bundled binary) | Shell execution. Runs bridged over NATS with `--default-root-cwd` (seeds CWD as allowed root with `$HOME` protection). Wrapped with `harnx-mcp-hooks-proxy` so GitHub/Atlassian auth injection hooks run before tool execution. Pre-configured toolchain paths. |
+| `bash.yaml` | `bash_*` | None (bundled binary) | Shell execution. Runs bridged over NATS with `--default-root-cwd` (seeds CWD as allowed root with `$HOME` protection). Configured with a co-launched native PreToolUse hook (`harnx-proxy-auth`) for GitHub/Atlassian credential injection. Pre-configured toolchain paths. |
 | `fs.yaml` | `fs_*` | None (bundled binary) | Filesystem read/write. Runs bridged over NATS with `--default-root-cwd` to bound access to the repository CWD. |
 | `plans.yaml` | `plans_*` | None (bundled binary) | Plan/task/note management, stored in `.agent/plans/` relative to the working directory. |
 | `time.yaml` | `time_*` | None (bundled binary) | Current time and wait/sleep utilities. |

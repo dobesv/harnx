@@ -191,16 +191,9 @@ async fn assert_mixed_transport_batch(binary: &str, instance_id: &InstanceId) ->
     let mcp_manager = stdio_time_manager(binary).await?;
     let config = Arc::new(RwLock::new(Config::default()));
     config.write().mcp_manager = Some(mcp_manager);
-    let persistent_manager = Arc::new(tokio::sync::Mutex::new(
-        harnx_hooks::PersistentHookManager::new(),
-    ));
     let context = harnx_runtime::tool::build_tool_eval_context(
-        harnx_runtime::tool::BuildToolEvalContextParams::new(
-            &config,
-            instance_id,
-            &persistent_manager,
-        )
-        .with_agent_use_tools(Some("*")),
+        harnx_runtime::tool::BuildToolEvalContextParams::new(&config, instance_id)
+            .with_agent_use_tools(Some("*")),
     )
     .await;
     assert_eq!(context.providers[0].name(), "nats");

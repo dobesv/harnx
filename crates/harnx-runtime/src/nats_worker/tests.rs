@@ -3444,22 +3444,9 @@ async fn remote_delete_command_routes_to_exact_set_mutations() {
     edit_remote_message_range(&global_config, 1, 1, &abort)
         .await
         .expect("edit older user message");
-
-    let mut async_manager = harnx_hooks::AsyncHookManager::new();
-    let persistent = Arc::new(tokio::sync::Mutex::new(
-        harnx_hooks::PersistentHookManager::new(),
-    ));
-    let mut pending_async_context = None;
-    crate::commands::run_command(
-        &global_config,
-        abort.clone(),
-        ".delete message 3-4",
-        &mut async_manager,
-        &persistent,
-        &mut pending_async_context,
-    )
-    .await
-    .expect("remote delete command succeeds");
+    crate::commands::run_command(&global_config, abort.clone(), ".delete message 3-4")
+        .await
+        .expect("remote delete command succeeds");
 
     let thin = ThinClientSession::from_global_config(
         crate::ThinClientConfig {
@@ -3579,22 +3566,9 @@ async fn remote_rewind_command_routes_to_exact_suffix_deletions() {
     edit_remote_message_range(&global_config, 1, 1, &abort)
         .await
         .expect("edit older user message");
-
-    let mut async_manager = harnx_hooks::AsyncHookManager::new();
-    let persistent = Arc::new(tokio::sync::Mutex::new(
-        harnx_hooks::PersistentHookManager::new(),
-    ));
-    let mut pending_async_context = None;
-    crate::commands::run_command(
-        &global_config,
-        abort.clone(),
-        ".rewind 2",
-        &mut async_manager,
-        &persistent,
-        &mut pending_async_context,
-    )
-    .await
-    .expect("remote rewind command succeeds");
+    crate::commands::run_command(&global_config, abort.clone(), ".rewind 2")
+        .await
+        .expect("remote rewind command succeeds");
 
     let thin = ThinClientSession::from_global_config(
         crate::ThinClientConfig {

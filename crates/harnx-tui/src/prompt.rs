@@ -23,10 +23,6 @@ pub(super) struct PromptTaskContext {
     pub(super) config: GlobalConfig,
     pub(super) abort_signal: AbortSignal,
     #[cfg(test)]
-    pub(super) async_manager: Arc<Mutex<harnx_hooks::AsyncHookManager>>,
-    #[cfg(test)]
-    pub(super) persistent_manager: Arc<Mutex<harnx_hooks::PersistentHookManager>>,
-    #[cfg(test)]
     pub(super) shared_pending_message: Arc<Mutex<Option<PendingMessage>>>,
     pub(super) local_worker:
         Arc<Mutex<Option<harnx_runtime::local_orchestrator::LocalWorkerSupervisor>>>,
@@ -152,8 +148,6 @@ impl Tui {
             instance_id: harnx_core::instance::InstanceId::new(),
             config: ctx.config.clone(),
             abort_signal: ctx.abort_signal.clone(),
-            async_manager: ctx.async_manager.clone(),
-            persistent_manager: ctx.persistent_manager.clone(),
             call_fn: Some(call_fn),
             on_tool_round: Some(on_tool_round),
             on_text_response: Some(on_text_response),

@@ -22,7 +22,6 @@ what you need:
 | `harnx-mcp-plans`       | MCP server exposing file-based plan/task/note management                        | [README](crates/harnx-mcp-plans/README.md)       |
 | `harnx-mcp-plans-github` | MCP server exposing GitHub Issues-backed plan/task/note management              | [README](crates/harnx-mcp-plans-github/README.md)|
 | `harnx-mcp-time`        | MCP server exposing time and timezone utilities                                 | [README](crates/harnx-mcp-time/README.md)        |
-| `harnx-mcp-hooks-proxy` | MCP proxy that runs harnx hooks around every tool call                          | [README](crates/harnx-mcp-hooks-proxy/README.md) |
 | `harnx-sandbox-run`     | Run commands inside the birdcage sandbox with hook support                      | [Sandbox Run](docs/sandbox-run.md)               |
 | `harnx-sandbox-exec`    | Low-level birdcage sandbox wrapper with explicit path allow-lists               | [README](crates/harnx-sandbox-common/README.md)  |
 | `harnx-aws-creds`       | Bearer-protected helper that serves AWS credentials to tools                    | [AWS Creds](docs/aws-creds.md)                   |
