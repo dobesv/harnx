@@ -15,10 +15,10 @@
 //!
 //! | Variable | Format | Effect |
 //! |---|---|---|
-//! | `HARNX_BASH_EXTRA_READABLE` | Colon-separated paths | Extra sandbox read-only paths |
-//! | `HARNX_BASH_EXTRA_EXEC` | Colon-separated paths | Extra sandbox execute paths |
-//! | `HARNX_BASH_EXTRA_WRITABLE` | Colon-separated paths | Extra sandbox writable paths |
-//! | `HARNX_BASH_EXTRA_RWX` | Colon-separated paths | Extra sandbox read/write/exec paths |
+//! | `HARNX_TOOLS_ALLOW_READ` | Colon-separated paths | Allowed sandbox read-only paths |
+//! | `HARNX_TOOLS_ALLOW_EXEC` | Colon-separated paths | Allowed sandbox execute paths |
+//! | `HARNX_TOOLS_ALLOW_WRITE` | Colon-separated paths | Allowed sandbox writable paths |
+//! | `HARNX_TOOLS_ALLOW_RWX` | Colon-separated paths | Allowed sandbox read/write/exec paths |
 //! | `HARNX_BASH_ENV_PASSTHROUGH` | Comma-separated names | Extra host env var names to pass through |
 
 mod cli;
@@ -66,18 +66,27 @@ fn main() -> Result<()> {
     let mut clap_args = vec!["harnx-sandbox-run".to_string()];
     clap_args.extend(remaining);
 
-    // Parse remaining args with clap
-    let mut cli = <cli::Cli as clap::Parser>::parse_from(&clap_args);
+    // Treat stale configuration as a startup failure with the same exit code as
+    // the tool servers. Help and version requests still exit successfully.
+    let mut cli = match <cli::Cli as clap::Parser>::try_parse_from(&clap_args) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let exit_code = match error.kind() {
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => 0,
+                _ => 1,
+            };
+            let _ = error.print();
+            std::process::exit(exit_code);
+        }
+    };
 
     // Merge env var overrides (matching harnx-bash-tools behaviour).
     #[cfg(unix)]
     {
-        cli.extra_read
-            .extend(env_paths("HARNX_BASH_EXTRA_READABLE"));
-        cli.extra_write
-            .extend(env_paths("HARNX_BASH_EXTRA_WRITABLE"));
-        cli.extra_exec.extend(env_paths("HARNX_BASH_EXTRA_EXEC"));
-        cli.extra_rwx.extend(env_paths("HARNX_BASH_EXTRA_RWX"));
+        cli.allow_read.extend(env_paths("HARNX_TOOLS_ALLOW_READ"));
+        cli.allow_write.extend(env_paths("HARNX_TOOLS_ALLOW_WRITE"));
+        cli.allow_exec.extend(env_paths("HARNX_TOOLS_ALLOW_EXEC"));
+        cli.allow_rwx.extend(env_paths("HARNX_TOOLS_ALLOW_RWX"));
     }
 
     // Extra env var names to pass through from host.

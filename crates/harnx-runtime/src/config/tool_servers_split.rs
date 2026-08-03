@@ -2,7 +2,7 @@
 //!
 //! These configs specify which NATS tool servers to spawn as separate processes.
 //! Similar in shape to `McpServerConfig` but without MCP-specific fields like
-//! `rename_tools`, `tool_templates`, and `roots`.
+//! `rename_tools` and `tool_templates`.
 
 use super::*;
 use anyhow::Context as _;

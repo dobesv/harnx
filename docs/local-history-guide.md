@@ -7,7 +7,7 @@ harnx provides automatic, transparent local history for file-modifying operation
 Local history feature automatically snapshots files before and after every mutating tool call. This provides safety net for AI agents, allowing them to undo their own changes without manual intervention.
 
 Key characteristics:
-- **Zero-config**: Automatically activates when MCP roots include git repositories.
+- **Zero-config**: Automatically activates when a mutated path belongs to a git repository.
 - **Transparent**: Snapshots are stored as standard git commit objects with no dedicated refs. Diff responses identify snapshot using `commit <sha>` line at top.
 - **Safe Rollback**: `rollback_file` tool can restore repository to any prior snapshot using forward commits, ensuring no history is ever lost.
 

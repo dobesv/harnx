@@ -1,39 +1,6 @@
 // Auto-split from server.rs for cohesion. See server/mod.rs.
 use super::*;
 
-/// Accumulator for sandbox CLI args plus the writable path set used to decide
-/// whether the working directory still needs an explicit `--read`.
-#[cfg(unix)]
-pub(crate) struct SandboxAcc {
-    pub(crate) args: Vec<OsString>,
-    pub(crate) writable: Vec<PathBuf>,
-}
-
-#[cfg(unix)]
-impl SandboxAcc {
-    pub(crate) fn new(args: Vec<OsString>) -> Self {
-        Self {
-            args,
-            writable: Vec::new(),
-        }
-    }
-
-    pub(crate) fn into_args(self) -> Vec<OsString> {
-        self.args
-    }
-
-    pub(crate) fn ensure_working_dir_readable(&mut self, working_dir: &Path) {
-        let covered = self
-            .writable
-            .iter()
-            .any(|path| working_dir.starts_with(path));
-        if !covered {
-            self.args.push(OsString::from("--read"));
-            self.args.push(working_dir.as_os_str().to_os_string());
-        }
-    }
-}
-
 /// Inputs for building a sandboxed child command. Groups the parameters
 /// shared by `build_sandbox_command` to keep its argument count manageable.
 #[cfg(unix)]
@@ -41,7 +8,6 @@ pub(crate) struct SandboxCommandSpec<'a> {
     pub(crate) working_dir: &'a Path,
     pub(crate) exec_dir: &'a Path,
     pub(crate) command: &'a str,
-    pub(crate) roots: &'a [PathBuf],
     pub(crate) extra_env: Option<&'a HashMap<String, String>>,
 }
 

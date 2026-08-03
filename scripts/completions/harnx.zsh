@@ -41,7 +41,6 @@ _harnx() {
 '--list-agents[List all agents]' \
 '--list-rags[List all RAGs]' \
 '--list-macros[List all macros]' \
-'*--mcp-root[Add MCP roots]:PATH:_directories' \
 '-t[Enable tools or toolsets for this session]:TOOL: ' \
 '--tool[Enable tools or toolsets for this session]:TOOL: ' \
 '-h[Print help]' \

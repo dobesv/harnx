@@ -25,8 +25,6 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
-    #[serde(default)]
-    pub roots: Vec<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -44,4 +42,20 @@ pub struct McpServerConfig {
     /// belongs to the same package, and under a prefixed name otherwise.
     #[serde(skip)]
     pub package: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::McpServerConfig;
+
+    #[test]
+    fn legacy_roots_field_is_ignored() {
+        let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "legacy-mcp-server",
+            "roots": ["/workspace"]
+        }))
+        .expect("legacy roots field should be ignored");
+
+        assert_eq!(config.command, "legacy-mcp-server");
+    }
 }

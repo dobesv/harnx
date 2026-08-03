@@ -1,5 +1,4 @@
 // Auto-split from server.rs / handlers.rs for cohesion. See server/mod.rs.
-// rmcp deprecated the MCP Roots feature (SEP-2577); this server still uses it.
 #![allow(deprecated)]
 use super::*;
 
@@ -41,124 +40,36 @@ impl BashServer {
     ];
 
     #[allow(dead_code)]
-    pub fn new(initial_roots: Vec<PathBuf>) -> Self {
-        Self::new_with_sandbox(
-            initial_roots,
-            SandboxConfig {
-                enabled: false,
-                extra_exec: vec![],
-                extra_readable: vec![],
-                extra_writable: vec![],
-                extra_rwx: vec![],
-                extra_env_passthrough: vec![],
-                env_overrides: vec![],
-                sandbox_run_path: PathBuf::from("harnx-sandbox-exec"),
-            },
-        )
+    pub fn new(allowlist: ResolvedAllowlist) -> Self {
+        let allowlist = Arc::new(allowlist);
+        Self::new_with_sandbox(SandboxConfig {
+            enabled: false,
+            allowlist,
+            extra_env_passthrough: vec![],
+            env_overrides: vec![],
+            sandbox_run_path: PathBuf::from("harnx-sandbox-exec"),
+        })
     }
 
-    pub fn new_with_sandbox(initial_roots: Vec<PathBuf>, sandbox_config: SandboxConfig) -> Self {
-        Self::new_with_sandbox_and_default_root(initial_roots, sandbox_config, false)
-    }
-
-    pub fn new_with_sandbox_and_default_root(
-        initial_roots: Vec<PathBuf>,
-        sandbox_config: SandboxConfig,
-        default_root_cwd: bool,
-    ) -> Self {
-        let log_dir = std::env::temp_dir().join(format!(
-            "harnx-bash-{}-{}",
-            std::process::id(),
-            Uuid::new_v4()
-        ));
+    pub fn new_with_sandbox(sandbox_config: SandboxConfig) -> Self {
+        let allowlist = sandbox_config.allowlist.clone();
+        let log_dir = std::env::temp_dir().join(format!("harnx-bash-tools-{}", Uuid::new_v4()));
         Self {
             inner: Arc::new(BashServerInner {
-                roots: RwLock::new(initial_roots.clone()),
-                initial_roots: initial_roots.clone(),
-                roots_initialized: AtomicBool::new(false),
-                default_root_cwd,
+                allowlist,
                 spawned: Mutex::new(HashMap::new()),
                 log_dir,
-                history: Arc::new(HistoryManager::new(&initial_roots)),
+                // Writable allowlist entries include broad shared paths such as /tmp.
+                // History discovers repositories lazily from actual snapshot paths, so
+                // scanning every writable path here is both unnecessary and unbounded.
+                history: Arc::new(HistoryManager::new(&[])),
                 sandbox_config,
             }),
         }
     }
 
-    pub(crate) async fn refresh_roots(
-        &self,
-        peer: &rmcp::service::Peer<RoleServer>,
-    ) -> Result<(), ErrorData> {
-        if !peer_supports_roots(peer) {
-            // The client never advertised the `roots` capability, so it can't
-            // answer a `roots/list` request. Keep the CLI-provided roots.
-            self.apply_default_root_cwd_if_empty().await;
-            self.inner.roots_initialized.store(true, Ordering::SeqCst);
-            return Ok(());
-        }
-
-        let result = peer.list_roots().await.map_err(|err| {
-            ErrorData::internal_error(format!("failed to fetch roots from peer: {err}"), None)
-        })?;
-
-        let peer_roots = result
-            .roots
-            .into_iter()
-            .filter_map(|root| file_uri_to_path(root.uri.as_ref()))
-            .collect::<Vec<_>>();
-
-        {
-            let mut roots = self.inner.roots.write().await;
-            *roots = if peer_roots.is_empty() {
-                self.inner.initial_roots.clone()
-            } else {
-                peer_roots
-            };
-        }
-        self.apply_default_root_cwd_if_empty().await;
-        self.inner.roots_initialized.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-
-    pub(crate) async fn apply_default_root_cwd_if_empty(&self) {
-        let mut roots = self.inner.roots.write().await;
-        if !roots.is_empty() || !self.inner.default_root_cwd {
-            return;
-        }
-
-        match default_root_from_cwd() {
-            Some(root) => roots.push(root),
-            None => eprintln!(
-                "harnx-bash-tools: --default-root-cwd: refusing to seed root from CWD \
-                 (HOME guard or path resolution failed) — filesystem/exec access denied"
-            ),
-        }
-    }
-
-    pub(crate) async fn initialize_native_roots(&self) {
-        self.apply_default_root_cwd_if_empty().await;
-        self.inner.roots_initialized.store(true, Ordering::SeqCst);
-    }
-
-    pub(crate) async fn ensure_roots_initialized(
-        &self,
-        peer: &rmcp::service::Peer<RoleServer>,
-    ) -> Result<(), ErrorData> {
-        if self.inner.roots_initialized.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-
-        match self.refresh_roots(peer).await {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                if self.inner.roots.read().await.is_empty() {
-                    Err(err)
-                } else {
-                    Ok(())
-                }
-            }
-        }
-    }
+    /// Native and MCP stdio modes share the immutable allowlist resolved at startup.
+    pub(crate) async fn initialize_allowlist(&self) {}
 
     pub(crate) async fn ensure_log_dir(&self) -> Result<(), ErrorData> {
         if let Some(parent) = self.inner.log_dir.parent() {
@@ -231,11 +142,18 @@ impl BashServer {
         &self,
         requested: Option<&str>,
     ) -> Result<PathBuf, ErrorData> {
-        let roots = self.inner.roots.read().await;
-        let default_dir = roots
-            .first()
-            .cloned()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let current_dir = std::env::current_dir().ok();
+        // Prefer the process cwd when it is allowed. Otherwise use the first
+        // read grant. Empty allowlists have no fallback and remain deny-all.
+        let default_dir = current_dir
+            .filter(|cwd| self.inner.allowlist.contains_read(cwd))
+            .or_else(|| self.inner.allowlist.read_paths().iter().next().cloned())
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    "no allowed paths are configured for a working directory".to_string(),
+                    None,
+                )
+            })?;
 
         let resolved = match requested {
             Some(path_str) if !path_str.trim().is_empty() => {
@@ -269,16 +187,10 @@ impl BashServer {
             ));
         }
 
-        if roots.is_empty()
-            || !roots.iter().any(|root| {
-                root.canonicalize()
-                    .map(|canonical_root| canonical.starts_with(&canonical_root))
-                    .unwrap_or(false)
-            })
-        {
+        if !self.inner.allowlist.contains_read(&canonical) {
             return Err(ErrorData::invalid_params(
                 format!(
-                    "working directory '{}' is outside allowed roots",
+                    "working directory '{}' is outside allowed paths",
                     canonical.display()
                 ),
                 None,

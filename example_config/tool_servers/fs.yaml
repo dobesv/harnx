@@ -1,9 +1,9 @@
 command: harnx-fs-tools
 description: >-
   Agent filesystem access
-# Runs directly as a toolset server. --default-root-cwd binds access to the
-# process CWD (the user's repo), keeping the $HOME guard. To allow other paths,
-# shadow this file at ~/.config/harnx/tool_servers/fs.yaml and add --root /path
-# in args.
+# Access is deny-all unless enabled by a batch or explicit path. repo-work
+# allows the current repository; dev-tools allows toolchain configuration and
+# caches. To allow other paths, use --allow-rwx /path or --allow-read /path.
 args:
-  - --default-root-cwd
+  - --allow-repo-work
+  - --allow-dev-tools

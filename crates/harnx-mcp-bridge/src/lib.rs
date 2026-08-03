@@ -1,6 +1,3 @@
-// rmcp deprecated MCP Roots (SEP-2577); bridge still returns method_not_found.
-#![allow(deprecated)]
-
 use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -15,10 +12,9 @@ use process_wrap::tokio::ProcessGroup;
 use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ErrorData, Implementation, InitializeRequestParams,
-    ListRootsResult, Tool,
+    CallToolRequestParams, ClientCapabilities, Implementation, InitializeRequestParams, Tool,
 };
-use rmcp::service::{Peer, RequestContext, RoleClient, ServiceError};
+use rmcp::service::{Peer, RoleClient, ServiceError};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
@@ -374,7 +370,7 @@ fn render_stderr_tail(stderr_tail: &StderrTail) -> String {
     }
 }
 
-/// Client handler for wrapped servers. S1 doesn't expose roots to children.
+/// Client handler for wrapped servers.
 pub struct BridgeClientHandler;
 
 impl ClientHandler for BridgeClientHandler {
@@ -383,15 +379,6 @@ impl ClientHandler for BridgeClientHandler {
             ClientCapabilities::default(),
             Implementation::new("harnx-mcp-bridge", env!("CARGO_PKG_VERSION")),
         )
-    }
-
-    async fn list_roots(
-        &self,
-        _context: RequestContext<RoleClient>,
-    ) -> Result<ListRootsResult, ErrorData> {
-        Err(ErrorData::method_not_found::<
-            rmcp::model::ListRootsRequestMethod,
-        >())
     }
 }
 

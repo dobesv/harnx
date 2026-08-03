@@ -345,9 +345,10 @@ fn test_invalid_flag_errors() {
         .output()
         .expect("failed to spawn sandbox");
 
-    assert!(
-        !output.status.success(),
-        "invalid flag should cause non-zero exit"
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "invalid flag should fail startup"
     );
 }
 
@@ -388,21 +389,21 @@ fn test_path_exceptions() {
 
 #[cfg(unix)]
 #[test]
-fn test_extra_rwx_flag() {
+fn test_allow_rwx_flag() {
     if !sandbox_runtime_works() {
         eprintln!("skipping: sandbox runtime not available");
         return;
     }
 
-    // Test that --extra-rwx flag is accepted
+    // Test that --allow-rwx flag is accepted
     let output = Command::new(binary_path())
-        .args(["--extra-rwx", "/tmp", "--working-dir", "/tmp", "--", "true"])
+        .args(["--allow-rwx", "/tmp", "--working-dir", "/tmp", "--", "true"])
         .output()
         .expect("failed to spawn sandbox");
 
     assert!(
         output.status.success(),
-        "sandbox should exit successfully with --extra-rwx"
+        "sandbox should exit successfully with --allow-rwx"
     );
 }
 

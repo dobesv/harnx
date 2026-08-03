@@ -247,13 +247,6 @@ async fn write_mcp_info(
             writeln!(output, "    {key}={value}")?;
         }
     }
-    let roots = client.live_roots();
-    if !roots.is_empty() {
-        writeln!(output, "  roots:")?;
-        for root in &roots {
-            writeln!(output, "    {root}")?;
-        }
-    }
     match cfg.hooks.as_ref() {
         Some(hooks) if !hooks.entries.is_empty() => {
             writeln!(output, "  hooks:")?;
@@ -748,50 +741,6 @@ pub async fn run_command_with_output_and_local_worker(
                         writeln!(output, "MCP is not configured")?;
                     }
                 }
-                Some(("roots", name)) => {
-                    let name = name.map(|n| n.trim()).unwrap_or("");
-                    if name.is_empty() {
-                        writeln!(output, "Usage: .mcp roots <server>")?;
-                    } else {
-                        let roots = Config::mcp_get_roots(config, name)?;
-                        if roots.is_empty() {
-                            writeln!(output, "No roots for MCP server '{}'", name)?;
-                        } else {
-                            writeln!(output, "MCP Roots for '{}':", name)?;
-                            for root in roots {
-                                writeln!(output, "  {}", root)?;
-                            }
-                        }
-                    }
-                }
-                Some(("add-root", name_and_root)) => {
-                    let name_and_root = name_and_root.map(|n| n.trim()).unwrap_or("");
-                    if let Some((name, root)) = name_and_root.split_once(' ') {
-                        let (name, root) = (name.trim(), root.trim());
-                        if name.is_empty() || root.is_empty() {
-                            writeln!(output, "Usage: .mcp add-root <server> <root>")?;
-                        } else {
-                            Config::mcp_add_root(config, name, root).await?;
-                            writeln!(output, "Added root '{}' to MCP server '{}'", root, name)?;
-                        }
-                    } else {
-                        writeln!(output, "Usage: .mcp add-root <server> <root>")?;
-                    }
-                }
-                Some(("remove-root", name_and_root)) => {
-                    let name_and_root = name_and_root.map(|n| n.trim()).unwrap_or("");
-                    if let Some((name, root)) = name_and_root.split_once(' ') {
-                        let (name, root) = (name.trim(), root.trim());
-                        if name.is_empty() || root.is_empty() {
-                            writeln!(output, "Usage: .mcp remove-root <server> <root>")?;
-                        } else {
-                            Config::mcp_remove_root(config, name, root).await?;
-                            writeln!(output, "Removed root '{}' from MCP server '{}'", root, name)?;
-                        }
-                    } else {
-                        writeln!(output, "Usage: .mcp remove-root <server> <root>")?;
-                    }
-                }
                 _ => {
                     writeln!(
                         output,
@@ -801,10 +750,7 @@ Commands:
   .mcp list                    - List configured MCP servers
   .mcp connect <server>        - Connect to an MCP server
   .mcp disconnect <server>     - Disconnect from an MCP server
-  .mcp tools [server]          - List available MCP tools
-  .mcp roots <server>          - List roots for an MCP server
-  .mcp add-root <server> <root> - Add a root to an MCP server
-  .mcp remove-root <server> <root> - Remove a root from an MCP server"#
+  .mcp tools [server]          - List available MCP tools"#
                     )?;
                 }
             },
@@ -1452,7 +1398,7 @@ mod tests {
 name: bash
 command: harnx-bash-tools
 args:
-  - "--extra-rwx"
+  - "--allow-rwx"
   - "$GIT_ROOT"
 env:
   EDITOR: "true"
@@ -1469,7 +1415,7 @@ hooks:
 
         assert!(text.contains("MCP server: bash"), "{text}");
         assert!(text.contains("command: harnx-bash-tools"), "{text}");
-        assert!(text.contains("--extra-rwx"), "{text}");
+        assert!(text.contains("--allow-rwx"), "{text}");
         assert!(text.contains("$GIT_ROOT"), "{text}");
         assert!(text.contains("EDITOR=true"), "{text}");
         assert!(text.contains("[1] harnx-proxy-auth --hook"), "{text}");

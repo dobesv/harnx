@@ -1,71 +1,12 @@
-// rmcp deprecated the MCP Roots feature (SEP-2577); these tests exercise it.
-#![allow(deprecated)]
-
 use super::*;
 
 use harnx_mcp::content::audience;
-use harnx_mcp::safety::path_to_file_uri;
 use rmcp::handler::client::ClientHandler;
-use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, InitializeRequestParams, ListRootsResult, Root,
-};
-use rmcp::service::{
-    serve_client, serve_server, RequestContext, RoleClient, RoleServer, RunningService,
-};
+use rmcp::model::{CallToolRequestParams, ClientCapabilities, InitializeRequestParams};
+use rmcp::service::{serve_client, serve_server, RoleClient, RoleServer, RunningService};
 use std::path::Path;
 use tokio::io::duplex;
 use uuid::Uuid;
-
-#[cfg(unix)]
-pub(crate) async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    use std::sync::OnceLock;
-
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await
-}
-
-#[cfg(unix)]
-pub(crate) struct HomeGuard(Option<std::ffi::OsString>);
-
-#[cfg(unix)]
-impl HomeGuard {
-    pub(crate) fn set(path: &Path) -> Self {
-        let previous = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", path) };
-        Self(previous)
-    }
-}
-
-#[cfg(unix)]
-impl Drop for HomeGuard {
-    fn drop(&mut self) {
-        match &self.0 {
-            Some(value) => unsafe { std::env::set_var("HOME", value) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-    }
-}
-
-#[cfg(unix)]
-pub(crate) struct CwdGuard(PathBuf);
-
-#[cfg(unix)]
-impl CwdGuard {
-    pub(crate) fn set(path: &Path) -> Self {
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(path).unwrap();
-        Self(previous)
-    }
-}
-
-#[cfg(unix)]
-impl Drop for CwdGuard {
-    fn drop(&mut self) {
-        std::env::set_current_dir(&self.0).unwrap();
-    }
-}
 
 struct TestDir {
     path: PathBuf,
@@ -90,37 +31,14 @@ impl Drop for TestDir {
 }
 
 #[derive(Clone, Default)]
-struct TestClientHandler {
-    roots: Vec<PathBuf>,
-}
-
-impl TestClientHandler {
-    fn new(roots: Vec<PathBuf>) -> Self {
-        Self { roots }
-    }
-}
+struct TestClientHandler;
 
 impl ClientHandler for TestClientHandler {
     fn get_info(&self) -> InitializeRequestParams {
         InitializeRequestParams::new(
-            ClientCapabilities::builder()
-                .enable_roots()
-                .enable_roots_list_changed()
-                .build(),
+            ClientCapabilities::builder().build(),
             Implementation::new("test", "0.1"),
         )
-    }
-
-    async fn list_roots(
-        &self,
-        _cx: RequestContext<RoleClient>,
-    ) -> Result<ListRootsResult, ErrorData> {
-        Ok(ListRootsResult::new(
-            self.roots
-                .iter()
-                .map(|root| Root::new(path_to_file_uri(&root.canonicalize().unwrap())))
-                .collect(),
-        ))
     }
 }
 
@@ -129,10 +47,10 @@ struct TestConnection {
     client_service: RunningService<RoleClient, TestClientHandler>,
 }
 
-async fn connect_server(server: FsServer, roots: Vec<PathBuf>) -> TestConnection {
+async fn connect_server(server: FsServer, _roots: Vec<PathBuf>) -> TestConnection {
     let (client_transport, server_transport) = duplex(65_536);
     let server_fut = serve_server(server, server_transport);
-    let client_fut = serve_client(TestClientHandler::new(roots), client_transport);
+    let client_fut = serve_client(TestClientHandler, client_transport);
     let (server_res, client_res) = tokio::join!(server_fut, client_fut);
     TestConnection {
         _server_service: server_res.unwrap(),
@@ -148,8 +66,16 @@ fn text_content(result: &CallToolResult) -> String {
         .unwrap()
 }
 
+fn rwx_allowlist(paths: impl IntoIterator<Item = PathBuf>) -> ResolvedAllowlist {
+    let mut allowlist = ResolvedAllowlist::new();
+    for path in paths {
+        allowlist.insert_rwx(path);
+    }
+    allowlist
+}
+
 fn make_server(dir: &Path) -> FsServer {
-    FsServer::new(vec![dir.to_path_buf()], false)
+    FsServer::new(rwx_allowlist([dir.to_path_buf()]))
 }
 
 fn write_fixture(dir: &TestDir, name: &str, contents: impl AsRef<[u8]>) -> PathBuf {
@@ -474,223 +400,101 @@ async fn edit_file_emits_unaudienced_diff_content() {
     assert!(audience(&result.content[1]).is_none(), "diff audience");
 }
 
-/// Production launch path: harnx-fs-tools starts with empty
-/// `initial_roots` (no `--root` CLI args) and only learns its roots
-/// later via the MCP `roots/list` protocol. `HistoryManager` was
-/// constructed with the empty initial roots and never refreshed, so
-/// it never tracked any repos and silently dropped the diff content
-/// block on every edit. This guards the lazy-discovery fallback in
-/// `HistoryManager::snapshot_file`.
 #[cfg(unix)]
 #[tokio::test]
-async fn edit_file_emits_diff_when_roots_only_set_via_protocol() {
-    let temp_dir = TestDir::new();
-    let dir = temp_dir.path();
-    if !seed_committed_file(dir, "tracked.txt", "old value\n") {
-        return;
-    }
+async fn read_only_allowlist_reads_but_denies_writes() {
+    let dir = TestDir::new();
+    let file = dir.path().join("read-only.txt");
+    std::fs::write(&file, "original").unwrap();
+    let mut allowlist = ResolvedAllowlist::new();
+    allowlist.insert_read(dir.path());
+    let server = FsServer::new(allowlist);
 
-    // Mimic the production launch: empty initial_roots.
-    let server = FsServer::new(vec![], false);
-    // Mimic `refresh_roots` populating roots after the MCP handshake.
-    *server.roots.write().await = vec![dir.to_path_buf()];
-
-    let result = server
-        .edit_file_impl(EditFileParams {
-            path: path_string(&dir.join("tracked.txt")),
-            old_text: "old value".into(),
-            new_text: "new value".into(),
-            replace_all: None,
+    server
+        .read_file_impl(ReadFileParams {
+            path: path_string(&file),
+            offset: None,
+            limit: None,
+            tail: None,
+            grep: None,
+            head_lines: None,
+            tail_lines: None,
+            max_output_bytes: None,
         })
         .await
-        .expect("edit succeeds");
+        .expect("read grant permits reads");
 
-    let texts: Vec<&str> = result
-        .content
-        .iter()
-        .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
-        .collect();
-    assert!(
-        texts.len() >= 2,
-        "expected summary + diff content blocks, got {}: {texts:?}",
-        texts.len()
-    );
-    assert!(texts[1].contains("-old value"), "diff missing: {texts:?}");
-}
-
-/// A client that does NOT advertise the `roots` capability.
-#[derive(Clone)]
-struct NoRootsClientHandler {
-    list_roots_called: Arc<AtomicBool>,
-}
-
-impl ClientHandler for NoRootsClientHandler {
-    fn get_info(&self) -> InitializeRequestParams {
-        // Deliberately no `.enable_roots()` — this client cannot answer
-        // a `roots/list` request.
-        InitializeRequestParams::new(
-            ClientCapabilities::builder().build(),
-            Implementation::new("test-no-roots", "0.1"),
-        )
-    }
-
-    async fn list_roots(
-        &self,
-        _cx: RequestContext<RoleClient>,
-    ) -> Result<ListRootsResult, ErrorData> {
-        self.list_roots_called.store(true, Ordering::SeqCst);
-        Ok(ListRootsResult::new(vec![]))
-    }
-}
-
-/// When the client never advertised `roots`, the server must not send it
-/// a `roots/list` request; it keeps the CLI-provided roots instead.
-#[tokio::test]
-async fn does_not_request_roots_when_client_lacks_capability() {
-    let temp_dir = TestDir::new();
-    let initial_root = temp_dir.path().to_path_buf();
-    let server = FsServer::new(vec![initial_root.clone()], false);
-    let server_clone = server.clone();
-
-    let (client_transport, server_transport) = duplex(65_536);
-    let list_roots_called = Arc::new(AtomicBool::new(false));
-    let client_handler = NoRootsClientHandler {
-        list_roots_called: list_roots_called.clone(),
-    };
-    let server_fut = serve_server(server, server_transport);
-    let client_fut = serve_client(client_handler, client_transport);
-    let (server_res, client_res) = tokio::join!(server_fut, client_fut);
-    let server_service = server_res.unwrap();
-    let client_service = client_res.unwrap();
-
-    let server_peer = server_service.peer().clone();
-    let _client_task = tokio::spawn(async move {
-        let _ = client_service.waiting().await;
-    });
-
-    server_clone
-        .ensure_roots_initialized(&server_peer)
+    let denied = server
+        .write_file_impl(WriteFileParams {
+            path: path_string(&file),
+            content: "changed".into(),
+        })
         .await
-        .expect("initialization succeeds without roots support");
-
-    assert!(
-        !list_roots_called.load(Ordering::SeqCst),
-        "server must not request roots from a client lacking the roots capability"
-    );
-    assert_eq!(
-        *server_clone.roots.read().await,
-        vec![initial_root],
-        "CLI-provided roots must be retained"
-    );
-    assert!(
-        server_clone.roots_initialized.load(Ordering::SeqCst),
-        "roots should be marked initialized so we don't retry every tool call"
-    );
+        .unwrap_err();
+    assert!(denied.message.contains("filesystem writes are denied"));
 }
 
-async fn initialize_without_roots_capability(server: FsServer) -> FsServer {
-    let server_clone = server.clone();
-    let (client_transport, server_transport) = duplex(65_536);
-    let client_handler = NoRootsClientHandler {
-        list_roots_called: Arc::new(AtomicBool::new(false)),
-    };
-    let (server_res, client_res) = tokio::join!(
-        serve_server(server, server_transport),
-        serve_client(client_handler, client_transport)
-    );
-    let server_service = server_res.unwrap();
-    let client_service = client_res.unwrap();
-    let server_peer = server_service.peer().clone();
-    let _client_task = tokio::spawn(async move {
-        let _ = client_service.waiting().await;
-    });
+#[tokio::test]
+async fn rollback_requires_write_allowlist() {
+    let dir = TestDir::new();
+    let mut allowlist = ResolvedAllowlist::new();
+    allowlist.insert_read(dir.path());
+    let server = FsServer::new(allowlist);
 
-    server_clone
-        .ensure_roots_initialized(&server_peer)
+    let denied = server
+        .rollback_file_impl(RollbackParams {
+            commit_id: "not-reached".into(),
+            repo_path: path_string(dir.path()),
+        })
         .await
-        .expect("initialization succeeds without roots support");
-    server_clone
+        .unwrap_err();
+    assert!(denied.message.contains("filesystem writes are denied"));
 }
 
-#[cfg(unix)]
 #[tokio::test]
-async fn default_root_cwd_seeds_bridged_startup_without_roots_capability() {
-    let _lock = env_lock().await;
-    let base = TestDir::new();
-    let cwd = base.path().join("repo");
-    let home = base.path().join("home");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&home).unwrap();
-    let _home = HomeGuard::set(&home);
-    let _cwd = CwdGuard::set(&cwd);
-    let expected = cwd.canonicalize().unwrap();
+async fn rwx_allowlist_reads_and_writes() {
+    let dir = TestDir::new();
+    let file = dir.path().join("writable.txt");
+    std::fs::write(&file, "original").unwrap();
+    let server = FsServer::new(rwx_allowlist([dir.path().to_path_buf()]));
 
-    let server = initialize_without_roots_capability(FsServer::new(vec![], true)).await;
-
-    assert_eq!(*server.roots.read().await, vec![expected]);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn default_root_cwd_seeds_when_peer_returns_empty_roots() {
-    let _lock = env_lock().await;
-    let base = TestDir::new();
-    let cwd = base.path().join("repo");
-    let home = base.path().join("home");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&home).unwrap();
-    let _home = HomeGuard::set(&home);
-    let _cwd = CwdGuard::set(&cwd);
-    let expected = cwd.canonicalize().unwrap();
-    let server = FsServer::new(vec![], true);
-    let server_clone = server.clone();
-    let connection = connect_server(server, vec![]).await;
-    let server_peer = connection._server_service.peer().clone();
-
-    server_clone
-        .ensure_roots_initialized(&server_peer)
+    server
+        .write_file_impl(WriteFileParams {
+            path: path_string(&file),
+            content: "changed".into(),
+        })
         .await
-        .expect("initialization succeeds with empty peer roots");
-
-    assert_eq!(*server_clone.roots.read().await, vec![expected]);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn default_root_cwd_refuses_home_and_leaves_roots_empty() {
-    let _lock = env_lock().await;
-    let home = TestDir::new();
-    let _home = HomeGuard::set(home.path());
-    let _cwd = CwdGuard::set(home.path());
-
-    let server = initialize_without_roots_capability(FsServer::new(vec![], true)).await;
-
-    assert!(server.roots.read().await.is_empty());
-}
-
-#[tokio::test]
-async fn empty_roots_remain_empty_without_default_root_cwd() {
-    let server = initialize_without_roots_capability(FsServer::new(vec![], false)).await;
-
-    assert!(server.roots.read().await.is_empty());
-}
-
-#[tokio::test]
-async fn explicit_root_takes_precedence_over_default_root_cwd() {
-    let root = TestDir::new();
-    let expected = root.path().to_path_buf();
-    let server = FsServer::new(vec![expected.clone()], true);
-    let server_clone = server.clone();
-    let connection = connect_server(server, vec![]).await;
-    let server_peer = connection._server_service.peer().clone();
-
-    server_clone
-        .ensure_roots_initialized(&server_peer)
+        .expect("rwx grant permits writes");
+    let result = server
+        .read_file_impl(ReadFileParams {
+            path: path_string(&file),
+            offset: None,
+            limit: None,
+            tail: None,
+            grep: None,
+            head_lines: None,
+            tail_lines: None,
+            max_output_bytes: None,
+        })
         .await
-        .expect("initialization succeeds with an explicit root");
-
-    assert_eq!(*server_clone.roots.read().await, vec![expected]);
+        .expect("rwx grant permits reads");
+    assert!(text_content(&result).contains("changed"));
 }
+
+#[tokio::test]
+async fn empty_allowlist_denies_default_search_path() {
+    let server = FsServer::new(ResolvedAllowlist::new());
+    let denied = server
+        .find_files_impl(FindFilesParams {
+            pattern: "**/*".into(),
+            path: None,
+            max_results: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(denied.message.contains("No paths configured for reading"));
+}
+
 #[tokio::test]
 async fn test_read_file_with_offset_limit() {
     let temp_dir = TestDir::new();
@@ -1022,7 +826,7 @@ async fn test_edit_file_unique_match() {
     let temp_dir = TestDir::new();
     let file_path = temp_dir.path().join("unique.txt");
     std::fs::write(&file_path, "alpha\nbeta\n").unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .edit_file_impl(EditFileParams {
@@ -1046,7 +850,7 @@ async fn test_edit_file_multiple_matches() {
     let temp_dir = TestDir::new();
     let file_path = temp_dir.path().join("multiple.txt");
     std::fs::write(&file_path, "value\nvalue\n").unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .edit_file_impl(EditFileParams {
@@ -1068,7 +872,7 @@ async fn test_list_directory_flat() {
     std::fs::create_dir_all(temp_dir.path().join("nested")).unwrap();
     std::fs::write(temp_dir.path().join("root.txt"), "root").unwrap();
     std::fs::write(temp_dir.path().join("nested").join("child.txt"), "child").unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .list_directory_impl(ListDirectoryParams {
@@ -1089,7 +893,7 @@ async fn test_search_files_basic() {
     let temp_dir = TestDir::new();
     std::fs::write(temp_dir.path().join("one.txt"), "alpha\nneedle\nomega\n").unwrap();
     std::fs::write(temp_dir.path().join("two.txt"), "nothing here\n").unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .search_files_impl(SearchFilesParams {
@@ -1117,7 +921,7 @@ async fn test_read_file_summary_limited_on_pagination() {
     let temp_dir = TestDir::new();
     let file_path = temp_dir.path().join("paginated.txt");
     std::fs::write(&file_path, "one\ntwo\nthree\nfour\n").unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .read_file_impl(ReadFileParams {
@@ -1146,7 +950,7 @@ async fn test_list_directory_summary_not_limited_when_small() {
     for i in 0..3 {
         std::fs::write(temp_dir.path().join(format!("f{i}.txt")), "x").unwrap();
     }
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .list_directory_impl(ListDirectoryParams {
@@ -1175,7 +979,7 @@ async fn test_list_directory_summary_limited_when_over_default_limit() {
     for i in 0..=DEFAULT_LS_LIMIT {
         std::fs::write(temp_dir.path().join(format!("f{i:04}.txt")), "x").unwrap();
     }
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .list_directory_impl(ListDirectoryParams {
@@ -1241,7 +1045,7 @@ async fn test_search_files_summary_variants() {
         for (name, content) in case.files {
             std::fs::write(temp_dir.path().join(name), content).unwrap();
         }
-        let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+        let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
         let result = server
             .search_files_impl(SearchFilesParams {
@@ -1265,7 +1069,7 @@ async fn test_find_files_basic() {
     // the glob crate expects Unix separators on all platforms.
     let temp_dir = TestDir::new();
     std::fs::write(temp_dir.path().join("hello.txt"), "").unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .find_files_impl(FindFilesParams {
@@ -1323,7 +1127,7 @@ async fn test_find_files_summary_variants() {
         for name in case.files {
             std::fs::write(temp_dir.path().join(name), "").unwrap();
         }
-        let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+        let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
         let result = server
             .find_files_impl(FindFilesParams {
@@ -1349,7 +1153,7 @@ gamma
 ",
     )
     .unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .insert_impl(InsertParams {
@@ -1384,7 +1188,7 @@ beta
 ",
     )
     .unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .insert_impl(InsertParams {
@@ -1414,7 +1218,7 @@ async fn test_insert_append_omit_line() {
     let temp_dir = TestDir::new();
     let file_path = temp_dir.path().join("append_omit.txt");
     std::fs::write(&file_path, "alpha\nbeta\n").unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .insert_impl(InsertParams {
@@ -1440,7 +1244,7 @@ async fn test_insert_append_omit_line_ignores_column() {
     let temp_dir = TestDir::new();
     let file_path = temp_dir.path().join("append_col.txt");
     std::fs::write(&file_path, "alpha\nbeta\n").unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .insert_impl(InsertParams {
@@ -1472,7 +1276,7 @@ four
 ",
     )
     .unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .insert_impl(InsertParams {
@@ -1509,7 +1313,7 @@ xyz
 ",
     )
     .unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .insert_impl(InsertParams {
@@ -1539,7 +1343,7 @@ async fn test_insert_column_utf8_boundary() {
 ",
     )
     .unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let ok_result = server
         .insert_impl(InsertParams {
@@ -1589,7 +1393,7 @@ beta
 ",
     )
     .unwrap();
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .insert_impl(InsertParams {
@@ -1615,7 +1419,7 @@ async fn test_insert_column_out_of_range() {
         "abcd
 ",
     );
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .insert_impl(InsertParams {
@@ -1639,7 +1443,7 @@ async fn test_re_replace_basic() {
         "foo123
 ",
     );
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .re_replace_impl(ReReplaceParams {
@@ -1668,7 +1472,7 @@ async fn test_re_replace_all() {
         "foo1 foo2 foo3
 ",
     );
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .re_replace_impl(ReReplaceParams {
@@ -1698,7 +1502,7 @@ async fn test_re_replace_no_match() {
 beta
 ",
     );
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .re_replace_impl(ReReplaceParams {
@@ -1723,7 +1527,7 @@ async fn test_re_replace_multiple_no_flag() {
         "foo1 foo2
 ",
     );
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
         .re_replace_impl(ReReplaceParams {
@@ -1748,7 +1552,7 @@ async fn test_re_replace_invalid_pattern() {
         "foo1
 ",
     );
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let err = server
         .re_replace_impl(ReReplaceParams {
@@ -1767,7 +1571,7 @@ async fn test_re_replace_invalid_pattern() {
 async fn test_insert_impl_serializes_concurrent_same_file_updates() {
     let temp_dir = TestDir::new();
     let file_path = write_fixture(&temp_dir, "concurrent_insert.txt", "start\n");
-    let server = FsServer::new(vec![temp_dir.path().to_path_buf()], false);
+    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let task_count = 32usize;
     let mut tasks = tokio::task::JoinSet::new();
@@ -1815,7 +1619,7 @@ async fn test_repo_lock_for_paths_in_same_repo_share_lock() {
     std::fs::create_dir_all(&nested_dir).unwrap();
     let file_b = repo_root.join("nested/b.txt");
     std::fs::write(&file_b, "b\n").unwrap();
-    let server = FsServer::new(vec![repo_root.clone()], false);
+    let server = FsServer::new(rwx_allowlist([repo_root.clone()]));
 
     let repo_guard = server.repo_write_guard_for_path(&file_a).await;
     let same_repo_try = tokio::time::timeout(
@@ -1849,7 +1653,7 @@ async fn test_rollback_excludes_concurrent_edits_in_same_repo() {
 
     let tracked_path = repo_root.join("tracked.txt");
     std::fs::write(&tracked_path, "tracked-v1\n").unwrap();
-    let server = FsServer::new(vec![repo_root.clone()], false);
+    let server = FsServer::new(rwx_allowlist([repo_root.clone()]));
 
     let tracked_before = server
         .snapshot_before(&tracked_path, "before tracked change")

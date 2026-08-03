@@ -190,8 +190,8 @@ The package includes ready-to-use tool server configs in `tool_servers/`. Bundle
 
 | Server | Namespace | Requires | Notes |
 |--------|-----------|----------|-------|
-| `bash.yaml` | `bash_*` | None (bundled binary) | Shell execution. Runs natively with `--default-root-cwd` (seeds CWD as allowed root with `$HOME` protection). Configured with a co-launched native PreToolUse hook (`harnx-proxy-auth`) for GitHub/Atlassian credential injection. Pre-configured toolchain paths. |
-| `fs.yaml` | `fs_*` | None (bundled binary) | Filesystem read/write. Runs natively with `--default-root-cwd` to bound access to the repository CWD. |
+| `bash.yaml` | `bash_*` | None (bundled binary) | Shell execution. Opts into common system, development-tool, and repository allow batches plus explicit app paths. Includes a native PreToolUse hook (`harnx-proxy-auth`) for GitHub/Atlassian credential injection. |
+| `fs.yaml` | `fs_*` | None (bundled binary) | Filesystem read/write. Opts into repository and development-tool allow batches. |
 | `plans.yaml` | `plans_*` | None (bundled binary) | Plan/task/note management, stored in `.agent/plans/` relative to the working directory. |
 | `time.yaml` | `time_*` | None (bundled binary) | Current time and wait/sleep utilities. |
 | `fetch.yaml` | `fetch_*` | Node.js / npx | Fetches URLs as markdown or text. No API key. |
@@ -217,8 +217,8 @@ tool_servers:
   # Each entry is a jq expression; .name is the server name.
   # The expression receives the full server config as JSON and returns it modified.
 
-  # Append extra args to the bash server (for sandbox filesystem access):
-  - 'if .name == "bash" then .args += ["--extra-exec", "/opt/company-tools/bin", "--extra-rwx", "~/.codescene"] end'
+  # Append custom paths to the bash server:
+  - 'if .name == "bash" then .args += ["--allow-exec", "/opt/company-tools/bin", "--allow-rwx", "~/.codescene"] end'
 
   # Disable a server you don't want:
   - 'if .name == "exa" then .enabled = false end'

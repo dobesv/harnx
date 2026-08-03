@@ -19,7 +19,6 @@ complete -c harnx -l list-sessions -d 'List all sessions'
 complete -c harnx -l list-agents -d 'List all agents'
 complete -c harnx -l list-rags -d 'List all RAGs'
 complete -c harnx -l list-macros -d 'List all macros'
-complete -c harnx -l mcp-root -d 'Add MCP roots' -r -F
 complete -c harnx -s t -l tool -d 'Enable tools or toolsets for this session'
 complete -c harnx -s h -l help -d 'Print help'
 complete -c harnx -s V -l version -d 'Print version'

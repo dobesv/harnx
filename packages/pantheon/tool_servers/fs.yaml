@@ -1,7 +1,9 @@
 command: harnx-fs-tools
 description: Filesystem read/write access for agents
 args:
-  - --default-root-cwd
+  - --allow-repo-work
+  - --allow-dev-tools
 
 # To allow access to additional paths, shadow this file with your own copy at
-# ~/.config/harnx/tool_servers/fs.yaml and add --root /path/to/allow in args.
+# ~/.config/harnx/tool_servers/fs.yaml and add --allow-rwx /path or
+# --allow-read /path in args.

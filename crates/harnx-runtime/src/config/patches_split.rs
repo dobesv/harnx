@@ -144,7 +144,6 @@ mod tests {
             command: "mcp-server".to_string(),
             args: Vec::new(),
             env: HashMap::new(),
-            roots: Vec::new(),
             enabled: true,
             description: None,
             rename_tools: HashMap::new(),

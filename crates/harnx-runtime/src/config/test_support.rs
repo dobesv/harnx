@@ -69,7 +69,6 @@ impl<'a> PackageServer<'a> {
             command: "echo".to_string(),
             args: vec![],
             env: HashMap::new(),
-            roots: vec![],
             enabled: true,
             description: None,
             rename_tools: HashMap::new(),

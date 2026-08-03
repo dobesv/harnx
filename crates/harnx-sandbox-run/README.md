@@ -2,7 +2,7 @@
 
 [See the full documentation](../../docs/sandbox-run.md) for more examples and details.
 
-`harnx-sandbox-run` is a standalone utility to run arbitrary commands inside the [birdcage](https://github.com/phylum-dev/birdcage) sandbox. It provides the same sandboxing defaults and configuration as `harnx-mcp-bash` but can be used as a general-purpose wrapper for any CLI tool.
+`harnx-sandbox-run` is a standalone utility for running arbitrary commands inside the [birdcage](https://github.com/phylum-dev/birdcage) sandbox. It keeps its existing default sandbox policy and accepts explicit `--allow-*` paths. Named allow batches belong to `harnx-fs-tools` and `harnx-bash-tools`, not this command.
 
 It also supports **hooks** for credential injection, allowing you to securely provide environment variables or files to the sandboxed process without exposing them to the host environment permanently.
 
@@ -47,10 +47,10 @@ Uses `harnx-aws-creds` to inject AWS credentials before running `claude`:
 harnx-sandbox-run --hook claude-command-persistent harnx-aws-creds --profile my-profile \; -- claude
 ```
 
-### Granting extra permissions
+### Allowing custom paths
 Give the sandbox full RWX access to a specific directory. Use `.` to grant access to the current directory:
 ```bash
-harnx-sandbox-run --extra-rwx . --extra-rwx ~/.npm -- npm install
+harnx-sandbox-run --allow-rwx . --allow-rwx ~/.npm -- npm install
 ```
 
 If `.` resolves to `$HOME` or an ancestor, `harnx-sandbox-run` prints a warning and ignores it rather than exposing your entire home directory.
@@ -69,10 +69,10 @@ Arguments:
   <COMMAND>...  Command to run (required, must come after `--` or at end)
 
 Options:
-      --extra-read <path>          Add sandbox read-only path (may be repeated)
-      --extra-write <path>         Add sandbox writable path (may be repeated)
-      --extra-exec <path>          Add sandbox execute path (may be repeated)
-      --extra-rwx <path>           Add sandbox read/write/exec path (may be repeated)
+      --allow-read <path>          Allow sandbox read-only path (may be repeated)
+      --allow-write <path>         Allow sandbox writable path (may be repeated)
+      --allow-exec <path>          Allow sandbox execute path (may be repeated)
+      --allow-rwx <path>           Allow sandbox read/write/exec path (may be repeated)
       --env <VAR[=VALUE]>          Set environment variable (VAR=VALUE); if VALUE omitted, inherit from host
       --no-network                 Disable network access
       --working-dir <path>         Working directory for the command
@@ -82,10 +82,10 @@ Options:
   -h, --help                       Print help
 
 Environment:
-  HARNX_BASH_EXTRA_READABLE   Colon-separated extra sandbox read-only paths
-  HARNX_BASH_EXTRA_EXEC       Colon-separated extra sandbox execute paths
-  HARNX_BASH_EXTRA_WRITABLE   Colon-separated extra sandbox writable paths
-  HARNX_BASH_EXTRA_RWX        Colon-separated extra sandbox read/write/exec paths
+  HARNX_TOOLS_ALLOW_READ   Colon-separated allowed sandbox read-only paths
+  HARNX_TOOLS_ALLOW_EXEC   Colon-separated allowed sandbox execute paths
+  HARNX_TOOLS_ALLOW_WRITE  Colon-separated allowed sandbox writable paths
+  HARNX_TOOLS_ALLOW_RWX    Colon-separated allowed sandbox read/write/exec paths
   HARNX_BASH_ENV_PASSTHROUGH  Comma-separated extra env var names to pass through
 ```
 
@@ -107,6 +107,6 @@ Syntax: `--hook TYPE CMD ARGS... \;`
 - Linux
 - macOS
 
-## Relationship to `harnx-mcp-bash`
+## Relationship to bash tools
 
-This binary uses the shared `harnx-sandbox-common` crate, ensuring that it uses the exact same default sandbox policies (whitelisted system paths, etc.) as the `harnx-mcp-bash` MCP server. It is essentially the standalone, non-MCP version of the same sandboxing logic.
+This binary and `harnx-bash-tools` use `harnx-sandbox-common` for birdcage policy construction. Sandbox-run remains a standalone command with explicit path options; it doesn't expose the tool-server allow batches.

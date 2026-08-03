@@ -17,7 +17,7 @@ _harnx() {
 
     case "${cmd}" in
         harnx)
-            opts="-m -s -a -f -S -t -h -V --model --prompt --session --empty-session --save-session --agent --agent-variable --rag --rebuild-rag --macro --serve --file --no-stream --dry-run --info --sync-models --list-models --list-sessions --list-agents --list-assistant-agents --list-rags --list-macros --mcp-root --tool --help --version"
+            opts="-m -s -a -f -S -t -h -V --model --prompt --session --empty-session --save-session --agent --agent-variable --rag --rebuild-rag --macro --serve --file --no-stream --dry-run --info --sync-models --list-models --list-sessions --list-agents --list-assistant-agents --list-rags --list-macros --tool --help --version"
             if [[ ${cur} == -* || ${cword} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -64,21 +64,6 @@ _harnx() {
                     fi
                     IFS=$'\n'
                     COMPREPLY=($(compgen -f "${cur}"))
-                    if [[ -v oldifs ]]; then
-                        IFS="$oldifs"
-                    fi
-                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
-                        compopt -o filenames
-                    fi
-                    return 0
-                    ;;
-                --mcp-root)
-                    local oldifs
-                    if [[ -v IFS ]]; then
-                        oldifs="$IFS"
-                    fi
-                    IFS=$'\n'
-                    COMPREPLY=($(compgen -d "${cur}"))
                     if [[ -v oldifs ]]; then
                         IFS="$oldifs"
                     fi

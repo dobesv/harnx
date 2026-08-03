@@ -16,6 +16,7 @@ harnx-core = { path = "../harnx-core" }
 harnx-mcp = { path = "../harnx-mcp" }
 harnx-mcp-history = { workspace = true }
 harnx-sandbox-common = { path = "../harnx-sandbox-common" }
+harnx-tool-allow = { workspace = true }
 harnx-toolset = { path = "../harnx-toolset" }
 harnx-toolset-server = { path = "../harnx-toolset-server" }
 libc = { workspace = true }

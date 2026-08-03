@@ -59,7 +59,7 @@ For project access, the shims use [Project-Root Pseudo-Variables](#project-root-
 
 A single dispatcher script can handle the entire Node family by detecting which name it was called with. Common Node caches are already whitelisted by default, and project roots are granted automatically.
 
-> **`npx` note:** the default whitelist grants `~/.npm` read+write but **not execute** (a writable+executable directory lets sandboxed code plant a binary the host might later run). `npx <pkg>@<version>` installs the package under `~/.npm/_npx/<hash>/node_modules/` and then executes its bin from there, so without an exec grant it fails with `sh: 1: <pkg>: Permission denied`. The shim below opts in with `--extra-rwx ~/.npm`. Omit that line if you never use `npx` to run cached package binaries.
+> **`npx` note:** the default whitelist grants `~/.npm` read+write but **not execute** (a writable+executable directory lets sandboxed code plant a binary the host might later run). `npx <pkg>@<version>` installs the package under `~/.npm/_npx/<hash>/node_modules/` and then executes its bin from there, so without an exec grant it fails with `sh: 1: <pkg>: Permission denied`. The shim below opts in with `--allow-rwx ~/.npm`. Omit that line if you never use `npx` to run cached package binaries.
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
@@ -69,7 +69,7 @@ set -euo pipefail
 # It detects which real tool to run from its own basename, so one script covers all five.
 # Common Node caches are already in harnx-sandbox-run's default whitelist.
 # Exception: ~/.npm is read+write but NOT exec by default, so `npx <pkg>@<ver>`
-# cannot run its cached bin. We add --extra-rwx ~/.npm below to allow it.
+# cannot run its cached bin. We add --allow-rwx ~/.npm below to allow it.
 # Project roots are auto-detected by harnx-sandbox-run's pseudo-vars and silently skipped when absent.
 
 tool="$(basename "$0")"
@@ -93,12 +93,12 @@ export PATH
 
 # shellcheck disable=SC2016 -- '$GIT_ROOT' style args are harnx-sandbox-run pseudo-vars; shell must pass them through literally.
 # Common tool and cache paths (like ~/.npm, ~/.cargo, ~/.cache) are pre-whitelisted
-# for read/write; ~/.npm needs the explicit --extra-rwx below to also allow exec (see npx note above).
+# for read/write; ~/.npm needs the explicit --allow-rwx below to also allow exec (see npx note above).
 exec harnx-sandbox-run \
-  --extra-rwx ~/.npm \
-  --extra-rwx '$GIT_ROOT' \
-  --extra-rwx '$NODE_PROJECT_ROOT' \
-  --extra-rwx '$GIT_COMMON_DIR' \
+  --allow-rwx ~/.npm \
+  --allow-rwx '$GIT_ROOT' \
+  --allow-rwx '$NODE_PROJECT_ROOT' \
+  --allow-rwx '$GIT_COMMON_DIR' \
   --env 'AWS_PROFILE=' \
   --env NODE_OPTIONS \
   --hook claude-command-persistent harnx-aws-creds --profile my-profile \; \
@@ -159,11 +159,11 @@ export PATH
 # shellcheck disable=SC2016 -- '$GIT_ROOT' style args are harnx-sandbox-run pseudo-vars; shell must pass them through literally.
 # ~/.local/share/claude is already default-whitelisted, so intentionally not listed here.
 exec harnx-sandbox-run \
-  --extra-rwx '$GIT_ROOT' \
-  --extra-rwx '$NODE_PROJECT_ROOT' \
-  --extra-rwx '$GIT_COMMON_DIR' \
-  --extra-rwx ~/.claude \
-  --extra-write ~/.claude.json \
+  --allow-rwx '$GIT_ROOT' \
+  --allow-rwx '$NODE_PROJECT_ROOT' \
+  --allow-rwx '$GIT_COMMON_DIR' \
+  --allow-rwx ~/.claude \
+  --allow-write ~/.claude.json \
   --env "EDITOR=true" \
   --env "PUPPETEER_NO_SANDBOX=1" \
   --hook claude-command-persistent harnx-aws-creds --profile my-profile \; \
@@ -190,7 +190,7 @@ exec harnx-sandbox-run \
   -- claude --dangerously-skip-permissions "$@"
 ```
 **Key points:**
-- Replace `my-profile` with your AWS profile name (omit `--hook ... harnx-aws-creds ...` entirely if you don't need AWS). Project access now uses harnx-sandbox-run pseudo-vars, so current git root / node project root / git common dir are granted automatically when present; add `--extra-rwx /path` for any extra directories the agent should access.
+- Replace `my-profile` with your AWS profile name (omit `--hook ... harnx-aws-creds ...` entirely if you don't need AWS). Project access now uses harnx-sandbox-run pseudo-vars, so current git root / node project root / git common dir are granted automatically when present; add `--allow-rwx /path` for any extra directories the agent should access.
 - The `--env` and `--fs` scripts inject fake sentinel tokens into the sandbox (e.g. `ghp_<random>` for GitHub, or a synthetic `jira_config.yaml` for Atlassian) so tools like `gh` or `acli` consider themselves authenticated. The real tokens never enter the sandbox — `harnx-proxy-auth` reads them from the host (environment or OS keyring) and injects them into outbound HTTP headers.
 - The Atlassian flow is handled by the **`jira-auth-hook.py`** script (referenced by path in the last `--hook` — here `"$self_dir/jira-auth-hook.py"`, a sibling of this launcher in the shim dir; see [the Atlassian section](#example-atlassian-jira--confluence-with-harnx-proxy-auth) for a one-line download command). It reads your host `acli` profile, sources the real token from the OS keyring, writes a synthetic `jira_config.yaml` (holding only a sentinel token) into the proxy's per-run temp dir, and rewrites auth for `api.atlassian.com` + your site on the wire. The `--fs`/`--env` lines just allocate that temp dir and point `ACLI_CONFIG_DIR` at it. **It works only when `acli` is authenticated with an API token, not OAuth.** As long as you have logged in with an API token on your host, it works automatically with no manual environment variables required.
 - The keyring lookup is platform-aware: Linux Secret Service (`secret-tool lookup service acli username jira:<profile>`) or the macOS login keychain (`security find-generic-password -s acli -a jira:<profile> -w`), selected automatically. Export `HARNX_JIRA_TOKEN_CMD` to override it for a different secret store.
@@ -233,14 +233,14 @@ export PATH
 
 # shellcheck disable=SC2016 -- '$GIT_ROOT' style args are harnx-sandbox-run pseudo-vars; shell must pass them through literally.
 exec harnx-sandbox-run \
-  --extra-rwx ~/.gemini \
-  --extra-rwx ~/.config/gemini \
-  --extra-rwx '$GIT_ROOT' \
-  --extra-rwx '$NODE_PROJECT_ROOT' \
-  --extra-rwx '$GIT_COMMON_DIR' \
+  --allow-rwx ~/.gemini \
+  --allow-rwx ~/.config/gemini \
+  --allow-rwx '$GIT_ROOT' \
+  --allow-rwx '$NODE_PROJECT_ROOT' \
+  --allow-rwx '$GIT_COMMON_DIR' \
   -- gemini --yolo "$@"
 ```
-If the agent needs access to additional directories, grant them with `--extra-rwx /path/to/dir` in the shim script.
+If the agent needs access to additional directories, grant them with `--allow-rwx /path/to/dir` in the shim script.
 
 ### Installing the shims
 
@@ -256,10 +256,10 @@ which -a node         # confirm the shim appears before the real tool
 
 | Option | Description |
 | :--- | :--- |
-| `--extra-read <path>` | Add sandbox read-only path (may be repeated) |
-| `--extra-write <path>` | Add sandbox writable path (may be repeated) |
-| `--extra-exec <path>` | Add sandbox execute path (may be repeated) |
-| `--extra-rwx <PATH>` | Add full rwx access for path (may be repeated) |
+| `--allow-read <path>` | Allow sandbox read-only path (may be repeated) |
+| `--allow-write <path>` | Allow sandbox writable path (may be repeated) |
+| `--allow-exec <path>` | Allow sandbox execute path (may be repeated) |
+| `--allow-rwx <PATH>` | Add full rwx access for path (may be repeated) |
 | `--env <VAR[=VALUE]>` | Set environment variable; if VALUE omitted, inherit from host |
 | `--no-network` | Disable network access |
 | `--working-dir <DIR>` | Working directory for the command |
@@ -273,10 +273,10 @@ These match the `harnx-bash-tools` environment variables, so the same shell prof
 
 | Variable | Format | Effect |
 | :--- | :--- | :--- |
-| `HARNX_BASH_EXTRA_READABLE` | Colon-separated paths | Extra sandbox read-only paths |
-| `HARNX_BASH_EXTRA_EXEC` | Colon-separated paths | Extra sandbox execute paths |
-| `HARNX_BASH_EXTRA_WRITABLE` | Colon-separated paths | Extra sandbox writable paths |
-| `HARNX_BASH_EXTRA_RWX` | Colon-separated paths | Extra sandbox read/write/exec paths |
+| `HARNX_TOOLS_ALLOW_READ` | Colon-separated paths | Allowed sandbox read-only paths |
+| `HARNX_TOOLS_ALLOW_EXEC` | Colon-separated paths | Allowed sandbox execute paths |
+| `HARNX_TOOLS_ALLOW_WRITE` | Colon-separated paths | Allowed sandbox writable paths |
+| `HARNX_TOOLS_ALLOW_RWX` | Colon-separated paths | Allowed sandbox read/write/exec paths |
 | `HARNX_BASH_ENV_PASSTHROUGH` | Comma-separated names | Extra host env var names to pass through |
 
 Paths support `~` expansion and project-root pseudo-variables. CLI flags and env vars both accumulate — they are not mutually exclusive.
@@ -296,12 +296,12 @@ For the full list of default paths, see the [Bash toolset server documentation](
 **The current working directory is NOT whitelisted automatically.** birdcage inherits the process's cwd so the command starts in the right place, but the sandbox blocks all reads and writes there unless you explicitly grant access:
 
 ```bash
-harnx-sandbox-run --extra-rwx . -- my-tool
+harnx-sandbox-run --allow-rwx . -- my-tool
 ```
 
 Passing `.` is safe: `harnx-sandbox-run` resolves it to an absolute path before use. If the resolved path is `$HOME` itself or an ancestor of `$HOME` (e.g. `/`), the path is silently skipped and a warning is printed to stderr — so running the `gemini` shim from your home directory won't accidentally expose all of `~`.
 
-The `--working-dir <path>` flag changes where the sandboxed command starts, but it also does not automatically grant filesystem access to that path — you still need a matching `--extra-rwx` (or `--extra-read` / `--extra-write`) for it.
+The `--working-dir <path>` flag changes where the sandboxed command starts, but it also does not automatically grant filesystem access to that path — you still need a matching `--allow-rwx` (or `--allow-read` / `--allow-write`) for it.
 
 ### Home directory
 
@@ -313,11 +313,11 @@ The `--working-dir <path>` flag changes where the sandboxed command starts, but 
 | Read/Write | `~/.cache`, `~/go/pkg`, `~/.npm`, `~/.yarn`, `~/.cargo/registry`, `~/.cargo/git`, `~/.bun/install/cache`, `~/.local/share/pnpm`, `~/.local/share/uv` |
 | Exec | `~/.local/bin`, `~/.local/lib`, `~/.bun`, `~/.asdf`, `~/go/bin`, `~/.cargo`, `~/.nvm`, `~/.cargo/bin`, `~/.mono`, `~/.pyenv`, `~/.rye`, `~/.local/share/claude`, `~/.local/share/opencode`, `~/.local/share/pipx` |
 
-Tool-install and self-update operations (such as `cargo install`, `nvm install`, etc.) require explicit write access; grant with `--extra-rwx` or perform them outside the sandbox.
+Tool-install and self-update operations (such as `cargo install`, `nvm install`, etc.) require explicit write access; grant with `--allow-rwx` or perform them outside the sandbox.
 
-Note that the Read/Write caches above are **not** executable. In particular, `npx <pkg>@<version>` installs and then runs a package binary from `~/.npm/_npx/...`, which fails with `sh: 1: <pkg>: Permission denied` unless you also grant exec. Add `--extra-rwx ~/.npm` (see the [Node shim](#node-yarn-npm-npx-pnpm-node) for an example).
+Note that the Read/Write caches above are **not** executable. In particular, `npx <pkg>@<version>` installs and then runs a package binary from `~/.npm/_npx/...`, which fails with `sh: 1: <pkg>: Permission denied` unless you also grant exec. Add `--allow-rwx ~/.npm` (see the [Node shim](#node-yarn-npm-npx-pnpm-node) for an example).
 
-Any other `$HOME` subdirectory (e.g. `~/.gemini`, `~/.config`, `~/.ssh`) is **blocked** unless you add it with `--extra-read`, `--extra-write`, or `--extra-rwx`. This is intentional — it prevents the sandboxed process from reading credentials or config files it doesn't need.
+Any other `$HOME` subdirectory (e.g. `~/.gemini`, `~/.config`, `~/.ssh`) is **blocked** unless you add it with `--allow-read`, `--allow-write`, or `--allow-rwx`. This is intentional — it prevents the sandboxed process from reading credentials or config files it doesn't need.
 
 ## Hooks
 
@@ -463,18 +463,18 @@ See the `claude` shim in [AI Agent Wrapper Scripts](#ai-agent-wrapper-scripts) a
 
 If a tool needs access to paths not in the default whitelist, use the access flags:
 
-- `--extra-read`: Read-only access (e.g., for config files)
-- `--extra-write`: Write access (e.g., for log files)
-- `--extra-exec`: Execution access (e.g., for binaries)
-- `--extra-rwx`: Full read, write, and execute access
+- `--allow-read`: Read-only access (e.g., for config files)
+- `--allow-write`: Write access (e.g., for log files)
+- `--allow-exec`: Execution access (e.g., for binaries)
+- `--allow-rwx`: Full read, write, and execute access
 
 ```bash
-harnx-sandbox-run --extra-rwx ~/.custom-tool-cache -- my-tool
+harnx-sandbox-run --allow-rwx ~/.custom-tool-cache -- my-tool
 ```
 
 ## Project-Root Pseudo-Variables
 
-Sandbox path flags (`--extra-read/-write/-exec/-rwx`) and environment variables (`HARNX_BASH_EXTRA_READABLE/EXEC/WRITABLE/RWX`) accept project-root pseudo-variables. These are resolved at startup against the current working directory:
+Sandbox path flags (`--allow-read/-write/-exec/-rwx`) and environment variables (`HARNX_TOOLS_ALLOW_{READ,WRITE,EXEC,RWX}`) accept project-root pseudo-variables. These are resolved at startup against the current working directory:
 
 | Pseudo-variable | Resolves to |
 | :--- | :--- |
@@ -486,7 +486,7 @@ Sandbox path flags (`--extra-read/-write/-exec/-rwx`) and environment variables 
 
 ### Semantics
 
-- **Silent skip**: If the current directory is not inside a matching project, the path is silently dropped. This allows you to set global environment variables like `HARNX_BASH_EXTRA_RWX='$GIT_ROOT'` that only take effect when you are actually in a git repository.
+- **Silent skip**: If the current directory is not inside a matching project, the path is silently dropped. This allows you to set global environment variables like `HARNX_TOOLS_ALLOW_RWX='$GIT_ROOT'` that only take effect when you are actually in a git repository.
 - **Security**: Any pseudo-variable that resolves to `$HOME` or an ancestor of `$HOME` is dropped. The sandbox never grants access to your entire home directory via root detection.
 - **Prefix match**: A pseudo-variable only triggers on an exact prefix-boundary match. `$GIT_ROOT` or `$GIT_ROOT/subdir` will be expanded, but `$GIT_ROOTX` or `/foo/$GIT_ROOT` will be treated as literal strings.
 - **No escaping**: There is no mechanism to escape these variables. A directory literally named `$GIT_ROOT` cannot be targeted.
@@ -498,7 +498,7 @@ Sandbox path flags (`--extra-read/-write/-exec/-rwx`) and environment variables 
 `$GIT_COMMON_DIR` is particularly useful for git history in linked worktrees. It resolves to the primary worktree's `.git` data directory, which is required for many git operations to function correctly from a linked worktree.
 
 ```bash
-harnx-sandbox-run --extra-rwx '$GIT_ROOT' --extra-rwx '$GIT_COMMON_DIR' -- yarn install
+harnx-sandbox-run --allow-rwx '$GIT_ROOT' --allow-rwx '$GIT_COMMON_DIR' -- yarn install
 ```
 
 ## Network Access

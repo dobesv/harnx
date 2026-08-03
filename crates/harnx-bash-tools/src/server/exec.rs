@@ -128,9 +128,8 @@ impl BashServer {
         &self,
         params: RollbackParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let roots = self.inner.roots.read().await;
-        let path = validate_path(&params.repo_path, &roots).map_err(invalid_params)?;
-        drop(roots);
+        let path = validate_write_path(&params.repo_path, &self.inner.allowlist)
+            .map_err(invalid_params)?;
 
         let commit_id = ObjectId::from_hex(params.commit_id.as_bytes())
             .map_err(|e| ErrorData::invalid_params(format!("invalid commit_id: {e}"), None))?;

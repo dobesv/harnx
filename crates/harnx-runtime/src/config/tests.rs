@@ -106,50 +106,6 @@ fn test_split_tool_selectors_empty() {
     assert_eq!(split_tool_selectors(""), vec![""]);
 }
 
-#[test]
-fn test_init_mcp_manager_with_roots() {
-    // This test asserts cwd is prepended as a root, which depends on HOME
-    // (cwd is skipped when it equals or is an ancestor of $HOME). Other tests
-    // mutate HOME under `env_lock`, so hold the same lock to avoid racing
-    // with them and observing a transient HOME that suppresses the cwd root.
-    #[cfg(unix)]
-    let _env_guard = env_lock();
-
-    let mut config = Config::default();
-    let server = McpServerConfig {
-        name: "test".to_string(),
-        command: "ls".to_string(),
-        args: vec![],
-        env: HashMap::new(),
-        roots: vec!["/existing".to_string()],
-        enabled: true,
-        description: None,
-        rename_tools: HashMap::new(),
-        tool_templates: HashMap::new(),
-        package: None,
-        hooks: None,
-    };
-    config.mcp_servers = vec![server];
-    config.mcp_root = vec!["/extra".to_string()];
-
-    config.init_mcp_manager();
-
-    let manager = config.mcp_manager.expect("Manager should be initialized");
-    let client = manager.get_client("test").expect("Client should exist");
-    let roots = client.get_roots();
-
-    // Roots should be: [cwd, /extra, /existing]
-    assert_eq!(roots.len(), 3);
-    let cwd = env::current_dir()
-        .unwrap()
-        .into_os_string()
-        .into_string()
-        .unwrap();
-    assert_eq!(roots[0], cwd);
-    assert_eq!(roots[1], "/extra");
-    assert_eq!(roots[2], "/existing");
-}
-
 // ── handoff session emptying tests ─────────────────────────────────────
 
 /// Verify that empty_session clears messages from a session that was loaded
@@ -479,128 +435,6 @@ async fn test_restored_sessions_resolve_new_agent_variable_defaults() {
     );
     assert_eq!(agent.system_text().unwrap(), "Greeting: custom");
 }
-// ── Tests for HOME boundary guard in reinit_managers_for_agent ──
-
-#[cfg(unix)]
-/// Helper: make a minimal MCP server config for testing roots.
-fn make_test_mcp_server(name: &str) -> McpServerConfig {
-    McpServerConfig {
-        name: name.to_string(),
-        command: "echo".to_string(),
-        args: vec![],
-        env: HashMap::new(),
-        roots: vec![],
-        enabled: true,
-        description: None,
-        rename_tools: HashMap::new(),
-        tool_templates: HashMap::new(),
-        hooks: None,
-        package: None,
-    }
-}
-
-#[cfg(unix)]
-/// Helper: RAII guard for HOME env var (holds the env_lock while alive).
-struct HomeGuard {
-    prev: Option<std::ffi::OsString>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-#[cfg(unix)]
-impl HomeGuard {
-    fn set(value: &str) -> Self {
-        let _lock = env_lock();
-        let prev = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", value) };
-        Self { prev, _lock }
-    }
-}
-#[cfg(unix)]
-impl Drop for HomeGuard {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn test_cwd_equals_home_not_added_as_root() {
-    // Set HOME to the actual CWD so they match.
-    let cwd = env::current_dir().unwrap();
-    let cwd_str = cwd.to_string_lossy().to_string();
-    let _home = HomeGuard::set(&cwd_str);
-
-    let mut config = Config::default();
-    let server = make_test_mcp_server("test_eq");
-    config.mcp_servers = vec![server];
-    config.mcp_root = vec![];
-    config.init_mcp_manager();
-
-    let manager = config.mcp_manager.expect("Manager should be initialized");
-    let client = manager.get_client("test_eq").expect("Client should exist");
-    let roots = client.get_roots();
-    assert!(
-        !roots.contains(&cwd_str),
-        "CWD = $HOME must not appear as MCP root, but got: {roots:?}"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn test_cwd_above_home_not_added_as_root() {
-    // Set HOME to CWD/subdir — making CWD an ancestor of $HOME.
-    // CWD must not be added as a root.
-    let cwd = env::current_dir().unwrap();
-    let cwd_str = cwd.to_string_lossy().to_string();
-    let fake_home = format!("{cwd_str}/harnx-test-fake-home-above");
-    let _home = HomeGuard::set(&fake_home);
-
-    let mut config = Config::default();
-    let server = make_test_mcp_server("test_above");
-    config.mcp_servers = vec![server];
-    config.mcp_root = vec![];
-    config.init_mcp_manager();
-
-    let manager = config.mcp_manager.expect("Manager should be initialized");
-    let client = manager
-        .get_client("test_above")
-        .expect("Client should exist");
-    let roots = client.get_roots();
-    assert!(
-        !roots.contains(&cwd_str),
-        "CWD that is ancestor of $HOME must not appear as root, but got: {roots:?}"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn test_cwd_below_home_added_as_root() {
-    // Set HOME to parent of CWD so CWD is a child of $HOME — should be allowed.
-    let cwd = env::current_dir().unwrap();
-    let cwd_str = cwd.to_string_lossy().to_string();
-    let parent = cwd.parent().unwrap_or(&cwd);
-    let parent_str = parent.to_string_lossy().to_string();
-    let _home = HomeGuard::set(&parent_str);
-
-    let mut config = Config::default();
-    let server = make_test_mcp_server("test_below");
-    config.mcp_servers = vec![server];
-    config.mcp_root = vec![];
-    config.init_mcp_manager();
-
-    let manager = config.mcp_manager.expect("Manager should be initialized");
-    let client = manager
-        .get_client("test_below")
-        .expect("Client should exist");
-    let roots = client.get_roots();
-    assert!(
-        roots.contains(&cwd_str),
-        "CWD below $HOME should be added as root, but not found in: {roots:?}"
-    );
-}
-
 // ── select_tools whitelist tests (#624) ──────────────────────────────────
 
 fn make_tool_decl(name: &str) -> harnx_core::tool::ToolDeclaration {
@@ -690,7 +524,6 @@ fn make_server(name: &str, command: &str) -> McpServerConfig {
         command: command.to_string(),
         args: vec![],
         env: Default::default(),
-        roots: vec![],
         enabled: true,
         description: None,
         rename_tools: Default::default(),
@@ -963,7 +796,7 @@ fn dynamic_provider_model_init_sets_client_name_from_provider() {
     let _provider_guard = ProviderGuard(std::env::var_os("HARNX_PROVIDER"));
     unsafe { std::env::set_var("HARNX_PROVIDER", "claude:some-model") };
 
-    let config = tokio_test::block_on(Config::init(WorkingMode::Cmd, false, vec![]))
+    let config = tokio_test::block_on(Config::init(WorkingMode::Cmd, false))
         .expect("dynamic config should load");
 
     assert_eq!(config.clients.len(), 1);
@@ -981,7 +814,6 @@ fn package_agent_mcp_tools_scoped_to_active_package() {
             PackageServer::new("fs", "pantheon").into_mcp(),
             PackageServer::new("db", "coding").into_mcp(),
         ],
-        mcp_root: vec![],
         ..Config::default()
     };
 
@@ -1017,7 +849,7 @@ async fn use_agent_routes_remote_refs_to_nats_cluster_validation() {
     // SAFETY: test-only; shared test lock held for duration.
     unsafe { std::env::set_var("HARNX_PROVIDER", "claude:some-model") };
 
-    let config = Config::init(WorkingMode::Cmd, false, vec![])
+    let config = Config::init(WorkingMode::Cmd, false)
         .await
         .expect("config init");
     let config = std::sync::Arc::new(parking_lot::RwLock::new(config));

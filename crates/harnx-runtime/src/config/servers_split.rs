@@ -1,8 +1,5 @@
 //! MCP server management extracted from config/mod.rs for code health.
 use super::*;
-#[cfg(unix)]
-use harnx_mcp::safety::path_is_home_or_ancestor;
-use std::env;
 impl Config {
     /// Load MCP servers from a single package directory.
     ///
@@ -91,7 +88,7 @@ impl Config {
         self.mcp_manager = if self.mcp_servers.is_empty() {
             None
         } else {
-            let mut mcp_servers: Vec<McpServerConfig> = self
+            let mcp_servers: Vec<McpServerConfig> = self
                 .mcp_servers
                 .iter()
                 .filter_map(|s| {
@@ -103,45 +100,6 @@ impl Config {
                     Some(s)
                 })
                 .collect();
-
-            // Prepend cwd to roots for every server
-            let mut extra_roots = self.mcp_root.clone();
-            if let Ok(cwd) = env::current_dir() {
-                #[cfg(unix)]
-                if path_is_home_or_ancestor(&cwd) {
-                    warn!(
-                        "sandbox: skipping CWD {:?} as MCP root — equals or is ancestor of $HOME",
-                        cwd.display()
-                    );
-                } else if let Ok(cwd_str) = cwd.into_os_string().into_string() {
-                    if !extra_roots.contains(&cwd_str) {
-                        extra_roots.insert(0, cwd_str);
-                    }
-                }
-                #[cfg(not(unix))]
-                if let Ok(cwd_str) = cwd.into_os_string().into_string() {
-                    if !extra_roots.contains(&cwd_str) {
-                        extra_roots.insert(0, cwd_str);
-                    }
-                }
-            }
-            if !extra_roots.is_empty() {
-                for server in mcp_servers.iter_mut() {
-                    for root in extra_roots.iter().rev() {
-                        #[cfg(unix)]
-                        if path_is_home_or_ancestor(Path::new(root)) {
-                            warn!(
-                                "sandbox: skipping root {:?} from mcp_roots — equals or is ancestor of $HOME",
-                                root
-                            );
-                            continue;
-                        }
-                        if !server.roots.contains(root) {
-                            server.roots.insert(0, root.clone());
-                        }
-                    }
-                }
-            }
 
             let manager = McpManager::new();
             manager.initialize(mcp_servers);
@@ -179,49 +137,6 @@ impl Config {
         let mcp_manager = config.read().mcp_manager.clone();
         match mcp_manager {
             Some(manager) => manager.disconnect(server_name).await,
-            None => bail!("MCP is not configured"),
-        }
-    }
-
-    pub fn mcp_get_roots(config: &GlobalConfig, server_name: &str) -> Result<Vec<String>> {
-        let mcp_manager = config.read().mcp_manager.clone();
-        match mcp_manager {
-            Some(manager) => {
-                let client = manager
-                    .get_client(server_name)
-                    .ok_or_else(|| anyhow!("MCP server '{}' not found", server_name))?;
-                Ok(client.get_roots())
-            }
-            None => bail!("MCP is not configured"),
-        }
-    }
-
-    pub async fn mcp_add_root(config: &GlobalConfig, server_name: &str, root: &str) -> Result<()> {
-        let mcp_manager = config.read().mcp_manager.clone();
-        match mcp_manager {
-            Some(manager) => {
-                let client = manager
-                    .get_client(server_name)
-                    .ok_or_else(|| anyhow!("MCP server '{}' not found", server_name))?;
-                client.add_root(root).await
-            }
-            None => bail!("MCP is not configured"),
-        }
-    }
-
-    pub async fn mcp_remove_root(
-        config: &GlobalConfig,
-        server_name: &str,
-        root: &str,
-    ) -> Result<()> {
-        let mcp_manager = config.read().mcp_manager.clone();
-        match mcp_manager {
-            Some(manager) => {
-                let client = manager
-                    .get_client(server_name)
-                    .ok_or_else(|| anyhow!("MCP server '{}' not found", server_name))?;
-                client.remove_root(root).await
-            }
             None => bail!("MCP is not configured"),
         }
     }
@@ -314,7 +229,6 @@ mod tests {
                     spawn_log_path.to_string_lossy().into_owned(),
                 ],
                 env: Default::default(),
-                roots: vec![],
                 enabled: true,
                 description: None,
                 rename_tools: Default::default(),

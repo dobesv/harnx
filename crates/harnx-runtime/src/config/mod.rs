@@ -309,7 +309,6 @@ pub struct Config {
     pub show_sequence_numbers: bool,
     pub show_timestamps: bool,
     pub agent_variables: Option<AgentVariables>,
-    pub mcp_root: Vec<String>,
 
     pub model: Model,
     pub tools: Tools,
@@ -365,7 +364,6 @@ impl std::fmt::Debug for Config {
             .field("macro_flag", &self.macro_flag)
             .field("info_flag", &self.info_flag)
             .field("agent_variables", &self.agent_variables)
-            .field("mcp_root", &self.mcp_root)
             .field("model", &self.model)
             .field("tools", &self.tools)
             .field("mcp_manager", &self.mcp_manager)
@@ -392,7 +390,6 @@ impl Clone for Config {
             show_sequence_numbers: self.show_sequence_numbers,
             show_timestamps: self.show_timestamps,
             agent_variables: self.agent_variables.clone(),
-            mcp_root: self.mcp_root.clone(),
             model: self.model.clone(),
             tools: self.tools.clone(),
             mcp_manager: self.mcp_manager.clone(),
@@ -439,7 +436,6 @@ impl Config {
             show_sequence_numbers: self.show_sequence_numbers,
             show_timestamps: self.show_timestamps,
             agent_variables: self.agent_variables.clone(),
-            mcp_root: self.mcp_root.clone(),
             model: self.model.clone(),
             tools: self.tools.clone(),
             mcp_manager: self.mcp_manager.clone(),
@@ -477,7 +473,6 @@ impl Default for Config {
             show_sequence_numbers: ConfigData::default().show_sequence_numbers,
             show_timestamps: ConfigData::default().show_timestamps,
             agent_variables: None,
-            mcp_root: vec![],
 
             model: Default::default(),
             tools: Default::default(),
