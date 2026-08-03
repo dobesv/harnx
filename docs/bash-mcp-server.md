@@ -1,8 +1,8 @@
-# Bash MCP Server
+# Bash Toolset Server
 
 ## Overview
 
-`harnx-mcp-bash` is the MCP server that exposes shell command execution to agents. Filesystem sandboxing (via [birdcage](https://github.com/phylum-dev/birdcage)) is enabled by default on Unix-like systems; it is unavailable on Windows.
+`harnx-bash-tools` is the native toolset server that exposes shell command execution to agents. Filesystem sandboxing (via [birdcage](https://github.com/phylum-dev/birdcage)) is enabled by default on Unix-like systems; it is unavailable on Windows.
 
 The server starts child bash processes with a curated environment, NOT the full host environment. This prevents sensitive information (like API keys or other secrets) in the parent shell from being accidentally exposed to the LLM agent's tool calls. Environment curation is independent of sandboxing — it applies on every platform, including Windows where filesystem sandboxing is unavailable.
 
@@ -35,16 +35,12 @@ You can add extra environment variables to the child process in three ways. Thes
 
 ### 1. Per-server CLI flags
 
-Use the `-e` or `--env` flags in your MCP server configuration. This is useful for passing specific variables or setting explicit values.
+Use the `-e` or `--env` flags in your tool server configuration. This is useful for passing specific variables or setting explicit values.
 
 ```yaml
 # tool_servers/bash.yaml
-command: harnx-mcp-bridge
+command: harnx-bash-tools
 args:
-  - --name
-  - bash
-  - --
-  - harnx-mcp-bash
   - -e
   - GITHUB_TOKEN              # Pass through from host env
   - -e
@@ -75,7 +71,7 @@ You can create a `.env.bash` file in your Harnx data directory (typically `~/.lo
 # GitHub Token
 GITHUB_TOKEN=ghp_xxx
 
-# SSH agent (resolved at MCP server startup)
+# SSH agent (resolved at toolset server startup)
 SSH_AUTH_SOCK=/tmp/ssh-XXXX/agent.123
 ```
 
@@ -90,7 +86,7 @@ When a variable is defined in multiple places, the value from the source highest
 
 ## Filesystem Sandboxing
 
-On Linux and macOS, `harnx-mcp-bash` uses [birdcage](https://github.com/phylum-dev/birdcage) to sandbox child processes. This restricts the agent's ability to read or write files outside of explicitly permitted locations.
+On Linux and macOS, `harnx-bash-tools` uses [birdcage](https://github.com/phylum-dev/birdcage) to sandbox child processes. This restricts the agent's ability to read or write files outside of explicitly permitted locations.
 
 ### Default Permissions
 
@@ -108,7 +104,7 @@ On Linux and macOS, `harnx-mcp-bash` uses [birdcage](https://github.com/phylum-d
 - **Read+Write**:
   - Cache and module directories under `$HOME`: `~/.cache`, `~/go/pkg`, `~/.npm`, `~/.yarn`, `~/.cargo/registry`, `~/.cargo/git`, `~/.bun/install/cache`, `~/.local/share/pnpm`, `~/.local/share/uv`.
 
-> **Security note:** Tool-install and self-update operations (such as `cargo install`, `nvm install`, `pyenv install`, `rye sync`, `pipx install`, `claude update`, or `opencode self-update`) require explicit write access because these directories are no longer writable by default. You can grant temporary write access using the `--extra-rwx` flag (or the `HARNX_BASH_EXTRA_RWX` environment variable for the bash MCP server), or perform these operations outside the sandbox.
+> **Security note:** Tool-install and self-update operations (such as `cargo install`, `nvm install`, `pyenv install`, `rye sync`, `pipx install`, `claude update`, or `opencode self-update`) require explicit write access because these directories are no longer writable by default. You can grant temporary write access using the `--extra-rwx` flag (or the `HARNX_BASH_EXTRA_RWX` environment variable for the bash toolset server), or perform these operations outside the sandbox.
 
 These `$HOME`-relative defaults exist regardless of whether the directory is present on the host (sandbox-run silently skips non-existent paths).
 

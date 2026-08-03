@@ -111,23 +111,23 @@ async fn wait_for_nats_ready(url: &str) -> Result<()> {
 fn plans_binary() -> Result<PathBuf> {
     // Cargo's compile-time binary path is preferred. Cross-crate test builds don't always set it,
     // so the fallback resolves the sibling binary next to the test executable's deps directory.
-    let (path, mechanism) = if let Some(path) = option_env!("CARGO_BIN_EXE_harnx-mcp-plans") {
-        (PathBuf::from(path), "CARGO_BIN_EXE_harnx-mcp-plans")
+    let (path, mechanism) = if let Some(path) = option_env!("CARGO_BIN_EXE_harnx-plans-tools") {
+        (PathBuf::from(path), "CARGO_BIN_EXE_harnx-plans-tools")
     } else {
         let mut path = std::env::current_exe().context("locate current test executable")?;
         path.pop();
         if path.ends_with("deps") {
             path.pop();
         }
-        (path.join("harnx-mcp-plans"), "test executable sibling")
+        (path.join("harnx-plans-tools"), "test executable sibling")
     };
     anyhow::ensure!(
         path.is_file(),
-        "harnx-mcp-plans binary missing at {} (resolved via {mechanism})",
+        "harnx-plans-tools binary missing at {} (resolved via {mechanism})",
         path.display()
     );
     eprintln!(
-        "resolved harnx-mcp-plans via {mechanism}: {}",
+        "resolved harnx-plans-tools via {mechanism}: {}",
         path.display()
     );
     Ok(path)

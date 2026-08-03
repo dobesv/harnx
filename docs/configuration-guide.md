@@ -112,7 +112,7 @@ patches:
 
 ## Tool Servers (`tool_servers/`) and MCP Servers (`mcp_servers/`)
 
-Tool servers provide external tools. Toolset servers (such as `harnx-fs-tools`) run directly without a bridge wrapper, while MCP servers run directly or via `harnx-mcp-bridge`. Each server is defined in a file like `tool_servers/fs.yaml` or `mcp_servers/custom.yaml`.
+Tool servers provide external tools. Native toolset servers (such as `harnx-fs-tools`, `harnx-bash-tools`, `harnx-plans-tools`, and `harnx-grep-tools`) run directly without a bridge wrapper, while MCP servers run directly or via `harnx-mcp-bridge`. Each server is defined in a file like `tool_servers/fs.yaml` or `mcp_servers/custom.yaml`.
 
 The **filename** (without `.yaml`) is used as the server name.
 

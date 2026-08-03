@@ -1,0 +1,33 @@
+[package]
+name = "harnx-plans-tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP server that exposes a file-based plan/task/note management system"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+harnx-toolset = { path = "../harnx-toolset" }
+harnx-toolset-server = { path = "../harnx-toolset-server" }
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true, features = ["fs", "time"] }
+tokio-util = { workspace = true }
+tower = { workspace = true }
+schemars = { workspace = true }
+similar = { workspace = true }
+
+[dev-dependencies]
+filetime = "0.2"
+tempfile = "3"
+
+[[bin]]
+name = "harnx-plans-tools"
+path = "src/main.rs"

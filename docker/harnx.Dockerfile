@@ -8,9 +8,10 @@ ARG TARGETARCH
 
 COPY linux-${TARGETARCH}/harnx /usr/local/bin/harnx
 COPY linux-${TARGETARCH}/harnx-serve /usr/local/bin/harnx-serve
-COPY linux-${TARGETARCH}/harnx-mcp-bash /usr/local/bin/harnx-mcp-bash
+COPY linux-${TARGETARCH}/harnx-bash-tools /usr/local/bin/harnx-bash-tools
 COPY linux-${TARGETARCH}/harnx-fs-tools /usr/local/bin/harnx-fs-tools
-COPY linux-${TARGETARCH}/harnx-mcp-plans /usr/local/bin/harnx-mcp-plans
+COPY linux-${TARGETARCH}/harnx-grep-tools /usr/local/bin/harnx-grep-tools
+COPY linux-${TARGETARCH}/harnx-plans-tools /usr/local/bin/harnx-plans-tools
 COPY linux-${TARGETARCH}/harnx-mcp-time /usr/local/bin/harnx-mcp-time
 COPY linux-${TARGETARCH}/harnx-time-server /usr/local/bin/harnx-time-server
 COPY linux-${TARGETARCH}/harnx-mcp-bridge /usr/local/bin/harnx-mcp-bridge

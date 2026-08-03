@@ -144,16 +144,6 @@ hooks:
         assert_eq!(coding, pantheon);
 
         let config: ToolServerConfig = serde_yaml::from_str(coding).expect("parse bash config");
-        assert_eq!(
-            config.args[..5],
-            [
-                "--name",
-                "bash",
-                "--",
-                "harnx-mcp-bash",
-                "--default-root-cwd"
-            ]
-        );
         let hooks = config.hooks.expect("bash hooks");
         assert_eq!(hooks.entries.len(), 1);
         let hook = &hooks.entries[0];

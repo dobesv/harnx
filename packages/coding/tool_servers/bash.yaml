@@ -1,7 +1,7 @@
-command: harnx-mcp-bridge
+command: harnx-bash-tools
 description: Shell execution — lets agents run commands and scripts
 
-# Runs bridged over NATS: harnx-mcp-bridge wraps harnx-mcp-bash. The co-located
+# Runs as a native toolset server. The co-located
 # proxy-auth hook injects GitHub/Atlassian credentials before exec/spawn calls.
 # --default-root-cwd binds the sandbox to the process CWD (the user's repo),
 # keeping the $HOME guard.
@@ -25,10 +25,6 @@ hooks:
         --hook "$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py"
 
 args:
-  - --name
-  - bash
-  - --
-  - harnx-mcp-bash
   - --default-root-cwd
   # Allow access to detected project root (when run in a subdirectory) and git metadata (when in a git worktree)
   - --extra-rwx

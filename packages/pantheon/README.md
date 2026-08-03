@@ -179,7 +179,7 @@ local `~/.config/harnx/agents/shared/` directory.
 
 ## Tool servers
 
-The package includes ready-to-use tool server configs in `tool_servers/`. All servers run bridged over NATS via `harnx-mcp-bridge` and are automatically active when the package is installed — you don't need to copy or symlink anything.
+The package includes ready-to-use tool server configs in `tool_servers/`. Bundled native toolset servers run directly, while external stdio servers use a bridge adapter. All servers are automatically active when the package is installed — you don't need to copy or symlink anything.
 
 > **Don't edit files inside the package directory.** They will be overwritten
 > when you run `harnx-pkg update`. To customise a server, create a file with
@@ -190,8 +190,8 @@ The package includes ready-to-use tool server configs in `tool_servers/`. All se
 
 | Server | Namespace | Requires | Notes |
 |--------|-----------|----------|-------|
-| `bash.yaml` | `bash_*` | None (bundled binary) | Shell execution. Runs bridged over NATS with `--default-root-cwd` (seeds CWD as allowed root with `$HOME` protection). Configured with a co-launched native PreToolUse hook (`harnx-proxy-auth`) for GitHub/Atlassian credential injection. Pre-configured toolchain paths. |
-| `fs.yaml` | `fs_*` | None (bundled binary) | Filesystem read/write. Runs bridged over NATS with `--default-root-cwd` to bound access to the repository CWD. |
+| `bash.yaml` | `bash_*` | None (bundled binary) | Shell execution. Runs natively with `--default-root-cwd` (seeds CWD as allowed root with `$HOME` protection). Configured with a co-launched native PreToolUse hook (`harnx-proxy-auth`) for GitHub/Atlassian credential injection. Pre-configured toolchain paths. |
+| `fs.yaml` | `fs_*` | None (bundled binary) | Filesystem read/write. Runs natively with `--default-root-cwd` to bound access to the repository CWD. |
 | `plans.yaml` | `plans_*` | None (bundled binary) | Plan/task/note management, stored in `.agent/plans/` relative to the working directory. |
 | `time.yaml` | `time_*` | None (bundled binary) | Current time and wait/sleep utilities. |
 | `fetch.yaml` | `fetch_*` | Node.js / npx | Fetches URLs as markdown or text. No API key. |

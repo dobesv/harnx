@@ -1,0 +1,35 @@
+[package]
+name = "harnx-bash-tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP server that exposes bash/subprocess execution with safety guards"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+fancy-regex = { workspace = true }
+gix = { workspace = true }
+harnx-core = { path = "../harnx-core" }
+harnx-mcp = { path = "../harnx-mcp" }
+harnx-mcp-history = { workspace = true }
+harnx-sandbox-common = { path = "../harnx-sandbox-common" }
+harnx-toolset = { path = "../harnx-toolset" }
+harnx-toolset-server = { path = "../harnx-toolset-server" }
+libc = { workspace = true }
+log = { workspace = true }
+process-wrap = { workspace = true }
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["fs"] }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+
+[[bin]]
+name = "harnx-bash-tools"
+path = "src/main.rs"

@@ -1450,7 +1450,7 @@ mod tests {
         let config = test_config_with_mcp(
             r#"
 name: bash
-command: harnx-mcp-bash
+command: harnx-bash-tools
 args:
   - "--extra-rwx"
   - "$GIT_ROOT"
@@ -1468,7 +1468,7 @@ hooks:
         let text = String::from_utf8(out).expect("utf8");
 
         assert!(text.contains("MCP server: bash"), "{text}");
-        assert!(text.contains("command: harnx-mcp-bash"), "{text}");
+        assert!(text.contains("command: harnx-bash-tools"), "{text}");
         assert!(text.contains("--extra-rwx"), "{text}");
         assert!(text.contains("$GIT_ROOT"), "{text}");
         assert!(text.contains("EDITOR=true"), "{text}");
@@ -1483,7 +1483,7 @@ hooks:
 
     #[tokio::test]
     async fn test_mcp_info_unknown_server_lists_available() {
-        let config = test_config_with_mcp("name: bash\ncommand: harnx-mcp-bash\n");
+        let config = test_config_with_mcp("name: bash\ncommand: harnx-bash-tools\n");
         let mut out: Vec<u8> = Vec::new();
         write_mcp_info(&mut out, &config, Some("nope"))
             .await

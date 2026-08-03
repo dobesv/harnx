@@ -1,7 +1,7 @@
 //! `harnx-sandbox-run`: A standalone utility to run commands inside a birdcage sandbox with hook support.
 //!
 //! This binary provides a way to run arbitrary commands with the same sandboxing defaults and
-//! credential injection hooks used by `harnx-mcp-bash`. It is useful for testing hooks,
+//! credential injection hooks used by `harnx-bash-tools`. It is useful for testing hooks,
 //! running tools securely, or as a building block for other agentic workflows.
 //!
 //! Sandboxing is delegated to `harnx-sandbox-exec`, which runs as a subprocess. This allows
@@ -11,7 +11,7 @@
 //! ## Environment variables
 //!
 //! In addition to CLI flags, the following environment variables are supported (matching
-//! `harnx-mcp-bash`):
+//! `harnx-bash-tools`):
 //!
 //! | Variable | Format | Effect |
 //! |---|---|---|
@@ -69,7 +69,7 @@ fn main() -> Result<()> {
     // Parse remaining args with clap
     let mut cli = <cli::Cli as clap::Parser>::parse_from(&clap_args);
 
-    // Merge env var overrides (matching harnx-mcp-bash behaviour).
+    // Merge env var overrides (matching harnx-bash-tools behaviour).
     #[cfg(unix)]
     {
         cli.extra_read

@@ -2,7 +2,7 @@ use rmcp::schemars::Schema;
 use serde_json::{Map, Value};
 
 /// Build a JSON Schema object where each property carries a `description`.
-/// Signature matches `harnx-mcp-plans`'s gold-standard helper.
+/// Signature matches `harnx-plans-tools`'s gold-standard helper.
 pub fn object_schema_with_desc(properties: Vec<(&str, &str, Schema)>, required: &[&str]) -> Schema {
     let mut schema = Map::new();
     schema.insert("type".to_string(), Value::String("object".to_string()));

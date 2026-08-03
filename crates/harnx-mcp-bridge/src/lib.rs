@@ -408,7 +408,7 @@ mod tests {
             "--name",
             "plans",
             "--",
-            "harnx-mcp-plans",
+            "harnx-plans-tools",
             "--mcp-stdio",
             "--dir",
             ".agent/plans",
@@ -417,7 +417,7 @@ mod tests {
         assert_eq!(args.name, "plans");
         assert_eq!(
             args.child,
-            ["harnx-mcp-plans", "--mcp-stdio", "--dir", ".agent/plans"]
+            ["harnx-plans-tools", "--mcp-stdio", "--dir", ".agent/plans"]
         );
     }
 
@@ -428,18 +428,18 @@ mod tests {
             "--name",
             "plans",
             "--",
-            "harnx-mcp-plans",
+            "harnx-plans-tools",
         ]);
 
         assert_eq!(args.name, "plans");
-        assert_eq!(args.child, ["harnx-mcp-plans"]);
+        assert_eq!(args.child, ["harnx-plans-tools"]);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn caches_prefixed_plans_tool_specs() {
         let plans_dir = tempfile::tempdir().expect("create temporary plans directory");
-        let plans_binary = option_env!("CARGO_BIN_EXE_harnx-mcp-plans")
+        let plans_binary = option_env!("CARGO_BIN_EXE_harnx-plans-tools")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
                 let mut path = std::env::current_exe().expect("locate current test executable");
@@ -447,11 +447,11 @@ mod tests {
                 if path.ends_with("deps") {
                     path.pop();
                 }
-                path.join("harnx-mcp-plans")
+                path.join("harnx-plans-tools")
             });
         assert!(
             plans_binary.is_file(),
-            "harnx-mcp-plans binary missing at {}; build it before this test",
+            "harnx-plans-tools binary missing at {}; build it before this test",
             plans_binary.display()
         );
         let bridge = BridgeToolset::new(
@@ -478,7 +478,7 @@ mod tests {
 
     #[cfg(unix)]
     fn plans_command(dir: &std::path::Path) -> Vec<String> {
-        let plans_binary = option_env!("CARGO_BIN_EXE_harnx-mcp-plans")
+        let plans_binary = option_env!("CARGO_BIN_EXE_harnx-plans-tools")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
                 let mut path = std::env::current_exe().expect("locate current test executable");
@@ -486,11 +486,11 @@ mod tests {
                 if path.ends_with("deps") {
                     path.pop();
                 }
-                path.join("harnx-mcp-plans")
+                path.join("harnx-plans-tools")
             });
         assert!(
             plans_binary.is_file(),
-            "harnx-mcp-plans binary missing at {}; build it before this test",
+            "harnx-plans-tools binary missing at {}; build it before this test",
             plans_binary.display()
         );
         vec![

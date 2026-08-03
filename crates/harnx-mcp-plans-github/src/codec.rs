@@ -2,7 +2,7 @@
 //!
 //! This module implements the encoding/decoding of `Plan`, `Task`, and `Note` structs
 //! to/from GitHub issue bodies and comments. Metadata is stored in YAML front-matter
-//! embedded in the issue body, mirroring the filesystem format from `harnx-mcp-plans`.
+//! embedded in the issue body, mirroring the filesystem format from `harnx-plans-tools`.
 //!
 //! ## Format
 //!
