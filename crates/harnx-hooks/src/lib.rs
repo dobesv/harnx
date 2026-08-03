@@ -60,10 +60,7 @@ pub use async_manager::{
     append_pending_context, drain_async_results, inject_pending_async_context, AsyncHookManager,
 };
 #[allow(unused_imports)]
-pub use dispatch::{
-    dispatch_hooks, dispatch_hooks_with_count, dispatch_hooks_with_count_and_manager,
-    dispatch_hooks_with_managers,
-};
+pub use dispatch::{dispatch_hooks, dispatch_hooks_with_options, DispatchOptions, InlineHookSpec};
 #[allow(unused_imports)]
 pub use executor::{execute_command_hook, HookCommand};
 pub use harnx_core::hooks::*;

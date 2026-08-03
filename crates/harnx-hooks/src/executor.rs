@@ -1,4 +1,4 @@
-use crate::{HookConfig, HookOutcome, HookPayload, HookResult, HookResultControl};
+use crate::{HookOutcome, HookPayload, HookResult, HookResultControl};
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -21,16 +21,6 @@ pub struct HookCommand {
     pub command: String,
     pub timeout: Option<u64>,
     pub package_dir: Option<PathBuf>,
-}
-
-impl From<&HookConfig> for HookCommand {
-    fn from(hook: &HookConfig) -> Self {
-        Self {
-            command: hook.command.clone(),
-            timeout: hook.timeout,
-            package_dir: hook.package_dir.clone(),
-        }
-    }
 }
 
 /// Build the base shell `Command` for a hook, with `HARNX_PACKAGE_DIR` injected

@@ -38,10 +38,12 @@ Register `harnx-aws-creds` as a persistent hook in your `harnx.yaml` or agent fr
 ```yaml
 hooks:
   entries:
-    - event: PreToolUse
-      type: claude-command-persistent
-      matcher: "bash_exec|bash_spawn"
-      command: harnx-aws-creds --profile my-profile
+    - command: >-
+        harnx-claude-compatible-hook-server
+        --event PreToolUse
+        --matcher "bash_exec|bash_spawn"
+        --persistent
+        -- harnx-aws-creds --profile my-profile
 ```
 
 Replace `my-profile` with the name of the AWS profile you want to use, or omit `--profile` entirely to use the default credential chain:
@@ -49,13 +51,15 @@ Replace `my-profile` with the name of the AWS profile you want to use, or omit `
 ```yaml
 hooks:
   entries:
-    - event: PreToolUse
-      type: claude-command-persistent
-      matcher: "bash_exec|bash_spawn"
-      command: harnx-aws-creds
+    - command: >-
+        harnx-claude-compatible-hook-server
+        --event PreToolUse
+        --matcher "bash_exec|bash_spawn"
+        --persistent
+        -- harnx-aws-creds
 ```
 
-**Note**: You must use `type: claude-command-persistent` to ensure the credential server stays alive across multiple tool calls.
+**Note**: The `--persistent` flag keeps the credential server alive across multiple tool calls, avoiding the overhead of credential resolution on each request.
 
 ## CLI Flags
 

@@ -1,6 +1,6 @@
 //! Hook execution for harnx-sandbox-run.
 //!
-//! Converts CLI hook definitions into `HookConfig` and dispatches them via
+//! Converts CLI hook definitions into inline hook specs and dispatches them via
 //! the harnx-hooks crate. Extracts environment mutations from hook output.
 //!
 //! The `PersistentHookManager` is returned alongside the env map so the caller
@@ -14,8 +14,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
-use harnx_core::hooks::{HookConfig, HookEvent, HookOutcome, HookResultControl};
-use harnx_hooks::{dispatch_hooks_with_managers, PersistentHookManager};
+use harnx_core::hooks::{HookEvent, HookOutcome, HookResultControl};
+use harnx_hooks::{
+    dispatch_hooks_with_options, DispatchOptions, HookCommand, InlineHookSpec,
+    PersistentHookManager,
+};
 use serde_json::json;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -44,79 +47,94 @@ pub async fn run_hooks(
     command: &[OsString],
 ) -> Result<HookResult> {
     if hook_defs.is_empty() {
-        return Ok(HookResult {
-            env: HashMap::new(),
-            manager: Arc::new(TokioMutex::new(PersistentHookManager::new())),
-        });
+        return Ok(empty_hook_result());
     }
 
-    // Convert HookDefs to HookConfigs
-    let hooks: Vec<HookConfig> = hook_defs
-        .iter()
-        .map(|def| {
-            let full_command = build_hook_command(&def.command, &def.args);
-            HookConfig {
-                event: "PreToolUse".to_string(),
-                matcher: None,
-                command: full_command,
-                timeout: Some(30),
-                status_message: None,
-                async_hook: Some(false),
-                hook_type: def.hook_type.clone(),
-                package_dir: None,
-            }
-        })
-        .collect();
-
-    let command_str: String = command
-        .iter()
-        .map(|s| s.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let tool_use_id = uuid::Uuid::new_v4().to_string();
-
-    let event = HookEvent::PreToolUse {
-        tool_name: "exec".to_string(),
-        tool_use_id,
-        tool_input: json!({
-            "command": command_str,
-            "env": {},
-        }),
-    };
-
+    let (hooks, persistent_modes) = build_inline_hooks(hook_defs);
+    let event = pre_tool_event(command);
     let persistent_manager = Arc::new(TokioMutex::new(PersistentHookManager::new()));
-
-    let outcome = dispatch_hooks_with_managers(
+    let outcome = dispatch_hooks_with_options(
         &event,
         &hooks,
         session_id,
         cwd,
-        None,
-        Some(&persistent_manager),
+        DispatchOptions {
+            persistent_modes: &persistent_modes,
+            persistent_manager: Some(&persistent_manager),
+            ..DispatchOptions::default()
+        },
     )
     .await;
 
-    // Check for block — shut down before bailing
-    if matches!(outcome.control, HookResultControl::Block { .. }) {
-        persistent_manager.lock().await.shutdown();
-        bail!(
-            "hook blocked execution: {}",
-            outcome
-                .result
-                .additional_context
-                .as_deref()
-                .unwrap_or("no reason")
-        );
-    }
-
-    let env = extract_hook_env(&outcome);
-
-    // Return the manager alive — caller keeps it until the child exits.
+    reject_blocked_hook(&outcome, &persistent_manager).await?;
     Ok(HookResult {
-        env,
+        env: extract_hook_env(&outcome),
         manager: persistent_manager,
     })
+}
+
+fn empty_hook_result() -> HookResult {
+    HookResult {
+        env: HashMap::new(),
+        manager: Arc::new(TokioMutex::new(PersistentHookManager::new())),
+    }
+}
+
+fn build_inline_hooks(hook_defs: &[HookDef]) -> (Vec<InlineHookSpec>, Vec<bool>) {
+    hook_defs.iter().filter_map(build_inline_hook).unzip()
+}
+
+fn build_inline_hook(def: &HookDef) -> Option<(InlineHookSpec, bool)> {
+    let persistent = match def.hook_type.as_str() {
+        "claude-command" => false,
+        "claude-command-persistent" => true,
+        _ => return None,
+    };
+    let hook = InlineHookSpec {
+        event: "PreToolUse".to_string(),
+        matcher: None,
+        command: HookCommand {
+            command: build_hook_command(&def.command, &def.args),
+            timeout: Some(30),
+            package_dir: None,
+        },
+        async_hook: Some(false),
+    };
+    Some((hook, persistent))
+}
+
+fn pre_tool_event(command: &[OsString]) -> HookEvent {
+    let command = command
+        .iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    HookEvent::PreToolUse {
+        tool_name: "exec".to_string(),
+        tool_use_id: uuid::Uuid::new_v4().to_string(),
+        tool_input: json!({
+            "command": command,
+            "env": {},
+        }),
+    }
+}
+
+async fn reject_blocked_hook(
+    outcome: &HookOutcome,
+    persistent_manager: &Arc<TokioMutex<PersistentHookManager>>,
+) -> Result<()> {
+    if !matches!(outcome.control, HookResultControl::Block { .. }) {
+        return Ok(());
+    }
+    persistent_manager.lock().await.shutdown();
+    bail!(
+        "hook blocked execution: {}",
+        outcome
+            .result
+            .additional_context
+            .as_deref()
+            .unwrap_or("no reason")
+    )
 }
 
 fn shell_quote(value: &str) -> String {

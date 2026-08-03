@@ -49,10 +49,7 @@ documents:
 hooks:
   max_resume: 3
   entries:
-    - event: Stop
-      type: claude-command
-      command: "/path/to/hook.sh"
-      timeout: 30
+    - command: harnx-claude-compatible-hook-server --event Stop -- /path/to/hook.sh
 ---
 
 You are a helpful coding assistant working on the {{project_dir}} project.
@@ -240,15 +237,13 @@ Hooks let you run external commands at specific points during agent execution. T
 hooks:
   max_resume: 3
   entries:
-    - event: PreToolUse
-      type: claude-command
-      matcher: shell
-      command: "/path/to/approve-tool.sh"
-      timeout: 15
-      async: false
-    - event: Stop
-      type: claude-command
-      command: "/path/to/on-stop.sh"
+    - command: >-
+        harnx-claude-compatible-hook-server
+        --event PreToolUse
+        --matcher shell
+        --timeout 15
+        -- /path/to/approve-tool.sh
+    - command: harnx-claude-compatible-hook-server --event Stop -- /path/to/on-stop.sh
       status_message: "Running stop hook..."
       async: true
 ```
@@ -257,13 +252,13 @@ hooks:
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `event` | `string` | yes | — | Hook event name (e.g. `PreToolUse`, `Stop`, `SessionStart`) |
-| `type` | `string` | yes | — | Execution protocol. Supported: `claude-command`, `claude-command-persistent`. Note: `PreToolUse` hooks can return `hookSpecificOutput.toolInput` to mutate tool arguments; `PostToolUse` hooks can return `hookSpecificOutput.toolResponse` to mutate the response. |
-| `matcher` | `string` | no | none | Regex pattern to match against the tool name (for tool-related events) |
-| `command` | `string` | yes | — | Shell command to execute |
-| `timeout` | `integer` | no | `30` | Timeout in seconds |
+| `command` | `string` | yes | — | Shell command to run as a hook server. For hooks that need event/matcher, use `harnx-claude-compatible-hook-server --event <E> --matcher <M> [--persistent] -- <child-command>`. |
 | `status_message` | `string` | no | none | Message to display while the hook runs |
 | `async` | `boolean` | no | none | Whether to run the hook asynchronously |
+
+The `command` field specifies a hook server binary. Options:
+- **Generic runner**: `harnx-claude-compatible-hook-server --event <EVENT> [--matcher <REGEX>] [--persistent] [--timeout <SECS>] [--priority <N>] [--fail-policy <closed|open>] -- <child-command>`. The `--persistent` flag keeps the child process alive across requests.
+- **Native hooks** (e.g., `harnx-proxy-auth`): Self-declare their event/matcher and need no runner flags.
 
 ### Top-level Hook Settings
 

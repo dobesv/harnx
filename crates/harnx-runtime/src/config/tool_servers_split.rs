@@ -120,11 +120,8 @@ command: harnx-time-server
 hooks:
   max_resume: 3
   entries:
-    - event: PreToolUse
-      matcher: "time"
-      command: "/path/to/hook.sh"
-      timeout: 30
-      type: claude-command
+    - command: "harnx-claude-compatible-hook-server --event PreToolUse --matcher time --timeout 30 --command /path/to/hook.sh"
+      status_message: "Checking time tool"
 "#;
         let config: ToolServerConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.command, "harnx-time-server");
@@ -132,11 +129,12 @@ hooks:
         assert_eq!(hooks.max_resume, Some(3));
         assert_eq!(hooks.entries.len(), 1);
         let entry = &hooks.entries[0];
-        assert_eq!(entry.event, "PreToolUse");
-        assert_eq!(entry.matcher, Some("time".to_string()));
-        assert_eq!(entry.command, "/path/to/hook.sh");
-        assert_eq!(entry.timeout, Some(30));
-        assert_eq!(entry.hook_type, "claude-command");
+        assert_eq!(
+            entry.command,
+            "harnx-claude-compatible-hook-server --event PreToolUse --matcher time --timeout 30 --command /path/to/hook.sh"
+        );
+        assert_eq!(entry.status_message.as_deref(), Some("Checking time tool"));
+        assert!(entry.async_hook.is_none());
     }
 
     #[test]
@@ -159,9 +157,6 @@ hooks:
         let hooks = config.hooks.expect("bash hooks");
         assert_eq!(hooks.entries.len(), 1);
         let hook = &hooks.entries[0];
-        assert_eq!(hook.event, "PreToolUse");
-        assert_eq!(hook.matcher.as_deref(), Some("exec|spawn"));
-        assert_eq!(hook.hook_type, "claude-command-persistent");
         assert!(hook.command.starts_with("harnx-proxy-auth --hook "));
         assert!(hook
             .command

@@ -66,6 +66,7 @@ pub async fn serve_with_client(
 
     let registration = HookRegistration {
         server: server.clone(),
+        display_label: None,
         hooks,
         schema_version: HOOK_SCHEMA_VERSION,
         proto_version: HOOK_PROTOCOL_VERSION,

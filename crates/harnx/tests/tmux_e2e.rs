@@ -376,10 +376,7 @@ fn write_proxy_auth_fixture_files(paths: &TestPaths, proxy_auth_bin: &Path) -> R
         &json!({
             "save": false,
             "hooks": { "entries": [{
-                "event": "PreToolUse",
-                "matcher": "bash_exec|bash_spawn",
                 "command": format!("'{bin_path}' --hook ."),
-                "type": "claude-command-persistent",
             }]},
         }),
     )?;

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use clap::{Parser, ValueEnum};
 use harnx_core::hooks::{HookOutcome, HookPayload};
 use harnx_hooks::{execute_command_hook, HookCommand, PersistentHookManager};
-use harnx_hookset::{FailPolicy, Hook, HookSpec};
+use harnx_hookset::{FailPolicy, Hook, HookSpec, HARNX_HOOK_NAME};
 use std::path::PathBuf;
 use tokio::sync::Mutex;
 
@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 #[command(about = "Serve a Claude Code-compatible command hook over NATS")]
 pub struct Args {
     /// Stable hook server name used in NATS subjects and registration.
-    #[arg(long)]
+    #[arg(long, env = HARNX_HOOK_NAME)]
     pub name: String,
 
     /// Hook event to register, such as PreToolUse or PostToolUse.
@@ -37,9 +37,9 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = CliFailPolicy::Closed)]
     pub fail_policy: CliFailPolicy,
 
-    /// Claude-compatible hook process type.
-    #[arg(long = "type", value_enum, default_value_t = HookType::ClaudeCommand)]
-    pub hook_type: HookType,
+    /// Keep one hook subprocess alive across requests.
+    #[arg(long)]
+    pub persistent: bool,
 
     /// Shell command run for hook requests.
     #[arg(long)]
@@ -48,15 +48,6 @@ pub struct Args {
     /// Package directory exposed to the command as HARNX_PACKAGE_DIR.
     #[arg(long)]
     pub package_dir: Option<PathBuf>,
-}
-
-/// Supported Claude-compatible subprocess protocols.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum HookType {
-    #[value(name = "claude-command")]
-    ClaudeCommand,
-    #[value(name = "claude-command-persistent")]
-    ClaudeCommandPersistent,
 }
 
 /// Hook dispatch behavior when the server fails.
@@ -79,9 +70,9 @@ impl From<CliFailPolicy> for FailPolicy {
 pub struct ClaudeCompatibleHook {
     name: String,
     spec: HookSpec,
-    hook_type: HookType,
+    persistent: bool,
     command: HookCommand,
-    persistent: Mutex<PersistentHookManager>,
+    manager: Mutex<PersistentHookManager>,
 }
 
 impl TryFrom<Args> for ClaudeCompatibleHook {
@@ -107,13 +98,13 @@ impl TryFrom<Args> for ClaudeCompatibleHook {
                 timeout_secs: args.timeout,
                 fail_policy: args.fail_policy.into(),
             },
-            hook_type: args.hook_type,
+            persistent: args.persistent,
             command: HookCommand {
                 command: args.command,
                 timeout: args.timeout,
                 package_dir: args.package_dir,
             },
-            persistent: Mutex::new(PersistentHookManager::new()),
+            manager: Mutex::new(PersistentHookManager::new()),
         })
     }
 }
@@ -129,15 +120,14 @@ impl Hook for ClaudeCompatibleHook {
     }
 
     async fn handle_hook(&self, payload: HookPayload) -> HookOutcome {
-        match self.hook_type {
-            HookType::ClaudeCommand => execute_command_hook(&payload, &self.command).await,
-            HookType::ClaudeCommandPersistent => {
-                self.persistent
-                    .lock()
-                    .await
-                    .send_event(&payload, &self.command)
-                    .await
-            }
+        if self.persistent {
+            self.manager
+                .lock()
+                .await
+                .send_event(&payload, &self.command)
+                .await
+        } else {
+            execute_command_hook(&payload, &self.command).await
         }
     }
 }
@@ -166,7 +156,7 @@ mod tests {
         }
     }
 
-    fn hook(command: &str, hook_type: HookType) -> ClaudeCompatibleHook {
+    fn hook(command: &str, persistent: bool) -> ClaudeCompatibleHook {
         Args {
             name: "test-hook".to_string(),
             event: "PreToolUse".to_string(),
@@ -174,7 +164,7 @@ mod tests {
             priority: 7,
             timeout: Some(5),
             fail_policy: CliFailPolicy::Closed,
-            hook_type,
+            persistent,
             command: command.to_string(),
             package_dir: None,
         }
@@ -182,14 +172,40 @@ mod tests {
         .expect("valid test hook")
     }
 
+    #[test]
+    fn cli_uses_persistent_flag_instead_of_type() {
+        let args = Args::try_parse_from([
+            "hook-server",
+            "--name",
+            "test-hook",
+            "--event",
+            "PreToolUse",
+            "--persistent",
+            "--command",
+            "true",
+        ])
+        .expect("parse persistent hook");
+        assert!(args.persistent);
+
+        assert!(Args::try_parse_from([
+            "hook-server",
+            "--name",
+            "test-hook",
+            "--event",
+            "PreToolUse",
+            "--type",
+            "persistent",
+            "--command",
+            "true",
+        ])
+        .is_err());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn one_shot_exit_zero_parses_hook_result() {
         let cwd = tempfile::tempdir().expect("temp dir");
-        let runner = hook(
-            r#"printf '%s' '{"additionalContext":"from-hook"}'"#,
-            HookType::ClaudeCommand,
-        );
+        let runner = hook(r#"printf '%s' '{"additionalContext":"from-hook"}'"#, false);
 
         let outcome = runner.handle_hook(payload(cwd.path(), 1)).await;
 
@@ -204,10 +220,7 @@ mod tests {
     #[tokio::test]
     async fn one_shot_exit_two_blocks_with_stderr() {
         let cwd = tempfile::tempdir().expect("temp dir");
-        let runner = hook(
-            "printf '%s' 'denied by test' >&2; exit 2",
-            HookType::ClaudeCommand,
-        );
+        let runner = hook("printf '%s' 'denied by test' >&2; exit 2", false);
 
         let outcome = runner.handle_hook(payload(cwd.path(), 1)).await;
 
@@ -225,7 +238,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("temp dir");
         let runner = hook(
             r#"printf '%s' '{"mutatedToolInput":{"command":"safe"}}'"#,
-            HookType::ClaudeCommand,
+            false,
         );
 
         let outcome = runner.handle_hook(payload(cwd.path(), 1)).await;
@@ -242,7 +255,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("temp dir");
         let runner = hook(
             r#"count=0; while IFS= read -r line; do count=$((count + 1)); id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'); printf '{"id":"%s","mutatedToolInput":{"sequence":%s}}\n' "$id" "$count"; done"#,
-            HookType::ClaudeCommandPersistent,
+            true,
         );
 
         let first = runner.handle_hook(payload(cwd.path(), 1)).await;
@@ -260,7 +273,7 @@ mod tests {
 
     #[test]
     fn hook_metadata_comes_from_configuration() {
-        let runner = hook("true", HookType::ClaudeCommand);
+        let runner = hook("true", false);
         assert_eq!(runner.name(), "test-hook");
         assert_eq!(
             runner.hooks(),

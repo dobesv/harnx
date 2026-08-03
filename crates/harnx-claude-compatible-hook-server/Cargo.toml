@@ -10,7 +10,7 @@ description = "NATS server for Claude Code-compatible command hooks"
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-clap = { workspace = true }
+clap = { workspace = true, features = ["env"] }
 harnx-core = { path = "../harnx-core" }
 harnx-hooks = { path = "../harnx-hooks" }
 harnx-hookset = { path = "../harnx-hookset" }

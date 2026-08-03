@@ -41,18 +41,26 @@ In your agent's YAML config:
 
 ```yaml
 hooks:
-  - event: PreToolUse
-    type: claude-command-persistent
-    command: "harnx-aws-creds"
+  entries:
+    - command: >-
+        harnx-claude-compatible-hook-server
+        --event PreToolUse
+        --matcher "bash_exec|bash_spawn"
+        --persistent
+        -- harnx-aws-creds
 ```
 
 With a specific profile:
 
 ```yaml
 hooks:
-  - event: PreToolUse
-    type: claude-command-persistent
-    command: "harnx-aws-creds --profile my-profile"
+  entries:
+    - command: >-
+        harnx-claude-compatible-hook-server
+        --event PreToolUse
+        --matcher "bash_exec|bash_spawn"
+        --persistent
+        -- harnx-aws-creds --profile my-profile
 ```
 
 ## CLI Reference

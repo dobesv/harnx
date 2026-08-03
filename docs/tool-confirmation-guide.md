@@ -9,9 +9,10 @@ The fastest way to enable manual confirmation for all tools is to add a hook ent
 ```yaml
 hooks:
   entries:
-    - event: PreToolUse
-      type: claude-command
-      command: >-
+    - command: >-
+        harnx-claude-compatible-hook-server
+        --event PreToolUse
+        --
         printf '%s\n' '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Manual approval required"}}'
 ```
 
@@ -34,14 +35,13 @@ Harnx uses the **hooks system** to implement tool confirmation. When a `PreToolU
 You can configure confirmation hooks globally in `config.yaml` or per-agent in front-matter.
 
 ### Method A: External Script
+
 For more complex logic, move the hook to a script file:
 
 ```yaml
 hooks:
   entries:
-    - event: PreToolUse
-      type: claude-command
-      command: "/path/to/ask-confirm.sh"
+    - command: harnx-claude-compatible-hook-server --event PreToolUse -- /path/to/ask-confirm.sh
 ```
 
 **ask-confirm.sh** (see `demos/config/ask-confirm-hook.sh` for a working example):
@@ -54,17 +54,14 @@ printf '%s\n' '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDeci
 ```
 
 ### Method B: Selective Confirmation (Matcher)
-Use the `matcher` field to only require confirmation for specific tools:
+Use the `--matcher` flag to only require confirmation for specific tools:
 
 ```yaml
 hooks:
   entries:
-    - event: PreToolUse
-      type: claude-command
-      matcher: "bash_exec|bash_spawn"
-      command: "/path/to/ask-confirm.sh"
+    - command: harnx-claude-compatible-hook-server --event PreToolUse --matcher "bash_exec|bash_spawn" -- /path/to/ask-confirm.sh
 ```
-*The `matcher` uses a regex against the tool name.*
+*The matcher uses a regex against the tool name.*
 
 ### Method C: Per-Agent Hooks
 Enable confirmation only for specific agents by adding the hook to their Markdown front-matter:
@@ -74,9 +71,7 @@ Enable confirmation only for specific agents by adding the hook to their Markdow
 model: openai:gpt-4o
 hooks:
   entries:
-    - event: PreToolUse
-      type: claude-command
-      command: "/path/to/ask-confirm.sh"
+    - command: harnx-claude-compatible-hook-server --event PreToolUse -- /path/to/ask-confirm.sh
 ---
 
 You are a helpful assistant with manual tool oversight.

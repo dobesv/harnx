@@ -341,6 +341,10 @@ async fn start_global_hooks(
     match result {
         Ok(supervisor) => Some(supervisor),
         Err(error) => {
+            // Failures happen before the supervisor can own cleanup or while its KV
+            // route is unavailable. Publishing here would either reuse the failed
+            // route or leave an unowned rejector behind after worker shutdown. Keep
+            // the worker available; unreadable registries fail closed at discovery.
             log::warn!("global NATS hook servers disabled: {error:#}");
             None
         }

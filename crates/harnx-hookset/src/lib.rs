@@ -3,6 +3,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// Environment variable containing the supervisor-assigned hook server name.
+pub const HARNX_HOOK_NAME: &str = "HARNX_HOOK_NAME";
 /// JetStream KV bucket containing hook server registrations.
 pub const HOOK_REGISTRY_BUCKET: &str = "harnx_hook_registry";
 /// JetStream KV bucket containing hooks local supervisors require to be available.
@@ -68,6 +70,8 @@ pub trait Hook: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookRegistration {
     pub server: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
     pub hooks: Vec<HookSpec>,
     pub schema_version: u32,
     pub proto_version: u32,
@@ -79,8 +83,17 @@ mod tests {
 
     #[test]
     fn hook_registration_round_trips_through_serde() -> anyhow::Result<()> {
-        let registration = HookRegistration {
+        #[derive(Deserialize)]
+        struct LegacyHookRegistration {
+            server: String,
+            hooks: Vec<HookSpec>,
+            schema_version: u32,
+            proto_version: u32,
+        }
+
+        let mut registration = HookRegistration {
             server: "test-hooks".to_string(),
+            display_label: None,
             hooks: vec![HookSpec {
                 event: "PreToolUse".to_string(),
                 matcher: Some("exec".to_string()),
@@ -93,9 +106,21 @@ mod tests {
         };
 
         let encoded = serde_json::to_vec(&registration)?;
+        assert!(!encoded
+            .windows(b"display_label".len())
+            .any(|window| window == b"display_label"));
         let decoded: HookRegistration = serde_json::from_slice(&encoded)?;
-
+        assert_eq!(decoded.display_label, None);
         assert_eq!(decoded, registration);
+
+        registration.display_label = Some("Friendly hook".to_string());
+        let encoded = serde_json::to_vec(&registration)?;
+        let legacy: LegacyHookRegistration = serde_json::from_slice(&encoded)?;
+        assert_eq!(legacy.server, registration.server);
+        assert_eq!(legacy.hooks, registration.hooks);
+        assert_eq!(legacy.schema_version, registration.schema_version);
+        assert_eq!(legacy.proto_version, registration.proto_version);
+
         assert_eq!(FailPolicy::default(), FailPolicy::Closed);
         assert_eq!(FailPolicy::Closed.as_str(), "closed");
         assert_eq!(FailPolicy::Open.as_str(), "open");

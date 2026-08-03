@@ -258,15 +258,7 @@ async fn write_mcp_info(
         Some(hooks) if !hooks.entries.is_empty() => {
             writeln!(output, "  hooks:")?;
             for (i, hook) in hooks.entries.iter().enumerate() {
-                writeln!(
-                    output,
-                    "    [{}] {} (type: {}, matcher: {})",
-                    i + 1,
-                    hook.event,
-                    hook.hook_type,
-                    hook.matcher.as_deref().unwrap_or("*"),
-                )?;
-                writeln!(output, "        command: {}", hook.command)?;
+                writeln!(output, "    [{}] {}", i + 1, hook.command)?;
                 writeln!(output, "        transport: NATS")?;
             }
         }
@@ -1466,10 +1458,7 @@ env:
   EDITOR: "true"
 hooks:
   entries:
-    - event: PreToolUse
-      type: claude-command-persistent
-      matcher: "exec|spawn"
-      command: "harnx-proxy-auth --hook 'if .host == \"api.github.com\" then . end'"
+    - command: "harnx-proxy-auth --hook 'if .host == \"api.github.com\" then . end'"
 "#,
         );
         let mut out: Vec<u8> = Vec::new();
@@ -1483,7 +1472,7 @@ hooks:
         assert!(text.contains("--extra-rwx"), "{text}");
         assert!(text.contains("$GIT_ROOT"), "{text}");
         assert!(text.contains("EDITOR=true"), "{text}");
-        assert!(text.contains("[1] PreToolUse"), "{text}");
+        assert!(text.contains("[1] harnx-proxy-auth --hook"), "{text}");
         // The exact hook command string is preserved — this is what reveals
         // YAML-folding/arg-dropping problems in a real config.
         assert!(text.contains("harnx-proxy-auth --hook"), "{text}");

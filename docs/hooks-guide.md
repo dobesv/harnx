@@ -24,14 +24,33 @@ Hooks can be configured in three places depending on their intended scope:
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `event` | string | **Required.** The event that triggers the hook (e.g., `PreToolUse`). |
-| `type` | string | **Required.** The execution protocol: `claude-command` or `claude-command-persistent`. |
-| `matcher` | string | **Optional.** A regex matched against the bare `tool_name` for tool-related events. |
-| `command` | string | **Required.** The shell command or path to the executable to run. |
-| `timeout` | integer | **Optional.** Execution timeout in seconds (default: 30). |
+| `command` | string | **Required.** The shell command to run as a hook server. |
 | `status_message` | string | **Optional.** A message displayed to the user while the hook is running. |
 | `async` | boolean | **Optional.** If `true`, the hook runs in the background. Async hooks cannot block or mutate. |
 | `max_resume` | integer | **Optional.** (Top-level only) Maximum number of times a `Stop` hook can request a resume. |
+
+### Command-Only Model
+
+Hook configuration uses a **command-only** model: a hook entry specifies only the `command` to run (plus optional `status_message` and `async`). The command is a hook server binary that declares its own event, matcher, and other metadata.
+
+There are two types of hook servers:
+
+1. **Generic runner** (`harnx-claude-compatible-hook-server`): Wraps a child command and exposes it as a NATS hook server. It declares the event/matcher/etc. via CLI flags:
+   ```sh
+   harnx-claude-compatible-hook-server
+     --event <EVENT>              # Hook event (e.g., PreToolUse, PostToolUse)
+     --matcher <REGEX>            # Optional regex matched against bare tool name
+     --persistent                 # Keep one process alive across requests (optional)
+     --priority <N>               # Dispatch priority, lower runs first (default: 0)
+     --timeout <SECS>             # Execution timeout in seconds (optional)
+     --fail-policy <closed|open>  # Failure behavior (default: closed)
+     -- <CHILD_COMMAND>           # The actual hook script/binary to run
+   ```
+
+2. **Native hooks** (e.g., `harnx-proxy-auth`): Specialized binaries that implement the NATS hook protocol directly and self-declare their event/matcher via `Hook::hooks()`. They need no `--event`/`--matcher` flags:
+   ```sh
+   harnx-proxy-auth --hook <FILTER> --env <JSON> ...
+   ```
 
 ### Hook Location and Merging
 
@@ -40,6 +59,7 @@ Hooks can be configured in three places depending on their intended scope:
 *   **Agent Hooks**: Defined in an agent's YAML front-matter and scoped to the active session.
 *   **Merging**: Agent hooks extend the global list. If an agent hook has the same `event` and `matcher` as a global hook, the agent hook **replaces** the global one.
 *   **max_resume**: If set in an agent's front-matter, it overrides the global `max_resume` value.
+*   **Declaration Order**: Within each scope (global, tool-server, agent), hooks dispatch in config declaration order when priorities are equal.
 
 ## 3. Event Reference
 
@@ -62,9 +82,9 @@ Harnx supports the following events. Each event sends a JSON payload to the hook
 
 Hooks run as NATS hook services launched and managed by the worker-side `HookServerSupervisor`.
 
-### `claude-command` (One-shot)
+### One-shot Hooks (Generic Runner)
 
-The default one-shot hook type. Served over NATS using the generic `harnx-claude-compatible-hook-server` binary wrapper.
+The default one-shot hook type. Served over NATS using the generic `harnx-claude-compatible-hook-server` binary wrapper. Use `--event` and `--matcher` to specify when the hook fires:
 *   **Input**: The event payload is sent to the command's `stdin` as a single JSON object.
 *   **Output**: Harnx reads `stdout` for a JSON response (see Protocol below).
 *   **Control**:
@@ -72,15 +92,18 @@ The default one-shot hook type. Served over NATS using the generic `harnx-claude
     *   Exit code `2`: Block execution (equivalent to `permissionDecision: "deny"`).
     *   Other non-zero codes: Logged as errors, but execution usually continues.
 
-### `claude-command-persistent` (Persistent)
+### Persistent Hooks (Generic Runner with `--persistent`)
 
-Useful for hooks that maintain state or have high startup overhead. The persistent process is started by `HookServerSupervisor` and served over NATS via `harnx-claude-compatible-hook-server`.
+Useful for hooks that maintain state or have high startup overhead. The persistent process is started by `HookServerSupervisor` and served over NATS via `harnx-claude-compatible-hook-server --persistent`.
 *   **Protocol**: JSONL (JSON Lines) over `stdin` and `stdout`.
 *   **Correlation**: Each request from Harnx includes a unique `id` field. The hook must include the same `id` in its response line.
 
-### Native Auth Proxy (`harnx-proxy-auth`)
+### Native Hooks (`harnx-proxy-auth`)
 
-When a persistent hook specifies `harnx-proxy-auth` as its command executable, `HookServerSupervisor` detects the binary name and launches `harnx-proxy-auth` directly as a native NATS `PreToolUse` hook (matcher `exec|spawn`, default `FailPolicy::Closed`). It serves over NATS without requiring an external proxy wrapper.
+Native hook servers implement the NATS hook protocol directly and self-declare their event/matcher via `Hook::hooks()`. They need no `--event`/`--matcher` flags:
+
+*   `harnx-proxy-auth`: Self-declares `PreToolUse` with matcher `exec|spawn`.
+*   Served over NATS without requiring an external proxy wrapper.
 
 ### Async Hooks (`async: true`)
 
@@ -151,8 +174,7 @@ echo "{\"hookSpecificOutput\": {\"toolInput\": $NEW_INPUT}}"
 
 ### Hook Process Environment: `$HARNX_PACKAGE_DIR`
 
-Every hook command (both `claude-command` and `claude-command-persistent`) runs
-through a shell, and Harnx injects one extra environment variable:
+Every hook command runs through a shell, and Harnx injects one extra environment variable:
 
 | Variable | Value |
 |---|---|
@@ -196,7 +218,7 @@ The `resume` field is primarily used with the `Stop` event. It allows a hook to 
 
 ## 9. Persistent Hooks
 
-Persistent hooks (`type: claude-command-persistent`) use a JSONL-based protocol to avoid the overhead of spawning a new process for every event.
+Persistent hooks use a JSONL-based protocol to avoid the overhead of spawning a new process for every event. Use the `--persistent` flag on `harnx-claude-compatible-hook-server` to enable this mode:
 
 ### Request Format (Harnx to Hook)
 ```json
@@ -272,10 +294,7 @@ Injects AWS credentials into any `bash_exec` call.
 # config.yaml
 hooks:
   entries:
-    - event: PreToolUse
-      type: claude-command
-      matcher: bash_exec
-      command: "inject-aws-creds.sh"
+    - command: harnx-claude-compatible-hook-server --event PreToolUse --matcher bash_exec -- inject-aws-creds.sh
 ```
 
 **inject-aws-creds.sh:**
@@ -313,10 +332,7 @@ Prevents the use of `bash_exec` for security reasons.
 ```yaml
 hooks:
   entries:
-    - event: PreToolUse
-      type: claude-command
-      matcher: bash_exec
-      command: "exit 2"
+    - command: harnx-claude-compatible-hook-server --event PreToolUse --matcher bash_exec -- exit 2
       status_message: "Blocking bash_exec for safety"
 ```
 
@@ -327,9 +343,8 @@ Requires user approval before any tool runs. See the [Tool Confirmation Guide](t
 ```yaml
 hooks:
   entries:
-    - event: PreToolUse
-      type: claude-command
-      command: >-
+    - command: >-
+        harnx-claude-compatible-hook-server --event PreToolUse --
         printf '%s\n' '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Manual approval required"}}'
 ```
 
@@ -344,15 +359,12 @@ Input: {
 Allow this tool call? (y/N)
 ```
 
-The default is **No** (deny). Use `matcher` to limit confirmation to specific tools:
+The default is **No** (deny). Use `--matcher` to limit confirmation to specific tools:
 
 ```yaml
 hooks:
   entries:
-    - event: PreToolUse
-      type: claude-command
-      matcher: "bash_exec|bash_spawn"
-      command: "/path/to/ask-confirm.sh"
+    - command: harnx-claude-compatible-hook-server --event PreToolUse --matcher "bash_exec|bash_spawn" -- /path/to/ask-confirm.sh
 ```
 
 ### 5. Audit Logger (Async PostToolUse)
@@ -362,9 +374,7 @@ Logs all tool results to a file in the background.
 ```yaml
 hooks:
   entries:
-    - event: PostToolUse
-      type: claude-command
-      command: "tee -a tool_audit.log"
+    - command: harnx-claude-compatible-hook-server --event PostToolUse -- tee -a tool_audit.log
       async: true
 ```
 
@@ -374,7 +384,7 @@ The `harnx-proxy-auth` binary is a specialized persistent hook that solves the p
 
 ### Feature Overview
 
-It acts as a local HTTPS MITM (Man-in-the-Middle) proxy. When configured as a `claude-command-persistent` hook for `bash_exec` or `bash_spawn`, it:
+It acts as a local HTTPS MITM (Man-in-the-Middle) proxy. When configured as a hook for `bash_exec` or `bash_spawn`, it:
 1. Starts a local proxy server.
 2. Generates an ephemeral CA certificate.
 3. Injects proxy configuration environment variables into the tool's environment.
@@ -463,19 +473,16 @@ harnx-proxy-auth --hook '
 
 ### Hook Configuration
 
-Add it to your `config.yaml` as persistent hook for bash tools:
+Add it to your `config.yaml` as a hook for bash tools. `harnx-proxy-auth` is a native hook that self-declares `PreToolUse` with matcher `exec|spawn`:
 
 ```yaml
 hooks:
   entries:
-  - event: PreToolUse
-    type: claude-command-persistent
-    matcher: "bash_exec|bash_spawn"
-    command: >-
-      harnx-proxy-auth
-      --hook 'if (.host == "github.com" or .host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com")
-          then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
-          end'
+    - command: >-
+        harnx-proxy-auth
+        --hook 'if (.host == "github.com" or .host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com")
+            then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
+            end'
 ```
 
 ### Sentinel Environment Variable Injection (`--env`)
@@ -524,15 +531,12 @@ The `--env` script overrides `GITHUB_TOKEN` in the bash tool's environment with 
 ```yaml
 hooks:
   entries:
-  - event: PreToolUse
-    type: claude-command-persistent
-    matcher: "bash_exec|bash_spawn"
-    command: >-
-      harnx-proxy-auth
-      --env 'if (env.GITHUB_TOKEN // env.GH_TOKEN) then .GITHUB_TOKEN = "ghs_\($fake_base64_key)" else . end'
-      --hook 'if (.host == "api.github.com") and (.headers.authorization == "Bearer ghs_\($fake_base64_key)")
-          then .headers.authorization = bearer(env.GITHUB_TOKEN // env.GH_TOKEN)
-          else . end'
+    - command: >-
+        harnx-proxy-auth
+        --env 'if (env.GITHUB_TOKEN // env.GH_TOKEN) then .GITHUB_TOKEN = "ghs_\($fake_base64_key)" else . end'
+        --hook 'if (.host == "api.github.com") and (.headers.authorization == "Bearer ghs_\($fake_base64_key)")
+            then .headers.authorization = bearer(env.GITHUB_TOKEN // env.GH_TOKEN)
+            else . end'
 ```
 
 ### Atlassian CLI (`acli`) Example
@@ -571,14 +575,11 @@ No manual environment variables are required as long as you have logged in with 
 ```yaml
 hooks:
   entries:
-  - event: PreToolUse
-    type: claude-command-persistent
-    matcher: "exec|spawn"
-    command: >-
-      harnx-proxy-auth
-      --fs '{"harnx-fs-acli/acli/.keep": ""}'
-      --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
-      --hook "$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py"
+    - command: >-
+        harnx-proxy-auth
+        --fs '{"harnx-fs-acli/acli/.keep": ""}'
+        --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
+        --hook "$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py"
 ```
 
 The hook sources the token from the platform keyring automatically (`secret-tool` on Linux, `security find-generic-password` on macOS); set `HARNX_JIRA_TOKEN_CMD` to use a different secret store.
@@ -590,16 +591,13 @@ You can combine Atlassian and GitHub auth in a single `harnx-proxy-auth` invocat
 ```yaml
 hooks:
   entries:
-  - event: PreToolUse
-    type: claude-command-persistent
-    matcher: "exec|spawn"
-    command: >-
-      harnx-proxy-auth
-      --hook 'if .host == "github.com" and (env.GITHUB_TOKEN // env.GH_TOKEN) != null then .headers.authorization = "Basic \(["x-access-token", (env.GITHUB_TOKEN // env.GH_TOKEN)] | join(":") | @base64)" end'
-      --hook 'if (.host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com") and (env.GITHUB_TOKEN // env.GH_TOKEN) != null then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)" end'
-      --fs '{"harnx-fs-acli/acli/.keep": ""}'
-      --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
-      --hook "$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py"
+    - command: >-
+        harnx-proxy-auth
+        --hook 'if .host == "github.com" and (env.GITHUB_TOKEN // env.GH_TOKEN) != null then .headers.authorization = "Basic \(["x-access-token", (env.GITHUB_TOKEN // env.GH_TOKEN)] | join(":") | @base64)" end'
+        --hook 'if (.host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com") and (env.GITHUB_TOKEN // env.GH_TOKEN) != null then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)" end'
+        --fs '{"harnx-fs-acli/acli/.keep": ""}'
+        --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
+        --hook "$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py"
 ```
 
 ### Injected Environment Variables
@@ -643,7 +641,7 @@ NATS hook servers register their capabilities in a JetStream Key-Value bucket an
 * **Registry Bucket**: `harnx_hook_registry` (constant `HOOK_REGISTRY_BUCKET`).
 * **Registration**: Hook servers publish a `HookRegistration` payload containing their server ID, registered `HookSpec` list, `schema_version`, and `proto_version`. Registrations feature a 60-second TTL refreshed every 30 seconds.
 * **Subject Scheme**: `{instance}.hook.{server}.{event}`.
-* **Request/Reply**: `NatsHookProvider` queries active registrations, matches events against configured matchers (regex on bare tool names like `bash_exec`), orders matching hooks by priority ascending (with registration-timestamp tiebreaks), and posts `HookPayload` requests to collect `HookOutcome` replies.
+* **Request/Reply**: `NatsHookProvider` queries active registrations, matches events against configured matchers (regex on bare tool names like `bash_exec`), orders matching hooks by ascending priority, then by registered server name (supervisor-assigned nonce), then by discovery-list index, and posts `HookPayload` requests to collect `HookOutcome` replies.
 
 ### Event Processing and Capabilities
 
@@ -666,6 +664,17 @@ Each hook specification registers a `fail_policy`:
 * `Open` (`"open"`): Logs errors and permits execution to continue.
 
 To prevent fail-open security gaps if a required closed hook fails to start or crashes mid-session, Harnx uses an expectation manifest bucket (`harnx_hook_expectations`). `HookServerSupervisor` registers required closed hooks in the expectations manifest upon launch. If a required closed hook server process fails to start or exits unexpectedly, `NatsHookProvider` checks expectations against live registry entries and **blocks** tool execution rather than silently bypassing the missing hook.
+
+### Fail-Closed-on-Failure
+
+When a hook server with `fail_policy: closed` fails to start or crashes:
+
+* **UserPromptSubmit** and **PreToolUse** events are blocked.
+* A synthetic "rejector" server is published with the hook's name suffixed by `-rejector`.
+* The rejector's display label is prefixed with `hook server failed to start:` and includes the `status_message` (or a truncated command if no status_message).
+* This ensures security-critical hooks (like auth injection) never silently bypass.
+
+Hooks with `fail_policy: open` do not block on failure — errors are logged and execution continues.
 
 ### Standalone Utility Exception (`harnx-sandbox-run`)
 
