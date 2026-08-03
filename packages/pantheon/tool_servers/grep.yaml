@@ -1,9 +1,5 @@
-command: harnx-mcp-bridge
+command: harnx-grep-tools
 description: >-
   GitHub code search via grep.app. Used by Pytheas, Sisyphus, and Zosimus
   to find real-world usage examples of APIs and patterns in public repos.
-args:
-  - --name
-  - grep
-  - --
-  - harnx-vercel-grep-server
+args: []

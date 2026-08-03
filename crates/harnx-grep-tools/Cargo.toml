@@ -1,0 +1,29 @@
+[package]
+name = "harnx-grep-tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Toolset server for GitHub code search through grep.app (also supports MCP stdio via --mcp-stdio)"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+fancy-regex = { workspace = true }
+harnx-toolset = { path = "../harnx-toolset" }
+harnx-toolset-server = { path = "../harnx-toolset-server" }
+log = { workspace = true }
+reqwest = { workspace = true, features = ["query"] }
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+
+[[bin]]
+name = "harnx-grep-tools"
+path = "src/main.rs"

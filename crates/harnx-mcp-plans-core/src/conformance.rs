@@ -51,7 +51,7 @@
 //!
 //! ```ignore
 //! use harnx_mcp_plans_core::conformance::{run_conformance, BackendCapabilities};
-//! use harnx_mcp_plans::FilePlanStore;
+//! use harnx_plans_tools::FilePlanStore;
 //!
 //! #[tokio::test]
 //! async fn file_store_conformance() {

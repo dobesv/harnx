@@ -2,7 +2,7 @@
 
 ## Overview
 
-`harnx-sandbox-run` is a standalone utility to run arbitrary commands inside the [birdcage](https://github.com/phylum-dev/birdcage) filesystem sandbox. It provides the same sandboxing defaults and configuration as `harnx-mcp-bash`, but as a general-purpose wrapper for any CLI tool.
+`harnx-sandbox-run` is a standalone utility to run arbitrary commands inside the [birdcage](https://github.com/phylum-dev/birdcage) filesystem sandbox. It provides the same sandboxing defaults and configuration as `harnx-bash-tools`, but as a general-purpose wrapper for any CLI tool.
 
 This is particularly useful for running AI coding agents (like Claude Code or the Gemini CLI) safely. By running them inside the sandbox, you can bypass their internal permission prompts while maintaining a strict, verifiable safety boundary at the OS level.
 
@@ -269,7 +269,7 @@ which -a node         # confirm the shim appears before the real tool
 
 ## Environment Variables
 
-These match the `harnx-mcp-bash` environment variables, so the same shell profile settings work for both:
+These match the `harnx-bash-tools` environment variables, so the same shell profile settings work for both:
 
 | Variable | Format | Effect |
 | :--- | :--- | :--- |
@@ -289,7 +289,7 @@ Paths support `~` expansion and project-root pseudo-variables. CLI flags and env
 
 By default, `harnx-sandbox-run` grants access to a curated set of system paths and common developer tools (like `cargo`, `npm`, and `git`).
 
-For the full list of default paths, see the [Bash MCP Server documentation](bash-mcp-server.md#default-environment-allowlist).
+For the full list of default paths, see the [Bash toolset server documentation](bash-mcp-server.md#default-environment-allowlist).
 
 ### Current directory
 

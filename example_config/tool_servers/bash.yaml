@@ -1,7 +1,7 @@
-command: harnx-mcp-bridge
+command: harnx-bash-tools
 description: >-
   Allow the agent to run commands or script snippets
-# Runs bridged over NATS. --default-root-cwd binds the sandbox to the process
+# Runs as a native toolset server. --default-root-cwd binds the sandbox to the process
 # CWD (the user's repo), keeping the $HOME guard; the sandbox stays enabled.
 #
 # NOTE: Many home-directory paths are already whitelisted by default and do NOT
@@ -15,10 +15,6 @@ description: >-
 # grant write access for operations like cargo install, nvm install, pyenv
 # install, rye sync, or claude update.
 args:
-  - --name
-  - bash
-  - --
-  - harnx-mcp-bash
   - --default-root-cwd
   # Allow access to rustup-managed toolchains
   - --extra-exec

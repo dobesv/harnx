@@ -50,7 +50,7 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
     let mut args: Vec<OsString> = Vec::new();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    // Default whitelist — same paths that harnx-mcp-bash uses
+    // Default whitelist — same paths that harnx-bash-tools uses
     if use_defaults {
         for path in SYSTEM_EXEC_PATHS {
             let p = std::path::PathBuf::from(path);

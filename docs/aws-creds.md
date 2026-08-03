@@ -1,10 +1,10 @@
 # harnx-aws-creds
 
-`harnx-aws-creds` is a persistent hook that injects AWS credentials into sandboxed processes. It runs as a sidecar alongside `harnx-mcp-bash` or `harnx-sandbox-run`, resolving credentials from the host and making them available inside the sandbox without mounting `~/.aws` or leaking raw key material.
+`harnx-aws-creds` is a persistent hook that injects AWS credentials into sandboxed processes. It runs as a sidecar alongside `harnx-bash-tools` or `harnx-sandbox-run`, resolving credentials from the host and making them available inside the sandbox without mounting `~/.aws` or leaking raw key material.
 
 ## The Problem It Solves
 
-The birdcage sandbox blocks access to `~/.aws`, and the bash MCP server strips `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` from the child environment by default (they're not in the allowlist). Without `harnx-aws-creds`, any AWS CLI or SDK call inside the sandbox fails with "no credentials found".
+The birdcage sandbox blocks access to `~/.aws`, and the bash toolset server strips `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` from the child environment by default (they're not in the allowlist). Without `harnx-aws-creds`, any AWS CLI or SDK call inside the sandbox fails with "no credentials found".
 
 ## How It Works
 
@@ -35,7 +35,7 @@ harnx-sandbox-run --hook claude-command-persistent harnx-aws-creds \; -- aws s3 
 harnx-sandbox-run --hook claude-command-persistent harnx-aws-creds --profile my-profile \; -- aws s3 ls
 ```
 
-### With `harnx-mcp-bash` (via agent config)
+### With `harnx-bash-tools` (via agent config)
 
 In your agent's YAML config:
 
@@ -93,6 +93,6 @@ If omitted, the AWS SDK default credential chain applies:
 - Credentials are fetched on-demand from the provider, so short-lived credentials (STS, SSO) are refreshed automatically
 - `~/.aws` is never mounted into the sandbox — the credential files remain inaccessible to the sandboxed process
 
-## Relationship to `harnx-mcp-bash`
+## Relationship to `harnx-bash-tools`
 
-When `harnx-mcp-bash` runs a command in the sandbox, it strips most environment variables (including `AWS_*`) from the child process to prevent accidental credential leakage. `harnx-aws-creds` is the approved re-injection path: it uses the hook mechanism to add only the container credential protocol variables, which point to a localhost proxy rather than exposing raw keys.
+When `harnx-bash-tools` runs a command in the sandbox, it strips most environment variables (including `AWS_*`) from the child process to prevent accidental credential leakage. `harnx-aws-creds` is the approved re-injection path: it uses the hook mechanism to add only the container credential protocol variables, which point to a localhost proxy rather than exposing raw keys.

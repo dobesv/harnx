@@ -78,8 +78,8 @@ See the [Agent Guide](agent-guide.md) for full details.
 
 ## How do `fs` and `bash` tool servers handle path roots and directory access?
 
-`fs` (`harnx-fs-tools`) runs directly as a toolset server and `bash` runs bridged via `harnx-mcp-bridge` in `tool_servers/`. Directory bounding relies on CLI flags and explicit config:
+`fs` (`harnx-fs-tools`) and `bash` (`harnx-bash-tools`) run directly as native toolset servers in `tool_servers/`. Directory bounding relies on CLI flags and explicit config:
 
-- **CWD root default (`--default-root-cwd`):** In `tool_servers/`, `harnx-fs-tools` and `harnx-mcp-bash` use `--default-root-cwd`. When no explicit roots are specified, this seeds an allowed root from the process working directory (which inherits the workspace CWD).
+- **CWD root default (`--default-root-cwd`):** In `tool_servers/`, `harnx-fs-tools` and `harnx-bash-tools` use `--default-root-cwd`. When no explicit roots are specified, this seeds an allowed root from the process working directory (which inherits the workspace CWD).
 - **`$HOME` guard:** If the working directory is `$HOME` or an ancestor of `$HOME` (or if `$HOME` is unset or unresolvable), CWD seeding is skipped. Access is denied with a stderr warning to prevent exposing your home directory.
-- **Explicit paths:** For specific directory access, pass `--root <PATH>` to `fs` or `bash`. `harnx-mcp-bash` also supports `--extra-read`, `--extra-write`, `--extra-exec`, and `--extra-rwx` flags (or `HARNX_BASH_EXTRA_*` environment variables). Explicit path options take precedence over `--default-root-cwd`.
+- **Explicit paths:** For specific directory access, pass `--root <PATH>` to `fs` or `bash`. `harnx-bash-tools` also supports `--extra-read`, `--extra-write`, `--extra-exec`, and `--extra-rwx` flags (or `HARNX_BASH_EXTRA_*` environment variables). Explicit path options take precedence over `--default-root-cwd`.

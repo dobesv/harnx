@@ -42,7 +42,7 @@ Harnx can load environment variables from a `.env` file located in the data dire
 
 - **HARNX_CONFIG_DIR**: The directory for configuration files.
 - **HARNX_ENV_FILE**: Path to the `.env` credentials file. Defaults to `~/.local/share/harnx/.env`.
-- **HARNX_BASH_ENV_FILE**: Path to the `.env.bash` credentials file used by the bash MCP server. Defaults to `~/.local/share/harnx/.env.bash`.
+- **HARNX_BASH_ENV_FILE**: Path to the `.env.bash` credentials file used by the bash toolset server. Defaults to `~/.local/share/harnx/.env.bash`.
 - **HARNX_CONFIG_FILE**: The path to the configuration file.
 - **HARNX_SESSIONS_DIR**: The directory for sessions.
 - **HARNX_RAGS_DIR**: The directory for RAG data.
@@ -75,9 +75,9 @@ Harnx can load environment variables from a `.env` file located in the data dire
   message history the harness built is responsible. The file is appended,
   not truncated, so set a fresh path per session.
 
-## Bash MCP Server Envs
+## Bash Toolset Server Envs
 
-These are honored by **both** `harnx-mcp-bash` (for `bash_exec` child processes) and `harnx-sandbox-run` — so they apply not only to the bash tool but to any MCP server launched through a sandbox-wrapped `npx`/`node` shim (e.g. the Exa server, whose environment would otherwise be scrubbed). The same shell-profile settings work for both.
+These are honored by **both** `harnx-bash-tools` (for `bash_exec` child processes) and `harnx-sandbox-run` — so they apply not only to the bash tool but to any MCP server launched through a sandbox-wrapped `npx`/`node` shim (e.g. the Exa server, whose environment would otherwise be scrubbed). The same shell-profile settings work for both.
 
 - **HARNX_BASH_ENV_PASSTHROUGH**: Comma-separated list of extra host env var names to forward into the sandbox (e.g. so the Exa MCP server receives `EXA_API_KEY`). Example: `HARNX_BASH_ENV_PASSTHROUGH=GITHUB_TOKEN,SSH_AUTH_SOCK`.
 - **HARNX_BASH_EXTRA_READABLE**: Colon-separated extra sandbox read-only paths.

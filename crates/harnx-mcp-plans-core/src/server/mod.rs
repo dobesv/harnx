@@ -111,7 +111,7 @@ impl TargetPolicy {
 }
 
 pub const DEFAULT_SERVER_META: ServerMeta = ServerMeta::new(
-    "harnx-mcp-plans",
+    "harnx-plans-tools",
     "File-based plan/task/note management server using markdown + YAML front matter",
 );
 

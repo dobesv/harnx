@@ -3499,6 +3499,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-bash-tools"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "fancy-regex 0.19.0",
+ "gix",
+ "harnx-core",
+ "harnx-mcp",
+ "harnx-mcp-history",
+ "harnx-sandbox-common",
+ "harnx-toolset",
+ "harnx-toolset-server",
+ "libc",
+ "log",
+ "process-wrap",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "harnx-claude-compatible-hook-server"
 version = "0.33.4"
 dependencies = [
@@ -3657,6 +3684,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-grep-tools"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "fancy-regex 0.19.0",
+ "harnx-toolset",
+ "harnx-toolset-server",
+ "log",
+ "reqwest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "wiremock",
+]
+
+[[package]]
 name = "harnx-hooks"
 version = "0.33.4"
 dependencies = [
@@ -3744,29 +3790,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "harnx-mcp-bash"
-version = "0.33.4"
-dependencies = [
- "anyhow",
- "fancy-regex 0.19.0",
- "gix",
- "harnx-core",
- "harnx-mcp",
- "harnx-mcp-history",
- "harnx-sandbox-common",
- "libc",
- "log",
- "process-wrap",
- "rmcp",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "harnx-mcp-bridge"
 version = "0.33.4"
 dependencies = [
@@ -3798,26 +3821,6 @@ dependencies = [
  "shell-words",
  "tempfile",
  "tokio",
-]
-
-[[package]]
-name = "harnx-mcp-plans"
-version = "0.33.4"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "filetime",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "serde_yaml",
- "similar 3.1.1",
- "tempfile",
- "tokio",
- "tokio-util",
- "tower",
 ]
 
 [[package]]
@@ -3930,6 +3933,29 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "harnx-plans-tools"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "filetime",
+ "harnx-toolset",
+ "harnx-toolset-server",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "similar 3.1.1",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower",
 ]
 
 [[package]]
@@ -4276,21 +4302,6 @@ dependencies = [
  "tokio-test",
  "unicode-width 0.2.2",
  "uuid",
-]
-
-[[package]]
-name = "harnx-vercel-grep-server"
-version = "0.33.4"
-dependencies = [
- "anyhow",
- "fancy-regex 0.19.0",
- "log",
- "reqwest",
- "rmcp",
- "serde",
- "serde_json",
- "tokio",
- "wiremock",
 ]
 
 [[package]]
