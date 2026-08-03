@@ -457,7 +457,7 @@
       supports_tool_use: true
       endpoint: responses
     - name: gpt-5.4-mini
-      max_input_tokens: 1050000
+      max_input_tokens: 272000
       max_output_tokens: 128000
       input_price: 0.75
       output_price: 4.5
@@ -465,7 +465,7 @@
       supports_tool_use: true
       endpoint: responses
     - name: gpt-5.4-mini-2026-03-17
-      max_input_tokens: 1050000
+      max_input_tokens: 272000
       max_output_tokens: 128000
       input_price: 0.75
       output_price: 4.5
@@ -473,7 +473,7 @@
       supports_tool_use: true
       endpoint: responses
     - name: gpt-5.4-nano
-      max_input_tokens: 1050000
+      max_input_tokens: 272000
       max_output_tokens: 128000
       input_price: 0.2
       output_price: 1.25
@@ -481,7 +481,7 @@
       supports_tool_use: true
       endpoint: responses
     - name: gpt-5.4-nano-2026-03-17
-      max_input_tokens: 1050000
+      max_input_tokens: 272000
       max_output_tokens: 128000
       input_price: 0.2
       output_price: 1.25
@@ -515,8 +515,8 @@
     - name: gpt-5.6-luna
       max_input_tokens: 1050000
       max_output_tokens: 128000
-      input_price: 1
-      output_price: 6
+      input_price: 0.2
+      output_price: 1.2
       supports_vision: true
       supports_tool_use: true
       endpoint: responses
@@ -542,8 +542,8 @@
     - name: gpt-5.6-terra
       max_input_tokens: 1050000
       max_output_tokens: 128000
-      input_price: 2.5
-      output_price: 15
+      input_price: 2
+      output_price: 12
       supports_vision: true
       supports_tool_use: true
       endpoint: responses
