@@ -43,5 +43,7 @@ pub use daemon::{
     new_remote_session_id, notify_subject, publish_session_activate, run_worker_daemon,
     worker_ready_subject, SessionActivate, WorkerDaemonConfig,
 };
+#[doc(hidden)]
+pub use hook_supervisor::publish_crash_rejector;
 pub use hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 pub use tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};

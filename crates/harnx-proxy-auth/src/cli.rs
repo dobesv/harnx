@@ -2,6 +2,10 @@ use clap::Parser;
 
 #[derive(Debug, Parser)]
 pub struct Args {
+    /// Hook server name assigned by the supervisor.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
     /// jq/jaq filter or exec hook applied to each request. Input is a JSON
     /// object with fields: host, path, method, headers (object of lowercase
     /// header names). Output should be same object, optionally with headers

@@ -70,7 +70,14 @@ pub async fn discover_process_nats_hook_provider(config: &Config) -> Option<Arc<
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveredHook {
     pub server: String,
+    pub display_label: Option<String>,
     pub spec: HookSpec,
+}
+
+impl DiscoveredHook {
+    fn label(&self) -> &str {
+        self.display_label.as_deref().unwrap_or(&self.server)
+    }
 }
 
 #[async_trait]
@@ -394,7 +401,7 @@ async fn dispatch_pre_tool_use_with(params: PreHookDispatch<'_>, event: &HookEve
         let payload = match serde_json::to_vec(&payload) {
             Ok(payload) => payload,
             Err(error) => {
-                return unavailable_outcome(&hook.server, hook.spec.fail_policy, error);
+                return unavailable_outcome(hook, hook.spec.fail_policy, error);
             }
         };
         let subject = params.instance_id.hook_subject(&hook.server, "PreToolUse");
@@ -406,10 +413,14 @@ async fn dispatch_pre_tool_use_with(params: PreHookDispatch<'_>, event: &HookEve
         let outcome = match params.dispatcher.request(subject, payload, timeout).await {
             Ok(outcome) => outcome,
             Err(error) if hook.spec.fail_policy == FailPolicy::Open => {
-                log::warn!("{} hook unavailable; continuing: {error:#}", hook.server);
+                log::warn!(
+                    "{} hook unavailable (route {}); continuing: {error:#}",
+                    hook.label(),
+                    hook.server
+                );
                 continue;
             }
-            Err(error) => return unavailable_outcome(&hook.server, FailPolicy::Closed, error),
+            Err(error) => return unavailable_outcome(hook, FailPolicy::Closed, error),
         };
 
         match outcome.control {
@@ -449,7 +460,7 @@ async fn dispatch_blocking_event_with(params: EventDispatch<'_>, event: &HookEve
         let payload = match serde_json::to_vec(&payload) {
             Ok(payload) => payload,
             Err(error) => {
-                return unavailable_outcome(&hook.server, hook.spec.fail_policy, error);
+                return unavailable_outcome(hook, hook.spec.fail_policy, error);
             }
         };
         let subject = params
@@ -463,10 +474,14 @@ async fn dispatch_blocking_event_with(params: EventDispatch<'_>, event: &HookEve
         let outcome = match params.dispatcher.request(subject, payload, timeout).await {
             Ok(outcome) => outcome,
             Err(error) if hook.spec.fail_policy == FailPolicy::Open => {
-                log::warn!("{} hook unavailable; continuing: {error:#}", hook.server);
+                log::warn!(
+                    "{} hook unavailable (route {}); continuing: {error:#}",
+                    hook.label(),
+                    hook.server
+                );
                 continue;
             }
-            Err(error) => return unavailable_outcome(&hook.server, FailPolicy::Closed, error),
+            Err(error) => return unavailable_outcome(hook, FailPolicy::Closed, error),
         };
 
         let texts = [
@@ -500,6 +515,7 @@ async fn dispatch_one_best_effort_hook(
     params: BestEffortHookDispatch,
 ) {
     let server = &params.hook.server;
+    let label = params.hook.label();
     let event_name = params.payload.hook_event.event_name();
     let timeout = params
         .hook
@@ -510,9 +526,10 @@ async fn dispatch_one_best_effort_hook(
     let payload = match serde_json::to_vec(&params.payload) {
         Ok(payload) => payload,
         Err(error) => {
-            emit_post_notice(format!(
-                "{server} hook request could not be serialized: {error}"
-            ));
+            emit_post_notice(
+                format!("{label} hook request could not be serialized: {error}"),
+                server,
+            );
             return;
         }
     };
@@ -523,16 +540,22 @@ async fn dispatch_one_best_effort_hook(
                 FailPolicy::Closed => "fail-closed",
                 FailPolicy::Open => "fail-open",
             };
-            emit_post_notice(format!("{server} hook unavailable ({policy}): {error:#}"));
+            emit_post_notice(
+                format!("{label} hook unavailable ({policy}): {error:#}"),
+                server,
+            );
             return;
         }
     };
 
     if !matches!(outcome.control, HookResultControl::Continue) {
-        emit_post_notice(format!(
-            "{server} hook returned {:?} during best-effort {event_name} dispatch",
-            outcome.control
-        ));
+        emit_post_notice(
+            format!(
+                "{label} hook returned {:?} during best-effort {event_name} dispatch",
+                outcome.control
+            ),
+            server,
+        );
     }
     if outcome.result.mutated_tool_input.is_some() || outcome.result.mutated_tool_response.is_some()
     {
@@ -606,25 +629,27 @@ fn continue_outcome(mutated_tool_input: Option<serde_json::Value>) -> HookOutcom
 }
 
 fn unavailable_outcome(
-    server: &str,
+    hook: &DiscoveredHook,
     fail_policy: FailPolicy,
     error: impl std::fmt::Display,
 ) -> HookOutcome {
+    let label = hook.label();
+    let server = &hook.server;
     if fail_policy == FailPolicy::Open {
-        log::warn!("{server} hook unavailable; continuing: {error}");
+        log::warn!("{label} hook unavailable (route {server}); continuing: {error}");
         return continue_outcome(None);
     }
-    log::warn!("{server} hook unavailable; blocking: {error}");
+    log::warn!("{label} hook unavailable (route {server}); blocking: {error}");
     HookOutcome {
         control: HookResultControl::Block {
-            reason: format!("{server} hook unavailable"),
+            reason: format!("{label} hook unavailable"),
         },
         result: HookResult::default(),
     }
 }
 
-fn emit_post_notice(message: String) {
-    log::warn!("{message}");
+fn emit_post_notice(message: String, server: &str) {
+    log::warn!("{message} (route {server})");
     harnx_core::sink::emit_agent_event(AgentEvent::Notice(NoticeEvent::Error(message)));
 }
 
@@ -632,19 +657,24 @@ fn hooks_or_fail_closed_guard(snapshot: Result<Vec<DiscoveredHook>>) -> Vec<Disc
     match snapshot {
         Ok(hooks) => hooks,
         Err(error) => {
-            log::warn!(
-                "NATS hook discovery failed; installing fail-closed PreToolUse guard: {error:#}"
-            );
-            vec![DiscoveredHook {
+            log::warn!("NATS hook discovery failed; installing fail-closed gate guards: {error:#}");
+            [
+                ("UserPromptSubmit", None),
+                ("PreToolUse", Some(".*".to_string())),
+            ]
+            .into_iter()
+            .map(|(event, matcher)| DiscoveredHook {
                 server: "hook-registry-unavailable".to_string(),
+                display_label: None,
                 spec: HookSpec {
-                    event: "PreToolUse".to_string(),
-                    matcher: Some(".*".to_string()),
+                    event: event.to_string(),
+                    matcher,
                     priority: i32::MIN,
                     timeout_secs: Some(1),
                     fail_policy: FailPolicy::Closed,
                 },
-            }]
+            })
+            .collect()
         }
     }
 }
@@ -727,6 +757,7 @@ async fn bucket_snapshot(
         }
         hooks.extend(registration.hooks.into_iter().map(|spec| DiscoveredHook {
             server: registration.server.clone(),
+            display_label: registration.display_label.clone(),
             spec,
         }));
     }
@@ -788,6 +819,7 @@ mod tests {
     fn hook(server: &str, event: &str, matcher: Option<&str>, priority: i32) -> DiscoveredHook {
         DiscoveredHook {
             server: server.to_string(),
+            display_label: None,
             spec: HookSpec {
                 event: event.to_string(),
                 matcher: matcher.map(str::to_string),
@@ -879,9 +911,10 @@ mod tests {
     #[test]
     fn priority_sort_uses_server_then_registry_order_as_tiebreakers() {
         let hooks = vec![
-            hook("zeta", "PreToolUse", None, 10),
-            hook("alpha", "PreToolUse", None, 10),
-            hook("alpha", "PreToolUse", None, 10),
+            hook("hook-a1b2c3d4-010", "PreToolUse", None, 10),
+            hook("hook-a1b2c3d4-002", "PreToolUse", None, 10),
+            hook("hook-a1b2c3d4-001", "PreToolUse", None, 10),
+            hook("hook-a1b2c3d4-002", "PreToolUse", None, 10),
             hook("later", "PreToolUse", None, 20),
             hook("first", "PreToolUse", None, -1),
         ];
@@ -895,14 +928,15 @@ mod tests {
             positions,
             [
                 ("first", -1),
-                ("alpha", 10),
-                ("alpha", 10),
-                ("zeta", 10),
+                ("hook-a1b2c3d4-001", 10),
+                ("hook-a1b2c3d4-002", 10),
+                ("hook-a1b2c3d4-002", 10),
+                ("hook-a1b2c3d4-010", 10),
                 ("later", 20),
             ]
         );
-        assert!(std::ptr::eq(selected[1], &hooks[1]));
-        assert!(std::ptr::eq(selected[2], &hooks[2]));
+        assert!(std::ptr::eq(selected[2], &hooks[1]));
+        assert!(std::ptr::eq(selected[3], &hooks[3]));
     }
 
     #[tokio::test]
@@ -1378,23 +1412,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_read_failure_guard_blocks_pre_tool_use() {
+    async fn discovery_read_failure_guard_blocks_both_gate_events() {
         let hooks = hooks_or_fail_closed_guard(Err(anyhow::anyhow!("KV read failed")));
+        assert_eq!(hooks.len(), 2);
         let dispatcher = stub(Vec::new());
         let provider =
             NatsHookProvider::from_dispatcher(InstanceId::from_string("test"), hooks, dispatcher);
-        let outcome = provider
+        let meta = || HookDispatchMeta {
+            session_id: "session".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            resume_count: 0,
+        };
+
+        let prompt_outcome = provider
             .dispatch_event(
-                pre_event(json!({"command": "true"})),
-                None,
-                HookDispatchMeta {
-                    session_id: "session".to_string(),
-                    cwd: PathBuf::from("/tmp"),
-                    resume_count: 0,
+                HookEvent::UserPromptSubmit {
+                    prompt: "continue?".to_string(),
                 },
+                None,
+                meta(),
             )
             .await;
+        let tool_outcome = provider
+            .dispatch_event(pre_event(json!({"command": "true"})), None, meta())
+            .await;
 
-        assert!(matches!(outcome.control, HookResultControl::Block { .. }));
+        assert!(matches!(
+            prompt_outcome.control,
+            HookResultControl::Block { .. }
+        ));
+        assert!(matches!(
+            tool_outcome.control,
+            HookResultControl::Block { .. }
+        ));
     }
 }

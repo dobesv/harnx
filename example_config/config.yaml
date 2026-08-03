@@ -42,20 +42,14 @@ toolsets:
 # ---- hooks ----
 # hooks:
 #   entries:
-#   - event: PreToolUse
-#     type: claude-command
-#     matcher: "Bash"
-#     command: "dcg"
+#   - command: harnx-claude-compatible-hook-server --event PreToolUse --matcher "bash_exec|bash_spawn" -- dcg
 #
 # Example: Mutate tool input via hookSpecificOutput.toolInput
 # This shows how a PreToolUse hook can inject environment variables into Bash calls.
 #
 # hooks:
 #   entries:
-#   - event: PreToolUse
-#     type: claude-command
-#     matcher: "Bash"
-#     command: "/path/to/inject-env-hook.sh"
+#   - command: harnx-claude-compatible-hook-server --event PreToolUse --matcher "bash_exec|bash_spawn" -- /path/to/inject-env-hook.sh
 #
 # The inject-env-hook.sh script would look like:
 #   #!/usr/bin/env python3
@@ -94,10 +88,7 @@ toolsets:
 #
 # hooks:
 #   entries:
-#   - event: PreToolUse
-#     type: claude-command-persistent
-#     matcher: "bash_exec|bash_spawn"
-#     command: >-
+#   - command: >-
 #       harnx-proxy-auth
 #       --env 'if env.GITHUB_TOKEN then .GITHUB_TOKEN = "ghp_\($fake_base64_key)" end'
 #       --hook 'if .host == "github.com"
@@ -126,10 +117,7 @@ toolsets:
 #
 # hooks:
 #   entries:
-#   - event: PreToolUse
-#     type: claude-command-persistent
-#     matcher: "bash_exec|bash_spawn"
-#     command: >-
+#   - command: >-
 #       harnx-proxy-auth
 #       --hook ./example_config/github-app-auth-hook.py
 #       # Inline shebang script content also works.
@@ -142,10 +130,7 @@ toolsets:
 #
 # hooks:
 #   entries:
-#   - event: PreToolUse
-#     type: claude-command-persistent
-#     matcher: "bash_exec|bash_spawn"
-#     command: >-
+#   - command: >-
 #       harnx-proxy-auth
 #       --fs '{"harnx-fs-acli/acli/.keep": ""}'
 #       --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
@@ -175,10 +160,7 @@ toolsets:
 #
 # hooks:
 #   entries:
-#   - event: PreToolUse
-#     type: claude-command-persistent
-#     matcher: "bash_exec|bash_spawn"
-#     command: >-
+#   - command: >-
 #       harnx-proxy-auth
 #       --env '{"GCE_METADATA_HOST":"127.0.0.1:\($proxy_port)","METADATA_SERVER_DETECTION":"assume-present"}'
 #       # Optional: add GOOGLE_CLOUD_PROJECT in same --env object.

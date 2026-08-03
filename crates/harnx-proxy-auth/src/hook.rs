@@ -10,6 +10,8 @@ use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 pub const SERVER_NAME: &str = "proxy-auth";
 
+pub use harnx_hookset::HARNX_HOOK_NAME as HARNX_HOOK_NAME_ENV;
+
 #[derive(Deserialize)]
 struct HookRequest {
     id: String,
@@ -33,14 +35,21 @@ struct HookSpecificOutput {
 
 /// Persistent proxy and startup environment exposed as a NATS PreToolUse hook.
 pub struct ProxyAuthHook {
+    name: String,
     proxy_port: u16,
     ca_cert_path: String,
     extra_env: Map<String, Value>,
 }
 
 impl ProxyAuthHook {
-    pub fn new(proxy_port: u16, ca_cert_path: PathBuf, extra_env: Map<String, Value>) -> Self {
+    pub fn new(
+        name: String,
+        proxy_port: u16,
+        ca_cert_path: PathBuf,
+        extra_env: Map<String, Value>,
+    ) -> Self {
         Self {
+            name,
             proxy_port,
             ca_cert_path: ca_cert_path.to_string_lossy().into_owned(),
             extra_env,
@@ -51,7 +60,7 @@ impl ProxyAuthHook {
 #[async_trait]
 impl Hook for ProxyAuthHook {
     fn name(&self) -> &str {
-        SERVER_NAME
+        &self.name
     }
 
     fn hooks(&self) -> Vec<HookSpec> {

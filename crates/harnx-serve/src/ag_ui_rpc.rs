@@ -877,7 +877,7 @@ mod tests {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent_with_front_matter(
             "plain",
-            "model: openai:gpt-4o\nuse_tools: harnx_agent_session_history_read\nhooks:\n  entries:\n    - event: PreToolUse\n      matcher: ^harnx_agent_session_history_read$\n      type: claude-command\n      command: |\n        printf '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"approval required\"}}'",
+            "model: openai:gpt-4o\nuse_tools: harnx_agent_session_history_read\nhooks:\n  entries:\n    - command: |\n        harnx-claude-compatible-hook-server --event PreToolUse --matcher '^harnx_agent_session_history_read$' --command 'printf '\"'\"'{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"approval required\"}}'\"'\"''",
             "You are plain.",
         );
 
@@ -935,7 +935,7 @@ mod tests {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent_with_front_matter(
             "plain",
-            "model: openai:gpt-4o\nuse_tools: harnx_agent_session_history_read\nhooks:\n  entries:\n    - event: PreToolUse\n      matcher: ^harnx_agent_session_history_read$\n      type: claude-command\n      command: |\n        printf '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"approval required\"}}'",
+            "model: openai:gpt-4o\nuse_tools: harnx_agent_session_history_read\nhooks:\n  entries:\n    - command: |\n        harnx-claude-compatible-hook-server --event PreToolUse --matcher '^harnx_agent_session_history_read$' --command 'printf '\"'\"'{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"approval required\"}}'\"'\"''",
             "You are plain.",
         );
 

@@ -1,5 +1,5 @@
 use crate::{
-    executor::execute_command_hook, AsyncHookManager, CompiledMatcher, HookConfig, HookEvent,
+    executor::execute_command_hook, AsyncHookManager, CompiledMatcher, HookCommand, HookEvent,
     HookOutcome, HookPayload, HookResult, HookResultControl, PersistentHookManager,
 };
 
@@ -8,219 +8,187 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
+/// Inline hook metadata used by sandbox-run's non-NATS dispatcher.
+#[derive(Debug, Clone)]
+pub struct InlineHookSpec {
+    pub event: String,
+    pub matcher: Option<String>,
+    pub command: HookCommand,
+    pub async_hook: Option<bool>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct DispatchOptions<'a> {
+    pub persistent_modes: &'a [bool],
+    pub resume_count: u32,
+    pub async_manager: Option<&'a AsyncHookManager>,
+    pub persistent_manager: Option<&'a Arc<TokioMutex<PersistentHookManager>>>,
+}
+
 pub async fn dispatch_hooks(
     event: &HookEvent,
-    hooks: &[HookConfig],
+    hooks: &[InlineHookSpec],
     session_id: &str,
     cwd: &Path,
 ) -> HookOutcome {
-    dispatch_hooks_with_count(event, hooks, session_id, cwd, 0, None).await
+    dispatch_hooks_with_options(event, hooks, session_id, cwd, DispatchOptions::default()).await
 }
 
-pub async fn dispatch_hooks_with_managers(
-    event: &HookEvent,
-    hooks: &[HookConfig],
-    session_id: &str,
-    cwd: &Path,
-    async_manager: Option<&AsyncHookManager>,
-    persistent_manager: Option<&Arc<TokioMutex<PersistentHookManager>>>,
-) -> HookOutcome {
-    dispatch_hooks_with_count_and_manager(
-        event,
-        hooks,
-        session_id,
-        cwd,
-        0,
-        async_manager,
-        persistent_manager,
-    )
-    .await
+struct DispatchState {
+    payload: HookPayload,
+    additional_contexts: Vec<String>,
+    resume: bool,
+    current_tool_input: Option<Value>,
+    current_tool_response: Option<Value>,
 }
 
-pub async fn dispatch_hooks_with_count(
-    event: &HookEvent,
-    hooks: &[HookConfig],
-    session_id: &str,
-    cwd: &Path,
-    resume_count: u32,
-    persistent_manager: Option<&Arc<TokioMutex<PersistentHookManager>>>,
-) -> HookOutcome {
-    dispatch_hooks_with_count_and_manager(
-        event,
-        hooks,
-        session_id,
-        cwd,
-        resume_count,
-        None,
-        persistent_manager,
-    )
-    .await
-}
-
-pub async fn dispatch_hooks_with_count_and_manager(
-    event: &HookEvent,
-    hooks: &[HookConfig],
-    session_id: &str,
-    cwd: &Path,
-    resume_count: u32,
-    async_manager: Option<&AsyncHookManager>,
-    persistent_manager: Option<&Arc<TokioMutex<PersistentHookManager>>>,
-) -> HookOutcome {
-    let mut payload = HookPayload {
-        session_id: session_id.to_string(),
-        cwd: cwd.to_path_buf(),
-        resume_count,
-        hook_event: event.clone(),
-    };
-
-    let mut additional_contexts = vec![];
-    let mut resume = false;
-    let mut current_tool_input: Option<Value> = None;
-    let mut current_tool_response: Option<Value> = None;
-
-    for hook in hooks {
-        if hook.event != event.event_name() || !hook.is_supported_type() {
-            continue;
+impl DispatchState {
+    fn new(event: &HookEvent, session_id: &str, cwd: &Path, resume_count: u32) -> Self {
+        Self {
+            payload: HookPayload {
+                session_id: session_id.to_string(),
+                cwd: cwd.to_path_buf(),
+                resume_count,
+                hook_event: event.clone(),
+            },
+            additional_contexts: Vec::new(),
+            resume: false,
+            current_tool_input: None,
+            current_tool_response: None,
         }
+    }
 
-        let matcher = match CompiledMatcher::compile(&hook.matcher) {
-            Ok(matcher) => matcher,
-            Err(err) => {
-                warn!(
-                    "Skipping hook `{}` for event `{}` because matcher compilation failed: {err}",
-                    hook.command, hook.event
-                );
-                continue;
-            }
-        };
-
-        if !matcher.matches(event) {
-            continue;
-        }
-
+    fn patch_payload(&mut self) {
         patch_payload_mutation(
-            &mut payload.hook_event,
-            current_tool_input.as_ref(),
-            current_tool_response.as_ref(),
+            &mut self.payload.hook_event,
+            self.current_tool_input.as_ref(),
+            self.current_tool_response.as_ref(),
         );
+    }
 
-        if hook.async_hook == Some(true) {
-            if let Some(manager) = async_manager {
-                manager.spawn_hook(payload.clone(), hook.into());
-            }
-            continue;
-        }
-
-        if hook.hook_type == "claude-command-persistent" {
-            if let Some(pm) = persistent_manager {
-                let outcome = pm.lock().await.send_event(&payload, &hook.into()).await;
-                let HookOutcome { control, result } = outcome;
-
-                // Extract mutations before branching so Ask/Block also carry them.
-                if let Some(ref hso) = result.hook_specific_output {
-                    if let Some(ref ti) = hso.tool_input {
-                        current_tool_input = Some(ti.clone());
-                    }
-                    if let Some(ref tr) = hso.tool_response {
-                        current_tool_response = Some(tr.clone());
-                    }
-                }
-
-                match control {
-                    HookResultControl::Block { reason } => {
-                        return HookOutcome {
-                            control: HookResultControl::Block { reason },
-                            result: HookResult {
-                                mutated_tool_input: current_tool_input,
-                                mutated_tool_response: current_tool_response,
-                                ..result
-                            },
-                        };
-                    }
-                    HookResultControl::Ask { reason } => {
-                        return HookOutcome {
-                            control: HookResultControl::Ask { reason },
-                            result: HookResult {
-                                mutated_tool_input: current_tool_input,
-                                mutated_tool_response: current_tool_response,
-                                ..result
-                            },
-                        };
-                    }
-                    HookResultControl::Continue => {
-                        if let Some(context) =
-                            result.additional_context.filter(|value| !value.is_empty())
-                        {
-                            additional_contexts.push(context);
-                        }
-                        if let Some(msg) = result.system_message.filter(|value| !value.is_empty()) {
-                            additional_contexts.push(msg);
-                        }
-                        resume |= result.resume.unwrap_or(false);
-                    }
-                }
-            }
-            continue;
-        }
-
-        let outcome = execute_command_hook(&payload, &hook.into()).await;
+    fn apply_outcome(&mut self, outcome: HookOutcome) -> Option<HookOutcome> {
         let HookOutcome { control, result } = outcome;
-
-        // Extract mutations from this hook before branching on control so that
-        // even Ask/Block outcomes carry the current hook's mutation forward.
-        if let Some(ref hso) = result.hook_specific_output {
-            if let Some(ref ti) = hso.tool_input {
-                current_tool_input = Some(ti.clone());
-            }
-            if let Some(ref tr) = hso.tool_response {
-                current_tool_response = Some(tr.clone());
-            }
-        }
-
+        self.capture_mutations(&result);
         match control {
-            HookResultControl::Block { reason } => {
-                return HookOutcome {
-                    control: HookResultControl::Block { reason },
-                    result: HookResult {
-                        mutated_tool_input: current_tool_input,
-                        mutated_tool_response: current_tool_response,
-                        ..result
-                    },
-                };
-            }
-            HookResultControl::Ask { reason } => {
-                return HookOutcome {
-                    control: HookResultControl::Ask { reason },
-                    result: HookResult {
-                        mutated_tool_input: current_tool_input,
-                        mutated_tool_response: current_tool_response,
-                        ..result
-                    },
-                };
-            }
             HookResultControl::Continue => {
-                if let Some(context) = result.additional_context.filter(|value| !value.is_empty()) {
-                    additional_contexts.push(context);
-                }
-                if let Some(msg) = result.system_message.filter(|value| !value.is_empty()) {
-                    additional_contexts.push(msg);
-                }
-                resume |= result.resume.unwrap_or(false);
+                self.capture_context(result);
+                None
             }
+            control => Some(HookOutcome {
+                control,
+                result: HookResult {
+                    mutated_tool_input: self.current_tool_input.clone(),
+                    mutated_tool_response: self.current_tool_response.clone(),
+                    ..result
+                },
+            }),
         }
     }
 
-    HookOutcome {
-        control: HookResultControl::Continue,
-        result: HookResult {
-            additional_context: (!additional_contexts.is_empty())
-                .then(|| additional_contexts.join("\n")),
-            resume: resume.then_some(true),
-            mutated_tool_input: current_tool_input,
-            mutated_tool_response: current_tool_response,
-            ..HookResult::default()
-        },
+    fn capture_mutations(&mut self, result: &HookResult) {
+        let Some(output) = &result.hook_specific_output else {
+            return;
+        };
+        if let Some(tool_input) = &output.tool_input {
+            self.current_tool_input = Some(tool_input.clone());
+        }
+        if let Some(tool_response) = &output.tool_response {
+            self.current_tool_response = Some(tool_response.clone());
+        }
     }
+
+    fn capture_context(&mut self, result: HookResult) {
+        self.additional_contexts.extend(
+            [result.additional_context, result.system_message]
+                .into_iter()
+                .flatten()
+                .filter(|value| !value.is_empty()),
+        );
+        self.resume |= result.resume.unwrap_or(false);
+    }
+
+    fn finish(self) -> HookOutcome {
+        HookOutcome {
+            control: HookResultControl::Continue,
+            result: HookResult {
+                additional_context: (!self.additional_contexts.is_empty())
+                    .then(|| self.additional_contexts.join("\n")),
+                resume: self.resume.then_some(true),
+                mutated_tool_input: self.current_tool_input,
+                mutated_tool_response: self.current_tool_response,
+                ..HookResult::default()
+            },
+        }
+    }
+}
+
+pub async fn dispatch_hooks_with_options(
+    event: &HookEvent,
+    hooks: &[InlineHookSpec],
+    session_id: &str,
+    cwd: &Path,
+    options: DispatchOptions<'_>,
+) -> HookOutcome {
+    let mut state = DispatchState::new(event, session_id, cwd, options.resume_count);
+    for (index, hook) in hooks.iter().enumerate() {
+        if !hook_matches_event(hook, event) {
+            continue;
+        }
+        state.patch_payload();
+        let Some(outcome) = execute_hook(index, hook, &state.payload, options).await else {
+            continue;
+        };
+        if let Some(terminal) = state.apply_outcome(outcome) {
+            return terminal;
+        }
+    }
+    state.finish()
+}
+
+fn hook_matches_event(hook: &InlineHookSpec, event: &HookEvent) -> bool {
+    if hook.event != event.event_name() {
+        return false;
+    }
+    match CompiledMatcher::compile(&hook.matcher) {
+        Ok(matcher) => matcher.matches(event),
+        Err(error) => {
+            warn!(
+                "Skipping hook `{}` for event `{}` because matcher compilation failed: {error}",
+                hook.command.command, hook.event
+            );
+            false
+        }
+    }
+}
+
+async fn execute_hook(
+    index: usize,
+    hook: &InlineHookSpec,
+    payload: &HookPayload,
+    options: DispatchOptions<'_>,
+) -> Option<HookOutcome> {
+    if hook.async_hook == Some(true) {
+        if let Some(manager) = options.async_manager {
+            manager.spawn_hook(payload.clone(), hook.command.clone());
+        }
+        return None;
+    }
+    if options
+        .persistent_modes
+        .get(index)
+        .copied()
+        .unwrap_or(false)
+    {
+        let manager = options.persistent_manager?;
+        return Some(
+            manager
+                .lock()
+                .await
+                .send_event(payload, &hook.command)
+                .await,
+        );
+    }
+    Some(execute_command_hook(payload, &hook.command).await)
 }
 
 fn patch_payload_mutation(
@@ -255,8 +223,8 @@ fn patch_payload_mutation(
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch_hooks, dispatch_hooks_with_count, dispatch_hooks_with_count_and_manager};
-    use crate::{AsyncHookManager, HookConfig, HookEvent, HookResultControl};
+    use super::{dispatch_hooks, dispatch_hooks_with_options, DispatchOptions, InlineHookSpec};
+    use crate::{AsyncHookManager, HookCommand, HookEvent, HookResultControl};
     use serde_json::json;
     use std::fs;
     #[cfg(unix)]
@@ -327,16 +295,16 @@ mod tests {
         }
     }
 
-    fn hook_config(event: &str, command: String) -> HookConfig {
-        HookConfig {
+    fn hook_config(event: &str, command: String) -> InlineHookSpec {
+        InlineHookSpec {
             event: event.to_string(),
             matcher: None,
-            command,
-            timeout: Some(5),
-            status_message: None,
+            command: HookCommand {
+                command,
+                timeout: Some(5),
+                package_dir: None,
+            },
             async_hook: None,
-            hook_type: "claude-command".to_string(),
-            package_dir: None,
         }
     }
 
@@ -822,13 +790,15 @@ mod tests {
             payload_dump_command(&cwd, &marker),
         )];
 
-        let outcome = dispatch_hooks_with_count(
+        let outcome = dispatch_hooks_with_options(
             &pre_tool_use_event("shell"),
             &hooks,
             "session-3",
             &cwd,
-            4,
-            None,
+            DispatchOptions {
+                resume_count: 4,
+                ..DispatchOptions::default()
+            },
         )
         .await;
 
@@ -840,22 +810,22 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_async_hook_does_not_block() {
         let cwd = temp_test_dir("async-no-block");
-        let hooks = vec![HookConfig {
+        let hooks = vec![InlineHookSpec {
             async_hook: Some(true),
-            command: sleep_command(5),
             ..hook_config("PreToolUse", sleep_command(5))
         }];
         let manager = AsyncHookManager::new();
         let start = tokio::time::Instant::now();
 
-        let outcome = dispatch_hooks_with_count_and_manager(
+        let outcome = dispatch_hooks_with_options(
             &pre_tool_use_event("shell"),
             &hooks,
             "session-async",
             &cwd,
-            0,
-            Some(&manager),
-            None,
+            DispatchOptions {
+                async_manager: Some(&manager),
+                ..DispatchOptions::default()
+            },
         )
         .await;
 
@@ -891,22 +861,19 @@ done"#,
 
         let cwd = temp_test_dir("persistent-hook-manager");
         let command = persistent_mutate_command(&cwd);
-        let hooks = vec![HookConfig {
-            hook_type: "claude-command-persistent".to_string(),
-            package_dir: None,
-            ..hook_config("PreToolUse", command)
-        }];
+        let hooks = vec![hook_config("PreToolUse", command)];
         let event = pre_tool_use_event("bash_exec");
 
         // With None: persistent hook is skipped — no mutation.
-        let outcome_no_pm = dispatch_hooks_with_count_and_manager(
+        let outcome_no_pm = dispatch_hooks_with_options(
             &event,
             &hooks,
             "session-no-pm",
             &cwd,
-            0,
-            None,
-            None,
+            DispatchOptions {
+                persistent_modes: &[true],
+                ..DispatchOptions::default()
+            },
         )
         .await;
         assert!(matches!(outcome_no_pm.control, HookResultControl::Continue));
@@ -917,14 +884,16 @@ done"#,
 
         // With Some(pm): persistent hook runs and mutates tool_input.
         let pm = Arc::new(Mutex::new(PersistentHookManager::new()));
-        let outcome_with_pm = dispatch_hooks_with_count_and_manager(
+        let outcome_with_pm = dispatch_hooks_with_options(
             &event,
             &hooks,
             "session-with-pm",
             &cwd,
-            0,
-            None,
-            Some(&pm),
+            DispatchOptions {
+                persistent_modes: &[true],
+                persistent_manager: Some(&pm),
+                ..DispatchOptions::default()
+            },
         )
         .await;
         assert!(matches!(

@@ -6,22 +6,22 @@ use harnx_core::hooks::{HookConfig, HooksConfig};
 use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
 use harnx_hooks::executor::HARNX_PACKAGE_DIR_ENV;
 use harnx_hookset::{
-    FailPolicy, HookRegistration, HookSpec, HOOK_EXPECTATIONS_BUCKET, HOOK_PROTOCOL_VERSION,
-    HOOK_REGISTRY_BUCKET, HOOK_SCHEMA_VERSION,
+    FailPolicy, HookRegistration, HookSpec, HARNX_HOOK_NAME, HOOK_EXPECTATIONS_BUCKET,
+    HOOK_PROTOCOL_VERSION, HOOK_REGISTRY_BUCKET, HOOK_SCHEMA_VERSION,
 };
 use harnx_hookset_server::hook_registration_key;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 const HOOK_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-const GENERIC_HOOK_BINARY: &str = "harnx-claude-compatible-hook-server";
-const PROXY_AUTH_BINARY: &str = "harnx-proxy-auth";
+const MAX_HOOKS_PER_SUPERVISOR: usize = 999;
 
 /// Connection and identity shared by hook servers spawned for one worker.
 #[derive(Clone)]
@@ -69,9 +69,10 @@ impl HookServerSupervisor {
     pub async fn start_local_with_timeout(
         config: HookServerStartConfig,
         hooks: &HooksConfig,
-        scope: &str,
+        _scope: &str,
         readiness_timeout: Duration,
     ) -> Result<Self> {
+        let run_id = Uuid::new_v4().simple().to_string()[..8].to_string();
         let processes = Arc::new(Mutex::new(HashMap::new()));
         let mut supervisor = Self {
             processes: Arc::clone(&processes),
@@ -80,25 +81,27 @@ impl HookServerSupervisor {
             instance_id: config.instance_id.clone(),
             registrations: Vec::new(),
         };
-        let enabled: Vec<_> = hooks
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, hook)| hook.is_supported_type())
-            .collect();
+        let enabled: Vec<_> = hooks.entries.iter().collect();
+        validate_hook_count(enabled.len())?;
         if enabled.is_empty() {
             return Ok(supervisor);
         }
+        let launch_plan: Vec<_> = enabled
+            .into_iter()
+            .enumerate()
+            .map(|(order_index, hook)| HookLaunch {
+                order_index,
+                name: hook_server_name(&run_id, order_index),
+                hook,
+            })
+            .collect();
 
-        let watches = prepare_hook_registrations(&config, &enabled, scope, &mut supervisor).await?;
-        spawn_enabled_hooks(&config, enabled, scope, &mut supervisor).await;
-        wait_for_hook_registrations(
-            watches,
-            &processes,
-            Instant::now() + readiness_timeout,
-            readiness_timeout,
-        )
-        .await;
+        let prepared = prepare_hook_registrations(&config, &launch_plan, &mut supervisor).await?;
+        let startups = spawn_enabled_hooks(&config, prepared, &mut supervisor).await?;
+        let monitors =
+            start_hook_servers(startups, &config, Arc::clone(&processes), readiness_timeout)
+                .await?;
+        supervisor.tasks.extend(monitors);
         Ok(supervisor)
     }
 
@@ -117,130 +120,258 @@ impl HookServerSupervisor {
     }
 }
 
-type RegistrationWatch = (String, String, kv::Watch);
+fn validate_hook_count(count: usize) -> Result<()> {
+    if count > MAX_HOOKS_PER_SUPERVISOR {
+        bail!("hook supervisor supports at most {MAX_HOOKS_PER_SUPERVISOR} hooks, got {count}");
+    }
+    Ok(())
+}
+
+struct HookLaunch<'a> {
+    order_index: usize,
+    name: String,
+    hook: &'a HookConfig,
+}
+
+struct PreparedHook {
+    order_index: usize,
+    name: String,
+    key: String,
+    rejector_name: String,
+    display_label: String,
+    failure_label: String,
+    hook: HookConfig,
+    watch: kv::Watch,
+}
+
+struct HookStartup {
+    name: String,
+    key: String,
+    rejector_name: String,
+    display_label: String,
+    failure_label: String,
+    watch: kv::Watch,
+    child: Child,
+    pid: u32,
+}
+
+struct HookMonitor {
+    child: Child,
+    pid: u32,
+    server: String,
+    display_label: String,
+    registration: HookRegistration,
+    instance_id: InstanceId,
+    client: async_nats::Client,
+    processes: Arc<Mutex<HashMap<u32, String>>>,
+}
 
 async fn prepare_hook_registrations(
     config: &HookServerStartConfig,
-    enabled: &[(usize, &HookConfig)],
-    scope: &str,
+    launch_plan: &[HookLaunch<'_>],
     supervisor: &mut HookServerSupervisor,
-) -> Result<Vec<RegistrationWatch>> {
+) -> Result<Vec<PreparedHook>> {
     let registry = ensure_bucket(&config.client, HOOK_REGISTRY_BUCKET).await?;
     let expectations = ensure_bucket(&config.client, HOOK_EXPECTATIONS_BUCKET).await?;
-    let mut watches = Vec::new();
-    for (index, hook) in enabled {
-        let name = hook_server_name(scope, *index, hook);
-        let key = hook_registration_key(&config.instance_id, &name);
-        let _ = registry.delete(&key).await;
-        let watch = registry
-            .watch_with_history(&key)
-            .await
-            .with_context(|| format!("watch hook registration '{key}'"))?;
-        publish_expectation(&expectations, &key, &name, hook).await?;
-        supervisor.registrations.push(name.clone());
-        watches.push((name, key, watch));
+    let mut prepared = Vec::new();
+    for launch in launch_plan {
+        let key = hook_registration_key(&config.instance_id, &launch.name);
+        let rejector_name = format!("{}-rejector", launch.name);
+        supervisor.registrations.push(launch.name.clone());
+        supervisor.registrations.push(rejector_name.clone());
+        let display_label = hook_display_label(launch.hook);
+        let failure_label = startup_failure_label(launch.hook);
+
+        if let Err(error) = registry.delete(&key).await {
+            publish_startup_rejector(
+                &expectations,
+                &config.instance_id,
+                &rejector_name,
+                &failure_label,
+            )
+            .await?;
+            log::warn!(
+                "hook server '{}' startup rejected because stale registration '{}' could not be deleted: {error:#}",
+                launch.name,
+                key
+            );
+            continue;
+        }
+
+        let watch = match registry.watch_with_history(&key).await {
+            Ok(watch) => watch,
+            Err(error) => {
+                publish_startup_rejector(
+                    &expectations,
+                    &config.instance_id,
+                    &rejector_name,
+                    &failure_label,
+                )
+                .await?;
+                log::warn!(
+                    "hook server '{}' registration watch failed: {error:#}",
+                    launch.name
+                );
+                continue;
+            }
+        };
+        prepared.push(PreparedHook {
+            order_index: launch.order_index,
+            name: launch.name.clone(),
+            key,
+            rejector_name,
+            display_label,
+            failure_label,
+            hook: launch.hook.clone(),
+            watch,
+        });
     }
-    Ok(watches)
+    Ok(prepared)
 }
 
 async fn spawn_enabled_hooks(
     config: &HookServerStartConfig,
-    enabled: Vec<(usize, &HookConfig)>,
-    scope: &str,
+    prepared: Vec<PreparedHook>,
     supervisor: &mut HookServerSupervisor,
-) {
-    for (index, hook) in enabled {
-        let name = hook_server_name(scope, index, hook);
-        let child = match spawn_hook_server(config, hook, &name) {
+) -> Result<Vec<HookStartup>> {
+    let expectations = ensure_bucket(&config.client, HOOK_EXPECTATIONS_BUCKET).await?;
+    let mut startups = Vec::new();
+    for prepared in prepared {
+        let mut child = match spawn_hook_server(config, &prepared.hook, &prepared.name) {
             Ok(child) => child,
             Err(error) => {
+                publish_startup_rejector(
+                    &expectations,
+                    &config.instance_id,
+                    &prepared.rejector_name,
+                    &prepared.failure_label,
+                )
+                .await?;
                 log::warn!(
-                    "hook server '{name}' failed to start; fail-closed expectation remains: {error:#}"
+                    "hook server #{index} '{name}' failed to spawn: {error:#}",
+                    index = prepared.order_index,
+                    name = prepared.name
                 );
                 continue;
             }
         };
         let Some(pid) = child.id() else {
-            log::warn!("hook server '{name}' has no process ID; fail-closed expectation remains");
+            let _ = child.start_kill();
+            publish_startup_rejector(
+                &expectations,
+                &config.instance_id,
+                &prepared.rejector_name,
+                &prepared.failure_label,
+            )
+            .await?;
+            log::warn!("hook server '{}' has no process ID", prepared.name);
             continue;
         };
-        supervisor.processes.lock().await.insert(pid, name.clone());
-        supervisor.tasks.push(spawn_child_monitor(
+        supervisor
+            .processes
+            .lock()
+            .await
+            .insert(pid, prepared.name.clone());
+        startups.push(HookStartup {
+            name: prepared.name,
+            key: prepared.key,
+            rejector_name: prepared.rejector_name,
+            display_label: prepared.display_label,
+            failure_label: prepared.failure_label,
+            watch: prepared.watch,
             child,
             pid,
-            name,
-            config.instance_id.clone(),
-            config.client.clone(),
-            Arc::clone(&supervisor.processes),
-        ));
+        });
     }
+    Ok(startups)
 }
 
-async fn wait_for_hook_registrations(
-    watches: Vec<RegistrationWatch>,
-    processes: &Arc<Mutex<HashMap<u32, String>>>,
-    deadline: Instant,
+async fn start_hook_servers(
+    startups: Vec<HookStartup>,
+    config: &HookServerStartConfig,
+    processes: Arc<Mutex<HashMap<u32, String>>>,
     readiness_timeout: Duration,
-) {
-    let readiness = watches.into_iter().map(|(name, key, mut watch)| {
-        let processes = Arc::clone(processes);
-        async move {
-            if let Err(error) = wait_for_registration(
-                &mut watch,
-                &processes,
-                &name,
-                &key,
-                deadline,
-                readiness_timeout,
-            )
-            .await
-            {
-                log::warn!(
-                    "hook server '{name}' unavailable; fail-closed expectation remains: {error:#}"
-                );
-            }
-        }
+) -> Result<Vec<JoinHandle<()>>> {
+    let starts = startups.into_iter().map(|startup| {
+        let config = config.clone();
+        let processes = Arc::clone(&processes);
+        async move { start_hook_server(startup, config, processes, readiness_timeout).await }
     });
-    futures_util::future::join_all(readiness).await;
+    let mut monitors = Vec::new();
+    for result in futures_util::future::join_all(starts).await {
+        if let Some(monitor) = result? {
+            monitors.push(monitor);
+        }
+    }
+    Ok(monitors)
 }
 
-impl Drop for HookServerSupervisor {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
+async fn start_hook_server(
+    startup: HookStartup,
+    config: HookServerStartConfig,
+    processes: Arc<Mutex<HashMap<u32, String>>>,
+    readiness_timeout: Duration,
+) -> Result<Option<JoinHandle<()>>> {
+    let HookStartup {
+        name,
+        key,
+        rejector_name,
+        display_label,
+        failure_label,
+        mut watch,
+        mut child,
+        pid,
+    } = startup;
+
+    let readiness = tokio::select! {
+        registration = wait_for_registration(&mut watch, &name, &key) => registration,
+        status = child.wait() => match status {
+            Ok(status) => Err(anyhow::anyhow!(
+                "hook server '{name}' exited with {status} before registering at '{key}'"
+            )),
+            Err(error) => Err(error).with_context(|| format!("wait for hook server '{name}' during startup")),
+        },
+        _ = tokio::time::sleep(readiness_timeout) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Err(anyhow::anyhow!(
+                "hook server '{name}' did not register at '{key}' within {}s",
+                readiness_timeout.as_secs_f64()
+            ))
         }
-        let client = self.client.clone();
-        let instance_id = self.instance_id.clone();
-        let registrations = std::mem::take(&mut self.registrations);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                for server in registrations {
-                    remove_registration_and_expectation(&client, &instance_id, &server).await;
-                }
-            });
+    };
+
+    match readiness {
+        Ok(registration) => Ok(Some(spawn_child_monitor(HookMonitor {
+            child,
+            pid,
+            server: name,
+            display_label,
+            registration,
+            instance_id: config.instance_id,
+            client: config.client,
+            processes,
+        }))),
+        Err(error) => {
+            processes.lock().await.remove(&pid);
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let expectations = ensure_bucket(&config.client, HOOK_EXPECTATIONS_BUCKET).await?;
+            publish_startup_rejector(
+                &expectations,
+                &config.instance_id,
+                &rejector_name,
+                &failure_label,
+            )
+            .await?;
+            log::warn!("hook server '{name}' failed during startup: {error:#}");
+            Ok(None)
         }
     }
 }
 
-fn hook_server_name(scope: &str, index: usize, hook: &HookConfig) -> String {
-    if is_proxy_auth_command(&hook.command) {
-        return "proxy-auth".to_string();
-    }
-    let scope = sanitize_name(scope);
-    let event = sanitize_name(&hook.event);
-    format!("{scope}-{event}-{index}")
-}
-
-fn sanitize_name(value: &str) -> String {
-    let value: String = value
-        .chars()
-        .map(|ch| if is_server_name_char(ch) { ch } else { '-' })
-        .collect();
-    value.trim_matches('-').to_string()
-}
-
-fn is_server_name_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')
+fn hook_server_name(run_id: &str, order_index: usize) -> String {
+    format!("hook-{run_id}-{order_index:03}")
 }
 
 fn spawn_hook_server(
@@ -252,40 +383,23 @@ fn spawn_hook_server(
         .package_dir
         .clone()
         .unwrap_or_else(harnx_core::config_paths::config_dir);
-    let mut command = if let Some(args) = proxy_auth_args(&hook.command, &package_dir)? {
-        let binary = resolve_binary(PROXY_AUTH_BINARY)?;
-        let mut command = Command::new(&binary);
-        command.args(args);
-        command
-    } else {
-        let binary = resolve_binary(GENERIC_HOOK_BINARY)?;
-        let mut command = Command::new(&binary);
-        command
-            .arg("--name")
-            .arg(name)
-            .arg("--event")
-            .arg(&hook.event)
-            .arg("--priority")
-            .arg("0")
-            .arg("--fail-policy")
-            .arg(FailPolicy::Closed.as_str())
-            .arg("--type")
-            .arg(&hook.hook_type)
-            .arg("--command")
-            .arg(&hook.command)
-            .arg("--package-dir")
-            .arg(&package_dir);
-        if let Some(matcher) = &hook.matcher {
-            command.arg("--matcher").arg(matcher);
-        }
-        if let Some(timeout) = hook.timeout {
-            command.arg("--timeout").arg(timeout.to_string());
-        }
-        command
-    };
+    let mut words = shell_words::split(&hook.command).context("parse hook command")?;
+    if words.is_empty() {
+        bail!("hook command is empty");
+    }
+    let package_dir_value = package_dir.to_string_lossy();
+    for word in &mut words[1..] {
+        *word = word
+            .replace("${HARNX_PACKAGE_DIR}", &package_dir_value)
+            .replace("$HARNX_PACKAGE_DIR", &package_dir_value);
+    }
+    let binary = resolve_binary(&words[0])?;
+    let mut command = Command::new(binary);
+    command.args(&words[1..]);
 
     command
         .env(HARNX_PACKAGE_DIR_ENV, package_dir)
+        .env(HARNX_HOOK_NAME, name)
         .env(HARNX_INSTANCE_ID, config.instance_id.as_str())
         .env(HARNX_NATS_URL_ENV, &config.nats_url)
         .env(HARNX_NATS_TOKEN_ENV, &config.token)
@@ -297,37 +411,6 @@ fn spawn_hook_server(
     command
         .spawn()
         .with_context(|| format!("spawn hook server '{name}'"))
-}
-
-/// A command whose executable basename is `harnx-proxy-auth` is already a
-/// native hook server. Its remaining words are forwarded as normal CLI flags.
-fn proxy_auth_args(command: &str, package_dir: &Path) -> Result<Option<Vec<String>>> {
-    let words = shell_words::split(command).context("parse hook command")?;
-    if !is_proxy_auth_words(&words) {
-        return Ok(None);
-    }
-    let package_dir = package_dir.to_string_lossy();
-    let args = words
-        .into_iter()
-        .skip(1)
-        .map(|word| {
-            word.replace("${HARNX_PACKAGE_DIR}", &package_dir)
-                .replace("$HARNX_PACKAGE_DIR", &package_dir)
-        })
-        .collect();
-    Ok(Some(args))
-}
-
-fn is_proxy_auth_command(command: &str) -> bool {
-    shell_words::split(command).is_ok_and(|words| is_proxy_auth_words(&words))
-}
-
-fn is_proxy_auth_words(words: &[String]) -> bool {
-    words
-        .first()
-        .and_then(|program| Path::new(program).file_name())
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == PROXY_AUTH_BINARY || name == "harnx-proxy-auth.exe")
 }
 
 fn resolve_binary(binary: &str) -> Result<PathBuf> {
@@ -356,66 +439,148 @@ fn resolve_binary(binary: &str) -> Result<PathBuf> {
     })
 }
 
-fn spawn_child_monitor(
-    mut child: Child,
-    pid: u32,
-    server: String,
-    instance_id: InstanceId,
-    client: async_nats::Client,
-    processes: Arc<Mutex<HashMap<u32, String>>>,
-) -> JoinHandle<()> {
+fn spawn_child_monitor(monitor: HookMonitor) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let HookMonitor {
+            mut child,
+            pid,
+            server,
+            display_label,
+            registration,
+            instance_id,
+            client,
+            processes,
+        } = monitor;
         let status = child.wait().await;
         processes.lock().await.remove(&pid);
-        remove_registration(&client, &instance_id, &server).await;
-        // Keep the supervisor's expectation after an unexpected exit. Discovery
-        // will route to the absent server and apply its fail-closed policy.
-        match status {
-            Ok(status) if status.success() => log::debug!("hook server '{server}' exited"),
-            Ok(status) => log::warn!("hook server '{server}' exited with {status}"),
-            Err(error) => log::warn!("hook server '{server}' wait failed: {error}"),
-        }
+        replace_crashed_hook_route(
+            &client,
+            &instance_id,
+            &server,
+            crash_marker(registration, display_label),
+        )
+        .await;
+        log_child_exit(&server, status);
     })
+}
+
+fn crash_marker(mut registration: HookRegistration, display_label: String) -> HookRegistration {
+    registration.display_label = Some(display_label);
+    for hook in &mut registration.hooks {
+        hook.fail_policy = FailPolicy::Closed;
+    }
+    registration
+}
+
+async fn replace_crashed_hook_route(
+    client: &async_nats::Client,
+    instance_id: &InstanceId,
+    server: &str,
+    marker: HookRegistration,
+) {
+    let key = hook_registration_key(instance_id, server);
+    let rejector_name = format!("{server}-rejector");
+    let rejector_label: String = format!(
+        "hook server crashed: {}",
+        marker.display_label.as_deref().unwrap_or(server)
+    )
+    .chars()
+    .take(120)
+    .collect();
+
+    // Publish before deleting the live registration so discovery never sees
+    // an empty route set. If both publications fail, retain the live route.
+    let route = publish_marker_or_rejector(
+        || async {
+            let expectations = ensure_bucket(client, HOOK_EXPECTATIONS_BUCKET).await?;
+            publish_registration(&expectations, &key, &marker).await
+        },
+        || publish_crash_rejector(client, instance_id, &rejector_name, &rejector_label),
+    )
+    .await;
+    finish_crash_route(
+        CrashRouteContext {
+            client,
+            instance_id,
+            server,
+            rejector_name: &rejector_name,
+        },
+        route,
+    )
+    .await;
+}
+
+struct CrashRouteContext<'a> {
+    client: &'a async_nats::Client,
+    instance_id: &'a InstanceId,
+    server: &'a str,
+    rejector_name: &'a str,
+}
+
+async fn finish_crash_route(context: CrashRouteContext<'_>, route: Result<CrashRoute>) {
+    let CrashRouteContext {
+        client,
+        instance_id,
+        server,
+        rejector_name,
+    } = context;
+    match route {
+        Ok(CrashRoute::Marker) => remove_registration(client, instance_id, server).await,
+        Ok(CrashRoute::Rejector) => {
+            log::warn!("hook server '{server}' crash marker failed; installed fail-closed rejector '{rejector_name}'");
+            remove_registration(client, instance_id, server).await;
+        }
+        Err(error) => {
+            log::error!("failed to install any fail-closed route for crashed hook server '{server}': {error:#}");
+        }
+    }
+}
+
+fn log_child_exit(server: &str, status: std::io::Result<std::process::ExitStatus>) {
+    match status {
+        Ok(status) if status.success() => log::debug!("hook server '{server}' exited"),
+        Ok(status) => log::warn!("hook server '{server}' exited with {status}"),
+        Err(error) => log::warn!("hook server '{server}' wait failed: {error}"),
+    }
+}
+
+struct RegistrationExpectation<'a> {
+    server: &'a str,
+    key: &'a str,
 }
 
 async fn wait_for_registration(
     watch: &mut kv::Watch,
-    processes: &Arc<Mutex<HashMap<u32, String>>>,
     server: &str,
     key: &str,
-    deadline: Instant,
-    timeout: Duration,
-) -> Result<()> {
+) -> Result<HookRegistration> {
     loop {
-        if !processes.lock().await.values().any(|name| name == server) {
-            bail!("hook server '{server}' exited before registering at '{key}'");
+        let Some(entry) = watch.next().await else {
+            bail!("hook registration watch closed for '{key}'");
+        };
+        let entry = entry.with_context(|| format!("watch hook registration '{key}'"))?;
+        if entry.operation != kv::Operation::Put {
+            continue;
         }
-        let now = Instant::now();
-        if now >= deadline {
-            bail!(
-                "hook server '{server}' did not register at '{key}' within {}s",
-                timeout.as_secs_f64()
-            );
-        }
-        let poll = deadline
-            .saturating_duration_since(now)
-            .min(Duration::from_millis(100));
-        match tokio::time::timeout(poll, watch.next()).await {
-            Ok(Some(Ok(entry))) if entry.operation == kv::Operation::Put => {
-                let registration: HookRegistration = serde_json::from_slice(&entry.value)
-                    .with_context(|| format!("decode hook registration '{key}'"))?;
-                if registration.server == server {
-                    return Ok(());
-                }
-            }
-            Ok(Some(Ok(_))) => {}
-            Ok(Some(Err(error))) => {
-                return Err(error).with_context(|| format!("watch hook registration '{key}'"));
-            }
-            Ok(None) => bail!("hook registration watch closed for '{key}'"),
-            Err(_) => continue,
-        }
+        return decode_expected_registration(&entry.value, RegistrationExpectation { server, key });
     }
+}
+
+fn decode_expected_registration(
+    value: &[u8],
+    expected: RegistrationExpectation<'_>,
+) -> Result<HookRegistration> {
+    let registration: HookRegistration = serde_json::from_slice(value)
+        .with_context(|| format!("decode hook registration '{}'", expected.key))?;
+    if registration.server != expected.server {
+        bail!(
+            "hook registration '{}' declared server '{}' instead of assigned name '{}'",
+            expected.key,
+            registration.server,
+            expected.server
+        );
+    }
+    Ok(registration)
 }
 
 async fn ensure_bucket(client: &async_nats::Client, bucket: &str) -> Result<kv::Store> {
@@ -439,25 +604,121 @@ async fn ensure_bucket(client: &async_nats::Client, bucket: &str) -> Result<kv::
     }
 }
 
-async fn publish_expectation(
-    store: &kv::Store,
-    key: &str,
-    server: &str,
-    hook: &HookConfig,
-) -> Result<()> {
-    let registration = HookRegistration {
+fn hook_display_label(hook: &HookConfig) -> String {
+    hook.status_message
+        .as_deref()
+        .unwrap_or(&hook.command)
+        .chars()
+        .take(120)
+        .collect()
+}
+
+fn startup_failure_label(hook: &HookConfig) -> String {
+    format!("hook server failed to start: {}", hook_display_label(hook))
+        .chars()
+        .take(120)
+        .collect()
+}
+
+fn fail_closed_rejector(server: &str, display_label: &str) -> HookRegistration {
+    HookRegistration {
         server: server.to_string(),
-        hooks: vec![HookSpec {
-            event: hook.event.clone(),
-            matcher: hook.matcher.clone(),
-            priority: 0,
-            timeout_secs: hook.timeout,
-            fail_policy: FailPolicy::Closed,
-        }],
+        display_label: Some(display_label.to_string()),
+        hooks: vec![
+            HookSpec {
+                event: "UserPromptSubmit".to_string(),
+                matcher: None,
+                priority: 0,
+                timeout_secs: None,
+                fail_policy: FailPolicy::Closed,
+            },
+            HookSpec {
+                event: "PreToolUse".to_string(),
+                matcher: Some(".*".to_string()),
+                priority: 0,
+                timeout_secs: None,
+                fail_policy: FailPolicy::Closed,
+            },
+        ],
         schema_version: HOOK_SCHEMA_VERSION,
         proto_version: HOOK_PROTOCOL_VERSION,
-    };
-    let payload = serde_json::to_vec(&registration).context("encode hook expectation")?;
+    }
+}
+
+async fn publish_startup_rejector(
+    store: &kv::Store,
+    instance_id: &InstanceId,
+    server: &str,
+    display_label: &str,
+) -> Result<()> {
+    let registration = fail_closed_rejector(server, display_label);
+    let key = hook_registration_key(instance_id, server);
+    publish_registration(store, &key, &registration).await
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum CrashRoute {
+    Marker,
+    Rejector,
+}
+
+async fn publish_marker_or_rejector<M, MFut, R, RFut>(
+    publish_marker: M,
+    publish_rejector: R,
+) -> Result<CrashRoute>
+where
+    M: FnOnce() -> MFut,
+    MFut: std::future::Future<Output = Result<()>>,
+    R: FnOnce() -> RFut,
+    RFut: std::future::Future<Output = Result<()>>,
+{
+    match publish_marker().await {
+        Ok(()) => Ok(CrashRoute::Marker),
+        Err(marker_error) => {
+            publish_rejector().await.with_context(|| {
+                format!("crash marker failed ({marker_error:#}); publish crash rejector")
+            })?;
+            Ok(CrashRoute::Rejector)
+        }
+    }
+}
+
+/// Publishes a synthetic fail-closed route after a hook server crash.
+///
+/// Exposed for integration testing of the live JetStream fallback paths.
+#[doc(hidden)]
+pub async fn publish_crash_rejector(
+    client: &async_nats::Client,
+    instance_id: &InstanceId,
+    server: &str,
+    display_label: &str,
+) -> Result<()> {
+    let registration = fail_closed_rejector(server, display_label);
+    let key = hook_registration_key(instance_id, server);
+
+    let expectation_result = async {
+        let expectations = ensure_bucket(client, HOOK_EXPECTATIONS_BUCKET).await?;
+        publish_registration(&expectations, &key, &registration).await
+    }
+    .await;
+    if expectation_result.is_ok() {
+        return Ok(());
+    }
+
+    // If the expectations path itself is unavailable, the registry bucket is a
+    // second fail-closed publication path. The rejector still has no responder.
+    let registry = ensure_bucket(client, HOOK_REGISTRY_BUCKET).await?;
+    publish_registration(&registry, &key, &registration)
+        .await
+        .with_context(|| format!("publish crash rejector after {expectation_result:#?}"))
+}
+
+async fn publish_registration(
+    store: &kv::Store,
+    key: &str,
+    registration: &HookRegistration,
+) -> Result<()> {
+    let payload = serde_json::to_vec(registration).context("encode hook expectation")?;
     store
         .put(key.to_string(), payload.into())
         .await
@@ -520,43 +781,41 @@ fn configure_hook_process(_command: &mut Command) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn detects_proxy_auth_and_forwards_flags() {
-        let package_dir = Path::new("/packages/coding");
+    fn hook_count_limit_accepts_boundary_and_rejects_overflow() {
+        validate_hook_count(MAX_HOOKS_PER_SUPERVISOR).expect("999 hooks are supported");
+        let error = validate_hook_count(MAX_HOOKS_PER_SUPERVISOR + 1)
+            .expect_err("1000 hooks must be rejected");
         assert_eq!(
-            proxy_auth_args(
-                "harnx-proxy-auth --hook 'token helper' --hook '$HARNX_PACKAGE_DIR/hooks/jira.py' --env '$temp_file_root'",
-                package_dir,
-            )
-            .unwrap(),
-            Some(vec![
-                "--hook".to_string(),
-                "token helper".to_string(),
-                "--hook".to_string(),
-                "/packages/coding/hooks/jira.py".to_string(),
-                "--env".to_string(),
-                "$temp_file_root".to_string(),
-            ])
+            error.to_string(),
+            "hook supervisor supports at most 999 hooks, got 1000"
         );
-        assert_eq!(proxy_auth_args("echo hello", package_dir).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn crash_marker_failure_invokes_fail_closed_rejector_fallback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let rejector_called = AtomicBool::new(false);
+        let route = publish_marker_or_rejector(
+            || async { anyhow::bail!("marker unavailable") },
+            || async {
+                rejector_called.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect("rejector fallback succeeds");
+
+        assert_eq!(route, CrashRoute::Rejector);
+        assert!(rejector_called.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn names_are_stable_and_nats_safe() {
-        let hook = HookConfig {
-            event: "PreToolUse".to_string(),
-            matcher: None,
-            command: "echo".to_string(),
-            timeout: Some(30),
-            status_message: None,
-            async_hook: None,
-            hook_type: "claude-command".to_string(),
-            package_dir: None,
-        };
-        assert_eq!(
-            hook_server_name("agent:review", 2, &hook),
-            "agent-review-PreToolUse-2"
-        );
+    fn ordered_nonce_names_are_zero_padded() {
+        assert_eq!(hook_server_name("a1b2c3d4", 0), "hook-a1b2c3d4-000");
+        assert_eq!(hook_server_name("a1b2c3d4", 12), "hook-a1b2c3d4-012");
+        assert_eq!(hook_server_name("a1b2c3d4", 998), "hook-a1b2c3d4-998");
+        assert!(hook_server_name("a1b2c3d4", 2) < hook_server_name("a1b2c3d4", 10));
     }
 }

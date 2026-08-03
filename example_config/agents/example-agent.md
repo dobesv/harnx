@@ -37,9 +37,7 @@ documents:                       # RAG document paths (relative to config dir)
 # hooks:                         # Per-agent hooks (merged with global)
 #   max_resume: 3
 #   entries:
-#   - event: Stop
-#     type: claude-command
-#     command: "/path/to/agent-hook.sh"
+#   - command: harnx-claude-compatible-hook-server --event Stop -- /path/to/agent-hook.sh
 ---
 
 You are a helpful AI assistant. Your task is to help the user with their questions and tasks.

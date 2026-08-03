@@ -19,6 +19,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = <cli::Args as Parser>::parse();
+    let hook_name = args
+        .name
+        .clone()
+        .or_else(|| std::env::var(hook::HARNX_HOOK_NAME_ENV).ok())
+        .unwrap_or_else(|| hook::SERVER_NAME.to_string());
     // Register the notice channel before starting the proxy, so exec hooks can
     // surface structured notices that the JSONL loop drains to stdout.
     let notice_rx = notice::init_channel();
@@ -78,6 +83,7 @@ async fn main() -> Result<()> {
     write_readiness(port, &ca_cert_path, &ca_cert_pem)?;
 
     run_dispatch_mode(DispatchRuntime {
+        name: hook_name,
         port,
         ca_cert_path,
         extra_env,
@@ -121,6 +127,7 @@ fn write_readiness(port: u16, ca_cert_path: &std::path::Path, ca_cert_pem: &str)
 }
 
 struct DispatchRuntime {
+    name: String,
     port: u16,
     ca_cert_path: std::path::PathBuf,
     extra_env: serde_json::Map<String, serde_json::Value>,
@@ -130,6 +137,7 @@ struct DispatchRuntime {
 
 async fn run_dispatch_mode(runtime: DispatchRuntime) -> Result<()> {
     let DispatchRuntime {
+        name,
         port,
         ca_cert_path,
         extra_env,
@@ -141,6 +149,7 @@ async fn run_dispatch_mode(runtime: DispatchRuntime) -> Result<()> {
         let _temp_dir_guard = fs_temp_dir;
         let _notice_rx_guard = notice_rx;
         return harnx_hookset_server::run_hookset_main(hook::ProxyAuthHook::new(
+            name,
             port,
             ca_cert_path,
             extra_env,

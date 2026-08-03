@@ -1,10 +1,10 @@
 #![cfg(unix)]
 
 use anyhow::{Context, Result};
-use harnx_claude_compatible_hook_server::{Args, ClaudeCompatibleHook, CliFailPolicy, HookType};
+use harnx_claude_compatible_hook_server::{Args, ClaudeCompatibleHook, CliFailPolicy};
 use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResultControl};
-use harnx_core::instance::InstanceId;
-use harnx_hookset::HookRegistration;
+use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
+use harnx_hookset::{HookRegistration, HARNX_HOOK_NAME};
 use harnx_hookset_server::{hook_registration_key, serve_over_nats, HOOK_REGISTRY_BUCKET};
 use serde_json::json;
 use std::net::TcpListener;
@@ -26,6 +26,15 @@ impl Drop for NatsServerHandle {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+struct HookServerHandle(Child);
+
+impl Drop for HookServerHandle {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -91,12 +100,13 @@ async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
 async fn wait_for_registration(
     client: &async_nats::Client,
     instance_id: &InstanceId,
+    server_name: &str,
 ) -> Result<HookRegistration> {
     let jetstream = async_nats::jetstream::new(client.clone());
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(store) = jetstream.get_key_value(HOOK_REGISTRY_BUCKET).await {
-            let key = hook_registration_key(instance_id, SERVER_NAME);
+            let key = hook_registration_key(instance_id, server_name);
             if let Some(value) = store.get(&key).await? {
                 return serde_json::from_slice(&value).context("decode hook registration");
             }
@@ -121,7 +131,7 @@ async fn command_hook_registers_and_answers_over_nats() -> Result<()> {
         priority: 3,
         timeout: Some(5),
         fail_policy: CliFailPolicy::Closed,
-        hook_type: HookType::ClaudeCommand,
+        persistent: false,
         command: r#"printf '%s' '{"mutatedToolInput":{"overNats":true}}'"#.to_string(),
         package_dir: None,
     })?;
@@ -136,7 +146,7 @@ async fn command_hook_registers_and_answers_over_nats() -> Result<()> {
         .connect(&server.url)
         .await?;
 
-    let registration = wait_for_registration(&client, &instance_id).await?;
+    let registration = wait_for_registration(&client, &instance_id, SERVER_NAME).await?;
     assert_eq!(registration.server, SERVER_NAME);
     assert_eq!(registration.hooks[0].matcher.as_deref(), Some("exec"));
 
@@ -164,5 +174,44 @@ async fn command_hook_registers_and_answers_over_nats() -> Result<()> {
     );
 
     server_task.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn command_hook_uses_env_name_with_end_of_options_separator() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let assigned_name = "hook-env-name-000";
+    let instance_id = InstanceId::new();
+    let child = Command::new(env!("CARGO_BIN_EXE_harnx-claude-compatible-hook-server"))
+        .args([
+            "--event",
+            "PreToolUse",
+            "--matcher",
+            "exec",
+            "--command",
+            "printf '{}'",
+            "--",
+        ])
+        .env(HARNX_HOOK_NAME, assigned_name)
+        .env(HARNX_INSTANCE_ID, instance_id.as_str())
+        .env("HARNX_NATS_URL", &server.url)
+        .env("HARNX_NATS_TOKEN", TOKEN)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn command hook with environment-assigned name")?;
+    let _hook_server = HookServerHandle(child);
+    let client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(&server.url)
+        .await?;
+
+    let registration = wait_for_registration(&client, &instance_id, assigned_name).await?;
+    assert_eq!(registration.server, assigned_name);
+    assert_eq!(registration.hooks[0].matcher.as_deref(), Some("exec"));
     Ok(())
 }

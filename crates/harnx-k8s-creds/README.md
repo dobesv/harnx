@@ -37,10 +37,12 @@ Register `harnx-k8s-creds` as a persistent hook in your `harnx.yaml` or agent fr
 ```yaml
 hooks:
   entries:
-    - event: PreToolUse
-      type: claude-command-persistent
-      matcher: "bash_exec|bash_spawn"
-      command: harnx-k8s-creds --context my-cluster
+    - command: >-
+        harnx-claude-compatible-hook-server
+        --event PreToolUse
+        --matcher "bash_exec|bash_spawn"
+        --persistent
+        -- harnx-k8s-creds --context my-cluster
 ```
 
 ### Multi-Context Example
@@ -48,13 +50,15 @@ hooks:
 ```yaml
 hooks:
   entries:
-    - event: PreToolUse
-      type: claude-command-persistent
-      matcher: "bash_exec|bash_spawn"
-      command: harnx-k8s-creds --context cluster-a --context cluster-b
+    - command: >-
+        harnx-claude-compatible-hook-server
+        --event PreToolUse
+        --matcher "bash_exec|bash_spawn"
+        --persistent
+        -- harnx-k8s-creds --context cluster-a --context cluster-b
 ```
 
-**Note**: You must use `type: claude-command-persistent` to ensure the credential server stays alive across multiple tool calls.
+**Note**: The `--persistent` flag keeps the credential server alive across multiple tool calls, avoiding the overhead of credential resolution on each request.
 
 ## CLI Flags
 

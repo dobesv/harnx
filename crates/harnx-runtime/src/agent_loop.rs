@@ -424,12 +424,12 @@ async fn apply_round_embeddings(
     Ok(())
 }
 
-async fn user_prompt_blocked(
+async fn user_prompt_block_reason(
     ctx: &AgentLoopContext,
     input: &Input,
     turn: &TurnHookContext,
     resume_count: u32,
-) -> bool {
+) -> Option<String> {
     let outcome = dispatch_agent_loop_hook(AgentHookDispatch {
         ctx,
         event: HookEvent::UserPromptSubmit {
@@ -440,7 +440,29 @@ async fn user_prompt_blocked(
         resume_count,
     })
     .await;
-    matches!(outcome.control, HookResultControl::Block { .. })
+    match outcome.control {
+        HookResultControl::Block { reason } => Some(reason),
+        _ => None,
+    }
+}
+
+fn emit_user_prompt_block_notice(reason: String) {
+    harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Notice(
+        harnx_core::event::NoticeEvent::Error(reason),
+    ));
+}
+
+async fn user_prompt_gate_passes(
+    ctx: &AgentLoopContext,
+    input: &Input,
+    turn: &TurnHookContext,
+    resume_count: u32,
+) -> bool {
+    let Some(reason) = user_prompt_block_reason(ctx, input, turn, resume_count).await else {
+        return true;
+    };
+    emit_user_prompt_block_notice(reason);
+    false
 }
 
 type AgentModelResult = Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)>;
@@ -756,7 +778,7 @@ async fn run_agent_loop_inner(
         config.write().before_chat_completion(&input)?;
 
         let turn = turn_hook_context(ctx);
-        if user_prompt_blocked(ctx, &input, &turn, resume_count).await {
+        if !user_prompt_gate_passes(ctx, &input, &turn, resume_count).await {
             break;
         }
 
@@ -869,7 +891,7 @@ mod tests {
     use super::*;
     use crate::client::MessageRole;
     use crate::utils::create_abort_signal;
-    use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, TurnEvent};
+    use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, NoticeEvent, TurnEvent};
     use parking_lot::RwLock;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -889,6 +911,24 @@ mod tests {
             };
             self.events.lock().unwrap().push((event, source));
         }
+    }
+
+    #[tokio::test]
+    async fn user_prompt_block_reason_is_emitted_as_error_notice() {
+        let _guard = SINK_LOCK.lock().await;
+        let sink = Arc::new(CollectingSink::default());
+        let reason = "hook server failed to start: Friendly safety guard hook unavailable";
+
+        harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+            emit_user_prompt_block_notice(reason.to_string());
+        })
+        .await;
+
+        let events = sink.events.lock().unwrap();
+        assert!(events.iter().any(|(event, source)| {
+            source.is_none()
+                && matches!(event, AgentEvent::Notice(NoticeEvent::Error(message)) if message == reason)
+        }));
     }
 
     use tempfile::TempDir;

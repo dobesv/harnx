@@ -190,7 +190,7 @@ let mut accumulated = guard.take().unwrap_or_default();
 *guard = Some(accumulated);
 ```
 
-**Discovery fail-open is safe:** If the hook registry bucket doesn't exist, discovery returns an empty list and the worker runs inline-only. This mirrors the tool registry posture.
+**Discovery with no provider:** When no `HARNX_INSTANCE_ID` is set (frontends without NATS), `dispatch_hook_event` returns `Continue` without hook enforcement by design. A normal empty registry (no hooks configured) means no hooks run. If discovery/registry read fails while a provider is set, the fail-closed guard blocks `UserPromptSubmit` and `PreToolUse` — see `hooks-nats-launch-dispatch-complete-2026-08-01.md` for the expectations-manifest pattern.
 
 ## Accepted Behavior Changes / Known Gaps
 

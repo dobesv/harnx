@@ -5,7 +5,7 @@ use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResultControl};
 use harnx_core::instance::InstanceId;
 use harnx_hookset::{FailPolicy, HookRegistration};
 use harnx_hookset_server::{hook_registration_key, serve_over_nats, HOOK_REGISTRY_BUCKET};
-use harnx_proxy_auth::hook::{ProxyAuthHook, SERVER_NAME};
+use harnx_proxy_auth::hook::ProxyAuthHook;
 use serde_json::{json, Map};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const TOKEN: &str = "proxy-auth-hook-test-token";
+const ASSIGNED_NAME: &str = "hook-a1b2c3d4-000";
 
 struct NatsServerHandle {
     url: String,
@@ -95,7 +96,7 @@ async fn wait_for_registration(
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(store) = jetstream.get_key_value(HOOK_REGISTRY_BUCKET).await {
-            let key = hook_registration_key(instance_id, SERVER_NAME);
+            let key = hook_registration_key(instance_id, ASSIGNED_NAME);
             if let Some(value) = store.get(&key).await? {
                 return serde_json::from_slice(&value).context("decode hook registration");
             }
@@ -117,7 +118,12 @@ async fn proxy_auth_registers_and_mutates_tool_env_over_nats() -> Result<()> {
     let proxy_port = 4312;
     let ca_cert_path = PathBuf::from("/tmp/proxy-auth-nats-test-ca.pem");
     let extra_env = Map::from_iter([("ACLI_CONFIG_DIR".to_string(), json!("/tmp/acli-config"))]);
-    let hook = ProxyAuthHook::new(proxy_port, ca_cert_path.clone(), extra_env);
+    let hook = ProxyAuthHook::new(
+        ASSIGNED_NAME.to_string(),
+        proxy_port,
+        ca_cert_path.clone(),
+        extra_env,
+    );
     let instance_id = InstanceId::new();
     let server_instance_id = instance_id.clone();
     let server_url = server.url.clone();
@@ -131,7 +137,7 @@ async fn proxy_auth_registers_and_mutates_tool_env_over_nats() -> Result<()> {
         .await?;
 
     let registration = wait_for_registration(&client, &instance_id).await?;
-    assert_eq!(registration.server, SERVER_NAME);
+    assert_eq!(registration.server, ASSIGNED_NAME);
     assert_eq!(registration.hooks.len(), 1);
     assert_eq!(registration.hooks[0].event, "PreToolUse");
     assert_eq!(registration.hooks[0].matcher.as_deref(), Some("exec|spawn"));
@@ -149,7 +155,7 @@ async fn proxy_auth_registers_and_mutates_tool_env_over_nats() -> Result<()> {
     };
     let message = client
         .request(
-            instance_id.hook_subject(SERVER_NAME, "PreToolUse"),
+            instance_id.hook_subject(ASSIGNED_NAME, "PreToolUse"),
             serde_json::to_vec(&payload)?.into(),
         )
         .await?;
