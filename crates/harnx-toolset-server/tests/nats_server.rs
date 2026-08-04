@@ -139,6 +139,7 @@ impl Toolset for TestToolset {
             idempotent_hint: false,
             read_only_hint: false,
             timeout_secs: None,
+            meta: None,
         }]
     }
 

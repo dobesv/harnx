@@ -27,6 +27,8 @@ pub struct ToolSpec {
     /// Missing values use the client's default backstop for older registrations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Error returned directly by a [`Toolset`] implementation.
@@ -173,6 +175,7 @@ mod tests {
             idempotent_hint: true,
             read_only_hint: true,
             timeout_secs: Some(120),
+            meta: None,
         }
     }
 
@@ -187,6 +190,7 @@ mod tests {
         });
         let spec: ToolSpec = serde_json::from_value(value).expect("decode legacy tool spec");
         assert_eq!(spec.timeout_secs, None);
+        assert_eq!(spec.meta, None);
     }
 
     #[test]

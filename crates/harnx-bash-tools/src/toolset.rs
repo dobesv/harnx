@@ -45,6 +45,7 @@ fn spec<T: JsonSchema + 'static>(name: &str, description: &str) -> ToolSpec {
         idempotent_hint: false,
         read_only_hint: false,
         timeout_secs: None,
+        meta: None,
     }
 }
 
