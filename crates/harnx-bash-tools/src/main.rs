@@ -284,6 +284,7 @@ mod tests {
     use super::*;
     use crate::test_support::{env_lock, EnvVar};
 
+    #[cfg(unix)]
     #[test]
     fn shared_allow_environment_names_are_parsed() {
         let _guard = env_lock();

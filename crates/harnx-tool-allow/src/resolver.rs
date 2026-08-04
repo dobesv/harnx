@@ -91,9 +91,11 @@ fn absolute(path: &Path, cwd: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn empty_inputs_hard_deny_without_fallback() {
         let resolved = resolve_allowlist(
@@ -108,6 +110,7 @@ mod tests {
         assert!(!resolved.contains_read("/work/project"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn explicit_write_and_exec_are_home_guarded() {
         let inputs = AllowInputs {
@@ -126,6 +129,7 @@ mod tests {
         assert!(!resolved.contains_exec("/home/tester"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn allow_all_is_downgraded_to_read_by_home_guard() {
         let inputs = AllowInputs {

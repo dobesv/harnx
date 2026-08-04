@@ -352,12 +352,14 @@ fn default_homebrew_prefix() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn has(rules: &[AllowRule], path: impl AsRef<Path>, permission: Permission) -> bool {
         rules
             .iter()
             .any(|rule| rule == &(path.as_ref().to_path_buf(), permission))
     }
 
+    #[cfg(unix)]
     #[test]
     fn common_default_has_system_and_temp_members() {
         let rules = common_default(&AllowEnv::default());
@@ -366,6 +368,7 @@ mod tests {
         assert!(has(&rules, "/dev/shm", Permission::ReadWriteExec));
     }
 
+    #[cfg(unix)]
     #[test]
     fn dev_tools_has_user_red_line_members() {
         let env = AllowEnv {
@@ -438,6 +441,7 @@ mod tests {
         assert!(has(&rules, &cwd, Permission::ReadWriteExec));
     }
 
+    #[cfg(unix)]
     #[test]
     fn allow_all_is_rwx_root_rule() {
         let rules = all(&AllowEnv::default());
