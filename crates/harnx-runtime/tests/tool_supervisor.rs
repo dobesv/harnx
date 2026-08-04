@@ -7,7 +7,6 @@ use harnx_core::abort::create_abort_signal;
 use harnx_core::event::{AgentEvent, AgentEventSink, NoticeEvent};
 use harnx_core::instance::InstanceId;
 use harnx_core::tool::{ToolCall, ToolError, ToolProvider};
-use harnx_mcp::{McpManager, McpServerConfig};
 use harnx_runtime::config::{Config, ToolServerConfig, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
 use harnx_runtime::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
 use harnx_runtime::nats_worker::{ToolServerStartConfig, ToolServerSupervisor};
@@ -165,71 +164,31 @@ async fn assert_pilot_registration(
     Ok(pid)
 }
 
-async fn stdio_time_manager(binary: &str) -> Result<Arc<McpManager>> {
-    let manager = Arc::new(McpManager::new());
-    manager.initialize(vec![McpServerConfig {
-        name: "legacy".to_string(),
-        command: binary.to_string(),
-        args: vec!["--mcp-stdio".to_string()],
-        env: Default::default(),
-        enabled: true,
-        description: None,
-        rename_tools: Default::default(),
-        tool_templates: Default::default(),
-        hooks: None,
-        package: None,
-    }]);
-    let tools = manager.get_all_tools().await;
-    assert!(tools
-        .iter()
-        .any(|tool| tool.name == "legacy_get_current_time"));
-    Ok(manager)
-}
-
-async fn assert_mixed_transport_batch(binary: &str, instance_id: &InstanceId) -> Result<()> {
-    let mcp_manager = stdio_time_manager(binary).await?;
+async fn assert_nats_eval_batch(instance_id: &InstanceId) -> Result<()> {
     let config = Arc::new(RwLock::new(Config::default()));
-    config.write().mcp_manager = Some(mcp_manager);
     let context = harnx_runtime::tool::build_tool_eval_context(
         harnx_runtime::tool::BuildToolEvalContextParams::new(&config, instance_id)
             .with_agent_use_tools(Some("*")),
     )
     .await;
     assert_eq!(context.providers[0].name(), "nats");
-    assert!(context
-        .providers
-        .iter()
-        .any(|provider| provider.name() == "mcp"));
     let results = harnx_runtime::tool::eval_tool_calls(
         &context,
-        vec![
-            ToolCall::new(
-                "get_current_time".to_string(),
-                json!({ "timezone": "UTC" }),
-                Some("nats-time".to_string()),
-                None,
-            ),
-            ToolCall::new(
-                "legacy_get_current_time".to_string(),
-                json!({ "timezone": "UTC" }),
-                Some("stdio-time".to_string()),
-                None,
-            ),
-        ],
+        vec![ToolCall::new(
+            "get_current_time".to_string(),
+            json!({ "timezone": "UTC" }),
+            Some("nats-time".to_string()),
+            None,
+        )],
         &create_abort_signal(),
     )
     .await?;
-    let nats = results
+    let result = results
         .iter()
         .find(|result| result.call.id.as_deref() == Some("nats-time"))
         .context("NATS time result in worker transcript")?;
-    assert_eq!(nats.output["timezone"], "UTC");
-    assert!(nats.output["datetime"].as_str().is_some());
-    let stdio = results
-        .iter()
-        .find(|result| result.call.id.as_deref() == Some("stdio-time"))
-        .context("stdio time result in worker transcript")?;
-    assert!(stdio.output.to_string().contains("UTC"));
+    assert_eq!(result.output["timezone"], "UTC");
+    assert!(result.output["datetime"].as_str().is_some());
     Ok(())
 }
 
@@ -310,7 +269,7 @@ async fn assert_crash_failure(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn time_over_nats_pilot_e2e_mixed_stdio_cancel_and_crash() -> Result<()> {
+async fn time_over_nats_pilot_e2e_eval_cancel_and_crash() -> Result<()> {
     let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
         auth_token: Some(TOKEN.to_string()),
     })
@@ -342,7 +301,7 @@ async fn time_over_nats_pilot_e2e_mixed_stdio_cancel_and_crash() -> Result<()> {
     )
     .await?;
 
-    assert_mixed_transport_batch(&binary, &instance_id).await?;
+    assert_nats_eval_batch(&instance_id).await?;
     assert_cancel_control(&provider, &client, &instance_id).await?;
     assert_crash_failure(&provider, pid, &client, &instance_id).await
 }

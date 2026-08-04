@@ -1,7 +1,6 @@
 //! `AgentConfig` — a named agent's pure configuration: model, prompts,
 //! tools, hooks, retry config, variables. Data + pure methods only; no
-//! file I/O, no inquire, no runtime state. Runtime fields (mcp_manager,
-//! rag) live on the harnx-side `Agent` wrapper.
+//! file I/O, no inquire, no runtime state. Runtime fields (rag) live on the harnx-side `Agent` wrapper.
 
 use crate::hooks::HooksConfig;
 use crate::model::Model;

@@ -22,9 +22,10 @@ impl Config {
         paths::clients_dir()
     }
 
-    pub fn mcp_servers_dir() -> PathBuf {
-        paths::mcp_servers_dir()
+    pub fn tool_servers_dir() -> PathBuf {
+        paths::tool_servers_dir()
     }
+
     pub fn macro_file(name: &str) -> PathBuf {
         paths::macro_file(name)
     }

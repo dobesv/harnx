@@ -90,32 +90,7 @@ impl Config {
         self.use_agent_obj(agent)
     }
 
-    /// Reinitialize the MCP manager so it is scoped to the package of
-    /// the agent named `agent_name` (or to the global, no-package view for a
-    /// top-level agent).
-    ///
-    /// This MUST run before the agent's tool declarations are read/snapshotted
-    /// (e.g. `agent::init` calls `mcp_manager.get_all_tools()`), otherwise the
-    /// agent inherits whatever scope the managers were last left in — typically
-    /// the global (`None`) scope from `Config::init`, which prefixes every
-    /// package server (`<pkg>__*`) and breaks same-package delegation and tool
-    /// naming (#826).
-    ///
-    /// Both agent-activation paths funnel their scoping decision through here so
-    /// the logic cannot drift between them again:
-    /// - the synchronous `use_agent_obj` path, and
-    /// - the asynchronous `use_agent` path.
-    pub(super) fn scope_managers_for_agent(&mut self, agent_name: &str) {
-        let agent_package =
-            harnx_core::package_namespace::pkg_from_qualified(agent_name).map(str::to_string);
-        self.reinit_managers_for_agent(agent_package.as_deref());
-    }
-
-    /// Install an already-built, already-scoped agent as the active agent.
-    ///
-    /// Assumes the managers have already been scoped for this agent via
-    /// [`scope_managers_for_agent`]. Use [`use_agent_obj`] when you have a
-    /// freshly built agent and still need the managers scoped.
+    /// Install an already-built agent as the active agent.
     pub(super) fn set_active_agent(&mut self, agent: Agent) {
         self.agent = Some(agent);
     }
@@ -125,10 +100,6 @@ impl Config {
             self.exit_agent()?;
         }
 
-        // Scope MCP manager to the incoming agent's package (or None for
-        // top-level agents) so same-package MCP servers appear under their bare
-        // names and others stay prefixed.
-        self.scope_managers_for_agent(agent.name());
         self.set_active_agent(agent);
         Ok(())
     }
@@ -296,19 +267,7 @@ impl Config {
         if config.read().agent.is_some() {
             config.write().exit_agent()?;
         }
-        // Scope the MCP manager to the incoming agent's package BEFORE
-        // `agent::init` snapshots selector-filtered MCP tool declarations (it
-        // reads `mcp_manager.get_tools_for_selectors(...)` during init).
-        // Without this the agent would inherit the global (`None`) scope left
-        // by `Config::init` and its same-package tools would be wrongly
-        // prefixed (#826).
-        //
-        // Scoping + install go through the same `scope_managers_for_agent` /
-        // `set_active_agent` helpers as the synchronous `use_agent_obj` path, so
-        // the two activation paths cannot drift apart. We scope here (rather than
-        // letting `use_agent_obj` do it after the build) because the async build
-        // snapshots the agent's tools and must see the scoped managers.
-        config.write().scope_managers_for_agent(agent_name);
+        // Tools are now loaded via NATS tool_servers, not direct MCP
         let agent = self::agent::init(config, agent_name, abort_signal).await?;
         let session = session_name.map(|v| v.to_string());
         config.write().rag = agent.rag();
@@ -352,8 +311,6 @@ impl Config {
         if self.agent.take().is_some() {
             self.rag.take();
             self.discontinuous_last_message();
-            // Restore global (no-agent) manager view: all package servers prefixed.
-            self.reinit_managers_for_agent(None);
         }
         // Clear remote agent metadata too
         self.remote_agent.take();

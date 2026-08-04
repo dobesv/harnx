@@ -1,11 +1,12 @@
 ---
 source: crates/harnx-tui/src/tests.rs
+assertion_line: 1858
 expression: rendered
 ---
+.exit rag                Leave RAG
 .attach                  Attach a file to the next message
 .detach                  Remove attached files
 .macro                   Execute a macro
-.mcp                     Manage MCP servers
 .file                    Include files, directories, URLs or commands
 .continue                Continue previous response
 .regenerate              Regenerate last response

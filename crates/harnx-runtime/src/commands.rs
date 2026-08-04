@@ -30,15 +30,11 @@ pub enum CommandOutcome {
     OpenSessionPicker,
 }
 
-pub static COMMANDS: LazyLock<[Command; 50]> = LazyLock::new(|| {
+pub static COMMANDS: LazyLock<[Command; 48]> = LazyLock::new(|| {
     [
         Command::new(".help", "Show this help guide"),
         Command::new(".info", "Show system info"),
         Command::new(".info tools", "List all available tools and their status"),
-        Command::new(
-            ".info mcp [server]",
-            "Show an MCP server's command, args, env, roots, hooks, and PID",
-        ),
         Command::new(
             ".info env [name]",
             "List harnx process env var names (or show one var's value)",
@@ -95,7 +91,6 @@ pub static COMMANDS: LazyLock<[Command; 50]> = LazyLock::new(|| {
         Command::new(".attach", "Attach a file to the next message"),
         Command::new(".detach", "Remove attached files"),
         Command::new(".macro", "Execute a macro"),
-        Command::new(".mcp", "Manage MCP servers"),
         Command::new(".file", "Include files, directories, URLs or commands"),
         Command::new(".continue", "Continue previous response"),
         Command::new(".regenerate", "Regenerate last response"),
@@ -173,89 +168,6 @@ fn write_env_info(output: &mut (dyn Write + Send), name: Option<&str>) -> Result
                 writeln!(output, "  {key}")?;
             }
         }
-    }
-    Ok(())
-}
-
-/// Write diagnostic details for MCP servers: resolved command, args, env,
-/// roots, and hooks (with their exact command strings — useful for spotting
-/// YAML-folding or arg-dropping issues), plus connection status and PID.
-/// With `name = None`, lists all running servers with brief status.
-async fn write_mcp_info(
-    output: &mut (dyn Write + Send),
-    config: &GlobalConfig,
-    name: Option<&str>,
-) -> Result<()> {
-    let Some(manager) = config.read().mcp_manager.clone() else {
-        writeln!(output, "MCP is not configured")?;
-        return Ok(());
-    };
-
-    let name = name.map(str::trim).filter(|s| !s.is_empty());
-    let Some(name) = name else {
-        let names = manager.server_names();
-        if names.is_empty() {
-            writeln!(output, "No MCP servers running")?;
-            return Ok(());
-        }
-        writeln!(output, "MCP servers:")?;
-        for n in names {
-            if let Some(client) = manager.get_client(&n) {
-                let pid = client
-                    .pid()
-                    .map(|p| format!(" pid={p}"))
-                    .unwrap_or_default();
-                writeln!(output, "  {} [{}]{}", n, client.status_label(), pid)?;
-            }
-        }
-        writeln!(output, "\nUse `.info mcp <name>` for full details.")?;
-        return Ok(());
-    };
-
-    let Some(client) = manager.get_client(name) else {
-        writeln!(output, "No running MCP server named '{name}'.")?;
-        let names = manager.server_names();
-        if !names.is_empty() {
-            writeln!(output, "Available: {}", names.join(", "))?;
-        }
-        return Ok(());
-    };
-
-    let cfg = client.config();
-    write!(output, "MCP server: {}", client.name())?;
-    if let Some(pkg) = client.package() {
-        write!(output, "  (package: {pkg})")?;
-    }
-    writeln!(output)?;
-    write!(output, "  status:  {}", client.status_label())?;
-    if let Some(pid) = client.pid() {
-        write!(output, "   pid: {pid}")?;
-    }
-    writeln!(output)?;
-    writeln!(output, "  command: {}", cfg.command)?;
-    if !cfg.args.is_empty() {
-        writeln!(output, "  args:")?;
-        for arg in &cfg.args {
-            writeln!(output, "    {arg}")?;
-        }
-    }
-    if !cfg.env.is_empty() {
-        writeln!(output, "  env:")?;
-        let mut envs: Vec<_> = cfg.env.iter().collect();
-        envs.sort_by(|a, b| a.0.cmp(b.0));
-        for (key, value) in envs {
-            writeln!(output, "    {key}={value}")?;
-        }
-    }
-    match cfg.hooks.as_ref() {
-        Some(hooks) if !hooks.entries.is_empty() => {
-            writeln!(output, "  hooks:")?;
-            for (i, hook) in hooks.entries.iter().enumerate() {
-                writeln!(output, "    [{}] {}", i + 1, hook.command)?;
-                writeln!(output, "        transport: NATS")?;
-            }
-        }
-        _ => writeln!(output, "  hooks: (none)")?,
     }
     Ok(())
 }
@@ -447,10 +359,6 @@ pub async fn run_command_with_output_and_local_worker(
                     } else {
                         writeln!(output, "highlighting: disabled")?;
                     }
-                }
-                Some(rest) if rest == "mcp" || rest.starts_with("mcp ") => {
-                    let name = rest.strip_prefix("mcp").map(str::trim).filter(|s| !s.is_empty());
-                    write_mcp_info(output, config, name).await?;
                 }
                 Some(rest) if rest == "env" || rest.starts_with("env ") => {
                     let name = rest.strip_prefix("env").map(str::trim).filter(|s| !s.is_empty());
@@ -689,70 +597,6 @@ pub async fn run_command_with_output_and_local_worker(
                     writeln!(output, "{sources}")?;
                 }
                 _ => writeln!(output, r#"Usage: .sources rag"#)?,
-            },
-            ".mcp" => match split_first_arg(args) {
-                Some(("list", _)) => {
-                    let servers = Config::mcp_list_servers(config);
-                    if servers.is_empty() {
-                        writeln!(output, "No MCP servers configured")?;
-                    } else {
-                        writeln!(output, "MCP Servers:")?;
-                        for name in servers {
-                            writeln!(output, "  {}", name)?;
-                        }
-                    }
-                }
-                Some(("connect", name)) => {
-                    let name = name.map(|n| n.trim()).unwrap_or("");
-                    if name.is_empty() {
-                        writeln!(output, "Usage: .mcp connect <server>")?;
-                    } else {
-                        Config::mcp_connect_server(config, name).await?;
-                        writeln!(output, "Connected to MCP server '{}'", name)?;
-                    }
-                }
-                Some(("disconnect", name)) => {
-                    let name = name.map(|n| n.trim()).unwrap_or("");
-                    if name.is_empty() {
-                        crate::utils::emit_info("Usage: .mcp disconnect <server>".to_string());
-                    } else {
-                        Config::mcp_disconnect_server(config, name).await?;
-                        crate::utils::emit_info(format!("Disconnected from MCP server '{name}'"));
-                    }
-                }
-                Some(("tools", name)) => {
-                    let mcp_manager = config.read().mcp_manager.clone();
-                    if let Some(manager) = mcp_manager {
-                        let tools = match name {
-                            Some(n) if !n.trim().is_empty() => {
-                                manager.get_server_tools(n.trim()).await?
-                            }
-                            _ => manager.get_all_tools().await,
-                        };
-                        if tools.is_empty() {
-                            writeln!(output, "No MCP tools available")?;
-                        } else {
-                            writeln!(output, "MCP Tools:")?;
-                            for tool in tools {
-                                writeln!(output, "  {} - {}", tool.name, tool.description)?;
-                            }
-                        }
-                    } else {
-                        writeln!(output, "MCP is not configured")?;
-                    }
-                }
-                _ => {
-                    writeln!(
-                        output,
-                        r#"Usage: .mcp <command>
-
-Commands:
-  .mcp list                    - List configured MCP servers
-  .mcp connect <server>        - Connect to an MCP server
-  .mcp disconnect <server>     - Disconnect from an MCP server
-  .mcp tools [server]          - List available MCP tools"#
-                    )?;
-                }
             },
             ".macro" => match split_first_arg(args) {
                 Some((name, extra)) => {
@@ -1376,71 +1220,6 @@ mod tests {
         };
         config.session = Some(config::session::new(&config, "test", None).expect("test session"));
         Arc::new(RwLock::new(config))
-    }
-
-    fn test_config_with_mcp(server_yaml: &str) -> GlobalConfig {
-        let server: harnx_mcp::McpServerConfig =
-            serde_yaml::from_str(server_yaml).expect("parse mcp server config");
-        let manager = harnx_mcp::McpManager::new();
-        manager.initialize(vec![server]);
-        let config: GlobalConfig = Arc::new(RwLock::new(Config {
-            working_mode: WorkingMode::Cmd,
-            ..Default::default()
-        }));
-        config.write().mcp_manager = Some(Arc::new(manager));
-        config
-    }
-
-    #[tokio::test]
-    async fn test_mcp_info_reports_command_args_env_and_hooks() {
-        let config = test_config_with_mcp(
-            r#"
-name: bash
-command: harnx-bash-tools
-args:
-  - "--allow-rwx"
-  - "$GIT_ROOT"
-env:
-  EDITOR: "true"
-hooks:
-  entries:
-    - command: "harnx-proxy-auth --hook 'if .host == \"api.github.com\" then . end'"
-"#,
-        );
-        let mut out: Vec<u8> = Vec::new();
-        write_mcp_info(&mut out, &config, Some("bash"))
-            .await
-            .expect("write mcp info");
-        let text = String::from_utf8(out).expect("utf8");
-
-        assert!(text.contains("MCP server: bash"), "{text}");
-        assert!(text.contains("command: harnx-bash-tools"), "{text}");
-        assert!(text.contains("--allow-rwx"), "{text}");
-        assert!(text.contains("$GIT_ROOT"), "{text}");
-        assert!(text.contains("EDITOR=true"), "{text}");
-        assert!(text.contains("[1] harnx-proxy-auth --hook"), "{text}");
-        // The exact hook command string is preserved — this is what reveals
-        // YAML-folding/arg-dropping problems in a real config.
-        assert!(text.contains("harnx-proxy-auth --hook"), "{text}");
-        assert!(text.contains("api.github.com"), "{text}");
-        // Persistent hook is not spawned in this test → reported as not started.
-        assert!(text.contains("transport: NATS"), "{text}");
-    }
-
-    #[tokio::test]
-    async fn test_mcp_info_unknown_server_lists_available() {
-        let config = test_config_with_mcp("name: bash\ncommand: harnx-bash-tools\n");
-        let mut out: Vec<u8> = Vec::new();
-        write_mcp_info(&mut out, &config, Some("nope"))
-            .await
-            .expect("write mcp info");
-        let text = String::from_utf8(out).expect("utf8");
-
-        assert!(
-            text.contains("No running MCP server named 'nope'"),
-            "{text}"
-        );
-        assert!(text.contains("Available: bash"), "{text}");
     }
 
     #[test]

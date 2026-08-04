@@ -10,7 +10,6 @@ members = [
     "crates/harnx-k8s-creds",
     "crates/harnx-fetch",
     "crates/harnx-hooks",
-    "crates/harnx-mcp",
     "crates/harnx-bash-tools",
     "crates/harnx-mcp-bridge",
     "crates/harnx-sandbox-common",

@@ -1,5 +1,6 @@
 //! Config loading/initialization extracted from config/mod.rs for code health.
 use super::*;
+use crate::config::patches_split::load_package_tool_server_patch;
 use harnx_core::agent_config::AgentConfig;
 
 fn normalize_description(description: Option<String>) -> Option<String> {
@@ -43,7 +44,6 @@ impl Config {
                 config.set_wrap(&wrap)?;
             }
 
-            config.init_mcp_manager();
             config.tools = Tools::init_from_mcp(None);
 
             config.setup_model()?;
@@ -78,8 +78,6 @@ impl Config {
         config.clients = Self::load_clients_from_dir(&config_dir.join(paths::CLIENTS_DIR_NAME))?;
         config.nats_servers =
             Self::load_nats_servers_from_dir(&config_dir.join(paths::NATS_SERVERS_DIR_NAME))?;
-        config.mcp_servers =
-            Self::load_mcp_servers_from_dir(&config_dir.join(paths::MCP_SERVERS_DIR_NAME))?;
         config.tool_servers =
             Self::load_tool_servers_from_dir(&config_dir.join(paths::TOOL_SERVERS_DIR_NAME))?;
         let packages_dir = paths::packages_dir();
@@ -104,6 +102,11 @@ impl Config {
         packages.sort_by(|(left, _), (right, _)| left.cmp(right));
         for (pkg_name, path) in packages {
             Self::load_package_servers(config, &path, &pkg_name);
+            // Load clients after tool servers so patch is available
+            let patch = load_package_tool_server_patch(&pkg_name);
+            config
+                .clients
+                .extend(Self::load_package_clients(&path, &pkg_name, patch.as_ref()));
         }
         Ok(())
     }
@@ -263,8 +266,6 @@ impl Config {
         let config_dir = Self::config_dir();
         config.nats_servers =
             Self::load_nats_servers_from_dir(&config_dir.join(paths::NATS_SERVERS_DIR_NAME))?;
-        config.mcp_servers =
-            Self::load_mcp_servers_from_dir(&config_dir.join(paths::MCP_SERVERS_DIR_NAME))?;
         config.tool_servers =
             Self::load_tool_servers_from_dir(&config_dir.join(paths::TOOL_SERVERS_DIR_NAME))?;
         Ok(config)

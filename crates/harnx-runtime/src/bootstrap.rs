@@ -119,8 +119,8 @@ mod tests {
             filter
         );
         assert!(
-            "harnx_mcp::client".starts_with(&filter),
-            "harnx_mcp::client should match filter {:?}",
+            "harnx_runtime::client".starts_with(&filter),
+            "harnx_runtime::client should match filter {:?}",
             filter
         );
         assert!(
@@ -147,8 +147,8 @@ mod tests {
             buggy_filter
         );
         assert!(
-            !"harnx_mcp::client".starts_with(buggy_filter),
-            "harnx_mcp::client should NOT match buggy filter {:?}",
+            !"harnx_runtime::client".starts_with(buggy_filter),
+            "harnx_runtime::client should NOT match buggy filter {:?}",
             buggy_filter
         );
         assert!(

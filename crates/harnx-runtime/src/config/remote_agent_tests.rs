@@ -51,8 +51,7 @@ fn handoff_tool_declarations_filter_per_agent_and_keep_targets_in_sync() {
     )
     .unwrap();
 
-    let mut config = Config::default();
-    config.reinit_managers_for_agent(None);
+    let config = Config::default();
 
     let (selected_declarations, selected_targets) =
         config.tool_declarations_for_use_tools(Some("metis__at__local_session_handoff"), None);

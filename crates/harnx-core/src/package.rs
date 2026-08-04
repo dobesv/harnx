@@ -51,9 +51,9 @@ pub struct PackagePatch {
     /// JQ expressions for patching client configs.
     #[serde(default)]
     pub clients: Vec<String>,
-    /// JQ expressions for patching MCP server configs.
+    /// JQ expressions for patching tool server configs.
     #[serde(default)]
-    pub mcp_servers: Vec<String>,
+    pub tool_servers: Vec<String>,
 }
 
 #[cfg(test)]
@@ -103,7 +103,7 @@ mod tests {
         let patch = PackagePatch {
             agents: vec![".model = \"claude\"".to_string()],
             clients: vec![".api_key = \"sk-test\"".to_string()],
-            mcp_servers: vec![".enabled = false".to_string()],
+            tool_servers: vec![".enabled = false".to_string()],
         };
 
         let yaml = serde_yaml::to_string(&patch).unwrap();
@@ -125,7 +125,7 @@ mod tests {
         let patch = PackagePatch {
             agents: vec![".model = \"claude\"".to_string()],
             clients: Vec::new(),
-            mcp_servers: Vec::new(),
+            tool_servers: Vec::new(),
         };
 
         let yaml = serde_yaml::to_string(&patch).unwrap();

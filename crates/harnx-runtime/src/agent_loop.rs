@@ -1140,10 +1140,7 @@ user prompt"
 
         let global_config = Arc::new(RwLock::new(config));
 
-        // Register our mock provider. We need to inject it into the tool
-        // evaluation context. The providers are built by build_tool_providers
-        // from Config.mcp_manager. For this test, we'll use the
-        // handoff's built-in dispatch path which checks allowed_tool_names
+        // Use the handoff built-in dispatch path which checks allowed_tool_names
         // and handoff_targets. The mock provider is an alternative but the
         // dispatch path for _session_handoff tools in dispatch_tool_call
         // synthesizes the switch_agent JSON directly when allowed_tool_names

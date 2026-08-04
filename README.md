@@ -154,7 +154,7 @@ within your workflow.
 #### Bundled tool servers
 
 Harnx ships with native toolset servers and MCP servers ready to enable in your config. See
-`example_config/tool_servers/` and `example_config/mcp_servers/` for ready-to-use templates.
+`example_config/tool_servers/` for ready-to-use templates.
 
 *   **`harnx-fs-tools`** — Filesystem toolset (`read`, `write`, `edit`, `insert`, `re_replace`, `ls`, `grep`, `find`, `rollback_file`)
     *   Deny-all filesystem allowlist with separate read and write permissions; smart output truncation; binary detection.

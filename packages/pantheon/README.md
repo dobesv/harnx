@@ -110,7 +110,7 @@ settings without editing package files (which are overwritten on update), use a
 
 ### Patch file format
 
-Each field in the patch file (`agents`, `clients`, `mcp_servers`) is an array
+Each field in the patch file (`agents`, `clients`) is an array
 of jq expressions. Each expression receives the full config struct as JSON and
 returns it modified; use `if .name == "..." then ... end` to target specific
 entries (the `else .` is implicit when omitted).

@@ -178,7 +178,7 @@ Every hook command runs through a shell, and Harnx injects one extra environment
 
 | Variable | Value |
 |---|---|
-| `HARNX_PACKAGE_DIR` | The directory of the package that owns the hook or tool server (`<config>/packages/<name>/`). For hooks or tool servers defined outside a package (the global `config.yaml`, or servers under `<config>/mcp_servers/` or `<config>/tool_servers/`), it falls back to the config directory (`~/.config/harnx` by default). |
+| `HARNX_PACKAGE_DIR` | The directory of the package that owns the hook or tool server (`<config>/packages/<name>/`). For hooks or tool servers defined outside a package (the global `config.yaml`, or servers under `<config>/tool_servers/`), it falls back to the config directory (`~/.config/harnx` by default). |
 
 This lets a package bundle helper scripts alongside its config and reference
 them without hardcoding an absolute path. For example, a packaged MCP server can

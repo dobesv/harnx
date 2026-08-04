@@ -132,10 +132,7 @@ fn load_config_via_internal_pipeline(config_path: &Path) -> Config {
         .parent()
         .expect("config path must have parent directory");
     let _config_guard = TestEnvGuard::new("HARNX_CONFIG_DIR", config_dir);
-    let mut config = Config::load_from_file(config_path).unwrap();
-    // Keep explicit MCP configs initialized for tests that exercise them.
-    // Configured agents themselves are no longer auto-registered through the old backend.
-    config.reinit_managers_for_agent(None);
+    let config = Config::load_from_file(config_path).unwrap();
     drop(_config_guard);
     match prev {
         Some(value) => unsafe { std::env::set_var("HARNX_CONFIG_DIR", value) },

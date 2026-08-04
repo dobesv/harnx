@@ -3765,30 +3765,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "harnx-mcp"
-version = "0.33.4"
-dependencies = [
- "anyhow",
- "async-trait",
- "dirs",
- "futures-util",
- "globset",
- "harnx-core",
- "harnx-test-bins",
- "indexmap",
- "log",
- "parking_lot",
- "process-wrap",
- "rmcp",
- "serde",
- "serde_json",
- "shellexpand",
- "tempfile",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "harnx-mcp-bridge"
 version = "0.33.4"
 dependencies = [
@@ -4068,7 +4044,6 @@ dependencies = [
  "harnx-hooks",
  "harnx-hookset",
  "harnx-hookset-server",
- "harnx-mcp",
  "harnx-rag",
  "harnx-render",
  "harnx-spinner",

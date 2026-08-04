@@ -3,10 +3,9 @@
 
 #[cfg(unix)]
 use super::test_support::env_lock;
-use super::test_support::{EnvGuard, PackageServer};
+use super::test_support::EnvGuard;
 use super::*;
 use harnx_core::message::MessageRole;
-use std::sync::{Mutex, OnceLock};
 
 #[test]
 fn test_render_status_line() {
@@ -515,95 +514,6 @@ fn select_tools_returns_none_without_use_tools() {
     );
 }
 
-use super::apply_mcp_server_patch;
-use harnx_mcp::McpServerConfig;
-
-fn make_server(name: &str, command: &str) -> McpServerConfig {
-    McpServerConfig {
-        name: name.to_string(),
-        command: command.to_string(),
-        args: vec![],
-        env: Default::default(),
-        enabled: true,
-        description: None,
-        rename_tools: Default::default(),
-        tool_templates: Default::default(),
-        package: Some("mypkg".to_string()), // Important: test that this is preserved
-        hooks: None,
-    }
-}
-
-#[test]
-fn apply_mcp_server_patch_with_identity_expression_leaves_config_unchanged() {
-    let mut server = make_server("test-server", "mcp-test");
-    let original_name = server.name.clone();
-    let original_command = server.command.clone();
-
-    let result = apply_mcp_server_patch(&mut server, &[".".to_string()]);
-
-    assert!(result.is_ok());
-    assert_eq!(server.name, original_name);
-    assert_eq!(server.command, original_command);
-}
-
-#[test]
-fn apply_mcp_server_patch_sets_field_via_jq_expression() {
-    let mut server = make_server("test-server", "mcp-original");
-
-    let result = apply_mcp_server_patch(
-        &mut server,
-        &[
-            r#".command = "mcp-patched""#.to_string(),
-            r#".args = ["--verbose"]"#.to_string(),
-        ],
-    );
-
-    assert!(result.is_ok());
-    assert_eq!(server.command, "mcp-patched");
-    assert_eq!(server.args, vec!["--verbose"]);
-}
-
-#[test]
-fn apply_mcp_server_patch_with_empty_patches_is_noop() {
-    let mut server = make_server("test-server", "mcp-test");
-    let original_name = server.name.clone();
-
-    let result = apply_mcp_server_patch(&mut server, &[]);
-
-    assert!(result.is_ok());
-    assert_eq!(server.name, original_name);
-}
-
-#[test]
-fn apply_mcp_server_patch_preserves_server_package_field() {
-    let mut server = make_server("test-server", "mcp-test");
-    assert_eq!(server.package, Some("mypkg".to_string()));
-
-    // Apply a patch that would serialize and deserialize
-    let result = apply_mcp_server_patch(
-        &mut server,
-        &[r#".description = "Updated description""#.to_string()],
-    );
-
-    assert!(result.is_ok());
-    // The package field should be preserved even though it has #[serde(skip)]
-    assert_eq!(server.package, Some("mypkg".to_string()));
-    assert_eq!(server.description, Some("Updated description".to_string()));
-}
-
-#[test]
-fn apply_mcp_server_patch_with_invalid_jq_expression_returns_err() {
-    let mut server = make_server("test-server", "mcp-test");
-    let original_command = server.command.clone();
-
-    // Invalid expression — unclosed string
-    let result = apply_mcp_server_patch(&mut server, &[r#".command = "unclosed"#.to_string()]);
-
-    assert!(result.is_err());
-    // Server should be unchanged
-    assert_eq!(server.command, original_command);
-}
-
 use super::apply_client_patch;
 use harnx_client::ClientConfig;
 
@@ -802,40 +712,6 @@ fn dynamic_provider_model_init_sets_client_name_from_provider() {
     assert_eq!(config.clients.len(), 1);
     assert_eq!(config.clients[0].effective_name(), "claude");
 }
-/// #826 regression (MCP side): when scoped to the active agent's package,
-/// same-package MCP servers use bare names while OTHER packages stay prefixed.
-/// In the broken (`None`) scope every package server is prefixed, so the agent
-/// sees both `pantheon__*` AND `coding__*` namespaced tools instead of its bare
-/// same-package tools — the "extra tools that shouldn't be available" symptom.
-#[test]
-fn package_agent_mcp_tools_scoped_to_active_package() {
-    let mut config = Config {
-        mcp_servers: vec![
-            PackageServer::new("fs", "pantheon").into_mcp(),
-            PackageServer::new("db", "coding").into_mcp(),
-        ],
-        ..Config::default()
-    };
-
-    // Active agent is in `pantheon`.
-    config.reinit_managers_for_agent(Some("pantheon"));
-    let manager = config.mcp_manager.as_ref().expect("mcp_manager");
-    let servers = manager.list_servers();
-
-    assert!(
-        servers.contains(&"fs".to_string()),
-        "same-package MCP server must use its bare name `fs`; got {servers:?}"
-    );
-    assert!(
-        servers.contains(&"coding__db".to_string()),
-        "other-package MCP server stays prefixed as `coding__db`; got {servers:?}"
-    );
-    assert!(
-        !servers.contains(&"pantheon__fs".to_string()),
-        "same-package MCP server must NOT be prefixed `pantheon__fs`; got {servers:?}"
-    );
-}
-
 #[tokio::test]
 async fn use_agent_routes_remote_refs_to_nats_cluster_validation() {
     use crate::client::TestStateGuard;
@@ -879,5 +755,3 @@ async fn use_agent_routes_remote_refs_to_nats_cluster_validation() {
         "remote refs must no longer be stubbed: {msg}"
     );
 }
-
-pub(super) static LOG_CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();

@@ -7,7 +7,6 @@ use crate::{
 };
 use anyhow::Result;
 use harnx_hooks::HookEvent;
-use harnx_mcp::client::McpManager;
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -242,7 +241,6 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
     let (
         mut tool_declarations,
         handoff_targets,
-        mcp_manager,
         session_name,
         confirm_tool_use_fn,
         config_snapshot,
@@ -253,7 +251,6 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
         (
             tool_declarations,
             handoff_targets,
-            guard.mcp_manager.clone(),
             guard.session.as_ref().map(|s| s.id().to_string()),
             build_confirm_tool_use_fn(&guard),
             guard.clone(),
@@ -268,7 +265,7 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
 
     let decl_map = Arc::new(build_decl_map(tool_declarations));
     let allowed_tool_names: HashSet<String> = decl_map.keys().cloned().collect();
-    let providers = build_tool_providers(config, nats_provider, mcp_manager);
+    let providers = build_tool_providers(config, nats_provider);
     let dispatch_hook_fn = build_dispatch_hook_fn(
         session_name.as_deref(),
         working_dir,
@@ -312,15 +309,11 @@ fn build_confirm_tool_use_fn(config: &Config) -> Arc<ConfirmToolUseFn> {
 fn build_tool_providers(
     config: &GlobalConfig,
     nats_provider: Option<Arc<crate::nats_tool_provider::NatsToolProvider>>,
-    mcp_manager: Option<Arc<McpManager>>,
 ) -> Vec<Arc<dyn ToolProvider>> {
     let mut providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
     // NATS is the runtime provider for configured sub-agent and tool-server tools.
     if let Some(nats) = nats_provider {
         providers.push(nats as Arc<dyn ToolProvider>);
-    }
-    if let Some(mcp) = mcp_manager {
-        providers.push(mcp as Arc<dyn ToolProvider>);
     }
     providers.push(
         Arc::new(crate::session_history::SessionHistoryProvider::new(

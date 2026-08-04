@@ -13,86 +13,76 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use harnx::test_utils::interrupt::{harnx_mcp_time_bin, spawn_oneshot, wait_for_exit};
+use harnx::test_utils::interrupt::{harnx_mcp_time_bin, spawn_oneshot, wait_for_exit, ConfigPaths};
 use harnx::test_utils::mock_openai_server::{
     MockOpenAiScript, MockOpenAiServer, MockOpenAiToolCall, MockOpenAiTurn,
 };
 
-/// Write a config that uses the OpenAI client with gpt-5.6-sol:high alias
-/// AND includes the time_wait MCP tool for multi-turn testing.
-fn write_responses_config_with_tool(
-    dir: &std::path::Path,
-    mock_base_url: &str,
-    mcp_time_bin: &Path,
-) -> Result<harnx::test_utils::interrupt::ConfigPaths> {
-    use harnx::test_utils::interrupt::ConfigPaths;
-
-    let harnx_config_dir = dir.join("harnx-config");
-    let harnx_data_dir = dir.join("harnx-data");
-    let harnx_state_dir = dir.join("harnx-state");
-
-    std::fs::create_dir_all(harnx_config_dir.join("clients"))
-        .context("failed to create harnx config dir")?;
-    std::fs::create_dir_all(&harnx_data_dir).context("failed to create harnx data dir")?;
-    std::fs::create_dir_all(&harnx_state_dir).context("failed to create harnx state dir")?;
-
-    // Config.yaml with model pointing to the alias, stream:false for non-streaming path
+fn write_time_tool_server(harnx_config_dir: &Path, mcp_time_bin: &Path) -> Result<()> {
+    let tool_servers_dir = harnx_config_dir.join("tool_servers");
+    std::fs::create_dir_all(&tool_servers_dir).context("failed to create tool_servers dir")?;
+    let bridge_bin =
+        mcp_time_bin.with_file_name(format!("harnx-mcp-bridge{}", std::env::consts::EXE_SUFFIX));
     std::fs::write(
-        harnx_config_dir.join("config.yaml"),
-        "save: false\nclient: openai\nmodel: openai:gpt-5.6-sol:high\ntool_use: true\nuse_tools: '*'\nstream: false\n",
-    )
-    .context("failed to write config.yaml")?;
-
-    // OpenAI client pointing to mock
-    std::fs::write(
-        harnx_config_dir.join("clients/openai.yaml"),
+        tool_servers_dir.join("time.yaml"),
         format!(
-            "type: openai\nname: openai\napi_base: {}\napi_key: test-key\n",
-            mock_base_url
-        ),
-    )
-    .context("failed to write clients/openai.yaml")?;
-
-    // Write the models.yaml with the alias (endpoint: responses)
-    std::fs::write(
-        harnx_config_dir.join("models.yaml"),
-        r#"openai:
-  - name: gpt-5.6-sol
-    max_input_tokens: 1050000
-    max_output_tokens: 128000
-    supports_tool_use: true
-  - name: gpt-5.6-sol:high
-    real_name: gpt-5.6-sol
-    endpoint: responses
-    max_input_tokens: 1050000
-    max_output_tokens: 128000
-    supports_tool_use: true
-    patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.reasoning.effort = "high"
-"#,
-    )
-    .context("failed to write models.yaml")?;
-
-    // Default agent
-    std::fs::create_dir_all(harnx_config_dir.join("agents"))
-        .context("failed to create agents dir")?;
-    std::fs::write(
-        harnx_config_dir.join("agents/default.md"),
-        "---\nclient: openai\nmodel: openai:gpt-5.6-sol:high\ntool_use: true\nuse_tools: '*'\n---\nDefault test agent.\n",
-    )
-    .context("failed to write agents/default.md")?;
-
-    // MCP servers dir with time_wait tool
-    let mcp_servers_dir = harnx_config_dir.join("mcp_servers");
-    std::fs::create_dir_all(&mcp_servers_dir).context("failed to create mcp_servers dir")?;
-    std::fs::write(
-        mcp_servers_dir.join("time.yaml"),
-        format!(
-            "command: {}\nargs: []\ntools:\n  - time_wait\n",
+            "command: {}\nargs:\n  - --name\n  - time\n  - --\n  - {}\n",
+            bridge_bin.display(),
             mcp_time_bin.display()
         ),
     )
-    .context("failed to write mcp_servers/time.yaml")?;
+    .context("failed to write tool_servers/time.yaml")
+}
+
+/// Write a config that uses the OpenAI client with gpt-5.6-sol:high alias
+/// AND includes the bridged time_wait tool for multi-turn testing.
+fn write_responses_config_with_tool(
+    dir: &Path,
+    mock_base_url: &str,
+    mcp_time_bin: &Path,
+) -> Result<ConfigPaths> {
+    let paths = write_responses_config(dir, mock_base_url)?;
+    write_time_tool_server(&paths.harnx_config_dir, mcp_time_bin)?;
+    Ok(paths)
+}
+
+struct OpenAiConfigSpec {
+    config_yaml: &'static str,
+    models_yaml: &'static str,
+    agent_md: &'static str,
+}
+
+fn write_openai_config_base(
+    dir: &Path,
+    mock_base_url: &str,
+    spec: OpenAiConfigSpec,
+) -> Result<ConfigPaths> {
+    let harnx_config_dir = dir.join("harnx-config");
+    let harnx_data_dir = dir.join("harnx-data");
+    let harnx_state_dir = dir.join("harnx-state");
+
+    std::fs::create_dir_all(harnx_config_dir.join("clients"))
+        .context("failed to create harnx config dir")?;
+    std::fs::create_dir_all(&harnx_data_dir).context("failed to create harnx data dir")?;
+    std::fs::create_dir_all(&harnx_state_dir).context("failed to create harnx state dir")?;
+
+    std::fs::write(harnx_config_dir.join("config.yaml"), spec.config_yaml)
+        .context("failed to write config.yaml")?;
+    std::fs::write(
+        harnx_config_dir.join("clients/openai.yaml"),
+        format!(
+            "type: openai\nname: openai\napi_base: {}\napi_key: test-key\n",
+            mock_base_url
+        ),
+    )
+    .context("failed to write clients/openai.yaml")?;
+    std::fs::write(harnx_config_dir.join("models.yaml"), spec.models_yaml)
+        .context("failed to write models.yaml")?;
+
+    std::fs::create_dir_all(harnx_config_dir.join("agents"))
+        .context("failed to create agents dir")?;
+    std::fs::write(harnx_config_dir.join("agents/default.md"), spec.agent_md)
+        .context("failed to write agents/default.md")?;
 
     Ok(ConfigPaths {
         dir: dir.to_path_buf(),
@@ -103,42 +93,13 @@ fn write_responses_config_with_tool(
 }
 
 /// Write a config that uses the OpenAI client with gpt-5.6-sol:high alias
-fn write_responses_config(
-    dir: &std::path::Path,
-    mock_base_url: &str,
-) -> Result<harnx::test_utils::interrupt::ConfigPaths> {
-    use harnx::test_utils::interrupt::ConfigPaths;
-
-    let harnx_config_dir = dir.join("harnx-config");
-    let harnx_data_dir = dir.join("harnx-data");
-    let harnx_state_dir = dir.join("harnx-state");
-
-    std::fs::create_dir_all(harnx_config_dir.join("clients"))
-        .context("failed to create harnx config dir")?;
-    std::fs::create_dir_all(&harnx_data_dir).context("failed to create harnx data dir")?;
-    std::fs::create_dir_all(&harnx_state_dir).context("failed to create harnx state dir")?;
-
-    // Config.yaml with model pointing to the alias, stream:false for non-streaming path
-    std::fs::write(
-        harnx_config_dir.join("config.yaml"),
-        "save: false\nclient: openai\nmodel: openai:gpt-5.6-sol:high\ntool_use: true\nuse_tools: '*'\nstream: false\n",
-    )
-    .context("failed to write config.yaml")?;
-
-    // OpenAI client pointing to mock
-    std::fs::write(
-        harnx_config_dir.join("clients/openai.yaml"),
-        format!(
-            "type: openai\nname: openai\napi_base: {}\napi_key: test-key\n",
-            mock_base_url
-        ),
-    )
-    .context("failed to write clients/openai.yaml")?;
-
-    // Write the models.yaml with the alias (endpoint: responses)
-    std::fs::write(
-        harnx_config_dir.join("models.yaml"),
-        r#"openai:
+fn write_responses_config(dir: &Path, mock_base_url: &str) -> Result<ConfigPaths> {
+    write_openai_config_base(
+        dir,
+        mock_base_url,
+        OpenAiConfigSpec {
+            config_yaml: "save: false\nclient: openai\nmodel: openai:gpt-5.6-sol:high\ntool_use: true\nuse_tools: '*'\nstream: false\n",
+            models_yaml: r#"openai:
   - name: gpt-5.6-sol
     max_input_tokens: 1050000
     max_output_tokens: 128000
@@ -152,82 +113,27 @@ fn write_responses_config(
     patches:
       - del(.body.temperature) | del(.body.top_p) | .body.reasoning.effort = "high"
 "#,
+            agent_md: "---\nclient: openai\nmodel: openai:gpt-5.6-sol:high\ntool_use: true\nuse_tools: '*'\n---\nDefault test agent.\n",
+        },
     )
-    .context("failed to write models.yaml")?;
-
-    // Default agent
-    std::fs::create_dir_all(harnx_config_dir.join("agents"))
-        .context("failed to create agents dir")?;
-    std::fs::write(
-        harnx_config_dir.join("agents/default.md"),
-        "---\nclient: openai\nmodel: openai:gpt-5.6-sol:high\ntool_use: true\nuse_tools: '*'\n---\nDefault test agent.\n",
-    )
-    .context("failed to write agents/default.md")?;
-
-    Ok(ConfigPaths {
-        dir: dir.to_path_buf(),
-        harnx_config_dir,
-        harnx_data_dir,
-        harnx_state_dir,
-    })
 }
 
 /// Write a config using plain gpt-4o (no endpoint alias) to hit /v1/chat/completions.
-fn write_chat_config(
-    dir: &std::path::Path,
-    mock_base_url: &str,
-) -> Result<harnx::test_utils::interrupt::ConfigPaths> {
-    use harnx::test_utils::interrupt::ConfigPaths;
-
-    let harnx_config_dir = dir.join("harnx-config");
-    let harnx_data_dir = dir.join("harnx-data");
-    let harnx_state_dir = dir.join("harnx-state");
-
-    std::fs::create_dir_all(harnx_config_dir.join("clients"))
-        .context("failed to create harnx config dir")?;
-    std::fs::create_dir_all(&harnx_data_dir).context("failed to create harnx data dir")?;
-    std::fs::create_dir_all(&harnx_state_dir).context("failed to create harnx state dir")?;
-
-    std::fs::write(
-        harnx_config_dir.join("config.yaml"),
-        "save: false\nclient: openai\nmodel: openai:gpt-4o\ntool_use: true\nuse_tools: '*'\n",
-    )
-    .context("failed to write config.yaml")?;
-
-    std::fs::write(
-        harnx_config_dir.join("clients/openai.yaml"),
-        format!(
-            "type: openai\nname: openai\napi_base: {}\napi_key: test-key\n",
-            mock_base_url
-        ),
-    )
-    .context("failed to write clients/openai.yaml")?;
-
-    std::fs::write(
-        harnx_config_dir.join("models.yaml"),
-        r#"openai:
+fn write_chat_config(dir: &Path, mock_base_url: &str) -> Result<ConfigPaths> {
+    write_openai_config_base(
+        dir,
+        mock_base_url,
+        OpenAiConfigSpec {
+            config_yaml: "save: false\nclient: openai\nmodel: openai:gpt-4o\ntool_use: true\nuse_tools: '*'\n",
+            models_yaml: r#"openai:
   - name: gpt-4o
     max_input_tokens: 128000
     max_output_tokens: 4096
     supports_tool_use: true
 "#,
+            agent_md: "---\nclient: openai\nmodel: openai:gpt-4o\ntool_use: true\nuse_tools: '*'\n---\nDefault test agent.\n",
+        },
     )
-    .context("failed to write models.yaml")?;
-
-    std::fs::create_dir_all(harnx_config_dir.join("agents"))
-        .context("failed to create agents dir")?;
-    std::fs::write(
-        harnx_config_dir.join("agents/default.md"),
-        "---\nclient: openai\nmodel: openai:gpt-4o\ntool_use: true\nuse_tools: '*'\n---\nDefault test agent.\n",
-    )
-    .context("failed to write agents/default.md")?;
-
-    Ok(ConfigPaths {
-        dir: dir.to_path_buf(),
-        harnx_config_dir,
-        harnx_data_dir,
-        harnx_state_dir,
-    })
 }
 
 /// Test A: model openai:gpt-5.6-sol:high hits /v1/responses with correct body shape.

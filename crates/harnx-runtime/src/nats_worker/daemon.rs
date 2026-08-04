@@ -285,7 +285,7 @@ pub(crate) fn tool_servers_matching_use_tools(
             let display_name =
                 server_display_name(&server.name, server.package.as_deref(), agent_package);
             let matches = namespaced_use_tools.iter().any(|selector| {
-                harnx_mcp::client::selector_could_match_server(selector, &display_name, &[])
+                super::super::config::selector_could_match_server(selector, &display_name)
             });
             matches && seen_names.insert(server.name.clone())
         })
@@ -429,12 +429,14 @@ fn configured_worker_services(
         .as_ref()
         .and_then(|agent| harnx_core::package_namespace::pkg_from_qualified(agent.name()));
     let mut selectors = Vec::new();
-    for selector in config
+    let use_tools = config
         .agent
         .as_ref()
         .and_then(|agent| agent.use_tools())
-        .unwrap_or_default()
-    {
+        // Fall back when no agent is active or the active agent has no use_tools.
+        .or_else(|| config.use_tools.clone())
+        .unwrap_or_default();
+    for selector in use_tools {
         if let Some(namespaced) = namespaced_selector(&selector, agent_package) {
             selectors.push(namespaced);
         }
@@ -1128,7 +1130,9 @@ impl WorkerRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{optional_tool_server, tool_servers_matching_use_tools};
+    use super::{
+        configured_worker_services, optional_tool_server, tool_servers_matching_use_tools,
+    };
     use crate::config::ToolServerConfig;
 
     fn tool_server(name: &str) -> ToolServerConfig {
@@ -1142,6 +1146,22 @@ mod tests {
             package: None,
             hooks: None,
         }
+    }
+
+    #[test]
+    fn configured_worker_services_falls_back_to_config_use_tools_without_agent() {
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            config.agent = None;
+            config.use_tools = Some(vec!["time_get_current_time".to_string()]);
+            config.tool_servers = vec![tool_server("time"), tool_server("weather")];
+        }
+
+        let (servers, _hooks) = configured_worker_services(&config);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "time");
     }
 
     #[test]

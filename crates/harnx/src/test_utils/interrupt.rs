@@ -175,7 +175,7 @@ pub fn script_call_trivial_tool() -> MockOpenAiScript {
 }
 
 /// Like `write_minimal_config`, but also registers the workspace-built
-/// `harnx-mcp-time` binary as an MCP server so the `wait` tool is available.
+/// time server through the NATS MCP bridge so the `wait` tool is available.
 ///
 /// `mcp_time_bin` should be the path to the compiled `harnx-mcp-time` binary,
 /// typically obtained via the `harnx_mcp_time_bin(harnx_bin)` helper in the
@@ -189,13 +189,19 @@ pub fn write_with_wait_tool(
     mcp_time_bin: &Path,
 ) -> Result<ConfigPaths> {
     let paths = write_minimal_config(dir, mock_base_url)?;
-    let mcp_servers_dir = paths.harnx_config_dir.join("mcp_servers");
-    std::fs::create_dir_all(&mcp_servers_dir).context("failed to create mcp_servers dir")?;
+    let tool_servers_dir = paths.harnx_config_dir.join("tool_servers");
+    std::fs::create_dir_all(&tool_servers_dir).context("failed to create tool_servers dir")?;
+    let bridge_bin =
+        mcp_time_bin.with_file_name(format!("harnx-mcp-bridge{}", std::env::consts::EXE_SUFFIX));
     std::fs::write(
-        mcp_servers_dir.join("time.yaml"),
-        format!("command: {}\n", mcp_time_bin.display()),
+        tool_servers_dir.join("time.yaml"),
+        format!(
+            "command: {}\nargs:\n  - --name\n  - time\n  - --\n  - {}\n",
+            bridge_bin.display(),
+            mcp_time_bin.display()
+        ),
     )
-    .context("failed to write mcp_servers/time.yaml")?;
+    .context("failed to write tool_servers/time.yaml")?;
     Ok(paths)
 }
 
