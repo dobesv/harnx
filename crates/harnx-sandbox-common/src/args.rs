@@ -108,18 +108,19 @@ mod tests {
 
     #[test]
     fn resolved_home_guard_never_emits_home_write_or_exec() {
-        let home = tempfile::tempdir().expect("home");
+        let home_guard = tempfile::tempdir().expect("home");
+        let home = home_guard.path().canonicalize().expect("canonical home");
         let env = AllowEnv {
-            home: Some(home.path().to_path_buf()),
+            home: Some(home.clone()),
             ..AllowEnv::default()
         };
         let inputs = AllowInputs {
-            rwx: vec![home.path().to_path_buf()],
+            rwx: vec![home.clone()],
             ..AllowInputs::default()
         };
         let allowlist = resolve_allowlist(&inputs, Path::new("/workspace"), &env);
         let args = string_args(&config(allowlist));
-        let home = home.path().to_string_lossy();
+        let home = home.to_string_lossy();
 
         assert!(args.windows(2).any(|w| w == ["--read", home.as_ref()]));
         assert!(!args.windows(2).any(|w| w == ["--write", home.as_ref()]));

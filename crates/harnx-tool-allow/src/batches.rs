@@ -404,12 +404,13 @@ mod tests {
     #[test]
     fn repo_work_guards_home_cwd() {
         let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().canonicalize().unwrap();
         let env = AllowEnv {
-            home: Some(temp.path().to_path_buf()),
+            home: Some(dir.clone()),
             ..Default::default()
         };
-        let rules = repo_work(temp.path(), &env);
-        assert_eq!(rules, vec![(temp.path().to_path_buf(), Permission::Read)]);
+        let rules = repo_work(&dir, &env);
+        assert_eq!(rules, vec![(dir, Permission::Read)]);
     }
 
     #[cfg(unix)]
@@ -420,11 +421,11 @@ mod tests {
         let _lock = env_lock();
         let _env = EnvGuard::new();
         let temp = tempfile::tempdir().expect("tempdir");
-        let home = temp.path().join("home");
+        let base = temp.path().canonicalize().expect("canonical tempdir");
+        let home = base.join("home");
         let cwd = home.join("project/src");
         std::fs::create_dir_all(&cwd).expect("create cwd");
-        std::fs::write(temp.path().join("Cargo.toml"), "[workspace]\n")
-            .expect("write marker above home");
+        std::fs::write(base.join("Cargo.toml"), "[workspace]\n").expect("write marker above home");
         unsafe { std::env::set_var("HOME", &home) };
         let env = AllowEnv {
             home: Some(home),
@@ -433,7 +434,7 @@ mod tests {
 
         let rules = repo_work(&cwd, &env);
 
-        assert!(!rules.iter().any(|(path, _)| path == temp.path()));
+        assert!(!rules.iter().any(|(path, _)| path == &base));
         assert!(has(&rules, &cwd, Permission::ReadWriteExec));
     }
 

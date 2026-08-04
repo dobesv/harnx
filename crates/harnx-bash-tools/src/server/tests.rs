@@ -169,7 +169,8 @@ fn enabled_sandbox_config() -> SandboxConfig {
 #[tokio::test]
 async fn rollback_rejects_repo_root_outside_write_grant() {
     let temp = TestDir::new();
-    let repo = temp.path().join("repo");
+    let base = temp.path().canonicalize().expect("canonical tempdir");
+    let repo = base.join("repo");
     let allowed = repo.join("allowed");
     std::fs::create_dir_all(&allowed).expect("create allowed subdirectory");
     let init = std::process::Command::new("git")
@@ -199,7 +200,8 @@ async fn rollback_rejects_repo_root_outside_write_grant() {
 #[tokio::test]
 async fn default_working_dir_skips_file_grants() {
     let temp = TestDir::new();
-    let file = temp.path().join("allowed-file");
+    let base = temp.path().canonicalize().expect("canonical tempdir");
+    let file = base.join("allowed-file");
     std::fs::write(&file, "content").expect("write file grant");
     let mut allowlist = ResolvedAllowlist::new();
     allowlist.insert_read(&file);
