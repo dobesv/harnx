@@ -14,7 +14,6 @@ harnx-tool-allow = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 birdcage = { workspace = true }
-gix = { workspace = true }
 tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]

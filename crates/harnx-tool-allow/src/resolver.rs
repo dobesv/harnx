@@ -20,6 +20,17 @@ pub struct AllowInputs {
 /// Resolve explicit grants and enabled batches without async work or global state.
 pub fn resolve_allowlist(inputs: &AllowInputs, cwd: &Path, env: &AllowEnv) -> ResolvedAllowlist {
     let mut resolved = ResolvedAllowlist::new();
+    apply_explicit_inputs(&mut resolved, inputs, cwd, env);
+    apply_enabled_batches(&mut resolved, inputs, cwd, env);
+    resolved
+}
+
+fn apply_explicit_inputs(
+    resolved: &mut ResolvedAllowlist,
+    inputs: &AllowInputs,
+    cwd: &Path,
+    env: &AllowEnv,
+) {
     for path in &inputs.read {
         resolved.insert_read(absolute(path, cwd));
     }
@@ -32,20 +43,26 @@ pub fn resolve_allowlist(inputs: &AllowInputs, cwd: &Path, env: &AllowEnv) -> Re
     for path in &inputs.rwx {
         resolved.insert_rwx_with_home(&absolute(path, cwd), env.home.as_deref());
     }
+}
 
+fn apply_enabled_batches(
+    resolved: &mut ResolvedAllowlist,
+    inputs: &AllowInputs,
+    cwd: &Path,
+    env: &AllowEnv,
+) {
     if inputs.common_default {
-        apply_rules(&mut resolved, common_default(env), env);
+        apply_rules(resolved, common_default(env), env);
     }
     if inputs.dev_tools {
-        apply_rules(&mut resolved, dev_tools(env), env);
+        apply_rules(resolved, dev_tools(env), env);
     }
     if inputs.repo_work {
-        apply_rules(&mut resolved, repo_work(cwd, env), env);
+        apply_rules(resolved, repo_work(cwd, env), env);
     }
     if inputs.all {
-        apply_rules(&mut resolved, all(env), env);
+        apply_rules(resolved, all(env), env);
     }
-    resolved
 }
 
 fn apply_rules(resolved: &mut ResolvedAllowlist, rules: Vec<AllowRule>, env: &AllowEnv) {

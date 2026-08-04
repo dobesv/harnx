@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::allowlist::home_or_ancestor;
+#[cfg(unix)]
+use crate::{detect_project_root, RootKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
@@ -63,6 +65,15 @@ pub fn common_default(env: &AllowEnv) -> Vec<AllowRule> {
 }
 
 pub fn dev_tools(env: &AllowEnv) -> Vec<AllowRule> {
+    let mut rules = Vec::new();
+    add_home_dev_rules(&mut rules, env);
+    add_cargo_dev_rules(&mut rules, env);
+    add_go_dev_rules(&mut rules, env);
+    add_homebrew_rule(&mut rules, env);
+    rules
+}
+
+fn add_home_dev_rules(rules: &mut Vec<AllowRule>, env: &AllowEnv) {
     const HOME_READ: &[&str] = &[
         ".gitconfig",
         ".gitignore",
@@ -98,88 +109,68 @@ pub fn dev_tools(env: &AllowEnv) -> Vec<AllowRule> {
         ".local/share/uv",
     ];
 
-    let mut rules = Vec::new();
-    if let Some(home) = &env.home {
-        rules.extend(
-            HOME_READ
-                .iter()
-                .map(|path| (home.join(path), Permission::Read)),
-        );
-        for path in HOME_EXEC {
-            push_guarded(&mut rules, home.join(path), Permission::ReadExec, env);
-        }
-        for path in HOME_WRITE {
-            push_guarded(&mut rules, home.join(path), Permission::ReadWrite, env);
-        }
-        push_guarded(
-            &mut rules,
-            home.join(".config/go"),
-            Permission::ReadWriteExec,
-            env,
-        );
+    let Some(home) = &env.home else {
+        return;
+    };
+    rules.extend(
+        HOME_READ
+            .iter()
+            .map(|path| (home.join(path), Permission::Read)),
+    );
+    for path in HOME_EXEC {
+        push_guarded(rules, home.join(path), Permission::ReadExec, env);
     }
+    for path in HOME_WRITE {
+        push_guarded(rules, home.join(path), Permission::ReadWrite, env);
+    }
+    push_guarded(
+        rules,
+        home.join(".config/go"),
+        Permission::ReadWriteExec,
+        env,
+    );
+}
 
-    if let Some(cargo_home) = &env.cargo_home {
-        rules.push((cargo_home.clone(), Permission::Read));
-        push_guarded(
-            &mut rules,
-            cargo_home.join("bin"),
-            Permission::ReadExec,
-            env,
-        );
-        push_guarded(
-            &mut rules,
-            cargo_home.join("registry"),
-            Permission::ReadWrite,
-            env,
-        );
-        push_guarded(
-            &mut rules,
-            cargo_home.join("git"),
-            Permission::ReadWrite,
-            env,
-        );
+fn add_cargo_dev_rules(rules: &mut Vec<AllowRule>, env: &AllowEnv) {
+    let Some(cargo_home) = &env.cargo_home else {
+        return;
+    };
+    rules.push((cargo_home.clone(), Permission::Read));
+    for (relative, permission) in [
+        ("bin", Permission::ReadExec),
+        ("registry", Permission::ReadWrite),
+        ("git", Permission::ReadWrite),
+    ] {
+        push_guarded(rules, cargo_home.join(relative), permission, env);
     }
+}
+
+fn add_go_dev_rules(rules: &mut Vec<AllowRule>, env: &AllowEnv) {
     if let Some(goroot) = &env.goroot {
-        push_guarded(&mut rules, goroot.clone(), Permission::ReadExec, env);
+        push_guarded(rules, goroot.clone(), Permission::ReadExec, env);
     }
     if let Some(gopath) = &env.gopath {
-        push_guarded(&mut rules, gopath.join("bin"), Permission::ReadExec, env);
-        push_guarded(&mut rules, gopath.join("pkg"), Permission::ReadWrite, env);
+        push_guarded(rules, gopath.join("bin"), Permission::ReadExec, env);
+        push_guarded(rules, gopath.join("pkg"), Permission::ReadWrite, env);
+    }
+    for cache in [&env.gomodcache, &env.gocache].into_iter().flatten() {
+        push_guarded(rules, cache.clone(), Permission::ReadWrite, env);
     }
     if let Some(gobin) = &env.gobin {
-        push_guarded(&mut rules, gobin.clone(), Permission::ReadExec, env);
+        push_guarded(rules, gobin.clone(), Permission::ReadExec, env);
     }
-    if let Some(cache) = &env.gomodcache {
-        push_guarded(&mut rules, cache.clone(), Permission::ReadWrite, env);
-    }
-    if let Some(cache) = &env.gocache {
-        push_guarded(&mut rules, cache.clone(), Permission::ReadWrite, env);
-    }
+}
 
-    let homebrew = env.homebrew_prefix.clone().or_else(default_homebrew_prefix);
-    if let Some(prefix) = homebrew {
-        push_guarded(&mut rules, prefix, Permission::ReadExec, env);
+fn add_homebrew_rule(rules: &mut Vec<AllowRule>, env: &AllowEnv) {
+    if let Some(prefix) = env.homebrew_prefix.clone().or_else(default_homebrew_prefix) {
+        push_guarded(rules, prefix, Permission::ReadExec, env);
     }
-    rules
 }
 
 pub fn repo_work(cwd: &Path, env: &AllowEnv) -> Vec<AllowRule> {
     let mut rules = Vec::new();
-    if let Some(root) = git_root(cwd) {
-        push_guarded(&mut rules, root, Permission::ReadWriteExec, env);
-    }
-    if let Some(common) = git_common_dir(cwd) {
-        push_guarded(&mut rules, common, Permission::ReadWrite, env);
-    }
-    for (marker, highest) in [
-        ("Cargo.toml", true),
-        ("package.json", true),
-        ("go.mod", false),
-    ] {
-        if let Some(root) = marker_root(cwd, marker, highest) {
-            push_guarded(&mut rules, root, Permission::ReadWriteExec, env);
-        }
+    for (root, permission) in detected_repo_roots(cwd) {
+        push_guarded(&mut rules, root, permission, env);
     }
     push_guarded(
         &mut rules,
@@ -188,6 +179,25 @@ pub fn repo_work(cwd: &Path, env: &AllowEnv) -> Vec<AllowRule> {
         env,
     );
     rules
+}
+
+#[cfg(unix)]
+fn detected_repo_roots(cwd: &Path) -> Vec<AllowRule> {
+    [
+        (RootKind::GitRoot, Permission::ReadWriteExec),
+        (RootKind::GitCommonDir, Permission::ReadWrite),
+        (RootKind::CargoRoot, Permission::ReadWriteExec),
+        (RootKind::NodeProjectRoot, Permission::ReadWriteExec),
+        (RootKind::GoRoot, Permission::ReadWriteExec),
+    ]
+    .into_iter()
+    .filter_map(|(kind, permission)| detect_project_root(kind, cwd).map(|root| (root, permission)))
+    .collect()
+}
+
+#[cfg(not(unix))]
+fn detected_repo_roots(_cwd: &Path) -> Vec<AllowRule> {
+    Vec::new()
 }
 
 pub fn all(_env: &AllowEnv) -> Vec<AllowRule> {
@@ -218,47 +228,6 @@ fn absolute_from(path: &Path) -> PathBuf {
                 .unwrap_or_else(|_| path.to_path_buf())
         }
     })
-}
-
-#[cfg(unix)]
-fn git_root(cwd: &Path) -> Option<PathBuf> {
-    gix::discover(cwd).ok()?.workdir().map(Path::to_path_buf)
-}
-
-#[cfg(not(unix))]
-fn git_root(_cwd: &Path) -> Option<PathBuf> {
-    None
-}
-
-#[cfg(unix)]
-fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
-    Some(gix::discover(cwd).ok()?.common_dir().to_path_buf())
-}
-
-#[cfg(not(unix))]
-fn git_common_dir(_cwd: &Path) -> Option<PathBuf> {
-    None
-}
-
-fn marker_root(cwd: &Path, marker: &str, highest: bool) -> Option<PathBuf> {
-    let mut current = if cwd.is_dir() {
-        cwd.to_path_buf()
-    } else {
-        cwd.parent()?.to_path_buf()
-    };
-    let mut found = None;
-    loop {
-        if current.join(marker).exists() {
-            if !highest {
-                return Some(current);
-            }
-            found = Some(current.clone());
-        }
-        let Some(parent) = current.parent() else {
-            return found;
-        };
-        current = parent.to_path_buf();
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -360,7 +329,6 @@ fn system_writable_paths(_env: &AllowEnv) -> Vec<PathBuf> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = env;
         vec![PathBuf::from("/tmp")]
     }
 }
@@ -413,6 +381,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn repo_work_grants_cwd_and_git_common_dir_without_exec() {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -421,7 +390,8 @@ mod tests {
             ..Default::default()
         };
         let rules = repo_work(&manifest, &env);
-        let common = git_common_dir(&manifest).expect("workspace git common dir");
+        let common = detect_project_root(RootKind::GitCommonDir, &manifest)
+            .expect("workspace git common dir");
         assert!(has(&rules, &common, Permission::ReadWrite));
         assert!(!has(&rules, &common, Permission::ReadWriteExec));
         assert!(has(
@@ -440,6 +410,31 @@ mod tests {
         };
         let rules = repo_work(temp.path(), &env);
         assert_eq!(rules, vec![(temp.path().to_path_buf(), Permission::Read)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_work_does_not_select_marker_above_home() {
+        use crate::test_support::{env_lock, EnvGuard};
+
+        let _lock = env_lock();
+        let _env = EnvGuard::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let cwd = home.join("project/src");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::write(temp.path().join("Cargo.toml"), "[workspace]\n")
+            .expect("write marker above home");
+        unsafe { std::env::set_var("HOME", &home) };
+        let env = AllowEnv {
+            home: Some(home),
+            ..Default::default()
+        };
+
+        let rules = repo_work(&cwd, &env);
+
+        assert!(!rules.iter().any(|(path, _)| path == temp.path()));
+        assert!(has(&rules, &cwd, Permission::ReadWriteExec));
     }
 
     #[test]

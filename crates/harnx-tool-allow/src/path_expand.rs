@@ -32,7 +32,15 @@ pub fn expand_tilde(raw: &str) -> String {
 ///    expansion and no `${...}` syntax.
 /// 3. Else apply `expand_tilde` and return resulting `PathBuf`.
 pub fn expand_path_var(raw: &str, cwd: &Path) -> Option<PathBuf> {
-    let pseudo_var = [
+    if let Some((prefix, kind)) = pseudo_var(raw) {
+        return expand_pseudo_var(raw, prefix, kind, cwd);
+    }
+    expand_env_var(raw).or_else(|| Some(PathBuf::from(expand_tilde(raw))))
+}
+
+#[cfg(unix)]
+fn pseudo_var(raw: &str) -> Option<(&'static str, crate::RootKind)> {
+    [
         ("$GIT_ROOT", crate::RootKind::GitRoot),
         ("$GIT_COMMON_DIR", crate::RootKind::GitCommonDir),
         ("$NODE_PROJECT_ROOT", crate::RootKind::NodeProjectRoot),
@@ -40,50 +48,63 @@ pub fn expand_path_var(raw: &str, cwd: &Path) -> Option<PathBuf> {
         ("$GO_ROOT", crate::RootKind::GoRoot),
     ]
     .into_iter()
-    .find(|(prefix, _)| {
-        raw == *prefix
-            || raw
-                .strip_prefix(prefix)
-                .is_some_and(|rest| rest.starts_with('/'))
-    });
+    .find(|(prefix, _)| path_var_matches(raw, prefix))
+}
 
-    if let Some((prefix, kind)) = pseudo_var {
-        let root = crate::detect_project_root(kind, cwd)?;
-        let remainder = raw.strip_prefix(prefix).expect("matched prefix");
-        return Some(match remainder.strip_prefix('/') {
-            Some(relative) => root.join(relative),
-            None => root,
-        });
+#[cfg(unix)]
+fn path_var_matches(raw: &str, prefix: &str) -> bool {
+    raw == prefix
+        || raw
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+#[cfg(unix)]
+fn expand_pseudo_var(
+    raw: &str,
+    prefix: &str,
+    kind: crate::RootKind,
+    cwd: &Path,
+) -> Option<PathBuf> {
+    let root = crate::detect_project_root(kind, cwd)?;
+    Some(join_remainder(
+        root,
+        raw.strip_prefix(prefix).expect("matched prefix"),
+    ))
+}
+
+#[cfg(unix)]
+fn expand_env_var(raw: &str) -> Option<PathBuf> {
+    let stripped = raw.strip_prefix('$')?;
+    let name_end = env_name_end(stripped)?;
+    let name = &stripped[..name_end];
+    let remainder = &stripped[name_end..];
+    if !remainder.is_empty() && !remainder.starts_with('/') {
+        return None;
     }
+    let value = std::env::var_os(name)?;
+    Some(join_remainder(PathBuf::from(value), remainder))
+}
 
-    if let Some(stripped) = raw.strip_prefix('$') {
-        let mut chars = stripped.char_indices();
-        let Some((_, first)) = chars.next() else {
-            return Some(PathBuf::from(expand_tilde(raw)));
-        };
-
-        if first.is_ascii_alphabetic() || first == '_' {
-            let name_end = chars
-                .find_map(|(idx, ch)| (!(ch.is_ascii_alphanumeric() || ch == '_')).then_some(idx))
-                .unwrap_or(stripped.len());
-            let name = &stripped[..name_end];
-            let remainder = &stripped[name_end..];
-
-            if remainder.is_empty() || remainder.starts_with('/') {
-                if let Some(value) = std::env::var_os(name) {
-                    let base = PathBuf::from(value);
-                    return Some(match remainder.strip_prefix('/') {
-                        Some(relative) => base.join(relative),
-                        None => base,
-                    });
-                }
-
-                return Some(PathBuf::from(raw));
-            }
-        }
+#[cfg(unix)]
+fn env_name_end(stripped: &str) -> Option<usize> {
+    let mut chars = stripped.char_indices();
+    let (_, first) = chars.next()?;
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return None;
     }
+    Some(
+        chars
+            .find_map(|(idx, ch)| (!(ch.is_ascii_alphanumeric() || ch == '_')).then_some(idx))
+            .unwrap_or(stripped.len()),
+    )
+}
 
-    Some(PathBuf::from(expand_tilde(raw)))
+#[cfg(unix)]
+fn join_remainder(base: PathBuf, remainder: &str) -> PathBuf {
+    remainder
+        .strip_prefix('/')
+        .map_or(base.clone(), |relative| base.join(relative))
 }
 
 #[cfg(not(unix))]

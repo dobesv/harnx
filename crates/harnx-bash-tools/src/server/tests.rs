@@ -166,6 +166,52 @@ fn enabled_sandbox_config() -> SandboxConfig {
     }
 }
 
+#[tokio::test]
+async fn rollback_rejects_repo_root_outside_write_grant() {
+    let temp = TestDir::new();
+    let repo = temp.path().join("repo");
+    let allowed = repo.join("allowed");
+    std::fs::create_dir_all(&allowed).expect("create allowed subdirectory");
+    let init = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&repo)
+        .status()
+        .expect("run git init");
+    assert!(init.success());
+    let server = server_with_paths(vec![allowed.clone()]);
+
+    let denied = server
+        .rollback_file_impl(RollbackParams {
+            commit_id: "0000000000000000000000000000000000000000".to_string(),
+            repo_path: allowed.to_string_lossy().into_owned(),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        denied.message.contains("outside allowed write paths"),
+        "unexpected error: {}",
+        denied.message
+    );
+    assert!(denied.message.contains(&repo.to_string_lossy().to_string()));
+}
+
+#[tokio::test]
+async fn default_working_dir_skips_file_grants() {
+    let temp = TestDir::new();
+    let file = temp.path().join("allowed-file");
+    std::fs::write(&file, "content").expect("write file grant");
+    let mut allowlist = ResolvedAllowlist::new();
+    allowlist.insert_read(&file);
+    let server = BashServer::new(allowlist);
+
+    let denied = server.resolve_working_dir(None).await.unwrap_err();
+
+    assert!(denied
+        .message
+        .contains("no allowed paths are configured for a working directory"));
+}
+
 #[cfg(unix)]
 fn disabled_sandbox_config() -> SandboxConfig {
     SandboxConfig {

@@ -137,6 +137,8 @@ impl BashServer {
         let repo_dir = harnx_mcp_history::discover::find_repo_for_path(&path).ok_or_else(|| {
             ErrorData::invalid_params("path is not inside a git repository".to_string(), None)
         })?;
+        validate_write_path(&repo_dir.to_string_lossy(), &self.inner.allowlist)
+            .map_err(invalid_params)?;
 
         let new_commit_id = self
             .inner

@@ -25,7 +25,7 @@ cargo install --path crates/harnx-fs-tools
 | `--mcp-stdio` | Run in stdio MCP backward-compatibility mode. |
 | `--help`, `-h` | Show help. |
 
-Path lists can also come from colon-separated `HARNX_TOOLS_ALLOW_READ`, `HARNX_TOOLS_ALLOW_WRITE`, `HARNX_TOOLS_ALLOW_EXEC`, and `HARNX_TOOLS_ALLOW_RWX` environment variables. Batch toggles use the corresponding `HARNX_TOOLS_ALLOW_COMMON_DEFAULT`, `HARNX_TOOLS_ALLOW_DEV_TOOLS`, `HARNX_TOOLS_ALLOW_REPO_WORK`, and `HARNX_TOOLS_ALLOW_ALL` variables. Values `1`, `true`, `yes`, and `on` enable a batch.
+Path lists can also come from `HARNX_TOOLS_ALLOW_READ`, `HARNX_TOOLS_ALLOW_WRITE`, `HARNX_TOOLS_ALLOW_EXEC`, and `HARNX_TOOLS_ALLOW_RWX` environment variables. Separate paths with a colon on Unix or a semicolon on Windows. Batch toggles use the corresponding `HARNX_TOOLS_ALLOW_COMMON_DEFAULT`, `HARNX_TOOLS_ALLOW_DEV_TOOLS`, `HARNX_TOOLS_ALLOW_REPO_WORK`, and `HARNX_TOOLS_ALLOW_ALL` variables. Values `1`, `true`, `yes`, and `on` enable a batch.
 
 ## Tools
 

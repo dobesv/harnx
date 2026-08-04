@@ -24,7 +24,7 @@ fs and bash MCP servers used independent allowlist implementations (fs: flat roo
 
 ## Symptoms
 
-```
+```text
 - Error: "outside allowed roots" from fs for paths bash could access
 - Behavior: Agent confusion when cross-tool path expectations diverged
 - Latent vuln: shebang scripts with `#/opt/notallowed/x` would auto-grant exec on /opt/notallowed
@@ -33,7 +33,7 @@ fs and bash MCP servers used independent allowlist implementations (fs: flat roo
 
 ## Investigation Steps
 
-Traced the divergence: `harnx-mcp::safety` exported `validate_path`/`validate_write_path` called by both tools, but their allowlist inputs came from different sources. Bash combined implicit defaults (` SYSTEM_EXEC_PATHS`, `/tmp`, `~/.cargo`) with explicit `--extra-*`. Fs had only explicit roots via MCP protocol. Neither enforced write/exec ⊇ read closure consistently.
+Traced the divergence: `harnx-mcp::safety` exported `validate_path`/`validate_write_path` called by both tools, but their allowlist inputs came from different sources. Bash combined implicit defaults (`SYSTEM_EXEC_PATHS`, `/tmp`, `~/.cargo`) with explicit `--extra-*`. Fs had only explicit roots via MCP protocol. Neither enforced write/exec ⊇ read closure consistently.
 
 Found the shebang issue in `command.rs`: when a script had an absolute shebang interpreter (`#/opt/notallowed/x`), bash would auto-grant `--exec` on the interpreter's parent directory. This grant bypassed validation because it happened during sandbox-arg construction.
 

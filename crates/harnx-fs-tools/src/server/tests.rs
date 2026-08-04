@@ -452,6 +452,34 @@ async fn rollback_requires_write_allowlist() {
 }
 
 #[tokio::test]
+async fn rollback_rejects_repo_root_outside_write_grant() {
+    let temp = TestDir::new();
+    let repo = temp.path().join("repo");
+    let allowed = repo.join("allowed");
+    std::fs::create_dir_all(&allowed).expect("create allowed subdirectory");
+    let init = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&repo)
+        .status()
+        .expect("run git init");
+    assert!(init.success());
+    let mut allowlist = ResolvedAllowlist::new();
+    allowlist.insert_write(&allowed);
+    let server = FsServer::new(allowlist);
+
+    let denied = server
+        .rollback_file_impl(RollbackParams {
+            commit_id: "0000000000000000000000000000000000000000".to_string(),
+            repo_path: path_string(&allowed),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(denied.message.contains("outside allowed write paths"));
+    assert!(denied.message.contains(&path_string(&repo)));
+}
+
+#[tokio::test]
 async fn rwx_allowlist_reads_and_writes() {
     let dir = TestDir::new();
     let file = dir.path().join("writable.txt");
@@ -492,7 +520,28 @@ async fn empty_allowlist_denies_default_search_path() {
         })
         .await
         .unwrap_err();
-    assert!(denied.message.contains("No paths configured for reading"));
+    assert!(denied
+        .message
+        .contains("No readable directories configured"));
+}
+
+#[cfg(unix)]
+#[test]
+fn default_search_path_prefers_allowed_cwd_over_common_defaults() {
+    let cwd = std::env::current_dir().expect("current dir");
+    let inputs = harnx_tool_allow::AllowInputs {
+        read: vec![cwd.clone()],
+        common_default: true,
+        ..Default::default()
+    };
+    let allowlist = harnx_tool_allow::resolve_allowlist(
+        &inputs,
+        &cwd,
+        &harnx_tool_allow::AllowEnv::from_current_process(),
+    );
+
+    assert!(allowlist.contains_read("/usr/bin"));
+    assert_eq!(default_search_path(&allowlist).unwrap(), cwd);
 }
 
 #[tokio::test]

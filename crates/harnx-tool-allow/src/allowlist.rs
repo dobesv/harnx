@@ -33,6 +33,15 @@ impl ResolvedAllowlist {
         self.read.is_empty() && self.write.is_empty() && self.exec.is_empty()
     }
 
+    /// Picks a readable directory, preferring `preferred` when it is allowed.
+    /// File grants are skipped because callers use this as a search or process cwd.
+    pub fn default_read_directory(&self, preferred: Option<&Path>) -> Option<PathBuf> {
+        preferred
+            .filter(|path| path.is_dir() && self.contains_read(path))
+            .map(Path::to_path_buf)
+            .or_else(|| self.read.iter().find(|path| path.is_dir()).cloned())
+    }
+
     pub fn insert_read(&mut self, path: impl AsRef<Path>) {
         self.read
             .insert(canonicalize_for_containment(path.as_ref()));
@@ -68,34 +77,52 @@ impl ResolvedAllowlist {
     }
 
     pub(crate) fn insert_write_with_home(&mut self, path: &Path, home: Option<&Path>) -> bool {
-        let path = canonicalize_for_containment(path);
-        self.read.insert(path.clone());
-        if home.is_some_and(|home| home_or_ancestor(&path, home)) {
-            return false;
-        }
-        self.write.insert(path);
-        true
+        self.insert_privileged_with_home(path, home, PrivilegedPermission::Write)
     }
 
     pub(crate) fn insert_exec_with_home(&mut self, path: &Path, home: Option<&Path>) -> bool {
-        let path = canonicalize_for_containment(path);
-        self.read.insert(path.clone());
-        if home.is_some_and(|home| home_or_ancestor(&path, home)) {
-            return false;
-        }
-        self.exec.insert(path);
-        true
+        self.insert_privileged_with_home(path, home, PrivilegedPermission::Exec)
     }
 
     pub(crate) fn insert_rwx_with_home(&mut self, path: &Path, home: Option<&Path>) -> bool {
+        self.insert_privileged_with_home(path, home, PrivilegedPermission::WriteExec)
+    }
+
+    fn insert_privileged_with_home(
+        &mut self,
+        path: &Path,
+        home: Option<&Path>,
+        permission: PrivilegedPermission,
+    ) -> bool {
         let path = canonicalize_for_containment(path);
         self.read.insert(path.clone());
         if home.is_some_and(|home| home_or_ancestor(&path, home)) {
             return false;
         }
-        self.write.insert(path.clone());
-        self.exec.insert(path);
+        if permission.grants_write() {
+            self.write.insert(path.clone());
+        }
+        if permission.grants_exec() {
+            self.exec.insert(path);
+        }
         true
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PrivilegedPermission {
+    Write,
+    Exec,
+    WriteExec,
+}
+
+impl PrivilegedPermission {
+    fn grants_write(self) -> bool {
+        matches!(self, Self::Write | Self::WriteExec)
+    }
+
+    fn grants_exec(self) -> bool {
+        matches!(self, Self::Exec | Self::WriteExec)
     }
 }
 

@@ -143,11 +143,12 @@ impl BashServer {
         requested: Option<&str>,
     ) -> Result<PathBuf, ErrorData> {
         let current_dir = std::env::current_dir().ok();
-        // Prefer the process cwd when it is allowed. Otherwise use the first
-        // read grant. Empty allowlists have no fallback and remain deny-all.
-        let default_dir = current_dir
-            .filter(|cwd| self.inner.allowlist.contains_read(cwd))
-            .or_else(|| self.inner.allowlist.read_paths().iter().next().cloned())
+        // Empty allowlists and allowlists containing only files have no
+        // fallback and remain deny-all for process working directories.
+        let default_dir = self
+            .inner
+            .allowlist
+            .default_read_directory(current_dir.as_deref())
             .ok_or_else(|| {
                 ErrorData::invalid_params(
                     "no allowed paths are configured for a working directory".to_string(),

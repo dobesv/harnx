@@ -83,14 +83,12 @@ fn internal_error(msg: impl Into<Cow<'static, str>>) -> ErrorData {
 }
 
 fn default_search_path(allowlist: &ResolvedAllowlist) -> Result<PathBuf, ErrorData> {
+    let current_dir = std::env::current_dir().ok();
     allowlist
-        .read_paths()
-        .iter()
-        .next()
-        .cloned()
+        .default_read_directory(current_dir.as_deref())
         .ok_or_else(|| {
             invalid_params(
-                "No paths configured for reading; provide an allowlist path or search path",
+                "No readable directories configured; provide an allowlist directory or search path",
             )
         })
 }
