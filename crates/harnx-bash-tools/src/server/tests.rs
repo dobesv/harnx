@@ -1,15 +1,11 @@
-// rmcp deprecated the MCP Roots feature (SEP-2577); these tests exercise it.
-#![allow(deprecated)]
 use super::*;
 
 #[cfg(unix)]
 use std::ffi::OsString;
 
 use rmcp::handler::client::ClientHandler;
-use rmcp::model::{ClientCapabilities, InitializeRequestParams, ListRootsResult, Root};
-use rmcp::service::{
-    serve_client, serve_server, RequestContext, RoleClient, RoleServer, RunningService,
-};
+use rmcp::model::{ClientCapabilities, InitializeRequestParams};
+use rmcp::service::{serve_client, serve_server, RoleClient, RoleServer, RunningService};
 use tokio::io::duplex;
 use uuid::Uuid;
 
@@ -36,39 +32,14 @@ impl Drop for TestDir {
 }
 
 #[derive(Clone, Default)]
-#[allow(dead_code)]
-struct TestClientHandler {
-    roots: Vec<PathBuf>,
-}
-
-impl TestClientHandler {
-    #[allow(dead_code)]
-    fn new(roots: Vec<PathBuf>) -> Self {
-        Self { roots }
-    }
-}
+struct TestClientHandler;
 
 impl ClientHandler for TestClientHandler {
     fn get_info(&self) -> InitializeRequestParams {
         InitializeRequestParams::new(
-            ClientCapabilities::builder()
-                .enable_roots()
-                .enable_roots_list_changed()
-                .build(),
+            ClientCapabilities::default(),
             Implementation::new("test", "0.1"),
         )
-    }
-
-    async fn list_roots(
-        &self,
-        _cx: RequestContext<RoleClient>,
-    ) -> Result<ListRootsResult, ErrorData> {
-        Ok(ListRootsResult::new(
-            self.roots
-                .iter()
-                .map(|root| Root::new(format!("file://{}", root.canonicalize().unwrap().display())))
-                .collect(),
-        ))
     }
 }
 
@@ -79,10 +50,10 @@ struct TestConnection {
 }
 
 #[allow(dead_code)]
-async fn connect_server(server: BashServer, roots: Vec<PathBuf>) -> TestConnection {
+async fn connect_server(server: BashServer, _roots: Vec<PathBuf>) -> TestConnection {
     let (client_transport, server_transport) = duplex(65_536);
     let server_fut = serve_server(server, server_transport);
-    let client_fut = serve_client(TestClientHandler::new(roots), client_transport);
+    let client_fut = serve_client(TestClientHandler, client_transport);
     let (server_res, client_res) = tokio::join!(server_fut, client_fut);
 
     TestConnection {
@@ -103,214 +74,6 @@ fn text_content(result: &CallToolResult) -> String {
         .join("\n")
 }
 
-/// A client that does NOT advertise the `roots` capability.
-#[derive(Clone)]
-struct NoRootsClientHandler {
-    list_roots_called: Arc<AtomicBool>,
-}
-
-impl ClientHandler for NoRootsClientHandler {
-    fn get_info(&self) -> InitializeRequestParams {
-        // Deliberately no `.enable_roots()` — this client cannot answer
-        // a `roots/list` request.
-        InitializeRequestParams::new(
-            ClientCapabilities::builder().build(),
-            Implementation::new("test-no-roots", "0.1"),
-        )
-    }
-
-    async fn list_roots(
-        &self,
-        _cx: RequestContext<RoleClient>,
-    ) -> Result<ListRootsResult, ErrorData> {
-        self.list_roots_called.store(true, Ordering::SeqCst);
-        Ok(ListRootsResult::new(vec![]))
-    }
-}
-
-/// When the client never advertised `roots`, the server must not send it
-/// a `roots/list` request; it keeps the CLI-provided roots instead.
-#[tokio::test]
-async fn does_not_request_roots_when_client_lacks_capability() {
-    let temp_dir = TestDir::new();
-    let initial_root = temp_dir.path().to_path_buf();
-    let server = BashServer::new(vec![initial_root.clone()]);
-    let server_clone = server.clone();
-
-    let (client_transport, server_transport) = duplex(65_536);
-    let list_roots_called = Arc::new(AtomicBool::new(false));
-    let client_handler = NoRootsClientHandler {
-        list_roots_called: list_roots_called.clone(),
-    };
-    let server_fut = serve_server(server, server_transport);
-    let client_fut = serve_client(client_handler, client_transport);
-    let (server_res, client_res) = tokio::join!(server_fut, client_fut);
-    let server_service = server_res.unwrap();
-    let client_service = client_res.unwrap();
-
-    let server_peer = server_service.peer().clone();
-    let _client_task = tokio::spawn(async move {
-        let _ = client_service.waiting().await;
-    });
-
-    server_clone
-        .ensure_roots_initialized(&server_peer)
-        .await
-        .expect("initialization succeeds without roots support");
-
-    assert!(
-        !list_roots_called.load(Ordering::SeqCst),
-        "server must not request roots from a client lacking the roots capability"
-    );
-    assert_eq!(
-        *server_clone.inner.roots.read().await,
-        vec![initial_root],
-        "CLI-provided roots must be retained"
-    );
-    assert!(
-        server_clone.inner.roots_initialized.load(Ordering::SeqCst),
-        "roots should be marked initialized so we don't retry every tool call"
-    );
-}
-
-#[cfg(unix)]
-#[allow(clippy::await_holding_lock)]
-#[tokio::test(flavor = "current_thread")]
-async fn no_roots_capability_seeds_canonical_cwd_when_enabled() {
-    let _env_guard = env_lock();
-    let temp = tempfile::tempdir().expect("tempdir");
-    let cwd = temp.path().join("repo");
-    let home = temp.path().join("home");
-    std::fs::create_dir_all(&cwd).expect("create cwd");
-    std::fs::create_dir_all(&home).expect("create home");
-    let _home = EnvVar::set("HOME", &home);
-    let _cwd = CwdGuard::set(&cwd);
-    let server =
-        BashServer::new_with_sandbox_and_default_root(vec![], disabled_sandbox_config(), true);
-    let server_clone = server.clone();
-
-    let (client_transport, server_transport) = duplex(65_536);
-    let client_handler = NoRootsClientHandler {
-        list_roots_called: Arc::new(AtomicBool::new(false)),
-    };
-    let (server_res, client_res) = tokio::join!(
-        serve_server(server, server_transport),
-        serve_client(client_handler, client_transport)
-    );
-    let server_service = server_res.expect("serve server");
-    let client_service = client_res.expect("serve client");
-    let server_peer = server_service.peer().clone();
-    let _client_task = tokio::spawn(async move {
-        let _ = client_service.waiting().await;
-    });
-
-    server_clone
-        .ensure_roots_initialized(&server_peer)
-        .await
-        .expect("initialize roots");
-
-    assert_eq!(
-        *server_clone.inner.roots.read().await,
-        vec![cwd.canonicalize().expect("canonical cwd")]
-    );
-}
-
-#[cfg(unix)]
-#[allow(clippy::await_holding_lock)]
-#[tokio::test(flavor = "current_thread")]
-async fn empty_peer_roots_seed_canonical_cwd_when_enabled() {
-    let _env_guard = env_lock();
-    let temp = tempfile::tempdir().expect("tempdir");
-    let cwd = temp.path().join("repo");
-    let home = temp.path().join("home");
-    std::fs::create_dir_all(&cwd).expect("create cwd");
-    std::fs::create_dir_all(&home).expect("create home");
-    let _home = EnvVar::set("HOME", &home);
-    let _cwd = CwdGuard::set(&cwd);
-    let server =
-        BashServer::new_with_sandbox_and_default_root(vec![], disabled_sandbox_config(), true);
-    let server_clone = server.clone();
-
-    let (client_transport, server_transport) = duplex(65_536);
-    let (server_res, client_res) = tokio::join!(
-        serve_server(server, server_transport),
-        serve_client(TestClientHandler::new(vec![]), client_transport)
-    );
-    let server_service = server_res.expect("serve server");
-    let client_service = client_res.expect("serve client");
-    let server_peer = server_service.peer().clone();
-    let _client_task = tokio::spawn(async move {
-        let _ = client_service.waiting().await;
-    });
-
-    server_clone
-        .ensure_roots_initialized(&server_peer)
-        .await
-        .expect("initialize roots");
-
-    assert_eq!(
-        *server_clone.inner.roots.read().await,
-        vec![cwd.canonicalize().expect("canonical cwd")]
-    );
-}
-
-#[cfg(unix)]
-#[allow(clippy::await_holding_lock)]
-#[tokio::test(flavor = "current_thread")]
-async fn default_root_cwd_refuses_home_and_leaves_roots_empty() {
-    let _env_guard = env_lock();
-    let home = tempfile::tempdir().expect("home tempdir");
-    let _home = EnvVar::set("HOME", home.path());
-    let _cwd = CwdGuard::set(home.path());
-    let server =
-        BashServer::new_with_sandbox_and_default_root(vec![], disabled_sandbox_config(), true);
-
-    server.apply_default_root_cwd_if_empty().await;
-
-    assert!(server.inner.roots.read().await.is_empty());
-}
-
-#[cfg(unix)]
-#[allow(clippy::await_holding_lock)]
-#[tokio::test(flavor = "current_thread")]
-async fn empty_roots_stay_denied_without_default_root_cwd() {
-    let _env_guard = env_lock();
-    let temp = tempfile::tempdir().expect("tempdir");
-    let home = temp.path().join("home");
-    std::fs::create_dir_all(&home).expect("create home");
-    let _home = EnvVar::set("HOME", &home);
-    let _cwd = CwdGuard::set(temp.path());
-    let server = BashServer::new_with_sandbox(vec![], disabled_sandbox_config());
-
-    server.apply_default_root_cwd_if_empty().await;
-
-    assert!(server.inner.roots.read().await.is_empty());
-}
-
-#[cfg(unix)]
-#[allow(clippy::await_holding_lock)]
-#[tokio::test(flavor = "current_thread")]
-async fn explicit_root_is_not_overridden_by_default_root_cwd() {
-    let _env_guard = env_lock();
-    let temp = tempfile::tempdir().expect("tempdir");
-    let root = temp.path().join("explicit");
-    let cwd = temp.path().join("cwd");
-    let home = temp.path().join("home");
-    for path in [&root, &cwd, &home] {
-        std::fs::create_dir_all(path).expect("create directory");
-    }
-    let _home = EnvVar::set("HOME", &home);
-    let _cwd = CwdGuard::set(&cwd);
-    let server = BashServer::new_with_sandbox_and_default_root(
-        vec![root.clone()],
-        disabled_sandbox_config(),
-        true,
-    );
-
-    server.apply_default_root_cwd_if_empty().await;
-
-    assert_eq!(*server.inner.roots.read().await, vec![root]);
-}
 #[tokio::test]
 async fn bash_tools_advertise_call_template_only() {
     // Each tool ships a `_meta.call_template` for the TUI's call header.
@@ -318,7 +81,7 @@ async fn bash_tools_advertise_call_template_only() {
     // back to its audience-aware generic renderer — that's what surfaces
     // the history diff content blocks (issue #398).
     let temp_dir = tempfile::tempdir().expect("tempdir");
-    let server = BashServer::new_with_sandbox(
+    let server = server_with_sandbox(
         vec![temp_dir.path().to_path_buf()],
         disabled_sandbox_config(),
     );
@@ -368,20 +131,87 @@ fn collect_arg_pairs(args: &[OsString]) -> Vec<(String, String)> {
 }
 
 #[cfg(unix)]
-use crate::test_support::{env_lock, CwdGuard, EnvVar};
+use crate::test_support::{env_lock, EnvVar};
+
+fn allowlist_for_paths(paths: Vec<PathBuf>) -> Arc<ResolvedAllowlist> {
+    let inputs = harnx_tool_allow::AllowInputs {
+        rwx: paths,
+        ..harnx_tool_allow::AllowInputs::default()
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    Arc::new(harnx_tool_allow::resolve_allowlist(
+        &inputs,
+        &cwd,
+        &harnx_tool_allow::AllowEnv::from_current_process(),
+    ))
+}
+
+fn server_with_paths(paths: Vec<PathBuf>) -> BashServer {
+    BashServer::new((*allowlist_for_paths(paths)).clone())
+}
+
+fn server_with_sandbox(paths: Vec<PathBuf>, mut config: SandboxConfig) -> BashServer {
+    config.allowlist = allowlist_for_paths(paths);
+    BashServer::new_with_sandbox(config)
+}
 
 #[cfg(unix)]
 fn enabled_sandbox_config() -> SandboxConfig {
     SandboxConfig {
         enabled: true,
-        extra_exec: vec![],
-        extra_readable: vec![],
-        extra_writable: vec![],
-        extra_rwx: vec![],
+        allowlist: Arc::new(ResolvedAllowlist::new()),
         extra_env_passthrough: vec![],
         env_overrides: vec![],
         sandbox_run_path: PathBuf::from("harnx-sandbox-exec"),
     }
+}
+
+#[tokio::test]
+async fn rollback_rejects_repo_root_outside_write_grant() {
+    let temp = TestDir::new();
+    let base = temp.path().canonicalize().expect("canonical tempdir");
+    let repo = base.join("repo");
+    let allowed = repo.join("allowed");
+    std::fs::create_dir_all(&allowed).expect("create allowed subdirectory");
+    let init = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&repo)
+        .status()
+        .expect("run git init");
+    assert!(init.success());
+    let server = server_with_paths(vec![allowed.clone()]);
+
+    let denied = server
+        .rollback_file_impl(RollbackParams {
+            commit_id: "0000000000000000000000000000000000000000".to_string(),
+            repo_path: allowed.to_string_lossy().into_owned(),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        denied.message.contains("outside allowed write paths"),
+        "unexpected error: {}",
+        denied.message
+    );
+    assert!(denied.message.contains(&repo.to_string_lossy().to_string()));
+}
+
+#[tokio::test]
+async fn default_working_dir_skips_file_grants() {
+    let temp = TestDir::new();
+    let base = temp.path().canonicalize().expect("canonical tempdir");
+    let file = base.join("allowed-file");
+    std::fs::write(&file, "content").expect("write file grant");
+    let mut allowlist = ResolvedAllowlist::new();
+    allowlist.insert_read(&file);
+    let server = BashServer::new(allowlist);
+
+    let denied = server.resolve_working_dir(None).await.unwrap_err();
+
+    assert!(denied
+        .message
+        .contains("no allowed paths are configured for a working directory"));
 }
 
 #[cfg(unix)]
@@ -394,14 +224,11 @@ fn disabled_sandbox_config() -> SandboxConfig {
 
 #[cfg(target_os = "linux")]
 fn sandboxed_server(roots: Vec<PathBuf>) -> BashServer {
-    BashServer::new_with_sandbox(
+    server_with_sandbox(
         roots,
         SandboxConfig {
             enabled: true,
-            extra_exec: vec![],
-            extra_readable: vec![],
-            extra_writable: vec![],
-            extra_rwx: vec![],
+            allowlist: Arc::new(ResolvedAllowlist::new()),
             extra_env_passthrough: vec![],
             env_overrides: vec![],
             sandbox_run_path: sandbox_run_test_path(),
@@ -478,32 +305,7 @@ fn sandbox_runtime_works() -> bool {
 
 #[cfg(unix)]
 fn sandbox_server(root: impl Into<PathBuf>) -> BashServer {
-    BashServer::new_with_sandbox(vec![root.into()], enabled_sandbox_config())
-}
-
-#[cfg(unix)]
-fn sandbox_arg_pairs(root: &Path, working_dir: &Path) -> Vec<(String, String)> {
-    let server = sandbox_server(root.to_path_buf());
-    let args = server.build_sandbox_args(working_dir, &[root.to_path_buf()]);
-    collect_arg_pairs(&args)
-}
-
-#[cfg(unix)]
-fn assert_arg_pair_present(pairs: &[(String, String)], flag: &str, value: impl AsRef<str>) {
-    let expected = (flag.to_string(), value.as_ref().to_string());
-    assert!(
-        pairs.contains(&expected),
-        "missing sandbox arg pair {expected:?}: {pairs:?}"
-    );
-}
-
-#[cfg(unix)]
-fn assert_arg_pair_absent(pairs: &[(String, String)], flag: &str, value: impl AsRef<str>) {
-    let unexpected = (flag.to_string(), value.as_ref().to_string());
-    assert!(
-        !pairs.contains(&unexpected),
-        "unexpected sandbox arg pair {unexpected:?}: {pairs:?}"
-    );
+    server_with_sandbox(vec![root.into()], enabled_sandbox_config())
 }
 
 fn exec_params(command: impl Into<String>, working_dir: &Path) -> ExecCommandParams {
@@ -606,271 +408,44 @@ fn extract_field(text: &str, field: &str) -> String {
 mod sandbox_args {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
-    fn test_sandbox_args_defaults() {
-        // Reads process-global $HOME to derive expected home-relative defaults,
-        // so serialize against tests that mutate HOME via the shared env lock.
-        let _env_guard = env_lock();
-        let root = Path::new("/test/root");
-        let pairs = sandbox_arg_pairs(root, Path::new("/test/root/workdir"));
-
-        assert_arg_pair_present(&pairs, "--write", "/test/root");
-        assert_arg_pair_present(&pairs, "--exec", "/usr/bin");
-        assert_arg_pair_absent(&pairs, "--write", "/usr/bin");
-
-        #[cfg(target_os = "linux")]
-        assert_arg_pair_present(&pairs, "--read", "/usr/include");
-
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
-            let path_str = |sub: &str| home.join(sub).to_string_lossy().into_owned();
-            assert_arg_pair_present(&pairs, "--read", path_str(".gitconfig"));
-            assert_arg_pair_present(&pairs, "--exec", path_str(".local/bin"));
-            assert_arg_pair_present(&pairs, "--read", path_str(".cache"));
-            assert_arg_pair_present(&pairs, "--write", path_str(".cache"));
-            // .pyenv is exec-only (read+exec, no write): the EXEC defaults emit
-            // only --exec, so neither --read nor --write should be present.
-            assert_arg_pair_absent(&pairs, "--read", path_str(".pyenv"));
-            assert_arg_pair_absent(&pairs, "--write", path_str(".pyenv"));
-            assert_arg_pair_present(&pairs, "--exec", path_str(".pyenv"));
-            assert_arg_pair_present(&pairs, "--exec", path_str(".cargo/bin"));
-            assert_arg_pair_present(&pairs, "--read", path_str(".npm"));
-            assert_arg_pair_present(&pairs, "--write", path_str(".npm"));
-            assert_arg_pair_absent(&pairs, "--exec", path_str(".npm"));
-            // .local/share/claude is exec-only: --exec only, no --read/--write.
-            assert_arg_pair_absent(&pairs, "--read", path_str(".local/share/claude"));
-            assert_arg_pair_absent(&pairs, "--write", path_str(".local/share/claude"));
-            assert_arg_pair_present(&pairs, "--exec", path_str(".local/share/claude"));
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_sandbox_args_honours_toolchain_env_vars() {
-        let _env_guard = env_lock();
-        let _cargo = EnvVar::set("CARGO_HOME", "/opt/cargo-custom");
-        let _goroot = EnvVar::set("GOROOT", "/opt/go");
-        let _gopath = EnvVar::set("GOPATH", "/srv/go-workspace");
-        let _gobin = EnvVar::set("GOBIN", "/srv/go-workspace/installed");
-
-        let pairs = sandbox_arg_pairs(Path::new("/test/root"), Path::new("/test/root/workdir"));
-
-        // Custom CARGO_HOME root is readable so config.toml/credentials work.
-        assert_arg_pair_present(&pairs, "--read", "/opt/cargo-custom");
-        assert_arg_pair_present(&pairs, "--exec", "/opt/cargo-custom/bin");
-        // Custom CARGO_HOME keeps cache-write parity with the default ~/.cargo.
-        assert_arg_pair_present(&pairs, "--read", "/opt/cargo-custom/registry");
-        assert_arg_pair_present(&pairs, "--write", "/opt/cargo-custom/registry");
-        assert_arg_pair_absent(&pairs, "--exec", "/opt/cargo-custom/registry");
-        assert_arg_pair_present(&pairs, "--read", "/opt/cargo-custom/git");
-        assert_arg_pair_present(&pairs, "--write", "/opt/cargo-custom/git");
-        assert_arg_pair_present(&pairs, "--exec", "/opt/go");
-        assert_arg_pair_present(&pairs, "--exec", "/srv/go-workspace/bin");
-        assert_arg_pair_present(&pairs, "--read", "/srv/go-workspace/pkg");
-        assert_arg_pair_present(&pairs, "--write", "/srv/go-workspace/pkg");
-        assert_arg_pair_present(&pairs, "--exec", "/srv/go-workspace/installed");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_sandbox_args_honours_go_cache_env_vars() {
-        let _env_guard = env_lock();
-        let _gomodcache = EnvVar::set("GOMODCACHE", "/srv/go-mod-cache");
-        let _gocache = EnvVar::set("GOCACHE", "/srv/go-build-cache");
-
-        let pairs = sandbox_arg_pairs(Path::new("/test/root"), Path::new("/test/root/workdir"));
-
-        assert_arg_pair_present(&pairs, "--read", "/srv/go-mod-cache");
-        assert_arg_pair_present(&pairs, "--write", "/srv/go-mod-cache");
-        assert_arg_pair_absent(&pairs, "--exec", "/srv/go-mod-cache");
-        assert_arg_pair_present(&pairs, "--read", "/srv/go-build-cache");
-        assert_arg_pair_present(&pairs, "--write", "/srv/go-build-cache");
-        assert_arg_pair_absent(&pairs, "--exec", "/srv/go-build-cache");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_sandbox_args_honours_homebrew_prefix_env_var() {
-        let _env_guard = env_lock();
-        let _homebrew = EnvVar::set("HOMEBREW_PREFIX", "/custom/homebrew");
-
-        let pairs = sandbox_arg_pairs(Path::new("/test/root"), Path::new("/test/root/workdir"));
-
-        // The Homebrew prefix is granted read+execute (exec implies read).
-        assert_arg_pair_present(&pairs, "--exec", "/custom/homebrew");
-        // Never writable: a writable+executable prefix would let sandboxed code
-        // plant binaries the host later runs (security precedent).
-        assert_arg_pair_absent(&pairs, "--write", "/custom/homebrew");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_sandbox_args_homebrew_prefix_macos_fallback() {
-        let _env_guard = env_lock();
-        let _homebrew = EnvVar::unset("HOMEBREW_PREFIX");
-
-        let pairs = sandbox_arg_pairs(Path::new("/test/root"), Path::new("/test/root/workdir"));
-
-        // With HOMEBREW_PREFIX unset, the macOS compile-time default applies.
-        assert_arg_pair_present(&pairs, "--exec", "/opt/homebrew");
-        assert_arg_pair_absent(&pairs, "--write", "/opt/homebrew");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_sandbox_args_homebrew_prefix_linux_fallback() {
-        let _env_guard = env_lock();
-        let _homebrew = EnvVar::unset("HOMEBREW_PREFIX");
-
-        let pairs = sandbox_arg_pairs(Path::new("/test/root"), Path::new("/test/root/workdir"));
-
-        // With HOMEBREW_PREFIX unset, the Linux compile-time default applies.
-        assert_arg_pair_present(&pairs, "--exec", "/home/linuxbrew/.linuxbrew");
-        assert_arg_pair_absent(&pairs, "--write", "/home/linuxbrew/.linuxbrew");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_sandbox_args_root_write_exec_workdir_inside_root() {
-        let pairs = sandbox_arg_pairs(Path::new("/test/root"), Path::new("/test/root/workdir"));
-
-        assert_arg_pair_present(&pairs, "--write", "/test/root");
-        assert_arg_pair_present(&pairs, "--exec", "/test/root");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_sandbox_args_root_write_exec_workdir_outside_root() {
-        let pairs = sandbox_arg_pairs(Path::new("/test/root"), Path::new("/custom/out/workdir"));
-
-        assert_arg_pair_present(&pairs, "--write", "/test/root");
-        assert_arg_pair_present(&pairs, "--exec", "/test/root");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_sandbox_args_root_write_exec_tmp_workdir() {
-        let working_dir = Path::new("/tmp/test_wd_xxx");
-        let pairs = sandbox_arg_pairs(Path::new("/test/root"), working_dir);
-
-        assert_arg_pair_present(&pairs, "--write", "/test/root");
-        assert_arg_pair_present(&pairs, "--exec", "/test/root");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_roots_always_writable_and_executable() {
-        let root = tempfile::tempdir().unwrap();
-        let pairs = sandbox_arg_pairs(root.path(), root.path());
-
-        assert_arg_pair_present(&pairs, "--write", root.path().to_string_lossy());
-        assert_arg_pair_present(&pairs, "--exec", root.path().to_string_lossy());
-    }
-    #[test]
-    fn test_sandbox_args_extra_writable() {
-        let mut config = enabled_sandbox_config();
-        config
-            .extra_writable
-            .push(PathBuf::from("/custom/writable"));
-        let server = BashServer::new_with_sandbox(vec![PathBuf::from("/test/root")], config);
-        let args = server.build_sandbox_args(
-            Path::new("/custom/writable/workdir"),
-            &[PathBuf::from("/test/root")],
-        );
+    fn empty_allowlist_emits_no_filesystem_flags() {
+        let server = BashServer::new_with_sandbox(enabled_sandbox_config());
+        let args = server.build_sandbox_args(Path::new("/tmp"));
         let pairs = collect_arg_pairs(&args);
-
-        assert!(pairs.contains(&("--write".into(), "/custom/writable".into())));
+        assert!(!pairs
+            .iter()
+            .any(|(flag, _)| matches!(flag.as_str(), "--read" | "--write" | "--exec")));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn test_sandbox_args_extra_rwx() {
-        let mut config = enabled_sandbox_config();
-        config.extra_rwx.push(PathBuf::from("/custom/rwx"));
-        let server = BashServer::new_with_sandbox(vec![PathBuf::from("/test/root")], config);
-        let args = server.build_sandbox_args(
-            Path::new("/custom/rwx/workdir"),
-            &[PathBuf::from("/test/root")],
-        );
-        let pairs = collect_arg_pairs(&args);
-
-        assert!(pairs.contains(&("--read".into(), "/custom/rwx".into())));
-        assert!(pairs.contains(&("--write".into(), "/custom/rwx".into())));
-        assert!(pairs.contains(&("--exec".into(), "/custom/rwx".into())));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_sandbox_args_roots_get_exec() {
+    fn explicit_rwx_maps_to_all_sandbox_permissions() {
         let root = PathBuf::from("/test/root");
-        let server = BashServer::new_with_sandbox(vec![root.clone()], enabled_sandbox_config());
-        let args = server.build_sandbox_args(Path::new("/test/root/workdir"), &[root]);
-        let pairs = collect_arg_pairs(&args);
-
+        let server = server_with_sandbox(vec![root], enabled_sandbox_config());
+        let pairs = collect_arg_pairs(&server.build_sandbox_args(Path::new("/test/root")));
+        assert!(pairs.contains(&("--read".into(), "/test/root".into())));
         assert!(pairs.contains(&("--write".into(), "/test/root".into())));
         assert!(pairs.contains(&("--exec".into(), "/test/root".into())));
     }
 
-    #[cfg(unix)]
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn sandbox_args_include_seeded_cwd_root() {
-        let _env_guard = env_lock();
-        let temp = tempfile::tempdir().expect("tempdir");
-        let cwd = temp.path().join("repo");
-        let home = temp.path().join("home");
-        std::fs::create_dir_all(&cwd).expect("create cwd");
-        std::fs::create_dir_all(&home).expect("create home");
-        let _home = EnvVar::set("HOME", &home);
-        let _cwd = CwdGuard::set(&cwd);
-        let server =
-            BashServer::new_with_sandbox_and_default_root(vec![], enabled_sandbox_config(), true);
-        server.apply_default_root_cwd_if_empty().await;
-        let roots = server.inner.roots.read().await.clone();
-
-        let args = server.build_sandbox_args(&cwd, &roots);
-        let pairs = collect_arg_pairs(&args);
-        let canonical_cwd = cwd.canonicalize().expect("canonical cwd");
-        let canonical_cwd = canonical_cwd.to_string_lossy().into_owned();
-
-        assert!(pairs.contains(&("--write".into(), canonical_cwd.clone())));
-        assert!(pairs.contains(&("--exec".into(), canonical_cwd)));
-    }
-
-    #[cfg(all(unix, target_os = "linux"))]
     #[test]
-    fn test_sandbox_args_temp_dir_writable() {
-        let server = BashServer::new_with_sandbox(
-            vec![PathBuf::from("/test/root")],
-            enabled_sandbox_config(),
+    fn common_default_batch_emits_system_grants() {
+        let inputs = harnx_tool_allow::AllowInputs {
+            common_default: true,
+            ..harnx_tool_allow::AllowInputs::default()
+        };
+        let allowlist = harnx_tool_allow::resolve_allowlist(
+            &inputs,
+            Path::new("/workspace"),
+            &harnx_tool_allow::AllowEnv::default(),
         );
-        let args = server.build_sandbox_args(
-            Path::new("/test/root/workdir"),
-            &[PathBuf::from("/test/root")],
+        let mut config = enabled_sandbox_config();
+        config.allowlist = Arc::new(allowlist);
+        let pairs = collect_arg_pairs(
+            &BashServer::new_with_sandbox(config).build_sandbox_args(Path::new("/workspace")),
         );
-        let pairs = collect_arg_pairs(&args);
-
-        // Both /tmp and /dev/shm must be writable — /dev/shm is a tmpfs used
-        // by Chrome/Puppeteer for inter-process shared memory (issue #528).
-        assert!(pairs.contains(&("--write".into(), "/tmp".into())));
-        assert!(pairs.contains(&("--write".into(), "/dev/shm".into())));
-    }
-
-    #[cfg(all(unix, target_os = "macos"))]
-    #[test]
-    fn test_sandbox_args_temp_dir_writable() {
-        let server = BashServer::new_with_sandbox(
-            vec![PathBuf::from("/test/root")],
-            enabled_sandbox_config(),
-        );
-        let args = server.build_sandbox_args(
-            Path::new("/test/root/workdir"),
-            &[PathBuf::from("/test/root")],
-        );
-        let pairs = collect_arg_pairs(&args);
-
-        assert!(pairs.contains(&("--write".into(), "/private/tmp".into())));
+        assert!(pairs.contains(&("--read".into(), "/usr/bin".into())));
+        assert!(pairs.contains(&("--exec".into(), "/usr/bin".into())));
     }
 }
 
@@ -883,7 +458,7 @@ fn env_default_allowlist_vars_passed_through() {
     let _secret = EnvVar::set("HARNX_TEST_SECRET_4_1", "hunter2");
     let _config_dir = EnvVar::unset("HARNX_CONFIG_DIR");
 
-    let server = BashServer::new_with_sandbox(vec![], enabled_sandbox_config());
+    let server = server_with_sandbox(vec![], enabled_sandbox_config());
     let child_env = server.build_child_env();
 
     assert_child_env_contains(&child_env, "HOME", "/tmp/harnx-home-4-1");
@@ -900,7 +475,7 @@ fn env_overrides_and_passthrough() {
 
     let mut passthrough_config = enabled_sandbox_config();
     passthrough_config.extra_env_passthrough = vec!["HARNX_TEST_CUSTOM_4_2".to_string()];
-    let passthrough_server = BashServer::new_with_sandbox(vec![], passthrough_config);
+    let passthrough_server = server_with_sandbox(vec![], passthrough_config);
     let passthrough_env = passthrough_server.build_child_env();
     assert!(passthrough_env
         .iter()
@@ -912,7 +487,7 @@ fn env_overrides_and_passthrough() {
         "HARNX_TEST_CUSTOM_4_2".to_string(),
         "overridden".to_string(),
     )];
-    let override_server = BashServer::new_with_sandbox(vec![], override_config);
+    let override_server = server_with_sandbox(vec![], override_config);
     let override_env = override_server.build_child_env();
     assert!(override_env
         .iter()
@@ -936,7 +511,7 @@ fn env_non_interactive_defaults_applied_when_not_configured() {
         .map(|(k, _)| EnvVar::unset(k))
         .collect();
 
-    let server = BashServer::new_with_sandbox(vec![], enabled_sandbox_config());
+    let server = server_with_sandbox(vec![], enabled_sandbox_config());
     let child_env = server.build_child_env();
 
     let find = |key: &str, expected: &str| child_env.iter().any(|(k, v)| k == key && v == expected);
@@ -969,7 +544,7 @@ fn env_non_interactive_defaults_overridable() {
     // env_overrides wins for GIT_PAGER.
     let mut cfg = enabled_sandbox_config();
     cfg.env_overrides = vec![("GIT_PAGER".to_string(), "delta".to_string())];
-    let server = BashServer::new_with_sandbox(vec![], cfg);
+    let server = server_with_sandbox(vec![], cfg);
     let child_env = server.build_child_env();
 
     let find = |key: &str, expected: &str| child_env.iter().any(|(k, v)| k == key && v == expected);
@@ -1014,7 +589,7 @@ fn env_precedence_cli_over_passthrough_over_dotfile() {
     // Case 1: dotfile only (no passthrough, no override).
     // Expect dotfile value to win over (absent) default allowlist value.
     let dotfile_only = enabled_sandbox_config();
-    let dotfile_server = BashServer::new_with_sandbox(vec![], dotfile_only);
+    let dotfile_server = server_with_sandbox(vec![], dotfile_only);
     let dotfile_env = dotfile_server.build_child_env();
     assert!(dotfile_env
         .iter()
@@ -1023,7 +598,7 @@ fn env_precedence_cli_over_passthrough_over_dotfile() {
     // Case 2: dotfile + passthrough → passthrough beats dotfile.
     let mut passthrough_cfg = enabled_sandbox_config();
     passthrough_cfg.extra_env_passthrough = vec!["HARNX_TEST_PRECEDENCE_VAR".to_string()];
-    let passthrough_server = BashServer::new_with_sandbox(vec![], passthrough_cfg);
+    let passthrough_server = server_with_sandbox(vec![], passthrough_cfg);
     let passthrough_env = passthrough_server.build_child_env();
     assert!(passthrough_env
         .iter()
@@ -1036,7 +611,7 @@ fn env_precedence_cli_over_passthrough_over_dotfile() {
         "HARNX_TEST_PRECEDENCE_VAR".to_string(),
         "from_cli_override".to_string(),
     )];
-    let override_server = BashServer::new_with_sandbox(vec![], override_cfg);
+    let override_server = server_with_sandbox(vec![], override_cfg);
     let override_env = override_server.build_child_env();
     assert!(override_env
         .iter()
@@ -1147,10 +722,10 @@ async fn test_sandbox_exec_write_denied_outside_root() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn test_working_dir_rejected_outside_roots() {
+async fn test_working_dir_rejected_outside_allowlist() {
     let allowed = TestDir::new();
     let outside = TestDir::new();
-    let server = BashServer::new(vec![allowed.path().to_path_buf()]);
+    let server = server_with_paths(vec![allowed.path().to_path_buf()]);
 
     let result = server
         .exec_command_impl(ExecCommandParams {
@@ -1168,13 +743,13 @@ async fn test_working_dir_rejected_outside_roots() {
     assert!(result
         .unwrap_err()
         .message
-        .contains("outside allowed roots"));
+        .contains("outside allowed paths"));
 }
 
 #[tokio::test]
 async fn test_exec_rejects_empty_command() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .exec_command_impl(ExecCommandParams {
@@ -1194,7 +769,7 @@ async fn test_exec_rejects_empty_command() {
 #[tokio::test]
 async fn test_exec_rejects_invalid_env_keys() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     // Empty key
     let mut bad_env = std::collections::HashMap::new();
@@ -1248,7 +823,7 @@ async fn test_exec_rejects_invalid_env_keys() {
 #[tokio::test]
 async fn test_exec_nonzero_exit_code() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .exec_command_impl(ExecCommandParams {
@@ -1266,7 +841,7 @@ async fn test_exec_nonzero_exit_code() {
 #[tokio::test]
 async fn test_exec_basic_command() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .exec_command_impl(ExecCommandParams {
@@ -1313,7 +888,7 @@ async fn test_exec_basic_command() {
 #[tokio::test]
 async fn test_exec_per_call_env_vars() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let mut extra_env = std::collections::HashMap::new();
     extra_env.insert("MY_TEST_VAR".to_string(), "hello_from_env".to_string());
@@ -1341,7 +916,7 @@ async fn test_exec_per_call_env_vars() {
 #[tokio::test]
 async fn test_spawn_per_call_env_vars() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let mut extra_env = std::collections::HashMap::new();
     extra_env.insert("MY_SPAWN_VAR".to_string(), "spawned_value".to_string());
@@ -1466,8 +1041,7 @@ async fn env_secret_not_leaked_to_child() {
     let _secret = EnvVar::set("AWS_SECRET_ACCESS_KEY", "hunter2_4_4");
     let _config_dir = EnvVar::unset("HARNX_CONFIG_DIR");
     let root = TestDir::new();
-    let server =
-        BashServer::new_with_sandbox(vec![root.path().to_path_buf()], disabled_sandbox_config());
+    let server = server_with_sandbox(vec![root.path().to_path_buf()], disabled_sandbox_config());
 
     let result = server
         .exec_command_impl(ExecCommandParams {
@@ -1495,7 +1069,7 @@ async fn env_secret_not_leaked_to_child() {
 #[tokio::test]
 async fn test_exec_timeout() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .exec_command_impl(ExecCommandParams {
@@ -1524,7 +1098,7 @@ async fn test_exec_timeout() {
 #[tokio::test]
 async fn test_exec_truncation_mentions_log_paths_and_read_exec_log_works() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .exec_command_impl(ExecCommandParams {
@@ -1585,7 +1159,7 @@ async fn test_exec_truncation_mentions_log_paths_and_read_exec_log_works() {
 #[tokio::test]
 async fn test_read_exec_log_rejects_invalid_stream() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .read_exec_log_impl(ReadExecLogParams {
@@ -1611,7 +1185,7 @@ async fn test_read_exec_log_rejects_invalid_stream() {
 #[tokio::test]
 async fn test_read_exec_log_offset_and_tail_combined() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .exec_command_impl(ExecCommandParams {
@@ -1684,7 +1258,7 @@ fn test_select_log_lines_offset_and_tail() {
 #[tokio::test]
 async fn test_cleanup_log_dir_removes_temp_logs() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .exec_command_impl(ExecCommandParams {
@@ -1711,7 +1285,7 @@ async fn test_cleanup_log_dir_removes_temp_logs() {
 #[tokio::test]
 async fn test_spawn_and_wait() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .spawn_impl(SpawnCommandParams {
@@ -1753,7 +1327,7 @@ async fn test_spawn_and_wait() {
 #[tokio::test]
 async fn test_spawn_wait_timeout() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .spawn_impl(SpawnCommandParams {
@@ -1783,7 +1357,7 @@ async fn test_spawn_wait_timeout() {
 #[tokio::test]
 async fn test_spawn_and_terminate() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .spawn_impl(spawn_params("sleep 30", temp_dir.path()))
@@ -1823,7 +1397,7 @@ async fn test_spawn_and_terminate() {
 #[tokio::test]
 async fn test_wait_unknown_execution_id() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .wait_impl(WaitParams {
@@ -1842,7 +1416,7 @@ async fn test_wait_unknown_execution_id() {
 #[tokio::test]
 async fn test_terminate_unknown_execution_id() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .terminate_impl(TerminateParams {
@@ -1857,7 +1431,7 @@ async fn test_terminate_unknown_execution_id() {
 #[tokio::test]
 async fn test_spawn_with_output() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .spawn_impl(SpawnCommandParams {
@@ -1893,7 +1467,7 @@ async fn test_spawn_with_output() {
 #[tokio::test]
 async fn test_exec_env_special_chars_and_override() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let mut extra_env = std::collections::HashMap::new();
     extra_env.insert("VAR_WITH_EQUALS".to_string(), "key=value=more".to_string());
@@ -1978,111 +1552,35 @@ async fn test_sandbox_exec_env_special_chars_and_override() {
 mod home_filtering {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
-    fn test_home_itself_is_sensitive() {
+    fn home_rwx_is_downgraded_to_read_only() {
         let _env_guard = env_lock();
-        let _home = EnvVar::set("HOME", "/tmp/harnx-test-home");
-        assert!(
-            super::is_home_or_ancestor(std::path::Path::new("/tmp/harnx-test-home")),
-            "$HOME itself must be sensitive"
-        );
+        let home = tempfile::tempdir().expect("home");
+        let _home = EnvVar::set("HOME", home.path());
+        let server = server_with_sandbox(vec![home.path().to_path_buf()], enabled_sandbox_config());
+        let pairs = collect_arg_pairs(&server.build_sandbox_args(home.path()));
+        let home = home.path().canonicalize().expect("canonical home");
+        let home = home.to_string_lossy().into_owned();
+
+        assert!(pairs.contains(&("--read".into(), home.clone())));
+        assert!(!pairs.contains(&("--write".into(), home.clone())));
+        assert!(!pairs.contains(&("--exec".into(), home)));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn test_home_parent_is_sensitive() {
+    fn home_subdirectory_keeps_rwx() {
         let _env_guard = env_lock();
-        // Use a real temp subdir so canonicalize works cross-platform (macOS
-        // maps /tmp -> /private/tmp; both sides canonicalize, so they match).
-        let tmp = std::env::temp_dir();
-        let fake_home = tmp.join("harnx-test-home-parent-check");
-        std::fs::create_dir_all(&fake_home).unwrap();
-        let _home = EnvVar::set("HOME", fake_home.as_os_str());
-        assert!(
-            super::is_home_or_ancestor(&tmp),
-            "Parent of $HOME must be sensitive"
-        );
-        assert!(
-            super::is_home_or_ancestor(std::path::Path::new("/")),
-            "Root / must be sensitive when HOME is set"
-        );
-        std::fs::remove_dir_all(&fake_home).ok();
-    }
+        let home = tempfile::tempdir().expect("home");
+        let project = home.path().join("project");
+        std::fs::create_dir(&project).expect("project");
+        let _home = EnvVar::set("HOME", home.path());
+        let server = server_with_sandbox(vec![project.clone()], enabled_sandbox_config());
+        let pairs = collect_arg_pairs(&server.build_sandbox_args(&project));
+        let project = project.canonicalize().expect("canonical project");
+        let project = project.to_string_lossy().into_owned();
 
-    #[cfg(unix)]
-    #[test]
-    fn test_home_subdir_is_not_sensitive() {
-        let _env_guard = env_lock();
-        let _home = EnvVar::set("HOME", "/tmp/harnx-test-home");
-        assert!(
-            !super::is_home_or_ancestor(std::path::Path::new("/tmp/harnx-test-home/projects")),
-            "$HOME/projects must NOT be sensitive"
-        );
-        assert!(
-            !super::is_home_or_ancestor(std::path::Path::new("/other")),
-            "Unrelated path must NOT be sensitive"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_no_home_env_returns_false() {
-        let _env_guard = env_lock();
-        let _no_home = EnvVar::unset("HOME");
-        assert!(
-            !super::is_home_or_ancestor(std::path::Path::new("/")),
-            "With HOME unset, is_home_or_ancestor must return false"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_home_root_excluded_from_sandbox_args() {
-        let _env_guard = env_lock();
-        let _home = EnvVar::set("HOME", "/tmp/harnx-test-sandbox-home");
-        let home_root = PathBuf::from("/tmp/harnx-test-sandbox-home");
-        let server =
-            BashServer::new_with_sandbox(vec![home_root.clone()], enabled_sandbox_config());
-        let args = server.build_sandbox_args(
-            std::path::Path::new("/tmp/harnx-test-sandbox-home/work"),
-            &[home_root],
-        );
-        let pairs = collect_arg_pairs(&args);
-        assert!(
-            !pairs
-                .iter()
-                .any(|(flag, val)| flag == "--write" && val == "/tmp/harnx-test-sandbox-home"),
-            "$HOME must not appear as --write arg: {pairs:?}"
-        );
-        assert!(
-            !pairs
-                .iter()
-                .any(|(flag, val)| flag == "--exec" && val == "/tmp/harnx-test-sandbox-home"),
-            "$HOME must not appear as --exec arg: {pairs:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_home_subdir_root_included_in_sandbox_args() {
-        let _env_guard = env_lock();
-        let _home = EnvVar::set("HOME", "/tmp/harnx-test-sandbox-home2");
-        let subdir_root = PathBuf::from("/tmp/harnx-test-sandbox-home2/projects");
-        let server =
-            BashServer::new_with_sandbox(vec![subdir_root.clone()], enabled_sandbox_config());
-        let args = server.build_sandbox_args(
-            std::path::Path::new("/tmp/harnx-test-sandbox-home2/projects"),
-            &[subdir_root],
-        );
-        let pairs = collect_arg_pairs(&args);
-        assert!(
-            pairs
-                .iter()
-                .any(|(flag, val)| flag == "--write"
-                    && val == "/tmp/harnx-test-sandbox-home2/projects"),
-            "$HOME/projects must appear as --write arg: {pairs:?}"
-        );
+        assert!(pairs.contains(&("--write".into(), project.clone())));
+        assert!(pairs.contains(&("--exec".into(), project)));
     }
 }
 fn python3_available() -> bool {
@@ -2108,7 +1606,7 @@ async fn test_exec_python_shebang() {
         return;
     }
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .exec_command_impl(ExecCommandParams {
@@ -2138,7 +1636,7 @@ async fn test_exec_node_shebang() {
         return;
     }
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .exec_command_impl(ExecCommandParams {
@@ -2168,7 +1666,7 @@ async fn test_spawn_python_shebang() {
         return;
     }
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let spawn_result = server
         .spawn_impl(SpawnCommandParams {
@@ -2268,6 +1766,47 @@ mod shebangs {
             Some((PathBuf::from("python3"), vec!["-u".to_string()]))
         );
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_absolute_shebang_interpreter_is_not_auto_granted() {
+        let temp_dir = TestDir::new();
+        let root = temp_dir.path().to_path_buf();
+        let server = sandbox_server(root.clone());
+        let command = server
+            .build_sandbox_command(
+                SandboxCommandSpec {
+                    working_dir: &root,
+                    exec_dir: &root,
+                    command: "#!/opt/notallowed/x\nexit 0",
+                    extra_env: None,
+                },
+                Stdio::null(),
+                Stdio::null(),
+            )
+            .await
+            .expect("build sandbox command");
+        let args: Vec<_> = command
+            .command()
+            .as_std()
+            .get_args()
+            .map(OsString::from)
+            .collect();
+        let unexpected = [OsString::from("--exec"), OsString::from("/opt/notallowed")];
+
+        assert!(
+            !args.windows(2).any(|pair| pair == unexpected),
+            "absolute shebang interpreter directory was auto-granted: {args:?}"
+        );
+        let separator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("sandbox command separator");
+        assert_eq!(
+            args.get(separator + 1),
+            Some(&OsString::from("/opt/notallowed/x"))
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2316,7 +1855,7 @@ async fn test_sandbox_exec_python_shebang() {
 #[tokio::test]
 async fn test_wait_grep_filters_per_stream() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .spawn_impl(SpawnCommandParams {
@@ -2363,7 +1902,7 @@ async fn test_wait_grep_filters_per_stream() {
 #[tokio::test]
 async fn test_wait_truncation_triggers_and_mentions_log_path() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .spawn_impl(SpawnCommandParams {
@@ -2405,7 +1944,7 @@ async fn test_wait_truncation_triggers_and_mentions_log_path() {
 #[tokio::test]
 async fn test_wait_max_output_bytes_truncates() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .spawn_impl(SpawnCommandParams {
@@ -2441,7 +1980,7 @@ async fn test_wait_max_output_bytes_truncates() {
 #[tokio::test]
 async fn test_wait_stream_markers() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     // stdout has content, stderr is empty.
     let result = server
@@ -2492,7 +2031,7 @@ async fn test_wait_stream_markers() {
 #[tokio::test]
 async fn test_concurrent_execution_log_isolation() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
     let wd = temp_dir.path().to_string_lossy().to_string();
 
     let (res_a, res_b) = tokio::join!(
@@ -2567,7 +2106,7 @@ async fn test_concurrent_execution_log_isolation() {
 #[tokio::test]
 async fn test_spawn_wait_read_exec_log_returns_full_output() {
     let temp_dir = TestDir::new();
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+    let server = server_with_paths(vec![temp_dir.path().to_path_buf()]);
 
     let result = server
         .spawn_impl(SpawnCommandParams {

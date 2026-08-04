@@ -71,15 +71,8 @@ impl ServerHandler for FsServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
+        _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(err) = self.ensure_roots_initialized(&context.peer).await {
-            eprintln!(
-                "harnx-fs-tools: failed to initialize roots: {}",
-                err.message
-            );
-        }
-
         match request.name.as_ref() {
             "read" => {
                 let params = parse_arguments::<ReadFileParams>(request.arguments)?;
@@ -121,21 +114,6 @@ impl ServerHandler for FsServer {
                 format!("unknown tool: {other}"),
                 None,
             )),
-        }
-    }
-
-    fn on_roots_list_changed(
-        &self,
-        context: NotificationContext<RoleServer>,
-    ) -> impl Future<Output = ()> + Send + '_ {
-        let this = self.clone();
-        async move {
-            let peer = context.peer.clone();
-            tokio::spawn(async move {
-                if let Err(err) = this.refresh_roots(&peer).await {
-                    eprintln!("harnx-fs-tools: failed to refresh roots: {}", err.message);
-                }
-            });
         }
     }
 }

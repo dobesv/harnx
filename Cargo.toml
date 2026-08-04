@@ -14,6 +14,7 @@ members = [
     "crates/harnx-bash-tools",
     "crates/harnx-mcp-bridge",
     "crates/harnx-sandbox-common",
+    "crates/harnx-tool-allow",
     "crates/harnx-sandbox-run",
     "crates/harnx-fs-tools",
     "crates/harnx-mcp-time",
@@ -170,6 +171,7 @@ harnx-session = { path = "crates/harnx-session" }
 minijinja = { version = "2.21.0", default-features = false, features = ["builtins", "debug", "serde"] }
 harnx-mcp-history = { path = "crates/harnx-mcp-history" }
 harnx-sandbox-common = { path = "crates/harnx-sandbox-common" }
+harnx-tool-allow = { path = "crates/harnx-tool-allow" }
 similar = "3"
 jaq-core = "3.0.0"
 jaq-std = "3.0.0"

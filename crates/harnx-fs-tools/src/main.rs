@@ -1,85 +1,159 @@
 //! harnx-fs-tools: Filesystem toolset server, with MCP stdio back-compat.
 
 use harnx_fs_tools::FsToolset;
+use harnx_tool_allow::{resolve_allowlist, AllowEnv, AllowInputs};
 use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (roots, default_root_cwd) = parse_args();
+    let inputs = parse_args();
+    let cwd = std::env::current_dir()?;
+    let allowlist = resolve_allowlist(&inputs, &cwd, &AllowEnv::from_current_process());
 
     eprintln!(
-        "harnx-fs-tools v{}: starting ({} CLI root{})",
+        "harnx-fs-tools v{}: starting ({} read, {} write allow path{})",
         env!("CARGO_PKG_VERSION"),
-        roots.len(),
-        if roots.len() == 1 { "" } else { "s" }
+        allowlist.read_paths().len(),
+        allowlist.write_paths().len(),
+        if allowlist.write_paths().len() == 1 {
+            ""
+        } else {
+            "s"
+        }
     );
-    for root in &roots {
-        eprintln!("  root: {}", root.display());
-    }
 
-    let toolset = FsToolset::new(roots, default_root_cwd).await;
+    let toolset = FsToolset::new(allowlist);
     harnx_toolset_server::run_toolset_main(toolset).await
 }
 
-/// Parse filesystem-specific CLI arguments. The shared server runner consumes
-/// `--mcp-stdio`, so this parser accepts it without changing filesystem setup.
-fn parse_args() -> (Vec<PathBuf>, bool) {
+fn env_paths(name: &str) -> Vec<PathBuf> {
+    std::env::var_os(name)
+        .map(|value| {
+            std::env::split_paths(&value)
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn env_toggle(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Parse filesystem-specific CLI arguments. Shared server runner consumes
+/// `--mcp-stdio`, so this parser accepts it without changing allowlist setup.
+fn parse_args() -> AllowInputs {
     let args: Vec<String> = std::env::args().collect();
-    let mut roots = Vec::new();
-    let mut default_root_cwd = false;
+    parse_args_from(&args, initial_allow_inputs()).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    })
+}
+
+fn initial_allow_inputs() -> AllowInputs {
+    AllowInputs {
+        read: env_paths("HARNX_TOOLS_ALLOW_READ"),
+        write: env_paths("HARNX_TOOLS_ALLOW_WRITE"),
+        exec: env_paths("HARNX_TOOLS_ALLOW_EXEC"),
+        rwx: env_paths("HARNX_TOOLS_ALLOW_RWX"),
+        common_default: env_toggle("HARNX_TOOLS_ALLOW_COMMON_DEFAULT"),
+        dev_tools: env_toggle("HARNX_TOOLS_ALLOW_DEV_TOOLS"),
+        repo_work: env_toggle("HARNX_TOOLS_ALLOW_REPO_WORK"),
+        all: env_toggle("HARNX_TOOLS_ALLOW_ALL"),
+    }
+}
+
+fn parse_args_from(args: &[String], mut inputs: AllowInputs) -> Result<AllowInputs, String> {
     let mut i = 1;
 
     while i < args.len() {
-        match args[i].as_str() {
-            "--root" | "-r" => {
-                if i + 1 < args.len() {
-                    let raw = &args[i + 1];
-                    let path = PathBuf::from(raw);
-                    if path.exists() {
-                        match path.canonicalize() {
-                            Ok(canonical) => roots.push(canonical),
-                            Err(err) => {
-                                eprintln!(
-                                    "harnx-fs-tools: warning: failed to canonicalize root '{}': {}",
-                                    raw, err
-                                );
-                            }
-                        }
-                    } else {
-                        eprintln!("harnx-fs-tools: warning: root path does not exist: {}", raw);
-                    }
-                    i += 2;
-                } else {
-                    eprintln!("harnx-fs-tools: --root requires a path argument");
-                    std::process::exit(1);
-                }
+        let target = match args[i].as_str() {
+            "--allow-read" => Some(&mut inputs.read),
+            "--allow-write" => Some(&mut inputs.write),
+            "--allow-exec" => Some(&mut inputs.exec),
+            "--allow-rwx" => Some(&mut inputs.rwx),
+            "--allow-common-default" => {
+                inputs.common_default = true;
+                None
             }
-            "--default-root-cwd" => {
-                default_root_cwd = true;
-                i += 1;
+            "--allow-dev-tools" => {
+                inputs.dev_tools = true;
+                None
             }
-            "--mcp-stdio" => {
-                i += 1;
+            "--allow-repo-work" => {
+                inputs.repo_work = true;
+                None
             }
-            "--help" | "-h" => {
-                eprintln!("harnx-fs-tools: Filesystem toolset server");
-                eprintln!();
-                eprintln!("Usage: harnx-fs-tools [OPTIONS]");
-                eprintln!();
-                eprintln!("Options:");
-                eprintln!("  --root, -r <path>   Add an allowed root directory (repeatable)");
-                eprintln!("  --default-root-cwd  Use CWD when no other roots are available");
-                eprintln!("  --mcp-stdio         Serve MCP over stdio instead of the default toolset mode");
-                eprintln!("  --help, -h          Show this help message");
-                std::process::exit(0);
+            "--allow-all" => {
+                inputs.all = true;
+                None
             }
+            "--mcp-stdio" => None,
+            "--help" | "-h" => print_help_and_exit(),
             other => {
-                eprintln!("harnx-fs-tools: unknown argument: {}", other);
-                eprintln!("Try: harnx-fs-tools --help");
-                std::process::exit(1);
+                return Err(format!(
+                    "harnx-fs-tools: unknown argument: {other}\nTry: harnx-fs-tools --help"
+                ));
             }
+        };
+
+        if let Some(paths) = target {
+            let path = args
+                .get(i + 1)
+                .ok_or_else(|| format!("harnx-fs-tools: {} requires a path argument", args[i]))?;
+            paths.push(PathBuf::from(path));
+            i += 2;
+        } else {
+            i += 1;
         }
     }
 
-    (roots, default_root_cwd)
+    Ok(inputs)
+}
+
+fn print_help_and_exit() -> ! {
+    eprintln!("harnx-fs-tools: Filesystem toolset server");
+    eprintln!();
+    eprintln!("Usage: harnx-fs-tools [OPTIONS]");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --allow-read <path>       Allow filesystem reads (repeatable)");
+    eprintln!("  --allow-write <path>      Allow reads and writes (repeatable)");
+    eprintln!("  --allow-exec <path>       Allow reads; fs has no exec operation (repeatable)");
+    eprintln!("  --allow-rwx <path>        Allow reads and writes (repeatable)");
+    eprintln!("  --allow-common-default    Allow common operating-system paths");
+    eprintln!("  --allow-dev-tools         Allow development tool paths");
+    eprintln!("  --allow-repo-work         Allow detected project roots and current directory");
+    eprintln!("  --allow-all               Allow all filesystem paths");
+    eprintln!("  --mcp-stdio               Serve MCP over stdio instead of toolset mode");
+    eprintln!("  --help, -h                Show this help message");
+    std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_legacy_allowlist_flags() {
+        let legacy_flags = [
+            ["--", "root"].concat(),
+            ["--extra", "-read"].concat(),
+            ["--default", "-root", "-cwd"].concat(),
+        ];
+
+        for flag in legacy_flags {
+            let args = vec!["harnx-fs-tools".to_string(), flag.clone()];
+            let error = parse_args_from(&args, AllowInputs::default())
+                .expect_err("legacy flag should be rejected");
+            assert!(error.contains(&format!("unknown argument: {flag}")));
+        }
+    }
 }

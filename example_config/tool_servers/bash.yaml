@@ -1,41 +1,26 @@
 command: harnx-bash-tools
 description: >-
   Allow the agent to run commands or script snippets
-# Runs as a native toolset server. --default-root-cwd binds the sandbox to the process
-# CWD (the user's repo), keeping the $HOME guard; the sandbox stays enabled.
-#
-# NOTE: Many home-directory paths are already whitelisted by default and do NOT
-# need to be added here. See docs/bash-mcp-server.md for the full list, which
-# includes: ~/.gitconfig, ~/.gitignore, ~/.gitignore_global, ~/.tool-versions
-# (read), ~/.local/bin, ~/.local/lib, ~/.bun, ~/.asdf, ~/go/bin, ~/.cargo,
-# ~/.nvm, ~/.cargo/bin, ~/.pyenv, ~/.rye, ~/.local/share/claude (read+exec),
-# ~/.cache, ~/go/pkg, ~/.npm, ~/.yarn, ~/.cargo/registry, ~/.cargo/git,
-# ~/.bun/install/cache (read+write). Tool-install directories (~/.cargo/bin,
-# ~/.nvm, ~/.pyenv, ~/.rye, etc.) are read+exec only — use --extra-rwx to
-# grant write access for operations like cargo install, nvm install, pyenv
-# install, rye sync, or claude update.
+# Filesystem access is deny-all unless enabled by an opt-in batch or explicit
+# --allow-* argument. These batches provide system commands and temp space,
+# development toolchains, and the current repository. See
+# docs/bash-mcp-server.md and docs/migration-allowlist.md.
 args:
-  - --default-root-cwd
-  # Allow access to rustup-managed toolchains
-  - --extra-exec
-  - ~/.rustup
-  # Allow ruff to write to its cache (not a default-writable path)
-  - --extra-rwx
+  - --allow-common-default
+  - --allow-dev-tools
+  - --allow-repo-work
+  # Custom paths outside the batches
+  - --allow-rwx
   - ~/.ruff_cache
-  # Allow access to various config files
-  - --extra-write
+  - --allow-write
   - ~/.config/chromium
-  - --extra-read
+  - --allow-read
   - ~/.config/dcg
-  - --extra-read
+  - --allow-read
   - ~/.config/git
-  # Allow go to write to its config dir (not a default-writable path)
-  - --extra-rwx
-  - ~/.config/go
-  - --extra-read
+  - --allow-read
   - ~/.config/rtk
-  # Allow access to codescene config/license
-  - --extra-write
+  - --allow-write
   - ~/.codescene
   # Disable interactive editor
   - --env

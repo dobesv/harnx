@@ -48,7 +48,6 @@ fn expand_use_tools_mcp_failure_logs_warning_and_continues() {
             command: std::env::current_exe().unwrap().display().to_string(),
             args: vec!["--definitely-not-a-valid-harnx-flag".to_string()],
             env: std::collections::HashMap::new(),
-            roots: vec![],
             enabled: true,
             description: None,
             rename_tools: std::collections::HashMap::new(),

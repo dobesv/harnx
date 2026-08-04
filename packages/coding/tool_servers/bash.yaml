@@ -1,18 +1,12 @@
 command: harnx-bash-tools
 description: Shell execution — lets agents run commands and scripts
 
-# Runs as a native toolset server. The co-located
-# proxy-auth hook injects GitHub/Atlassian credentials before exec/spawn calls.
-# --default-root-cwd binds the sandbox to the process CWD (the user's repo),
-# keeping the $HOME guard.
-#
-# NOTE: Many home-directory paths are already whitelisted by default and do NOT
-# need to be added here. See docs/bash-mcp-server.md for the full list, which
-# includes: ~/.gitconfig, ~/.gitignore, ~/.gitignore_global, ~/.tool-versions
-# (read), ~/.local/bin, ~/.local/lib, ~/.bun, ~/.asdf, ~/go/bin, ~/.cargo
-# (read+exec), ~/.cache, ~/go/pkg (read+write), ~/.npm, ~/.yarn, ~/.nvm,
-# ~/.cargo/bin, ~/.cargo/registry, ~/.cargo/git, ~/.mono, ~/.bun/install/cache,
-# ~/.pyenv, ~/.rye (read+write+exec).
+# Runs as a native toolset server. The co-located proxy-auth hook injects
+# GitHub/Atlassian credentials before exec/spawn calls. Filesystem access is
+# deny-all unless enabled by an opt-in batch or an explicit --allow-* argument.
+# These batches provide system commands and temp space, development toolchains,
+# and the current repository. See docs/bash-mcp-server.md and
+# docs/migration-allowlist.md.
 
 hooks:
   entries:
@@ -25,41 +19,25 @@ hooks:
         --hook "$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py"
 
 args:
-  - --default-root-cwd
-  # Allow access to detected project root (when run in a subdirectory) and git metadata (when in a git worktree)
-  - --extra-rwx
-  - $GIT_ROOT
-  - --extra-write
-  - $GIT_COMMON_DIR
-  - --extra-rwx
-  - $NODE_PROJECT_ROOT
-  - --extra-rwx
-  - $CARGO_ROOT
-  - --extra-rwx
-  - $GO_ROOT
-  # Allow access to various config files
-  - --extra-write
+  - --allow-common-default
+  - --allow-dev-tools
+  - --allow-repo-work
+  # Custom paths outside the batches
+  - --allow-write
   - ~/.config/chromium
-  - --extra-read
+  - --allow-read
   - ~/.config/dcg
-  - --extra-read
+  - --allow-read
   - ~/.config/git
-  - --extra-rwx
-  - ~/.config/go
-  - --extra-read
+  - --allow-read
   - ~/.config/rtk
-  # Allow access to ruff's cache
-  - --extra-rwx
+  - --allow-rwx
   - ~/.ruff_cache
-  # Allow access to rustup-managed toolchains
-  - --extra-exec
-  - ~/.rustup
-  # Upgrade ~/.cache from default read+write to read+write+exec (needed by some
+  # Upgrade ~/.cache from dev-tools read+write to read+write+exec (needed by some
   # build tools that run executables out of the cache directory)
-  - --extra-rwx
+  - --allow-rwx
   - ~/.cache
-  # Allow access to google chrome binaries
-  - --extra-exec
+  - --allow-exec
   - /opt/google/chrome
   # Disable interactive editor
   - --env

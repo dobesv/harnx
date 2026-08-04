@@ -118,17 +118,21 @@ The **filename** (without `.yaml`) is used as the server name.
 
 ```yaml
 command: harnx-fs-tools    # Executable command
-args: ["--default-root-cwd"] # Optional arguments
-env:                      # Environment variables
+args:                      # Filesystem access is opt-in
+  - --allow-repo-work
+  - --allow-dev-tools
+  - --allow-read
+  - /srv/reference-data
+env:                       # Environment variables
   API_KEY: "..."
-roots:                    # Directories the server can access
-  - "$HOME/projects"
 description: "Filesystem access tools"
 ```
 
+Filesystem and bash tool servers deny filesystem access when no allow inputs are configured. Use `--allow-read`, `--allow-write`, `--allow-exec`, or `--allow-rwx` for explicit paths, or opt into `--allow-common-default`, `--allow-dev-tools`, `--allow-repo-work`, or `--allow-all`. Filesystem tools enforce read and write access separately. See [Allowlist migration](migration-allowlist.md) for removed settings.
+
 > **Passing secrets to MCP servers.** Two things commonly trip people up:
 >
-> - **`env:` values are literal — they are *not* shell-expanded.** Unlike `roots:` above (and the NATS `token:` below), `$VAR`/`${VAR}` in an `env:` value is passed through verbatim rather than substituted. Writing `API_KEY: "$API_KEY"` sends the literal string `$API_KEY` to the server.
+> - **`env:` values are literal — they are *not* shell-expanded.** `$VAR`/`${VAR}` in an `env:` value is passed through verbatim rather than substituted. Writing `API_KEY: "$API_KEY"` sends the literal string `$API_KEY` to the server.
 > - **A sandbox wrapper strips the child environment.** If you've wrapped `npx`/`node` with a [harnx sandbox](sandbox-run.md), the server starts with a scrubbed environment, so neither an `env:` value nor an inherited host variable reaches it by default. Forward the specific variable with `HARNX_BASH_ENV_PASSTHROUGH` instead — the sandbox reads it and passes the host value through:
 >
 >   ```yaml

@@ -83,15 +83,8 @@ impl ServerHandler for BashServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
+        _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(err) = self.ensure_roots_initialized(&context.peer).await {
-            eprintln!(
-                "harnx-bash-tools: failed to initialize roots: {}",
-                err.message
-            );
-        }
-
         match request.name.as_ref() {
             "exec" => {
                 let params = parse_arguments::<ExecCommandParams>(request.arguments)?;
@@ -124,18 +117,5 @@ impl ServerHandler for BashServer {
         }
     }
 
-    fn on_roots_list_changed(
-        &self,
-        context: NotificationContext<RoleServer>,
-    ) -> impl Future<Output = ()> + Send + '_ {
-        let this = self.clone();
-        async move {
-            let peer = context.peer.clone();
-            tokio::spawn(async move {
-                if let Err(err) = this.refresh_roots(&peer).await {
-                    eprintln!("harnx-bash-tools: failed to refresh roots: {}", err.message);
-                }
-            });
-        }
-    }
+    async fn on_roots_list_changed(&self, _context: NotificationContext<RoleServer>) {}
 }

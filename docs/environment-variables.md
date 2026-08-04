@@ -75,15 +75,22 @@ Harnx can load environment variables from a `.env` file located in the data dire
   message history the harness built is responsible. The file is appended,
   not truncated, so set a fresh path per session.
 
-## Bash Toolset Server Envs
+## Tool filesystem allowlist envs
 
-These are honored by **both** `harnx-bash-tools` (for `bash_exec` child processes) and `harnx-sandbox-run` — so they apply not only to the bash tool but to any MCP server launched through a sandbox-wrapped `npx`/`node` shim (e.g. the Exa server, whose environment would otherwise be scrubbed). The same shell-profile settings work for both.
+`harnx-fs-tools` and `harnx-bash-tools` accept the same path lists and batch toggles. `harnx-sandbox-run` accepts the four explicit path lists but doesn't support batches.
 
-- **HARNX_BASH_ENV_PASSTHROUGH**: Comma-separated list of extra host env var names to forward into the sandbox (e.g. so the Exa MCP server receives `EXA_API_KEY`). Example: `HARNX_BASH_ENV_PASSTHROUGH=GITHUB_TOKEN,SSH_AUTH_SOCK`.
-- **HARNX_BASH_EXTRA_READABLE**: Colon-separated extra sandbox read-only paths.
-- **HARNX_BASH_EXTRA_WRITABLE**: Colon-separated extra sandbox writable paths.
-- **HARNX_BASH_EXTRA_EXEC**: Colon-separated extra sandbox executable paths.
-- **HARNX_BASH_EXTRA_RWX**: Colon-separated extra sandbox read/write/execute paths.
+- **HARNX_TOOLS_ALLOW_READ**: Platform-separated read-only paths.
+- **HARNX_TOOLS_ALLOW_WRITE**: Platform-separated read/write paths.
+- **HARNX_TOOLS_ALLOW_EXEC**: Platform-separated read/execute paths.
+- **HARNX_TOOLS_ALLOW_RWX**: Platform-separated read/write/execute paths.
+- **HARNX_TOOLS_ALLOW_COMMON_DEFAULT**: Enable common system and temporary paths with `1`, `true`, `yes`, or `on`.
+- **HARNX_TOOLS_ALLOW_DEV_TOOLS**: Enable development toolchains and caches.
+- **HARNX_TOOLS_ALLOW_REPO_WORK**: Enable detected project paths and session working directory.
+- **HARNX_TOOLS_ALLOW_ALL**: Request full filesystem access, subject to the `$HOME` guard.
+
+No allow variables or CLI options means deny-all for filesystem and bash tool servers. See [Allowlist migration](migration-allowlist.md) for removed variables.
+
+`HARNX_BASH_ENV_PASSTHROUGH` remains a comma-separated list of host environment variable names forwarded into bash or sandbox-run child processes. Example: `HARNX_BASH_ENV_PASSTHROUGH=GITHUB_TOKEN,SSH_AUTH_SOCK`.
 
 ## Generic Envs
 

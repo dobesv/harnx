@@ -81,11 +81,7 @@ You work.",
 
     let config = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(Config::init(
-            harnx_runtime::config::WorkingMode::Cmd,
-            false,
-            vec![],
-        ))
+        .block_on(Config::init(harnx_runtime::config::WorkingMode::Cmd, false))
         .expect("config should load");
 
     let client = config
@@ -122,11 +118,7 @@ fn package_loading_test_package_client_loaded_with_qualified_name() {
 
     let config = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(Config::init(
-            harnx_runtime::config::WorkingMode::Cmd,
-            false,
-            vec![],
-        ))
+        .block_on(Config::init(harnx_runtime::config::WorkingMode::Cmd, false))
         .expect("config should load");
 
     assert!(
@@ -170,11 +162,7 @@ You work.",
 
     let config = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(Config::init(
-            harnx_runtime::config::WorkingMode::Cmd,
-            false,
-            vec![],
-        ))
+        .block_on(Config::init(harnx_runtime::config::WorkingMode::Cmd, false))
         .expect("config should load");
     let agent = config.retrieve_agent("mypkg/worker").unwrap();
 
@@ -208,11 +196,7 @@ You work.",
 
     let config = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(Config::init(
-            harnx_runtime::config::WorkingMode::Cmd,
-            false,
-            vec![],
-        ))
+        .block_on(Config::init(harnx_runtime::config::WorkingMode::Cmd, false))
         .expect("config should load");
     let agent = config.retrieve_agent("mypkg/worker").unwrap();
 
@@ -248,11 +232,7 @@ You work.",
 
     let config = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(Config::init(
-            harnx_runtime::config::WorkingMode::Cmd,
-            false,
-            vec![],
-        ))
+        .block_on(Config::init(harnx_runtime::config::WorkingMode::Cmd, false))
         .expect("config should load");
     let agent = config.retrieve_agent("mypkg/worker").unwrap();
 
@@ -286,11 +266,7 @@ fn package_loading_test_package_clients_same_bare_name_do_not_collide() {
 
     let config = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(Config::init(
-            harnx_runtime::config::WorkingMode::Cmd,
-            false,
-            vec![],
-        ))
+        .block_on(Config::init(harnx_runtime::config::WorkingMode::Cmd, false))
         .expect("config should load");
 
     let client_names = config
@@ -327,11 +303,7 @@ You work.",
 
     let config = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(Config::init(
-            harnx_runtime::config::WorkingMode::Cmd,
-            false,
-            vec![],
-        ))
+        .block_on(Config::init(harnx_runtime::config::WorkingMode::Cmd, false))
         .expect("config should load");
     let agent = config.retrieve_agent("worker").unwrap();
 
@@ -672,7 +644,6 @@ fn package_loading_test_mcp_server_display_names_for_agent() {
         command: "echo".to_string(),
         args: vec![],
         env: Default::default(),
-        roots: vec![],
         enabled: true,
         description: None,
         rename_tools: Default::default(),
@@ -742,11 +713,7 @@ fn package_loading_test_client_name_ignored_from_file_contents() {
 
     let config = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(Config::init(
-            harnx_runtime::config::WorkingMode::Cmd,
-            false,
-            vec![],
-        ))
+        .block_on(Config::init(harnx_runtime::config::WorkingMode::Cmd, false))
         .expect("config should load");
 
     // Find the client and verify its effective_name is "foo" (filename stem), not "bar"

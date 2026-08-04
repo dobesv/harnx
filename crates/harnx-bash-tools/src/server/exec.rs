@@ -128,9 +128,8 @@ impl BashServer {
         &self,
         params: RollbackParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let roots = self.inner.roots.read().await;
-        let path = validate_path(&params.repo_path, &roots).map_err(invalid_params)?;
-        drop(roots);
+        let path = validate_write_path(&params.repo_path, &self.inner.allowlist)
+            .map_err(invalid_params)?;
 
         let commit_id = ObjectId::from_hex(params.commit_id.as_bytes())
             .map_err(|e| ErrorData::invalid_params(format!("invalid commit_id: {e}"), None))?;
@@ -138,6 +137,8 @@ impl BashServer {
         let repo_dir = harnx_mcp_history::discover::find_repo_for_path(&path).ok_or_else(|| {
             ErrorData::invalid_params("path is not inside a git repository".to_string(), None)
         })?;
+        validate_write_path(&repo_dir.to_string_lossy(), &self.inner.allowlist)
+            .map_err(invalid_params)?;
 
         let new_commit_id = self
             .inner

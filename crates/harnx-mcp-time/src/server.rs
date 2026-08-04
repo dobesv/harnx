@@ -584,8 +584,6 @@ fn schema_object(
 }
 
 #[cfg(test)]
-// rmcp deprecated the MCP Roots feature (SEP-2577); this test enables roots.
-#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -600,10 +598,7 @@ mod tests {
     impl ClientHandler for TestClientHandler {
         fn get_info(&self) -> InitializeRequestParams {
             InitializeRequestParams::new(
-                ClientCapabilities::builder()
-                    .enable_roots()
-                    .enable_roots_list_changed()
-                    .build(),
+                ClientCapabilities::default(),
                 Implementation::new("test", "0.1"),
             )
         }

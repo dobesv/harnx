@@ -111,9 +111,7 @@ impl HistoryManager {
     }
 
     /// Ensure tracked repos exist for any git workdirs found under
-    /// `working_dir`. Mirrors `find_repos_under_roots`, but runs at
-    /// snapshot time rather than at construction time so repos that
-    /// arrive via the MCP `roots/list` protocol are picked up.
+    /// `working_dir`. Runs at snapshot time so newly created repos are picked up.
     async fn ensure_repos_under(&self, working_dir: &Path) {
         let discovered = crate::discover::find_repos_under_roots(&[working_dir.to_path_buf()]);
         if discovered.is_empty() {

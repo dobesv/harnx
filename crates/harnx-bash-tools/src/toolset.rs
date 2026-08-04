@@ -9,7 +9,6 @@ use rmcp::model::{CallToolResult, ErrorCode, ErrorData, Tool};
 use rmcp::schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
-use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 /// Native toolset for sandboxed command execution and process management.
@@ -19,18 +18,10 @@ pub struct BashToolset {
 }
 
 impl BashToolset {
-    /// Build a toolset from CLI roots and sandbox configuration.
-    pub async fn new(
-        initial_roots: Vec<PathBuf>,
-        sandbox_config: SandboxConfig,
-        default_root_cwd: bool,
-    ) -> Self {
-        let server = BashServer::new_with_sandbox_and_default_root(
-            initial_roots,
-            sandbox_config,
-            default_root_cwd,
-        );
-        server.initialize_native_roots().await;
+    /// Build a toolset from resolved filesystem permissions and sandbox configuration.
+    pub async fn new(sandbox_config: SandboxConfig) -> Self {
+        let server = BashServer::new_with_sandbox(sandbox_config);
+        server.initialize_allowlist().await;
         Self { server }
     }
 
@@ -135,7 +126,10 @@ impl Toolset for BashToolset {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harnx_tool_allow::ResolvedAllowlist;
     use serde_json::json;
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
     #[test]
     fn maps_server_errors_by_error_code() {
@@ -149,20 +143,30 @@ mod tests {
     fn sandbox_config(enabled: bool) -> SandboxConfig {
         SandboxConfig {
             enabled,
-            extra_exec: vec![],
-            extra_readable: vec![],
-            extra_writable: vec![],
-            extra_rwx: vec![],
+            allowlist: Arc::new(ResolvedAllowlist::new()),
             extra_env_passthrough: vec![],
             env_overrides: vec![],
             sandbox_run_path: PathBuf::from("harnx-sandbox-exec"),
         }
     }
 
+    async fn test_toolset(
+        paths: Vec<PathBuf>,
+        mut config: SandboxConfig,
+        _legacy_default: bool,
+    ) -> BashToolset {
+        let mut allowlist = ResolvedAllowlist::new();
+        for path in paths {
+            allowlist.insert_rwx(path);
+        }
+        config.allowlist = Arc::new(allowlist);
+        BashToolset::new(config).await
+    }
+
     #[tokio::test]
     async fn exposes_exact_bash_tools() {
         let root = tempfile::tempdir().unwrap();
-        let toolset = BashToolset::new(
+        let toolset = test_toolset(
             vec![root.path().to_path_buf()],
             sandbox_config(false),
             false,
@@ -196,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn invokes_exec_with_cli_root_without_sandbox_helper() {
         let root = tempfile::tempdir().unwrap();
-        let toolset = BashToolset::new(
+        let toolset = test_toolset(
             vec![root.path().to_path_buf()],
             sandbox_config(false),
             false,
@@ -221,7 +225,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_unknown_tool() {
         let root = tempfile::tempdir().unwrap();
-        let toolset = BashToolset::new(
+        let toolset = test_toolset(
             vec![root.path().to_path_buf()],
             sandbox_config(false),
             false,

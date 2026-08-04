@@ -1,6 +1,3 @@
-// rmcp deprecated the MCP Roots feature (SEP-2577); this server still uses it.
-#![allow(deprecated)]
-
 use base64::Engine;
 use harnx_mcp::content::WithAudience;
 
@@ -10,13 +7,11 @@ use super::*;
 type ReadLinesPage<'a> = (Vec<(usize, &'a str)>, usize, usize);
 
 impl FsServer {
-    pub fn new(initial_roots: Vec<PathBuf>, default_root_cwd: bool) -> Self {
+    pub fn new(allowlist: ResolvedAllowlist) -> Self {
+        let history_paths = allowlist.read_paths().iter().cloned().collect::<Vec<_>>();
         Self {
-            roots: Arc::new(RwLock::new(initial_roots.clone())),
-            configured_roots: Arc::new(initial_roots.clone()),
-            roots_initialized: Arc::new(AtomicBool::new(false)),
-            default_root_cwd,
-            history: Arc::new(HistoryManager::new(&initial_roots)),
+            allowlist: Arc::new(allowlist),
+            history: Arc::new(HistoryManager::new(&history_paths)),
             repo_locks: Arc::new(Mutex::new(HashMap::new())),
             file_locks: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -317,83 +312,6 @@ impl FsServer {
         paths
     }
 
-    pub(crate) async fn seed_default_root_if_empty(&self) {
-        if !self.default_root_cwd {
-            return;
-        }
-
-        let mut roots = self.roots.write().await;
-        if !roots.is_empty() {
-            return;
-        }
-
-        if let Some(root) = harnx_mcp::safety::default_root_from_cwd() {
-            roots.push(root);
-        } else {
-            eprintln!(
-                "harnx-fs-tools: warning: --default-root-cwd: refusing to seed root from CWD \
-                 (equals/ancestor of $HOME, HOME unset, or unresolvable) — all filesystem access denied"
-            );
-        }
-    }
-
-    pub(crate) async fn refresh_roots(
-        &self,
-        peer: &rmcp::service::Peer<RoleServer>,
-    ) -> Result<(), ErrorData> {
-        if !peer_supports_roots(peer) {
-            // The client never advertised the `roots` capability, so it can't
-            // answer a `roots/list` request. Keep the CLI-provided roots and
-            // mark initialization done so we don't keep retrying.
-            self.seed_default_root_if_empty().await;
-            self.roots_initialized.store(true, Ordering::SeqCst);
-            return Ok(());
-        }
-
-        let result = peer.list_roots().await.map_err(|err| {
-            ErrorData::internal_error(format!("failed to fetch roots from peer: {err}"), None)
-        })?;
-
-        let peer_roots = result
-            .roots
-            .into_iter()
-            .filter_map(|root| file_uri_to_path(root.uri.as_ref()))
-            .collect::<Vec<_>>();
-        let resolved_roots = if peer_roots.is_empty() && !self.configured_roots.is_empty() {
-            self.configured_roots.as_ref().clone()
-        } else {
-            peer_roots
-        };
-
-        {
-            let mut guard = self.roots.write().await;
-            *guard = resolved_roots;
-        }
-        self.seed_default_root_if_empty().await;
-        self.roots_initialized.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-
-    pub(crate) async fn ensure_roots_initialized(
-        &self,
-        peer: &rmcp::service::Peer<RoleServer>,
-    ) -> Result<(), ErrorData> {
-        if self.roots_initialized.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-
-        match self.refresh_roots(peer).await {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                if self.roots.read().await.is_empty() {
-                    Err(err)
-                } else {
-                    Ok(())
-                }
-            }
-        }
-    }
-
     fn image_mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
         if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
             return Some("image/png");
@@ -468,9 +386,7 @@ impl FsServer {
         &self,
         params: ReadFileParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let roots = self.roots.read().await;
-        let path = validate_path(&params.path, &roots).map_err(invalid_params)?;
-        drop(roots);
+        let path = validate_path(&params.path, &self.allowlist).map_err(invalid_params)?;
 
         let metadata = std::fs::metadata(&path)
             .map_err(|err| internal_error(format!("cannot access '{}': {err}", params.path)))?;
@@ -559,9 +475,7 @@ impl FsServer {
         &self,
         params: WriteFileParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let roots = self.roots.read().await;
-        let path = validate_write_path(&params.path, &roots).map_err(invalid_params)?;
-        drop(roots);
+        let path = validate_write_path(&params.path, &self.allowlist).map_err(invalid_params)?;
         let repo_lock = self.repo_lock_for_path(&path);
         let _repo_guard = repo_lock.read().await;
         let file_lock = self.lock_for_path(&path);
@@ -608,9 +522,7 @@ impl FsServer {
         &self,
         params: InsertParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let roots = self.roots.read().await;
-        let path = validate_write_path(&params.path, &roots).map_err(invalid_params)?;
-        drop(roots);
+        let path = validate_write_path(&params.path, &self.allowlist).map_err(invalid_params)?;
         let repo_lock = self.repo_lock_for_path(&path);
         let _repo_guard = repo_lock.read().await;
         let file_lock = self.lock_for_path(&path);
@@ -664,9 +576,7 @@ impl FsServer {
         &self,
         params: ReReplaceParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let roots = self.roots.read().await;
-        let path = validate_write_path(&params.path, &roots).map_err(invalid_params)?;
-        drop(roots);
+        let path = validate_write_path(&params.path, &self.allowlist).map_err(invalid_params)?;
         let repo_lock = self.repo_lock_for_path(&path);
         let _repo_guard = repo_lock.read().await;
         let file_lock = self.lock_for_path(&path);
@@ -739,9 +649,7 @@ impl FsServer {
         &self,
         params: EditFileParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let roots = self.roots.read().await;
-        let path = validate_write_path(&params.path, &roots).map_err(invalid_params)?;
-        drop(roots);
+        let path = validate_write_path(&params.path, &self.allowlist).map_err(invalid_params)?;
         let repo_lock = self.repo_lock_for_path(&path);
         let _repo_guard = repo_lock.read().await;
         let file_lock = self.lock_for_path(&path);
@@ -820,9 +728,7 @@ impl FsServer {
         &self,
         params: ListDirectoryParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let roots = self.roots.read().await;
-        let path = validate_path(&params.path, &roots).map_err(invalid_params)?;
-        drop(roots);
+        let path = validate_path(&params.path, &self.allowlist).map_err(invalid_params)?;
 
         let metadata = std::fs::metadata(&path)
             .map_err(|err| internal_error(format!("cannot access '{}': {err}", params.path)))?;
@@ -883,12 +789,10 @@ impl FsServer {
         &self,
         params: SearchFilesParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let roots = self.roots.read().await;
         let search_path = match params.path.as_deref() {
-            Some(path) => validate_path(path, &roots).map_err(invalid_params)?,
-            None => default_search_path(&roots),
+            Some(path) => validate_path(path, &self.allowlist).map_err(invalid_params)?,
+            None => default_search_path(&self.allowlist)?,
         };
-        drop(roots);
 
         let pattern = if params.ignore_case.unwrap_or(false) {
             format!("(?i){}", params.pattern)
@@ -956,12 +860,10 @@ impl FsServer {
         &self,
         params: FindFilesParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let roots = self.roots.read().await;
         let search_path = match params.path.as_deref() {
-            Some(path) => validate_path(path, &roots).map_err(invalid_params)?,
-            None => default_search_path(&roots),
+            Some(path) => validate_path(path, &self.allowlist).map_err(invalid_params)?,
+            None => default_search_path(&self.allowlist)?,
         };
-        drop(roots);
 
         let max_results = params.max_results.unwrap_or(DEFAULT_FIND_LIMIT);
         if params.pattern.contains("..") {
@@ -1013,9 +915,8 @@ impl FsServer {
         &self,
         params: RollbackParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let roots = self.roots.read().await;
-        let path = validate_path(&params.repo_path, &roots).map_err(invalid_params)?;
-        drop(roots);
+        let path =
+            validate_write_path(&params.repo_path, &self.allowlist).map_err(invalid_params)?;
 
         // Validate inputs and resolve the repository root *before* taking the
         // exclusive repo lock, so invalid requests fail fast without blocking
@@ -1026,6 +927,8 @@ impl FsServer {
         let repo_dir = harnx_mcp_history::discover::find_repo_for_path(&path).ok_or_else(|| {
             ErrorData::invalid_params("path is not inside a git repository".to_string(), None)
         })?;
+        validate_write_path(&repo_dir.to_string_lossy(), &self.allowlist)
+            .map_err(invalid_params)?;
 
         let repo_lock = self.repo_lock_for_path(&repo_dir);
         let _repo_guard = repo_lock.write().await;

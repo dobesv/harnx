@@ -3,14 +3,18 @@ pub mod config;
 #[cfg(unix)]
 pub mod defaults;
 #[cfg(unix)]
-pub mod home_guard;
+pub mod home_guard {
+    pub use harnx_tool_allow::{is_home_or_ancestor, resolve_path};
+}
 #[cfg(target_os = "macos")]
 pub mod macos_sandbox;
-pub mod path_expand;
+pub mod path_expand {
+    pub use harnx_tool_allow::{expand_path_var, expand_tilde};
+}
 #[cfg(unix)]
-pub mod root_detection;
-#[cfg(all(test, unix))]
-pub(crate) mod test_support;
+pub mod root_detection {
+    pub use harnx_tool_allow::{detect_project_root, RootKind};
+}
 
 pub use args::build_default_sandbox_args;
 pub use config::SandboxConfig;

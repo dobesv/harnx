@@ -3,12 +3,12 @@ use crate::server::{
     ReadFileParams, RollbackParams, SearchFilesParams, WriteFileParams,
 };
 use async_trait::async_trait;
+use harnx_tool_allow::ResolvedAllowlist;
 use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
 use rmcp::model::{CallToolResult, ErrorData, Tool};
 use rmcp::schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
-use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 /// Toolset exposing the filesystem tools (read, write, edit, insert,
@@ -21,14 +21,11 @@ pub struct FsToolset {
 }
 
 impl FsToolset {
-    /// Build a toolset bounded to `initial_roots`. When `default_root_cwd` is
-    /// set and no roots are given, seeds a single root from the process CWD
-    /// (subject to the `$HOME`-ancestor guard); otherwise access is denied
-    /// until a root is configured.
-    pub async fn new(initial_roots: Vec<PathBuf>, default_root_cwd: bool) -> Self {
-        let server = FsServer::new(initial_roots, default_root_cwd);
-        server.seed_default_root_if_empty().await;
-        Self { server }
+    /// Build a toolset bounded to an immutable resolved allowlist.
+    pub fn new(allowlist: ResolvedAllowlist) -> Self {
+        Self {
+            server: FsServer::new(allowlist),
+        }
     }
 }
 
@@ -146,6 +143,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::path::Path;
+    use std::path::PathBuf;
     use uuid::Uuid;
 
     struct TestDir(PathBuf);
@@ -260,49 +258,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn native_default_root_cwd_bounds_repo_and_denies_home() {
-        use crate::server::tests::{env_lock, path_string, CwdGuard, HomeGuard};
-
-        let _lock = env_lock().await;
-        let base = TestDir::new();
-        let repo = base.0.join("repo");
-        let home = base.0.join("home");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::create_dir_all(&home).unwrap();
-        let repo_file = repo.join("allowed.txt");
-        let home_file = home.join("denied.txt");
-        std::fs::write(&repo_file, "allowed\n").unwrap();
-        std::fs::write(&home_file, "denied\n").unwrap();
-        let _home = HomeGuard::set(&home);
-
-        {
-            let _cwd = CwdGuard::set(&repo);
-            let toolset = FsToolset::new(vec![], true).await;
-            let result = toolset
-                .invoke(
-                    "read",
-                    json!({"path": path_string(&repo_file)}),
-                    CancellationToken::new(),
-                )
-                .await
-                .unwrap();
-            assert_success_shape(&result);
-        }
-
-        let _cwd = CwdGuard::set(&home);
-        let toolset = FsToolset::new(vec![], true).await;
-        let result = toolset
-            .invoke(
-                "read",
-                json!({"path": path_string(&home_file)}),
-                CancellationToken::new(),
-            )
-            .await;
-        assert!(matches!(result, Err(ToolInvokeError::Recoverable(_))));
-    }
-
     #[tokio::test]
     async fn invokes_all_fs_tools() {
         let root = TestDir::new();
@@ -313,7 +268,9 @@ mod tests {
         let file = root_path.join("sample.txt");
         let file_arg = file.to_string_lossy().into_owned();
         let root_arg = root_path.to_string_lossy().into_owned();
-        let toolset = FsToolset::new(vec![root_path], false).await;
+        let mut allowlist = ResolvedAllowlist::new();
+        allowlist.insert_rwx(root_path);
+        let toolset = FsToolset::new(allowlist);
 
         invoke_content_tools(&toolset, &file_arg, &root_arg).await;
         invoke_rollback(&toolset, &file, &root_arg).await;

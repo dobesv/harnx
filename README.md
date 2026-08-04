@@ -157,10 +157,10 @@ Harnx ships with native toolset servers and MCP servers ready to enable in your 
 `example_config/tool_servers/` and `example_config/mcp_servers/` for ready-to-use templates.
 
 *   **`harnx-fs-tools`** — Filesystem toolset (`read`, `write`, `edit`, `insert`, `re_replace`, `ls`, `grep`, `find`, `rollback_file`)
-    *   Path validation against allowed roots; smart output truncation; binary detection.
+    *   Deny-all filesystem allowlist with separate read and write permissions; smart output truncation; binary detection.
     *   [Local history snapshots](docs/local-history-guide.md) before and after every mutation.
 *   **`harnx-bash-tools`** — Bash command execution (`exec`, `spawn`, `wait`, `terminate`, `read_exec_log`, `rollback_file`)
-    *   **Filesystem sandboxing via [birdcage](https://crates.io/crates/birdcage)** (Linux/macOS) — commands run with read+write+exec access to the project roots plus default system/cache allow-lists.
+    *   **Filesystem sandboxing via [birdcage](https://crates.io/crates/birdcage)** (Linux/macOS), with explicit `--allow-*` paths and opt-in common, development-tool, and repository batches.
     *   Process group management (kill-on-drop) and background `spawn` + `wait` pattern.
     *   Path validation and history snapshots around mutating commands.
 *   **`harnx-mcp-time`** — Time and timezone utilities (`get_current_time`, `convert_time`, `wait`).
@@ -208,7 +208,7 @@ Embeddings API:       http://127.0.0.1:8000/v1/embeddings
 Rerank API:           http://127.0.0.1:8000/v1/rerank
 ```
 
-Pass `--model <MODEL>`, `--dry-run`, or one or more `--mcp-root <PATH>` flags as needed.
+Pass `--model <MODEL>` or `--dry-run` as needed.
 For interactive agent sessions, use AG-UI control plane exposed by `harnx-serve` under `/v1/agents`. See [crates/harnx-serve/README.md](crates/harnx-serve/README.md).
 
 ## Custom Themes

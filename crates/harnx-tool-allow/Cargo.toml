@@ -1,0 +1,14 @@
+[package]
+name = "harnx-tool-allow"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared filesystem allowlist resolution and validation for harnx tools"
+
+[target.'cfg(unix)'.dependencies]
+gix = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

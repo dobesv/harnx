@@ -1,7 +1,5 @@
 #[cfg(test)]
 use std::ffi::{OsStr, OsString};
-#[cfg(all(test, unix))]
-use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -36,6 +34,7 @@ impl EnvVar {
 
     // Only used by Unix-gated tests; avoids dead-code warnings on Windows.
     #[cfg(unix)]
+    #[allow(dead_code)]
     pub(crate) fn unset(key: &str) -> Self {
         let prev = std::env::var_os(key);
         // SAFETY: see `set` — serialized by the process-global `env_lock()`.
@@ -58,34 +57,6 @@ impl Drop for EnvVar {
                 Some(value) => std::env::set_var(&self.key, value),
                 None => std::env::remove_var(&self.key),
             }
-        }
-    }
-}
-
-// Only used by Unix-gated tests; gating avoids dead-code warnings on Windows.
-#[cfg(all(test, unix))]
-pub(crate) struct CwdGuard {
-    prev: PathBuf,
-}
-
-#[cfg(all(test, unix))]
-impl CwdGuard {
-    pub(crate) fn set(path: &Path) -> Self {
-        let prev = std::env::current_dir().expect("current_dir");
-        std::env::set_current_dir(path).expect("set_current_dir");
-        Self { prev }
-    }
-}
-
-#[cfg(all(test, unix))]
-impl Drop for CwdGuard {
-    fn drop(&mut self) {
-        // Non-panicking: log restoration failures rather than silencing them.
-        if let Err(e) = std::env::set_current_dir(&self.prev) {
-            eprintln!(
-                "test_support: restoring working directory to {} failed: {e}",
-                self.prev.display()
-            );
         }
     }
 }

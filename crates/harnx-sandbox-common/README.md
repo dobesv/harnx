@@ -3,7 +3,7 @@
 `harnx-sandbox-exec` is a low-level wrapper that runs a single command inside the
 [birdcage](https://github.com/phylum-dev/birdcage) filesystem sandbox with an
 explicit allow-list of paths. It is the primitive that higher-level tools such as
-`harnx-sandbox-run` and `harnx-mcp-bash` build on, and it ships in the
+`harnx-sandbox-run` and `harnx-bash-tools` build on, and it ships in the
 `harnx-sandbox-common` crate.
 
 ## Overview

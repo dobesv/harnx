@@ -244,11 +244,9 @@ impl BashServer {
             .log_dir
             .join(execution_id)
             .join(format!("{stream}.log"));
-        validate_path(
-            abs.to_string_lossy().as_ref(),
-            std::slice::from_ref(&self.inner.log_dir),
-        )
-        .map_err(|err| {
+        let mut log_allowlist = ResolvedAllowlist::new();
+        log_allowlist.insert_read(&self.inner.log_dir);
+        validate_path(abs.to_string_lossy().as_ref(), &log_allowlist).map_err(|err| {
             if err.starts_with("Cannot resolve path") {
                 ErrorData::invalid_params(
                     format!("cannot resolve execution_id '{execution_id}': {err}"),

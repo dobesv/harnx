@@ -1,15 +1,11 @@
 #![cfg(unix)]
-// rmcp deprecated MCP Roots (SEP-2577); this raw client still returns method_not_found.
-#![allow(deprecated)]
-
 use std::process::Stdio;
 
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ErrorData, Implementation, InitializeRequestParams,
-    ListRootsResult,
+    CallToolRequestParams, ClientCapabilities, Implementation, InitializeRequestParams,
 };
-use rmcp::service::{RequestContext, RoleClient};
+use rmcp::service::RoleClient;
 use rmcp::transport::async_rw::AsyncRwTransport;
 use tokio::process::Command;
 
@@ -21,15 +17,6 @@ impl ClientHandler for RawClientHandler {
             ClientCapabilities::default(),
             Implementation::new("raw-rmcp-test-client", env!("CARGO_PKG_VERSION")),
         )
-    }
-
-    async fn list_roots(
-        &self,
-        _context: RequestContext<RoleClient>,
-    ) -> Result<ListRootsResult, ErrorData> {
-        Err(ErrorData::method_not_found::<
-            rmcp::model::ListRootsRequestMethod,
-        >())
     }
 }
 

@@ -3,19 +3,8 @@ use super::*;
 
 impl BashServer {
     #[cfg(unix)]
-    pub(crate) fn build_sandbox_args(
-        &self,
-        working_dir: &Path,
-        roots: &[PathBuf],
-    ) -> Vec<OsString> {
-        let mut acc = SandboxAcc::new(build_default_sandbox_args(&self.inner.sandbox_config));
-
-        acc.ensure_working_dir_readable(working_dir);
-        for root in roots {
-            push_root_write_exec(root, &mut acc.args, &mut acc.writable);
-        }
-
-        let mut args = acc.into_args();
+    pub(crate) fn build_sandbox_args(&self, _working_dir: &Path) -> Vec<OsString> {
+        let mut args = build_default_sandbox_args(&self.inner.sandbox_config);
         for (key, value) in self.build_child_env() {
             args.push(OsString::from("--env"));
             args.push(OsString::from(format!("{key}={value}")));
@@ -55,10 +44,9 @@ impl BashServer {
             working_dir,
             exec_dir,
             command,
-            roots,
             extra_env,
         } = spec;
-        let mut sb_args = self.build_sandbox_args(working_dir, roots);
+        let mut sb_args = self.build_sandbox_args(working_dir);
         sb_args.push(OsString::from("--working-dir"));
         sb_args.push(working_dir.as_os_str().to_owned());
         if let Some(extra_env) = extra_env {
@@ -70,15 +58,6 @@ impl BashServer {
         sb_args.push(OsString::from("--"));
         if let Some((interp, shebang_args)) = parse_shebang(command) {
             let script_path = self.write_script_file(exec_dir, command).await?;
-            if interp.is_absolute() {
-                if let Some(interp_dir) = interp.parent() {
-                    let dir_str = interp_dir.to_string_lossy();
-                    if !SYSTEM_EXEC_PATHS.iter().any(|p| *p == dir_str.as_ref()) {
-                        sb_args.push(OsString::from("--exec"));
-                        sb_args.push(interp_dir.as_os_str().to_owned());
-                    }
-                }
-            }
             sb_args.push(interp.as_os_str().to_owned());
             for arg in shebang_args {
                 sb_args.push(OsString::from(arg));
@@ -154,22 +133,17 @@ impl BashServer {
         if use_sandbox {
             #[cfg(unix)]
             {
-                let roots_guard = self.inner.roots.read().await;
-                let command = self
-                    .build_sandbox_command(
-                        SandboxCommandSpec {
-                            working_dir: ctx.working_dir,
-                            exec_dir: ctx.exec_dir,
-                            command: ctx.command,
-                            roots: &roots_guard,
-                            extra_env: ctx.env,
-                        },
-                        stdout,
-                        stderr,
-                    )
-                    .await?;
-                drop(roots_guard);
-                Ok(command)
+                self.build_sandbox_command(
+                    SandboxCommandSpec {
+                        working_dir: ctx.working_dir,
+                        exec_dir: ctx.exec_dir,
+                        command: ctx.command,
+                        extra_env: ctx.env,
+                    },
+                    stdout,
+                    stderr,
+                )
+                .await
             }
             #[cfg(not(unix))]
             unreachable!()

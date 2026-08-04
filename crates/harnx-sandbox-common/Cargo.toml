@@ -10,10 +10,10 @@ description = "Shared sandbox configuration and default whitelist for harnx sand
 [dependencies]
 anyhow = { workspace = true }
 log = { workspace = true }
+harnx-tool-allow = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 birdcage = { workspace = true }
-gix = { workspace = true }
 tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]

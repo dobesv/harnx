@@ -56,7 +56,6 @@ module completions {
     --list-agents                                       # List all agents
     --list-rags                                         # List all RAGs
     --list-macros                                       # List all macros
-    --mcp-root: string                                  # Add MCP roots
     --tool(-t): string                                  # Enable tools or toolsets for this session
     ...text: string                                     # Input text
     --help(-h)                                          # Print help

@@ -15,10 +15,10 @@
 //!
 //! | Variable | Format | Effect |
 //! |---|---|---|
-//! | `HARNX_BASH_EXTRA_READABLE` | Colon-separated paths | Extra sandbox read-only paths |
-//! | `HARNX_BASH_EXTRA_EXEC` | Colon-separated paths | Extra sandbox execute paths |
-//! | `HARNX_BASH_EXTRA_WRITABLE` | Colon-separated paths | Extra sandbox writable paths |
-//! | `HARNX_BASH_EXTRA_RWX` | Colon-separated paths | Extra sandbox read/write/exec paths |
+//! | `HARNX_TOOLS_ALLOW_READ` | Colon-separated paths | Allowed sandbox read-only paths |
+//! | `HARNX_TOOLS_ALLOW_EXEC` | Colon-separated paths | Allowed sandbox execute paths |
+//! | `HARNX_TOOLS_ALLOW_WRITE` | Colon-separated paths | Allowed sandbox writable paths |
+//! | `HARNX_TOOLS_ALLOW_RWX` | Colon-separated paths | Allowed sandbox read/write/exec paths |
 //! | `HARNX_BASH_ENV_PASSTHROUGH` | Comma-separated names | Extra host env var names to pass through |
 
 mod cli;
@@ -53,6 +53,37 @@ fn env_passthrough_names() -> Vec<String> {
         .collect()
 }
 
+fn merge_environment(cli: &mut cli::Cli) {
+    #[cfg(unix)]
+    {
+        cli.allow_read.extend(env_paths("HARNX_TOOLS_ALLOW_READ"));
+        cli.allow_write.extend(env_paths("HARNX_TOOLS_ALLOW_WRITE"));
+        cli.allow_exec.extend(env_paths("HARNX_TOOLS_ALLOW_EXEC"));
+        cli.allow_rwx.extend(env_paths("HARNX_TOOLS_ALLOW_RWX"));
+    }
+
+    cli.env_vars
+        .extend(env_passthrough_names().into_iter().filter_map(|name| {
+            std::env::var(&name)
+                .ok()
+                .map(|value| format!("{name}={value}"))
+        }));
+}
+
+fn parse_cli(args: &[String]) -> cli::Cli {
+    match <cli::Cli as clap::Parser>::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let exit_code = match error.kind() {
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => 0,
+                _ => 1,
+            };
+            let _ = error.print();
+            std::process::exit(exit_code);
+        }
+    }
+}
+
 fn main() -> Result<()> {
     env_logger::init();
 
@@ -66,26 +97,12 @@ fn main() -> Result<()> {
     let mut clap_args = vec!["harnx-sandbox-run".to_string()];
     clap_args.extend(remaining);
 
-    // Parse remaining args with clap
-    let mut cli = <cli::Cli as clap::Parser>::parse_from(&clap_args);
+    // Treat stale configuration as a startup failure with the same exit code as
+    // the tool servers. Help and version requests still exit successfully.
+    let mut cli = parse_cli(&clap_args);
 
     // Merge env var overrides (matching harnx-bash-tools behaviour).
-    #[cfg(unix)]
-    {
-        cli.extra_read
-            .extend(env_paths("HARNX_BASH_EXTRA_READABLE"));
-        cli.extra_write
-            .extend(env_paths("HARNX_BASH_EXTRA_WRITABLE"));
-        cli.extra_exec.extend(env_paths("HARNX_BASH_EXTRA_EXEC"));
-        cli.extra_rwx.extend(env_paths("HARNX_BASH_EXTRA_RWX"));
-    }
-
-    // Extra env var names to pass through from host.
-    for name in env_passthrough_names() {
-        if let Ok(value) = std::env::var(&name) {
-            cli.env_vars.push(format!("{name}={value}"));
-        }
-    }
+    merge_environment(&mut cli);
 
     // Run hooks if any, keeping the tokio runtime (and all sidecar processes,
     // e.g. harnx-proxy-auth) alive for the full duration of the child.

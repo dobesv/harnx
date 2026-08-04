@@ -104,7 +104,7 @@ impl TestConfigSandbox {
     pub fn config(&self) -> Config {
         let prev = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&self.root).expect("switch cwd");
-        let result = futures::executor::block_on(Config::init(WorkingMode::Cmd, false, vec![]));
+        let result = futures::executor::block_on(Config::init(WorkingMode::Cmd, false));
         std::env::set_current_dir(prev).expect("restore cwd");
         result.expect("load config")
     }

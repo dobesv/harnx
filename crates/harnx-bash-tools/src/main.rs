@@ -3,41 +3,34 @@ mod test_support;
 
 use harnx_bash_tools::BashToolset;
 use harnx_sandbox_common::SandboxConfig;
-#[cfg(unix)]
-use std::path::Path;
+use harnx_tool_allow::{resolve_allowlist, AllowEnv, AllowInputs};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (roots, sandbox_config, default_root_cwd) = parse_args()?;
+    let sandbox_config = parse_args()?;
+    let allowlist = &sandbox_config.allowlist;
 
     eprintln!(
-        "harnx-bash-tools v{}: starting ({} root{})",
+        "harnx-bash-tools v{}: starting ({} read, {} write, {} exec allow paths)",
         env!("CARGO_PKG_VERSION"),
-        if roots.is_empty() {
-            "no CLI roots".to_string()
-        } else {
-            roots.len().to_string()
-        },
-        if roots.len() == 1 { "" } else { "s" }
+        allowlist.read_paths().len(),
+        allowlist.write_paths().len(),
+        allowlist.exec_paths().len(),
     );
-    for root in &roots {
-        eprintln!("  root: {}", root.display());
-    }
 
     #[cfg(unix)]
-    {
-        if sandbox_config.enabled {
-            eprintln!(
-                "  sandbox: enabled (helper: {})",
-                sandbox_config.sandbox_run_path.display()
-            );
-        } else {
-            eprintln!("  sandbox: disabled");
-        }
+    if sandbox_config.enabled {
+        eprintln!(
+            "  sandbox: enabled (helper: {})",
+            sandbox_config.sandbox_run_path.display()
+        );
+    } else {
+        eprintln!("  sandbox: disabled");
     }
 
-    let toolset = BashToolset::new(roots, sandbox_config, default_root_cwd).await;
+    let toolset = BashToolset::new(sandbox_config).await;
     let cleanup_toolset = toolset.clone();
     let result = harnx_toolset_server::run_toolset_main(toolset).await;
     if let Err(err) = cleanup_toolset.cleanup_log_dir() {
@@ -46,59 +39,60 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-#[cfg(unix)]
-fn parse_env_paths(var_name: &str, cwd: &Path) -> Vec<PathBuf> {
-    std::env::var_os(var_name)
+fn env_paths(name: &str) -> Vec<PathBuf> {
+    std::env::var_os(name)
         .map(|value| {
             std::env::split_paths(&value)
                 .filter(|path| !path.as_os_str().is_empty())
-                .filter_map(|path| {
-                    harnx_sandbox_common::expand_path_var(&path.to_string_lossy(), cwd)
-                })
                 .collect()
         })
         .unwrap_or_default()
 }
 
+fn env_toggle(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(unix)]
+fn path_is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
 fn parse_env_passthrough() -> Vec<String> {
     std::env::var("HARNX_BASH_ENV_PASSTHROUGH")
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
         .collect()
 }
 
-#[cfg(unix)]
-fn path_is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    path.metadata()
-        .map(|metadata| metadata.is_file() && (metadata.permissions().mode() & 0o111 != 0))
-        .unwrap_or(false)
-}
-
-fn push_root(roots: &mut Vec<PathBuf>, raw: &str) {
-    let raw = harnx_sandbox_common::expand_tilde(raw);
-    let path = PathBuf::from(&raw);
-    if path.exists() {
-        match path.canonicalize() {
-            Ok(canonical) => roots.push(canonical),
-            Err(err) => {
-                eprintln!("warning: failed to canonicalize root '{}': {}", raw, err);
-            }
-        }
-    } else {
-        eprintln!(
-            "harnx-bash-tools: warning: root path does not exist: {}",
-            raw
-        );
+fn initial_allow_inputs() -> AllowInputs {
+    AllowInputs {
+        read: env_paths("HARNX_TOOLS_ALLOW_READ"),
+        write: env_paths("HARNX_TOOLS_ALLOW_WRITE"),
+        exec: env_paths("HARNX_TOOLS_ALLOW_EXEC"),
+        rwx: env_paths("HARNX_TOOLS_ALLOW_RWX"),
+        common_default: env_toggle("HARNX_TOOLS_ALLOW_COMMON_DEFAULT"),
+        dev_tools: env_toggle("HARNX_TOOLS_ALLOW_DEV_TOOLS"),
+        repo_work: env_toggle("HARNX_TOOLS_ALLOW_REPO_WORK"),
+        all: env_toggle("HARNX_TOOLS_ALLOW_ALL"),
     }
 }
 
-fn parse_env_option(args: &[String], i: &mut usize, sandbox_config: &mut SandboxConfig) {
+fn parse_env_option(args: &[String], i: &mut usize, config: &mut SandboxConfig) {
     let Some(raw) = args.get(*i + 1) else {
         eprintln!("harnx-bash-tools: --env requires an argument");
         std::process::exit(1);
@@ -109,7 +103,7 @@ fn parse_env_option(args: &[String], i: &mut usize, sandbox_config: &mut Sandbox
             eprintln!("harnx-bash-tools: --env requires a non-empty variable name");
             std::process::exit(1);
         }
-        sandbox_config
+        config
             .env_overrides
             .push((key.to_string(), value.to_string()));
     } else {
@@ -117,419 +111,222 @@ fn parse_env_option(args: &[String], i: &mut usize, sandbox_config: &mut Sandbox
             eprintln!("harnx-bash-tools: --env requires a non-empty variable name");
             std::process::exit(1);
         }
-        sandbox_config.extra_env_passthrough.push(raw.clone());
+        config.extra_env_passthrough.push(raw.clone());
     }
     *i += 2;
 }
 
-fn required_option_value<'a>(args: &'a [String], i: usize, option: &str) -> &'a str {
-    args.get(i + 1).map(String::as_str).unwrap_or_else(|| {
-        eprintln!("harnx-bash-tools: {option} requires a path argument");
+fn required_path(args: &[String], i: usize) -> PathBuf {
+    args.get(i + 1).map(PathBuf::from).unwrap_or_else(|| {
+        eprintln!("harnx-bash-tools: {} requires a path argument", args[i]);
         std::process::exit(1);
     })
 }
 
-#[cfg(unix)]
-enum ExtraPathKind {
-    Read,
-    Exec,
-    Write,
-    ReadWriteExec,
+fn print_help_and_exit() -> ! {
+    eprintln!("harnx-bash-tools: MCP shell command server");
+    eprintln!();
+    eprintln!("Usage: harnx-bash-tools [OPTIONS]");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --allow-read <path>       Allow filesystem reads (repeatable)");
+    eprintln!("  --allow-write <path>      Allow filesystem reads and writes (repeatable)");
+    eprintln!("  --allow-exec <path>       Allow filesystem reads and execution (repeatable)");
+    eprintln!("  --allow-rwx <path>        Allow reads, writes, and execution (repeatable)");
+    eprintln!("  --allow-common-default    Allow common operating-system paths");
+    eprintln!("  --allow-dev-tools         Allow development tool paths");
+    eprintln!("  --allow-repo-work         Allow detected project roots and current directory");
+    eprintln!("  --allow-all               Allow all filesystem paths (HOME guard still applies)");
+    eprintln!("  --no-sandbox              Disable filesystem sandboxing explicitly");
+    eprintln!("  --sandbox-run <path>      Override sandbox helper binary path");
+    eprintln!("  --env, -e <VAR>           Pass VAR from host env to child (repeatable)");
+    eprintln!("  --env, -e <VAR=VALUE>     Set VAR=VALUE in child env (repeatable)");
+    eprintln!("  --mcp-stdio               Use MCP stdio transport instead of NATS");
+    eprintln!("  --help, -h                Show this help message");
+    eprintln!();
+    eprintln!("Environment:");
+    eprintln!("  HARNX_TOOLS_ALLOW_READ            Path-list of read grants");
+    eprintln!("  HARNX_TOOLS_ALLOW_WRITE           Path-list of read/write grants");
+    eprintln!("  HARNX_TOOLS_ALLOW_EXEC            Path-list of read/exec grants");
+    eprintln!("  HARNX_TOOLS_ALLOW_RWX             Path-list of read/write/exec grants");
+    eprintln!("  HARNX_TOOLS_ALLOW_COMMON_DEFAULT  Enable common-default batch (1/true/yes/on)");
+    eprintln!("  HARNX_TOOLS_ALLOW_DEV_TOOLS       Enable dev-tools batch (1/true/yes/on)");
+    eprintln!("  HARNX_TOOLS_ALLOW_REPO_WORK       Enable repo-work batch (1/true/yes/on)");
+    eprintln!("  HARNX_TOOLS_ALLOW_ALL             Enable allow-all batch (1/true/yes/on)");
+    eprintln!("  HARNX_BASH_ENV_PASSTHROUGH        Comma-separated extra child env names");
+    eprintln!();
+    eprintln!("No allow flags or batch toggles means deny-all filesystem access.");
+    #[cfg(not(unix))]
+    eprintln!("Sandboxing is Unix-only; filesystem allow inputs are not enforced here.");
+    std::process::exit(0);
 }
 
-#[cfg(unix)]
-impl ExtraPathKind {
-    fn from_flag(flag: &str) -> Self {
-        match flag {
-            "--extra-read" => Self::Read,
-            "--extra-exec" => Self::Exec,
-            "--extra-write" => Self::Write,
-            "--extra-rwx" => Self::ReadWriteExec,
-            _ => unreachable!("unknown extra path flag: {flag}"),
-        }
-    }
-
-    fn flag(&self) -> &'static str {
-        match self {
-            Self::Read => "--extra-read",
-            Self::Exec => "--extra-exec",
-            Self::Write => "--extra-write",
-            Self::ReadWriteExec => "--extra-rwx",
-        }
-    }
-}
-
-#[cfg(unix)]
-struct ExtraPathParser<'a> {
-    args: &'a [String],
-    cwd: &'a Path,
-}
-
-#[cfg(unix)]
-impl ExtraPathParser<'_> {
-    fn parse(&self, kind: ExtraPathKind, i: &mut usize, sandbox_config: &mut SandboxConfig) {
-        let raw = required_option_value(self.args, *i, kind.flag());
-        if let Some(path) = harnx_sandbox_common::expand_path_var(raw, self.cwd) {
-            match kind {
-                ExtraPathKind::Read => sandbox_config.extra_readable.push(path),
-                ExtraPathKind::Exec => sandbox_config.extra_exec.push(path),
-                ExtraPathKind::Write => sandbox_config.extra_writable.push(path),
-                ExtraPathKind::ReadWriteExec => sandbox_config.extra_rwx.push(path),
-            }
-        }
-        *i += 2;
-    }
-}
-
-#[cfg(unix)]
-fn parse_sandbox_run_option(args: &[String], i: &mut usize) -> PathBuf {
-    let raw = required_option_value(args, *i, "--sandbox-run");
-    *i += 2;
-    PathBuf::from(harnx_sandbox_common::expand_tilde(raw))
-}
-
-#[cfg(not(unix))]
-fn skip_path_option(args: &[String], i: &mut usize, option: &str) {
-    required_option_value(args, *i, option);
-    *i += 2;
-}
-
-#[cfg(unix)]
-fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig, bool)> {
-    let args: Vec<String> = std::env::args().collect();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut roots = Vec::new();
-    let mut default_root_cwd = false;
-    let mut sandbox_enabled = true;
-    let mut sandbox_config = SandboxConfig {
-        enabled: true,
-        extra_exec: parse_env_paths("HARNX_BASH_EXTRA_EXEC", &cwd),
-        extra_readable: parse_env_paths("HARNX_BASH_EXTRA_READABLE", &cwd),
-        extra_writable: parse_env_paths("HARNX_BASH_EXTRA_WRITABLE", &cwd),
-        extra_rwx: parse_env_paths("HARNX_BASH_EXTRA_RWX", &cwd),
-        sandbox_run_path: PathBuf::from("harnx-sandbox-exec"),
+fn initial_sandbox_config() -> SandboxConfig {
+    SandboxConfig {
+        enabled: cfg!(unix),
+        allowlist: Arc::new(harnx_tool_allow::ResolvedAllowlist::new()),
         extra_env_passthrough: parse_env_passthrough(),
-        env_overrides: vec![],
-    };
+        env_overrides: Vec::new(),
+        sandbox_run_path: PathBuf::from("harnx-sandbox-exec"),
+    }
+}
+
+fn parse_cli_args(
+    args: &[String],
+    inputs: &mut AllowInputs,
+    config: &mut SandboxConfig,
+) -> Result<Option<PathBuf>, String> {
     let mut sandbox_run_override = None;
-    let extra_path_parser = ExtraPathParser {
-        args: &args,
-        cwd: &cwd,
-    };
     let mut i = 1;
 
     while i < args.len() {
         match args[i].as_str() {
-            "--root" | "-r" => {
-                if i + 1 < args.len() {
-                    push_root(&mut roots, &args[i + 1]);
-                    i += 2;
-                } else {
-                    eprintln!("harnx-bash-tools: --root requires a path argument");
-                    std::process::exit(1);
-                }
+            "--allow-read" => {
+                inputs.read.push(required_path(args, i));
+                i += 2;
             }
-            "--default-root-cwd" => {
-                default_root_cwd = true;
+            "--allow-write" => {
+                inputs.write.push(required_path(args, i));
+                i += 2;
+            }
+            "--allow-exec" => {
+                inputs.exec.push(required_path(args, i));
+                i += 2;
+            }
+            "--allow-rwx" => {
+                inputs.rwx.push(required_path(args, i));
+                i += 2;
+            }
+            "--allow-common-default" => {
+                inputs.common_default = true;
+                i += 1;
+            }
+            "--allow-dev-tools" => {
+                inputs.dev_tools = true;
+                i += 1;
+            }
+            "--allow-repo-work" => {
+                inputs.repo_work = true;
+                i += 1;
+            }
+            "--allow-all" => {
+                inputs.all = true;
                 i += 1;
             }
             "--no-sandbox" => {
-                sandbox_enabled = false;
-                sandbox_config.enabled = false;
+                config.enabled = false;
                 i += 1;
-            }
-            option @ ("--extra-read" | "--extra-exec" | "--extra-write" | "--extra-rwx") => {
-                extra_path_parser.parse(
-                    ExtraPathKind::from_flag(option),
-                    &mut i,
-                    &mut sandbox_config,
-                );
             }
             "--sandbox-run" => {
-                sandbox_run_override = Some(parse_sandbox_run_option(&args, &mut i));
+                sandbox_run_override = Some(required_path(args, i));
+                i += 2;
             }
-            "--env" | "-e" => parse_env_option(&args, &mut i, &mut sandbox_config),
-            "--mcp-stdio" => {
-                // The shared toolset runner selects the MCP stdio adapter from this flag.
-                i += 1;
-            }
-            "--help" | "-h" => {
-                eprintln!("harnx-bash-tools: MCP shell command server");
-                eprintln!();
-                eprintln!("Usage: harnx-bash-tools [OPTIONS]");
-                eprintln!();
-                eprintln!("Options:");
-                eprintln!("  --root, -r <path>        Add an allowed root directory (repeatable)");
-                eprintln!(
-                    "  --default-root-cwd       Use canonical CWD when no roots are available"
-                );
-                eprintln!("  --no-sandbox            Disable filesystem sandboxing explicitly");
-                eprintln!("  --extra-read <path> Add sandbox read-only path (repeatable)");
-                eprintln!("  --extra-exec <path>     Add sandbox execute path (repeatable)");
-                eprintln!("  --extra-write <path>    Add sandbox writable path (repeatable)");
-                eprintln!(
-                    "  --extra-rwx <path>      Add sandbox read/write/exec path (repeatable)"
-                );
-                eprintln!("  --sandbox-run <path>    Override sandbox helper binary path");
-                eprintln!("  --env, -e <VAR>         Pass VAR from host env to child (repeatable)");
-                eprintln!("  --env, -e <VAR=VALUE>   Set VAR=VALUE in child env (repeatable)");
-                eprintln!("  --mcp-stdio             Use MCP stdio transport instead of NATS");
-                eprintln!("  --help, -h              Show this help message");
-                eprintln!();
-                eprintln!("Environment:");
-                eprintln!(
-                    "  HARNX_BASH_EXTRA_READABLE   Colon-separated extra sandbox read-only paths"
-                );
-                eprintln!(
-                    "  HARNX_BASH_EXTRA_EXEC       Colon-separated extra sandbox execute paths"
-                );
-                eprintln!(
-                    "  HARNX_BASH_EXTRA_WRITABLE   Colon-separated extra sandbox writable paths"
-                );
-                eprintln!(
-                    "  HARNX_BASH_EXTRA_RWX        Colon-separated extra sandbox read/write/exec paths"
-                );
-                eprintln!(
-                    "  HARNX_BASH_ENV_PASSTHROUGH  Comma-separated extra env var names to pass through"
-                );
-                eprintln!();
-                eprintln!("  $GIT_ROOT, $GIT_COMMON_DIR, $NODE_PROJECT_ROOT, $CARGO_ROOT, $GO_ROOT supported; resolved vs cwd, dropped if absent; any other $ENV_VAR resolves from environment, left literal if unset");
-                eprintln!();
-                eprintln!("Sandboxing is enabled by default on Unix. Use --no-sandbox to disable it explicitly.");
-                eprintln!(
-                    "The server uses NATS transport by default; --mcp-stdio selects MCP stdio."
-                );
-                eprintln!("If no roots are specified, operations are denied until the client provides roots.");
-                eprintln!("Roots can also be provided dynamically by the MCP client.");
-                std::process::exit(0);
-            }
+            "--env" | "-e" => parse_env_option(args, &mut i, config),
+            "--mcp-stdio" => i += 1,
+            "--help" | "-h" => print_help_and_exit(),
             other => {
-                eprintln!("harnx-bash-tools: unknown argument: {}", other);
-                eprintln!("Try: harnx-bash-tools --help");
-                std::process::exit(1);
+                return Err(format!(
+                    "harnx-bash-tools: unknown argument: {other}\nTry: harnx-bash-tools --help"
+                ));
             }
         }
     }
 
-    let resolved_sandbox_run_path = sandbox_run_override.clone().or_else(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(|dir| dir.join("harnx-sandbox-exec")))
-    });
-
-    if sandbox_enabled {
-        let path = resolved_sandbox_run_path.unwrap_or_else(|| PathBuf::from("harnx-sandbox-exec"));
-        if path_is_executable(&path) {
-            sandbox_config.sandbox_run_path = path;
-        } else if sandbox_run_override.is_some() {
-            anyhow::bail!(
-                "harnx-bash-tools: error: sandbox helper at {} does not exist or is not executable; fix --sandbox-run or pass --no-sandbox to disable sandboxing explicitly",
-                path.display()
-            );
-        } else {
-            anyhow::bail!(
-                "harnx-bash-tools: error: sandbox helper at {} does not exist or is not executable; place harnx-sandbox-exec next to harnx-bash-tools, use --sandbox-run <path>, or pass --no-sandbox to disable sandboxing explicitly",
-                path.display()
-            );
-        }
-    } else {
-        sandbox_config.enabled = false;
-        sandbox_config.sandbox_run_path =
-            resolved_sandbox_run_path.unwrap_or_else(|| PathBuf::from("harnx-sandbox-exec"));
-    }
-
-    Ok((roots, sandbox_config, default_root_cwd))
+    Ok(sandbox_run_override)
 }
 
-#[cfg(not(unix))]
-fn parse_env_passthrough() -> Vec<String> {
-    std::env::var("HARNX_BASH_ENV_PASSTHROUGH")
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect()
-}
-
-#[cfg(not(unix))]
-fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig, bool)> {
+fn parse_args() -> anyhow::Result<SandboxConfig> {
     let args: Vec<String> = std::env::args().collect();
-    let mut roots = Vec::new();
-    let mut default_root_cwd = false;
-    let mut sandbox_config = SandboxConfig {
-        // Sandbox itself is Unix-only; on Windows these fields are unused.
-        enabled: false,
-        extra_exec: vec![],
-        extra_readable: vec![],
-        extra_writable: vec![],
-        extra_rwx: vec![],
-        sandbox_run_path: PathBuf::from("harnx-sandbox-exec"),
-        extra_env_passthrough: parse_env_passthrough(),
-        env_overrides: vec![],
-    };
-    let mut i = 1;
+    let cwd = std::env::current_dir()?;
+    let mut inputs = initial_allow_inputs();
+    let mut config = initial_sandbox_config();
+    let sandbox_run_override =
+        parse_cli_args(&args, &mut inputs, &mut config).unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
 
-    while i < args.len() {
-        match args[i].as_str() {
-            "--root" | "-r" => {
-                if i + 1 < args.len() {
-                    push_root(&mut roots, &args[i + 1]);
-                    i += 2;
-                } else {
-                    eprintln!("harnx-bash-tools: --root requires a path argument");
-                    std::process::exit(1);
-                }
-            }
-            option @ ("--extra-read" | "--extra-exec" | "--extra-write" | "--extra-rwx"
-            | "--sandbox-run") => {
-                skip_path_option(&args, &mut i, option);
-            }
-            "--default-root-cwd" => {
-                default_root_cwd = true;
-                i += 1;
-            }
-            "--no-sandbox" => {
-                i += 1;
-            }
-            "--env" | "-e" => parse_env_option(&args, &mut i, &mut sandbox_config),
-            "--mcp-stdio" => {
-                // The shared toolset runner selects the MCP stdio adapter from this flag.
-                i += 1;
-            }
-            "--help" | "-h" => {
-                eprintln!("harnx-bash-tools: MCP shell command server");
-                eprintln!();
-                eprintln!("Usage: harnx-bash-tools [OPTIONS]");
-                eprintln!();
-                eprintln!("Options:");
-                eprintln!("  --root, -r <path>       Add an allowed root directory (repeatable)");
-                eprintln!(
-                    "  --default-root-cwd      Use canonical CWD when no roots are available"
+    #[cfg(unix)]
+    {
+        let resolved_helper = sandbox_run_override.clone().or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(|dir| dir.join("harnx-sandbox-exec")))
+        });
+        if config.enabled {
+            let helper = resolved_helper.unwrap_or_else(|| PathBuf::from("harnx-sandbox-exec"));
+            if !path_is_executable(&helper) {
+                anyhow::bail!(
+                    "harnx-bash-tools: error: sandbox helper at {} does not exist or is not executable; fix --sandbox-run or pass --no-sandbox to disable sandboxing explicitly",
+                    helper.display()
                 );
-                eprintln!("  --extra-read <path> Accept sandbox read-only path flag (ignored on this platform)");
-                eprintln!("  --extra-exec <path>     Accept sandbox execute path flag (ignored on this platform)");
-                eprintln!("  --extra-write <path>    Accept sandbox writable path flag (ignored on this platform)");
-                eprintln!("  --extra-rwx <path>      Accept sandbox read/write/exec path flag (ignored on this platform)");
-                eprintln!("  --env, -e <VAR>         Pass VAR from host env to child (repeatable)");
-                eprintln!("  --env, -e <VAR=VALUE>   Set VAR=VALUE in child env (repeatable)");
-                eprintln!("  --mcp-stdio             Use MCP stdio transport instead of NATS");
-                eprintln!("  --help, -h              Show this help message");
-                eprintln!();
-                eprintln!("Environment:");
-                eprintln!(
-                    "  HARNX_BASH_ENV_PASSTHROUGH  Comma-separated extra env var names to pass through"
-                );
-                eprintln!();
-                eprintln!("Sandboxing is Unix-only. On other platforms the child bash process");
-                eprintln!("still receives only the curated environment built from the default");
-                eprintln!("allowlist plus any --env / passthrough configuration.");
-                eprintln!(
-                    "The server uses NATS transport by default; --mcp-stdio selects MCP stdio."
-                );
-                eprintln!("If no roots are specified, operations are denied until the client provides roots.");
-                std::process::exit(0);
             }
-            other => {
-                eprintln!("harnx-bash-tools: unknown argument: {}", other);
-                eprintln!("Try: harnx-bash-tools --help");
-                std::process::exit(1);
-            }
+            config.sandbox_run_path = helper;
+        } else if let Some(helper) = resolved_helper {
+            config.sandbox_run_path = helper;
         }
     }
+    #[cfg(not(unix))]
+    if let Some(helper) = sandbox_run_override {
+        config.sandbox_run_path = helper;
+    }
 
-    Ok((roots, sandbox_config, default_root_cwd))
+    config.allowlist = Arc::new(resolve_allowlist(
+        &inputs,
+        &cwd,
+        &AllowEnv::from_current_process(),
+    ));
+    Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use super::*;
-    #[cfg(unix)]
-    use crate::test_support::CwdGuard;
     use crate::test_support::{env_lock, EnvVar};
 
-    #[test]
-    fn test_expand_tilde_replaces_prefix() {
-        let _env_guard = env_lock();
-        let _home = EnvVar::set("HOME", "/tmp/test-home");
-
-        assert_eq!(
-            harnx_sandbox_common::expand_tilde("~/foo"),
-            "/tmp/test-home/foo"
-        );
-        assert_eq!(harnx_sandbox_common::expand_tilde("~"), "/tmp/test-home");
-        assert_eq!(harnx_sandbox_common::expand_tilde("/abs/path"), "/abs/path");
-    }
-
     #[cfg(unix)]
     #[test]
-    fn env_extra_rwx_git_root_resolves_inside_repo() {
-        let _env_guard = env_lock();
-        let _clear_read = EnvVar::unset("HARNX_BASH_EXTRA_READABLE");
-        let _clear_write = EnvVar::unset("HARNX_BASH_EXTRA_WRITABLE");
-        let _clear_exec = EnvVar::unset("HARNX_BASH_EXTRA_EXEC");
-        let _clear_rwx = EnvVar::unset("HARNX_BASH_EXTRA_RWX");
-        let manifest_dir =
-            PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
-        let _cwd = CwdGuard::set(&manifest_dir);
-        let _extra = EnvVar::set("HARNX_BASH_EXTRA_RWX", "$GIT_ROOT");
-        let repo_root = harnx_sandbox_common::detect_project_root(
-            harnx_sandbox_common::RootKind::GitRoot,
-            &manifest_dir,
-        )
-        .expect("git root");
+    fn shared_allow_environment_names_are_parsed() {
+        let _guard = env_lock();
+        let _read = EnvVar::set("HARNX_TOOLS_ALLOW_READ", "/read:/other");
+        let _write = EnvVar::set("HARNX_TOOLS_ALLOW_WRITE", "/write");
+        let _exec = EnvVar::set("HARNX_TOOLS_ALLOW_EXEC", "/exec");
+        let _rwx = EnvVar::set("HARNX_TOOLS_ALLOW_RWX", "/rwx");
+        let _batch = EnvVar::set("HARNX_TOOLS_ALLOW_COMMON_DEFAULT", "true");
 
+        let inputs = initial_allow_inputs();
         assert_eq!(
-            parse_env_paths("HARNX_BASH_EXTRA_RWX", &manifest_dir),
-            vec![repo_root]
+            inputs.read,
+            [PathBuf::from("/read"), PathBuf::from("/other")]
         );
+        assert_eq!(inputs.write, [PathBuf::from("/write")]);
+        assert_eq!(inputs.exec, [PathBuf::from("/exec")]);
+        assert_eq!(inputs.rwx, [PathBuf::from("/rwx")]);
+        assert!(inputs.common_default);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn env_extra_git_root_is_dropped_outside_repo() {
-        let _env_guard = env_lock();
-        let _clear_read = EnvVar::unset("HARNX_BASH_EXTRA_READABLE");
-        let _clear_write = EnvVar::unset("HARNX_BASH_EXTRA_WRITABLE");
-        let _clear_exec = EnvVar::unset("HARNX_BASH_EXTRA_EXEC");
-        let _clear_rwx = EnvVar::unset("HARNX_BASH_EXTRA_RWX");
-        let temp = tempfile::tempdir().expect("tempdir");
-        if harnx_sandbox_common::detect_project_root(
-            harnx_sandbox_common::RootKind::GitRoot,
-            temp.path().parent().unwrap_or(temp.path()),
-        )
-        .is_some()
-        {
-            return;
+    fn false_batch_toggle_stays_disabled() {
+        let _guard = env_lock();
+        let _batch = EnvVar::set("HARNX_TOOLS_ALLOW_ALL", "false");
+        assert!(!env_toggle("HARNX_TOOLS_ALLOW_ALL"));
+    }
+
+    #[test]
+    fn rejects_legacy_allowlist_flags() {
+        let legacy_flags = [
+            ["--", "root"].concat(),
+            ["--default", "-root", "-cwd"].concat(),
+            ["--extra", "-rwx"].concat(),
+        ];
+
+        for flag in legacy_flags {
+            let args = vec!["harnx-bash-tools".to_string(), flag.clone()];
+            let mut inputs = AllowInputs::default();
+            let mut config = initial_sandbox_config();
+            let error = parse_cli_args(&args, &mut inputs, &mut config)
+                .expect_err("legacy flag should be rejected");
+            assert!(error.contains(&format!("unknown argument: {flag}")));
         }
-        let _cwd = CwdGuard::set(temp.path());
-        let _extra = EnvVar::set("HARNX_BASH_EXTRA_RWX", "$GIT_ROOT");
-
-        assert!(parse_env_paths("HARNX_BASH_EXTRA_RWX", temp.path()).is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn env_extra_paths_keep_tilde_and_literal_behavior() {
-        let _env_guard = env_lock();
-        let _clear_read = EnvVar::unset("HARNX_BASH_EXTRA_READABLE");
-        let _clear_write = EnvVar::unset("HARNX_BASH_EXTRA_WRITABLE");
-        let _clear_exec = EnvVar::unset("HARNX_BASH_EXTRA_EXEC");
-        let _clear_rwx = EnvVar::unset("HARNX_BASH_EXTRA_RWX");
-        let temp = tempfile::tempdir().expect("tempdir");
-        let home = temp.path().join("home");
-        std::fs::create_dir_all(&home).expect("create home");
-        let _cwd = CwdGuard::set(temp.path());
-        let _home = EnvVar::set("HOME", &home);
-        let _read = EnvVar::set(
-            "HARNX_BASH_EXTRA_READABLE",
-            std::ffi::OsString::from(format!("{}:{}", "~/foo", "/abs")),
-        );
-
-        assert_eq!(
-            parse_env_paths("HARNX_BASH_EXTRA_READABLE", temp.path()),
-            vec![home.join("foo"), PathBuf::from("/abs")]
-        );
     }
 }

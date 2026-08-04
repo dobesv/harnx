@@ -172,7 +172,6 @@ async fn stdio_time_manager(binary: &str) -> Result<Arc<McpManager>> {
         command: binary.to_string(),
         args: vec!["--mcp-stdio".to_string()],
         env: Default::default(),
-        roots: vec![],
         enabled: true,
         description: None,
         rename_tools: Default::default(),

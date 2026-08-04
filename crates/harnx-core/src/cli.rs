@@ -39,10 +39,6 @@ pub struct CommonFlags {
     #[arg(long)]
     pub config_path: Option<PathBuf>,
 
-    /// Override the MCP root directory.
-    #[arg(long)]
-    pub mcp_root: Option<PathBuf>,
-
     /// Disable all writes (sessions, files, etc.).
     #[arg(long)]
     pub dry_run: bool,

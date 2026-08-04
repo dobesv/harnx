@@ -121,57 +121,57 @@ fn test_parse_command_after_double_dash() {
 
 #[test]
 fn test_parse_multiple_path_flags() {
-    // --extra-read /a --extra-write /b --extra-exec /c all parsed
+    // --allow-read /a --allow-write /b --allow-exec /c all parsed
     let cli = <Cli as clap::Parser>::try_parse_from([
         "harnx-sandbox-run",
-        "--extra-read",
+        "--allow-read",
         "/a",
-        "--extra-write",
+        "--allow-write",
         "/b",
-        "--extra-exec",
+        "--allow-exec",
         "/c",
         "--",
         "cmd",
     ])
     .expect("parse should succeed");
-    assert!(cli.extra_read.contains(&PathBuf::from("/a")));
-    assert!(cli.extra_write.contains(&PathBuf::from("/b")));
-    assert!(cli.extra_exec.contains(&PathBuf::from("/c")));
+    assert!(cli.allow_read.contains(&PathBuf::from("/a")));
+    assert!(cli.allow_write.contains(&PathBuf::from("/b")));
+    assert!(cli.allow_exec.contains(&PathBuf::from("/c")));
 }
 
 #[test]
 fn test_parse_repeated_path_flags() {
-    // Multiple --extra-read flags accumulate
+    // Multiple --allow-read flags accumulate
     let cli = <Cli as clap::Parser>::try_parse_from([
         "harnx-sandbox-run",
-        "--extra-read",
+        "--allow-read",
         "/a",
-        "--extra-read",
+        "--allow-read",
         "/b",
-        "--extra-read",
+        "--allow-read",
         "/c",
         "--",
         "cmd",
     ])
     .expect("parse should succeed");
-    assert_eq!(cli.extra_read.len(), 3);
-    assert!(cli.extra_read.contains(&PathBuf::from("/a")));
-    assert!(cli.extra_read.contains(&PathBuf::from("/b")));
-    assert!(cli.extra_read.contains(&PathBuf::from("/c")));
+    assert_eq!(cli.allow_read.len(), 3);
+    assert!(cli.allow_read.contains(&PathBuf::from("/a")));
+    assert!(cli.allow_read.contains(&PathBuf::from("/b")));
+    assert!(cli.allow_read.contains(&PathBuf::from("/c")));
 }
 
 #[test]
-fn test_parse_extra_rwx() {
-    // --extra-rwx /tmp parses correctly
+fn test_parse_allow_rwx() {
+    // --allow-rwx /tmp parses correctly
     let cli = <Cli as clap::Parser>::try_parse_from([
         "harnx-sandbox-run",
-        "--extra-rwx",
+        "--allow-rwx",
         "/tmp",
         "--",
         "cmd",
     ])
     .expect("parse should succeed");
-    assert!(cli.extra_rwx.contains(&PathBuf::from("/tmp")));
+    assert!(cli.allow_rwx.contains(&PathBuf::from("/tmp")));
 }
 
 #[test]

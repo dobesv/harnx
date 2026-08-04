@@ -87,7 +87,7 @@ pub const HOME_READ_PATHS: &[&str] = &[
 // Security hardening: writable + executable directories on PATH, or directories
 // that hold host-executed binaries, let sandboxed code plant trojans that user
 // may later run on host. Default to exec-only or write-only instead; users opt
-// into write with --extra-rwx/--extra-write for installs and self-updates.
+// into write with explicit allow rules for installs and self-updates.
 pub const HOME_EXEC_PATHS: &[&str] = &[
     ".local/bin",
     ".local/lib",

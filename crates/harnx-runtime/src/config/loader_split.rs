@@ -10,11 +10,7 @@ fn normalize_description(description: Option<String>) -> Option<String> {
 }
 
 impl Config {
-    pub async fn init(
-        working_mode: WorkingMode,
-        info_flag: bool,
-        mut mcp_root: Vec<String>,
-    ) -> Result<Self> {
+    pub async fn init(working_mode: WorkingMode, info_flag: bool) -> Result<Self> {
         // Install any user-supplied models-override list before the
         // harnx-client `ALL_PROVIDER_MODELS` lazy-lock is first accessed.
         crate::client::install_models_override();
@@ -37,18 +33,8 @@ impl Config {
             Self::load_from_file(&config_path)?
         };
 
-        if let Ok(v) = env::var("HARNX_MCP_ROOTS") {
-            for root in v.split(',') {
-                let root = root.trim();
-                if !root.is_empty() && !mcp_root.contains(&root.to_string()) {
-                    mcp_root.push(root.to_string());
-                }
-            }
-        }
-
         config.working_mode = working_mode;
         config.info_flag = info_flag;
-        config.mcp_root = mcp_root;
 
         let setup = |config: &mut Self| -> Result<()> {
             config.load_envs();

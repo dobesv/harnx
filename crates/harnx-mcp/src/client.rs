@@ -1,11 +1,5 @@
-// rmcp deprecated the MCP Roots feature (SEP-2577), but this client still
-// implements roots support that connected MCP servers rely on. Keep using the
-// deprecated APIs until roots support is dropped here or removed upstream.
-#![allow(deprecated)]
-
 use crate::config::{McpServerConfig, ToolDisplayTemplates};
 use crate::convert::{mcp_tool_to_declaration, ToolTemplates};
-use crate::safety::path_to_file_uri;
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::event::NoticeEvent;
 use harnx_core::sink::emit_agent_event;
@@ -20,10 +14,9 @@ use process_wrap::tokio::CommandWrap;
 use process_wrap::tokio::ProcessGroup;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ErrorData, Implementation, InitializeRequestParams,
-    ListRootsResult, Root,
+    CallToolRequestParams, ClientCapabilities, Implementation, InitializeRequestParams,
 };
-use rmcp::service::{RequestContext, RoleClient, RunningService, ServiceError};
+use rmcp::service::{RoleClient, RunningService, ServiceError};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::process::Stdio;
@@ -31,7 +24,6 @@ use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    path::Path,
     sync::Arc,
 };
 
@@ -147,7 +139,6 @@ pub struct McpClient {
     name: String,
     config: McpServerConfig,
     tools: Arc<RwLock<Vec<ToolDeclaration>>>,
-    roots: Arc<RwLock<Vec<String>>>,
     connected: Arc<RwLock<bool>>,
     connection_failed: Arc<RwLock<bool>>,
     service: Arc<RwLock<Option<RunningService<RoleClient, McpClientHandler>>>>,
@@ -165,45 +156,15 @@ pub struct McpClient {
     pid: Arc<RwLock<Option<u32>>>,
 }
 
-#[derive(Clone)]
-pub struct McpClientHandler {
-    roots: Arc<RwLock<Vec<String>>>,
-}
-
-impl McpClientHandler {
-    pub fn new(roots: Arc<RwLock<Vec<String>>>) -> Self {
-        Self { roots }
-    }
-}
+#[derive(Clone, Default)]
+pub struct McpClientHandler;
 
 impl ClientHandler for McpClientHandler {
     fn get_info(&self) -> InitializeRequestParams {
         InitializeRequestParams::new(
-            ClientCapabilities::builder()
-                .enable_roots()
-                .enable_roots_list_changed()
-                .build(),
+            ClientCapabilities::default(),
             Implementation::new("harnx", env!("CARGO_PKG_VERSION")),
         )
-    }
-
-    async fn list_roots(
-        &self,
-        _cx: RequestContext<RoleClient>,
-    ) -> Result<ListRootsResult, ErrorData> {
-        let roots = self.roots.read();
-        let roots = roots
-            .iter()
-            .filter_map(|r| {
-                let path = Path::new(r);
-                let abs = path
-                    .canonicalize()
-                    .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(path)))
-                    .ok()?;
-                Some(Root::new(path_to_file_uri(&abs)))
-            })
-            .collect();
-        Ok(ListRootsResult::new(roots))
     }
 }
 
@@ -219,7 +180,6 @@ impl fmt::Debug for McpClient {
             .field("name", &self.name)
             .field("config", &self.config)
             .field("tools", &*self.tools.read())
-            .field("roots", &*self.roots.read())
             .field("connected", &*self.connected.read())
             .field("service", &service)
             .field("stderr_buffer_len", &self.stderr_buffer.lock().len())
@@ -228,12 +188,6 @@ impl fmt::Debug for McpClient {
 }
 
 impl McpClient {
-    fn expand_path(path: &str) -> String {
-        shellexpand::full(path)
-            .map(|p| p.to_string())
-            .unwrap_or_else(|_| path.to_string())
-    }
-
     /// Emit a notice event with deduplication against this client's shared
     /// dedup state. Returns true if emitted, false if suppressed as duplicate.
     fn emit_notice(&self, key: &str, event: NoticeEvent) -> bool {
@@ -242,16 +196,10 @@ impl McpClient {
 
     pub fn new(config: McpServerConfig) -> Self {
         let name = config.name.clone();
-        let roots = config
-            .roots
-            .iter()
-            .map(|r| Self::expand_path(r))
-            .collect::<Vec<_>>();
         Self {
             name,
             config,
             tools: Arc::new(RwLock::new(Vec::new())),
-            roots: Arc::new(RwLock::new(roots)),
             connected: Arc::new(RwLock::new(false)),
             connection_failed: Arc::new(RwLock::new(false)),
             service: Arc::new(RwLock::new(None)),
@@ -278,7 +226,7 @@ impl McpClient {
         self.config.package.as_deref()
     }
 
-    /// Full resolved server configuration (command, args, env, roots, hooks).
+    /// Full resolved server configuration (command, args, env, hooks).
     /// Surfaced by `.mcp info` for diagnostics.
     pub fn config(&self) -> &McpServerConfig {
         &self.config
@@ -298,11 +246,6 @@ impl McpClient {
         } else {
             "idle"
         }
-    }
-
-    /// The effective roots (config roots plus any injected cwd/extra roots).
-    pub fn live_roots(&self) -> Vec<String> {
-        self.roots.read().clone()
     }
 
     pub fn is_connected(&self) -> bool {
@@ -436,7 +379,7 @@ impl McpClient {
         let transport =
             rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(stdout, stdin);
 
-        let handler = McpClientHandler::new(self.roots.clone());
+        let handler = McpClientHandler;
         let serve_result = tokio::time::timeout(
             Duration::from_secs(30),
             rmcp::service::serve_client(handler, transport),
@@ -579,46 +522,6 @@ impl McpClient {
         self.tools.read().clone()
     }
 
-    pub fn get_roots(&self) -> Vec<String> {
-        self.roots.read().clone()
-    }
-
-    pub async fn add_root(&self, root: &str) -> Result<()> {
-        let root = Self::expand_path(root);
-        let changed = {
-            let mut roots = self.roots.write();
-            if !roots.contains(&root) {
-                roots.push(root);
-                true
-            } else {
-                false
-            }
-        };
-        if changed {
-            let peer = self.service.read().as_ref().map(|s| s.peer().clone());
-            if let Some(peer) = peer {
-                let _ = peer.notify_roots_list_changed().await;
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn remove_root(&self, root: &str) -> Result<()> {
-        let changed = {
-            let mut roots = self.roots.write();
-            let old_len = roots.len();
-            roots.retain(|r| r != root);
-            roots.len() < old_len
-        };
-        if changed {
-            let peer = self.service.read().as_ref().map(|s| s.peer().clone());
-            if let Some(peer) = peer {
-                let _ = peer.notify_roots_list_changed().await;
-            }
-        }
-        Ok(())
-    }
-
     pub async fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<Value> {
         if !self.is_connected() {
             self.connect().await?;
@@ -729,15 +632,13 @@ mod tests {
         CallToolRequestParams, CallToolResult, ContentBlock, InitializeResult, ListToolsResult,
         ServerCapabilities, Tool,
     };
-    use rmcp::service::{serve_server, NotificationContext, RoleServer};
+    use rmcp::service::{serve_server, RequestContext, RoleServer};
     use serde_json::{json, Map};
-    use std::time::Duration;
     use tokio::io::duplex;
 
     #[derive(Clone, Default, Debug)]
     struct MockServerHandler {
         initialized_params: Arc<RwLock<Option<InitializeRequestParams>>>,
-        roots_list_changed_notified: Arc<RwLock<bool>>,
         peer: Arc<RwLock<Option<rmcp::service::Peer<rmcp::service::RoleServer>>>>,
         tools: Arc<RwLock<Vec<Tool>>>,
         last_tool_call: Arc<RwLock<Option<(String, Value)>>>,
@@ -799,10 +700,6 @@ mod tests {
                 )),
             }
         }
-
-        async fn on_roots_list_changed(&self, _cx: NotificationContext<rmcp::service::RoleServer>) {
-            *self.roots_list_changed_notified.write() = true;
-        }
     }
 
     fn test_mcp_config(name: &str) -> McpServerConfig {
@@ -811,7 +708,6 @@ mod tests {
             command: "mock-mcp".to_string(),
             args: vec![],
             env: HashMap::new(),
-            roots: vec![],
             enabled: true,
             description: None,
             rename_tools: HashMap::new(),
@@ -819,134 +715,6 @@ mod tests {
             package: None,
             hooks: None,
         }
-    }
-
-    #[tokio::test]
-    async fn test_mcp_roots_propagation() {
-        let (client_transport, server_transport) = duplex(1024);
-
-        let mock_server = MockServerHandler::default();
-        let server_handler = mock_server.clone();
-
-        // Client
-        let roots = Arc::new(RwLock::new(vec!["/test/root".to_string()]));
-        let handler = McpClientHandler::new(roots.clone());
-
-        let server_fut = serve_server(server_handler, server_transport);
-        let client_fut = rmcp::service::serve_client(handler, client_transport);
-
-        let (_server_res, client_res) = tokio::join!(server_fut, client_fut);
-        let _client_service = client_res.unwrap();
-        let client_peer = _client_service.peer().clone();
-
-        // Run client in background
-        let _client_task = tokio::spawn(async move {
-            let _ = _client_service.waiting().await;
-        });
-
-        // Verify roots in initialize params
-        {
-            let params = mock_server.initialized_params.read();
-            let params = params.as_ref().unwrap();
-            assert!(params.capabilities.roots.is_some());
-            assert_eq!(
-                params.capabilities.roots.as_ref().unwrap().list_changed,
-                Some(true)
-            );
-        }
-
-        let server_peer = mock_server.peer.read().as_ref().unwrap().clone();
-
-        let roots_result = server_peer.list_roots().await.unwrap();
-        assert_eq!(roots_result.roots.len(), 1);
-        let uri = &roots_result.roots[0].uri;
-        assert!(
-            uri.starts_with("file:///") && uri.ends_with("/test/root"),
-            "expected file:///...test/root, got: {uri}"
-        );
-
-        {
-            roots.write().push("/test/root2".to_string());
-            client_peer.notify_roots_list_changed().await.unwrap();
-        }
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(*mock_server.roots_list_changed_notified.read());
-
-        let roots_result = server_peer.list_roots().await.unwrap();
-        assert_eq!(roots_result.roots.len(), 2);
-        let uri2 = &roots_result.roots[1].uri;
-        assert!(
-            uri2.starts_with("file:///") && uri2.ends_with("/test/root2"),
-            "expected file:///...test/root2, got: {uri2}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_mcp_roots_canonicalization() {
-        let (client_transport, server_transport) = duplex(1024);
-        let mock_server = MockServerHandler::default();
-        let server_handler = mock_server.clone();
-
-        // Client with a relative root
-        let roots = Arc::new(RwLock::new(vec![".".to_string()]));
-        let handler = McpClientHandler::new(roots.clone());
-
-        let server_fut = serve_server(server_handler, server_transport);
-        let client_fut = rmcp::service::serve_client(handler, client_transport);
-
-        let (_server_res, client_res) = tokio::join!(server_fut, client_fut);
-        let _client_service = client_res.unwrap();
-
-        // Run client in background
-        let _client_task = tokio::spawn(async move {
-            let _ = _client_service.waiting().await;
-        });
-
-        let server_peer = mock_server.peer.read().as_ref().unwrap().clone();
-
-        // Verify list_roots works (server calling client)
-        let roots_result = server_peer.list_roots().await.unwrap();
-        assert_eq!(roots_result.roots.len(), 1);
-        let uri = roots_result.roots[0].uri.clone();
-
-        // It should be an absolute path
-        assert!(
-            uri.starts_with("file:///"),
-            "URI should be an absolute file URI, got: {}",
-            uri
-        );
-
-        let expected_path = std::env::current_dir().unwrap().canonicalize().unwrap();
-        let expected_uri = path_to_file_uri(&expected_path);
-        assert_eq!(uri, expected_uri);
-    }
-
-    #[test]
-    fn test_mcp_roots_expansion() {
-        let mut config = test_mcp_config("test");
-        std::env::set_var("TEST_ROOT", "/tmp/test");
-        config.roots = vec!["$TEST_ROOT/a".to_string(), "~/b".to_string()];
-
-        let client = McpClient::new(config);
-        let roots = client.get_roots();
-
-        assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0], "/tmp/test/a");
-        let home = dirs::home_dir().unwrap();
-        assert_eq!(roots[1], format!("{}/b", home.to_string_lossy()));
-    }
-
-    #[tokio::test]
-    async fn test_mcp_roots_add_expansion() {
-        let config = test_mcp_config("test");
-        std::env::set_var("ADD_TEST_ROOT", "/tmp/add_test");
-        let client = McpClient::new(config);
-
-        client.add_root("$ADD_TEST_ROOT/c").await.unwrap();
-        let roots = client.get_roots();
-
-        assert!(roots.contains(&"/tmp/add_test/c".to_string()));
     }
 
     #[tokio::test]
@@ -1109,7 +877,7 @@ mod tests {
         };
 
         let server_handler = mock_server.clone();
-        let client_handler = McpClientHandler::new(Arc::new(RwLock::new(vec![])));
+        let client_handler = McpClientHandler;
         let (server_res, client_res) = tokio::join!(
             serve_server(server_handler, server_transport),
             rmcp::service::serve_client(client_handler, client_transport)
@@ -1825,7 +1593,6 @@ mod selector_filter_tests {
                 spawn_log_path.to_string_lossy().into_owned(),
             ],
             env: Default::default(),
-            roots: vec![],
             enabled: true,
             description: None,
             rename_tools: Default::default(),

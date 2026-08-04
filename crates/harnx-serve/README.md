@@ -21,7 +21,6 @@ cargo install --path crates/harnx-serve
 | `--addr <ADDRESS>` | `-a` | Listen address (default from `config.yaml` or `127.0.0.1:8000`). |
 | `--model <MODEL>` | `-m` | Select a specific LLM model to use. |
 | `--dry-run` | | Echo prompts instead of sending them to the LLM. |
-| `--mcp-root <PATH>` | | Add one or more MCP roots (comma-separated). |
 | `--web-assets <PATH>` | | Directory of web-ui static assets to serve (default: `~/.local/share/harnx/web-assets`, XDG-aware). |
 
 ## Web UI assets

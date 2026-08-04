@@ -93,6 +93,17 @@ mod tests {
         std::fs::write(path, "marker").expect("write marker");
     }
 
+    fn assert_marker_roots(
+        cwd: &Path,
+        node: Option<PathBuf>,
+        cargo: Option<PathBuf>,
+        go: Option<PathBuf>,
+    ) {
+        assert_eq!(detect_project_root(RootKind::NodeProjectRoot, cwd), node);
+        assert_eq!(detect_project_root(RootKind::CargoRoot, cwd), cargo);
+        assert_eq!(detect_project_root(RootKind::GoRoot, cwd), go);
+    }
+
     #[test]
     fn detects_node_cargo_and_go_roots_from_nested_directory() {
         let _lock = env_lock();
@@ -105,15 +116,7 @@ mod tests {
         touch(&root.join("Cargo.toml"));
         touch(&root.join("go.mod"));
 
-        assert_eq!(
-            detect_project_root(RootKind::NodeProjectRoot, &nested),
-            Some(root.clone())
-        );
-        assert_eq!(
-            detect_project_root(RootKind::CargoRoot, &nested),
-            Some(root.clone())
-        );
-        assert_eq!(detect_project_root(RootKind::GoRoot, &nested), Some(root));
+        assert_marker_roots(&nested, Some(root.clone()), Some(root.clone()), Some(root));
     }
 
     #[test]
@@ -124,12 +127,7 @@ mod tests {
         let nested = temp.path().join("workspace/subdir");
         std::fs::create_dir_all(&nested).expect("create nested");
 
-        assert_eq!(
-            detect_project_root(RootKind::NodeProjectRoot, &nested),
-            None
-        );
-        assert_eq!(detect_project_root(RootKind::CargoRoot, &nested), None);
-        assert_eq!(detect_project_root(RootKind::GoRoot, &nested), None);
+        assert_marker_roots(&nested, None, None, None);
     }
 
     #[test]
@@ -145,12 +143,7 @@ mod tests {
         touch(&home.join("go.mod"));
         unsafe { std::env::set_var("HOME", &home) };
 
-        assert_eq!(
-            detect_project_root(RootKind::NodeProjectRoot, &nested),
-            None
-        );
-        assert_eq!(detect_project_root(RootKind::CargoRoot, &nested), None);
-        assert_eq!(detect_project_root(RootKind::GoRoot, &nested), None);
+        assert_marker_roots(&nested, None, None, None);
     }
 
     #[test]
@@ -259,12 +252,7 @@ mod tests {
         std::fs::create_dir_all(&nested).expect("create nested via symlink");
         unsafe { std::env::set_var("HOME", &home) };
 
-        assert_eq!(
-            detect_project_root(RootKind::NodeProjectRoot, &nested),
-            None
-        );
-        assert_eq!(detect_project_root(RootKind::CargoRoot, &nested), None);
-        assert_eq!(detect_project_root(RootKind::GoRoot, &nested), None);
+        assert_marker_roots(&nested, None, None, None);
     }
 
     #[test]
@@ -283,14 +271,6 @@ mod tests {
         touch(&top.join("go.mod"));
         touch(&middle.join("go.mod"));
 
-        assert_eq!(
-            detect_project_root(RootKind::NodeProjectRoot, &nested),
-            Some(top.clone())
-        );
-        assert_eq!(
-            detect_project_root(RootKind::CargoRoot, &nested),
-            Some(top.clone())
-        );
-        assert_eq!(detect_project_root(RootKind::GoRoot, &nested), Some(middle));
+        assert_marker_roots(&nested, Some(top.clone()), Some(top), Some(middle));
     }
 }

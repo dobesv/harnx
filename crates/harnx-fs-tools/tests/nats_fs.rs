@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use harnx_core::instance::InstanceId;
 use harnx_fs_tools::{FsServer, FsToolset, ListDirectoryParams, ReadFileParams};
+use harnx_tool_allow::ResolvedAllowlist;
 use harnx_toolset::{
     Registration, ToolErrorPayload, ToolReply, ToolRequest, HDR_CALL_ID, HDR_IDEMPOTENCY_KEY,
 };
@@ -261,7 +262,9 @@ async fn assert_envelope_parity(
         .to_string_lossy()
         .into_owned();
     let root_arg = root_path.to_string_lossy().into_owned();
-    let direct_server = FsServer::new(vec![root_path.to_path_buf()], false);
+    let mut direct_allowlist = ResolvedAllowlist::new();
+    direct_allowlist.insert_rwx(root_path);
+    let direct_server = FsServer::new(direct_allowlist);
     let direct_read = direct_server
         .read_file_impl(serde_json::from_value::<ReadFileParams>(json!({
             "path": file_arg
@@ -292,7 +295,9 @@ async fn fs_toolset_round_trips_over_nats_with_bridge_envelope_parity() -> Resul
     };
     let root = tempfile::tempdir().context("create filesystem root")?;
     let root_path = root.path().canonicalize()?;
-    let toolset = FsToolset::new(vec![root_path.clone()], false).await;
+    let mut allowlist = ResolvedAllowlist::new();
+    allowlist.insert_rwx(&root_path);
+    let toolset = FsToolset::new(allowlist);
     let instance_id = InstanceId::new();
     let server_url = server.url.clone();
     let server_instance_id = instance_id.clone();

@@ -23,15 +23,7 @@ impl Config {
                 ".info" => map_completion_values(vec![
                     "session", "model", "agent", "rag", "tools", "theme", "mcp", "env",
                 ]),
-                ".mcp" => map_completion_values(vec![
-                    "list",
-                    "connect",
-                    "disconnect",
-                    "tools",
-                    "roots",
-                    "add-root",
-                    "remove-root",
-                ]),
+                ".mcp" => map_completion_values(vec!["list", "connect", "disconnect", "tools"]),
                 ".title" => map_completion_values(vec!["generate", "now"]),
                 ".use" => map_completion_values(vec!["tool"]),
                 ".drop" => map_completion_values(vec!["tool"]),
@@ -151,10 +143,7 @@ impl Config {
             values = current.into_iter().map(|s| (s, None)).collect();
         } else if cmd == ".mcp" && args.len() == 2 {
             let subcmd = args[0];
-            if matches!(
-                subcmd,
-                "connect" | "disconnect" | "tools" | "roots" | "add-root" | "remove-root"
-            ) {
+            if matches!(subcmd, "connect" | "disconnect" | "tools") {
                 let servers = Self::mcp_list_servers_from_config(self);
                 values = servers.into_iter().map(|v| (v, None)).collect();
             }

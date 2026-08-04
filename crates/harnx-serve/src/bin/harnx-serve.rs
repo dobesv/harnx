@@ -26,9 +26,6 @@ struct Cli {
     /// Echo prompts instead of sending them to the LLM
     #[clap(long)]
     dry_run: bool,
-    /// Add MCP roots (comma-separated)
-    #[clap(long, value_name = "PATH", value_delimiter = ',')]
-    mcp_root: Vec<String>,
     /// Directory of web-ui static assets to serve
     /// (default: ~/.local/share/harnx/web-assets, XDG-aware)
     #[clap(long, value_name = "PATH")]
@@ -46,7 +43,7 @@ async fn main() -> Result<()> {
     setup_logger(true)?;
 
     let config = Arc::new(RwLock::new(
-        Config::init(WorkingMode::Serve, false, cli.mcp_root.clone())
+        Config::init(WorkingMode::Serve, false)
             .await
             .context("Failed to init Config")?,
     ));

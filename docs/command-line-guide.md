@@ -107,7 +107,6 @@ Common flags:
 ```sh
 harnx-serve --addr 0.0.0.0:8000
 harnx-serve --model claude:claude-3-5-sonnet-20240620
-harnx-serve --mcp-root /path/to/project --mcp-root /path/to/other/project
 harnx-serve --dry-run
 harnx-serve --agent-variable env production --agent-variable debug true
 ```

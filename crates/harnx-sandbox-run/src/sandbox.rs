@@ -115,7 +115,7 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
     }
 
     // CLI-provided extra paths
-    for path in &cli.extra_read {
+    for path in &cli.allow_read {
         let raw = path.to_string_lossy();
         let Some(expanded) = expand_path_var(&raw, &cwd) else {
             continue;
@@ -123,7 +123,7 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
         let resolved = resolve_path(&expanded);
         if is_home_or_ancestor(&resolved) {
             eprintln!(
-                "harnx-sandbox-run: warning: ignoring --extra-read {}: would expose home directory",
+                "harnx-sandbox-run: warning: ignoring --allow-read {}: would expose home directory",
                 path.display()
             );
             continue;
@@ -131,7 +131,7 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
         args.push("--read".into());
         args.push(resolved.into_os_string());
     }
-    for path in &cli.extra_write {
+    for path in &cli.allow_write {
         let raw = path.to_string_lossy();
         let Some(expanded) = expand_path_var(&raw, &cwd) else {
             continue;
@@ -139,7 +139,7 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
         let resolved = resolve_path(&expanded);
         if is_home_or_ancestor(&resolved) {
             eprintln!(
-                "harnx-sandbox-run: warning: ignoring --extra-write {}: would expose home directory",
+                "harnx-sandbox-run: warning: ignoring --allow-write {}: would expose home directory",
                 path.display()
             );
             continue;
@@ -147,7 +147,7 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
         args.push("--write".into());
         args.push(resolved.into_os_string());
     }
-    for path in &cli.extra_exec {
+    for path in &cli.allow_exec {
         let raw = path.to_string_lossy();
         let Some(expanded) = expand_path_var(&raw, &cwd) else {
             continue;
@@ -155,7 +155,7 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
         let resolved = resolve_path(&expanded);
         if is_home_or_ancestor(&resolved) {
             eprintln!(
-                "harnx-sandbox-run: warning: ignoring --extra-exec {}: would expose home directory",
+                "harnx-sandbox-run: warning: ignoring --allow-exec {}: would expose home directory",
                 path.display()
             );
             continue;
@@ -163,7 +163,7 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
         args.push("--exec".into());
         args.push(resolved.into_os_string());
     }
-    for path in &cli.extra_rwx {
+    for path in &cli.allow_rwx {
         let raw = path.to_string_lossy();
         let Some(expanded) = expand_path_var(&raw, &cwd) else {
             continue;
@@ -171,7 +171,7 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
         let resolved = resolve_path(&expanded);
         if is_home_or_ancestor(&resolved) {
             eprintln!(
-                "harnx-sandbox-run: warning: ignoring --extra-rwx {}: would expose home directory",
+                "harnx-sandbox-run: warning: ignoring --allow-rwx {}: would expose home directory",
                 path.display()
             );
             continue;
@@ -342,10 +342,10 @@ mod tests {
     fn collect_env_hook_overrides_cli() {
         let cli = Cli {
             env_vars: vec!["MYVAR=from_cli".to_string()],
-            extra_read: vec![],
-            extra_write: vec![],
-            extra_exec: vec![],
-            extra_rwx: vec![],
+            allow_read: vec![],
+            allow_write: vec![],
+            allow_exec: vec![],
+            allow_rwx: vec![],
             no_network: false,
             working_dir: None,
             no_defaults: false,
@@ -366,10 +366,10 @@ mod tests {
         // Keys list must contain the key name — the test just checks it's present
         let cli = Cli {
             env_vars: vec!["HOME".to_string()],
-            extra_read: vec![],
-            extra_write: vec![],
-            extra_exec: vec![],
-            extra_rwx: vec![],
+            allow_read: vec![],
+            allow_write: vec![],
+            allow_exec: vec![],
+            allow_rwx: vec![],
             no_network: false,
             working_dir: None,
             no_defaults: false,
@@ -410,10 +410,10 @@ mod tests {
 
         let cli = Cli {
             env_vars: vec![],
-            extra_read: vec![],
-            extra_write: vec![],
-            extra_exec: vec![],
-            extra_rwx: vec![],
+            allow_read: vec![],
+            allow_write: vec![],
+            allow_exec: vec![],
+            allow_rwx: vec![],
             no_network: false,
             working_dir: None,
             no_defaults: false,
@@ -455,10 +455,10 @@ mod tests {
 
         let cli = Cli {
             env_vars: vec![],
-            extra_read: vec![PathBuf::from(".")],
-            extra_write: vec![home.clone()],
-            extra_exec: vec![PathBuf::from("/")],
-            extra_rwx: vec![child.clone()],
+            allow_read: vec![PathBuf::from(".")],
+            allow_write: vec![home.clone()],
+            allow_exec: vec![PathBuf::from("/")],
+            allow_rwx: vec![child.clone()],
             no_network: false,
             working_dir: None,
             no_defaults: false,
@@ -511,10 +511,10 @@ mod tests {
 
         let cli = Cli {
             env_vars: vec![],
-            extra_read: vec![],
-            extra_write: vec![PathBuf::from("$HARNX_TEST_HOME_VAR")],
-            extra_exec: vec![],
-            extra_rwx: vec![],
+            allow_read: vec![],
+            allow_write: vec![PathBuf::from("$HARNX_TEST_HOME_VAR")],
+            allow_exec: vec![],
+            allow_rwx: vec![],
             no_network: false,
             working_dir: None,
             no_defaults: false,
@@ -554,10 +554,10 @@ mod tests {
 
         let cli = Cli {
             env_vars: vec![],
-            extra_read: vec![],
-            extra_write: vec![],
-            extra_exec: vec![],
-            extra_rwx: vec![PathBuf::from("$GIT_ROOT")],
+            allow_read: vec![],
+            allow_write: vec![],
+            allow_exec: vec![],
+            allow_rwx: vec![PathBuf::from("$GIT_ROOT")],
             no_network: false,
             working_dir: None,
             no_defaults: false,
@@ -600,10 +600,10 @@ mod tests {
 
         let cli = Cli {
             env_vars: vec![],
-            extra_read: vec![],
-            extra_write: vec![],
-            extra_exec: vec![],
-            extra_rwx: vec![PathBuf::from("$GIT_ROOT")],
+            allow_read: vec![],
+            allow_write: vec![],
+            allow_exec: vec![],
+            allow_rwx: vec![PathBuf::from("$GIT_ROOT")],
             no_network: false,
             working_dir: None,
             no_defaults: false,

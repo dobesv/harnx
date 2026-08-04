@@ -120,9 +120,7 @@ async fn main() -> Result<()> {
     let info_flag = legacy_info_flag(&cli);
     setup_logger(false)?;
     harnx_core::alloc_guard::init_from_env();
-    let config = Arc::new(RwLock::new(
-        Config::init(working_mode, info_flag, cli.mcp_root.clone()).await?,
-    ));
+    let config = Arc::new(RwLock::new(Config::init(working_mode, info_flag).await?));
     if let Err(err) = run(config, cli, text).await {
         render_error(err);
         std::process::exit(1);
@@ -134,7 +132,7 @@ async fn run_command(command: &Commands) -> Result<()> {
     match command {
         Commands::Info(info_args) => match &info_args.command {
             InfoSubcommands::Agent { name } => {
-                let mut config = Config::init(WorkingMode::Cmd, true, vec![]).await?;
+                let mut config = Config::init(WorkingMode::Cmd, true).await?;
                 config.init_mcp_manager();
                 let out = render_agent_dump(&config, name)?;
                 println!("{out}");
@@ -159,7 +157,7 @@ async fn run_command(command: &Commands) -> Result<()> {
 }
 
 async fn run_session_delete_command(delete_args: &DeleteSessionArgs) -> Result<()> {
-    let config = Config::init(WorkingMode::Cmd, true, vec![]).await?;
+    let config = Config::init(WorkingMode::Cmd, true).await?;
     let result = harnx_runtime::nats_admin::delete_remote_session(
         &config,
         &delete_args.cluster,
@@ -186,9 +184,7 @@ async fn run_session_delete_command(delete_args: &DeleteSessionArgs) -> Result<(
 }
 
 async fn run_worker_command(worker_args: &WorkerArgs) -> Result<()> {
-    let config = Arc::new(RwLock::new(
-        Config::init(WorkingMode::Cmd, true, vec![]).await?,
-    ));
+    let config = Arc::new(RwLock::new(Config::init(WorkingMode::Cmd, true).await?));
     config.write().agent_variables = collect_agent_variables(&worker_args.agent_variable)?;
     let worker_id = worker_args
         .worker_id

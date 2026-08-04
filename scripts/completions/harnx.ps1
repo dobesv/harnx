@@ -46,7 +46,6 @@ Register-ArgumentCompleter -Native -CommandName 'harnx' -ScriptBlock {
             [CompletionResult]::new('--list-agents', '--list-agents', [CompletionResultType]::ParameterName, 'List all agents')
             [CompletionResult]::new('--list-rags', '--list-rags', [CompletionResultType]::ParameterName, 'List all RAGs')
             [CompletionResult]::new('--list-macros', '--list-macros', [CompletionResultType]::ParameterName, 'List all macros')
-            [CompletionResult]::new('--mcp-root', '--mcp-root', [CompletionResultType]::ParameterName, 'Add MCP roots')
             [CompletionResult]::new('-t', '-t', [CompletionResultType]::ParameterName, 'Enable tools or toolsets for this session')
             [CompletionResult]::new('--tool', '--tool', [CompletionResultType]::ParameterName, 'Enable tools or toolsets for this session')
             [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
@@ -78,8 +77,6 @@ Register-ArgumentCompleter -Native -CommandName 'harnx' -ScriptBlock {
         } elseif ($flag -eq "--macro") {
             $completions = Get-HarnxValues "--list-macros"
         } elseif ($flag -ceq "-f" -or $flag -eq "--file") {
-            $completions = @()
-        } elseif ($flag -eq "--mcp-root") {
             $completions = @()
         } elseif ($flag -ceq "-t" -or $flag -eq "--tool") {
             $completions = @()
