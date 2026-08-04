@@ -433,6 +433,7 @@ fn configured_worker_services(
         .agent
         .as_ref()
         .and_then(|agent| agent.use_tools())
+        // Fall back when no agent is active or the active agent has no use_tools.
         .or_else(|| config.use_tools.clone())
         .unwrap_or_default();
     for selector in use_tools {
@@ -1129,7 +1130,9 @@ impl WorkerRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{optional_tool_server, tool_servers_matching_use_tools};
+    use super::{
+        configured_worker_services, optional_tool_server, tool_servers_matching_use_tools,
+    };
     use crate::config::ToolServerConfig;
 
     fn tool_server(name: &str) -> ToolServerConfig {
@@ -1143,6 +1146,22 @@ mod tests {
             package: None,
             hooks: None,
         }
+    }
+
+    #[test]
+    fn configured_worker_services_falls_back_to_config_use_tools_without_agent() {
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            config.agent = None;
+            config.use_tools = Some(vec!["time_get_current_time".to_string()]);
+            config.tool_servers = vec![tool_server("time"), tool_server("weather")];
+        }
+
+        let (servers, _hooks) = configured_worker_services(&config);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "time");
     }
 
     #[test]
