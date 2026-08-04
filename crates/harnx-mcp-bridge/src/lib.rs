@@ -355,6 +355,7 @@ fn map_tool(server_name: &str, tool: Tool) -> ToolSpec {
             .and_then(|value| value.read_only_hint)
             .unwrap_or(false),
         timeout_secs: None,
+        meta: tool.meta.map(|m| m.0),
     }
 }
 
@@ -384,9 +385,9 @@ impl ClientHandler for BridgeClientHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
     #[cfg(unix)]
     use super::BridgeToolset;
+    use super::{map_tool, Args};
 
     #[test]
     fn arg_parses_child_command_and_flags_after_separator() {
@@ -420,6 +421,28 @@ mod tests {
 
         assert_eq!(args.name, "plans");
         assert_eq!(args.child, ["harnx-plans-tools"]);
+    }
+
+    #[test]
+    fn maps_child_tool_meta_into_tool_spec() {
+        let meta = rmcp::model::Meta(
+            serde_json::json!({ "call_template": "Running {{name}}" })
+                .as_object()
+                .expect("meta object")
+                .clone(),
+        );
+        let tool =
+            rmcp::model::Tool::new("echo", "Echo input", serde_json::Map::new()).with_meta(meta);
+
+        let spec = map_tool("child", tool);
+
+        assert_eq!(
+            spec.meta
+                .as_ref()
+                .and_then(|meta| meta.get("call_template"))
+                .and_then(serde_json::Value::as_str),
+            Some("Running {{name}}")
+        );
     }
 
     #[cfg(unix)]

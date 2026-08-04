@@ -1,5 +1,8 @@
 //! Server-side adapters for hosting a [`harnx_toolset::Toolset`].
 
+pub mod content;
+pub mod schema;
+
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv, stream};
 use futures_util::StreamExt;
@@ -10,7 +13,8 @@ use harnx_toolset::{
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Implementation,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    ListToolsResult, Meta, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ServerHandler, ServiceExt};
@@ -500,11 +504,13 @@ impl ServerHandler for McpToolsetAdapter {
                     Value::Object(schema) => schema,
                     _ => Map::new(),
                 };
-                Tool::new(spec.name, spec.description, input_schema).annotate(
+                let mut tool = Tool::new(spec.name, spec.description, input_schema).annotate(
                     ToolAnnotations::new()
                         .read_only(spec.read_only_hint)
                         .idempotent(spec.idempotent_hint),
-                )
+                );
+                tool.meta = spec.meta.map(Meta);
+                tool
             })
             .collect();
         Ok(ListToolsResult {

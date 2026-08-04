@@ -27,6 +27,10 @@ pub struct ToolSpec {
     /// Missing values use the client's default backstop for older registrations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// Tool `_meta` as in-house JSON, including optional display templates.
+    /// Missing values indicate tools without `call_template`, `result_template`, or other metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Error returned directly by a [`Toolset`] implementation.
@@ -173,6 +177,7 @@ mod tests {
             idempotent_hint: true,
             read_only_hint: true,
             timeout_secs: Some(120),
+            meta: None,
         }
     }
 
@@ -187,6 +192,17 @@ mod tests {
         });
         let spec: ToolSpec = serde_json::from_value(value).expect("decode legacy tool spec");
         assert_eq!(spec.timeout_secs, None);
+        assert_eq!(spec.meta, None);
+    }
+
+    #[test]
+    fn tool_spec_meta_round_trips_through_serde() {
+        let mut spec = tool_spec();
+        spec.meta = json!({ "call_template": "Calling {{tool}}" })
+            .as_object()
+            .cloned();
+
+        assert_round_trip(spec);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use base64::Engine;
-use harnx_mcp::content::WithAudience;
+use harnx_toolset_server::content::WithAudience;
 
 // Auto-split from server.rs for cohesion. See server/mod.rs.
 use super::*;

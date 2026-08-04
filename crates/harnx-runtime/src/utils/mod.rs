@@ -77,8 +77,8 @@ pub fn pretty_yaml_block(value: &serde_json::Value) -> String {
 /// terminal. Both the TUI sink and the CLI sink call this so they
 /// render identically.
 pub fn render_tool_result_text(output: &serde_json::Value, markdown: Option<&str>) -> String {
+    use harnx_core::safety::{truncate_output, TruncateOpts};
     use harnx_core::tool::extract_user_display_text;
-    use harnx_mcp::safety::{truncate_output, TruncateOpts};
 
     let mut opts = TruncateOpts::default();
     let marker = " [...] ";

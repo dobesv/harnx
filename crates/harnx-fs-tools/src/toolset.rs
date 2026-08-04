@@ -43,6 +43,7 @@ fn spec<T: JsonSchema + 'static>(name: &str, description: &str, read_only_hint: 
         idempotent_hint: false,
         read_only_hint,
         timeout_secs: None,
+        meta: None,
     }
 }
 

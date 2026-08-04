@@ -158,6 +158,7 @@ impl Toolset for TimeToolset {
                 idempotent_hint: true,
                 read_only_hint: true,
                 timeout_secs: Some(60),
+                meta: None,
             },
             ToolSpec {
                 name: "convert_time".to_string(),
@@ -179,6 +180,7 @@ impl Toolset for TimeToolset {
                 idempotent_hint: true,
                 read_only_hint: true,
                 timeout_secs: Some(60),
+                meta: None,
             },
             ToolSpec {
                 name: "wait".to_string(),
@@ -191,6 +193,7 @@ impl Toolset for TimeToolset {
                 idempotent_hint: false,
                 read_only_hint: true,
                 timeout_secs: Some(3_660),
+                meta: None,
             },
             ToolSpec {
                 name: "wait_until".to_string(),
@@ -206,6 +209,7 @@ impl Toolset for TimeToolset {
                 idempotent_hint: false,
                 read_only_hint: true,
                 timeout_secs: Some(86_460),
+                meta: None,
             },
         ]
     }

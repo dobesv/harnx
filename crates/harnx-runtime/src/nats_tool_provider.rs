@@ -285,6 +285,18 @@ fn build_registered_tools(
     let mut registered = HashMap::new();
     for registration in registrations {
         for spec in registration.tools {
+            let call_template = spec
+                .meta
+                .as_ref()
+                .and_then(|m| m.get("call_template"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let result_template = spec
+                .meta
+                .as_ref()
+                .and_then(|m| m.get("result_template"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let parameters = match serde_json::from_value::<JsonSchema>(spec.input_schema) {
                 Ok(parameters) => parameters,
                 Err(error) => {
@@ -310,8 +322,8 @@ fn build_registered_tools(
                 parameters,
                 mcp_tool_name: None,
                 mcp_server_name: None,
-                call_template: None,
-                result_template: None,
+                call_template,
+                result_template,
                 idempotent_hint: Some(spec.idempotent_hint),
                 read_only_hint: Some(spec.read_only_hint),
             };
@@ -402,4 +414,49 @@ async fn registration_snapshot(
         }
     }
     Ok(registrations)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_registered_tools;
+    use harnx_toolset::{Registration, ToolSpec};
+    use serde_json::json;
+
+    #[test]
+    fn builds_tool_declaration_templates_from_tool_spec_meta() {
+        harnx_core::require_nextest();
+        let meta = json!({
+            "call_template": "Calling {{tool}}",
+            "result_template": "Called {{tool}}"
+        })
+        .as_object()
+        .expect("meta object")
+        .clone();
+        let registration = Registration {
+            server: "template-server".to_string(),
+            tools: vec![ToolSpec {
+                name: "template_tool".to_string(),
+                description: "Tool with display templates".to_string(),
+                input_schema: json!({ "type": "object" }),
+                idempotent_hint: false,
+                read_only_hint: false,
+                timeout_secs: None,
+                meta: Some(meta),
+            }],
+            schema_version: 1,
+            proto_version: 1,
+        };
+
+        let (_, declarations) = build_registered_tools(vec![registration]);
+
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(
+            declarations[0].call_template.as_deref(),
+            Some("Calling {{tool}}")
+        );
+        assert_eq!(
+            declarations[0].result_template.as_deref(),
+            Some("Called {{tool}}")
+        );
+    }
 }

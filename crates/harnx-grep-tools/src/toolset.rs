@@ -69,6 +69,7 @@ impl Toolset for GrepToolset {
             idempotent_hint: true,
             read_only_hint: true,
             timeout_secs: None,
+            meta: None,
         }]
     }
 

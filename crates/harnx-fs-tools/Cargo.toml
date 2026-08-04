@@ -13,7 +13,7 @@ async-trait = { workspace = true }
 fancy-regex = { workspace = true }
 gix = { workspace = true }
 glob = { workspace = true }
-harnx-mcp = { path = "../harnx-mcp" }
+harnx-core = { path = "../harnx-core" }
 harnx-mcp-history = { workspace = true }
 harnx-tool-allow = { path = "../harnx-tool-allow" }
 harnx-toolset = { path = "../harnx-toolset" }
@@ -28,7 +28,6 @@ tokio-util = { workspace = true }
 
 [dev-dependencies]
 async-nats = { workspace = true }
-harnx-core = { path = "../harnx-core" }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 uuid = { workspace = true }

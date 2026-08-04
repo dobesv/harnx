@@ -1,6 +1,6 @@
 // Auto-split from server.rs / handlers.rs for cohesion. See server/mod.rs.
 use super::*;
-use harnx_mcp::content::WithAudience;
+use harnx_toolset_server::content::WithAudience;
 
 impl BashServer {
     // exec

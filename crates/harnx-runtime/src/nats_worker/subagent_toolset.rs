@@ -439,6 +439,7 @@ fn tool_specs(agent: &str, server_name: &str, timeouts: SubagentTimeouts) -> Vec
                 idempotent_hint: false,
                 read_only_hint: false,
                 timeout_secs: Some(request_timeout),
+                meta: None,
             },
             ToolSpec {
                 name: format!("{server_name}_session_prompt"),
@@ -463,6 +464,7 @@ fn tool_specs(agent: &str, server_name: &str, timeouts: SubagentTimeouts) -> Vec
                 idempotent_hint: false,
                 read_only_hint: false,
                 timeout_secs: Some(request_timeout),
+                meta: None,
             },
             ToolSpec {
                 name: format!("{server_name}_session_load"),
@@ -483,6 +485,7 @@ fn tool_specs(agent: &str, server_name: &str, timeouts: SubagentTimeouts) -> Vec
                 idempotent_hint: true,
                 read_only_hint: true,
                 timeout_secs: Some(60),
+                meta: None,
             },
             ToolSpec {
                 name: format!("{server_name}_session_cancel"),
@@ -500,6 +503,7 @@ fn tool_specs(agent: &str, server_name: &str, timeouts: SubagentTimeouts) -> Vec
                 idempotent_hint: true,
                 read_only_hint: false,
                 timeout_secs: Some(60),
+                meta: None,
             },
         ]
 }
