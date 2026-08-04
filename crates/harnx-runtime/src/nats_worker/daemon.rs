@@ -285,7 +285,7 @@ pub(crate) fn tool_servers_matching_use_tools(
             let display_name =
                 server_display_name(&server.name, server.package.as_deref(), agent_package);
             let matches = namespaced_use_tools.iter().any(|selector| {
-                harnx_mcp::client::selector_could_match_server(selector, &display_name, &[])
+                super::super::config::selector_could_match_server(selector, &display_name)
             });
             matches && seen_names.insert(server.name.clone())
         })
@@ -429,12 +429,13 @@ fn configured_worker_services(
         .as_ref()
         .and_then(|agent| harnx_core::package_namespace::pkg_from_qualified(agent.name()));
     let mut selectors = Vec::new();
-    for selector in config
+    let use_tools = config
         .agent
         .as_ref()
         .and_then(|agent| agent.use_tools())
-        .unwrap_or_default()
-    {
+        .or_else(|| config.use_tools.clone())
+        .unwrap_or_default();
+    for selector in use_tools {
         if let Some(namespaced) = namespaced_selector(&selector, agent_package) {
             selectors.push(namespaced);
         }

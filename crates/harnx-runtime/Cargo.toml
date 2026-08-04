@@ -37,7 +37,6 @@ harnx-hookset = { path = "../harnx-hookset" }
 harnx-hookset-server = { path = "../harnx-hookset-server" }
 harnx-toolset = { path = "../harnx-toolset" }
 harnx-toolset-server = { path = "../harnx-toolset-server" }
-harnx-mcp = { path = "../harnx-mcp" }
 harnx-rag = { path = "../harnx-rag" }
 harnx-render = { path = "../harnx-render" }
 harnx-spinner = { path = "../harnx-spinner" }

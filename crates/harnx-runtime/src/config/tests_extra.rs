@@ -1,6 +1,5 @@
 #![cfg(test)]
 
-use super::test_support::EnvGuard;
 use super::*;
 
 #[test]
@@ -28,53 +27,6 @@ fn expand_use_tools_empty_is_graceful() {
     let expanded = config.expand_use_tools(None, None);
 
     assert!(expanded.is_empty());
-}
-
-#[test]
-fn expand_use_tools_mcp_failure_logs_warning_and_continues() {
-    let _log_guard = lock_log_capture();
-    let temp = tempfile::TempDir::new().unwrap();
-    let log_file = temp.path().join("expand-use-tools.log");
-    let _log_path = EnvGuard::new_file("HARNX_LOG_PATH", &log_file);
-    let prev_level = std::env::var_os("HARNX_LOG_LEVEL");
-    // SAFETY: test-only; this test serializes env + logger-adjacent state.
-    unsafe { std::env::set_var("HARNX_LOG_LEVEL", "debug") };
-    let _ = crate::bootstrap::setup_logger(false);
-
-    let mut config = Config {
-        tools: crate::tool::Tools::init_from_mcp(Some(vec![make_tool_decl("local_tool")])),
-        mcp_servers: vec![harnx_mcp::McpServerConfig {
-            name: "broken".to_string(),
-            command: std::env::current_exe().unwrap().display().to_string(),
-            args: vec!["--definitely-not-a-valid-harnx-flag".to_string()],
-            env: std::collections::HashMap::new(),
-            enabled: true,
-            description: None,
-            rename_tools: std::collections::HashMap::new(),
-            tool_templates: std::collections::HashMap::new(),
-            hooks: None,
-            package: None,
-        }],
-        ..Config::default()
-    };
-    config.reinit_managers_for_agent(None);
-
-    let expanded = config.expand_use_tools(Some(&["*".to_string()]), None);
-
-    match prev_level {
-        Some(value) => unsafe { std::env::set_var("HARNX_LOG_LEVEL", value) },
-        None => unsafe { std::env::remove_var("HARNX_LOG_LEVEL") },
-    }
-
-    assert_eq!(
-        expanded,
-        vec!["local_tool", crate::session_history::TOOL_NAME]
-    );
-    let log = std::fs::read_to_string(log_file).unwrap_or_default();
-    assert!(
-        log.contains("MCP server 'broken' connection failed"),
-        "expected MCP warning in log, got: {log}"
-    );
 }
 
 // ── expand_use_tools regression tests (#886 filtering) ──────────────────────
@@ -256,11 +208,4 @@ fn make_tool_decl(name: &str) -> crate::tool::ToolDeclaration {
         idempotent_hint: None,
         read_only_hint: None,
     }
-}
-
-fn lock_log_capture() -> std::sync::MutexGuard<'static, ()> {
-    super::tests::LOG_CAPTURE_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
 }

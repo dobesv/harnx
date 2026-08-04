@@ -19,7 +19,7 @@ use harnx::test_utils::mock_openai_server::{
 };
 
 /// Write a config that uses the OpenAI client with gpt-5.6-sol:high alias
-/// AND includes the time_wait MCP tool for multi-turn testing.
+/// AND includes the bridged time_wait tool for multi-turn testing.
 fn write_responses_config_with_tool(
     dir: &std::path::Path,
     mock_base_url: &str,
@@ -82,17 +82,20 @@ fn write_responses_config_with_tool(
     )
     .context("failed to write agents/default.md")?;
 
-    // MCP servers dir with time_wait tool
-    let mcp_servers_dir = harnx_config_dir.join("mcp_servers");
-    std::fs::create_dir_all(&mcp_servers_dir).context("failed to create mcp_servers dir")?;
+    // Bridge the time server into the NATS tool registry.
+    let tool_servers_dir = harnx_config_dir.join("tool_servers");
+    std::fs::create_dir_all(&tool_servers_dir).context("failed to create tool_servers dir")?;
+    let bridge_bin =
+        mcp_time_bin.with_file_name(format!("harnx-mcp-bridge{}", std::env::consts::EXE_SUFFIX));
     std::fs::write(
-        mcp_servers_dir.join("time.yaml"),
+        tool_servers_dir.join("time.yaml"),
         format!(
-            "command: {}\nargs: []\ntools:\n  - time_wait\n",
+            "command: {}\nargs:\n  - --name\n  - time\n  - --\n  - {}\n",
+            bridge_bin.display(),
             mcp_time_bin.display()
         ),
     )
-    .context("failed to write mcp_servers/time.yaml")?;
+    .context("failed to write tool_servers/time.yaml")?;
 
     Ok(ConfigPaths {
         dir: dir.to_path_buf(),

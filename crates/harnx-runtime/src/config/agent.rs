@@ -14,7 +14,6 @@ const DEFAULT_AGENT_NAME: &str = "rag";
 pub struct Agent {
     config: AgentConfig,
     rag: Option<Arc<Rag>>,
-    mcp_manager: Option<Arc<McpManager>>,
 }
 
 impl std::ops::Deref for Agent {
@@ -32,11 +31,7 @@ impl std::ops::DerefMut for Agent {
 
 impl Agent {
     pub fn new(config: AgentConfig) -> Self {
-        Self {
-            config,
-            rag: None,
-            mcp_manager: None,
-        }
+        Self { config, rag: None }
     }
 
     pub fn into_config(self) -> AgentConfig {
@@ -239,6 +234,7 @@ pub fn resolve_variables(agent: &mut Agent) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn expand_agent_use_tool_selectors(config: &Config, use_tools: Option<Vec<String>>) -> Vec<String> {
     let Some(use_tools) = use_tools.filter(|selectors| !selectors.is_empty()) else {
         return Vec::new();
@@ -265,22 +261,8 @@ pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) 
         builtin(name)?
     };
 
-    let prefetched_tool_selectors = {
-        let guard = config.read();
-        expand_agent_use_tool_selectors(&guard, agent.config.use_tools())
-    };
-    let mcp_manager = config.read().mcp_manager.clone();
-    agent.mcp_manager = mcp_manager.clone();
-
-    let mcp_tools = match &mcp_manager {
-        Some(manager) => Some(
-            manager
-                .get_tools_for_selectors(&prefetched_tool_selectors)
-                .await,
-        ),
-        None => None,
-    };
-    agent.config.set_tools(Tools::init_from_mcp(mcp_tools));
+    // Tools are now loaded via NATS tool_servers, not direct MCP
+    agent.config.set_tools(Tools::init_from_mcp(None));
 
     let model = {
         let config = config.read();
@@ -690,29 +672,20 @@ pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>
 /// 3. Expand `use_tools` via `Config::expand_use_tools`
 /// 4. Assemble via `AgentConfig::export_rendered`
 ///
-/// The caller must provide a `Config` with `mcp_manager` already initialized
-/// (via `init_mcp_manager()` or by the TUI's existing runtime). This ensures
-/// both CLI and TUI can use the same function without requiring a live session.
+/// Tool declarations come from NATS tool providers configured for the runtime,
+/// so CLI and TUI callers can use the same function without requiring a live
+/// session.
 ///
 /// # Errors
 ///
 /// Returns a clear error if the agent is not found.
 ///
-/// # Example (CLI usage)
+/// # Example
 ///
 /// ```ignore
-/// let mut config = Config::load_from_file(&Config::config_file())?;
-/// config.init_mcp_manager();
+/// let config = Config::load_from_file(&Config::config_file())?;
 /// let rendered = render_agent_dump(&config, "my-agent")?;
 /// println!("{}", rendered);
-/// ```
-///
-/// # Example (TUI usage)
-///
-/// ```ignore
-/// // TUI already has a GlobalConfig with mcp_manager initialized
-/// let config = global_config.read();
-/// let rendered = render_agent_dump(&config, "some-agent")?;
 /// ```
 pub fn render_agent_dump(config: &Config, agent_name: &str) -> Result<String> {
     // Step 1: Load agent config by name

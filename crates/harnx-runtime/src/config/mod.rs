@@ -57,11 +57,8 @@ pub use self::agent::{
 pub(crate) use self::attachments::attachments_dir_for;
 pub use self::attachments::{write_attachment, Base64Encoder};
 pub use self::input::Input;
-pub use self::patches_split::mcp_server_display_name;
 pub(crate) use self::patches_split::server_display_name;
-use self::patches_split::{
-    apply_client_patch, apply_mcp_server_patch, load_package_mcp_patch, package_dir_name,
-};
+use self::patches_split::{apply_client_patch, package_dir_name};
 use self::session::Session;
 pub use self::session_meta::{
     build_picker_context, find_matching_session, parse_session_meta, sort_sessions_for_picker,
@@ -90,7 +87,6 @@ use crate::commands::{run_command, split_args_text};
 use crate::tool::{ToolDeclaration, ToolResult, Tools};
 use crate::utils::*;
 use harnx_hooks::HooksConfig;
-use harnx_mcp::{McpManager, McpServerConfig};
 use harnx_rag::Rag;
 use harnx_render::{MarkdownRender, RenderOptions};
 
@@ -184,7 +180,7 @@ fn selector_literal_prefix(selector: &str) -> &str {
         .map_or(selector, |idx| &selector[..idx])
 }
 
-fn selector_could_match_server(selector: &str, server_name: &str) -> bool {
+pub(crate) fn selector_could_match_server(selector: &str, server_name: &str) -> bool {
     if selector == "*" {
         return true;
     }
@@ -299,7 +295,6 @@ pub struct Config {
     // not in ConfigData, to avoid reverse deps from harnx-core).
     pub clients: Vec<ClientConfig>,
     pub nats_servers: Vec<NatsServerConfig>,
-    pub mcp_servers: Vec<McpServerConfig>,
     pub tool_servers: Vec<ToolServerConfig>,
 
     // Runtime state — unchanged from pre-A2:
@@ -312,7 +307,6 @@ pub struct Config {
 
     pub model: Model,
     pub tools: Tools,
-    pub mcp_manager: Option<Arc<McpManager>>,
     pub working_mode: WorkingMode,
     pub last_message: Option<LastMessage>,
 
@@ -359,14 +353,12 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("data", &self.data)
             .field("clients", &self.clients)
-            .field("mcp_servers", &self.mcp_servers)
             .field("tool_servers", &self.tool_servers)
             .field("macro_flag", &self.macro_flag)
             .field("info_flag", &self.info_flag)
             .field("agent_variables", &self.agent_variables)
             .field("model", &self.model)
             .field("tools", &self.tools)
-            .field("mcp_manager", &self.mcp_manager)
             .field("working_mode", &self.working_mode)
             .field("last_message", &self.last_message)
             .field("session", &self.session)
@@ -382,7 +374,6 @@ impl Clone for Config {
             data: self.data.clone(),
             clients: self.clients.clone(),
             nats_servers: self.nats_servers.clone(),
-            mcp_servers: self.mcp_servers.clone(),
             tool_servers: self.tool_servers.clone(),
             model_cooldowns: self.model_cooldowns.clone(),
             macro_flag: self.macro_flag,
@@ -392,7 +383,6 @@ impl Clone for Config {
             agent_variables: self.agent_variables.clone(),
             model: self.model.clone(),
             tools: self.tools.clone(),
-            mcp_manager: self.mcp_manager.clone(),
             working_mode: self.working_mode.clone(),
             last_message: self.last_message.clone(),
             session: self.session.clone(),
@@ -413,7 +403,7 @@ impl Config {
     /// its own session, without disturbing the original.
     ///
     /// SHARED (cheap `Arc`/value clones — the fork sees the same underlying
-    /// runtime resources): `mcp_manager`, `rag`,
+    /// runtime resources): `rag`,
     /// `model_cooldowns`, plus config data, clients, model, tools, agent, and
     /// all flags/overrides.
     ///
@@ -428,7 +418,6 @@ impl Config {
             data: self.data.clone(),
             clients: self.clients.clone(),
             nats_servers: self.nats_servers.clone(),
-            mcp_servers: self.mcp_servers.clone(),
             tool_servers: self.tool_servers.clone(),
             model_cooldowns: self.model_cooldowns.clone(),
             macro_flag: self.macro_flag,
@@ -438,7 +427,6 @@ impl Config {
             agent_variables: self.agent_variables.clone(),
             model: self.model.clone(),
             tools: self.tools.clone(),
-            mcp_manager: self.mcp_manager.clone(),
             working_mode: self.working_mode.clone(),
             last_message: self.last_message.clone(),
             session: None,
@@ -464,7 +452,6 @@ impl Default for Config {
 
             clients: vec![],
             nats_servers: vec![],
-            mcp_servers: vec![],
             tool_servers: vec![],
 
             model_cooldowns: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
@@ -476,7 +463,6 @@ impl Default for Config {
 
             model: Default::default(),
             tools: Default::default(),
-            mcp_manager: None,
             working_mode: WorkingMode::Cmd,
             last_message: None,
 
@@ -581,7 +567,7 @@ impl Config {
             "NOTE: Remember to restart harnx if there are changes made.\nConfig files:\n  {}\n  {}/\n  {}/",
             config_path.display(),
             Self::clients_dir().display(),
-            Self::mcp_servers_dir().display(),
+            Self::tool_servers_dir().display(),
         ));
         Ok(())
     }
@@ -1326,15 +1312,6 @@ impl Config {
                         .unwrap_or_else(|| vec![selector.to_string()])
                 })
                 .collect::<Vec<String>>();
-            if self.needs_mcp_tools() {
-                if let Some(manager) = &self.mcp_manager {
-                    if selectors.iter().any(|selector| selector == "*") {
-                        declarations.extend(manager.get_all_tools_blocking());
-                    } else {
-                        declarations.extend(manager.get_tools_for_selectors_blocking(&selectors));
-                    }
-                }
-            }
             let (filtered_handoff_declarations, filtered_handoff_targets) =
                 self.filtered_handoff_declarations(&selectors, active_pkg);
             declarations.extend(filtered_handoff_declarations);

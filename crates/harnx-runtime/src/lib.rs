@@ -49,6 +49,3 @@ pub use agent_loop::{
 };
 
 pub use tool::{ConfirmToolUseFn, ToolApprovalInterrupt, ToolUseConfirmation};
-
-/// Re-export for integration tests — verifies the scoped-MCP naming logic.
-pub use config::mcp_server_display_name as mcp_server_display_name_for_test;

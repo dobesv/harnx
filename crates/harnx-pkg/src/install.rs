@@ -163,25 +163,6 @@ fn print_install_summary(name: &str, pkg_dir: &Path, source: &PackageSource, tag
             }
         }
     }
-
-    let mcp_dir = pkg_dir.join("mcp_servers");
-    if mcp_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(&mcp_dir) {
-            let servers: Vec<_> = entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("yaml"))
-                .filter_map(|e| {
-                    e.path()
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .map(str::to_string)
-                })
-                .collect();
-            if !servers.is_empty() {
-                println!("  MCP servers: {}", servers.join(", "));
-            }
-        }
-    }
 }
 
 #[cfg(test)]

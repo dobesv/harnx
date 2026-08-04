@@ -3,7 +3,7 @@
 //! `ConfigData` owns the scalar payload of `config.yaml`. It is fully
 //! serde-deserializable and has no runtime state, handles, or closures.
 //! The `harnx` crate's `Config` type wraps `ConfigData` and adds runtime
-//! fields (clients, mcp_manager, session, agent, rag, …).
+//! fields (clients, session, agent, rag, …).
 
 use std::collections::HashMap;
 

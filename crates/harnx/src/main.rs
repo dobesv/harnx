@@ -131,8 +131,7 @@ async fn run_command(command: &Commands) -> Result<()> {
     match command {
         Commands::Info(info_args) => match &info_args.command {
             InfoSubcommands::Agent { name } => {
-                let mut config = Config::init(WorkingMode::Cmd, true).await?;
-                config.init_mcp_manager();
+                let config = Config::init(WorkingMode::Cmd, true).await?;
                 let out = render_agent_dump(&config, name)?;
                 println!("{out}");
                 Ok(())

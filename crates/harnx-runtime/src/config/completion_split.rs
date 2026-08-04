@@ -126,11 +126,6 @@ impl Config {
                 .map(|v| v.name.clone())
                 .collect();
             candidates.extend(self.toolsets.keys().map(|v| v.to_string()));
-            if let Some(manager) = &self.mcp_manager {
-                for name in manager.list_servers() {
-                    candidates.push(format!("{name}_*"));
-                }
-            }
             let active = self.active_tool_names();
             values = candidates
                 .into_iter()
@@ -141,12 +136,6 @@ impl Config {
             let agent = self.extract_agent();
             let current = agent.use_tools().unwrap_or_default();
             values = current.into_iter().map(|s| (s, None)).collect();
-        } else if cmd == ".mcp" && args.len() == 2 {
-            let subcmd = args[0];
-            if matches!(subcmd, "connect" | "disconnect" | "tools") {
-                let servers = Self::mcp_list_servers_from_config(self);
-                values = servers.into_iter().map(|v| (v, None)).collect();
-            }
         } else if cmd == ".agent" {
             if args.len() == 2 {
                 let dir = Self::agent_data_dir(args[0]).join(paths::SESSIONS_DIR_NAME);
