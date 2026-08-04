@@ -31,6 +31,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
+#[cfg(test)]
+mod allowlist_tests;
 mod handler;
 mod handlers;
 mod params;
