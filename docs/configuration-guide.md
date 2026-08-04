@@ -1,6 +1,6 @@
 # Configuration Guide
 
-Harnx uses a modular configuration structure. Global settings are defined in a main `config.yaml`, while LLM providers and MCP servers are defined in separate YAML files within dedicated subdirectories.
+Harnx uses a modular configuration structure. Global settings are defined in a main `config.yaml`, while LLM providers and tool servers are defined in separate YAML files within dedicated subdirectories.
 
 ## Configuration Directory
 
@@ -28,11 +28,10 @@ Harnx organizes configuration into the following structure:
 ├── clients/             # LLM provider configurations
 │   ├── openai.yaml
 │   └── claude.yaml
-├── mcp_servers/         # MCP server configurations (user stdio servers)
-│   └── custom.yaml
 ├── tool_servers/        # Tool servers (native toolsets and bridged MCP servers)
 │   ├── fs.yaml
-│   └── bash.yaml
+│   ├── bash.yaml
+│   └── exa.yaml
 └── agents/              # Agent definitions (.md files)
     └── coder.md
 ```
@@ -110,11 +109,13 @@ patches:
     - 'if (.body.model | test("gpt-5.*")) then .body.reasoning_effort = "high" end'
 ```
 
-## Tool Servers (`tool_servers/`) and MCP Servers (`mcp_servers/`)
+## Tool Servers (`tool_servers/`)
 
-Tool servers provide external tools. Native toolset servers (such as `harnx-fs-tools`, `harnx-bash-tools`, `harnx-plans-tools`, and `harnx-grep-tools`) run directly without a bridge wrapper, while MCP servers run directly or via `harnx-mcp-bridge`. Each server is defined in a file like `tool_servers/fs.yaml` or `mcp_servers/custom.yaml`.
+Tool servers provide external tools to Harnx. Native toolset servers (such as `harnx-fs-tools`, `harnx-bash-tools`, `harnx-plans-tools`, and `harnx-grep-tools`) run directly without a bridge wrapper, while external stdio MCP servers run via `harnx-mcp-bridge`. Each server is defined in a file under `tool_servers/` (such as `tool_servers/fs.yaml` or `tool_servers/exa.yaml`).
 
 The **filename** (without `.yaml`) is used as the server name.
+
+### Native Tool Server Example
 
 ```yaml
 command: harnx-fs-tools    # Executable command
@@ -129,6 +130,24 @@ description: "Filesystem access tools"
 ```
 
 Filesystem and bash tool servers deny filesystem access when no allow inputs are configured. Use `--allow-read`, `--allow-write`, `--allow-exec`, or `--allow-rwx` for explicit paths, or opt into `--allow-common-default`, `--allow-dev-tools`, `--allow-repo-work`, or `--allow-all`. Filesystem tools enforce read and write access separately. See [Allowlist migration](migration-allowlist.md) for removed settings.
+
+### External MCP Server Example (`harnx-mcp-bridge`)
+
+To configure an external stdio MCP server, define a server in `tool_servers/` that launches `harnx-mcp-bridge`:
+
+```yaml
+command: harnx-mcp-bridge
+description: "Web search via Exa API"
+args:
+  - --name
+  - exa
+  - --
+  - npx
+  - "-y"
+  - exa-mcp-server
+env:
+  HARNX_BASH_ENV_PASSTHROUGH: EXA_API_KEY
+```
 
 > **Passing secrets to MCP servers.** Two things commonly trip people up:
 >
@@ -169,7 +188,7 @@ A comprehensive reference for the new folder structure and common provider/serve
 This directory includes:
 - `config.yaml` with recommended global settings.
 - `clients/` examples for OpenAI, Claude, Gemini, Bedrock, Azure, Vertex AI, and more.
-- `mcp_servers/` and `tool_servers/` examples for filesystem, shell, and web search.
+- `tool_servers/` examples for filesystem, shell, and web search.
 - `agents/` examples for interactive assistants and sub-agents (auto-registered as NATS delegation toolsets).
 
 ---
