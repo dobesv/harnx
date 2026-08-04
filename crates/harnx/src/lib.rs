@@ -4,8 +4,7 @@ pub mod cli_event_sink;
 
 pub mod test_utils;
 
-pub use harnx_mcp as mcp;
-pub use harnx_mcp::safety as mcp_safety;
+pub use harnx_core::safety as mcp_safety;
 pub use harnx_tui as tui;
 
 // Re-export the runtime bundle so `crate::config::X`, `crate::client::X`,

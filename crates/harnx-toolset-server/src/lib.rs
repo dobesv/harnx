@@ -1,5 +1,8 @@
 //! Server-side adapters for hosting a [`harnx_toolset::Toolset`].
 
+pub mod content;
+pub mod schema;
+
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv, stream};
 use futures_util::StreamExt;

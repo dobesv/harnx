@@ -29,6 +29,7 @@ pub mod package_namespace;
 pub mod path;
 pub mod provider_config;
 pub mod retry_config;
+pub mod safety;
 pub mod session;
 pub mod session_log;
 pub mod session_reconstruct;

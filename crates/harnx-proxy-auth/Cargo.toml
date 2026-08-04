@@ -44,7 +44,6 @@ jaq-std.workspace = true
 async-nats.workspace = true
 harnx-engine = { path = "../harnx-engine" }
 harnx-hooks = { path = "../harnx-hooks" }
-harnx-mcp = { path = "../harnx-mcp" }
 harnx-runtime = { path = "../harnx-runtime" }
 http-body-util.workspace = true
 hyper.workspace = true

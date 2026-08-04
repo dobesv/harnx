@@ -13,7 +13,6 @@ async-trait = { workspace = true }
 fancy-regex = { workspace = true }
 gix = { workspace = true }
 harnx-core = { path = "../harnx-core" }
-harnx-mcp = { path = "../harnx-mcp" }
 harnx-mcp-history = { workspace = true }
 harnx-sandbox-common = { path = "../harnx-sandbox-common" }
 harnx-tool-allow = { workspace = true }

@@ -116,7 +116,7 @@ pub(crate) async fn render_attachment_preview(path: &Path) -> Option<String> {
     // Reuse the same middle-cropping utility the agent uses so previews keep
     // the first and last lines instead of cutting off only the head. See
     // issue #770.
-    let opts = harnx_mcp::safety::TruncateOpts {
+    let opts = harnx_core::safety::TruncateOpts {
         head_lines: ATTACHMENT_PREVIEW_HEAD_LINES,
         tail_lines: ATTACHMENT_PREVIEW_TAIL_LINES,
         // Allow long single lines to be cropped in the middle too.
@@ -126,7 +126,7 @@ pub(crate) async fn render_attachment_preview(path: &Path) -> Option<String> {
         marker: Some("...".to_string()),
     };
 
-    let preview = harnx_mcp::safety::truncate_output(text, &opts);
+    let preview = harnx_core::safety::truncate_output(text, &opts);
     let preview = preview.trim_end_matches('\n').to_string();
     if preview.is_empty() {
         return None;

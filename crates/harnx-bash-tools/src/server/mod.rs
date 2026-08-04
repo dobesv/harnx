@@ -1,14 +1,14 @@
-use harnx_mcp::safety::{format_size, sanitize_output_text, truncate_output, TruncateOpts};
+use harnx_core::safety::{format_size, sanitize_output_text, truncate_output, TruncateOpts};
 
 use fancy_regex::Regex;
 use gix::ObjectId;
-use harnx_mcp::schema::object_schema_with_desc;
 use harnx_mcp_history::classify::{classify_command, SnapshotDecision};
 use harnx_mcp_history::HistoryManager;
 #[cfg(unix)]
 use harnx_sandbox_common::build_default_sandbox_args;
 use harnx_sandbox_common::SandboxConfig;
 use harnx_tool_allow::{validate_path, validate_write_path, ResolvedAllowlist};
+use harnx_toolset_server::schema::object_schema_with_desc;
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
 #[cfg(unix)]

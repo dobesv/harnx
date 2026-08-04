@@ -1,7 +1,7 @@
-use harnx_mcp::content::WithAudience;
-use harnx_mcp::safety::{
+use harnx_core::safety::{
     format_size, truncate_output, TruncateOpts, DEFAULT_MAX_BYTES, LS_SCAN_HARD_LIMIT,
 };
+use harnx_toolset_server::content::WithAudience;
 use rmcp::model::{CallToolResult, ContentBlock, ErrorData, Role};
 use std::fmt::Write as _;
 

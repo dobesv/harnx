@@ -19,7 +19,6 @@ crossterm = { workspace = true }
 fancy-regex = { workspace = true }
 futures-util = { workspace = true }
 harnx-core = { path = "../harnx-core" }
-harnx-mcp = { path = "../harnx-mcp" }
 harnx-render = { path = "../harnx-render" }
 harnx-runtime = { path = "../harnx-runtime" }
 indexmap = { workspace = true }

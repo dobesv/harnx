@@ -13,8 +13,7 @@ static GLOBAL_ALLOC: harnx_core::alloc_guard::HeapGuard = harnx_core::alloc_guar
 #[cfg(test)]
 pub mod test_utils;
 
-pub use harnx_mcp as mcp;
-pub use harnx_mcp::safety as mcp_safety;
+pub use harnx_core::safety as mcp_safety;
 pub use harnx_runtime::{client, commands, config, tool};
 pub use harnx_tui as tui;
 
