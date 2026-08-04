@@ -32,23 +32,45 @@ pub fn expand_tilde(raw: &str) -> String {
 ///    expansion and no `${...}` syntax.
 /// 3. Else apply `expand_tilde` and return resulting `PathBuf`.
 pub fn expand_path_var(raw: &str, cwd: &Path) -> Option<PathBuf> {
-    if let Some((prefix, kind)) = pseudo_var(raw) {
-        return expand_pseudo_var(raw, prefix, kind, cwd);
+    if let Some(pseudo) = pseudo_var(raw) {
+        return expand_pseudo_var(raw, pseudo, cwd);
     }
     expand_env_var(raw).or_else(|| Some(PathBuf::from(expand_tilde(raw))))
 }
 
 #[cfg(unix)]
-fn pseudo_var(raw: &str) -> Option<(&'static str, crate::RootKind)> {
+#[derive(Clone, Copy)]
+struct PseudoVar {
+    prefix: &'static str,
+    kind: crate::RootKind,
+}
+
+#[cfg(unix)]
+fn pseudo_var(raw: &str) -> Option<PseudoVar> {
     [
-        ("$GIT_ROOT", crate::RootKind::GitRoot),
-        ("$GIT_COMMON_DIR", crate::RootKind::GitCommonDir),
-        ("$NODE_PROJECT_ROOT", crate::RootKind::NodeProjectRoot),
-        ("$CARGO_ROOT", crate::RootKind::CargoRoot),
-        ("$GO_ROOT", crate::RootKind::GoRoot),
+        PseudoVar {
+            prefix: "$GIT_ROOT",
+            kind: crate::RootKind::GitRoot,
+        },
+        PseudoVar {
+            prefix: "$GIT_COMMON_DIR",
+            kind: crate::RootKind::GitCommonDir,
+        },
+        PseudoVar {
+            prefix: "$NODE_PROJECT_ROOT",
+            kind: crate::RootKind::NodeProjectRoot,
+        },
+        PseudoVar {
+            prefix: "$CARGO_ROOT",
+            kind: crate::RootKind::CargoRoot,
+        },
+        PseudoVar {
+            prefix: "$GO_ROOT",
+            kind: crate::RootKind::GoRoot,
+        },
     ]
     .into_iter()
-    .find(|(prefix, _)| path_var_matches(raw, prefix))
+    .find(|pseudo| path_var_matches(raw, pseudo.prefix))
 }
 
 #[cfg(unix)]
@@ -60,16 +82,11 @@ fn path_var_matches(raw: &str, prefix: &str) -> bool {
 }
 
 #[cfg(unix)]
-fn expand_pseudo_var(
-    raw: &str,
-    prefix: &str,
-    kind: crate::RootKind,
-    cwd: &Path,
-) -> Option<PathBuf> {
-    let root = crate::detect_project_root(kind, cwd)?;
+fn expand_pseudo_var(raw: &str, pseudo: PseudoVar, cwd: &Path) -> Option<PathBuf> {
+    let root = crate::detect_project_root(pseudo.kind, cwd)?;
     Some(join_remainder(
         root,
-        raw.strip_prefix(prefix).expect("matched prefix"),
+        raw.strip_prefix(pseudo.prefix).expect("matched prefix"),
     ))
 }
 

@@ -1,20 +1,52 @@
 use super::*;
 
+async fn list_directory(temp_dir: &TestDir) -> CallToolResult {
+    FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]))
+        .list_directory_impl(ListDirectoryParams {
+            path: temp_dir.path().to_string_lossy().to_string(),
+            recursive: Some(false),
+        })
+        .await
+        .unwrap()
+}
+
+struct SearchSpec<'a> {
+    include: Option<&'a str>,
+    max_results: usize,
+}
+
+async fn search_files(temp_dir: &TestDir, spec: SearchSpec<'_>) -> CallToolResult {
+    FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]))
+        .search_files_impl(SearchFilesParams {
+            pattern: "needle".to_string(),
+            path: Some(temp_dir.path().to_string_lossy().to_string()),
+            include: spec.include.map(str::to_string),
+            context_lines: Some(0),
+            ignore_case: Some(false),
+            max_results: Some(spec.max_results),
+        })
+        .await
+        .unwrap()
+}
+
+async fn find_files(temp_dir: &TestDir, max_results: usize) -> CallToolResult {
+    FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]))
+        .find_files_impl(FindFilesParams {
+            pattern: "*.txt".to_string(),
+            path: Some(temp_dir.path().to_string_lossy().to_string()),
+            max_results: Some(max_results),
+        })
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn test_list_directory_flat() {
     let temp_dir = TestDir::new();
     std::fs::create_dir_all(temp_dir.path().join("nested")).unwrap();
     std::fs::write(temp_dir.path().join("root.txt"), "root").unwrap();
     std::fs::write(temp_dir.path().join("nested").join("child.txt"), "child").unwrap();
-    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
-
-    let result = server
-        .list_directory_impl(ListDirectoryParams {
-            path: temp_dir.path().to_string_lossy().to_string(),
-            recursive: Some(false),
-        })
-        .await
-        .unwrap();
+    let result = list_directory(&temp_dir).await;
 
     let text = text_content(&result);
     assert!(text.contains("nested/"));
@@ -27,19 +59,14 @@ async fn test_search_files_basic() {
     let temp_dir = TestDir::new();
     std::fs::write(temp_dir.path().join("one.txt"), "alpha\nneedle\nomega\n").unwrap();
     std::fs::write(temp_dir.path().join("two.txt"), "nothing here\n").unwrap();
-    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
-
-    let result = server
-        .search_files_impl(SearchFilesParams {
-            pattern: "needle".to_string(),
-            path: Some(temp_dir.path().to_string_lossy().to_string()),
-            include: Some("*.txt".to_string()),
-            context_lines: Some(0),
-            ignore_case: Some(false),
-            max_results: Some(10),
-        })
-        .await
-        .unwrap();
+    let result = search_files(
+        &temp_dir,
+        SearchSpec {
+            include: Some("*.txt"),
+            max_results: 10,
+        },
+    )
+    .await;
 
     let text = text_content(&result);
     assert!(text.contains("one.txt:2: needle"));
@@ -84,15 +111,7 @@ async fn test_list_directory_summary_not_limited_when_small() {
     for i in 0..3 {
         std::fs::write(temp_dir.path().join(format!("f{i}.txt")), "x").unwrap();
     }
-    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
-
-    let result = server
-        .list_directory_impl(ListDirectoryParams {
-            path: temp_dir.path().to_string_lossy().to_string(),
-            recursive: Some(false),
-        })
-        .await
-        .unwrap();
+    let result = list_directory(&temp_dir).await;
 
     let summary = user_summary(&result);
     assert!(
@@ -113,15 +132,7 @@ async fn test_list_directory_summary_limited_when_over_default_limit() {
     for i in 0..=DEFAULT_LS_LIMIT {
         std::fs::write(temp_dir.path().join(format!("f{i:04}.txt")), "x").unwrap();
     }
-    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
-
-    let result = server
-        .list_directory_impl(ListDirectoryParams {
-            path: temp_dir.path().to_string_lossy().to_string(),
-            recursive: Some(false),
-        })
-        .await
-        .unwrap();
+    let result = list_directory(&temp_dir).await;
 
     let summary = user_summary(&result);
     // Should show "Listed 500 of 501 entries" — capped count + true total.
@@ -179,19 +190,14 @@ async fn test_search_files_summary_variants() {
         for (name, content) in case.files {
             std::fs::write(temp_dir.path().join(name), content).unwrap();
         }
-        let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
-
-        let result = server
-            .search_files_impl(SearchFilesParams {
-                pattern: "needle".to_string(),
-                path: Some(temp_dir.path().to_string_lossy().to_string()),
+        let result = search_files(
+            &temp_dir,
+            SearchSpec {
                 include: None,
-                context_lines: Some(0),
-                ignore_case: Some(false),
-                max_results: Some(case.max_results),
-            })
-            .await
-            .unwrap();
+                max_results: case.max_results,
+            },
+        )
+        .await;
 
         (case.check)(user_summary(&result).as_str());
     }
@@ -203,16 +209,7 @@ async fn test_find_files_basic() {
     // the glob crate expects Unix separators on all platforms.
     let temp_dir = TestDir::new();
     std::fs::write(temp_dir.path().join("hello.txt"), "").unwrap();
-    let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
-
-    let result = server
-        .find_files_impl(FindFilesParams {
-            pattern: "*.txt".to_string(),
-            path: Some(temp_dir.path().to_string_lossy().to_string()),
-            max_results: Some(10),
-        })
-        .await
-        .unwrap();
+    let result = find_files(&temp_dir, 10).await;
 
     let text = text_content(&result);
     assert!(
@@ -261,16 +258,7 @@ async fn test_find_files_summary_variants() {
         for name in case.files {
             std::fs::write(temp_dir.path().join(name), "").unwrap();
         }
-        let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
-
-        let result = server
-            .find_files_impl(FindFilesParams {
-                pattern: "*.txt".to_string(),
-                path: Some(temp_dir.path().to_string_lossy().to_string()),
-                max_results: Some(case.max_results),
-            })
-            .await
-            .unwrap();
+        let result = find_files(&temp_dir, case.max_results).await;
 
         (case.check)(user_summary(&result).as_str());
     }

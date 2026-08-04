@@ -1,25 +1,47 @@
 use super::*;
 
-#[tokio::test]
-async fn test_read_file_with_offset_limit() {
-    let temp_dir = TestDir::new();
-    let file_path = temp_dir.path().join("offset.txt");
-    std::fs::write(&file_path, "one\ntwo\nthree\nfour\n").unwrap();
-    let server = make_server(temp_dir.path());
+#[derive(Default)]
+struct ReadSpec {
+    offset: Option<usize>,
+    limit: Option<usize>,
+    tail: Option<usize>,
+    grep: Option<String>,
+}
 
-    let result = server
+async fn read_fixture(
+    file_name: &str,
+    content: &[u8],
+    spec: ReadSpec,
+) -> Result<CallToolResult, ErrorData> {
+    let temp_dir = TestDir::new();
+    let file_path = write_fixture(&temp_dir, file_name, content);
+    make_server(temp_dir.path())
         .read_file_impl(ReadFileParams {
             path: path_string(&file_path),
-            offset: Some(2),
-            limit: Some(2),
-            tail: None,
-            grep: None,
+            offset: spec.offset,
+            limit: spec.limit,
+            tail: spec.tail,
+            grep: spec.grep,
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
         })
         .await
-        .unwrap();
+}
+
+#[tokio::test]
+async fn test_read_file_with_offset_limit() {
+    let result = read_fixture(
+        "offset.txt",
+        b"one\ntwo\nthree\nfour\n",
+        ReadSpec {
+            offset: Some(2),
+            limit: Some(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     let text = text_content(&result);
     assert!(text.contains("2: two"));
@@ -29,24 +51,16 @@ async fn test_read_file_with_offset_limit() {
 
 #[tokio::test]
 async fn test_read_file_with_grep() {
-    let temp_dir = TestDir::new();
-    let file_path = temp_dir.path().join("grep.txt");
-    std::fs::write(&file_path, "alpha\nmatch-one\nbeta\nmatch-two\n").unwrap();
-    let server = make_server(temp_dir.path());
-
-    let result = server
-        .read_file_impl(ReadFileParams {
-            path: path_string(&file_path),
-            offset: None,
-            limit: None,
-            tail: None,
+    let result = read_fixture(
+        "grep.txt",
+        b"alpha\nmatch-one\nbeta\nmatch-two\n",
+        ReadSpec {
             grep: Some("match".to_string()),
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-        })
-        .await
-        .unwrap();
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     let text = text_content(&result);
     assert!(text.contains("2: match-one"));
@@ -56,24 +70,16 @@ async fn test_read_file_with_grep() {
 
 #[tokio::test]
 async fn test_read_file_with_tail() {
-    let temp_dir = TestDir::new();
-    let file_path = temp_dir.path().join("tail.txt");
-    std::fs::write(&file_path, "one\ntwo\nthree\nfour\n").unwrap();
-    let server = make_server(temp_dir.path());
-
-    let result = server
-        .read_file_impl(ReadFileParams {
-            path: path_string(&file_path),
-            offset: None,
-            limit: None,
+    let result = read_fixture(
+        "tail.txt",
+        b"one\ntwo\nthree\nfour\n",
+        ReadSpec {
             tail: Some(2),
-            grep: None,
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-        })
-        .await
-        .unwrap();
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     let text = text_content(&result);
     assert!(text.contains("3: three"));
@@ -83,25 +89,17 @@ async fn test_read_file_with_tail() {
 
 /// Read `content` with combined `offset`+`tail` and return the rendered text.
 async fn read_offset_tail(content: &str, offset: usize, tail: usize) -> String {
-    let temp_dir = TestDir::new();
-    let file_path = temp_dir.path().join("offset_tail.txt");
-    std::fs::write(&file_path, content).unwrap();
-    let server = make_server(temp_dir.path());
-
-    let result = server
-        .read_file_impl(ReadFileParams {
-            path: path_string(&file_path),
+    let result = read_fixture(
+        "offset_tail.txt",
+        content.as_bytes(),
+        ReadSpec {
             offset: Some(offset),
-            limit: None,
             tail: Some(tail),
-            grep: None,
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-        })
-        .await
-        .unwrap();
-
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     text_content(&result)
 }
 
@@ -141,25 +139,16 @@ fn assert_window_without_notice(text: &str) {
 
 #[tokio::test]
 async fn test_read_file_offset_beyond_eof_with_tail_errors() {
-    let temp_dir = TestDir::new();
-    let file_path = temp_dir.path().join("offset_tail_eof.txt");
-    std::fs::write(&file_path, "one\ntwo\nthree\n").unwrap();
-    let server = make_server(temp_dir.path());
-
-    // offset one past EOF (total=3, offset=4) with tail must error, matching
-    // the non-tail path.
-    let result = server
-        .read_file_impl(ReadFileParams {
-            path: path_string(&file_path),
+    let result = read_fixture(
+        "offset_tail_eof.txt",
+        b"one\ntwo\nthree\n",
+        ReadSpec {
             offset: Some(4),
-            limit: None,
             tail: Some(2),
-            grep: None,
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-        })
-        .await;
+            ..Default::default()
+        },
+    )
+    .await;
 
     let message = result.expect_err("expected error").message;
     assert!(
@@ -170,25 +159,15 @@ async fn test_read_file_offset_beyond_eof_with_tail_errors() {
 
 #[tokio::test]
 async fn test_read_file_offset_zero_rejected() {
-    let temp_dir = TestDir::new();
-    let file_path = temp_dir.path().join("offset_zero.txt");
-    std::fs::write(&file_path, "one\ntwo\n").unwrap();
-    let server = make_server(temp_dir.path());
-
-    // Explicit offset=0 is invalid (offset is 1-indexed), matching
-    // read_exec_log's contract rather than silently coercing to 1.
-    let result = server
-        .read_file_impl(ReadFileParams {
-            path: path_string(&file_path),
+    let result = read_fixture(
+        "offset_zero.txt",
+        b"one\ntwo\n",
+        ReadSpec {
             offset: Some(0),
-            limit: None,
-            tail: None,
-            grep: None,
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-        })
-        .await;
+            ..Default::default()
+        },
+    )
+    .await;
 
     let message = result.expect_err("expected error").message;
     assert!(message.contains("offset must be >= 1"), "got: {message}");
@@ -196,22 +175,7 @@ async fn test_read_file_offset_zero_rejected() {
 
 #[tokio::test]
 async fn test_read_file_binary_detection() {
-    let temp_dir = TestDir::new();
-    let file_path = temp_dir.path().join("binary.bin");
-    std::fs::write(&file_path, b"hello\0world").unwrap();
-    let server = make_server(temp_dir.path());
-
-    let result = server
-        .read_file_impl(ReadFileParams {
-            path: path_string(&file_path),
-            offset: None,
-            limit: None,
-            tail: None,
-            grep: None,
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-        })
+    let result = read_fixture("binary.bin", b"hello\0world", ReadSpec::default())
         .await
         .unwrap();
 
@@ -221,24 +185,13 @@ async fn test_read_file_binary_detection() {
 
 #[tokio::test]
 async fn test_read_file_image_png() {
-    let temp_dir = TestDir::new();
-    let file_path = temp_dir.path().join("test.png");
-    std::fs::write(&file_path, b"\x89PNG\r\n\x1a\n...fake...").unwrap();
-    let server = make_server(temp_dir.path());
-
-    let result = server
-        .read_file_impl(ReadFileParams {
-            path: path_string(&file_path),
-            offset: None,
-            limit: None,
-            tail: None,
-            grep: None,
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-        })
-        .await
-        .unwrap();
+    let result = read_fixture(
+        "test.png",
+        b"\x89PNG\r\n\x1a\n...fake...",
+        ReadSpec::default(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.is_error, Some(false));
     let mut found_image = false;
@@ -255,26 +208,9 @@ async fn test_read_file_image_png() {
 
 #[tokio::test]
 async fn test_read_file_image_oversized() {
-    let temp_dir = TestDir::new();
-    let file_path = temp_dir.path().join("big.jpg");
-    // > 5MB
-    let big_data = vec![0xFF, 0xD8, 0xFF, 0x00];
-    let mut file_data = big_data.clone();
+    let mut file_data = vec![0xFF, 0xD8, 0xFF, 0x00];
     file_data.resize(5 * 1024 * 1024 + 10, 0);
-    std::fs::write(&file_path, &file_data).unwrap();
-    let server = make_server(temp_dir.path());
-
-    let result = server
-        .read_file_impl(ReadFileParams {
-            path: path_string(&file_path),
-            offset: None,
-            limit: None,
-            tail: None,
-            grep: None,
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-        })
+    let result = read_fixture("big.jpg", &file_data, ReadSpec::default())
         .await
         .unwrap();
 
