@@ -334,6 +334,9 @@ pub(crate) fn replay_log_entries_for_external(
                 session.compressed_messages.clear();
                 session.data_urls.clear();
             }
+            // A failed turn is a transcript annotation, not conversation
+            // history — replaying it would feed the error back to the model.
+            SessionLogEntry::Error { .. } => {}
             SessionLogEntry::Cancel { .. } => {}
             SessionLogEntry::EditEntries { .. }
             | SessionLogEntry::Rewind { .. }

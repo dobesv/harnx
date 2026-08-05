@@ -1178,6 +1178,7 @@ mod tests {
             response: Some("world".to_string()),
             session_id: "session".to_string(),
             was_cancelled: false,
+            error: None,
             user_msg_seq: 1,
             user_msg_id: "message".to_string(),
         };

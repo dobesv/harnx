@@ -58,6 +58,101 @@ pub(crate) fn new_client_message_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// How often the client re-reads the session lease. Slower than the durable
+/// completion check because a worker's death is not latency-sensitive and each
+/// read is a NATS round trip on every in-flight turn.
+const ORPHAN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Consecutive lease reads with no holder before a turn is declared orphaned.
+/// Two reads at the interval above leave ~4s of slack for a worker's lease
+/// release to race the barrier it just wrote.
+const ORPHAN_MISSING_CHECKS: u32 = 2;
+
+/// Detects a turn whose worker vanished without writing a barrier.
+///
+/// The worker writes its assistant message (or its `Error` entry) before
+/// releasing the session lease, so "lease gone, nothing in the log" means the
+/// worker died — a panic, a kill, a lost connection. Only trips once a lease
+/// has actually been observed, so a worker that is slow to claim the activation
+/// is never mistaken for a dead one. A turn no worker ever picks up still waits
+/// indefinitely, which is the correct behaviour for a queued session.
+struct OrphanWatchdog {
+    lease_config: crate::nats_lease::NatsLeaseConfig,
+    /// Opened once and reused: `get_key_value` costs a `stream_info` round trip
+    /// that the per-poll `get` does not.
+    bucket: Option<async_nats::jetstream::kv::Store>,
+    next_check: tokio::time::Instant,
+    saw_lease: bool,
+    missing_checks: u32,
+}
+
+impl OrphanWatchdog {
+    fn new() -> Self {
+        Self {
+            lease_config: crate::nats_lease::NatsLeaseConfig::default(),
+            bucket: None,
+            next_check: tokio::time::Instant::now() + ORPHAN_CHECK_INTERVAL,
+            saw_lease: false,
+            missing_checks: 0,
+        }
+    }
+
+    /// The failure message to end the turn with, or `None` to keep waiting.
+    async fn check(&mut self, jetstream: &jetstream::Context, session_id: &str) -> Option<String> {
+        let now = tokio::time::Instant::now();
+        if now < self.next_check {
+            return None;
+        }
+        self.next_check = now + ORPHAN_CHECK_INTERVAL;
+
+        if self.bucket.is_none() {
+            self.bucket = crate::nats_lease::open_lease_bucket(jetstream, &self.lease_config).await;
+        }
+        // No bucket means no worker has ever leased on this cluster; that is
+        // indistinguishable from "not started yet", so keep waiting.
+        let bucket = self.bucket.as_ref()?;
+
+        let holder = match crate::nats_lease::lease_holder_in(
+            bucket,
+            &self.lease_config,
+            session_id,
+        )
+        .await
+        {
+            Ok(holder) => holder,
+            Err(error) => {
+                // An unreadable lease says nothing about the worker.
+                log::debug!("thin client: lease liveness check failed: {error:#}");
+                self.missing_checks = 0;
+                return None;
+            }
+        };
+
+        let Some(holder) = holder else {
+            if !self.saw_lease {
+                return None;
+            }
+            self.missing_checks += 1;
+            if self.missing_checks < ORPHAN_MISSING_CHECKS {
+                return None;
+            }
+            return Some(
+                "The worker handling this session stopped without answering. \
+                 Check the worker log for the underlying failure."
+                    .to_string(),
+            );
+        };
+
+        log::trace!(
+            "thin client: session {session_id} held by {}",
+            holder.worker_id
+        );
+        self.saw_lease = true;
+        self.missing_checks = 0;
+        None
+    }
+}
+
 /// Configuration for a thin-client session.
 #[derive(Clone)]
 pub struct ThinClientConfig {
@@ -218,6 +313,7 @@ impl ThinClientSession {
         // Step 4: Stream events and handle control until turn completion.
         let mut event_stream = event_stream;
         let mut final_response: Option<String> = None;
+        let mut turn_error: Option<String> = None;
         let mut turn_complete = false;
         // Cached effective log for emitting LogSeqAssigned on live advisory
         // events. Refreshed on throttled durable reloads so we avoid O(N^2)
@@ -238,6 +334,7 @@ impl ThinClientSession {
         // Wrap channel in Option for select! handling.
         let mut pending_cancel_rx = pending_cancel;
         let mut was_cancelled = false;
+        let mut orphan_watchdog = OrphanWatchdog::new();
 
         // Main event loop with abort signal handling
         let abort_signal_clone = self.abort_signal.clone();
@@ -302,7 +399,15 @@ impl ThinClientSession {
                             );
                         }
                         if self.is_turn_complete(&entries, user_msg_seq) {
-                            final_response = Self::extract_final_response(&entries, user_msg_seq);
+                            (final_response, turn_error) =
+                                Self::extract_turn_outcome(&entries, user_msg_seq);
+                            turn_complete = true;
+                            break;
+                        }
+                        if let Some(reason) =
+                            orphan_watchdog.check(&self.jetstream, &self.session_id).await
+                        {
+                            turn_error = Some(reason);
                             turn_complete = true;
                             break;
                         }
@@ -346,7 +451,8 @@ impl ThinClientSession {
                                     }
                                     if self.is_turn_complete(&entries, user_msg_seq) {
                                         // Extract final response before we finish
-                                        final_response = Self::extract_final_response(&entries, user_msg_seq);
+                                        (final_response, turn_error) =
+                                            Self::extract_turn_outcome(&entries, user_msg_seq);
                                         turn_complete = true;
                                         break;
                                     }
@@ -366,13 +472,18 @@ impl ThinClientSession {
         // Re-load durable log to get final state if we haven't already
         if !turn_complete {
             let entries = self.load_durable_entries().await?;
-            final_response = Self::extract_final_response(&entries, user_msg_seq);
+            (final_response, turn_error) = Self::extract_turn_outcome(&entries, user_msg_seq);
+        }
+
+        if let Some(error) = &turn_error {
+            render_error_entry(error, &event_sink);
         }
 
         Ok(ThinClientTurnResult {
             response: final_response,
             session_id: self.session_id.clone(),
             was_cancelled: was_cancelled || self.abort_signal.aborted(),
+            error: turn_error,
             user_msg_seq,
             user_msg_id,
         })
@@ -448,16 +559,43 @@ impl ThinClientSession {
 
     /// Check if the turn is complete based on durable entries.
     fn is_turn_complete(&self, entries: &[(u64, SessionLogEntry)], user_msg_seq: u64) -> bool {
-        let has_assistant_after_user = entries.iter().any(|(seq, entry)| {
+        let has_barrier_after_user = entries.iter().any(|(seq, entry)| {
             *seq > user_msg_seq
-                && matches!(entry, SessionLogEntry::Message { role, .. } if role.is_assistant())
+                && match entry {
+                    SessionLogEntry::Message { role, .. } => role.is_assistant(),
+                    SessionLogEntry::Error { .. } => true,
+                    _ => false,
+                }
         });
 
-        has_assistant_after_user
+        has_barrier_after_user
             || matches!(
                 reconstruct_state_from_nats(entries).turn_status,
                 TurnStatus::InFlightCancelled
             )
+    }
+
+    /// Final assistant text and worker-reported failure for the current turn.
+    fn extract_turn_outcome(
+        entries: &[(u64, SessionLogEntry)],
+        user_msg_seq: u64,
+    ) -> (Option<String>, Option<String>) {
+        (
+            Self::extract_final_response(entries, user_msg_seq),
+            Self::extract_turn_error(entries, user_msg_seq),
+        )
+    }
+
+    /// Worker-reported failure for the current turn, if the turn ended in one.
+    fn extract_turn_error(entries: &[(u64, SessionLogEntry)], user_msg_seq: u64) -> Option<String> {
+        entries
+            .iter()
+            .rev()
+            .filter(|(seq, _)| *seq > user_msg_seq)
+            .find_map(|(_, entry)| match entry {
+                SessionLogEntry::Error { message, .. } => Some(message.clone()),
+                _ => None,
+            })
     }
 
     /// Extract final assistant response text for current turn from durable entries.
@@ -503,6 +641,8 @@ pub struct ThinClientTurnResult {
     pub session_id: String,
     /// Whether the turn was cancelled.
     pub was_cancelled: bool,
+    /// Worker-side failure that ended the turn without an assistant reply.
+    pub error: Option<String>,
     /// Sequence number of the appended user message (for retract/edit).
     pub user_msg_seq: u64,
     /// Client-generated message ID of the appended user message.
@@ -554,6 +694,10 @@ fn render_log_entry_to_sink(
         }
         SessionLogEntry::Cancel { .. } => {
             render_cancel_entry(&sink);
+            false
+        }
+        SessionLogEntry::Error { message, .. } => {
+            render_error_entry(message, &sink);
             false
         }
         SessionLogEntry::Header { .. }
@@ -765,6 +909,12 @@ fn render_cancel_entry(sink: &Arc<dyn AgentEventSink>) {
     sink.emit(AgentEvent::Notice(NoticeEvent::Warning(
         "Session cancelled".to_string(),
     )));
+}
+
+fn render_error_entry(message: &str, sink: &Arc<dyn AgentEventSink>) {
+    use harnx_core::event::NoticeEvent;
+
+    sink.emit(AgentEvent::Notice(NoticeEvent::Error(message.to_string())));
 }
 
 /// Send a control command to a remote session.

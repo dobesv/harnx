@@ -91,6 +91,20 @@ impl NatsSessionLogBackend {
         &self.session_id
     }
 
+    /// Append an entry.
+    ///
+    /// Prefer this over [`Self::append_event_blocking`] wherever the caller is
+    /// already async.
+    pub async fn append_event(&self, entry: &harnx_core::session::SessionLogEntry) -> Result<u64> {
+        let log = crate::nats_session_log::NatsSessionLog::new(
+            self.jetstream.clone(),
+            self.session_id.clone(),
+        );
+        let seq = log.append_event_async(entry).await?;
+        self.observe_append(seq);
+        Ok(seq)
+    }
+
     /// Append an entry, blocking on the async NATS call.
     ///
     /// Must be called from within a Tokio multi-threaded runtime.
@@ -106,12 +120,16 @@ impl NatsSessionLogBackend {
         let seq = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(log.append_event_async(entry))
         })?;
-        // Advance the P4.1 fan-out `after_seq` so subsequent advisories in this
-        // (possibly multi-step) turn carry an up-to-date durable sequence.
+        self.observe_append(seq);
+        Ok(seq)
+    }
+
+    /// Advance the P4.1 fan-out `after_seq` so subsequent advisories in this
+    /// (possibly multi-step) turn carry an up-to-date durable sequence.
+    fn observe_append(&self, seq: u64) {
         if let Some(observer) = &self.after_seq_observer {
             observer.fetch_max(seq, std::sync::atomic::Ordering::Relaxed);
         }
-        Ok(seq)
     }
 
     /// Load all events, blocking on async NATS reads.

@@ -143,6 +143,17 @@ pub enum SessionLogEntry {
         #[serde(default, skip_serializing_if = "is_zero_usize")]
         tokens: usize,
     },
+    /// A turn that ended in a worker-side failure instead of an assistant
+    /// reply. Written by the worker so attached clients stop waiting and the
+    /// transcript records why the turn produced nothing. Unlike `Message`, an
+    /// `Error` is never replayed into the model's context.
+    #[serde(rename = "error")]
+    Error {
+        message: String,
+        fence_token: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<DateTime<Utc>>,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -163,13 +174,14 @@ impl SessionLogEntry {
     }
 
     /// Fence token carried by this entry, if any. `Message`/`ToolCalls` carry an
-    /// optional fence; `Cancel` always carries one. All other variants are
-    /// unfenced and return `None`.
+    /// optional fence; `Cancel` and `Error` always carry one. All other variants
+    /// are unfenced and return `None`.
     pub fn fence_token(&self) -> Option<u64> {
         match self {
             SessionLogEntry::Message { fence_token, .. }
             | SessionLogEntry::ToolCalls { fence_token, .. } => *fence_token,
-            SessionLogEntry::Cancel { fence_token } => Some(*fence_token),
+            SessionLogEntry::Cancel { fence_token }
+            | SessionLogEntry::Error { fence_token, .. } => Some(*fence_token),
             _ => None,
         }
     }
@@ -869,6 +881,26 @@ content: replacement two
                 assert_eq!(fence_token, 42);
             }
             other => panic!("expected cancel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_log_entry_error_serde_round_trip() {
+        let entry = SessionLogEntry::Error {
+            message: "Template error in agent 'sisyphus': undefined value".to_string(),
+            fence_token: 7,
+            timestamp: None,
+        };
+
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(round_tripped.fence_token(), Some(7));
+        match round_tripped {
+            SessionLogEntry::Error { message, .. } => {
+                assert!(message.contains("undefined value"));
+            }
+            other => panic!("expected error, got {other:?}"),
         }
     }
 
