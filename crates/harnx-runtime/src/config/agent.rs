@@ -462,6 +462,33 @@ fn prompt_agent_variable(agent_variable: &AgentVariable, printed: &mut bool) -> 
     .map_err(Into::into)
 }
 
+/// Resolve an agent's variables without ever prompting, failing when a declared
+/// variable has no value.
+///
+/// [`init_agent_variables`] tolerates an unset variable when it is told not to
+/// interact, so you can inspect or list an agent without supplying its inputs.
+/// A worker cannot afford that: it is about to render the prompt, and a missing
+/// value surfaces as an opaque "undefined value" from the template engine
+/// instead of naming what the operator has to supply.
+pub fn require_agent_variables(
+    agent_variables: &[AgentVariable],
+    variables: &AgentVariables,
+) -> Result<AgentVariables> {
+    let mut output = IndexMap::new();
+    let mut unset_variables = vec![];
+    let mut printed = false;
+    for agent_variable in agent_variables {
+        match resolve_agent_variable(agent_variable, variables, true, &mut printed)? {
+            Some(value) => {
+                output.insert(agent_variable.name.clone(), value);
+            }
+            None => unset_variables.push(agent_variable),
+        }
+    }
+    ensure_no_unset_variables(&unset_variables)?;
+    Ok(output)
+}
+
 /// Bail with a descriptive error listing all required variables that were left
 /// unset in a non-interactive context.
 fn ensure_no_unset_variables(unset_variables: &[&AgentVariable]) -> Result<()> {

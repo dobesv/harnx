@@ -867,7 +867,7 @@ impl WorkerRuntime {
         let mut cfg = per_session.write();
         cfg.use_agent_obj(agent)
             .with_context(|| format!("activate agent '{agent_name}'"))?;
-        cfg.init_agent_shared_variables()
+        cfg.require_agent_shared_variables()
             .with_context(|| format!("initialize variables for agent '{agent_name}'"))
     }
 

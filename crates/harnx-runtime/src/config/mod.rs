@@ -1192,6 +1192,24 @@ impl Config {
         Ok(())
     }
 
+    /// Like [`Self::init_agent_shared_variables`], but never prompts and fails
+    /// when a declared variable has no value. Used by the NATS worker, which is
+    /// never attached to a terminal and is about to render the prompt.
+    pub(crate) fn require_agent_shared_variables(&mut self) -> Result<()> {
+        let overrides = self.agent_variables.clone().unwrap_or_default();
+        let agent = match self.agent.as_mut() {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+        if agent.defined_variables().is_empty() || !agent.shared_variables().is_empty() {
+            return Ok(());
+        }
+        let new_variables =
+            self::agent::require_agent_variables(agent.defined_variables(), &overrides)?;
+        agent.set_shared_variables(new_variables);
+        Ok(())
+    }
+
     fn init_agent_session_variables(&mut self, new_session: bool) -> Result<()> {
         let (agent, session) = match (self.agent.as_mut(), self.session.as_mut()) {
             (Some(agent), Some(session)) => (agent, session),
