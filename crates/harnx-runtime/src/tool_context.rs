@@ -4,7 +4,7 @@ use crate::nats_hook_provider::NatsHookProvider;
 use crate::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
 use crate::tool::CompletionText;
 use crate::utils::AbortSignal;
-use harnx_core::instance::InstanceId;
+use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -78,19 +78,23 @@ impl AgentLoopContext {
     }
 }
 
-const NATS_HOOK_DISCOVERY_TTL: Duration = Duration::from_secs(30);
+const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 type HookDiscoveryCache = std::sync::Mutex<HashMap<InstanceId, CachedDiscovery<NatsHookProvider>>>;
+type ToolDiscoveryKey = (InstanceId, Option<String>);
+type ToolDiscoveryCache =
+    std::sync::Mutex<HashMap<ToolDiscoveryKey, CachedDiscovery<NatsToolProvider>>>;
 static NATS_HOOK_DISCOVERY_CACHE: OnceLock<HookDiscoveryCache> = OnceLock::new();
+static NATS_TOOL_DISCOVERY_CACHE: OnceLock<ToolDiscoveryCache> = OnceLock::new();
 
 struct CachedDiscovery<T> {
     provider: Option<Arc<T>>,
     discovered_at: Instant,
 }
 
-fn cached_discovery<T>(
-    cache: &std::sync::Mutex<HashMap<InstanceId, CachedDiscovery<T>>>,
-    instance_id: &InstanceId,
+fn cached_discovery<K: Eq + std::hash::Hash, T>(
+    cache: &std::sync::Mutex<HashMap<K, CachedDiscovery<T>>>,
+    key: &K,
     now: Instant,
     ttl: Duration,
 ) -> Option<Option<Arc<T>>> {
@@ -98,12 +102,12 @@ fn cached_discovery<T>(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.retain(|_, entry| now.saturating_duration_since(entry.discovered_at) < ttl);
-    cache.get(instance_id).map(|entry| entry.provider.clone())
+    cache.get(key).map(|entry| entry.provider.clone())
 }
 
-fn cache_discovery<T>(
-    cache: &std::sync::Mutex<HashMap<InstanceId, CachedDiscovery<T>>>,
-    instance_id: InstanceId,
+fn cache_discovery<K: Eq + std::hash::Hash, T>(
+    cache: &std::sync::Mutex<HashMap<K, CachedDiscovery<T>>>,
+    key: K,
     provider: Option<Arc<T>>,
     discovered_at: Instant,
 ) {
@@ -111,7 +115,7 @@ fn cache_discovery<T>(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(
-            instance_id,
+            key,
             CachedDiscovery {
                 provider,
                 discovered_at,
@@ -126,7 +130,8 @@ pub async fn discover_nats_hook_provider_cached(
 ) -> Option<Arc<NatsHookProvider>> {
     let cache = NATS_HOOK_DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let now = Instant::now();
-    if let Some(provider) = cached_discovery(cache, instance_id, now, NATS_HOOK_DISCOVERY_TTL) {
+    if let Some(provider) = cached_discovery(cache, instance_id, now, REGISTRATION_REFRESH_INTERVAL)
+    {
         return provider;
     }
 
@@ -139,23 +144,106 @@ pub async fn discover_nats_hook_provider_cached(
     provider
 }
 
-pub async fn discover_nats_tool_provider(
+pub async fn discover_nats_tool_provider_cached(
     config: &Config,
     instance_id: &InstanceId,
+    active_package: Option<&str>,
 ) -> Option<Arc<NatsToolProvider>> {
-    NatsToolProvider::discover(
+    let cache = NATS_TOOL_DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let key = (instance_id.clone(), active_package.map(str::to_string));
+    let now = Instant::now();
+    if let Some(provider) = cached_discovery(cache, &key, now, REGISTRATION_REFRESH_INTERVAL) {
+        return provider;
+    }
+
+    // Don't hold the process-wide lock while connecting to NATS or scanning KV.
+    let provider = NatsToolProvider::discover(
         config,
         instance_id.clone(),
         NatsInFlightCalls::for_instance(instance_id),
+        active_package,
     )
     .await
     .ok()
-    .map(Arc::new)
+    .map(Arc::new);
+    cache_discovery(cache, key, provider.clone(), Instant::now());
+    provider
+}
+
+/// Refresh declarations before completion request construction.
+pub async fn refresh_nats_tool_declarations(config: &GlobalConfig, instance_id: &InstanceId) {
+    // Match hook discovery: only worker process trees have NATS identity and connectivity.
+    if std::env::var_os(HARNX_INSTANCE_ID).is_none() {
+        return;
+    }
+
+    let config_snapshot = config.read().clone();
+    let active_package = config_snapshot.active_package();
+    let provider = discover_nats_tool_provider_cached(
+        &config_snapshot,
+        instance_id,
+        active_package.as_deref(),
+    )
+    .await;
+    let declarations = provider
+        .as_ref()
+        .map(|provider| provider.declarations_for_use_tools(Some("*")))
+        .unwrap_or_default();
+    *config.read().nats_tool_declarations.write() = declarations;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: this test holds ENV_LOCK for the guard's lifetime.
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                // SAFETY: this test holds ENV_LOCK for the guard's lifetime.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: this test holds ENV_LOCK for the guard's lifetime.
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn refresh_without_worker_instance_is_a_no_op() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = EnvGuard::unset(HARNX_INSTANCE_ID);
+        let config = GlobalConfig::default();
+
+        tokio_test::block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                refresh_nats_tool_declarations(
+                    &config,
+                    &InstanceId::from_string("non-worker-refresh-test"),
+                ),
+            )
+            .await
+            .expect("refresh returns without connecting to NATS");
+        });
+
+        assert!(config.read().nats_tool_declarations.read().is_empty());
+    }
 
     #[test]
     fn hook_discovery_cache_reuses_arc_until_ttl_expires() {
@@ -204,6 +292,37 @@ mod tests {
         .expect("refreshed provider cached");
         assert!(Arc::ptr_eq(&refreshed, &cached));
         assert!(!Arc::ptr_eq(&first, &cached));
+    }
+
+    #[test]
+    fn tool_discovery_cache_populates_and_expires_at_refresh_interval() {
+        let cache = std::sync::Mutex::new(HashMap::new());
+        let instance_id = InstanceId::from_string("tool-cache-test");
+        let discovered_at = Instant::now();
+        let provider = Arc::new(());
+        cache_discovery(
+            &cache,
+            instance_id.clone(),
+            Some(Arc::clone(&provider)),
+            discovered_at,
+        );
+
+        let cached = cached_discovery(
+            &cache,
+            &instance_id,
+            discovered_at + REGISTRATION_REFRESH_INTERVAL - Duration::from_millis(1),
+            REGISTRATION_REFRESH_INTERVAL,
+        )
+        .flatten()
+        .expect("fresh tool provider cached");
+        assert!(Arc::ptr_eq(&provider, &cached));
+        assert!(cached_discovery(
+            &cache,
+            &instance_id,
+            discovered_at + REGISTRATION_REFRESH_INTERVAL,
+            REGISTRATION_REFRESH_INTERVAL,
+        )
+        .is_none());
     }
 
     #[test]

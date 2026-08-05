@@ -129,7 +129,7 @@ async fn wait_for_registration(
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(store) = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await {
-            let key = registration_key(instance_id, "fs");
+            let key = registration_key(instance_id, "____fs");
             if let Some(value) = store.get(&key).await? {
                 return serde_json::from_slice(&value).context("decode registration");
             }
@@ -157,7 +157,7 @@ async fn invoke(
     };
     let message = client
         .request_with_headers(
-            instance_id.tool_subject("fs", tool),
+            instance_id.tool_subject("____fs", tool),
             request_headers(&call_id, &format!("fs-{tool}-{request_id}-idempotency")),
             serde_json::to_vec(&request)?.into(),
         )

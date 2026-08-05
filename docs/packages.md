@@ -101,12 +101,16 @@ This deletes the package directory. Session transcripts referencing the package'
 
 Package agents and servers are automatically namespaced to avoid collisions with top-level configs and with each other.
 
-| What | On-disk name | Runtime name | Tool name |
-|------|-------------|-------------|-----------|
+| What | On-disk name | Runtime name | Tool name visible to agent |
+|------|-------------|-------------|----------------------------|
 | Agent `coder.md` in `my-pkg` | `packages/my-pkg/agents/coder.md` | `my-pkg/coder` | `my-pkg__coder_session_prompt` |
-| Tool server `fs.yaml` in `my-pkg` | `packages/my-pkg/tool_servers/fs.yaml` | `my-pkg__fs` | `my-pkg__fs_read` |
+| Package tool server `fs.yaml`, used by an agent in `my-pkg` | `packages/my-pkg/tool_servers/fs.yaml` | `my-pkg__fs` | `fs_read` |
+| Package tool server `fs.yaml`, used by an agent outside `my-pkg` | `packages/my-pkg/tool_servers/fs.yaml` | `my-pkg__fs` | `my-pkg__fs_read` |
+| Top-level tool server `fs.yaml` | `tool_servers/fs.yaml` | `fs` | `fs_read` |
 
-The `/` in agent names is replaced with `__` in tool names.
+Package separators become `__` in tool names. Harnx keeps the server/tool separator as `_`.
+
+Add native tool servers through `tool_servers/`. To use an external MCP server, add its bridge configuration there as well; the bridge publishes the MCP tools through the same naming and routing path.
 
 ### Naming Convention
 

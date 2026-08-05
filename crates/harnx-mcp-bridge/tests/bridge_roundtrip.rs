@@ -3,7 +3,10 @@
 use anyhow::{Context, Result};
 use harnx_core::instance::InstanceId;
 use harnx_mcp_bridge::BridgeToolset;
-use harnx_toolset::{Registration, ToolReply, ToolRequest, HDR_CALL_ID, HDR_IDEMPOTENCY_KEY};
+use harnx_runtime::server_identity::ServerIdentity;
+use harnx_toolset::{
+    server_identity_token, Registration, ToolReply, ToolRequest, HDR_CALL_ID, HDR_IDEMPOTENCY_KEY,
+};
 use harnx_toolset_server::{
     registration_key, serve_over_nats, TOOL_REGISTRY_BUCKET, TOOL_SCHEMA_VERSION,
 };
@@ -108,45 +111,60 @@ async fn wait_for_nats_ready(url: &str) -> Result<()> {
     }
 }
 
-fn plans_binary() -> Result<PathBuf> {
+fn workspace_binary(name: &str, cargo_path: Option<&str>) -> Result<PathBuf> {
     // Cargo's compile-time binary path is preferred. Cross-crate test builds don't always set it,
     // so the fallback resolves the sibling binary next to the test executable's deps directory.
-    let (path, mechanism) = if let Some(path) = option_env!("CARGO_BIN_EXE_harnx-plans-tools") {
-        (PathBuf::from(path), "CARGO_BIN_EXE_harnx-plans-tools")
+    let (path, mechanism) = if let Some(path) = cargo_path {
+        (PathBuf::from(path), "CARGO_BIN_EXE")
     } else {
         let mut path = std::env::current_exe().context("locate current test executable")?;
         path.pop();
         if path.ends_with("deps") {
             path.pop();
         }
-        (path.join("harnx-plans-tools"), "test executable sibling")
+        (path.join(name), "test executable sibling")
     };
     anyhow::ensure!(
         path.is_file(),
-        "harnx-plans-tools binary missing at {} (resolved via {mechanism})",
+        "{name} binary missing at {} (resolved via {mechanism})",
         path.display()
     );
-    eprintln!(
-        "resolved harnx-plans-tools via {mechanism}: {}",
-        path.display()
-    );
+    eprintln!("resolved {name} via {mechanism}: {}", path.display());
     Ok(path)
+}
+
+fn plans_binary() -> Result<PathBuf> {
+    workspace_binary(
+        "harnx-plans-tools",
+        option_env!("CARGO_BIN_EXE_harnx-plans-tools"),
+    )
+}
+
+fn mock_mcp_binary() -> Result<PathBuf> {
+    workspace_binary(
+        "harnx-mock-mcp",
+        option_env!("CARGO_BIN_EXE_harnx-mock-mcp"),
+    )
 }
 
 async fn wait_for_registration(
     client: &async_nats::Client,
     instance_id: &InstanceId,
+    identity_token: &str,
 ) -> Result<Registration> {
     let jetstream = async_nats::jetstream::new(client.clone());
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(store) = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await {
-            if let Some(value) = store.get(registration_key(instance_id, "plans")).await? {
-                return serde_json::from_slice(&value).context("decode plans registration");
+            if let Some(value) = store
+                .get(registration_key(instance_id, identity_token))
+                .await?
+            {
+                return serde_json::from_slice(&value).context("decode tool registration");
             }
         }
         if Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for plans tool registration");
+            anyhow::bail!("timed out waiting for tool registration '{identity_token}'");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -180,19 +198,24 @@ async fn bridge_registers_plans_and_round_trips_an_invoke() -> Result<()> {
         .token(TOKEN.to_string())
         .connect(&server.url)
         .await?;
-    let registration = wait_for_registration(&client, &instance_id).await?;
+    let identity_token = server_identity_token(None, "", "plans");
+    let registration = wait_for_registration(&client, &instance_id, &identity_token).await?;
     assert_eq!(registration.server, "plans");
     assert_eq!(registration.schema_version, TOOL_SCHEMA_VERSION);
     assert_eq!(registration.tools.len(), 15);
     assert!(registration
         .tools
         .iter()
-        .all(|tool| tool.name.starts_with("plans_")));
+        .any(|tool| tool.name == "list_plans"));
+    assert!(registration
+        .tools
+        .iter()
+        .all(|tool| !tool.name.starts_with("plans_")));
 
     let call_id = "bridge-plans-list";
     let request = ToolRequest {
         call_id: call_id.to_owned(),
-        tool: "plans_list_plans".to_owned(),
+        tool: "list_plans".to_owned(),
         args: json!({}),
         parent_session_id: None,
     };
@@ -201,14 +224,14 @@ async fn bridge_registers_plans_and_round_trips_an_invoke() -> Result<()> {
     headers.insert(HDR_IDEMPOTENCY_KEY, "bridge-plans-list-idempotency");
     let message = client
         .request_with_headers(
-            instance_id.tool_subject("plans", "plans_list_plans"),
+            instance_id.tool_subject(&identity_token, "list_plans"),
             headers,
             serde_json::to_vec(&request)?.into(),
         )
         .await?;
     let reply: ToolReply = serde_json::from_slice(&message.payload)?;
     assert_eq!(reply.call_id, call_id);
-    let value = reply.result.expect("plans_list_plans should succeed");
+    let value = reply.result.expect("list_plans should succeed");
     assert!(value.is_object());
     assert!(value
         .get("content")
@@ -219,6 +242,57 @@ async fn bridge_registers_plans_and_round_trips_an_invoke() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn bridge_registers_raw_search_and_worker_composes_visible_name() -> Result<()> {
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let script_dir = tempfile::tempdir().context("create mock MCP script directory")?;
+    let script_path = script_dir.path().join("exa.yaml");
+    std::fs::write(
+        &script_path,
+        "tools:\n  - name: search\n    description: Search documents.\nresponses:\n  - found\n",
+    )
+    .context("write mock MCP script")?;
+    let bridge = BridgeToolset::new(
+        "exa",
+        vec![
+            mock_mcp_binary()?.display().to_string(),
+            "--script".to_owned(),
+            script_path.display().to_string(),
+        ],
+    )
+    .await?;
+    let instance_id = InstanceId::new();
+    let server_instance_id = instance_id.clone();
+    let nats_url = server.url.clone();
+    let server_task =
+        tokio::spawn(
+            async move { serve_over_nats(bridge, server_instance_id, &nats_url, TOKEN).await },
+        );
+
+    let client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(&server.url)
+        .await?;
+    let identity_token = server_identity_token(None, "", "exa");
+    let registration = wait_for_registration(&client, &instance_id, &identity_token).await?;
+
+    assert_eq!(registration.package, None);
+    assert_eq!(registration.config, "");
+    assert_eq!(registration.server, "exa");
+    assert_eq!(registration.tools.len(), 1);
+    assert_eq!(registration.tools[0].name, "search");
+    assert_ne!(registration.tools[0].name, "exa_search");
+    assert_eq!(
+        ServerIdentity::agent_visible_name(Some("agent-package"), &registration, "search"),
+        "exa_search"
+    );
+
+    server_task.abort();
+    let _ = server_task.await;
+    Ok(())
+}
 #[cfg(target_os = "linux")]
 fn direct_child_pid(parent_pid: u32) -> Result<u32> {
     // /proc avoids depending on pgrep in minimal Linux test environments.
@@ -302,7 +376,8 @@ async fn bridge_binary_exits_when_wrapped_child_dies() -> Result<()> {
         .token(TOKEN.to_string())
         .connect(&server.url)
         .await?;
-    wait_for_registration(&client, &instance_id).await?;
+    let identity_token = server_identity_token(None, "", "plans");
+    wait_for_registration(&client, &instance_id, &identity_token).await?;
 
     let wrapped_child_pid = direct_child_pid(bridge_pid)?;
     // SAFETY: wrapped_child_pid was read from the bridge process's direct children.

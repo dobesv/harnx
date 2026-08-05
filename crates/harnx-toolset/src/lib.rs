@@ -6,6 +6,16 @@ use serde_json::Value;
 use std::fmt;
 use tokio_util::sync::CancellationToken;
 
+/// Environment variable carrying the tool server's package name.
+pub const HARNX_SERVER_PACKAGE: &str = "HARNX_SERVER_PACKAGE";
+/// Environment variable carrying the tool server's config-file stem.
+pub const HARNX_SERVER_CONFIG: &str = "HARNX_SERVER_CONFIG";
+
+/// Build the wire identity for a tool server.
+pub fn server_identity_token(package: Option<&str>, config: &str, server: &str) -> String {
+    format!("{}__{config}__{server}", package.unwrap_or_default())
+}
+
 /// Header carrying the request's idempotency key.
 pub const HDR_IDEMPOTENCY_KEY: &str = "Idempotency-Key";
 /// Header carrying the tool call ID.
@@ -145,6 +155,10 @@ impl From<ProgressMessageWire> for ProgressMessage {
 /// Tool server metadata stored in KV for discovery and schema publication.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Registration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
+    #[serde(default)]
+    pub config: String,
     pub server: String,
     pub tools: Vec<ToolSpec>,
     pub schema_version: u32,
@@ -233,6 +247,8 @@ mod tests {
             chunk: json!({ "completed": 1, "total": 2 }),
         });
         assert_round_trip(Registration {
+            package: None,
+            config: String::new(),
             server: "time".to_string(),
             tools: vec![tool_spec()],
             schema_version: 1,
@@ -241,9 +257,32 @@ mod tests {
     }
 
     #[test]
+    fn registration_without_identity_fields_uses_defaults() {
+        let registration: Registration = serde_json::from_value(json!({
+            "server": "time",
+            "tools": [],
+            "schema_version": 1,
+            "proto_version": 1
+        }))
+        .expect("legacy registration should deserialize");
+
+        assert_eq!(registration.package, None);
+        assert_eq!(registration.config, "");
+    }
+
+    #[test]
     fn error_payload_variants_round_trip_through_serde() {
         assert_round_trip(ToolErrorPayload::Recoverable("retry".to_string()));
         assert_round_trip(ToolErrorPayload::Fatal("stop".to_string()));
+    }
+
+    #[test]
+    fn server_identity_token_preserves_package_boundary() {
+        assert_eq!(
+            server_identity_token(Some("coding"), "time", "time"),
+            "coding__time__time"
+        );
+        assert_eq!(server_identity_token(None, "time", "time"), "__time__time");
     }
 
     #[test]

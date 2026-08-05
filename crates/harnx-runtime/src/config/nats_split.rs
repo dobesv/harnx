@@ -343,6 +343,7 @@ fn expand_env_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::test_support::{env_lock, EnvGuard};
 
     /// Assert a resolved server matches the expected dynamic-local identity
     /// (reserved name, url, token) and routes through the authenticated path.
@@ -369,12 +370,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn local_cluster_env_handoff_builds_authenticated_dynamic_config() {
         harnx_core::require_nextest();
-        unsafe {
-            std::env::set_var(HARNX_NATS_URL_ENV, "nats://127.0.0.1:4555");
-            std::env::set_var(HARNX_NATS_TOKEN_ENV, "handoff-token");
-        }
+        let _lock = env_lock();
+        let _url = EnvGuard::new(
+            HARNX_NATS_URL_ENV,
+            std::path::Path::new("nats://127.0.0.1:4555"),
+        );
+        let _token = EnvGuard::new(HARNX_NATS_TOKEN_ENV, std::path::Path::new("handoff-token"));
 
         let server = resolve_local_nats_server_config().await.unwrap();
 
@@ -382,12 +386,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn local_cluster_dynamic_resolution_wins_over_reserved_yaml_entry() {
         harnx_core::require_nextest();
-        unsafe {
-            std::env::set_var(HARNX_NATS_URL_ENV, "nats://127.0.0.1:4666");
-            std::env::set_var(HARNX_NATS_TOKEN_ENV, "dynamic-token");
-        }
+        let _lock = env_lock();
+        let _url = EnvGuard::new(
+            HARNX_NATS_URL_ENV,
+            std::path::Path::new("nats://127.0.0.1:4666"),
+        );
+        let _token = EnvGuard::new(HARNX_NATS_TOKEN_ENV, std::path::Path::new("dynamic-token"));
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
             directory.path().join("__local__.yaml"),
@@ -412,12 +419,11 @@ mod tests {
 
     #[test]
     fn expand_nats_server_envs_expands_secret_fields() {
-        unsafe {
-            std::env::set_var("NATS_TOKEN", "secret-token");
-            std::env::set_var("NATS_CERT", "/tmp/client-cert.pem");
-            std::env::set_var("NATS_KEY", "/tmp/client-key.pem");
-            std::env::set_var("NATS_CA", "/tmp/ca.pem");
-        }
+        let _lock = env_lock();
+        let _token = EnvGuard::new("NATS_TOKEN", std::path::Path::new("secret-token"));
+        let _cert = EnvGuard::new("NATS_CERT", std::path::Path::new("/tmp/client-cert.pem"));
+        let _key = EnvGuard::new("NATS_KEY", std::path::Path::new("/tmp/client-key.pem"));
+        let _ca = EnvGuard::new("NATS_CA", std::path::Path::new("/tmp/ca.pem"));
 
         let mut server = NatsServerConfig {
             name: "local".into(),

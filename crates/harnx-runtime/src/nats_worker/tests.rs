@@ -1498,6 +1498,127 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
     let _ = child.wait();
 }
 
+async fn registered_agent_provider(
+    jetstream: &async_nats::jetstream::Context,
+    config: &Config,
+    agents: &[&str],
+) -> (
+    String,
+    Arc<crate::nats_tool_provider::NatsToolProvider>,
+    Vec<(String, harnx_toolset::Registration)>,
+) {
+    let (instance_id, registrations) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(registry) = jetstream
+                .get_key_value(harnx_toolset_server::TOOL_REGISTRY_BUCKET)
+                .await
+            {
+                let mut keys = registry.keys().await.expect("list registry keys");
+                let mut registrations = Vec::new();
+                while let Some(key) = keys.next().await {
+                    let key = key.expect("read registry key");
+                    let Some(value) = registry.get(&key).await.expect("read registration") else {
+                        continue;
+                    };
+                    let registration: harnx_toolset::Registration =
+                        serde_json::from_slice(&value).expect("decode registration");
+                    registrations.push((key, registration));
+                }
+                if agents.iter().all(|agent| {
+                    registrations
+                        .iter()
+                        .any(|(_, registration)| registration.server == *agent)
+                }) {
+                    let agent = agents.first().expect("at least one requested agent");
+                    let key = registrations
+                        .iter()
+                        .find(|(_, registration)| registration.server == *agent)
+                        .map(|(key, _)| key)
+                        .expect("requested agent registration exists");
+                    let instance_id = key
+                        .strip_suffix(&format!(".____{agent}"))
+                        .expect("registry key uses {instance}.{identity_token}")
+                        .to_string();
+                    break (instance_id, registrations);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("worker did not register configured agents");
+    let provider = crate::nats_tool_provider::NatsToolProvider::discover(
+        config,
+        harnx_core::instance::InstanceId::from_string(instance_id.clone()),
+        crate::nats_tool_provider::NatsInFlightCalls::default(),
+        None,
+    )
+    .await
+    .expect("parent discovers configured sub-agent toolsets");
+    (instance_id, Arc::new(provider), registrations)
+}
+
+async fn call_registered_agent(
+    provider: Arc<crate::nats_tool_provider::NatsToolProvider>,
+    tool: String,
+    message: String,
+    early_event: Option<(&mut async_nats::Subscriber, &str)>,
+) -> (serde_json::Value, Option<String>) {
+    let prompt_call = tokio::spawn(async move {
+        provider
+            .call_tool(
+                &tool,
+                json!({ "message": message }),
+                &harnx_core::abort::create_abort_signal(),
+            )
+            .await
+    });
+    let child_session_id = if let Some((parent_events, expected_agent)) = early_event {
+        let (agent, session_id) = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = parent_events
+                    .next()
+                    .await
+                    .expect("parent event stream closed");
+                let envelope =
+                    crate::nats_event_sink::AdvisoryEnvelope::from_bytes(&message.payload)
+                        .expect("decode parent advisory");
+                if let AgentEvent::SubAgent { source, event } = envelope.event {
+                    if let AgentEvent::Turn(harnx_core::event::TurnEvent::SubAgentStarted {
+                        agent,
+                        session_id,
+                    }) = *event
+                    {
+                        assert_eq!(source.agent, agent);
+                        assert_eq!(source.session_id.as_deref(), Some(session_id.as_str()));
+                        break (agent, session_id);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("parent did not receive early SubAgentStarted");
+        assert_eq!(agent, expected_agent);
+        assert!(
+            !prompt_call.is_finished(),
+            "SubAgentStarted must arrive before final tool result"
+        );
+        Some(session_id)
+    } else {
+        None
+    };
+    let result = prompt_call
+        .await
+        .expect("join prompt tool call")
+        .unwrap_or_else(|error| match error {
+            harnx_core::tool::ToolError::Recoverable(error)
+            | harnx_core::tool::ToolError::Fatal(error) => {
+                panic!("registered agent prompt failed: {error:#}")
+            }
+        });
+    (result, child_session_id)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_registers_and_delegates_to_every_configured_agent() {
     let _env_guard = env_lock().await;
@@ -1522,47 +1643,12 @@ async fn worker_registers_and_delegates_to_every_configured_agent() {
         .await
         .expect("connect registry observer");
     let jetstream = async_nats::jetstream::new(client);
-    let (instance_id, registrations) = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let Ok(registry) = jetstream
-                .get_key_value(harnx_toolset_server::TOOL_REGISTRY_BUCKET)
-                .await
-            else {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                continue;
-            };
-            let mut keys = registry.keys().await.expect("list registry keys");
-            let mut values = Vec::new();
-            while let Some(key) = keys.next().await {
-                let key = key.expect("read registry key");
-                let Some(value) = registry.get(&key).await.expect("read registration") else {
-                    continue;
-                };
-                let registration: harnx_toolset::Registration =
-                    serde_json::from_slice(&value).expect("decode registration");
-                values.push((key, registration));
-            }
-            let alpha_key = values
-                .iter()
-                .find(|(_, registration)| registration.server == "alpha")
-                .map(|(key, _)| key.clone());
-            let has_remaining_agents = ["beta", "metis"].iter().all(|agent| {
-                values
-                    .iter()
-                    .any(|(_, registration)| registration.server == *agent)
-            });
-            if let (Some(alpha_key), true) = (alpha_key, has_remaining_agents) {
-                let instance = alpha_key
-                    .strip_suffix(".alpha")
-                    .expect("registry key uses {instance}.{agent}")
-                    .to_string();
-                break (instance, values);
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("configured agent toolsets did not register");
+    let (instance_id, provider, registrations) = registered_agent_provider(
+        &jetstream,
+        &seeded.parent_config,
+        &["alpha", "beta", "metis"],
+    )
+    .await;
 
     // Old auto-registration included the active agent; preserve self-delegation parity.
     for agent in ["alpha", "beta", "metis"] {
@@ -1570,7 +1656,7 @@ async fn worker_registers_and_delegates_to_every_configured_agent() {
             .iter()
             .find(|(_, registration)| registration.server == agent)
             .expect("configured agent registration exists");
-        assert_eq!(key, &format!("{instance_id}.{agent}"));
+        assert_eq!(key, &format!("{instance_id}.____{agent}"));
         assert_eq!(registration.tools.len(), 4);
         assert!(registration
             .tools
@@ -1578,31 +1664,18 @@ async fn worker_registers_and_delegates_to_every_configured_agent() {
             .all(|tool| tool.name.starts_with(&format!("{agent}_session_"))));
     }
 
-    let provider = crate::nats_tool_provider::NatsToolProvider::discover(
-        &seeded.parent_config,
-        harnx_core::instance::InstanceId::from_string(instance_id),
-        crate::nats_tool_provider::NatsInFlightCalls::default(),
-    )
-    .await
-    .expect("parent discovers configured sub-agent toolsets");
     let declarations = provider.declarations_for_use_tools(Some("*"));
     for agent in ["alpha", "beta"] {
         assert!(declarations
             .iter()
-            .any(|tool| tool.name == format!("{agent}_session_prompt")));
-        let result = provider
-            .call_tool(
-                &format!("{agent}_session_prompt"),
-                json!({ "message": format!("delegate to {agent}") }),
-                &harnx_core::abort::create_abort_signal(),
-            )
-            .await
-            .unwrap_or_else(|error| match error {
-                harnx_core::tool::ToolError::Recoverable(error)
-                | harnx_core::tool::ToolError::Fatal(error) => {
-                    panic!("parent delegates to configured agent: {error:#}")
-                }
-            });
+            .any(|tool| tool.name == format!("{agent}_{agent}_session_prompt")));
+        let (result, _) = call_registered_agent(
+            Arc::clone(&provider),
+            format!("{agent}_{agent}_session_prompt"),
+            format!("delegate to {agent}"),
+            None,
+        )
+        .await;
         assert_eq!(
             result["response"],
             format!("stub remote reply over nats: delegate to {agent}")
@@ -1700,84 +1773,16 @@ async fn subagent_started_reaches_parent_stream_before_prompt_result() {
         .await
         .expect("flush parent event subscription");
     let jetstream = async_nats::jetstream::new(client);
-    let instance_id = tokio::time::timeout(Duration::from_secs(5), async {
-        'registration: loop {
-            if let Ok(registry) = jetstream
-                .get_key_value(harnx_toolset_server::TOOL_REGISTRY_BUCKET)
-                .await
-            {
-                let mut keys = registry.keys().await.expect("list registry keys");
-                while let Some(key) = keys.next().await {
-                    let key = key.expect("read registry key");
-                    if let Some(instance) = key.strip_suffix(".metis") {
-                        break 'registration instance.to_string();
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("metis toolset registration missing");
-    let provider = Arc::new(
-        crate::nats_tool_provider::NatsToolProvider::discover(
-            &seeded.parent_config,
-            harnx_core::instance::InstanceId::from_string(instance_id),
-            crate::nats_tool_provider::NatsInFlightCalls::default(),
-        )
-        .await
-        .expect("discover metis toolset for parent"),
-    );
-    let prompt_call = tokio::spawn({
-        let provider = Arc::clone(&provider);
-        async move {
-            provider
-                .call_tool(
-                    "metis_session_prompt",
-                    json!({ "message": "emit start before finishing" }),
-                    &harnx_core::abort::create_abort_signal(),
-                )
-                .await
-        }
-    });
-
-    let (event_agent, child_session_id) = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let message = parent_events
-                .next()
-                .await
-                .expect("parent event stream closed");
-            let envelope = crate::nats_event_sink::AdvisoryEnvelope::from_bytes(&message.payload)
-                .expect("decode parent advisory");
-            if let AgentEvent::SubAgent { source, event } = envelope.event {
-                if let AgentEvent::Turn(harnx_core::event::TurnEvent::SubAgentStarted {
-                    agent,
-                    session_id,
-                }) = *event
-                {
-                    assert_eq!(source.agent, agent);
-                    assert_eq!(source.session_id.as_deref(), Some(session_id.as_str()));
-                    break (agent, session_id);
-                }
-            }
-        }
-    })
-    .await
-    .expect("parent did not receive early SubAgentStarted");
-    assert_eq!(event_agent, "metis");
-    assert!(
-        !prompt_call.is_finished(),
-        "SubAgentStarted must arrive before final tool result"
-    );
-    let result = prompt_call
-        .await
-        .expect("join prompt tool call")
-        .unwrap_or_else(|error| match error {
-            harnx_core::tool::ToolError::Recoverable(error)
-            | harnx_core::tool::ToolError::Fatal(error) => {
-                panic!("prompt tool call failed: {error:#}")
-            }
-        });
+    let (_, provider, _) =
+        registered_agent_provider(&jetstream, &seeded.parent_config, &["metis"]).await;
+    let (result, child_session_id) = call_registered_agent(
+        provider,
+        "metis_session_prompt".to_string(),
+        "emit start before finishing".to_string(),
+        Some((&mut parent_events, "metis")),
+    )
+    .await;
+    let child_session_id = child_session_id.expect("SubAgentStarted includes child session id");
     assert_eq!(result["response"], "early event child response");
     assert_eq!(result["sub_agent"]["agent"], "metis");
     assert_eq!(result["sub_agent"]["session_id"], child_session_id);

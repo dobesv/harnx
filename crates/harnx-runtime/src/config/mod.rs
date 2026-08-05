@@ -307,6 +307,8 @@ pub struct Config {
 
     pub model: Model,
     pub tools: Tools,
+    #[doc(hidden)]
+    pub nats_tool_declarations: Arc<parking_lot::RwLock<Vec<ToolDeclaration>>>,
     pub working_mode: WorkingMode,
     pub last_message: Option<LastMessage>,
 
@@ -383,6 +385,7 @@ impl Clone for Config {
             agent_variables: self.agent_variables.clone(),
             model: self.model.clone(),
             tools: self.tools.clone(),
+            nats_tool_declarations: Arc::clone(&self.nats_tool_declarations),
             working_mode: self.working_mode.clone(),
             last_message: self.last_message.clone(),
             session: self.session.clone(),
@@ -427,6 +430,7 @@ impl Config {
             agent_variables: self.agent_variables.clone(),
             model: self.model.clone(),
             tools: self.tools.clone(),
+            nats_tool_declarations: Arc::clone(&self.nats_tool_declarations),
             working_mode: self.working_mode.clone(),
             last_message: self.last_message.clone(),
             session: None,
@@ -463,6 +467,7 @@ impl Default for Config {
 
             model: Default::default(),
             tools: Default::default(),
+            nats_tool_declarations: Arc::new(parking_lot::RwLock::new(Vec::new())),
             working_mode: WorkingMode::Cmd,
             last_message: None,
 
@@ -1300,6 +1305,7 @@ impl Config {
         active_pkg: Option<&str>,
     ) -> (Vec<ToolDeclaration>, HashMap<String, String>) {
         let mut declarations = self.tools.declarations();
+        declarations.extend(self.nats_tool_declarations.read().iter().cloned());
         let mut handoff_targets = HashMap::new();
         if let Some(use_tools) = use_tools {
             let selectors = split_tool_selectors(use_tools)
