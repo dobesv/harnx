@@ -159,6 +159,9 @@ fn check_agent(qualified_name: &str, failures: &mut Vec<String>) -> AgentOutcome
 
 #[test]
 fn agent_prompt_rendering_renders_all_shipped_agents() {
+    // `install_packages` sets HARNX_CONFIG_DIR process-wide; the guards are
+    // only sound because nextest runs each test in its own process.
+    harnx_core::require_nextest();
     let Some(workspace_root) = workspace_root() else {
         // Published crates do not include workspace package assets.
         return;
@@ -166,14 +169,14 @@ fn agent_prompt_rendering_renders_all_shipped_agents() {
     let (_temp, _config_guard) = install_packages(&workspace_root);
 
     let mut failures = Vec::new();
-    let mut totals = AgentOutcome::default();
+    let mut file_backed_variables = 0usize;
     let mut rendered = 0usize;
 
     for package in PACKAGES {
         let agents_dir = workspace_root.join("packages").join(package).join("agents");
         for stem in agent_stems(&agents_dir, &mut failures) {
             let outcome = check_agent(&format!("{package}/{stem}"), &mut failures);
-            totals.file_backed_variables += outcome.file_backed_variables;
+            file_backed_variables += outcome.file_backed_variables;
             rendered += usize::from(outcome.rendered);
         }
     }
@@ -185,7 +188,7 @@ fn agent_prompt_rendering_renders_all_shipped_agents() {
     );
     assert!(rendered > 0, "no shipped agents were rendered");
     assert!(
-        totals.file_backed_variables > 0,
+        file_backed_variables > 0,
         "no shipped agent exercised a file-backed variable"
     );
 }

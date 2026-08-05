@@ -346,9 +346,13 @@ pub(super) fn spawn_metis_worker_with_hooks(
     daemon: crate::nats_worker::WorkerDaemonConfig,
     hooks: Option<harnx_core::hooks::HooksConfig>,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-    let worker_agent =
+    let mut worker_agent =
         AgentConfig::from_markdown("metis", "---\nuse_tools: \"*\"\n---\nstub worker prompt")
             .unwrap();
+    // A real worker starts with its model already resolved. Without this the
+    // fixture has no client for `test:`, so loading an agent file that declares
+    // `model: test:test-model` fails outright.
+    worker_agent.set_resolved_model(harnx_core::model::Model::new("test", "test-model"));
     let worker_config = Config {
         data: harnx_core::config_data::ConfigData {
             model_id: "test:test-model".to_string(),

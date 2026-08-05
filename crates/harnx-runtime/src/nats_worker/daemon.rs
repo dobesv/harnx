@@ -10,8 +10,8 @@ use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use super::subagent_toolset::SubagentToolset;
 use super::tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
 use crate::config::{
-    list_agents, resolve_local_nats_server_config, server_display_name, GlobalConfig, Input,
-    ToolServerConfig, LOCAL_CLUSTER_KEY,
+    list_agents, resolve_local_nats_server_config, server_display_name, Config, GlobalConfig,
+    Input, ToolServerConfig, LOCAL_CLUSTER_KEY,
 };
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use crate::nats_metrics;
@@ -844,20 +844,23 @@ impl WorkerRuntime {
     /// template, or an agent like `pantheon/sisyphus` fails with an undefined
     /// value on its first render.
     ///
-    /// An agent the worker cannot find is not fatal — the session falls back to
-    /// the worker's own configuration, as it has always done. Failing to set up
-    /// an agent that *does* exist is fatal: running it half-initialized only
-    /// fails later, deeper, and less legibly.
+    /// An agent the worker simply does not have is not fatal — the session
+    /// falls back to the worker's own configuration, as it has always done.
+    /// Anything else is: an agent whose file is present but unreadable,
+    /// unparseable, or names a model the worker cannot resolve must not
+    /// silently answer as some other agent.
     fn install_activation_agent(per_session: &GlobalConfig, agent_name: &str) -> Result<()> {
         let retrieved = per_session.read().retrieve_agent(agent_name);
         let mut agent = match retrieved {
             Ok(agent) => agent,
-            Err(error) => {
+            // No file and no built-in by this name: nothing to load.
+            Err(error) if !Config::agent_file(agent_name).exists() => {
                 log::warn!(
                     "activation agent '{agent_name}' not available, using worker config: {error:#}"
                 );
                 return Ok(());
             }
+            Err(error) => return Err(error).context(format!("load agent '{agent_name}'")),
         };
         crate::config::agent::resolve_file_defaults(&mut agent)
             .with_context(|| format!("resolve file-backed variables for agent '{agent_name}'"))?;
@@ -1091,7 +1094,7 @@ impl WorkerRuntime {
             fence_token: lease.fence_token(),
             timestamp: Some(chrono::Utc::now()),
         };
-        if let Err(append_error) = backend.append_event_blocking(&entry) {
+        if let Err(append_error) = backend.append_event(&entry).await {
             log::warn!(
                 "failed to append Error entry: session_id={} err={append_error:#}",
                 backend.session_id(),

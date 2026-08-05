@@ -297,9 +297,10 @@ impl LeaseState {
 
 /// Open the lease bucket read-only, without creating it.
 ///
-/// `Ok(None)` means no worker has ever taken a lease on this cluster. Callers
-/// that poll should hold on to the returned store: opening it costs a
-/// `stream_info` round trip that a plain `get` does not.
+/// `None` means the lookup did not succeed — either no worker has ever taken a
+/// lease on this cluster, or the lookup failed transiently. Callers that poll
+/// should hold on to the returned store: opening it costs a `stream_info` round
+/// trip that a plain `get` does not.
 pub async fn open_lease_bucket(
     jetstream: &jetstream::Context,
     config: &NatsLeaseConfig,

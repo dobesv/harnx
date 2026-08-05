@@ -29,6 +29,7 @@ use std::time::Duration;
 
 const FILE_VARIABLE_AGENT: &str = "varagent";
 const BROKEN_AGENT: &str = "brokenagent";
+const UNLOADABLE_AGENT: &str = "unloadableagent";
 const VARIABLE_FILE_TEXT: &str = "core instructions loaded from a file";
 /// Generous enough that a slow CI box does not trip it, short enough that a
 /// genuinely stalled turn fails the test rather than hanging the suite.
@@ -135,6 +136,15 @@ impl TestEnv {
         self.write_agent(
             BROKEN_AGENT,
             "---\nmodel: openai:test-model\n---\nPreamble.\n\n{{never_defined}}\n",
+        )
+    }
+
+    /// An agent the worker can find but cannot load: its model names a client
+    /// that is not configured.
+    fn write_unloadable_agent(&self) -> Result<()> {
+        self.write_agent(
+            UNLOADABLE_AGENT,
+            "---\nmodel: nosuchclient:nosuchmodel\n---\nPreamble.\n",
         )
     }
 
@@ -314,6 +324,42 @@ async fn worker_reports_template_error_to_client() -> Result<()> {
         messages[0].contains("never_defined"),
         "durable Error entry must carry the failure text, got: {}",
         messages[0]
+    );
+
+    worker.abort();
+    let _ = worker.await;
+    Ok(())
+}
+
+/// An agent whose file is present but unloadable must fail the turn. Falling
+/// back to the worker's own config would answer as a different agent than the
+/// one the client asked for, without saying so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_reports_unloadable_agent_instead_of_falling_back() -> Result<()> {
+    require_nextest();
+
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: nats-server not available");
+        return Ok(());
+    };
+
+    let env = TestEnv::new(server)?;
+    env.write_unloadable_agent()?;
+    let worker = env.spawn_worker("worker-unloadable-agent").await?;
+
+    let session_id = "agent-unloadable";
+    let turn = env.run_turn(UNLOADABLE_AGENT, session_id).await?;
+
+    let error = turn
+        .error
+        .context("turn must report that the agent could not be loaded")?;
+    assert!(
+        error.contains(UNLOADABLE_AGENT),
+        "error must name the agent, got: {error}"
+    );
+    assert_eq!(
+        turn.response, None,
+        "the worker must not answer as its own fallback agent"
     );
 
     worker.abort();
