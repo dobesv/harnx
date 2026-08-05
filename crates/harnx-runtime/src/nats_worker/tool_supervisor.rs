@@ -3,12 +3,14 @@ use crate::config::{ToolServerConfig, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
 use crate::nats_tool_provider::NatsInFlightCalls;
 use anyhow::{bail, Context, Result};
 use async_nats::jetstream::{self, kv, stream};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
 use harnx_core::sink::emit_agent_event;
 use harnx_hooks::executor::HARNX_PACKAGE_DIR_ENV;
-use harnx_toolset::Registration;
+use harnx_toolset::{
+    server_identity_token, Registration, HARNX_SERVER_CONFIG, HARNX_SERVER_PACKAGE,
+};
 use harnx_toolset_server::{registration_key, TOOL_REGISTRY_BUCKET};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -97,29 +99,21 @@ impl ToolServerSupervisor {
             }
         };
 
-        let mut watches = Vec::new();
-        for server in &enabled {
-            let key = registration_key(&config.instance_id, &server.name);
-            let _ = registry.delete(&key).await;
-            match registry.watch_with_history(&key).await {
-                Ok(watch) => watches.push((*server, key, watch)),
-                Err(error) => warn_server_failure(
-                    &server.name,
-                    format!("watch tool registration '{key}': {error:#}"),
-                ),
-            }
-        }
+        let watches = prepare_registration_watches(&registry, &config, &enabled).await;
 
         spawn_enabled_tool_servers(&mut supervisor, &config, &enabled, &processes).await;
 
         let deadline = Instant::now() + readiness_timeout;
+        let instance_id = config.instance_id.clone();
         let readiness = watches.into_iter().map(|(server, key, mut watch)| {
             let processes = Arc::clone(&processes);
+            let instance_id = instance_id.clone();
             async move {
                 if let Err(error) = wait_for_registration(
                     &mut watch,
                     &processes,
-                    &server.name,
+                    server,
+                    &instance_id,
                     &key,
                     deadline,
                     readiness_timeout,
@@ -141,6 +135,35 @@ impl ToolServerSupervisor {
     }
 }
 
+async fn prepare_registration_watches<'a>(
+    registry: &kv::Store,
+    config: &ToolServerStartConfig,
+    servers: &[&'a ToolServerConfig],
+) -> Vec<(&'a ToolServerConfig, String, kv::Watch)> {
+    let mut watches = Vec::new();
+    for server in servers {
+        let expected_token =
+            server_identity_token(server.package.as_deref(), &server.name, "<server>");
+        let key = registration_key(&config.instance_id, &expected_token);
+        remove_registrations_for_config(
+            &config.client,
+            &config.instance_id,
+            server.package.as_deref(),
+            &server.name,
+            None,
+        )
+        .await;
+        match registry.watch_with_history(">").await {
+            Ok(watch) => watches.push((*server, key, watch)),
+            Err(error) => warn_server_failure(
+                &server.name,
+                format!("watch tool registration '{key}': {error:#}"),
+            ),
+        }
+    }
+    watches
+}
+
 async fn spawn_enabled_tool_servers(
     supervisor: &mut ToolServerSupervisor,
     config: &ToolServerStartConfig,
@@ -156,15 +179,17 @@ async fn spawn_enabled_tool_servers(
                     continue;
                 };
                 processes.lock().await.insert(pid, server.name.clone());
-                supervisor.tasks.push(spawn_child_monitor(
+                supervisor.tasks.push(spawn_child_monitor(ToolMonitor {
                     child,
                     pid,
-                    server.name.clone(),
-                    config.instance_id.clone(),
-                    config.client.clone(),
-                    Arc::clone(processes),
-                    in_flight.clone(),
-                ));
+                    server: server.name.clone(),
+                    package: server.package.clone(),
+                    config: server.name.clone(),
+                    instance_id: config.instance_id.clone(),
+                    client: config.client.clone(),
+                    processes: Arc::clone(processes),
+                    in_flight: in_flight.clone(),
+                }));
             }
             Err(error) => warn_server_failure(&server.name, format!("{error:#}")),
         }
@@ -253,6 +278,11 @@ fn spawn_tool_server(config: &ToolServerStartConfig, server: &ToolServerConfig) 
         .args(&server.args)
         .env(HARNX_PACKAGE_DIR_ENV, tool_server_package_dir(server))
         .envs(&server.env)
+        .env(
+            HARNX_SERVER_PACKAGE,
+            server.package.as_deref().unwrap_or_default(),
+        )
+        .env(HARNX_SERVER_CONFIG, &server.name)
         .env(HARNX_INSTANCE_ID, config.instance_id.as_str())
         .env(HARNX_NATS_URL_ENV, &config.nats_url)
         .env(HARNX_NATS_TOKEN_ENV, &config.token)
@@ -281,15 +311,29 @@ fn emit_warning(message: String) {
     log::warn!("{message}");
 }
 
-fn spawn_child_monitor(
-    mut child: Child,
+struct ToolMonitor {
+    child: Child,
     pid: u32,
     server: String,
+    package: Option<String>,
+    config: String,
     instance_id: InstanceId,
     client: async_nats::Client,
     processes: Arc<Mutex<HashMap<u32, String>>>,
     in_flight: NatsInFlightCalls,
-) -> JoinHandle<()> {
+}
+fn spawn_child_monitor(monitor: ToolMonitor) -> JoinHandle<()> {
+    let ToolMonitor {
+        mut child,
+        pid,
+        server,
+        package,
+        config,
+        instance_id,
+        client,
+        processes,
+        in_flight,
+    } = monitor;
     tokio::spawn(async move {
         let status = wait_for_child(&mut child).await;
         processes.lock().await.remove(&pid);
@@ -302,8 +346,14 @@ fn spawn_child_monitor(
         };
         let message = format!("tool server '{server}' crashed, exit {exit}");
         emit_warning(message.clone());
-        in_flight.fail_server_unavailable(&server, message).await;
-        remove_registration(&client, &instance_id, &server).await;
+        remove_registrations_for_config(
+            &client,
+            &instance_id,
+            package.as_deref(),
+            &config,
+            Some((&in_flight, &message)),
+        )
+        .await;
     })
 }
 
@@ -326,19 +376,29 @@ async fn wait_for_child(child: &mut Child) -> std::io::Result<std::process::Exit
 async fn wait_for_registration(
     watch: &mut kv::Watch,
     processes: &Arc<Mutex<HashMap<u32, String>>>,
-    server: &str,
+    server: &ToolServerConfig,
+    instance_id: &InstanceId,
     key: &str,
     deadline: Instant,
     timeout: Duration,
 ) -> Result<()> {
     loop {
-        if !processes.lock().await.values().any(|name| name == server) {
-            bail!("tool server '{server}' exited before registering at '{key}'");
+        if !processes
+            .lock()
+            .await
+            .values()
+            .any(|name| name == &server.name)
+        {
+            bail!(
+                "tool server '{}' exited before registering at '{key}'",
+                server.name
+            );
         }
         let now = Instant::now();
         if now >= deadline {
             bail!(
-                "tool server '{server}' did not register at '{key}' within {}s",
+                "tool server '{}' did not register at '{key}' within {}s",
+                server.name,
                 timeout.as_secs_f64()
             );
         }
@@ -346,17 +406,54 @@ async fn wait_for_registration(
         let poll = remaining.min(Duration::from_millis(100));
         match tokio::time::timeout(poll, watch.next()).await {
             Ok(Some(Ok(entry))) if entry.operation == kv::Operation::Put => {
-                let registration: Registration = serde_json::from_slice(&entry.value)
-                    .with_context(|| format!("decode tool registration '{key}'"))?;
-                if registration.server == server {
-                    return Ok(());
+                if !entry.key.starts_with(key.trim_end_matches("<server>")) {
+                    continue;
                 }
+                let registration: Registration = match serde_json::from_slice(&entry.value) {
+                    Ok(registration) => registration,
+                    Err(error) => {
+                        log::warn!(
+                            "ignoring invalid tool registration '{}': {error}",
+                            entry.key
+                        );
+                        continue;
+                    }
+                };
+                if registration.package != server.package || registration.config != server.name {
+                    log::warn!(
+                        "ignoring tool registration '{}' identity mismatch: expected package {:?}, config '{}'; got package {:?}, config '{}'",
+                        entry.key,
+                        server.package,
+                        server.name,
+                        registration.package,
+                        registration.config
+                    );
+                    continue;
+                }
+                let identity_token = server_identity_token(
+                    registration.package.as_deref(),
+                    &registration.config,
+                    &registration.server,
+                );
+                let expected_key = registration_key(instance_id, &identity_token);
+                if entry.key != expected_key {
+                    log::warn!(
+                        "ignoring tool registration '{}' because its identity expects key '{}'",
+                        entry.key,
+                        expected_key
+                    );
+                    continue;
+                }
+                return Ok(());
             }
             Ok(Some(Ok(_))) => {}
             Ok(Some(Err(error))) => {
-                return Err(error).with_context(|| format!("watch tool registration '{key}'"));
+                log::warn!("ignoring tool registration watch error for '{key}': {error}");
             }
-            Ok(None) => bail!("tool registration watch closed for '{key}'"),
+            Ok(None) => {
+                log::warn!("tool registration watch closed for '{key}'; waiting for timeout");
+                tokio::time::sleep(poll).await;
+            }
             Err(_) => continue,
         }
     }
@@ -383,12 +480,49 @@ async fn ensure_registry_bucket(client: &async_nats::Client) -> Result<kv::Store
     }
 }
 
-async fn remove_registration(client: &async_nats::Client, instance_id: &InstanceId, server: &str) {
+async fn remove_registrations_for_config(
+    client: &async_nats::Client,
+    instance_id: &InstanceId,
+    package: Option<&str>,
+    config: &str,
+    failure: Option<(&NatsInFlightCalls, &str)>,
+) {
     let jetstream = jetstream::new(client.clone());
     let Ok(store) = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await else {
         return;
     };
-    let _ = store.delete(registration_key(instance_id, server)).await;
+    let Ok(mut keys) = store.keys().await else {
+        return;
+    };
+    let prefix = format!("{instance_id}.");
+    while let Ok(Some(key)) = keys.try_next().await {
+        if !key.starts_with(&prefix) {
+            continue;
+        }
+        let Ok(Some(value)) = store.get(&key).await else {
+            continue;
+        };
+        let Ok(registration) = serde_json::from_slice::<Registration>(&value) else {
+            continue;
+        };
+        if registration.package.as_deref() != package || registration.config != config {
+            continue;
+        }
+        let identity_token = server_identity_token(
+            registration.package.as_deref(),
+            &registration.config,
+            &registration.server,
+        );
+        if key != registration_key(instance_id, &identity_token) {
+            continue;
+        }
+        if let Some((in_flight, message)) = failure {
+            in_flight
+                .fail_server_unavailable(&identity_token, message.to_string())
+                .await;
+        }
+        let _ = store.delete(key).await;
+    }
 }
 
 #[cfg(unix)]

@@ -36,7 +36,7 @@ type SpawnedChild = (
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 #[command(trailing_var_arg = true)]
 pub struct Args {
-    /// Server name used for registration and tool-name prefixes.
+    /// Server name used for registration.
     #[arg(long)]
     pub name: String,
 
@@ -179,11 +179,7 @@ async fn connect_and_list_tools(
         }
         Ok(Ok(result)) => result,
     };
-    let cached_tools = listed
-        .tools
-        .into_iter()
-        .map(|tool| map_tool(server_name, tool))
-        .collect();
+    let cached_tools = listed.tools.into_iter().map(map_tool).collect();
 
     Ok((service, cached_tools))
 }
@@ -230,7 +226,7 @@ impl BridgeToolset {
         })
     }
 
-    /// Server name used to prefix cached tool names.
+    /// Server name used for toolset registration.
     pub fn server_name(&self) -> &str {
         &self.server_name
     }
@@ -282,10 +278,6 @@ impl Toolset for BridgeToolset {
         args: Value,
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
-        let prefix = format!("{}_", self.server_name);
-        let mcp_tool = tool
-            .strip_prefix(&prefix)
-            .ok_or_else(|| ToolInvokeError::Recoverable(format!("bad tool name {tool}")))?;
         let arguments = match args {
             Value::Object(arguments) => Some(arguments),
             Value::Null => None,
@@ -295,7 +287,7 @@ impl Toolset for BridgeToolset {
                 ));
             }
         };
-        let mut params = CallToolRequestParams::new(mcp_tool.to_owned());
+        let mut params = CallToolRequestParams::new(tool.to_owned());
         if let Some(arguments) = arguments {
             params = params.with_arguments(arguments);
         }
@@ -340,10 +332,10 @@ fn configure_child_process(command: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 fn configure_child_process(_command: &mut Command) {}
 
-fn map_tool(server_name: &str, tool: Tool) -> ToolSpec {
+fn map_tool(tool: Tool) -> ToolSpec {
     let annotations = tool.annotations.as_ref();
     ToolSpec {
-        name: format!("{server_name}_{}", tool.name),
+        name: tool.name.into(),
         description: tool
             .description
             .map_or_else(String::new, |value| value.into_owned()),
@@ -434,8 +426,9 @@ mod tests {
         let tool =
             rmcp::model::Tool::new("echo", "Echo input", serde_json::Map::new()).with_meta(meta);
 
-        let spec = map_tool("child", tool);
+        let spec = map_tool(tool);
 
+        assert_eq!(spec.name, "echo");
         assert_eq!(
             spec.meta
                 .as_ref()
@@ -447,7 +440,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn caches_prefixed_plans_tool_specs() {
+    async fn caches_raw_plans_tool_specs() {
         let plans_dir = tempfile::tempdir().expect("create temporary plans directory");
         let plans_binary = option_env!("CARGO_BIN_EXE_harnx-plans-tools")
             .map(std::path::PathBuf::from)
@@ -477,8 +470,12 @@ mod tests {
         .expect("connect to plans MCP server");
 
         assert_eq!(bridge.cached_tools().len(), 15);
+        assert!(bridge
+            .cached_tools()
+            .iter()
+            .any(|tool| tool.name == "list_plans"));
         assert!(bridge.cached_tools().iter().all(|tool| {
-            tool.name.starts_with("plans_")
+            !tool.name.starts_with("plans_")
                 && tool
                     .input_schema
                     .as_object()
@@ -557,7 +554,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn invokes_child_tools_and_validates_name_and_cancellation() {
+    async fn invokes_raw_child_tools_and_validates_arguments_and_cancellation() {
         use harnx_toolset::{ToolInvokeError, Toolset};
         use tokio_util::sync::CancellationToken;
 
@@ -568,7 +565,7 @@ mod tests {
 
         let result = bridge
             .invoke(
-                "plans_list_plans",
+                "list_plans",
                 serde_json::json!({}),
                 CancellationToken::new(),
             )
@@ -579,21 +576,9 @@ mod tests {
             .and_then(serde_json::Value::as_array)
             .is_some_and(|content| !content.is_empty()));
 
-        let bad_name = bridge
-            .invoke(
-                "wrongname_foo",
-                serde_json::json!({}),
-                CancellationToken::new(),
-            )
-            .await;
-        assert!(matches!(
-            bad_name,
-            Err(ToolInvokeError::Recoverable(message)) if message == "bad tool name wrongname_foo"
-        ));
-
         let bad_arguments = bridge
             .invoke(
-                "plans_list_plans",
+                "list_plans",
                 serde_json::json!([]),
                 CancellationToken::new(),
             )
@@ -607,7 +592,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let cancelled = bridge
-            .invoke("plans_list_plans", serde_json::json!({}), cancel)
+            .invoke("list_plans", serde_json::json!({}), cancel)
             .await;
         assert!(matches!(
             cancelled,

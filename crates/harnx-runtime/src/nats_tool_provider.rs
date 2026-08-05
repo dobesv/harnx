@@ -1,4 +1,5 @@
 use crate::config::{Config, LOCAL_CLUSTER_KEY};
+use crate::server_identity::ServerIdentity;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
@@ -6,7 +7,7 @@ use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::instance::InstanceId;
 use harnx_core::tool::{JsonSchema, ToolDeclaration, ToolError, ToolProvider};
 use harnx_toolset::{
-    ControlKind, ControlMessage, Registration, ToolErrorPayload, ToolReply, ToolRequest,
+    ControlKind, ControlMessage, Registration, ToolErrorPayload, ToolReply, ToolRequest, ToolSpec,
     HDR_CALL_ID, HDR_CONTENT_TYPE, HDR_IDEMPOTENCY_KEY, HDR_INSTANCE_ID,
 };
 use harnx_toolset_server::{registration_key, TOOL_REGISTRY_BUCKET};
@@ -23,6 +24,8 @@ const JSON_CONTENT_TYPE: &str = "application/json";
 #[derive(Clone, Debug)]
 struct RegisteredTool {
     server: String,
+    selector_server: String,
+    raw_name: String,
     request_timeout: Duration,
 }
 
@@ -113,6 +116,8 @@ pub struct NatsToolProvider {
     instance_id: InstanceId,
     parent_session_id: Option<String>,
     tools: HashMap<String, RegisteredTool>,
+    registrations: Vec<Registration>,
+    active_package: Option<String>,
     declarations: Vec<ToolDeclaration>,
     // Owning this subscription establishes the progress/cancel channel before requests start.
     _control_subscription: Mutex<async_nats::Subscriber>,
@@ -125,16 +130,22 @@ impl NatsToolProvider {
         config: &Config,
         instance_id: InstanceId,
         in_flight: NatsInFlightCalls,
+        active_package: Option<&str>,
     ) -> anyhow::Result<Self> {
         let client = config.nats_client(LOCAL_CLUSTER_KEY).await?;
         let control_subject = instance_id.control_subject();
         let control_subscription = client.subscribe(control_subject).await?;
         client.flush().await?;
 
-        let registrations = registration_snapshot(&client, &instance_id)
+        let mut registrations = registration_snapshot(&client, &instance_id)
             .await
             .unwrap_or_default();
-        let (tools, declarations) = build_registered_tools(registrations);
+        registrations.sort_by_key(|registration| match registration.package.as_deref() {
+            Some(package) if Some(package) == active_package => 0,
+            None => usize::from(active_package.is_some()),
+            Some(_) => 2,
+        });
+        let (tools, declarations) = build_registered_tools(active_package, registrations.clone());
         let parent_session_id = config
             .session
             .as_ref()
@@ -145,12 +156,41 @@ impl NatsToolProvider {
             instance_id,
             parent_session_id,
             tools,
+            registrations,
+            active_package: active_package.map(str::to_string),
             declarations,
             _control_subscription: Mutex::new(control_subscription),
             in_flight,
         })
     }
 
+    fn resolve_route(&self, tool_name: &str) -> Option<RegisteredTool> {
+        if let Some((identity_token, raw_name)) = ServerIdentity::parse_agent_tool_name(
+            tool_name,
+            &self.registrations,
+            self.active_package.as_deref(),
+        ) {
+            let registration = self.registrations.iter().find(|registration| {
+                ServerIdentity::identity_token(registration) == identity_token
+            })?;
+            let spec = registration
+                .tools
+                .iter()
+                .find(|spec| spec.name == raw_name)?;
+            return Some(RegisteredTool {
+                server: identity_token,
+                selector_server: registration.server.clone(),
+                raw_name,
+                request_timeout: spec
+                    .timeout_secs
+                    .map(Duration::from_secs)
+                    .unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+            });
+        }
+
+        // Raw aliases keep persisted calls from before server-prefixed naming routable.
+        self.tools.get(tool_name).cloned()
+    }
     pub fn declarations(&self) -> &[ToolDeclaration] {
         &self.declarations
     }
@@ -163,19 +203,21 @@ impl NatsToolProvider {
         self.declarations
             .iter()
             .filter(|declaration| {
-                let server = self
-                    .tools
-                    .get(&declaration.name)
-                    .map(|tool| tool.server.as_str());
+                let route = self.tools.get(&declaration.name);
                 selectors.iter().any(|selector| {
                     let selector = selector.trim();
                     selector == "*"
                         || selector == declaration.name
-                        || server.is_some_and(|server| selector == server)
+                        || route.is_some_and(|route| {
+                            selector == route.selector_server || selector == route.raw_name
+                        })
                         || globset::Glob::new(selector).is_ok_and(|pattern| {
                             let matcher = pattern.compile_matcher();
                             matcher.is_match(&declaration.name)
-                                || server.is_some_and(|server| matcher.is_match(server))
+                                || route.is_some_and(|route| {
+                                    matcher.is_match(&route.selector_server)
+                                        || matcher.is_match(&route.raw_name)
+                                })
                         })
                 })
             })
@@ -208,14 +250,13 @@ impl NatsToolProvider {
 
     fn prepare_request(
         &self,
-        tool_name: &str,
         arguments: Value,
         route: &RegisteredTool,
     ) -> Result<PendingToolRequest, ToolError> {
         let call_id = Uuid::new_v4().to_string();
         let request = ToolRequest {
             call_id: call_id.clone(),
-            tool: tool_name.to_string(),
+            tool: route.raw_name.clone(),
             args: arguments,
             parent_session_id: self.parent_session_id.clone(),
         };
@@ -230,7 +271,9 @@ impl NatsToolProvider {
         Ok(PendingToolRequest {
             call_id,
             server: route.server.clone(),
-            subject: self.instance_id.tool_subject(&route.server, tool_name),
+            subject: self
+                .instance_id
+                .tool_subject(&route.server, &route.raw_name),
             request: async_nats::Request::new()
                 .headers(headers)
                 .payload(payload.into())
@@ -278,54 +321,101 @@ impl NatsToolProvider {
     }
 }
 
+fn parse_json_schema(mut value: Value) -> serde_json::Result<JsonSchema> {
+    // schemars emits nullable fields as `type: [T, "null"]`, while the
+    // completion schema uses `required` to represent optional fields.
+    normalize_schema_types(&mut value);
+    serde_json::from_value(value)
+}
+
+fn normalize_schema_types(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            if let Some(Value::Array(types)) = object.get_mut("type") {
+                let schema_type = types
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .find(|schema_type| *schema_type != "null")
+                    .or_else(|| types.iter().find_map(Value::as_str));
+                if let Some(schema_type) = schema_type {
+                    *object.get_mut("type").expect("type key exists") =
+                        Value::String(schema_type.to_string());
+                }
+            }
+            for child in object.values_mut() {
+                normalize_schema_types(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                normalize_schema_types(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn registered_tool(
+    active_package: Option<&str>,
+    registration: &Registration,
+    spec: ToolSpec,
+) -> Option<(String, RegisteredTool, ToolDeclaration)> {
+    let template = |key| {
+        spec.meta
+            .as_ref()
+            .and_then(|meta| meta.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let call_template = template("call_template");
+    let result_template = template("result_template");
+    let parameters = match parse_json_schema(spec.input_schema) {
+        Ok(parameters) => parameters,
+        Err(error) => {
+            log::warn!(
+                "ignoring invalid schema for NATS tool '{}.{}': {error}",
+                registration.server,
+                spec.name
+            );
+            return None;
+        }
+    };
+    let raw_name = spec.name.clone();
+    let name = ServerIdentity::agent_visible_name(active_package, registration, &raw_name);
+    let route = RegisteredTool {
+        server: ServerIdentity::identity_token(registration),
+        selector_server: registration.server.clone(),
+        raw_name,
+        request_timeout: spec
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+    };
+    let declaration = ToolDeclaration {
+        name: name.clone(),
+        description: spec.description,
+        parameters,
+        mcp_tool_name: None,
+        mcp_server_name: None,
+        call_template,
+        result_template,
+        idempotent_hint: Some(spec.idempotent_hint),
+        read_only_hint: Some(spec.read_only_hint),
+    };
+    Some((name, route, declaration))
+}
 fn build_registered_tools(
+    active_package: Option<&str>,
     mut registrations: Vec<Registration>,
 ) -> (HashMap<String, RegisteredTool>, Vec<ToolDeclaration>) {
     registrations.sort_by(|left, right| left.server.cmp(&right.server));
     let mut registered = HashMap::new();
     for registration in registrations {
-        for spec in registration.tools {
-            let call_template = spec
-                .meta
-                .as_ref()
-                .and_then(|m| m.get("call_template"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let result_template = spec
-                .meta
-                .as_ref()
-                .and_then(|m| m.get("result_template"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let parameters = match serde_json::from_value::<JsonSchema>(spec.input_schema) {
-                Ok(parameters) => parameters,
-                Err(error) => {
-                    log::warn!(
-                        "ignoring invalid schema for NATS tool '{}.{}': {error}",
-                        registration.server,
-                        spec.name
-                    );
-                    continue;
-                }
-            };
-            let name = spec.name.clone();
-            let route = RegisteredTool {
-                server: registration.server.clone(),
-                request_timeout: spec
-                    .timeout_secs
-                    .map(Duration::from_secs)
-                    .unwrap_or(DEFAULT_REQUEST_TIMEOUT),
-            };
-            let declaration = ToolDeclaration {
-                name: spec.name,
-                description: spec.description,
-                parameters,
-                mcp_tool_name: None,
-                mcp_server_name: None,
-                call_template,
-                result_template,
-                idempotent_hint: Some(spec.idempotent_hint),
-                read_only_hint: Some(spec.read_only_hint),
+        for spec in registration.tools.clone() {
+            let Some((name, route, declaration)) =
+                registered_tool(active_package, &registration, spec)
+            else {
+                continue;
             };
             if let Some((previous, _)) = registered.insert(name.clone(), (route, declaration)) {
                 log::warn!(
@@ -336,11 +426,17 @@ fn build_registered_tools(
             }
         }
     }
-    let (tools, mut declarations): (HashMap<_, _>, Vec<_>) = registered
-        .into_iter()
-        .map(|(name, (route, declaration))| ((name, route), declaration))
-        .unzip();
-    declarations.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut entries = registered.into_iter().collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut tools = HashMap::new();
+    let mut declarations = Vec::with_capacity(entries.len());
+    for (name, (route, declaration)) in entries {
+        // Keep raw aliases during the naming transition so injected and persisted
+        // calls from older turns still route to the same server.
+        tools.insert(route.raw_name.clone(), route.clone());
+        tools.insert(name, route);
+        declarations.push(declaration);
+    }
     (tools, declarations)
 }
 
@@ -351,7 +447,7 @@ impl ToolProvider for NatsToolProvider {
     }
 
     fn has_tool(&self, tool_name: &str) -> bool {
-        self.tools.contains_key(tool_name)
+        self.resolve_route(tool_name).is_some()
     }
 
     async fn call_tool(
@@ -360,12 +456,12 @@ impl ToolProvider for NatsToolProvider {
         arguments: Value,
         abort: &AbortSignal,
     ) -> Result<Value, ToolError> {
-        let Some(route) = self.tools.get(tool_name) else {
+        let Some(route) = self.resolve_route(tool_name) else {
             return Err(ToolError::Recoverable(anyhow!(
                 "NATS tool is not registered: {tool_name}"
             )));
         };
-        let pending = self.prepare_request(tool_name, arguments, route)?;
+        let pending = self.prepare_request(arguments, &route)?;
         let call_id = pending.call_id.clone();
         let message = self.await_response(pending, abort).await?;
         let reply: ToolReply = serde_json::from_slice(&message.payload).map_err(|error| {
@@ -409,7 +505,8 @@ async fn registration_snapshot(
                 continue;
             }
         };
-        if key == registration_key(instance_id, &registration.server) {
+        let identity_token = ServerIdentity::identity_token(&registration);
+        if key == registration_key(instance_id, &identity_token) {
             registrations.push(registration);
         }
     }
@@ -423,6 +520,43 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn prefixes_registered_tool_with_server_and_keeps_raw_route_name() {
+        harnx_core::require_nextest();
+        let registration = Registration {
+            package: None,
+            config: String::new(),
+            server: "fs".to_string(),
+            tools: vec![ToolSpec {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "offset": { "type": ["integer", "null"] }
+                    }
+                }),
+                idempotent_hint: true,
+                read_only_hint: true,
+                timeout_secs: None,
+                meta: None,
+            }],
+            schema_version: 1,
+            proto_version: 1,
+        };
+
+        let (tools, declarations) = build_registered_tools(None, vec![registration]);
+
+        assert_eq!(declarations[0].name, "fs_read");
+        assert_eq!(
+            declarations[0].parameters.properties.as_ref().unwrap()["offset"]
+                .type_value
+                .as_deref(),
+            Some("integer")
+        );
+        assert_eq!(tools["fs_read"].raw_name, "read");
+    }
+
+    #[test]
     fn builds_tool_declaration_templates_from_tool_spec_meta() {
         harnx_core::require_nextest();
         let meta = json!({
@@ -433,6 +567,8 @@ mod tests {
         .expect("meta object")
         .clone();
         let registration = Registration {
+            package: None,
+            config: String::new(),
             server: "template-server".to_string(),
             tools: vec![ToolSpec {
                 name: "template_tool".to_string(),
@@ -447,7 +583,7 @@ mod tests {
             proto_version: 1,
         };
 
-        let (_, declarations) = build_registered_tools(vec![registration]);
+        let (_, declarations) = build_registered_tools(None, vec![registration]);
 
         assert_eq!(declarations.len(), 1);
         assert_eq!(

@@ -11,6 +11,9 @@ use harnx_runtime::config::{Config, ToolServerConfig, HARNX_NATS_TOKEN_ENV, HARN
 use harnx_runtime::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
 use harnx_runtime::nats_worker::{ToolServerStartConfig, ToolServerSupervisor};
 use harnx_toolset::{ControlKind, ControlMessage};
+// Only the Linux-gated #1350 identity/cleanup test uses these.
+#[cfg(target_os = "linux")]
+use harnx_toolset::{server_identity_token, Registration};
 use harnx_toolset_server::{registration_key, TOOL_REGISTRY_BUCKET};
 use parking_lot::RwLock;
 use serde_json::json;
@@ -133,7 +136,7 @@ async fn wait_until_registration_removed(
     let store = async_nats::jetstream::new(client.clone())
         .get_key_value(TOOL_REGISTRY_BUCKET)
         .await?;
-    let key = registration_key(instance_id, "time");
+    let key = registration_key(instance_id, "__time__time");
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         if store.get(&key).await?.is_none() {
@@ -158,7 +161,7 @@ async fn assert_pilot_registration(
         .get_key_value(TOOL_REGISTRY_BUCKET)
         .await?;
     assert!(store
-        .get(registration_key(instance_id, "time"))
+        .get(registration_key(instance_id, "__time__time"))
         .await?
         .is_some());
     Ok(pid)
@@ -175,7 +178,7 @@ async fn assert_nats_eval_batch(instance_id: &InstanceId) -> Result<()> {
     let results = harnx_runtime::tool::eval_tool_calls(
         &context,
         vec![ToolCall::new(
-            "get_current_time".to_string(),
+            "time_get_current_time".to_string(),
             json!({ "timezone": "UTC" }),
             Some("nats-time".to_string()),
             None,
@@ -209,7 +212,7 @@ async fn assert_cancel_control(
     };
     let started = Instant::now();
     let cancelled = provider
-        .call_tool("wait", json!({ "seconds": 30.0 }), &abort)
+        .call_tool("time_wait", json!({ "seconds": 30.0 }), &abort)
         .await;
     abort_task.await?;
     assert!(started.elapsed() < Duration::from_secs(2));
@@ -245,7 +248,11 @@ async fn assert_crash_failure(
     });
     let started = Instant::now();
     let result = provider
-        .call_tool("wait", json!({ "seconds": 30.0 }), &create_abort_signal())
+        .call_tool(
+            "time_wait",
+            json!({ "seconds": 30.0 }),
+            &create_abort_signal(),
+        )
         .await;
     kill_task.await?;
     assert!(started.elapsed() < Duration::from_secs(2));
@@ -262,9 +269,10 @@ async fn assert_crash_failure(
         &Config::default(),
         instance_id.clone(),
         NatsInFlightCalls::for_instance(instance_id),
+        None,
     )
     .await?;
-    assert!(!snapshot.has_tool("wait"));
+    assert!(!snapshot.has_tool("time_wait"));
     Ok(())
 }
 
@@ -298,6 +306,7 @@ async fn time_over_nats_pilot_e2e_eval_cancel_and_crash() -> Result<()> {
         &Config::default(),
         instance_id.clone(),
         NatsInFlightCalls::for_instance(&instance_id),
+        None,
     )
     .await?;
 
@@ -379,7 +388,7 @@ async fn tool_server_readiness_failure_warns_and_continues() -> Result<()> {
         .await?;
     assert!(
         store
-            .get(registration_key(&fixture.instance_id, "time"))
+            .get(registration_key(&fixture.instance_id, "__time__time"))
             .await?
             .is_none(),
         "non-registering server must not become available"
@@ -416,7 +425,7 @@ async fn readiness_waits_for_servers_concurrently() -> Result<()> {
         .await?;
     assert!(
         store
-            .get(registration_key(&fixture.instance_id, "time"))
+            .get(registration_key(&fixture.instance_id, "__time__time"))
             .await?
             .is_some(),
         "healthy server must register while another server stalls"
@@ -431,6 +440,138 @@ async fn readiness_waits_for_servers_concurrently() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn packaged_time_servers(binary: &str) -> [ToolServerConfig; 2] {
+    let mut alpha = time_server_config(binary.to_string());
+    alpha.package = Some("alpha".to_string());
+    let mut beta = time_server_config(binary.to_string());
+    beta.package = Some("beta".to_string());
+    [alpha, beta]
+}
+
+#[cfg(target_os = "linux")]
+async fn assert_packaged_registrations(
+    client: &async_nats::Client,
+    instance_id: &InstanceId,
+) -> Result<(async_nats::jetstream::kv::Store, String, String)> {
+    let alpha_key = registration_key(
+        instance_id,
+        &server_identity_token(Some("alpha"), "time", "time"),
+    );
+    let beta_key = registration_key(
+        instance_id,
+        &server_identity_token(Some("beta"), "time", "time"),
+    );
+    let store = async_nats::jetstream::new(client.clone())
+        .get_key_value(TOOL_REGISTRY_BUCKET)
+        .await?;
+    for (key, package) in [(&alpha_key, "alpha"), (&beta_key, "beta")] {
+        let registration: Registration = serde_json::from_slice(
+            &store
+                .get(key)
+                .await?
+                .with_context(|| format!("{package} registration after supervisor readiness"))?,
+        )?;
+        assert_eq!(registration.package.as_deref(), Some(package));
+        assert_eq!(registration.config, "time");
+    }
+    Ok((store, alpha_key, beta_key))
+}
+
+#[cfg(target_os = "linux")]
+async fn assert_distinct_time_routes(instance_id: &InstanceId) -> Result<()> {
+    let provider = NatsToolProvider::discover(
+        &Config::default(),
+        instance_id.clone(),
+        NatsInFlightCalls::for_instance(instance_id),
+        Some("alpha"),
+    )
+    .await?;
+    for tool in ["time_get_current_time", "beta__time_get_current_time"] {
+        assert!(provider.has_tool(tool), "missing distinct route {tool}");
+        let result = provider
+            .call_tool(tool, json!({ "timezone": "UTC" }), &create_abort_signal())
+            .await
+            .map_err(|error| match error {
+                ToolError::Recoverable(error) | ToolError::Fatal(error) => error,
+            })?;
+        assert_eq!(result["timezone"], "UTC");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn kill_alpha_and_assert_cleanup(
+    supervisor: &ToolServerSupervisor,
+    store: &async_nats::jetstream::kv::Store,
+    alpha_key: &str,
+    beta_key: &str,
+) -> Result<()> {
+    let alpha_pid = supervisor
+        .server_pids()
+        .await
+        .into_keys()
+        .find(|pid| {
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .map(|env| {
+                    env.split(|byte| *byte == 0)
+                        .any(|entry| entry == b"HARNX_SERVER_PACKAGE=alpha")
+                })
+                .unwrap_or(false)
+        })
+        .context("alpha tool server PID")?;
+    // SAFETY: PID belongs to child owned by this test's supervisor.
+    unsafe {
+        libc::kill(alpha_pid as libc::pid_t, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while store.get(alpha_key).await?.is_some() {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "alpha registration remained after its child exited"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        store.get(beta_key).await?.is_some(),
+        "crash cleanup removed the other package's registration"
+    );
+    Ok(())
+}
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn same_named_packaged_servers_use_distinct_identities_and_cleanup() -> Result<()> {
+    let Some(nats) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
+        auth_token: Some(TOKEN.to_string()),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let binary = time_server_binary()?.to_string_lossy().into_owned();
+    let instance_id = InstanceId::new();
+    let _env = EnvGuard::install(&[
+        (HARNX_NATS_URL_ENV, nats.url()),
+        (HARNX_NATS_TOKEN_ENV, TOKEN),
+    ]);
+    let client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(nats.url())
+        .await?;
+    let supervisor = ToolServerSupervisor::start_local_with_timeout(
+        ToolServerStartConfig::new(client.clone(), instance_id.clone(), nats.url(), TOKEN),
+        &packaged_time_servers(&binary),
+        Duration::from_secs(5),
+    )
+    .await?;
+
+    let (store, alpha_key, beta_key) = assert_packaged_registrations(&client, &instance_id).await?;
+    assert_distinct_time_routes(&instance_id).await?;
+    kill_alpha_and_assert_cleanup(&supervisor, &store, &alpha_key, &beta_key).await?;
+
+    drop(supervisor);
+    Ok(())
+}
 #[tokio::test(flavor = "multi_thread")]
 async fn missing_tool_server_binary_warns_and_continues() -> Result<()> {
     let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {

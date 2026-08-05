@@ -24,8 +24,8 @@ impl InstanceId {
     }
 
     /// Build the Core NATS subject for a tool invocation.
-    pub fn tool_subject(&self, server: &str, tool: &str) -> String {
-        format!("harnx.v1.{self}.tools.{server}.{tool}")
+    pub fn tool_subject(&self, identity_token: &str, tool: &str) -> String {
+        format!("harnx.v1.{self}.tools.{identity_token}.{tool}")
     }
 
     /// Build the per-instance control subject used for cancel and progress.

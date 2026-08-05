@@ -287,7 +287,12 @@ pub(crate) fn tool_servers_matching_use_tools(
             let matches = namespaced_use_tools.iter().any(|selector| {
                 super::super::config::selector_could_match_server(selector, &display_name)
             });
-            matches && seen_names.insert(server.name.clone())
+            let identity_token = harnx_toolset::server_identity_token(
+                server.package.as_deref(),
+                &server.name,
+                &server.name,
+            );
+            matches && seen_names.insert(identity_token)
         })
         .cloned()
         .collect()
@@ -376,7 +381,8 @@ async fn start_subagent_toolset(
         jetstream,
     ));
     let server_name = harnx_toolset::Toolset::name(toolset.as_ref()).to_string();
-    let registration_key = harnx_toolset_server::registration_key(&instance_id, &server_name);
+    let identity_token = harnx_toolset::server_identity_token(None, "", &server_name);
+    let registration_key = harnx_toolset_server::registration_key(&instance_id, &identity_token);
     let server = tokio::spawn(harnx_toolset_server::serve_with_client(
         toolset,
         instance_id,
@@ -1200,7 +1206,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_server_filter_deduplicates_names_first_wins() {
+    fn tool_server_filter_deduplicates_full_identities_first_wins() {
         let user_time = tool_server("time");
         let mut package_time = tool_server("time");
         package_time.package = Some("coding".to_string());
@@ -1209,10 +1215,11 @@ mod tests {
 
         let matching = tool_servers_matching_use_tools(&servers, None, &["*".to_string()]);
 
-        assert_eq!(matching.len(), 2);
+        assert_eq!(matching.len(), 3);
         assert_eq!(matching[0].name, "time");
         assert_eq!(matching[0].package, None);
-        assert_eq!(matching[1].name, "weather");
+        assert_eq!(matching[1].package.as_deref(), Some("coding"));
+        assert_eq!(matching[2].name, "weather");
 
         let mut aaa = tool_server("dup");
         aaa.package = Some("aaa".to_string());
@@ -1220,8 +1227,17 @@ mod tests {
         zzz.package = Some("zzz".to_string());
         let package_matching =
             tool_servers_matching_use_tools(&[aaa, zzz], None, &["*".to_string()]);
-        assert_eq!(package_matching.len(), 1);
+        assert_eq!(package_matching.len(), 2);
         assert_eq!(package_matching[0].package.as_deref(), Some("aaa"));
+        assert_eq!(package_matching[1].package.as_deref(), Some("zzz"));
+
+        let duplicate = tool_server("same");
+        let duplicate_matching = tool_servers_matching_use_tools(
+            &[duplicate.clone(), duplicate],
+            None,
+            &["*".to_string()],
+        );
+        assert_eq!(duplicate_matching.len(), 1);
     }
 
     #[test]

@@ -3,12 +3,12 @@ mod common;
 
 use anyhow::Result;
 use harnx_core::abort::create_abort_signal;
-use harnx_core::instance::InstanceId;
+use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
 use harnx_core::tool::{ToolError, ToolProvider};
 use harnx_runtime::config::{Config, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
 use harnx_runtime::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
 use harnx_time_server::TimeToolset;
-use harnx_toolset::{Registration, ToolSpec};
+use harnx_toolset::{server_identity_token, Registration, ToolSpec};
 use harnx_toolset_server::{
     registration_key, serve_over_nats, TOOL_PROTOCOL_VERSION, TOOL_REGISTRY_BUCKET,
     TOOL_SCHEMA_VERSION,
@@ -24,17 +24,20 @@ const TOKEN: &str = "nats-tool-provider-test-token";
 struct EnvGuard {
     url: Option<OsString>,
     token: Option<OsString>,
+    instance_id: Option<OsString>,
 }
 
 impl EnvGuard {
-    fn install(url: &str, token: &str) -> Self {
+    fn install(url: &str, token: &str, instance_id: &InstanceId) -> Self {
         let guard = Self {
             url: std::env::var_os(HARNX_NATS_URL_ENV),
             token: std::env::var_os(HARNX_NATS_TOKEN_ENV),
+            instance_id: std::env::var_os(HARNX_INSTANCE_ID),
         };
         unsafe {
             std::env::set_var(HARNX_NATS_URL_ENV, url);
             std::env::set_var(HARNX_NATS_TOKEN_ENV, token);
+            std::env::set_var(HARNX_INSTANCE_ID, instance_id.as_str());
         }
         guard
     }
@@ -51,6 +54,10 @@ impl Drop for EnvGuard {
                 Some(value) => std::env::set_var(HARNX_NATS_TOKEN_ENV, value),
                 None => std::env::remove_var(HARNX_NATS_TOKEN_ENV),
             }
+            match self.instance_id.take() {
+                Some(value) => std::env::set_var(HARNX_INSTANCE_ID, value),
+                None => std::env::remove_var(HARNX_INSTANCE_ID),
+            }
         }
     }
 }
@@ -61,7 +68,7 @@ async fn wait_for_registry(client: &async_nats::Client, instance_id: &InstanceId
     loop {
         if let Ok(store) = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await {
             if store
-                .get(registration_key(instance_id, "time"))
+                .get(registration_key(instance_id, "____time"))
                 .await?
                 .is_some()
             {
@@ -83,7 +90,7 @@ async fn set_wait_timeout(
     let store = async_nats::jetstream::new(client.clone())
         .get_key_value(TOOL_REGISTRY_BUCKET)
         .await?;
-    let key = registration_key(instance_id, "time");
+    let key = registration_key(instance_id, "____time");
     let value = store
         .get(&key)
         .await?
@@ -108,6 +115,8 @@ async fn add_collision_registration(
     let jetstream = async_nats::jetstream::new(client.clone());
     let store = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await?;
     let registration = Registration {
+        package: None,
+        config: String::new(),
         server: "collision".to_string(),
         tools: vec![ToolSpec {
             name: harnx_runtime::session_history::TOOL_NAME.to_string(),
@@ -123,7 +132,10 @@ async fn add_collision_registration(
     };
     store
         .put(
-            registration_key(instance_id, &registration.server),
+            registration_key(
+                instance_id,
+                &server_identity_token(None, "", &registration.server),
+            ),
             serde_json::to_vec(&registration)?.into(),
         )
         .await?;
@@ -139,6 +151,8 @@ async fn add_duplicate_registrations(
         .await?;
     for server in ["alpha", "beta"] {
         let registration = Registration {
+            package: None,
+            config: String::new(),
             server: server.to_string(),
             tools: vec![ToolSpec {
                 name: "duplicate_tool".to_string(),
@@ -154,7 +168,7 @@ async fn add_duplicate_registrations(
         };
         store
             .put(
-                registration_key(instance_id, server),
+                registration_key(instance_id, &server_identity_token(None, "", server)),
                 serde_json::to_vec(&registration)?.into(),
             )
             .await?;
@@ -173,18 +187,18 @@ fn assert_declarations_and_collisions(provider: &NatsToolProvider) {
         provider
             .declarations()
             .iter()
-            .filter(|tool| tool.name == "duplicate_tool")
+            .filter(|tool| tool.name.ends_with("_duplicate_tool"))
             .count(),
-        1
+        2
     );
     assert!(provider
         .declarations_for_use_tools(Some("beta"))
         .iter()
-        .any(|tool| tool.name == "duplicate_tool"));
-    assert!(!provider
+        .any(|tool| tool.name == "beta_duplicate_tool"));
+    assert!(provider
         .declarations_for_use_tools(Some("alpha"))
         .iter()
-        .any(|tool| tool.name == "duplicate_tool"));
+        .any(|tool| tool.name == "alpha_duplicate_tool"));
 }
 
 async fn assert_invocation_and_per_call_timeout(provider: &NatsToolProvider) -> Result<()> {
@@ -240,12 +254,13 @@ async fn assert_context_declarations_and_precedence(instance_id: &InstanceId) {
     )
     .await;
     let declarations = &context.render.as_ref().expect("render context").decl_map;
-    for tool in ["get_current_time", "convert_time", "wait", "wait_until"] {
+    for raw_tool in ["get_current_time", "convert_time", "wait", "wait_until"] {
+        let visible_tool = format!("time_{raw_tool}");
         assert!(
-            declarations.contains_key(tool),
-            "pilot tool not declared: {tool}"
+            declarations.contains_key(&visible_tool),
+            "pilot tool not declared: {visible_tool}"
         );
-        assert!(context.allowed_tool_names.contains(tool));
+        assert!(context.allowed_tool_names.contains(&visible_tool));
     }
     let collision = harnx_runtime::session_history::TOOL_NAME;
     assert!(context.providers[0].has_tool(collision));
@@ -274,7 +289,7 @@ async fn assert_abort_and_supervisor_failure(provider: &NatsToolProvider) -> Res
     let fail_task = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
         in_flight
-            .fail_server_unavailable("time", "time tool process exited")
+            .fail_server_unavailable("____time", "time tool process exited")
             .await;
     });
     let failure = provider
@@ -324,8 +339,8 @@ async fn nats_tool_provider_end_to_end_declarations_cancel_and_precedence() -> R
     else {
         return Ok(());
     };
-    let _env = EnvGuard::install(server.url(), TOKEN);
     let instance_id = InstanceId::new();
+    let _env = EnvGuard::install(server.url(), TOKEN, &instance_id);
     let server_url = server.url.clone();
     let server_instance = instance_id.clone();
     let server_task = tokio::spawn(async move {
@@ -343,6 +358,7 @@ async fn nats_tool_provider_end_to_end_declarations_cancel_and_precedence() -> R
         &Config::default(),
         instance_id.clone(),
         NatsInFlightCalls::for_instance(&instance_id),
+        None,
     )
     .await?;
 
@@ -354,6 +370,7 @@ async fn nats_tool_provider_end_to_end_declarations_cancel_and_precedence() -> R
         &Config::default(),
         instance_id.clone(),
         NatsInFlightCalls::for_instance(&instance_id),
+        None,
     )
     .await?;
     assert_per_call_timeout_enforced(&short_timeout_provider).await?;

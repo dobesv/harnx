@@ -32,7 +32,7 @@ pub struct CompletionText<'a> {
 }
 
 use crate::nats_tool_provider::NatsToolProvider;
-use crate::tool_context::{discover_nats_hook_provider_cached, discover_nats_tool_provider};
+use crate::tool_context::{discover_nats_hook_provider_cached, discover_nats_tool_provider_cached};
 pub use crate::tool_context::{BuildToolEvalContextParams, ToolRoundParams};
 
 #[derive(Debug, Clone)]
@@ -217,9 +217,11 @@ fn build_emit_fns(
 async fn resolve_nats_providers(
     config: &Config,
     instance_id: &harnx_core::instance::InstanceId,
+    active_package: Option<&str>,
     injected_hook_provider: Option<Arc<NatsHookProvider>>,
 ) -> (Option<Arc<NatsToolProvider>>, Option<Arc<NatsHookProvider>>) {
-    let tool_provider = discover_nats_tool_provider(config, instance_id).await;
+    let tool_provider =
+        discover_nats_tool_provider_cached(config, instance_id, active_package).await;
     let hook_provider = match injected_hook_provider {
         Some(provider) => Some(provider),
         None => discover_nats_hook_provider_cached(config, instance_id).await,
@@ -257,8 +259,13 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
         )
     };
 
-    let (nats_provider, nats_hook_provider) =
-        resolve_nats_providers(&config_snapshot, instance_id, nats_hook_provider).await;
+    let (nats_provider, nats_hook_provider) = resolve_nats_providers(
+        &config_snapshot,
+        instance_id,
+        current_agent_package.as_deref(),
+        nats_hook_provider,
+    )
+    .await;
     if let Some(provider) = &nats_provider {
         tool_declarations.extend(provider.declarations_for_use_tools(agent_use_tools));
     }

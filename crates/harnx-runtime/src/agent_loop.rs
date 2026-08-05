@@ -468,6 +468,7 @@ async fn user_prompt_gate_passes(
 type AgentModelResult = Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)>;
 
 async fn call_agent_model(ctx: &AgentLoopContext, input: &mut Input) -> AgentModelResult {
+    crate::tool_context::refresh_nats_tool_declarations(&ctx.config, &ctx.instance_id).await;
     if let Some(call_fn) = &ctx.call_fn {
         call_fn(input, &ctx.config, ctx.abort_signal.clone()).await
     } else {

@@ -3773,6 +3773,7 @@ dependencies = [
  "async-trait",
  "clap",
  "harnx-core",
+ "harnx-runtime",
  "harnx-toolset",
  "harnx-toolset-server",
  "libc",

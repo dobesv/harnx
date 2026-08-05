@@ -182,7 +182,7 @@ async fn wait_for_registration(
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(store) = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await {
-            let key = registration_key(instance_id, "test");
+            let key = registration_key(instance_id, "____test");
             if let Some(value) = store.get(&key).await? {
                 return serde_json::from_slice(&value).context("decode registration");
             }
@@ -229,7 +229,7 @@ impl TestHarness {
     }
 
     fn echo_subject(&self) -> String {
-        self.instance_id.tool_subject("test", "echo")
+        self.instance_id.tool_subject("____test", "echo")
     }
 }
 
@@ -385,7 +385,7 @@ async fn assert_cancellation(harness: &TestHarness) -> Result<()> {
         parent_session_id: None,
     };
     let slow_request = harness.client.request_with_headers(
-        harness.instance_id.tool_subject("test", "slow"),
+        harness.instance_id.tool_subject("____test", "slow"),
         request_headers(&request.call_id, "logical-slow"),
         serde_json::to_vec(&request)?.into(),
     );

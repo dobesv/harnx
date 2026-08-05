@@ -495,6 +495,29 @@ fn select_tools_respects_use_tools_whitelist() {
     );
 }
 
+#[test]
+fn select_tools_merges_cached_nats_declarations() {
+    use harnx_core::agent_config::AgentConfig;
+
+    let config = Config::default();
+    config
+        .nats_tool_declarations
+        .write()
+        .push(make_tool_decl("fs_read"));
+    let mut agent = AgentConfig::from_prompt("test");
+    agent.set_use_tools(Some(vec!["fs_read".to_string()]));
+
+    let declarations = config
+        .select_tools(&agent)
+        .expect("cached NATS tool selected");
+    assert_eq!(
+        declarations
+            .iter()
+            .map(|declaration| declaration.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fs_read"]
+    );
+}
 /// When use_tools is not set, select_tools should return None (no tools).
 #[test]
 fn select_tools_returns_none_without_use_tools() {

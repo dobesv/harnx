@@ -8,8 +8,9 @@ use async_nats::jetstream::{self, kv, stream};
 use futures_util::StreamExt;
 use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
 use harnx_toolset::{
-    ControlKind, ControlMessage, Registration, ToolErrorPayload, ToolInvokeError, ToolReply,
-    ToolRequest, Toolset, HDR_CALL_ID, HDR_IDEMPOTENCY_KEY,
+    server_identity_token, ControlKind, ControlMessage, Registration, ToolErrorPayload,
+    ToolInvokeError, ToolReply, ToolRequest, Toolset, HARNX_SERVER_CONFIG, HARNX_SERVER_PACKAGE,
+    HDR_CALL_ID, HDR_IDEMPOTENCY_KEY,
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Implementation,
@@ -70,8 +71,8 @@ struct ValidatedToolRequest {
 }
 
 /// KV key for one worker instance's tool server registration.
-pub fn registration_key(instance_id: &InstanceId, server: &str) -> String {
-    format!("{instance_id}.{server}")
+pub fn registration_key(instance_id: &InstanceId, identity_token: &str) -> String {
+    format!("{instance_id}.{identity_token}")
 }
 
 /// Host a toolset over Core NATS request-reply and publish its KV registration.
@@ -98,11 +99,16 @@ pub async fn serve_with_client(
     client: async_nats::Client,
 ) -> Result<()> {
     let server_name = toolset.name().to_owned();
-    let tool_subject = instance_id.tool_subject(&server_name, ">");
+    let package = std::env::var(HARNX_SERVER_PACKAGE)
+        .ok()
+        .filter(|package| !package.is_empty());
+    let config = std::env::var(HARNX_SERVER_CONFIG).unwrap_or_default();
+    let identity_token = server_identity_token(package.as_deref(), &config, &server_name);
+    let tool_subject = instance_id.tool_subject(&identity_token, ">");
     let control_subject = instance_id.control_subject();
 
     let mut tool_requests = client
-        .subscribe(tool_subject.clone())
+        .queue_subscribe(tool_subject.clone(), identity_token.clone())
         .await
         .with_context(|| format!("subscribe to tool requests on {tool_subject}"))?;
     let mut controls = client
@@ -114,7 +120,9 @@ pub async fn serve_with_client(
     client.flush().await.context("flush tool subscriptions")?;
 
     let registration = Registration {
-        server: server_name.clone(),
+        package,
+        config,
+        server: server_name,
         tools: toolset.tools(),
         schema_version: TOOL_SCHEMA_VERSION,
         proto_version: TOOL_PROTOCOL_VERSION,
@@ -437,7 +445,12 @@ async fn publish_registration(
     instance_id: &InstanceId,
     registration: &Registration,
 ) -> Result<u64> {
-    let key = registration_key(instance_id, &registration.server);
+    let identity_token = server_identity_token(
+        registration.package.as_deref(),
+        &registration.config,
+        &registration.server,
+    );
+    let key = registration_key(instance_id, &identity_token);
     let payload = serde_json::to_vec(registration).context("encode tool registration")?;
     registry
         .put(&key, payload.into())
