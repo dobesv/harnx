@@ -30,6 +30,15 @@ use std::time::Duration;
 const FILE_VARIABLE_AGENT: &str = "varagent";
 const BROKEN_AGENT: &str = "brokenagent";
 const UNLOADABLE_AGENT: &str = "unloadableagent";
+const PACKAGE_NAME: &str = "testpkg";
+const PACKAGE_AGENT_STEM: &str = "assembled";
+/// Shared prompt fragments the package agent stitches together, mirroring
+/// `packages/pantheon/agents/shared/*.md`.
+const PACKAGE_SHARED_FILES: [(&str, &str); 3] = [
+    ("core.md", "CORE: you are the assembled agent."),
+    ("review.md", "REVIEW: always run the quality gate."),
+    ("delegation.md", "DELEGATION: hand off research tasks."),
+];
 const VARIABLE_FILE_TEXT: &str = "core instructions loaded from a file";
 /// Generous enough that a slow CI box does not trip it, short enough that a
 /// genuinely stalled turn fails the test rather than hanging the suite.
@@ -148,19 +157,112 @@ impl TestEnv {
         )
     }
 
+    /// A package agent assembled from several shared files, plus an inline
+    /// default and a variable left for the caller to supply — the shape every
+    /// pantheon agent has.
+    ///
+    /// Package agents resolve through `<config>/packages/<pkg>/agents/<stem>.md`
+    /// rather than `<config>/agents/<name>.md`, so their `path:` variables
+    /// resolve against a different directory than a plain agent's.
+    fn write_package_agent(&self) -> Result<()> {
+        let package_dir = self.config_dir.join("packages").join(PACKAGE_NAME);
+        let agents_dir = package_dir.join("agents");
+        std::fs::create_dir_all(agents_dir.join("shared"))?;
+        std::fs::create_dir_all(package_dir.join("clients"))?;
+        for (file, body) in PACKAGE_SHARED_FILES {
+            std::fs::write(agents_dir.join("shared").join(file), body)?;
+        }
+        std::fs::write(
+            package_dir.join("package.yaml"),
+            format!("name: {PACKAGE_NAME}\nversion: 0.0.0\n"),
+        )?;
+        // Package agents resolve their model's client name relative to the
+        // package, so the client must live in the package too — the same way
+        // pantheon ships `clients/claude.yaml` for `model: claude:...`.
+        std::fs::write(
+            package_dir.join("clients").join("openai.yaml"),
+            "type: openai\napi_key: sk-test\nmodels:\n  - name: test-model\n    type: chat\n    max_input_tokens: 4096\n",
+        )?;
+        std::fs::write(
+            agents_dir.join(format!("{PACKAGE_AGENT_STEM}.md")),
+            "---\n\
+             model: openai:test-model\n\
+             variables:\n\
+             - name: core\n\
+             \x20 description: Core identity\n\
+             \x20 path: shared/core.md\n\
+             - name: review\n\
+             \x20 description: Review protocol\n\
+             \x20 path: shared/review.md\n\
+             - name: delegation\n\
+             \x20 description: Delegation protocol\n\
+             \x20 path: shared/delegation.md\n\
+             - name: tone\n\
+             \x20 description: Response tone\n\
+             \x20 default: terse and direct\n\
+             - name: repo\n\
+             \x20 description: Repository under work\n\
+             ---\n\
+             {{core}}\n\n{{review}}\n\n{{delegation}}\n\nTone: {{tone}}\nRepo: {{repo}}\n",
+        )?;
+        Ok(())
+    }
+
     async fn spawn_worker(&self, worker_id: &'static str) -> Result<tokio::task::JoinHandle<()>> {
-        let config = Config::load_from_file(&self.config_dir.join("config.yaml"))?;
+        self.spawn_worker_with(worker_id, fixed_reply_call_fn("stub reply"), &[])
+            .await
+    }
+
+    /// Spawn a worker with `--agent-variable`-style overrides, as
+    /// `run_worker_command` sets them from the CLI.
+    async fn spawn_worker_with(
+        &self,
+        worker_id: &'static str,
+        call_fn: harnx_runtime::agent_loop::AgentCallFn,
+        agent_variables: &[(&str, &str)],
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        let mut config = Config::load_from_file(&self.config_dir.join("config.yaml"))?;
+        // `run_worker_command` builds its config with `Config::init(.., true)`.
+        config.info_flag = true;
+        if !agent_variables.is_empty() {
+            let mut vars = harnx_core::agent_config::AgentVariables::new();
+            for (name, value) in agent_variables {
+                vars.insert((*name).to_string(), (*value).to_string());
+            }
+            config.agent_variables = Some(vars);
+        }
         let config = Arc::new(RwLock::new(config));
         let handle = tokio::spawn(async move {
             let _ = run_worker_daemon(
                 config,
                 WorkerDaemonConfig::new("local", worker_id),
-                Some(fixed_reply_call_fn("stub reply")),
+                Some(call_fn),
             )
             .await;
         });
         tokio::time::sleep(Duration::from_millis(500)).await;
         Ok(handle)
+    }
+
+    /// Link a package straight out of the workspace so the worker loads the
+    /// agents we actually ship, not a stand-in. Returns `None` when the package
+    /// assets are absent (published crates do not carry them).
+    fn link_workspace_package(&self, package: &str) -> Result<Option<()>> {
+        let Some(workspace_root) = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .find(|ancestor| ancestor.join("packages").join(package).is_dir())
+        else {
+            return Ok(None);
+        };
+        let packages_dir = self.config_dir.join("packages");
+        std::fs::create_dir_all(&packages_dir)?;
+        let source = workspace_root.join("packages").join(package);
+        let link = packages_dir.join(package);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&source, &link)?;
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&source, &link)?;
+        Ok(Some(()))
     }
 
     async fn jetstream(&self) -> Result<async_nats::jetstream::Context> {
@@ -190,6 +292,34 @@ impl TestEnv {
         .await
         .context("turn stalled: the client never stopped waiting for the worker")?
     }
+}
+
+/// Records the system message the worker would send to the model, by running
+/// the same `build_messages` the real call path uses. Asserting on this rather
+/// than on the variable map proves the prompt the model sees is fully
+/// interpolated.
+fn prompt_capturing_call_fn(
+    captured: Arc<std::sync::Mutex<Option<String>>>,
+) -> harnx_runtime::agent_loop::AgentCallFn {
+    Arc::new(move |input, config, _abort| {
+        let system = harnx_runtime::config::input::build_messages(input, config)
+            .ok()
+            .and_then(|messages| {
+                messages
+                    .into_iter()
+                    .find(|message| message.role == harnx_core::message::MessageRole::System)
+                    .map(|message| message.content.to_text())
+            });
+        *captured.lock().unwrap() = system;
+        Box::pin(async move {
+            Ok((
+                "stub reply".to_string(),
+                None,
+                vec![],
+                harnx_runtime::client::CompletionTokenUsage::default(),
+            ))
+        })
+    })
 }
 
 fn fixed_reply_call_fn(reply: &'static str) -> harnx_runtime::agent_loop::AgentCallFn {
@@ -276,6 +406,169 @@ async fn worker_renders_agent_prompt_with_file_backed_variables() -> Result<()> 
             .iter()
             .any(|(name, value)| name == "agent_core" && value == VARIABLE_FILE_TEXT),
         "header must carry the file-loaded variable value, got {variables:?}"
+    );
+
+    worker.abort();
+    let _ = worker.await;
+    Ok(())
+}
+
+/// A pantheon-shaped package agent: several `path:` fragments, an inline
+/// `default:`, and one variable supplied by the worker's `--agent-variable`.
+/// All of them must be interpolated into the prompt the model receives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_assembles_package_agent_prompt_from_multiple_files() -> Result<()> {
+    require_nextest();
+
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: nats-server not available");
+        return Ok(());
+    };
+
+    let env = TestEnv::new(server)?;
+    env.write_package_agent()?;
+
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let worker = env
+        .spawn_worker_with(
+            "worker-package-agent",
+            prompt_capturing_call_fn(Arc::clone(&captured)),
+            &[("repo", "harnx")],
+        )
+        .await?;
+
+    let agent = format!("{PACKAGE_NAME}/{PACKAGE_AGENT_STEM}");
+    let turn = env.run_turn(&agent, "agent-package-assembled").await?;
+
+    assert_eq!(turn.error, None, "turn must not report a worker failure");
+    assert_eq!(turn.response.as_deref(), Some("stub reply"));
+
+    let prompt = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .context("worker must have built a system message for the turn")?;
+    for (file, body) in PACKAGE_SHARED_FILES {
+        assert!(
+            prompt.contains(body),
+            "prompt is missing the contents of shared/{file}; got:\n{prompt}"
+        );
+    }
+    assert!(
+        prompt.contains("Tone: terse and direct"),
+        "inline default must be interpolated; got:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("Repo: harnx"),
+        "worker --agent-variable must be interpolated; got:\n{prompt}"
+    );
+    assert!(
+        !prompt.contains("{{"),
+        "prompt must be fully interpolated; got:\n{prompt}"
+    );
+
+    worker.abort();
+    let _ = worker.await;
+    Ok(())
+}
+
+/// The real thing: activate a shipped pantheon agent, whose prompt is stitched
+/// together from a dozen `shared/*.md` fragments. This is the case from #1365,
+/// driven through the worker rather than a stand-in package.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_activates_shipped_pantheon_agent() -> Result<()> {
+    require_nextest();
+
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: nats-server not available");
+        return Ok(());
+    };
+
+    let env = TestEnv::new(server)?;
+    if env.link_workspace_package("pantheon")?.is_none() {
+        eprintln!("skipping: packages/pantheon not available");
+        return Ok(());
+    }
+
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let worker = env
+        .spawn_worker_with(
+            "worker-pantheon",
+            prompt_capturing_call_fn(Arc::clone(&captured)),
+            &[],
+        )
+        .await?;
+
+    let turn = env.run_turn("pantheon/sisyphus", "agent-pantheon").await?;
+    assert_eq!(
+        turn.error, None,
+        "a shipped pantheon agent must activate cleanly"
+    );
+
+    let prompt = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .context("worker must have built a system message for the turn")?;
+    // The variable that broke in the original report.
+    let core = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .find(|a| a.join("packages/pantheon").is_dir())
+            .expect("workspace root")
+            .join("packages/pantheon/agents/shared/sisyphus.md"),
+    )?;
+    let core_head = core
+        .lines()
+        .find(|line| line.len() > 20)
+        .unwrap_or_default();
+    assert!(
+        prompt.contains(core_head),
+        "prompt must contain shared/sisyphus.md; looked for {core_head:?}"
+    );
+    assert!(
+        !prompt.contains("{{"),
+        "prompt must be fully interpolated; got:\n{prompt}"
+    );
+
+    worker.abort();
+    let _ = worker.await;
+    Ok(())
+}
+
+/// A variable the agent declares but nobody supplies must produce an error
+/// that names the variable, not a bare template failure. The worker is never a
+/// TTY, so there is nothing to prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_reports_required_agent_variable_that_was_never_supplied() -> Result<()> {
+    require_nextest();
+
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: nats-server not available");
+        return Ok(());
+    };
+
+    let env = TestEnv::new(server)?;
+    env.write_package_agent()?;
+    // Same agent as the happy path, but started without `repo`.
+    let worker = env
+        .spawn_worker_with("worker-missing-variable", fixed_reply_call_fn("stub"), &[])
+        .await?;
+
+    let agent = format!("{PACKAGE_NAME}/{PACKAGE_AGENT_STEM}");
+    let turn = env.run_turn(&agent, "agent-missing-variable").await?;
+
+    let error = turn
+        .error
+        .context("turn must report the unsupplied variable")?;
+    assert!(
+        error.contains("repo"),
+        "error must name the missing variable, got: {error}"
+    );
+    assert!(
+        error.contains("Repository under work"),
+        "error should carry the variable's description so the operator knows \
+         what to supply, got: {error}"
     );
 
     worker.abort();
