@@ -39,6 +39,7 @@ pub fn entry_type(entry: &SessionLogEntry) -> &'static str {
         SessionLogEntry::Compress { .. } => "compress",
         SessionLogEntry::Clear => "clear",
         SessionLogEntry::Cancel { .. } => "cancel",
+        SessionLogEntry::Error { .. } => "error",
         SessionLogEntry::EditEntries { .. } => "edit_entries",
         SessionLogEntry::Rewind { .. } => "rewind",
         SessionLogEntry::Title { .. } => "title",
@@ -66,6 +67,7 @@ fn entry_searchable_text(entry: &SessionLogEntry) -> String {
         SessionLogEntry::Compress { prompt } => prompt.clone(),
         SessionLogEntry::Title { title, .. } => title.clone(),
         SessionLogEntry::Header { model_id, .. } => format!("model: {model_id}"),
+        SessionLogEntry::Error { message, .. } => message.clone(),
         _ => String::new(),
     }
 }

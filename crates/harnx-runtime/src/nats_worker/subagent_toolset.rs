@@ -343,6 +343,11 @@ impl SubagentToolset {
 }
 
 fn require_response(result: &ThinClientTurnResult) -> Result<&str, ToolInvokeError> {
+    if let Some(error) = &result.error {
+        return Err(ToolInvokeError::Recoverable(format!(
+            "sub-agent turn failed: {error}"
+        )));
+    }
     result.response.as_deref().ok_or_else(|| {
         ToolInvokeError::Recoverable("sub-agent turn returned no final response".to_string())
     })

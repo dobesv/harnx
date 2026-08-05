@@ -295,6 +295,42 @@ impl LeaseState {
     }
 }
 
+/// Open the lease bucket read-only, without creating it.
+///
+/// `Ok(None)` means no worker has ever taken a lease on this cluster. Callers
+/// that poll should hold on to the returned store: opening it costs a
+/// `stream_info` round trip that a plain `get` does not.
+pub async fn open_lease_bucket(
+    jetstream: &jetstream::Context,
+    config: &NatsLeaseConfig,
+) -> Option<kv::Store> {
+    jetstream.get_key_value(&config.bucket).await.ok()
+}
+
+/// Read the worker currently holding a session's lease, without acquiring it.
+///
+/// `Ok(None)` means nobody holds the session: the key expired because its
+/// holder stopped renewing, or it was released. Clients use this to tell "a
+/// worker is still working" from "the worker is gone".
+pub async fn lease_holder_in(
+    bucket: &kv::Store,
+    config: &NatsLeaseConfig,
+    session_id: &str,
+) -> Result<Option<LeaseRecord>> {
+    let key = config.key_for_session(session_id);
+    let Some(entry) = bucket
+        .get(&key)
+        .await
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("Failed to read NATS lease for session '{session_id}'"))?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&entry)
+        .map(Some)
+        .with_context(|| format!("Failed to decode NATS lease record for session '{session_id}'"))
+}
+
 async fn ensure_lease_bucket(
     jetstream: &jetstream::Context,
     config: &NatsLeaseConfig,

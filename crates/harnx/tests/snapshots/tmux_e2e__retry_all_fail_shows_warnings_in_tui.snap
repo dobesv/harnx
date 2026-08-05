@@ -45,8 +45,8 @@ Caused by:
 
 ⚠ Model 'mock-llm:fallback' exhausted retries (error: Failed to call chat-completions api (client: mock-llm, model:
 mock-llm:fallback)), cooldown 60s. Trying next fallback.
-
-
+error: Failed to call chat-completions api (client: mock-llm, model: mock-llm:fallback): Internal Server Error (type:
+server_error) (status: 500)
 
 
 * 🤖 retry-agent ▸ mock-llm:primary ▸ [SID]

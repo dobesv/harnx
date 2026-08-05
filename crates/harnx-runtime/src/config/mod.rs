@@ -1172,7 +1172,7 @@ impl Config {
         crate::config::session::add_tool_results(session, tool_results)
     }
 
-    fn init_agent_shared_variables(&mut self) -> Result<()> {
+    pub(crate) fn init_agent_shared_variables(&mut self) -> Result<()> {
         let agent = match self.agent.as_mut() {
             Some(v) => v,
             None => return Ok(()),

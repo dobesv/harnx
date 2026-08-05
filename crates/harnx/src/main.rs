@@ -654,8 +654,14 @@ async fn start_directive_inner(
         .run_turn(&input.text(), tracking_sink.clone(), None)
         .await?;
 
+    let worker_error = result.error.clone();
     tracking_sink.emit_durable_response_if_needed(result);
-    Ok(())
+    // A worker-side failure must not exit 0 — scripts driving one-shot mode
+    // rely on the exit code to tell an answer from a dead turn.
+    match worker_error {
+        Some(error) => Err(anyhow::anyhow!(error)),
+        None => Ok(()),
+    }
 }
 
 async fn start_interactive(config: &GlobalConfig) -> Result<()> {

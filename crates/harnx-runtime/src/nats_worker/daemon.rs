@@ -836,6 +836,38 @@ impl WorkerRuntime {
         )
     }
 
+    /// Install the activation's agent into the per-session config.
+    ///
+    /// Mirrors the local `use_agent_by_name` flow: file-backed variable
+    /// defaults (`variables: [{name, path}]`) must be read off disk and folded
+    /// into the agent's shared variables before anything renders the prompt
+    /// template, or an agent like `pantheon/sisyphus` fails with an undefined
+    /// value on its first render.
+    ///
+    /// An agent the worker cannot find is not fatal — the session falls back to
+    /// the worker's own configuration, as it has always done. Failing to set up
+    /// an agent that *does* exist is fatal: running it half-initialized only
+    /// fails later, deeper, and less legibly.
+    fn install_activation_agent(per_session: &GlobalConfig, agent_name: &str) -> Result<()> {
+        let retrieved = per_session.read().retrieve_agent(agent_name);
+        let mut agent = match retrieved {
+            Ok(agent) => agent,
+            Err(error) => {
+                log::warn!(
+                    "activation agent '{agent_name}' not available, using worker config: {error:#}"
+                );
+                return Ok(());
+            }
+        };
+        crate::config::agent::resolve_file_defaults(&mut agent)
+            .with_context(|| format!("resolve file-backed variables for agent '{agent_name}'"))?;
+        let mut cfg = per_session.write();
+        cfg.use_agent_obj(agent)
+            .with_context(|| format!("activate agent '{agent_name}'"))?;
+        cfg.init_agent_shared_variables()
+            .with_context(|| format!("initialize variables for agent '{agent_name}'"))
+    }
+
     async fn execute_session(
         &self,
         activation: SessionActivate,
@@ -849,10 +881,7 @@ impl WorkerRuntime {
             let base = self.config.read().clone();
             Arc::new(parking_lot::RwLock::new(base))
         };
-        if let Ok(agent) = self.config.read().retrieve_agent(&activation.agent) {
-            let mut cfg = per_session.write();
-            let _ = cfg.use_agent_obj(agent);
-        }
+        let agent_setup = Self::install_activation_agent(&per_session, &activation.agent);
 
         // Create event sink for live fan-out. `new` seeds `after_seq` from stream once.
         let event_sink = crate::nats_event_sink::NatsEventSink::new(
@@ -875,6 +904,10 @@ impl WorkerRuntime {
             Self::spawn_lease_loss_watch(&lease, &abort_signal, &activation.session_id);
 
         let result = harnx_core::sink::with_agent_event_sink(event_sink, async {
+            // A half-installed agent cannot render its prompt, so stop here and
+            // let the caller record the failure rather than failing deeper in.
+            agent_setup?;
+
             // Activation high-water cursor: max log seq of ANY user message we've fed into this
             // activation. Includes messages folded into turn inputs AND mid-round injections.
             // A continuation turn only runs if there's a user message with seq > this cursor.
@@ -1015,6 +1048,13 @@ impl WorkerRuntime {
         })
         .await;
 
+        // Record the failure durably BEFORE releasing the lease: attached
+        // clients treat an `Error` entry as the turn barrier, and a client that
+        // reconnects later still sees why the turn produced nothing.
+        if let Err(error) = &result {
+            Self::record_session_error(&backend, &lease, error).await;
+        }
+
         if !lease.is_held() {
             log::warn!(
                 "session execution ended after failover: session_id={} worker_id={} revision={}",
@@ -1031,6 +1071,32 @@ impl WorkerRuntime {
 
         let _ = lease.release().await;
         result
+    }
+
+    /// Append an `Error` entry for a turn that failed.
+    ///
+    /// Skipped when the lease is gone: a newer worker owns the session and
+    /// writing behind it would corrupt the log. That case is covered by the
+    /// client's orphan watchdog instead.
+    async fn record_session_error(
+        backend: &NatsSessionLogBackend,
+        lease: &NatsSessionLease,
+        error: &anyhow::Error,
+    ) {
+        if !should_append_control_log_entry(lease) {
+            return;
+        }
+        let entry = harnx_core::session::SessionLogEntry::Error {
+            message: format!("{error:#}"),
+            fence_token: lease.fence_token(),
+            timestamp: Some(chrono::Utc::now()),
+        };
+        if let Err(append_error) = backend.append_event_blocking(&entry) {
+            log::warn!(
+                "failed to append Error entry: session_id={} err={append_error:#}",
+                backend.session_id(),
+            );
+        }
     }
 
     /// Spawn a task that watches for lease loss and aborts on loss.
