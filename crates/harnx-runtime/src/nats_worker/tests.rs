@@ -37,7 +37,7 @@ use tokio_util::sync::CancellationToken;
 /// dir guard. Using a free port + per-run store dir avoids cross-run state
 /// bleed (JetStream KV/lease buckets) and port collisions that make tests flaky
 /// when run repeatedly or in parallel. Returns `None` if nats-server is absent.
-async fn spawn_test_nats() -> Option<(String, std::process::Child, tempfile::TempDir)> {
+pub(super) async fn spawn_test_nats() -> Option<(String, std::process::Child, tempfile::TempDir)> {
     if which::which("nats-server").is_err() {
         eprintln!("skipping: nats-server not available");
         return None;
@@ -97,17 +97,17 @@ impl Drop for CurrentDirGuard {
     }
 }
 
-async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+pub(super) async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
     ENV_MUTEX.lock().await
 }
 
-struct TestEnvGuard {
+pub(super) struct TestEnvGuard {
     key: String,
     prev: Option<std::ffi::OsString>,
 }
 
 impl TestEnvGuard {
-    fn new(key: &str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+    pub(super) fn new(key: &str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let prev = std::env::var_os(key);
         unsafe { std::env::set_var(key, value) };
         Self {
@@ -141,13 +141,13 @@ fn load_config_via_internal_pipeline(config_path: &Path) -> Config {
     config
 }
 
-struct SeededRemoteParentConfig {
+pub(super) struct SeededRemoteParentConfig {
     temp: tempfile::TempDir,
-    parent_config: Config,
+    pub(super) parent_config: Config,
 }
 
 impl SeededRemoteParentConfig {
-    fn config_dir(&self) -> &Path {
+    pub(super) fn config_dir(&self) -> &Path {
         self.temp.path()
     }
 }
@@ -156,7 +156,7 @@ fn expected_metis_remote_tool_names() -> Vec<String> {
     vec!["metis__at__local_session_handoff".to_string()]
 }
 
-fn seed_remote_config(url: &str) -> SeededRemoteParentConfig {
+pub(super) fn seed_remote_config(url: &str) -> SeededRemoteParentConfig {
     use std::fs;
 
     let temp = tempfile::TempDir::new().unwrap();
@@ -337,12 +337,22 @@ fn spawn_metis_worker_with_call_fn_and_daemon(
     call_fn: crate::agent_loop::AgentCallFn,
     daemon: crate::nats_worker::WorkerDaemonConfig,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    spawn_metis_worker_with_hooks(url, call_fn, daemon, None)
+}
+
+pub(super) fn spawn_metis_worker_with_hooks(
+    url: &str,
+    call_fn: crate::agent_loop::AgentCallFn,
+    daemon: crate::nats_worker::WorkerDaemonConfig,
+    hooks: Option<harnx_core::hooks::HooksConfig>,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     let worker_agent =
         AgentConfig::from_markdown("metis", "---\nuse_tools: \"*\"\n---\nstub worker prompt")
             .unwrap();
     let worker_config = Config {
         data: harnx_core::config_data::ConfigData {
             model_id: "test:test-model".to_string(),
+            hooks,
             ..Default::default()
         },
         agent: Some(crate::config::Agent::new(worker_agent)),
@@ -381,14 +391,16 @@ async fn run_remote_round_trip_with_session_id(
         parent_config,
         session_id,
         Arc::new(NoopEventSink),
+        "local",
     )
     .await
 }
 
-async fn run_remote_round_trip_with_session_id_and_sink(
+pub(super) async fn run_remote_round_trip_with_session_id_and_sink(
     parent_config: Config,
     session_id: String,
     sink: Arc<dyn AgentEventSink>,
+    cluster: &str,
 ) -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -399,7 +411,7 @@ async fn run_remote_round_trip_with_session_id_and_sink(
     let parent_global_config = Arc::new(parking_lot::RwLock::new(parent_config));
     let abort_signal = harnx_core::abort::create_abort_signal();
     let thin_cfg = crate::ThinClientConfig {
-        cluster: "local".to_string(),
+        cluster: cluster.to_string(),
         agent: "metis".to_string(),
         session_id: Some(session_id),
     };
@@ -780,7 +792,7 @@ async fn control_log_append_requires_live_lease() {
     let _ = child.wait();
 }
 
-struct NoopEventSink;
+pub(super) struct NoopEventSink;
 
 impl AgentEventSink for NoopEventSink {
     fn emit(&self, _event: AgentEvent) {}
@@ -803,7 +815,7 @@ impl AgentEventSink for RecordingEventSink {
     }
 }
 
-fn fixed_prompt_call_fn(reply: &'static str) -> crate::agent_loop::AgentCallFn {
+pub(super) fn fixed_prompt_call_fn(reply: &'static str) -> crate::agent_loop::AgentCallFn {
     Arc::new(move |_input, _config, _abort| {
         Box::pin(async move {
             Ok((
@@ -972,7 +984,7 @@ async fn assert_remote_header_inserted_once(log: &NatsSessionLog, expected_first
     }
 }
 
-async fn wait_for_condition<F>(timeout: Duration, mut predicate: F) -> bool
+pub(super) async fn wait_for_condition<F>(timeout: Duration, mut predicate: F) -> bool
 where
     F: FnMut() -> bool,
 {
@@ -1271,6 +1283,7 @@ async fn remote_replay_and_live_rows_emit_logical_seq_assignments() {
         seeded.parent_config,
         session_id.clone(),
         sink.clone(),
+        "local",
     )
     .await
     .expect("worker should migrate legacy session, replay history, then answer turn");

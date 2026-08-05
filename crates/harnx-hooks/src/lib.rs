@@ -12,7 +12,7 @@
 //!   or request a follow-up turn; they never block or deny the active operation
 //!
 //! ## Supported Events
-//! SessionStart, SessionEnd, UserPromptSubmit, Stop, StopFailure,
+//! SessionStart, UserPromptSubmit, Stop, StopFailure,
 //! PreToolUse, PostToolUse, PostToolUseFailure, InstructionsLoaded, CwdChanged
 //!
 //! ## Resume

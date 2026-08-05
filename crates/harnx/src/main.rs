@@ -28,18 +28,14 @@ use crate::config::{
 use crate::tui::{TranscriptItem, Tui};
 use harnx_core::agent_config::collect_agent_variables;
 use harnx_core::event::{AgentEvent, AgentSource, NoticeEvent};
-use harnx_core::hooks::HookEvent;
 use harnx_render::{render_error, MarkdownRender};
 use harnx_runtime::config::SessionMeta;
-use harnx_runtime::nats_hook_provider::{
-    discover_process_nats_hook_provider, dispatch_hook_event, HookDispatchMeta, HookEventDispatch,
-};
 use harnx_runtime::utils::*;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use parking_lot::RwLock;
-use std::{env, path::PathBuf, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use harnx_core::sink::emit_agent_event;
 use harnx_runtime::remote_session_cleanup::{run_remote_cleanup, RemoteCleanupStats};
@@ -453,10 +449,9 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
                 }
             }
             let input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
-            dispatch_session_start(&config, "cmd").await;
             let aborted_check = abort_signal.clone();
             let result = start_directive(&config, input, abort_signal).await;
-            exit_session_with_hook(&config).await?;
+            exit_session(&config)?;
             if aborted_check.aborted() {
                 bail!("interrupted by user");
             }
@@ -469,41 +464,6 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
             start_interactive(&config).await
         }
     }
-}
-
-fn hook_dispatch_context(config: &GlobalConfig) -> (String, PathBuf) {
-    let config = config.read();
-    (
-        config
-            .session
-            .as_ref()
-            .map(|session| session.id())
-            .unwrap_or("default")
-            .to_string(),
-        env::current_dir().unwrap_or_default(),
-    )
-}
-
-async fn dispatch_session_start(config: &GlobalConfig, source: &str) {
-    let (session_id, cwd) = hook_dispatch_context(config);
-    let config_snapshot = config.read().clone();
-    let nats_hook_provider = discover_process_nats_hook_provider(&config_snapshot).await;
-    let model_id = config.read().current_model().id().to_string();
-    let event = HookEvent::SessionStart {
-        source: source.to_string(),
-        model: model_id,
-    };
-    let _ = dispatch_hook_event(HookEventDispatch {
-        event,
-        provider: nats_hook_provider.as_deref(),
-        meta: HookDispatchMeta {
-            session_id: session_id.clone(),
-            cwd: cwd.clone(),
-            resume_count: 0,
-        },
-        pending_async_context: None,
-    })
-    .await;
 }
 
 fn session_resume_command(config: &GlobalConfig) -> Option<String> {
@@ -618,29 +578,9 @@ fn print_session_breakdown(
     }
 }
 
-async fn exit_session_with_hook(config: &GlobalConfig) -> Result<()> {
+fn exit_session(config: &GlobalConfig) -> Result<()> {
     let resume_cmd = session_resume_command(config);
-    let (session_id, cwd) = hook_dispatch_context(config);
-    let config_snapshot = config.read().clone();
-    let nats_hook_provider = discover_process_nats_hook_provider(&config_snapshot).await;
     config.write().exit_session()?;
-    let event = HookEvent::SessionEnd {
-        reason: "session_exit".to_string(),
-    };
-    let _ = tokio::time::timeout(
-        Duration::from_secs(5),
-        dispatch_hook_event(HookEventDispatch {
-            event,
-            provider: nats_hook_provider.as_deref(),
-            meta: HookDispatchMeta {
-                session_id: session_id.clone(),
-                cwd: cwd.clone(),
-                resume_count: 0,
-            },
-            pending_async_context: None,
-        }),
-    )
-    .await;
 
     if let Some(cmd) = resume_cmd {
         eprintln!(
@@ -719,7 +659,6 @@ async fn start_directive_inner(
 }
 
 async fn start_interactive(config: &GlobalConfig) -> Result<()> {
-    dispatch_session_start(config, "tui").await;
     let mut tui: Tui = Tui::init(config).await?;
     let result = tui.run().await;
     let source = {
@@ -731,7 +670,7 @@ async fn start_interactive(config: &GlobalConfig) -> Result<()> {
         }
     };
     print_session_breakdown(tui.transcript(), &source, config);
-    exit_session_with_hook(config).await?;
+    exit_session(config)?;
     result
 }
 
