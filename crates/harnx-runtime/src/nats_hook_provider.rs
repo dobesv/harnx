@@ -227,7 +227,6 @@ impl NatsHookProvider {
                 outcome
             }
             HookEvent::SessionStart { .. }
-            | HookEvent::SessionEnd { .. }
             | HookEvent::UserPromptSubmit { .. }
             | HookEvent::Stop { .. }
             | HookEvent::StopFailure { .. } => {
@@ -860,9 +859,6 @@ mod tests {
                 source: "cli".to_string(),
                 model: "model".to_string(),
             },
-            HookEvent::SessionEnd {
-                reason: "exit".to_string(),
-            },
             HookEvent::UserPromptSubmit {
                 prompt: "hello".to_string(),
             },
@@ -1226,8 +1222,9 @@ mod tests {
     #[tokio::test]
     async fn unified_entrypoint_without_provider_is_noop() {
         let actual = dispatch_hook_event(HookEventDispatch {
-            event: HookEvent::SessionEnd {
-                reason: "test".to_string(),
+            event: HookEvent::Stop {
+                stop_hook_active: false,
+                last_assistant_message: None,
             },
             provider: None,
             meta: HookDispatchMeta {
@@ -1311,7 +1308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_end_is_delivered_before_dispatch_returns() {
+    async fn session_start_is_delivered_before_dispatch_returns() {
         let dispatcher = Arc::new(StubDispatcher {
             outcomes: Mutex::new(vec![continue_outcome(None)].into()),
             seen_inputs: Mutex::new(Vec::new()),
@@ -1323,15 +1320,16 @@ mod tests {
         });
         let provider = NatsHookProvider::from_dispatcher(
             InstanceId::from_string("test"),
-            vec![hook("lifecycle", "SessionEnd", None, 0)],
+            vec![hook("lifecycle", "SessionStart", None, 0)],
             dispatcher.clone(),
         );
 
         let started = tokio::time::Instant::now();
         let outcome = provider
             .dispatch_event(
-                HookEvent::SessionEnd {
-                    reason: "exit".to_string(),
+                HookEvent::SessionStart {
+                    source: "startup".to_string(),
+                    model: "model".to_string(),
                 },
                 None,
                 HookDispatchMeta {
@@ -1347,7 +1345,7 @@ mod tests {
         assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             dispatcher.seen_subjects.lock().await.as_slice(),
-            ["harnx.v1.test.hook.lifecycle.SessionEnd"]
+            ["harnx.v1.test.hook.lifecycle.SessionStart"]
         );
         assert_eq!(dispatcher.seen_resume_counts.lock().await.as_slice(), [4]);
     }

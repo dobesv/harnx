@@ -5,6 +5,9 @@ use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use crate::agent_loop::OnToolRoundFn;
 use crate::config::{resolve_local_nats_server_config, GlobalConfig, Input, LOCAL_CLUSTER_KEY};
 use crate::nats_event_sink::NatsEventSink;
+use crate::nats_hook_provider::{
+    dispatch_hook_event, HookDispatchMeta, HookEventDispatch, NatsHookProvider,
+};
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use crate::nats_metrics;
 use crate::nats_session_index::{put_record, SessionIndexRecord};
@@ -199,7 +202,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         on_tool_round,
         working_dir,
     } = args;
-    let jetstream_ctx = prepare_agent_session(PrepareAgentSessionParams {
+    let (jetstream_ctx, session_origin) = prepare_agent_session(PrepareAgentSessionParams {
         cluster_key,
         session_id,
         config: &config,
@@ -235,6 +238,10 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
     })
     .await;
 
+    // After hook reconciliation and provider discovery so the dispatch reaches
+    // both global and agent hook servers.
+    dispatch_context_session_start(&ctx, session_origin, session_id).await;
+
     // Run unified agent loop
     // Persistence goes through shared Config.save_message entry construction; append_event routes sink
     run_agent_loop_segment(AgentLoopSegmentArgs {
@@ -268,7 +275,7 @@ struct PrepareAgentSessionParams<'a> {
 
 async fn prepare_agent_session(
     params: PrepareAgentSessionParams<'_>,
-) -> Result<jetstream::Context> {
+) -> Result<(jetstream::Context, SessionOrigin)> {
     let cfg_snapshot = params.config.read().clone();
     let jetstream = cfg_snapshot.nats_jetstream(params.cluster_key).await?;
     let mut backend = NatsSessionLogBackend::new(jetstream.clone(), params.session_id);
@@ -276,7 +283,7 @@ async fn prepare_agent_session(
         backend = backend.with_after_seq_observer(observer);
     }
     abort_resume_if_fenced(&backend, params.lease.map(Arc::as_ref))?;
-    let session = load_or_repair_session(LoadOrRepairSessionParams {
+    let (session, origin) = load_or_repair_session(LoadOrRepairSessionParams {
         backend: &backend,
         config: params.config,
         instance_id: params.instance_id,
@@ -290,7 +297,7 @@ async fn prepare_agent_session(
     })
     .await?;
     attach_session_to_config(params.config, session, &backend, params.lease);
-    Ok(jetstream)
+    Ok((jetstream, origin))
 }
 
 struct AgentContextParams {
@@ -323,6 +330,79 @@ async fn build_agent_loop_context(
         working_dir: params.working_dir,
         session_lock: None,
     }
+}
+
+/// Whether this activation created the session or picked up an existing one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionOrigin {
+    Created,
+    Resumed,
+}
+
+struct SessionStartDispatch<'a> {
+    origin: SessionOrigin,
+    provider: Option<&'a NatsHookProvider>,
+    session_id: &'a str,
+    cwd: std::path::PathBuf,
+    model: String,
+    pending_async_context: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
+}
+
+/// Dispatch SessionStart using the loop context's provider, model, and cwd.
+///
+/// Any additional context the hooks return rides the loop's pending queue into
+/// the first turn.
+async fn dispatch_context_session_start(
+    ctx: &crate::agent_loop::AgentLoopContext,
+    origin: SessionOrigin,
+    session_id: &str,
+) {
+    // Same cwd rule as the shared agent loop: the session's working directory
+    // when it has one, else the worker's.
+    let cwd = ctx
+        .working_dir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let model = ctx.config.read().current_model().id().to_string();
+    dispatch_session_start(SessionStartDispatch {
+        origin,
+        provider: ctx.nats_hook_provider.as_deref(),
+        session_id,
+        cwd,
+        model,
+        pending_async_context: ctx.pending_async_context.clone(),
+    })
+    .await;
+}
+
+/// Fire SessionStart for a session this worker just created.
+///
+/// The worker owns this event because only it can reach the hook servers it
+/// launched. Every activation of an existing session skips it: activations
+/// happen once per turn, and the activation that created the session already
+/// fired it.
+///
+/// The outcome is dropped on purpose. SessionStart hooks observe and contribute
+/// context; the session already exists by the time they run, so there is nothing
+/// for a `Block` to prevent.
+async fn dispatch_session_start(params: SessionStartDispatch<'_>) {
+    if params.origin == SessionOrigin::Resumed {
+        return;
+    }
+    let _ = dispatch_hook_event(HookEventDispatch {
+        event: harnx_core::hooks::HookEvent::SessionStart {
+            source: "startup".to_string(),
+            model: params.model,
+        },
+        provider: params.provider,
+        meta: HookDispatchMeta {
+            session_id: params.session_id.to_string(),
+            cwd: params.cwd,
+            resume_count: 0,
+        },
+        pending_async_context: params.pending_async_context,
+    })
+    .await;
 }
 
 struct AgentLoopSegmentArgs {
@@ -581,7 +661,7 @@ struct LoadOrRepairSessionParams<'a> {
 /// existing session.
 async fn load_or_repair_session(
     params: LoadOrRepairSessionParams<'_>,
-) -> Result<harnx_core::session::Session> {
+) -> Result<(harnx_core::session::Session, SessionOrigin)> {
     let LoadOrRepairSessionParams {
         backend,
         config,
@@ -597,7 +677,7 @@ async fn load_or_repair_session(
     let entries = backend.load_events_blocking()?;
     if entries.is_empty() {
         // New session: write header and load
-        return write_header_and_load_session(
+        let session = write_header_and_load_session(
             backend,
             config,
             input,
@@ -605,14 +685,17 @@ async fn load_or_repair_session(
             session_id,
             working_dir,
         )
-        .await;
+        .await?;
+        return Ok((session, SessionOrigin::Created));
     }
 
-    // Existing session: check effective session log for orphan tool calls and repair with hints
     let mut entries_vec = entries;
     let mut effective_entries =
         harnx_core::session_reconstruct::apply_log_mutations_nats(&entries_vec)?;
-    maybe_insert_remote_header(MaybeInsertRemoteHeaderArgs {
+    // The thin client appends its user message before it activates a session, so
+    // a brand-new session reaches this path with a headerless log rather than an
+    // empty one. Writing the header here is what creates the session.
+    let header_written = maybe_insert_remote_header(MaybeInsertRemoteHeaderArgs {
         backend,
         config,
         input,
@@ -624,35 +707,79 @@ async fn load_or_repair_session(
     })
     .await?;
     refresh_session_index_on_activation(session_index, &effective_entries, session_id).await;
-    let orphan_calls = find_orphan_tool_calls(&effective_entries);
-    if !orphan_calls.is_empty() {
-        nats_metrics::resume_detected();
-        info!(
-            "resume detected: session_id={} worker_id={} revision={} orphan_batches={}",
-            session_id,
-            lease.map(|l| l.worker_id()).unwrap_or("none"),
-            lease.map(|l| l.fence_token()).unwrap_or(0),
-            orphan_calls.len()
-        );
-        repair_orphan_tool_calls_with_hints(
-            backend,
-            &orphan_calls,
-            RepairOrphanToolCallsArgs {
-                config: config.clone(),
-                instance_id,
-                fence_token: lease.map(|l| l.fence_token()),
-                worker_id: lease.map(|l| l.worker_id().to_string()),
-                session_id,
-                abort_signal,
-            },
-        )
-        .await?;
-        // Repair appended ToolResults to the backend; reload so the
-        // in-memory session reflects the repaired log rather than the
-        // stale snapshot that still contains the orphan ToolCalls.
-        entries_vec = backend.load_events_blocking()?;
+    repair_orphan_tool_calls_if_any(RepairOrphanCallsParams {
+        backend,
+        config,
+        instance_id,
+        lease,
+        session_id,
+        abort_signal,
+        effective_entries: &effective_entries,
+        entries_vec: &mut entries_vec,
+    })
+    .await?;
+    let session = crate::nats_session_log::load_session_from_entries(&entries_vec, session_id)?;
+    let origin = if header_written {
+        SessionOrigin::Created
+    } else {
+        SessionOrigin::Resumed
+    };
+    Ok((session, origin))
+}
+
+struct RepairOrphanCallsParams<'a> {
+    backend: &'a NatsSessionLogBackend,
+    config: &'a GlobalConfig,
+    instance_id: &'a harnx_core::instance::InstanceId,
+    lease: Option<&'a NatsSessionLease>,
+    session_id: &'a str,
+    abort_signal: &'a AbortSignal,
+    effective_entries: &'a [(u64, SessionLogEntry)],
+    entries_vec: &'a mut Vec<(u64, SessionLogEntry)>,
+}
+
+/// Repair tool calls left without results by a previous worker, reloading
+/// `entries_vec` so the caller builds the session from the repaired log rather
+/// than the stale snapshot that still holds the orphan calls. No-op when the
+/// effective log has no orphans.
+async fn repair_orphan_tool_calls_if_any(params: RepairOrphanCallsParams<'_>) -> Result<()> {
+    let RepairOrphanCallsParams {
+        backend,
+        config,
+        instance_id,
+        lease,
+        session_id,
+        abort_signal,
+        effective_entries,
+        entries_vec,
+    } = params;
+    let orphan_calls = find_orphan_tool_calls(effective_entries);
+    if orphan_calls.is_empty() {
+        return Ok(());
     }
-    crate::nats_session_log::load_session_from_entries(&entries_vec, session_id)
+    nats_metrics::resume_detected();
+    info!(
+        "resume detected: session_id={} worker_id={} revision={} orphan_batches={}",
+        session_id,
+        lease.map(|l| l.worker_id()).unwrap_or("none"),
+        lease.map(|l| l.fence_token()).unwrap_or(0),
+        orphan_calls.len()
+    );
+    repair_orphan_tool_calls_with_hints(
+        backend,
+        &orphan_calls,
+        RepairOrphanToolCallsArgs {
+            config: config.clone(),
+            instance_id,
+            fence_token: lease.map(|l| l.fence_token()),
+            worker_id: lease.map(|l| l.worker_id().to_string()),
+            session_id,
+            abort_signal,
+        },
+    )
+    .await?;
+    *entries_vec = backend.load_events_blocking()?;
+    Ok(())
 }
 
 fn should_insert_remote_header(effective_entries: &[(u64, SessionLogEntry)]) -> bool {
@@ -1118,7 +1245,10 @@ struct MaybeInsertRemoteHeaderArgs<'a> {
 /// publishes the resulting seq to the daemon's high-water observer, and reloads
 /// `entries_vec` / `effective_entries` so the caller sees the repaired log.
 /// No-op when the effective log already has a header.
-async fn maybe_insert_remote_header(args: MaybeInsertRemoteHeaderArgs<'_>) -> Result<()> {
+///
+/// Returns whether a header was written, which is how the worker recognizes the
+/// activation that brought this session into existence.
+async fn maybe_insert_remote_header(args: MaybeInsertRemoteHeaderArgs<'_>) -> Result<bool> {
     let MaybeInsertRemoteHeaderArgs {
         backend,
         config,
@@ -1131,7 +1261,7 @@ async fn maybe_insert_remote_header(args: MaybeInsertRemoteHeaderArgs<'_>) -> Re
     } = args;
 
     if !should_insert_remote_header(effective_entries) {
-        return Ok(());
+        return Ok(false);
     }
     let Some((first_user_seq, last_user_seq, replacements)) =
         build_remote_header_insert_replacements(
@@ -1143,7 +1273,7 @@ async fn maybe_insert_remote_header(args: MaybeInsertRemoteHeaderArgs<'_>) -> Re
             working_dir,
         )?
     else {
-        return Ok(());
+        return Ok(false);
     };
 
     let edit_entry = SessionLogEntry::EditEntries {
@@ -1167,7 +1297,7 @@ async fn maybe_insert_remote_header(args: MaybeInsertRemoteHeaderArgs<'_>) -> Re
     }
     *entries_vec = backend.load_events_blocking()?;
     *effective_entries = harnx_core::session_reconstruct::apply_log_mutations_nats(entries_vec)?;
-    Ok(())
+    Ok(true)
 }
 
 /// Write a new session header and load the session.
@@ -1195,11 +1325,91 @@ pub(crate) async fn write_header_and_load_session(
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_resolved_hooks, fold_new_user_messages_since};
+    use super::{
+        agent_resolved_hooks, dispatch_session_start, fold_new_user_messages_since, SessionOrigin,
+        SessionStartDispatch,
+    };
     use crate::config::Config;
+    use crate::nats_hook_provider::{DiscoveredHook, NatsHookProvider};
     use chrono::{TimeZone, Utc};
+    use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResult, HookResultControl};
+    use harnx_core::instance::InstanceId;
     use harnx_core::message::{MessageContent, MessageRole};
     use harnx_core::session::SessionLogEntry;
+    use harnx_hookset::{FailPolicy, HookSpec};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    /// A provider whose only route is a SessionStart hook recording every
+    /// payload it receives.
+    fn recording_session_start_provider() -> (NatsHookProvider, Arc<Mutex<Vec<HookPayload>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let provider = NatsHookProvider::from_request_handler(
+            InstanceId::from_string("session-start-test"),
+            vec![DiscoveredHook {
+                server: "lifecycle".to_string(),
+                display_label: None,
+                spec: HookSpec {
+                    event: "SessionStart".to_string(),
+                    matcher: None,
+                    priority: 0,
+                    timeout_secs: Some(1),
+                    fail_policy: FailPolicy::Closed,
+                },
+            }],
+            Arc::new(move |_subject, payload: HookPayload| {
+                recorder.lock().expect("recorder lock").push(payload);
+                HookOutcome {
+                    control: HookResultControl::Continue,
+                    result: HookResult::default(),
+                }
+            }),
+        );
+        (provider, seen)
+    }
+
+    #[tokio::test]
+    async fn created_session_dispatches_session_start_to_worker_hooks() {
+        let (provider, seen) = recording_session_start_provider();
+
+        dispatch_session_start(SessionStartDispatch {
+            origin: SessionOrigin::Created,
+            provider: Some(&provider),
+            session_id: "fresh-session",
+            cwd: PathBuf::from("/tmp/project"),
+            model: "test:test-model".to_string(),
+            pending_async_context: None,
+        })
+        .await;
+
+        let seen = seen.lock().expect("recorder lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].session_id, "fresh-session");
+        assert_eq!(seen[0].cwd, PathBuf::from("/tmp/project"));
+        let HookEvent::SessionStart { source, model } = &seen[0].hook_event else {
+            panic!("expected SessionStart, got {:?}", seen[0].hook_event);
+        };
+        assert_eq!(source, "startup");
+        assert_eq!(model, "test:test-model");
+    }
+
+    #[tokio::test]
+    async fn resumed_session_does_not_redispatch_session_start() {
+        let (provider, seen) = recording_session_start_provider();
+
+        dispatch_session_start(SessionStartDispatch {
+            origin: SessionOrigin::Resumed,
+            provider: Some(&provider),
+            session_id: "existing-session",
+            cwd: PathBuf::from("/tmp/project"),
+            model: "test:test-model".to_string(),
+            pending_async_context: None,
+        })
+        .await;
+
+        assert!(seen.lock().expect("recorder lock").is_empty());
+    }
 
     fn user_entry(id: &str, text: &str, timestamp: chrono::DateTime<Utc>) -> SessionLogEntry {
         SessionLogEntry::Message {

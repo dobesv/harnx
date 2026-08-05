@@ -67,8 +67,7 @@ Harnx supports the following events. Each event sends a JSON payload to the hook
 
 | Event | When it fires | Payload Fields | Capabilities |
 | :--- | :--- | :--- | :--- |
-| `SessionStart` | At the beginning of a session. | `session_id`, `cwd`, `source`, `model` | Observe |
-| `SessionEnd` | When a session terminates. | `session_id`, `cwd`, `reason` | Observe |
+| `SessionStart` | Once, when a session is created. Resuming a session does not fire it again. `source` is `startup`. | `session_id`, `cwd`, `source`, `model` | Observe, Context |
 | `UserPromptSubmit` | When the user sends a prompt. | `session_id`, `cwd`, `prompt` | Observe |
 | `Stop` | When the agent finishes its turn. | `session_id`, `cwd`, `stop_hook_active`, `last_assistant_message` | Resume |
 | `StopFailure` | When an agent turn fails. | `session_id`, `cwd`, `error`, `error_type` | Observe |
@@ -645,7 +644,7 @@ NATS hook servers register their capabilities in a JetStream Key-Value bucket an
 
 ### Event Processing and Capabilities
 
-`NatsHookProvider` handles all `HookEvent` variants (`SessionStart`, `SessionEnd`, `UserPromptSubmit`, `Stop`, `StopFailure`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `InstructionsLoaded`, `CwdChanged`):
+`NatsHookProvider` handles all `HookEvent` variants (`SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `InstructionsLoaded`, `CwdChanged`):
 
 * **`PreToolUse` Hooks**: Executed sequentially in priority order.
   * *Input Mutation*: `mutated_tool_input` chains from hook to hook (e.g., sequentially augmenting environment variables).
@@ -653,8 +652,8 @@ NATS hook servers register their capabilities in a JetStream Key-Value bucket an
   * *Context Injection*: `additional_context` and `system_message` strings are aggregated across matching hooks and enqueued into `pending_async_context` for injection into the next agent turn.
 * **`Ask` Outcome & Headless Limitation**: A `PreToolUse` hook returning `Ask` surfaces as a tool confirmation request (`ToolApprovalRequiredError`). In headless worker environments where interactive prompts are unavailable, the caller's confirmation callback or approval handler determines whether the request proceeds or fails.
 * **`PostToolUse` Hooks**: Executed asynchronously (`tokio::spawn` fire-and-forget). Errors emit an `AgentEvent::Notice(Error)`. Returned `additional_context` or `system_message` values route to `pending_async_context`. Note: `mutated_tool_response` is logged and dropped in the NATS dispatch path.
-* **Non-Tool Blocking Events** (`UserPromptSubmit`, `Stop`, `StopFailure`): Executed sequentially; short-circuits on `Block` or `Ask`; appends returned context to `pending_async_context`.
-* **Best-Effort Events** (`SessionStart`, `SessionEnd`, `InstructionsLoaded`, `CwdChanged`, `PostToolUseFailure`): Dispatched as asynchronous background tasks.
+* **Non-Tool Blocking Events** (`SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`): Executed sequentially; short-circuits on `Block` or `Ask`; appends returned context to `pending_async_context`.
+* **Best-Effort Events** (`InstructionsLoaded`, `CwdChanged`, `PostToolUseFailure`): Dispatched as asynchronous background tasks.
 
 ### Fail-Closed Behavior & Expectation Tracking
 

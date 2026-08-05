@@ -30,6 +30,8 @@ mod subagent_toolset;
 mod tool_supervisor;
 
 #[cfg(test)]
+mod session_start_hook_tests;
+#[cfg(test)]
 mod tests;
 
 // Re-export public items to preserve the `crate::nats_worker::X` path

@@ -19,9 +19,6 @@ pub enum HookEvent {
         source: String,
         model: String,
     },
-    SessionEnd {
-        reason: String,
-    },
     UserPromptSubmit {
         prompt: String,
     },
@@ -65,7 +62,6 @@ impl HookEvent {
     pub fn event_name(&self) -> &'static str {
         match self {
             Self::SessionStart { .. } => "SessionStart",
-            Self::SessionEnd { .. } => "SessionEnd",
             Self::UserPromptSubmit { .. } => "UserPromptSubmit",
             Self::Stop { .. } => "Stop",
             Self::StopFailure { .. } => "StopFailure",
@@ -392,12 +388,6 @@ entries:
                     model: "claude".to_string(),
                 },
                 "SessionStart",
-            ),
-            (
-                HookEvent::SessionEnd {
-                    reason: "complete".to_string(),
-                },
-                "SessionEnd",
             ),
             (
                 HookEvent::UserPromptSubmit {
