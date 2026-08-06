@@ -154,12 +154,10 @@ pub fn query_entries_with_jaq(
     let Some(expr) = &query.jaq else {
         return Ok(rows);
     };
-    // `eval_filter` returns `None` on a parse/compile/runtime error; surface
-    // that so the agent can fix or drop the expression. A filter that simply
-    // matches nothing does not return `None`, so this won't misfire on
-    // legitimately-empty results.
-    harnx_core::jaq::eval_filter(expr, rows)
-        .ok_or_else(|| anyhow::anyhow!("invalid jaq expression: {expr}"))
+    // Report the jaq message itself so the agent can fix the expression instead
+    // of guessing. A filter that simply matches nothing is not an error, so this
+    // won't misfire on legitimately-empty results.
+    harnx_core::jaq::eval_filter_checked(expr, rows).map_err(|message| anyhow::anyhow!(message))
 }
 
 /// Parse a session log document string and run the full query against it.

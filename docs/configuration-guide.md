@@ -88,7 +88,16 @@ patches:                  # Patch API requests using jq expressions
 
 The `patches.chat_completions`, `patches.embeddings`, and `patches.rerank` fields are arrays of **jq filter strings**. Each filter receives the full request object as JSON (`{url, headers, body}`) and must return the modified version.
 
-Filters are applied in sequence. If an expression fails, a warning is logged and that specific patch is skipped.
+Filters are applied in sequence. If an expression fails, the request fails with the jq error and the name of the patch source — a skipped patch would send the very request body the patch exists to correct.
+
+Harnx evaluates filters with [jaq](https://github.com/01mf02/jaq), which does not create missing intermediate objects the way jq does. Assign the whole container rather than a nested path:
+
+```yaml
+patches:
+  chat_completions:
+    - '.body.reasoning = {"effort":"high"}'      # works
+    # - '.body.reasoning.effort = "high"'        # fails: `.body.reasoning` is null
+```
 
 To target specific models, use `if/then` within the expression:
 

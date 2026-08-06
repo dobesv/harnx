@@ -60,7 +60,9 @@ use serde_json::{json, Value};
 /// - `store`: hard default `false` (server default is `true`).
 /// - `include`: always `["reasoning.encrypted_content"]`.
 /// - `max_output_tokens`: from `model.max_tokens_param()`, clamped to min 16.
-/// - `reasoning`: NOT emitted by this builder; alias patches set `.body.reasoning.effort`.
+/// - `reasoning`: NOT emitted by this builder; alias patches assign the whole
+///   object, e.g. `.body.reasoning = {"effort":"high"}`. jaq won't create the
+///   missing parent for `.body.reasoning.effort = ...`.
 /// - `temperature`/`top_p`: included only if provided; alias patches may `del(.body.temperature)`
 ///   for reasoning models that reject these params.
 /// - `seed`: NOT supported by Responses API; never emitted.
@@ -1950,11 +1952,10 @@ mod tests {
         // Verify store:false default
         assert_eq!(body["store"], false, "store should default to false");
 
-        // Apply the patch that model aliases use via jaq::eval_filters
-        // (which returns Value directly, not Result)
+        // Apply the patch that model aliases use
         let patches = vec![".body.store = true".to_string()];
         let body_json = json!({ "body": body });
-        let patched = jaq::eval_filters(&patches, body_json);
+        let patched = jaq::eval_filters_strict(&patches, body_json).expect("patch should apply");
 
         // Verify store:true after patch
         assert_eq!(
@@ -1995,7 +1996,8 @@ mod tests {
         // Apply patch
         let body = json!({ "store": false });
         let body_json = json!({ "body": body });
-        let patched = harnx_core::jaq::eval_filters(patches, body_json);
+        let patched = harnx_core::jaq::eval_filters_strict(patches, body_json)
+            .expect("responses patch should apply");
 
         assert_eq!(
             patched.get("body").and_then(|b| b.get("responses")),
