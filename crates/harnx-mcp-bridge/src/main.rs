@@ -1,6 +1,6 @@
 use anyhow::Context;
 use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
-use harnx_mcp_bridge::{Args, BridgeToolset};
+use harnx_mcp_bridge::{report_tools, Args, BridgeToolset};
 use harnx_toolset_server::serve_over_nats;
 
 #[tokio::main]
@@ -9,7 +9,18 @@ async fn main() -> anyhow::Result<()> {
     // goes nowhere until a logger exists.
     harnx_core::server_logging::init_server_logger();
     let args = Args::parse();
-    let bridge = BridgeToolset::new(args.name, args.child).await?;
+
+    if args.list_tools {
+        let name = args.name.unwrap_or_else(|| "mcp-diagnostic".to_string());
+        let bridge = BridgeToolset::new(name, args.child).await?;
+        print!("{}", report_tools(&bridge));
+        return Ok(());
+    }
+
+    let name = args
+        .name
+        .context("--name is required when serving over NATS")?;
+    let bridge = BridgeToolset::new(name, args.child).await?;
     let child_died = bridge.child_died_token();
     let instance_id = std::env::var(HARNX_INSTANCE_ID)
         .with_context(|| format!("{HARNX_INSTANCE_ID} is required"))?;

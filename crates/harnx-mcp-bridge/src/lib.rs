@@ -36,9 +36,20 @@ type SpawnedChild = (
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 #[command(trailing_var_arg = true)]
 pub struct Args {
-    /// Server name used for registration.
+    /// Server name used for registration. Required when serving over NATS;
+    /// optional for `--list-tools`, which does not register.
     #[arg(long)]
-    pub name: String,
+    pub name: Option<String>,
+
+    /// Start the wrapped server, print the tools it advertises, and exit
+    /// without connecting to NATS.
+    ///
+    /// Diagnostic for a server that never registers: it separates "the child
+    /// does not start", "it starts but never completes the MCP handshake", and
+    /// "it works and the problem is elsewhere", which are indistinguishable
+    /// from the supervisor's registration timeout alone.
+    #[arg(long)]
+    pub list_tools: bool,
 
     /// Wrapped MCP command followed by its arguments.
     #[arg(required = true, allow_hyphen_values = true)]
@@ -70,6 +81,47 @@ pub struct BridgeToolset {
     _service_watch: tokio::task::JoinHandle<()>,
     _child: Box<dyn ChildWrapper>,
     stderr_tail: StderrTail,
+}
+
+/// Render what a wrapped server advertises, for `--list-tools`.
+///
+/// Reaching this at all establishes that the child starts, completes the MCP
+/// handshake, and answers `tools/list` — the three steps a registration
+/// timeout cannot distinguish between.
+pub fn report_tools(bridge: &BridgeToolset) -> String {
+    let tools = bridge.cached_tools();
+    let mut out = format!(
+        "MCP server '{}': {} tool(s)\n",
+        bridge.server_name(),
+        tools.len()
+    );
+    for tool in tools {
+        out.push_str(&format!("\n  {}\n", tool.name));
+        let description = tool.description.trim();
+        if !description.is_empty() {
+            out.push_str(&format!(
+                "    {}\n",
+                description.lines().next().unwrap_or("")
+            ));
+        }
+        let hints = [
+            tool.read_only_hint.then_some("read-only"),
+            tool.idempotent_hint.then_some("idempotent"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if !hints.is_empty() {
+            out.push_str(&format!("    [{}]\n", hints.join(", ")));
+        }
+        if let Some(seconds) = tool.timeout_secs {
+            out.push_str(&format!("    timeout: {seconds}s\n"));
+        }
+    }
+    if tools.is_empty() {
+        out.push_str("\n  (the server completed its handshake but advertises no tools)\n");
+    }
+    out
 }
 
 fn spawn_child(server_name: &str, program: &str, args: &[String]) -> anyhow::Result<SpawnedChild> {
@@ -387,7 +439,50 @@ impl ClientHandler for BridgeClientHandler {
 mod tests {
     #[cfg(unix)]
     use super::BridgeToolset;
-    use super::{map_tool, Args};
+    use super::{map_tool, report_tools, Args};
+
+    #[test]
+    fn list_tools_parses_without_a_name_but_serving_still_needs_one() {
+        let listing = Args::parse_from(["bridge", "--list-tools", "--", "npx", "-y", "srv"]);
+        assert!(listing.list_tools);
+        assert_eq!(listing.name, None);
+        assert_eq!(listing.child, vec!["npx", "-y", "srv"]);
+
+        let serving = Args::parse_from(["bridge", "--name", "exa", "--", "npx", "-y", "srv"]);
+        assert!(!serving.list_tools);
+        assert_eq!(serving.name.as_deref(), Some("exa"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_tools_reports_the_wrapped_server_inventory() {
+        let Some(binary) = plans_tools_binary() else {
+            eprintln!("skipping: harnx-plans-tools not built");
+            return;
+        };
+        let bridge = BridgeToolset::new(
+            "diag",
+            vec![binary.display().to_string(), "--mcp-stdio".to_string()],
+        )
+        .await
+        .expect("wrap plans tools");
+
+        let report = report_tools(&bridge);
+        assert!(report.starts_with("MCP server 'diag':"), "{report}");
+        assert!(report.contains("list_plans"), "{report}");
+        // Hints come from the child's advertised metadata, not from defaults.
+        assert!(report.contains("[read-only]"), "{report}");
+    }
+
+    #[cfg(unix)]
+    fn plans_tools_binary() -> Option<std::path::PathBuf> {
+        let mut dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        if dir.file_name().is_some_and(|name| name == "deps") {
+            dir.pop();
+        }
+        let binary = dir.join("harnx-plans-tools");
+        binary.is_file().then_some(binary)
+    }
 
     #[test]
     fn arg_parses_child_command_and_flags_after_separator() {
@@ -402,7 +497,7 @@ mod tests {
             ".agent/plans",
         ]);
 
-        assert_eq!(args.name, "plans");
+        assert_eq!(args.name.as_deref(), Some("plans"));
         assert_eq!(
             args.child,
             ["harnx-plans-tools", "--mcp-stdio", "--dir", ".agent/plans"]
@@ -419,7 +514,7 @@ mod tests {
             "harnx-plans-tools",
         ]);
 
-        assert_eq!(args.name, "plans");
+        assert_eq!(args.name.as_deref(), Some("plans"));
         assert_eq!(args.child, ["harnx-plans-tools"]);
     }
 
