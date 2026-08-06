@@ -180,6 +180,13 @@ async fn run_session_delete_command(delete_args: &DeleteSessionArgs) -> Result<(
 async fn run_worker_command(worker_args: &WorkerArgs) -> Result<()> {
     let config = Arc::new(RwLock::new(Config::init(WorkingMode::Cmd, true).await?));
     config.write().agent_variables = collect_agent_variables(&worker_args.agent_variable)?;
+    if worker_args.diagnose {
+        print!(
+            "{}",
+            harnx_runtime::nats_worker::diagnose_tool_servers(&config).await?
+        );
+        return Ok(());
+    }
     let worker_id = worker_args
         .worker_id
         .clone()

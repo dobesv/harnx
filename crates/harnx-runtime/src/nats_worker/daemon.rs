@@ -443,7 +443,7 @@ struct BackgroundServices {
     _subagent_tool_servers: Vec<JoinHandle<Result<()>>>,
 }
 
-fn configured_worker_services(
+pub(super) fn configured_worker_services(
     config: &GlobalConfig,
 ) -> (Vec<ToolServerConfig>, harnx_core::hooks::HooksConfig) {
     let config = config.read();

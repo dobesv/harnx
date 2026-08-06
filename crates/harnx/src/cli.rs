@@ -114,6 +114,10 @@ pub struct WorkerArgs {
     /// Set agent variable pairs (format: --agent-variable key value or -x key value); can be repeated
     #[arg(short = 'x', long, value_names = ["KEY", "VALUE"], num_args = 2, action = clap::ArgAction::Append)]
     pub agent_variable: Vec<String>,
+    /// Start this worker's tool servers, report which ones registered, and
+    /// exit without serving sessions.
+    #[arg(long)]
+    pub diagnose: bool,
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -256,10 +260,12 @@ mod tests {
                 cluster,
                 worker_id,
                 agent_variable,
+                diagnose,
             })) => {
                 assert_eq!(cluster, "prod");
                 assert_eq!(worker_id, None);
                 assert_eq!(agent_variable, vec!["cloud_env", "true", "debug", "false"]);
+                assert!(!diagnose);
             }
             other => panic!("unexpected command: {other:?}"),
         }

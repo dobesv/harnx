@@ -25,6 +25,7 @@ mod agent_loop;
 mod backend;
 mod control;
 mod daemon;
+mod diagnostics;
 mod hook_supervisor;
 mod subagent_toolset;
 mod tool_registry;
@@ -46,6 +47,7 @@ pub use daemon::{
     new_remote_session_id, notify_subject, publish_session_activate, run_worker_daemon,
     worker_ready_subject, SessionActivate, WorkerDaemonConfig,
 };
+pub use diagnostics::diagnose_tool_servers;
 #[doc(hidden)]
 pub use hook_supervisor::publish_crash_rejector;
 pub use hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
