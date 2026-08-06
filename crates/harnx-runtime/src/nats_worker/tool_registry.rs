@@ -121,19 +121,19 @@ pub(super) async fn wait_for_registration(
 /// the server has died or the deadline has passed.
 async fn next_poll_interval(wait: &RegistrationWait<'_>) -> Result<Duration> {
     if !is_still_running(wait.processes, &wait.identity).await {
-        bail!(
-            "tool server '{}' exited before registering at '{}'",
-            wait.identity.label(),
-            wait.key
-        );
+        bail!("exited before registering at '{}'", wait.key);
     }
     let now = Instant::now();
     if now >= wait.deadline {
+        // Its process is still alive, so this is "not ready yet", not "dead".
+        // Say so and name the log, rather than reporting a slow server — an MCP
+        // bridge waiting on a cold `npx` download routinely outlasts this — as a
+        // failure the reader can do nothing about.
         bail!(
-            "tool server '{}' did not register at '{}' within {}s",
-            wait.identity.label(),
-            wait.key,
-            wait.timeout.as_secs_f64()
+            "has not registered after {}s and is still running, so it may still be \
+             starting; its output goes to {}",
+            wait.timeout.as_secs_f64(),
+            crate::local_orchestrator::local_worker_output_file().display()
         );
     }
     Ok(wait
