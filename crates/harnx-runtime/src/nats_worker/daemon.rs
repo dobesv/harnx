@@ -25,6 +25,8 @@ use async_nats::jetstream::{
 };
 use chrono::Utc;
 use futures_util::StreamExt;
+use harnx_core::retry_config::RetryConfig;
+use harnx_engine::retry::compute_backoff_delay;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,6 +43,13 @@ const WORK_NOTIFY_STREAM_PREFIX: &str = "WORK_NOTIFY_";
 const WORK_NOTIFY_CONSUMER_PREFIX: &str = "worker-";
 const WORK_NOTIFY_ACK_WAIT: Duration = Duration::from_secs(30);
 const WORK_NOTIFY_INACTIVE_THRESHOLD: Duration = Duration::from_secs(60 * 60);
+/// Per-attempt registration wait for a background tool-server retry. Shorter
+/// than the first attempt because the backoff between rounds, not this timeout,
+/// is what gives a slow server time to come up.
+const TOOL_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest a session start will wait for the first tool-server registration
+/// round. Above the round's own budget, so it only fires if that round wedges.
+const INITIAL_TOOL_REGISTRATION_WAIT: Duration = Duration::from_secs(30);
 
 /// Configuration for a worker daemon instance.
 #[derive(Debug, Clone)]
@@ -420,10 +429,18 @@ async fn start_subagent_toolset(
 }
 
 struct WorkerServices {
-    tool_supervisor: Option<ToolServerSupervisor>,
-    global_hook_supervisor: Option<HookServerSupervisor>,
-    subagent_tool_servers: Vec<JoinHandle<Result<()>>>,
+    background: Arc<Mutex<Option<BackgroundServices>>>,
     session_index: Option<async_nats::jetstream::kv::Store>,
+    tools_attempted: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Tool servers, hooks and sub-agent toolsets, started after the worker has
+/// already announced readiness. Held only to keep the children alive for the
+/// worker's lifetime.
+struct BackgroundServices {
+    _tool_supervisor: Option<ToolServerSupervisor>,
+    _global_hook_supervisor: Option<HookServerSupervisor>,
+    _subagent_tool_servers: Vec<JoinHandle<Result<()>>>,
 }
 
 fn configured_worker_services(
@@ -466,33 +483,175 @@ async fn launch_worker_services(
     startup: &WorkerStartup,
     instance_id: &harnx_core::instance::InstanceId,
 ) -> Result<WorkerServices> {
-    let (tool_servers, global_hooks) = configured_worker_services(config);
-    let tool_supervisor =
-        start_local_tool_servers(daemon, startup.client.clone(), instance_id, &tool_servers).await;
-    let global_hook_supervisor =
-        start_global_hooks(daemon, startup.client.clone(), instance_id, &global_hooks).await;
-    let mut subagent_tool_servers = Vec::new();
-    for agent in list_agents() {
-        subagent_tool_servers.push(
-            start_subagent_toolset(
-                agent,
-                daemon.cluster.clone(),
-                instance_id.clone(),
-                startup.client.clone(),
-                startup.jetstream.clone(),
-            )
-            .await
-            .context("start sub-agent toolset")?,
-        );
-    }
+    // Announce readiness before starting tool servers, hooks and sub-agent
+    // toolsets. Those can take tens of seconds — or never finish, when a server
+    // is misconfigured — and none of them are required for the worker to accept
+    // and run a session. Gating readiness on them made a single broken tool
+    // server stall the front-end past its startup deadline, which turned an
+    // intentionally non-fatal degradation into an unusable CLI.
     spawn_readiness_publisher(startup.client.clone(), daemon);
+
+    let background = Arc::new(Mutex::new(None));
+    // Sessions snapshot the tool registry when they start, so a session that
+    // began before the first registration round finished would see no tools at
+    // all. Activation waits on this instead — the cost lands on the first turn,
+    // where it is visible and cancellable, rather than on worker readiness.
+    let (tools_attempted_tx, tools_attempted) = tokio::sync::watch::channel(false);
+    spawn_background_services(BackgroundServicesCtx {
+        config: config.clone(),
+        daemon: daemon.clone(),
+        client: startup.client.clone(),
+        jetstream: startup.jetstream.clone(),
+        instance_id: instance_id.clone(),
+        slot: Arc::clone(&background),
+        tools_attempted: tools_attempted_tx,
+    });
+
     let session_index = optional_session_index(&startup.jetstream).await;
     Ok(WorkerServices {
-        tool_supervisor,
-        global_hook_supervisor,
-        subagent_tool_servers,
+        background,
         session_index,
+        tools_attempted,
     })
+}
+
+/// Block until the first tool-server registration round has finished, so the
+/// session's registry snapshot includes whatever managed to come up.
+///
+/// Returns without waiting once the round is done, making this free for every
+/// turn after the first. A server that never registers costs this wait once.
+async fn await_initial_tool_registration(tools_attempted: &tokio::sync::watch::Receiver<bool>) {
+    if *tools_attempted.borrow() {
+        return;
+    }
+    let mut attempted = tools_attempted.clone();
+    log::debug!("waiting for the first tool-server registration round");
+    // The only sender lives in the background task; if it is gone the round can
+    // never complete and there is nothing left to wait for. Cap the wait so a
+    // wedged round costs the session its tools rather than the whole turn — the
+    // round is bounded by the per-server startup timeout, so reaching this cap
+    // means something below it is stuck.
+    if tokio::time::timeout(
+        INITIAL_TOOL_REGISTRATION_WAIT,
+        attempted.wait_for(|done| *done),
+    )
+    .await
+    .is_err()
+    {
+        log::warn!(
+            "tool servers did not finish their first registration round within {}s; \
+             starting this session with the tools registered so far",
+            INITIAL_TOOL_REGISTRATION_WAIT.as_secs()
+        );
+    }
+}
+
+/// Owned inputs for the post-readiness startup task.
+struct BackgroundServicesCtx {
+    config: GlobalConfig,
+    daemon: WorkerDaemonConfig,
+    client: async_nats::Client,
+    jetstream: jetstream::Context,
+    instance_id: harnx_core::instance::InstanceId,
+    slot: Arc<Mutex<Option<BackgroundServices>>>,
+    tools_attempted: tokio::sync::watch::Sender<bool>,
+}
+
+fn spawn_background_services(ctx: BackgroundServicesCtx) {
+    tokio::spawn(async move {
+        let BackgroundServicesCtx {
+            config,
+            daemon,
+            client,
+            jetstream,
+            instance_id,
+            slot,
+            tools_attempted,
+        } = ctx;
+        let (tool_servers, global_hooks) = configured_worker_services(&config);
+        let tool_supervisor =
+            start_local_tool_servers(&daemon, client.clone(), &instance_id, &tool_servers).await;
+        // Release waiting activations as soon as the first round settles, even
+        // if some servers failed — they are retried below without blocking.
+        let _ = tools_attempted.send(true);
+        let global_hook_supervisor =
+            start_global_hooks(&daemon, client.clone(), &instance_id, &global_hooks).await;
+
+        let mut subagent_tool_servers = Vec::new();
+        for agent in list_agents() {
+            match start_subagent_toolset(
+                agent.clone(),
+                daemon.cluster.clone(),
+                instance_id.clone(),
+                client.clone(),
+                jetstream.clone(),
+            )
+            .await
+            {
+                Ok(handle) => subagent_tool_servers.push(handle),
+                // One unusable sub-agent must not cost the others their toolset.
+                Err(error) => {
+                    log::warn!("sub-agent toolset for '{agent}' unavailable: {error:#}")
+                }
+            }
+        }
+
+        let tool_supervisor =
+            retry_unregistered_tool_servers(tool_supervisor, client, &instance_id, &tool_servers)
+                .await;
+
+        *slot.lock().await = Some(BackgroundServices {
+            _tool_supervisor: tool_supervisor,
+            _global_hook_supervisor: global_hook_supervisor,
+            _subagent_tool_servers: subagent_tool_servers,
+        });
+    });
+}
+
+/// Keep respawning tool servers that never registered, backing off between
+/// rounds. Runs after readiness, so a server that stays broken degrades the
+/// available tools instead of blocking the worker.
+async fn retry_unregistered_tool_servers(
+    supervisor: Option<ToolServerSupervisor>,
+    client: async_nats::Client,
+    instance_id: &harnx_core::instance::InstanceId,
+    servers: &[ToolServerConfig],
+) -> Option<ToolServerSupervisor> {
+    let mut supervisor = supervisor?;
+    if supervisor.unregistered_servers().is_empty() {
+        return Some(supervisor);
+    }
+    let Ok(local) = resolve_local_nats_server_config().await else {
+        return Some(supervisor);
+    };
+    let Some(token) = local.token.as_deref() else {
+        return Some(supervisor);
+    };
+    let start = ToolServerStartConfig::new(client, instance_id.clone(), &local.url, token);
+    let retry = RetryConfig::default();
+
+    // Retries never stop: a server the user fixes mid-session should come up
+    // without restarting harnx. The attempt counter only feeds the backoff
+    // curve, so saturate it rather than letting it wrap.
+    let mut attempt: u32 = 0;
+    loop {
+        let delay = compute_backoff_delay(&retry, attempt);
+        attempt = attempt.saturating_add(1);
+        let pending = supervisor.unregistered_servers().join(", ");
+        log::warn!(
+            "tool servers not registered ({pending}); retrying in {}s",
+            delay.as_secs_f64()
+        );
+        tokio::time::sleep(delay).await;
+        let still_missing = supervisor
+            .retry_unregistered(&start, servers, TOOL_RETRY_TIMEOUT)
+            .await;
+        if !still_missing {
+            log::info!("all tool servers registered");
+            break;
+        }
+    }
+    Some(supervisor)
 }
 
 /// Run a worker daemon: pull `SessionActivate` notifications, claim each via a
@@ -508,9 +667,8 @@ pub async fn run_worker_daemon(
     let runtime = Arc::new(WorkerRuntime {
         config,
         instance_id,
-        _tool_supervisor: services.tool_supervisor,
-        _global_hook_supervisor: services.global_hook_supervisor,
-        _subagent_tool_servers: services.subagent_tool_servers,
+        _background_services: services.background,
+        tools_attempted: services.tools_attempted,
         cluster: daemon.cluster.clone(),
         worker_id: daemon.worker_id.clone(),
         lease: daemon.lease,
@@ -548,9 +706,8 @@ struct ControlListenerCtx<'a> {
 struct WorkerRuntime {
     config: GlobalConfig,
     instance_id: harnx_core::instance::InstanceId,
-    _tool_supervisor: Option<ToolServerSupervisor>,
-    _global_hook_supervisor: Option<HookServerSupervisor>,
-    _subagent_tool_servers: Vec<JoinHandle<Result<()>>>,
+    _background_services: Arc<Mutex<Option<BackgroundServices>>>,
+    tools_attempted: tokio::sync::watch::Receiver<bool>,
     #[allow(dead_code)]
     cluster: String,
     worker_id: String,
@@ -630,6 +787,10 @@ impl WorkerRuntime {
         let Some(lease) = self.acquire_activation_lease(&activation).await? else {
             return Ok(());
         };
+
+        // The session snapshots the tool registry below, so give the first
+        // registration round a chance to finish before that snapshot is taken.
+        await_initial_tool_registration(&self.tools_attempted).await;
         log::info!(
             "session activate claimed: session_id={} worker_id={} revision={} epoch={}",
             activation.session_id,

@@ -9,18 +9,29 @@ use crate::nats_worker::worker_ready_subject;
 use anyhow::{bail, Context, Result};
 use fs4::fs_std::FileExt;
 use futures_util::StreamExt;
-use harnx_core::config_paths::nats_runtime_dir;
+use harnx_core::abort::AbortSignal;
+use harnx_core::config_paths::{nats_runtime_dir, state_path};
+use harnx_core::event::{AgentEvent, NoticeEvent};
+use harnx_core::sink::emit_agent_event;
 use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 
-const WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const READINESS_POLL_INITIAL: Duration = Duration::from_millis(50);
 const READINESS_POLL_MAX: Duration = Duration::from_millis(500);
 const JOINER_READY_TTL: Duration = Duration::from_secs(3);
 const LOCAL_WORKER_ID: &str = "local";
+/// How long the worker may take before the user is told it is still starting.
+const WORKER_SLOW_NOTICE_AFTER: Duration = Duration::from_secs(5);
+/// Spacing of the reminders that follow the first one.
+const WORKER_SLOW_NOTICE_INTERVAL: Duration = Duration::from_secs(10);
+/// Consecutive worker exits tolerated before the wait is declared hopeless.
+const MAX_WORKER_CRASHES: u32 = 3;
+/// Bytes of worker output shown when startup gives up.
+const WORKER_OUTPUT_TAIL_BYTES: u64 = 4096;
 
 /// Path used to elect one local worker owner per user/broker.
 pub fn local_worker_lock_file() -> PathBuf {
@@ -36,17 +47,22 @@ pub struct LocalWorkerSupervisor {
     owns_lock: bool,
     child: Option<Child>,
     last_confirmed_ready: Option<Instant>,
+    /// Owned workers that exited during the current readiness wait.
+    crashes: u32,
 }
 
 /// Lazily starts or re-checks a front-end's process-lifetime local worker.
 ///
 /// Front-ends keep the `Option` alive for their own lifetime. Repeated calls are
 /// cheap and respawn an owned worker when it has exited.
-pub async fn ensure_local_worker(supervisor: &mut Option<LocalWorkerSupervisor>) -> Result<()> {
+pub async fn ensure_local_worker(
+    supervisor: &mut Option<LocalWorkerSupervisor>,
+    abort_signal: AbortSignal,
+) -> Result<()> {
     match supervisor {
-        Some(supervisor) => supervisor.ensure().await,
+        Some(supervisor) => supervisor.ensure(abort_signal).await,
         slot @ None => {
-            *slot = Some(LocalWorkerSupervisor::start().await?);
+            *slot = Some(LocalWorkerSupervisor::start(abort_signal).await?);
             Ok(())
         }
     }
@@ -57,7 +73,7 @@ impl LocalWorkerSupervisor {
     /// Unified CLI callers use their current executable; standalone frontends
     /// such as `harnx-serve` resolve `HARNX_BIN` or a sibling
     /// `harnx` binary because they do not expose the `worker` subcommand.
-    pub async fn start() -> Result<Self> {
+    pub async fn start(abort_signal: AbortSignal) -> Result<Self> {
         let current = std::env::current_exe().context("resolve current frontend executable")?;
         let is_harnx = current
             .file_stem()
@@ -77,13 +93,16 @@ impl LocalWorkerSupervisor {
             }
             sibling
         };
-        Self::start_with_worker_binary(binary).await
+        Self::start_with_worker_binary(binary, abort_signal).await
     }
 
     /// Ensure the shared broker and local worker using an explicit `harnx`
     /// binary. Integration tests and front-end-specific binaries may use this
     /// when their current executable does not expose the `worker` subcommand.
-    pub async fn start_with_worker_binary(binary: impl AsRef<Path>) -> Result<Self> {
+    pub async fn start_with_worker_binary(
+        binary: impl AsRef<Path>,
+        abort_signal: AbortSignal,
+    ) -> Result<Self> {
         let server = ensure_shared_server().await?;
         let worker_binary = binary
             .as_ref()
@@ -100,15 +119,16 @@ impl LocalWorkerSupervisor {
             owns_lock,
             child: None,
             last_confirmed_ready: None,
+            crashes: 0,
         };
-        supervisor.ensure().await?;
+        supervisor.ensure(abort_signal).await?;
         Ok(supervisor)
     }
 
     /// Check worker health, respawn an exited owned worker, or take ownership
     /// after another front-end releases `worker.lock`. Returns only after a
     /// post-consumer readiness marker is observed.
-    pub async fn ensure(&mut self) -> Result<()> {
+    pub async fn ensure(&mut self, abort_signal: AbortSignal) -> Result<()> {
         if self.owned_child_is_running()? {
             return Ok(());
         }
@@ -121,8 +141,9 @@ impl LocalWorkerSupervisor {
         }
 
         let readiness = self.subscribe_to_readiness().await?;
+        self.crashes = 0;
         self.ensure_worker_ownership()?;
-        self.wait_for_readiness(readiness).await
+        self.wait_for_readiness(readiness, abort_signal).await
     }
 
     async fn subscribe_to_readiness(&self) -> Result<async_nats::Subscriber> {
@@ -162,10 +183,26 @@ impl LocalWorkerSupervisor {
         Ok(())
     }
 
-    async fn wait_for_readiness(&mut self, mut readiness: async_nats::Subscriber) -> Result<()> {
-        let deadline = Instant::now() + WORKER_STARTUP_TIMEOUT;
+    /// Wait for the worker's readiness heartbeat, retrying until it arrives or
+    /// the user aborts.
+    ///
+    /// A worker that is merely slow gets unlimited time — startup cost scales
+    /// with the user's agent and tool-server count, so any fixed deadline is
+    /// wrong for someone. A worker that keeps *exiting* is a different failure:
+    /// retrying cannot help, so give up after [`MAX_WORKER_CRASHES`] and show
+    /// what it printed.
+    async fn wait_for_readiness(
+        &mut self,
+        mut readiness: async_nats::Subscriber,
+        abort_signal: AbortSignal,
+    ) -> Result<()> {
+        let started = Instant::now();
         let mut poll = READINESS_POLL_INITIAL;
+        let mut next_notice = WORKER_SLOW_NOTICE_AFTER;
         loop {
+            if abort_signal.aborted() {
+                bail!("cancelled while waiting for the local worker to start");
+            }
             match tokio::time::timeout(poll, readiness.next()).await {
                 Ok(Some(_)) => {
                     self.last_confirmed_ready = Some(Instant::now());
@@ -174,14 +211,21 @@ impl LocalWorkerSupervisor {
                 Ok(None) => bail!("local worker readiness subscription closed"),
                 Err(_) => self.ensure_worker_ownership()?,
             }
-            poll = (poll * 2).min(READINESS_POLL_MAX);
-            if Instant::now() >= deadline {
+
+            if self.crashes >= MAX_WORKER_CRASHES {
                 bail!(
-                    "local worker did not publish readiness on {} within {}s",
-                    worker_ready_subject(LOCAL_CLUSTER_KEY),
-                    WORKER_STARTUP_TIMEOUT.as_secs()
+                    "local worker exited {} times without becoming ready:\n{}",
+                    self.crashes,
+                    worker_output_tail()
                 );
             }
+
+            let waited = started.elapsed();
+            if waited >= next_notice {
+                emit_worker_wait_notice(waited);
+                next_notice = waited + WORKER_SLOW_NOTICE_INTERVAL;
+            }
+            poll = (poll * 2).min(READINESS_POLL_MAX);
         }
     }
 
@@ -209,6 +253,7 @@ impl LocalWorkerSupervisor {
             Some(status) => {
                 log::warn!("local worker exited with {status}; respawning");
                 self.child = None;
+                self.crashes = self.crashes.saturating_add(1);
                 Ok(false)
             }
         }
@@ -228,8 +273,8 @@ impl LocalWorkerSupervisor {
             .env(HARNX_NATS_URL_ENV, &self.server.url)
             .env(HARNX_NATS_TOKEN_ENV, &self.server.token)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(worker_output_sink())
+            .stderr(worker_output_sink())
             .kill_on_drop(true);
         configure_worker_process(&mut command);
         self.child = Some(command.spawn().with_context(|| {
@@ -270,6 +315,79 @@ impl Drop for LocalWorkerSupervisor {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             });
+    }
+}
+
+/// File the local worker's stdout/stderr is appended to.
+///
+/// The worker is a detached subprocess with no terminal, so anything it writes
+/// outside the `log` facade — a panic, a `main` returning `Err`, a child
+/// process's own stderr — is otherwise lost. That made startup failures
+/// undiagnosable: the front-end only saw a readiness timeout.
+pub fn local_worker_output_file() -> PathBuf {
+    state_path("harnx_worker.log")
+}
+
+/// Tell the user the worker is still coming up, on the same channel as other
+/// agent notices so the TUI and the CLI both surface it.
+fn emit_worker_wait_notice(waited: Duration) {
+    let message = format!(
+        "Still waiting for the local worker to start ({}s). Ctrl-C to cancel; worker output goes to {}.",
+        waited.as_secs(),
+        local_worker_output_file().display()
+    );
+    // Warning, not Info: the CLI sink routes Info to stdout, where progress
+    // chatter would corrupt piped output from a one-shot invocation.
+    emit_agent_event(AgentEvent::Notice(NoticeEvent::Warning(message.clone())));
+    log::info!("{message}");
+}
+
+/// Last [`WORKER_OUTPUT_TAIL_BYTES`] of the worker log, for error messages.
+fn worker_output_tail() -> String {
+    let path = local_worker_output_file();
+    let render = |body: String| {
+        if body.trim().is_empty() {
+            format!("(no output in {})", path.display())
+        } else {
+            format!("--- tail of {} ---\n{}", path.display(), body.trim_end())
+        }
+    };
+    let Ok(mut file) = File::open(&path) else {
+        return render(String::new());
+    };
+    let Ok(length) = file.metadata().map(|meta| meta.len()) else {
+        return render(String::new());
+    };
+    let start = length.saturating_sub(WORKER_OUTPUT_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return render(String::new());
+    }
+    let mut body = String::new();
+    let _ = file.read_to_string(&mut body);
+    render(body)
+}
+
+/// Append-mode handle to [`local_worker_output_file`], falling back to a null
+/// sink so a non-writable state dir never blocks worker startup.
+///
+/// Also used for the worker's own children (tool and hook servers) so the whole
+/// worker subtree explains itself in one file. They redirect to this path rather
+/// than inheriting the worker's descriptors: an inherited pipe outlives the
+/// child that holds it, which strands test harness output.
+pub(crate) fn worker_output_sink() -> Stdio {
+    let path = local_worker_output_file();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => Stdio::from(file),
+        Err(error) => {
+            log::warn!(
+                "local worker output not captured to {}: {error}",
+                path.display()
+            );
+            Stdio::null()
+        }
     }
 }
 

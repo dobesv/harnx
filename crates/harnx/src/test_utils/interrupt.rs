@@ -234,7 +234,7 @@ pub fn write_with_blocking_hook(
         paths.harnx_config_dir.join("config.yaml"),
         format!(
             "save: false\nclient: mock-llm\nmodel: mock-llm:test\ntool_use: true\nuse_tools: '*'\n\
-             hooks:\n  entries:\n    - command: harnx-claude-compatible-hook-server --event PreToolUse --timeout 300 --command {}\n",
+             hooks:\n  entries:\n    - command: harnx-claude-compatible-hook-server --event PreToolUse --timeout 300 -- {}\n",
             shell_words::quote(&block_sh.display().to_string())
         ),
     )

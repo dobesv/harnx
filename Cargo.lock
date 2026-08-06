@@ -3712,6 +3712,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "shell-words",
  "tokio",
 ]
 

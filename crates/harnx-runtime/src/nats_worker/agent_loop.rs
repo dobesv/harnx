@@ -1428,7 +1428,7 @@ mod tests {
                 hooks: Some(harnx_core::hooks::HooksConfig {
                     max_resume: None,
                     entries: vec![harnx_core::hooks::HookConfig {
-                        command: "harnx-claude-compatible-hook-server --event SessionStart --timeout 30 --command 'echo global'".to_string(),
+                        command: "harnx-claude-compatible-hook-server --event SessionStart --timeout 30 -- echo global".to_string(),
                         status_message: None,
                         async_hook: None,
                         package_dir: None,
@@ -1446,14 +1446,14 @@ mod tests {
     #[test]
     fn session_hook_resolution_keeps_agent_override_of_global_hook() {
         let global_hook = harnx_core::hooks::HookConfig {
-            command: "harnx-claude-compatible-hook-server --event SessionStart --timeout 30 --command 'echo global'".to_string(),
+            command: "harnx-claude-compatible-hook-server --event SessionStart --timeout 30 -- echo global".to_string(),
             status_message: None,
             async_hook: None,
             package_dir: None,
         };
         let agent_config = harnx_core::agent_config::AgentConfig::from_markdown(
             "override-agent",
-            "---\nhooks:\n  entries:\n    - command: harnx-claude-compatible-hook-server --event SessionStart --timeout 30 --command 'echo agent'\n---\nprompt",
+            "---\nhooks:\n  entries:\n    - command: harnx-claude-compatible-hook-server --event SessionStart --timeout 30 -- echo agent\n---\nprompt",
         )
         .expect("agent config");
         let config = Config {
@@ -1473,7 +1473,7 @@ mod tests {
         assert_eq!(hooks.entries.len(), 1);
         assert_eq!(
             hooks.entries[0].command,
-            "harnx-claude-compatible-hook-server --event SessionStart --timeout 30 --command 'echo agent'"
+            "harnx-claude-compatible-hook-server --event SessionStart --timeout 30 -- echo agent"
         );
     }
 

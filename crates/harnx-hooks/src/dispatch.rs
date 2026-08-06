@@ -154,7 +154,8 @@ fn hook_matches_event(hook: &InlineHookSpec, event: &HookEvent) -> bool {
         Err(error) => {
             warn!(
                 "Skipping hook `{}` for event `{}` because matcher compilation failed: {error}",
-                hook.command.command, hook.event
+                hook.command.display(),
+                hook.event
             );
             false
         }
@@ -300,7 +301,7 @@ mod tests {
             event: event.to_string(),
             matcher: None,
             command: HookCommand {
-                command,
+                argv: crate::shell_argv(&command),
                 timeout: Some(5),
                 package_dir: None,
             },

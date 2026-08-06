@@ -184,9 +184,12 @@ impl Tui {
 
         if cluster == harnx_runtime::config::LOCAL_CLUSTER_KEY {
             let mut supervisor = ctx.local_worker.lock().await;
-            harnx_runtime::local_orchestrator::ensure_local_worker(&mut supervisor)
-                .await
-                .context("failed to ensure local NATS worker")?;
+            harnx_runtime::local_orchestrator::ensure_local_worker(
+                &mut supervisor,
+                ctx.abort_signal.clone(),
+            )
+            .await
+            .context("failed to ensure local NATS worker")?;
         }
 
         let sink = Arc::new(TuiAgentEventSink::new(ctx.event_tx.clone()));

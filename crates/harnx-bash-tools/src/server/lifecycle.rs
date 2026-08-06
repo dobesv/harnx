@@ -62,7 +62,7 @@ impl BashServer {
                 // Writable allowlist entries include broad shared paths such as /tmp.
                 // History discovers repositories lazily from actual snapshot paths, so
                 // scanning every writable path here is both unnecessary and unbounded.
-                history: Arc::new(HistoryManager::new(&[])),
+                history: Arc::new(HistoryManager::new()),
                 sandbox_config,
             }),
         }

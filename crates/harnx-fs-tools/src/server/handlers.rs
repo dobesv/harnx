@@ -8,10 +8,9 @@ type ReadLinesPage<'a> = (Vec<(usize, &'a str)>, usize, usize);
 
 impl FsServer {
     pub fn new(allowlist: ResolvedAllowlist) -> Self {
-        let history_paths = allowlist.read_paths().iter().cloned().collect::<Vec<_>>();
         Self {
             allowlist: Arc::new(allowlist),
-            history: Arc::new(HistoryManager::new(&history_paths)),
+            history: Arc::new(HistoryManager::new()),
             repo_locks: Arc::new(Mutex::new(HashMap::new())),
             file_locks: Arc::new(Mutex::new(HashMap::new())),
         }

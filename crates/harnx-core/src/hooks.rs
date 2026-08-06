@@ -193,7 +193,7 @@ mod tests {
         let yaml = r#"
 max_resume: 3
 entries:
-  - command: "/path/to/hook-server --event Stop --command /path/to/hook.sh"
+  - command: "/path/to/hook-server --event Stop -- /path/to/hook.sh"
     async: true
 "#;
 
@@ -204,7 +204,7 @@ entries:
         let entry = &config.entries[0];
         assert_eq!(
             entry.command,
-            "/path/to/hook-server --event Stop --command /path/to/hook.sh"
+            "/path/to/hook-server --event Stop -- /path/to/hook.sh"
         );
         assert!(entry.status_message.is_none());
         assert_eq!(entry.async_hook, Some(true));

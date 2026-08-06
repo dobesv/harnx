@@ -94,7 +94,7 @@ fn build_inline_hook(def: &HookDef) -> Option<(InlineHookSpec, bool)> {
         event: "PreToolUse".to_string(),
         matcher: None,
         command: HookCommand {
-            command: build_hook_command(&def.command, &def.args),
+            argv: hook_argv(&def.command, &def.args),
             timeout: Some(30),
             package_dir: None,
         },
@@ -137,17 +137,14 @@ async fn reject_blocked_hook(
     )
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn build_hook_command(command: &str, args: &[String]) -> String {
-    let mut parts = Vec::with_capacity(args.len() + 1);
-    parts.push(shell_quote(command));
-    for arg in args {
-        parts.push(shell_quote(arg));
-    }
-    parts.join(" ")
+/// Hooks run their argv directly, so the program and its arguments pass through
+/// unchanged. This used to shell-quote them into one string only for the
+/// executor to hand back to `sh -c`.
+fn hook_argv(command: &str, args: &[String]) -> Vec<String> {
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(command.to_string());
+    argv.extend(args.iter().cloned());
+    argv
 }
 
 fn extract_env_from_value(env: &mut HashMap<String, String>, value: &serde_json::Value) {
@@ -183,13 +180,17 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn shell_quotes_hook_command_and_args() {
+    fn hook_argv_passes_command_and_args_through_unquoted() {
         assert_eq!(
-            build_hook_command(
+            hook_argv(
                 "/tmp/hook script",
                 &["arg with spaces".to_string(), "it's fine".to_string()]
             ),
-            "'/tmp/hook script' 'arg with spaces' 'it'\\''s fine'"
+            vec![
+                "/tmp/hook script".to_string(),
+                "arg with spaces".to_string(),
+                "it's fine".to_string(),
+            ]
         );
     }
 

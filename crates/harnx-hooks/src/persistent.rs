@@ -76,7 +76,8 @@ impl PersistentHookManager {
     }
 
     pub async fn send_event(&mut self, payload: &HookPayload, hook: &HookCommand) -> HookOutcome {
-        let command = hook.command.as_str();
+        let command_owned = hook.display();
+        let command = command_owned.as_str();
         if !self.processes.contains_key(command) {
             match PersistentHookProcess::spawn(hook) {
                 Ok(process) => {
@@ -170,13 +171,12 @@ impl Default for PersistentHookManager {
 
 impl PersistentHookProcess {
     fn spawn(hook: &HookCommand) -> Result<Self> {
-        let mut child =
-            super::executor::base_hook_command(&hook.command, hook.package_dir.as_deref())
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()?;
+        let mut child = super::executor::base_hook_command(&hook.argv, hook.package_dir.as_deref())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
 
         let pid = child.id();
 
@@ -371,7 +371,7 @@ mod tests {
 
     fn hook_cmd(command: String, timeout: Option<u64>) -> HookCommand {
         HookCommand {
-            command,
+            argv: crate::shell_argv(&command),
             timeout,
             package_dir: None,
         }

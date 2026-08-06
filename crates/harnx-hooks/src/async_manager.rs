@@ -158,7 +158,7 @@ mod tests {
         manager.spawn_hook(
             payload,
             HookCommand {
-                command: echo_command().to_string(),
+                argv: crate::shell_argv(echo_command()),
                 timeout: Some(5),
                 package_dir: None,
             },

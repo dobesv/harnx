@@ -631,9 +631,12 @@ async fn start_directive_inner(
 
     let mut local_worker = None;
     if cluster == harnx_runtime::config::LOCAL_CLUSTER_KEY {
-        harnx_runtime::local_orchestrator::ensure_local_worker(&mut local_worker)
-            .await
-            .context("failed to ensure local NATS worker")?;
+        harnx_runtime::local_orchestrator::ensure_local_worker(
+            &mut local_worker,
+            abort_signal.clone(),
+        )
+        .await
+        .context("failed to ensure local NATS worker")?;
     }
 
     let session = harnx_runtime::ThinClientSession::from_global_config(

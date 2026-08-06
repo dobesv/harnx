@@ -55,7 +55,7 @@ fn session_start_marker_hook(marker: &Path) -> HooksConfig {
         max_resume: None,
         entries: vec![HookConfig {
             command: format!(
-                "{} --event SessionStart --timeout 30 --command 'echo fired >> \"{}\"'",
+                "{} --event SessionStart --timeout 30 -- sh -c 'echo fired >> \"{}\"'",
                 hook_server_binary().display(),
                 marker.display()
             ),

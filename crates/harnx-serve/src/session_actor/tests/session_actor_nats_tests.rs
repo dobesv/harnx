@@ -117,7 +117,7 @@ async fn serve_thin_client_replays_prompt_queued_during_active_run() {
         "Complete the turn.",
     );
     let config = sandbox.config();
-    let supervisor = LocalWorkerSupervisor::start_with_worker_binary(binary)
+    let supervisor = LocalWorkerSupervisor::start_with_worker_binary(binary, create_abort_signal())
         .await
         .expect("start local worker");
     let registry = SessionRegistry::new_with_local_worker_for_tests(config, supervisor);
@@ -223,7 +223,7 @@ async fn serve_local_nats_smoke_streams_sse_events_and_cancel_publishes_control(
         "Complete the turn.",
     );
     let config = sandbox.config();
-    let supervisor = LocalWorkerSupervisor::start_with_worker_binary(binary)
+    let supervisor = LocalWorkerSupervisor::start_with_worker_binary(binary, create_abort_signal())
         .await
         .expect("start local worker");
     let registry = SessionRegistry::new_with_local_worker_for_tests(config.clone(), supervisor);
