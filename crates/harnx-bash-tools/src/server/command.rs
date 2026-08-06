@@ -69,6 +69,19 @@ impl BashServer {
             sb_args.push(OsString::from(command));
         }
         let sandbox_run_path = self.inner.sandbox_config.sandbox_run_path.clone();
+        // The sandbox reports its own setup failures from inside a PID
+        // namespace, where the message carries no indication of which path or
+        // binary was missing. Logging the invocation makes the failure
+        // reproducible outside harnx by pasting it into a shell.
+        log::debug!(
+            "sandbox exec: {} {}",
+            sandbox_run_path.display(),
+            sb_args
+                .iter()
+                .map(|arg| shell_words::quote(&arg.to_string_lossy()).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         Ok(CommandWrap::with_new(sandbox_run_path, |command_wrap| {
             command_wrap
                 .args(&sb_args)
