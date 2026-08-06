@@ -124,6 +124,45 @@ pub fn report_tools(bridge: &BridgeToolset) -> String {
     out
 }
 
+/// Summarise the inherited settings that decide whether a wrapped server can
+/// reach the network and find its runtime.
+///
+/// A server that starts in a shell but stalls under the worker differs only by
+/// the environment it inherits, and a proxy pointing at a port that is gone
+/// makes package managers block silently. Names only for anything that could
+/// carry a credential.
+fn child_runtime_env() -> String {
+    const SHOWN: [&str; 6] = [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "NODE_EXTRA_CA_CERTS",
+        "npm_config_registry",
+        "npm_config_proxy",
+    ];
+    let mut parts: Vec<String> = SHOWN
+        .iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("{name}={value}"))
+        })
+        .collect();
+    let secretish = ["NPM_TOKEN", "npm_config__auth", "EXA_API_KEY"]
+        .iter()
+        .filter(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+        .copied()
+        .collect::<Vec<_>>();
+    if !secretish.is_empty() {
+        parts.push(format!("set(no values shown): {}", secretish.join(", ")));
+    }
+    if parts.is_empty() {
+        return "no proxy or registry overrides inherited".to_string();
+    }
+    format!("inherited {}", parts.join(" "))
+}
+
 fn spawn_child(server_name: &str, program: &str, args: &[String]) -> anyhow::Result<SpawnedChild> {
     let mut command = Command::new(program);
     command
@@ -250,6 +289,7 @@ impl BridgeToolset {
             "MCP server '{server_name}': starting {}",
             shell_words::join(&child_argv)
         );
+        log::info!("MCP server '{server_name}': {}", child_runtime_env());
         let (child, stdin, stdout, stderr) = spawn_child(&server_name, program, args)?;
         let stderr_tail = spawn_stderr_reader(&server_name, stderr);
         let (service, cached_tools) =
