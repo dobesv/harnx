@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use clap::Parser;
+use harnx_core::instance::HARNX_INSTANCE_ID;
 use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
@@ -184,8 +185,20 @@ fn spawn_handshake_progress(server_name: &str) -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// The worker identity a bridge must not pass on.
+///
+/// The bridge is the process that registers over NATS; everything below it
+/// speaks MCP on stdio. Leaking these lets a descendant conclude it was
+/// launched by a worker and switch to a NATS protocol — `harnx-proxy-auth`,
+/// run as a stdio hook by a sandbox shim, does exactly that and then never
+/// answers the stdio handshake, so the wrapped server is never launched at all.
+const WORKER_NATS_ENV: [&str; 3] = [HARNX_INSTANCE_ID, "HARNX_NATS_URL", "HARNX_NATS_TOKEN"];
+
 fn spawn_child(server_name: &str, program: &str, args: &[String]) -> anyhow::Result<SpawnedChild> {
     let mut command = Command::new(program);
+    for name in WORKER_NATS_ENV {
+        command.env_remove(name);
+    }
     command
         .args(args)
         .stdin(Stdio::piped())
@@ -560,6 +573,40 @@ mod tests {
         assert!(report.contains("list_plans"), "{report}");
         // Hints come from the child's advertised metadata, not from defaults.
         assert!(report.contains("[read-only]"), "{report}");
+    }
+
+    /// A sandbox shim in the child chain runs `harnx-proxy-auth` as a stdio
+    /// hook, and that binary switches to a NATS protocol when it finds a
+    /// worker's identity in the environment — leaving the shim waiting on a
+    /// stdio reply that never comes, so the wrapped server never starts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrapped_child_does_not_inherit_the_workers_nats_identity() {
+        harnx_core::require_nextest();
+        let Some(binary) = plans_tools_binary() else {
+            eprintln!("skipping: harnx-plans-tools not built");
+            return;
+        };
+        // SAFETY: nextest gives this test its own process.
+        unsafe {
+            std::env::set_var("HARNX_NATS_URL", "nats://127.0.0.1:1");
+            std::env::set_var("HARNX_NATS_TOKEN", "unused");
+            std::env::set_var(super::HARNX_INSTANCE_ID, "worker-instance");
+        }
+
+        // Stands in for the shim: refuse to exec the real server if any of the
+        // worker's identity survived into the child.
+        let guard = format!(
+            r#"if [ -n "${{HARNX_NATS_URL:-}}" ] || [ -n "${{HARNX_NATS_TOKEN:-}}" ]                  || [ -n "${{HARNX_INSTANCE_ID:-}}" ]; then exit 3; fi
+               exec {} --mcp-stdio"#,
+            binary.display()
+        );
+        let bridge =
+            BridgeToolset::new("scrubbed", vec!["sh".to_string(), "-c".to_string(), guard])
+                .await
+                .expect("child starts only when the worker identity is scrubbed");
+
+        assert!(!bridge.cached_tools().is_empty());
     }
 
     #[cfg(unix)]
