@@ -45,7 +45,7 @@ New `endpoint: Option<String>` field on `ModelData` triggers routing. Model alia
   real_name: gpt-5.6-sol
   endpoint: responses
   patches:
-    - del(.body.temperature) | del(.body.top_p) | .body.reasoning.effort = "high"
+    - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"high"}
 ```
 
 Dispatch in `openai.rs` checks `model.endpoint()`:

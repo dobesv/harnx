@@ -317,7 +317,8 @@ pub trait Client: Sync + Send {
         let mut json_value = request_data.to_json_value();
 
         if let Some(patches) = self.model().patches() {
-            json_value = harnx_core::jaq::eval_filters(patches, json_value);
+            let source = format!("model `{}`", self.model().id());
+            json_value = apply_request_patches(&source, patches, json_value)?;
         }
 
         if let Some(patches_config) = self.patches_config() {
@@ -326,7 +327,8 @@ pub trait Client: Sync + Send {
                 .model_type()
                 .extract_patches_for(patches_config, self.model().endpoint())
             {
-                json_value = harnx_core::jaq::eval_filters(patches, json_value);
+                let source = format!("client `{}`", self.name());
+                json_value = apply_request_patches(&source, patches, json_value)?;
             }
         }
 
@@ -340,12 +342,21 @@ pub trait Client: Sync + Send {
         if let Ok(raw_patches) = std::env::var(&env_name) {
             let patches: Vec<String> = serde_json::from_str(&raw_patches)
                 .with_context(|| format!("Invalid JSON patch array in {env_name}"))?;
-            json_value = harnx_core::jaq::eval_filters(&patches, json_value);
+            json_value = apply_request_patches(&env_name, &patches, json_value)?;
         }
 
         *request_data = RequestData::from_json_value(json_value)?;
         Ok(())
     }
+}
+
+/// Applies one group of request patches, failing the request if any of them
+/// errors. Skipping a broken patch would send a body the patch was meant to
+/// correct (an unsupported `temperature`, a missing thinking config) and the
+/// only trace used to be a `warn!` in the debug log.
+fn apply_request_patches(source: &str, patches: &[String], json_value: Value) -> Result<Value> {
+    harnx_core::jaq::eval_filters_strict(patches, json_value)
+        .with_context(|| format!("Failed to apply request patches from {source}"))
 }
 
 impl Default for crate::ClientConfig {
@@ -634,7 +645,8 @@ mod request_data_tests {
             r#".headers.authorization = "Bearer patched-token""#.to_string(),
             r#".body.model = "patched-model""#.to_string(),
         ];
-        json_value = harnx_core::jaq::eval_filters(&patches, json_value);
+        json_value = super::apply_request_patches("model `openai:test`", &patches, json_value)
+            .expect("valid patches should apply");
 
         let patched_data =
             RequestData::from_json_value(json_value).expect("should parse patched JSON");
@@ -668,10 +680,37 @@ mod request_data_tests {
             .expect("env var should parse as JSON array of strings");
 
         let input = serde_json::json!({"url": "...", "headers": {}, "body": {"model": "gpt-4o"}});
-        let output = harnx_core::jaq::eval_filters(&patches, input);
+        let output =
+            super::apply_request_patches("HARNX_PATCH_OPENAI_CHAT_COMPLETIONS", &patches, input)
+                .expect("valid patches should apply");
 
         assert_eq!(output["body"]["max_tokens"].as_i64(), Some(100));
         assert_eq!(output["body"]["temperature"].as_f64(), Some(0.5));
+    }
+
+    #[test]
+    fn apply_request_patches_reports_the_failing_patch_and_reason() {
+        // `.body.reasoning.effort` needs a `.body.reasoning` object; jaq won't
+        // create one. The request must fail loudly rather than go out unpatched.
+        let patches = vec![r#".body.reasoning.effort = "high""#.to_string()];
+        let input = serde_json::json!({"url": "...", "headers": {}, "body": {"model": "gpt-5.6"}});
+
+        let err = super::apply_request_patches("model `openai:gpt-5.6`", &patches, input)
+            .expect_err("assigning through a missing object must fail");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("model `openai:gpt-5.6`"),
+            "error should name the patch source: {message}"
+        );
+        assert!(
+            message.contains(".body.reasoning.effort"),
+            "error should name the failing expression: {message}"
+        );
+        assert!(
+            message.contains("cannot use null as iterable"),
+            "error should carry the jaq reason: {message}"
+        );
     }
 
     #[test]
