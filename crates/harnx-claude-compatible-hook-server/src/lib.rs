@@ -87,7 +87,14 @@ impl TryFrom<Args> for ClaudeCompatibleHook {
         if args.event.trim().is_empty() {
             bail!("hook event must not be empty");
         }
-        if args.command.iter().all(|word| word.trim().is_empty()) {
+        // Only the program word must be present: later arguments may legitimately
+        // be empty strings, but an empty argv[0] reaches process creation and fails
+        // with a bare ENOENT.
+        if args
+            .command
+            .first()
+            .is_none_or(|program| program.trim().is_empty())
+        {
             bail!("hook command must not be empty");
         }
 

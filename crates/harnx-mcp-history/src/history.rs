@@ -355,10 +355,20 @@ impl HistoryManager {
         repo_workdir: &Path,
         commit_id: gix::ObjectId,
     ) -> Result<gix::ObjectId> {
+        // Same lazy discovery as the snapshot paths: nothing pre-populates the
+        // repo map, so a rollback that is not preceded by a snapshot in this
+        // process would otherwise fail with "repo not tracked".
+        self.ensure_repo_for_path(repo_workdir).await;
+        // Tracked repos are keyed by canonical workdir; accept a non-canonical
+        // caller path the same way `diff_commits` does.
+        let canonical = repo_workdir
+            .canonicalize()
+            .unwrap_or_else(|_| repo_workdir.to_path_buf());
         let (ts_repo, workdir, parent) = {
             let repos = self.inner.repos.lock().await;
             let session = repos
-                .get(repo_workdir)
+                .get(&canonical)
+                .or_else(|| repos.get(repo_workdir))
                 .context("repo not tracked for rollback")?;
             (
                 session.repo.clone(),

@@ -362,9 +362,12 @@ fn worker_output_tail() -> String {
     if file.seek(SeekFrom::Start(start)).is_err() {
         return render(String::new());
     }
-    let mut body = String::new();
-    let _ = file.read_to_string(&mut body);
-    render(body)
+    // Decode leniently: an arbitrary byte offset can land mid-sequence, and
+    // `read_to_string` would reject the whole read for one split character —
+    // discarding exactly the output this message exists to show.
+    let mut body = Vec::new();
+    let _ = file.read_to_end(&mut body);
+    render(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// Append-mode handle to [`local_worker_output_file`], falling back to a null

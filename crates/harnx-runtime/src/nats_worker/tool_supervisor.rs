@@ -126,7 +126,9 @@ impl ToolServerSupervisor {
 
         let processes = Arc::clone(&self.processes);
         let running = running_server_names(&processes).await;
-        let watches = prepare_registration_watches(&registry, config, servers, &running).await;
+        let plan = prepare_registration_watches(&registry, config, servers, &running).await;
+        let watches = plan.watches;
+        self.unregistered.extend(plan.unwatchable);
         spawn_enabled_tool_servers(self, config, servers, &running).await;
 
         let deadline = Instant::now() + readiness_timeout;
@@ -220,8 +222,8 @@ async fn prepare_registration_watches<'a>(
     config: &ToolServerStartConfig,
     servers: &[&'a ToolServerConfig],
     running: &HashSet<SupervisedServer>,
-) -> Vec<(&'a ToolServerConfig, String, kv::Watch)> {
-    let mut watches = Vec::new();
+) -> WatchPlan<'a> {
+    let mut plan = WatchPlan::default();
     for server in servers {
         let expected_token =
             server_identity_token(server.package.as_deref(), &server.name, "<server>");
@@ -243,14 +245,31 @@ async fn prepare_registration_watches<'a>(
             .await;
         }
         match registry.watch_with_history(">").await {
-            Ok(watch) => watches.push((*server, key, watch)),
-            Err(error) => warn_server_failure(
-                &server.name,
-                format!("watch tool registration '{key}': {error:#}"),
-            ),
+            Ok(watch) => plan.watches.push((*server, key, watch)),
+            Err(error) => {
+                warn_server_failure(
+                    &server.name,
+                    format!("watch tool registration '{key}': {error:#}"),
+                );
+                // Still record it as unregistered. The child is spawned either
+                // way, and only servers in `unregistered` are ever retried, so
+                // dropping it here would strand a server that merely lost its
+                // watch.
+                plan.unwatchable.push(SupervisedServer::new(
+                    server.package.as_deref(),
+                    &server.name,
+                ));
+            }
         }
     }
-    watches
+    plan
+}
+
+/// Watches to await, plus the servers that could not get one.
+#[derive(Default)]
+struct WatchPlan<'a> {
+    watches: Vec<(&'a ToolServerConfig, String, kv::Watch)>,
+    unwatchable: Vec<SupervisedServer>,
 }
 
 async fn spawn_enabled_tool_servers(
