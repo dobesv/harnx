@@ -540,7 +540,11 @@ impl ClientHandler for BridgeClientHandler {
 mod tests {
     #[cfg(unix)]
     use super::BridgeToolset;
-    use super::{map_tool, report_tools, Args};
+    // Only the unix tests exercise a real child process, so the reporter is
+    // unused elsewhere and `-D warnings` rejects the import.
+    #[cfg(unix)]
+    use super::report_tools;
+    use super::{map_tool, Args};
 
     #[test]
     fn list_tools_parses_without_a_name_but_serving_still_needs_one() {
