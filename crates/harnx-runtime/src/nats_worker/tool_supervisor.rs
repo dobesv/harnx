@@ -149,7 +149,7 @@ impl ToolServerSupervisor {
                 match wait_for_registration(&mut watch, wait).await {
                     Ok(()) => None,
                     Err(error) => {
-                        warn_server_failure(&server.name, format!("{error:#}"));
+                        warn_server_failure(&identity.label(), format!("{error:#}"));
                         Some(identity)
                     }
                 }
@@ -423,8 +423,10 @@ fn spawn_tool_server(config: &ToolServerStartConfig, server: &ToolServerConfig) 
     })
 }
 
+/// Report a tool-server problem. Deliberately not phrased as "failed to start":
+/// a server that is merely slow is reported through here too.
 fn warn_server_failure(server: &str, detail: impl std::fmt::Display) {
-    emit_warning(format!("tool server '{server}' failed to start: {detail}"));
+    emit_warning(format!("tool server '{server}': {detail}"));
 }
 
 fn emit_warning(message: String) {

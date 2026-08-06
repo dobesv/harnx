@@ -194,11 +194,19 @@ impl BridgeToolset {
         let (program, args) = child_argv
             .split_first()
             .ok_or_else(|| anyhow!("MCP server '{}' command is empty", server_name))?;
+        log::info!(
+            "MCP server '{server_name}': starting {}",
+            shell_words::join(&child_argv)
+        );
         let (child, stdin, stdout, stderr) = spawn_child(&server_name, program, args)?;
         let stderr_tail = spawn_stderr_reader(&server_name, stderr);
         let (service, cached_tools) =
             connect_and_list_tools(&server_name, stdin, stdout, &stderr_tail).await?;
 
+        log::info!(
+            "MCP server '{server_name}': ready with {} tool(s)",
+            cached_tools.len()
+        );
         let peer = service.peer().clone();
         let child_died = CancellationToken::new();
         let watch_token = child_died.clone();

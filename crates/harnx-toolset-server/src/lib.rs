@@ -85,6 +85,7 @@ pub async fn serve_over_nats<T>(
 where
     T: Toolset + 'static,
 {
+    harnx_core::server_logging::init_server_logger();
     let client = async_nats::ConnectOptions::new()
         .token(token.to_owned())
         .connect(nats_url)
@@ -464,6 +465,7 @@ pub async fn run_toolset_main<T>(toolset: T) -> Result<()>
 where
     T: Toolset + 'static,
 {
+    harnx_core::server_logging::init_server_logger();
     let toolset: Arc<dyn Toolset> = Arc::new(toolset);
     if std::env::args_os().any(|arg| arg == "--mcp-stdio") {
         let service = McpToolsetAdapter { toolset }

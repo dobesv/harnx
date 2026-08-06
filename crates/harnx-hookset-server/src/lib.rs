@@ -196,6 +196,7 @@ pub async fn publish_hook_registration(
 
 /// Read hook server settings from the environment and serve over NATS.
 pub async fn run_hookset_main<H: Hook + 'static>(hook: H) -> Result<()> {
+    harnx_core::server_logging::init_server_logger();
     let instance_id = std::env::var(HARNX_INSTANCE_ID)
         .with_context(|| format!("{HARNX_INSTANCE_ID} is required"))?;
     let nats_url =

@@ -395,8 +395,7 @@ async fn tool_server_readiness_failure_warns_and_continues() -> Result<()> {
     );
     assert!(
         fixture.sink.warning_messages().iter().any(|message| {
-            message.contains("tool server 'time' failed to start")
-                && message.contains("did not register")
+            message.contains("tool server 'time'") && message.contains("has not registered")
         }),
         "readiness failure must emit a warning: {:?}",
         fixture.sink.warning_messages()
@@ -601,8 +600,7 @@ async fn missing_tool_server_binary_warns_and_continues() -> Result<()> {
     assert!(supervisor.server_pids().await.is_empty());
     assert!(
         sink.warning_messages().iter().any(|message| {
-            message.contains("tool server 'time' failed to start")
-                && message.contains("not found next to worker")
+            message.contains("tool server 'time'") && message.contains("not found next to worker")
         }),
         "missing binary must emit a warning: {:?}",
         sink.warning_messages()
