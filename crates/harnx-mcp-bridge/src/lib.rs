@@ -22,6 +22,8 @@ use tokio_util::sync::CancellationToken;
 
 const STDERR_TAIL_LINES: usize = 50;
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Spacing of the "still waiting" notices during a slow handshake.
+const HANDSHAKE_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(10);
 
 type StderrTail = Arc<Mutex<VecDeque<String>>>;
@@ -163,6 +165,25 @@ fn child_runtime_env() -> String {
     format!("inherited {}", parts.join(" "))
 }
 
+/// Report that a handshake is still outstanding, every few seconds.
+///
+/// Without this a slow start and a wedged one look identical until the 30s
+/// timeout, by which point a short-lived front-end has often already exited and
+/// taken the evidence with it.
+fn spawn_handshake_progress(server_name: &str) -> tokio::task::JoinHandle<()> {
+    let server_name = server_name.to_owned();
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(HANDSHAKE_PROGRESS_INTERVAL).await;
+            log::warn!(
+                "MCP server '{server_name}': still waiting for the MCP handshake after {:.0}s",
+                started.elapsed().as_secs_f64()
+            );
+        }
+    })
+}
+
 fn spawn_child(server_name: &str, program: &str, args: &[String]) -> anyhow::Result<SpawnedChild> {
     let mut command = Command::new(program);
     command
@@ -291,9 +312,26 @@ impl BridgeToolset {
         );
         log::info!("MCP server '{server_name}': {}", child_runtime_env());
         let (child, stdin, stdout, stderr) = spawn_child(&server_name, program, args)?;
+        // The pid makes a stalled handshake inspectable from outside: the child
+        // is a launcher like `npx`, so knowing which process to look at is the
+        // difference between "it is slow" and a `/proc` answer for why.
+        log::info!(
+            "MCP server '{server_name}': child pid {}",
+            child
+                .id()
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
         let stderr_tail = spawn_stderr_reader(&server_name, stderr);
+        let handshake = std::time::Instant::now();
+        let progress = spawn_handshake_progress(&server_name);
         let (service, cached_tools) =
             connect_and_list_tools(&server_name, stdin, stdout, &stderr_tail).await?;
+        progress.abort();
+        log::info!(
+            "MCP server '{server_name}': handshake completed in {:.1}s",
+            handshake.elapsed().as_secs_f64()
+        );
 
         log::info!(
             "MCP server '{server_name}': ready with {} tool(s)",
