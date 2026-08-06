@@ -311,6 +311,16 @@ impl BridgeToolset {
             shell_words::join(&child_argv)
         );
         log::info!("MCP server '{server_name}': {}", child_runtime_env());
+        // Resolve argv[0] the way the OS will. A wrapper shim earlier on PATH
+        // than the real binary is invisible in the command line but changes what
+        // actually runs, and a shim that prints anything of its own corrupts a
+        // stdio protocol before the server it wraps ever speaks.
+        log::info!(
+            "MCP server '{server_name}': '{program}' resolves to {}",
+            which::which(program)
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|error| format!("<unresolved: {error}>"))
+        );
         let (child, stdin, stdout, stderr) = spawn_child(&server_name, program, args)?;
         // The pid makes a stalled handshake inspectable from outside: the child
         // is a launcher like `npx`, so knowing which process to look at is the
