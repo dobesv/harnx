@@ -26,17 +26,17 @@ impl<'a> From<&'a str> for RequestId<'a> {
 const TOKEN: &str = "hook-supervisor-test-token";
 
 fn hook_config(event: &str) -> HooksConfig {
-    hook_config_with_command(event, "cat")
+    hook_config_with_command(event, &["cat"])
 }
 
-fn hook_config_with_command(event: &str, child_command: &str) -> HooksConfig {
+fn hook_config_with_command(event: &str, child_argv: &[&str]) -> HooksConfig {
     HooksConfig {
         max_resume: None,
         entries: vec![HookConfig {
             command: format!(
-                "harnx-claude-compatible-hook-server --event {} --matcher exec --timeout 5 --command {}",
+                "harnx-claude-compatible-hook-server --event {} --matcher exec --timeout 5 -- {}",
                 shell_words::quote(event),
-                shell_words::quote(child_command)
+                shell_words::join(child_argv.iter().copied())
             ),
             status_message: None,
             async_hook: None,
@@ -524,7 +524,10 @@ async fn crashed_closed_hook_blocks_through_retained_expectation() -> Result<()>
         _server,
     } = context;
     let mut hooks = hook_config("PreToolUse");
-    hooks.entries[0].command.push_str(" --fail-policy open");
+    // Server flags must precede `--`; anything after it belongs to the child argv.
+    hooks.entries[0].command = hooks.entries[0]
+        .command
+        .replace(" -- ", " --fail-policy open -- ");
     let supervisor = HookServerSupervisor::start_local_with_timeout(
         start,
         &hooks,
@@ -587,7 +590,7 @@ async fn healthy_closed_hook_with_expectation_dispatches_normally() -> Result<()
         start,
         _server,
     } = context;
-    let hooks = hook_config_with_command("PreToolUse", "printf '{}'");
+    let hooks = hook_config_with_command("PreToolUse", &["printf", "{}"]);
     let supervisor = HookServerSupervisor::start_local_with_timeout(
         start,
         &hooks,

@@ -1,10 +1,11 @@
 use crate::agent_loop::AgentLoopContext;
+use crate::config::HARNX_NATS_URL_ENV;
 use crate::config::{Config, GlobalConfig, Input};
 use crate::nats_hook_provider::NatsHookProvider;
 use crate::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
 use crate::tool::CompletionText;
 use crate::utils::AbortSignal;
-use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
+use harnx_core::instance::InstanceId;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -172,8 +173,17 @@ pub async fn discover_nats_tool_provider_cached(
 
 /// Refresh declarations before completion request construction.
 pub async fn refresh_nats_tool_declarations(config: &GlobalConfig, instance_id: &InstanceId) {
-    // Match hook discovery: only worker process trees have NATS identity and connectivity.
-    if std::env::var_os(HARNX_INSTANCE_ID).is_none() {
+    // Gate on the broker address, not on `HARNX_INSTANCE_ID`. The worker creates
+    // its instance id in-process and only ever exports it to the children it
+    // spawns, so an instance-id check is false in the one process that runs this
+    // — every turn discovered zero tools and the model saw built-ins only.
+    //
+    // A guard is still needed: with no broker address `resolve_local_nats_server_config`
+    // falls back to starting a shared NATS server, which a plain front-end must
+    // never do just to build a tool list. `HARNX_NATS_URL` is set on the worker
+    // by its supervisor and inherited by its children, so it marks exactly the
+    // processes that already have a broker to talk to.
+    if std::env::var_os(HARNX_NATS_URL_ENV).is_none() {
         return;
     }
 
@@ -224,10 +234,12 @@ mod tests {
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Without a broker address the refresh must return without touching NATS —
+    /// otherwise a plain front-end would start a shared server to build a tool list.
     #[test]
-    fn refresh_without_worker_instance_is_a_no_op() {
+    fn refresh_without_broker_address_is_a_no_op() {
         let _lock = ENV_LOCK.lock().expect("env lock");
-        let _env = EnvGuard::unset(HARNX_INSTANCE_ID);
+        let _env = EnvGuard::unset(HARNX_NATS_URL_ENV);
         let config = GlobalConfig::default();
 
         tokio_test::block_on(async {

@@ -55,8 +55,9 @@ fn session_start_marker_hook(marker: &Path) -> HooksConfig {
         max_resume: None,
         entries: vec![HookConfig {
             command: format!(
-                "{} --event SessionStart --timeout 30 --command 'echo fired >> \"{}\"'",
+                "{} --event SessionStart --timeout 30 -- {} 'echo fired >> \"{}\"'",
                 hook_server_binary().display(),
+                if cfg!(windows) { "cmd /C" } else { "sh -c" },
                 marker.display()
             ),
             status_message: None,

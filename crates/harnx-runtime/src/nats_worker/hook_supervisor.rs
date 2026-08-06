@@ -147,6 +147,8 @@ struct PreparedHook {
 struct HookStartup {
     name: String,
     key: String,
+    /// Untruncated command, for diagnosing a server that dies before it registers.
+    hook_command: String,
     rejector_name: String,
     display_label: String,
     failure_label: String,
@@ -275,6 +277,7 @@ async fn spawn_enabled_hooks(
         startups.push(HookStartup {
             name: prepared.name,
             key: prepared.key,
+            hook_command: prepared.hook.command.clone(),
             rejector_name: prepared.rejector_name,
             display_label: prepared.display_label,
             failure_label: prepared.failure_label,
@@ -315,6 +318,7 @@ async fn start_hook_server(
     let HookStartup {
         name,
         key,
+        hook_command,
         rejector_name,
         display_label,
         failure_label,
@@ -364,7 +368,12 @@ async fn start_hook_server(
                 &failure_label,
             )
             .await?;
-            log::warn!("hook server '{name}' failed during startup: {error:#}");
+            // `display_label` is capped at 120 chars for the UI, which cuts the
+            // command mid-flag and hides the argument that actually failed.
+            log::warn!(
+                "hook server '{name}' failed during startup: {error:#}; command: {}",
+                hook_command
+            );
             Ok(None)
         }
     }
@@ -404,8 +413,10 @@ fn spawn_hook_server(
         .env(HARNX_NATS_URL_ENV, &config.nats_url)
         .env(HARNX_NATS_TOKEN_ENV, &config.token)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        // Send output to the worker log so a hook server that exits before
+        // registering explains itself instead of failing silently.
+        .stdout(crate::local_orchestrator::worker_output_sink())
+        .stderr(crate::local_orchestrator::worker_output_sink())
         .kill_on_drop(true);
     configure_hook_process(&mut command);
     command

@@ -1,18 +1,19 @@
 use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
+use super::tool_registry::{
+    ensure_registry_bucket, log_registry_contents, remove_registrations_for_config,
+    wait_for_registration, RegistrationWait, SupervisedProcesses, SupervisedServer,
+};
 use crate::config::{ToolServerConfig, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
 use crate::nats_tool_provider::NatsInFlightCalls;
-use anyhow::{bail, Context, Result};
-use async_nats::jetstream::{self, kv, stream};
-use futures_util::{StreamExt, TryStreamExt};
+use anyhow::{Context, Result};
+use async_nats::jetstream::kv;
 use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
 use harnx_core::sink::emit_agent_event;
 use harnx_hooks::executor::HARNX_PACKAGE_DIR_ENV;
-use harnx_toolset::{
-    server_identity_token, Registration, HARNX_SERVER_CONFIG, HARNX_SERVER_PACKAGE,
-};
-use harnx_toolset_server::{registration_key, TOOL_REGISTRY_BUCKET};
-use std::collections::HashMap;
+use harnx_toolset::{server_identity_token, HARNX_SERVER_CONFIG, HARNX_SERVER_PACKAGE};
+use harnx_toolset_server::registration_key;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -24,6 +25,7 @@ use tokio::task::JoinHandle;
 const TOOL_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Connection and identity shared by all tool servers spawned for one worker.
+#[derive(Clone)]
 pub struct ToolServerStartConfig {
     client: async_nats::Client,
     instance_id: InstanceId,
@@ -58,9 +60,12 @@ impl ToolServerStartConfig {
 
 /// Owns local tool-server children for one worker process.
 pub struct ToolServerSupervisor {
-    processes: Arc<Mutex<HashMap<u32, String>>>,
+    processes: SupervisedProcesses,
     tasks: Vec<JoinHandle<()>>,
     hook_supervisors: Vec<HookServerSupervisor>,
+    /// Enabled servers that have not registered yet. Retried in the background
+    /// by the worker, so this shrinks as late registrations land.
+    unregistered: Vec<SupervisedServer>,
 }
 
 impl ToolServerSupervisor {
@@ -83,102 +88,217 @@ impl ToolServerSupervisor {
             processes: Arc::clone(&processes),
             tasks: Vec::new(),
             hook_supervisors: Vec::new(),
+            unregistered: Vec::new(),
         };
         let enabled: Vec<_> = servers.iter().filter(|server| server.enabled).collect();
         if enabled.is_empty() {
             return Ok(supervisor);
         }
+        supervisor
+            .start_servers(&config, &enabled, readiness_timeout)
+            .await;
+        start_co_located_hooks(&mut supervisor, &config, enabled).await;
+        Ok(supervisor)
+    }
 
+    /// Spawn `servers` and wait for each to register, recording the ones that
+    /// did not into `self.unregistered`. Per-server failures are warnings: the
+    /// worker stays usable with whatever registered.
+    async fn start_servers(
+        &mut self,
+        config: &ToolServerStartConfig,
+        servers: &[&ToolServerConfig],
+        readiness_timeout: Duration,
+    ) {
         let registry = match ensure_registry_bucket(&config.client).await {
             Ok(registry) => registry,
             Err(error) => {
-                for server in enabled {
+                for server in servers {
                     warn_server_failure(&server.name, format!("prepare tool registry: {error:#}"));
+                    self.unregistered.push(SupervisedServer::new(
+                        server.package.as_deref(),
+                        &server.name,
+                    ));
                 }
-                return Ok(supervisor);
+                return;
             }
         };
 
-        let watches = prepare_registration_watches(&registry, &config, &enabled).await;
-
-        spawn_enabled_tool_servers(&mut supervisor, &config, &enabled, &processes).await;
+        let processes = Arc::clone(&self.processes);
+        let running = running_server_names(&processes).await;
+        let plan = prepare_registration_watches(&registry, config, servers, &running).await;
+        let watches = plan.watches;
+        self.unregistered.extend(plan.unwatchable);
+        spawn_enabled_tool_servers(self, config, servers, &running).await;
 
         let deadline = Instant::now() + readiness_timeout;
         let instance_id = config.instance_id.clone();
         let readiness = watches.into_iter().map(|(server, key, mut watch)| {
             let processes = Arc::clone(&processes);
             let instance_id = instance_id.clone();
+            let identity = SupervisedServer::new(server.package.as_deref(), &server.name);
             async move {
-                if let Err(error) = wait_for_registration(
-                    &mut watch,
-                    &processes,
-                    server,
-                    &instance_id,
-                    &key,
+                let wait = RegistrationWait {
+                    processes: &processes,
+                    identity: identity.clone(),
+                    instance_id: &instance_id,
+                    key: &key,
                     deadline,
-                    readiness_timeout,
-                )
-                .await
-                {
-                    warn_server_failure(&server.name, format!("{error:#}"));
+                    timeout: readiness_timeout,
+                };
+                match wait_for_registration(&mut watch, wait).await {
+                    Ok(()) => None,
+                    Err(error) => {
+                        warn_server_failure(&server.name, format!("{error:#}"));
+                        Some(identity)
+                    }
                 }
             }
         });
-        futures_util::future::join_all(readiness).await;
+        self.unregistered.extend(
+            futures_util::future::join_all(readiness)
+                .await
+                .into_iter()
+                .flatten(),
+        );
+        if !self.unregistered.is_empty() {
+            log_registry_contents(&registry, &config.instance_id).await;
+        }
+    }
 
-        start_co_located_hooks(&mut supervisor, &config, enabled).await;
-        Ok(supervisor)
+    /// Labels of enabled servers still missing a registration.
+    pub fn unregistered_servers(&self) -> Vec<String> {
+        self.unregistered
+            .iter()
+            .map(SupervisedServer::label)
+            .collect()
+    }
+
+    /// Respawn only the servers that have not registered yet and wait again.
+    /// Returns whether any are still missing afterwards.
+    pub async fn retry_unregistered(
+        &mut self,
+        config: &ToolServerStartConfig,
+        servers: &[ToolServerConfig],
+        readiness_timeout: Duration,
+    ) -> bool {
+        let pending = std::mem::take(&mut self.unregistered);
+        let retry: Vec<_> = servers
+            .iter()
+            .filter(|server| {
+                server.enabled
+                    && pending.contains(&SupervisedServer::new(
+                        server.package.as_deref(),
+                        &server.name,
+                    ))
+            })
+            .collect();
+        if retry.is_empty() {
+            return false;
+        }
+        self.start_servers(config, &retry, readiness_timeout).await;
+        !self.unregistered.is_empty()
     }
 
     pub async fn server_pids(&self) -> HashMap<u32, String> {
-        self.processes.lock().await.clone()
+        self.processes
+            .lock()
+            .await
+            .iter()
+            .map(|(pid, server)| (*pid, server.config.clone()))
+            .collect()
     }
+}
+
+/// Names of servers with a live child process, so retries neither double-spawn
+/// a server that is merely slow to register nor clear a registration it is
+/// about to publish.
+async fn running_server_names(processes: &SupervisedProcesses) -> HashSet<SupervisedServer> {
+    processes.lock().await.values().cloned().collect()
 }
 
 async fn prepare_registration_watches<'a>(
     registry: &kv::Store,
     config: &ToolServerStartConfig,
     servers: &[&'a ToolServerConfig],
-) -> Vec<(&'a ToolServerConfig, String, kv::Watch)> {
-    let mut watches = Vec::new();
+    running: &HashSet<SupervisedServer>,
+) -> WatchPlan<'a> {
+    let mut plan = WatchPlan::default();
     for server in servers {
         let expected_token =
             server_identity_token(server.package.as_deref(), &server.name, "<server>");
         let key = registration_key(&config.instance_id, &expected_token);
-        remove_registrations_for_config(
-            &config.client,
-            &config.instance_id,
+        // Only clear stale registrations for servers we are about to respawn.
+        // A still-running server may publish its registration at any moment;
+        // deleting it here would lose a result the watch below cannot replay.
+        if !running.contains(&SupervisedServer::new(
             server.package.as_deref(),
             &server.name,
-            None,
-        )
-        .await;
-        match registry.watch_with_history(">").await {
-            Ok(watch) => watches.push((*server, key, watch)),
-            Err(error) => warn_server_failure(
+        )) {
+            remove_registrations_for_config(
+                &config.client,
+                &config.instance_id,
+                server.package.as_deref(),
                 &server.name,
-                format!("watch tool registration '{key}': {error:#}"),
-            ),
+                None,
+            )
+            .await;
+        }
+        match registry.watch_with_history(">").await {
+            Ok(watch) => plan.watches.push((*server, key, watch)),
+            Err(error) => {
+                warn_server_failure(
+                    &server.name,
+                    format!("watch tool registration '{key}': {error:#}"),
+                );
+                // Still record it as unregistered. The child is spawned either
+                // way, and only servers in `unregistered` are ever retried, so
+                // dropping it here would strand a server that merely lost its
+                // watch.
+                plan.unwatchable.push(SupervisedServer::new(
+                    server.package.as_deref(),
+                    &server.name,
+                ));
+            }
         }
     }
-    watches
+    plan
+}
+
+/// Watches to await, plus the servers that could not get one.
+#[derive(Default)]
+struct WatchPlan<'a> {
+    watches: Vec<(&'a ToolServerConfig, String, kv::Watch)>,
+    unwatchable: Vec<SupervisedServer>,
 }
 
 async fn spawn_enabled_tool_servers(
     supervisor: &mut ToolServerSupervisor,
     config: &ToolServerStartConfig,
     servers: &[&ToolServerConfig],
-    processes: &Arc<Mutex<HashMap<u32, String>>>,
+    running: &HashSet<SupervisedServer>,
 ) {
+    let processes = Arc::clone(&supervisor.processes);
     let in_flight = NatsInFlightCalls::for_instance(&config.instance_id);
     for server in servers {
+        // A server whose child is still alive is slow, not dead — give the
+        // existing process more time rather than stacking a second copy.
+        if running.contains(&SupervisedServer::new(
+            server.package.as_deref(),
+            &server.name,
+        )) {
+            continue;
+        }
         match spawn_tool_server(config, server) {
             Ok(child) => {
                 let Some(pid) = child.id() else {
                     warn_server_failure(&server.name, "spawned child has no process ID");
                     continue;
                 };
-                processes.lock().await.insert(pid, server.name.clone());
+                processes.lock().await.insert(
+                    pid,
+                    SupervisedServer::new(server.package.as_deref(), &server.name),
+                );
                 supervisor.tasks.push(spawn_child_monitor(ToolMonitor {
                     child,
                     pid,
@@ -187,7 +307,7 @@ async fn spawn_enabled_tool_servers(
                     config: server.name.clone(),
                     instance_id: config.instance_id.clone(),
                     client: config.client.clone(),
-                    processes: Arc::clone(processes),
+                    processes: Arc::clone(&processes),
                     in_flight: in_flight.clone(),
                 }));
             }
@@ -287,8 +407,11 @@ fn spawn_tool_server(config: &ToolServerStartConfig, server: &ToolServerConfig) 
         .env(HARNX_NATS_URL_ENV, &config.nats_url)
         .env(HARNX_NATS_TOKEN_ENV, &config.token)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        // Send output to the worker log instead of discarding it, so a tool
+        // server that dies or complains on startup leaves a trace there rather
+        // than silently timing out at registration.
+        .stdout(crate::local_orchestrator::worker_output_sink())
+        .stderr(crate::local_orchestrator::worker_output_sink())
         .kill_on_drop(true);
     configure_tool_process(&mut command);
     command.spawn().with_context(|| {
@@ -305,9 +428,15 @@ fn warn_server_failure(server: &str, detail: impl std::fmt::Display) {
 }
 
 fn emit_warning(message: String) {
-    if !emit_agent_event(AgentEvent::Notice(NoticeEvent::Warning(message.clone()))) {
-        eprintln!("Warning: {message}");
-    }
+    // `emit_agent_event` reports success even with no sink installed: it buffers
+    // into a capped queue for replay once one appears. That works for the
+    // front-end, but the worker has no sink while it starts up, so these
+    // warnings would sit in the queue until some later session replayed them —
+    // or be dropped entirely if the worker never gets one. Always write to
+    // stderr too; the supervisor redirects it to the worker log, which is the
+    // only channel that survives worker startup.
+    emit_agent_event(AgentEvent::Notice(NoticeEvent::Warning(message.clone())));
+    eprintln!("Warning: {message}");
     log::warn!("{message}");
 }
 
@@ -319,7 +448,7 @@ struct ToolMonitor {
     config: String,
     instance_id: InstanceId,
     client: async_nats::Client,
-    processes: Arc<Mutex<HashMap<u32, String>>>,
+    processes: SupervisedProcesses,
     in_flight: NatsInFlightCalls,
 }
 fn spawn_child_monitor(monitor: ToolMonitor) -> JoinHandle<()> {
@@ -370,158 +499,6 @@ async fn wait_for_child(child: &mut Child) -> std::io::Result<std::process::Exit
             return Ok(status);
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-async fn wait_for_registration(
-    watch: &mut kv::Watch,
-    processes: &Arc<Mutex<HashMap<u32, String>>>,
-    server: &ToolServerConfig,
-    instance_id: &InstanceId,
-    key: &str,
-    deadline: Instant,
-    timeout: Duration,
-) -> Result<()> {
-    loop {
-        if !processes
-            .lock()
-            .await
-            .values()
-            .any(|name| name == &server.name)
-        {
-            bail!(
-                "tool server '{}' exited before registering at '{key}'",
-                server.name
-            );
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            bail!(
-                "tool server '{}' did not register at '{key}' within {}s",
-                server.name,
-                timeout.as_secs_f64()
-            );
-        }
-        let remaining = deadline.saturating_duration_since(now);
-        let poll = remaining.min(Duration::from_millis(100));
-        match tokio::time::timeout(poll, watch.next()).await {
-            Ok(Some(Ok(entry))) if entry.operation == kv::Operation::Put => {
-                if !entry.key.starts_with(key.trim_end_matches("<server>")) {
-                    continue;
-                }
-                let registration: Registration = match serde_json::from_slice(&entry.value) {
-                    Ok(registration) => registration,
-                    Err(error) => {
-                        log::warn!(
-                            "ignoring invalid tool registration '{}': {error}",
-                            entry.key
-                        );
-                        continue;
-                    }
-                };
-                if registration.package != server.package || registration.config != server.name {
-                    log::warn!(
-                        "ignoring tool registration '{}' identity mismatch: expected package {:?}, config '{}'; got package {:?}, config '{}'",
-                        entry.key,
-                        server.package,
-                        server.name,
-                        registration.package,
-                        registration.config
-                    );
-                    continue;
-                }
-                let identity_token = server_identity_token(
-                    registration.package.as_deref(),
-                    &registration.config,
-                    &registration.server,
-                );
-                let expected_key = registration_key(instance_id, &identity_token);
-                if entry.key != expected_key {
-                    log::warn!(
-                        "ignoring tool registration '{}' because its identity expects key '{}'",
-                        entry.key,
-                        expected_key
-                    );
-                    continue;
-                }
-                return Ok(());
-            }
-            Ok(Some(Ok(_))) => {}
-            Ok(Some(Err(error))) => {
-                log::warn!("ignoring tool registration watch error for '{key}': {error}");
-            }
-            Ok(None) => {
-                log::warn!("tool registration watch closed for '{key}'; waiting for timeout");
-                tokio::time::sleep(poll).await;
-            }
-            Err(_) => continue,
-        }
-    }
-}
-
-async fn ensure_registry_bucket(client: &async_nats::Client) -> Result<kv::Store> {
-    let jetstream = jetstream::new(client.clone());
-    match jetstream
-        .create_key_value(kv::Config {
-            bucket: TOOL_REGISTRY_BUCKET.to_string(),
-            history: 1,
-            num_replicas: 1,
-            storage: stream::StorageType::File,
-            ..Default::default()
-        })
-        .await
-    {
-        Ok(store) => Ok(store),
-        Err(_) => jetstream
-            .get_key_value(TOOL_REGISTRY_BUCKET)
-            .await
-            .map_err(anyhow::Error::from)
-            .context("open tool registry bucket"),
-    }
-}
-
-async fn remove_registrations_for_config(
-    client: &async_nats::Client,
-    instance_id: &InstanceId,
-    package: Option<&str>,
-    config: &str,
-    failure: Option<(&NatsInFlightCalls, &str)>,
-) {
-    let jetstream = jetstream::new(client.clone());
-    let Ok(store) = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await else {
-        return;
-    };
-    let Ok(mut keys) = store.keys().await else {
-        return;
-    };
-    let prefix = format!("{instance_id}.");
-    while let Ok(Some(key)) = keys.try_next().await {
-        if !key.starts_with(&prefix) {
-            continue;
-        }
-        let Ok(Some(value)) = store.get(&key).await else {
-            continue;
-        };
-        let Ok(registration) = serde_json::from_slice::<Registration>(&value) else {
-            continue;
-        };
-        if registration.package.as_deref() != package || registration.config != config {
-            continue;
-        }
-        let identity_token = server_identity_token(
-            registration.package.as_deref(),
-            &registration.config,
-            &registration.server,
-        );
-        if key != registration_key(instance_id, &identity_token) {
-            continue;
-        }
-        if let Some((in_flight, message)) = failure {
-            in_flight
-                .fail_server_unavailable(&identity_token, message.to_string())
-                .await;
-        }
-        let _ = store.delete(key).await;
     }
 }
 

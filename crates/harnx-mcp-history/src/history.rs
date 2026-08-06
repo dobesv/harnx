@@ -7,7 +7,6 @@ use anyhow::{Context, Result};
 use gix::bstr::ByteSlice;
 
 use crate::diff::diff_commits_blocking;
-use crate::discover::find_repos_under_roots;
 use crate::rollback::rollback_to_commit_blocking;
 
 /// Maximum number of files per snapshot. Override with HARNX_HISTORY_MAX_FILES.
@@ -60,24 +59,23 @@ fn maybe_trigger_gc(
 }
 
 impl HistoryManager {
-    pub fn new(roots: &[PathBuf]) -> Self {
-        let mut repos = HashMap::new();
-
-        for repo_root in find_repos_under_roots(roots) {
-            if let Ok(repo) = gix::open(&repo_root) {
-                repos.insert(
-                    repo_root,
-                    RepoSession {
-                        repo: repo.into_sync(),
-                        last_commit_id: None,
-                    },
-                );
-            }
-        }
-
+    /// Start with no tracked repos.
+    ///
+    /// This used to eagerly walk every allowed root looking for git workdirs.
+    /// That walk descends until it hits a `.git`, so a root that is not itself a
+    /// repo is traversed in full: on a 170k-directory tree it burned over 100
+    /// seconds of syscalls before the caller could do anything. Because it ran
+    /// inside the constructor, a tool server built this way never reached its
+    /// NATS registration and the worker simply reported it as failed to start.
+    ///
+    /// Every entry point that needs a repo already discovers one on demand —
+    /// [`Self::ensure_repo_for_path`] walks up from the file, and
+    /// [`Self::ensure_repos_under`] scans a specific working directory at
+    /// snapshot time — so nothing is lost by starting empty.
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(HistoryManagerInner {
-                repos: tokio::sync::Mutex::new(repos),
+                repos: tokio::sync::Mutex::new(HashMap::new()),
                 last_gc: std::sync::Mutex::new(HashMap::new()),
             }),
         }
@@ -181,7 +179,7 @@ impl HistoryManager {
         // Lazily discover and track a repo covering this file path. This is
         // load-bearing in production: harnx-fs-tools / harnx-bash-tools launch
         // with empty `--root` args and only learn their roots later via the
-        // MCP `roots/list` protocol, so `HistoryManager::new(&[])` finds no
+        // MCP `roots/list` protocol, so `HistoryManager::new()` finds no
         // repos at construction. Without this fallback every snapshot would
         // silently fail with "no tracked repo" and edit_file would omit its
         // diff content block.
@@ -357,10 +355,20 @@ impl HistoryManager {
         repo_workdir: &Path,
         commit_id: gix::ObjectId,
     ) -> Result<gix::ObjectId> {
+        // Same lazy discovery as the snapshot paths: nothing pre-populates the
+        // repo map, so a rollback that is not preceded by a snapshot in this
+        // process would otherwise fail with "repo not tracked".
+        self.ensure_repo_for_path(repo_workdir).await;
+        // Tracked repos are keyed by canonical workdir; accept a non-canonical
+        // caller path the same way `diff_commits` does.
+        let canonical = repo_workdir
+            .canonicalize()
+            .unwrap_or_else(|_| repo_workdir.to_path_buf());
         let (ts_repo, workdir, parent) = {
             let repos = self.inner.repos.lock().await;
             let session = repos
-                .get(repo_workdir)
+                .get(&canonical)
+                .or_else(|| repos.get(repo_workdir))
                 .context("repo not tracked for rollback")?;
             (
                 session.repo.clone(),
@@ -384,6 +392,12 @@ impl HistoryManager {
             }
         }
         Ok(after_id)
+    }
+}
+
+impl Default for HistoryManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -865,7 +879,7 @@ mod tests {
         add_file_to_git(&repo_dir, "tracked.txt", b"old\n");
         commit_git(&repo_dir);
 
-        let history = HistoryManager::new(&[]);
+        let history = HistoryManager::new();
         let file_path = repo_dir.join("tracked.txt");
         let before = history
             .snapshot_file(&file_path, "before edit")

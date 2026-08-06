@@ -27,6 +27,7 @@ mod control;
 mod daemon;
 mod hook_supervisor;
 mod subagent_toolset;
+mod tool_registry;
 mod tool_supervisor;
 
 #[cfg(test)]

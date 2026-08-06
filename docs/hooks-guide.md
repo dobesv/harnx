@@ -46,6 +46,9 @@ There are two types of hook servers:
      --fail-policy <closed|open>  # Failure behavior (default: closed)
      -- <CHILD_COMMAND>           # The actual hook script/binary to run
    ```
+   Everything after `--` is an argv, executed directly rather than through a
+   shell. For pipes, redirection or variable expansion, ask for a shell:
+   `-- sh -c 'cmd >> log 2>&1'`.
 
 2. **Native hooks** (e.g., `harnx-proxy-auth`): Specialized binaries that implement the NATS hook protocol directly and self-declare their event/matcher via `Hook::hooks()`. They need no `--event`/`--matcher` flags:
    ```sh
@@ -331,7 +334,7 @@ Prevents the use of `bash_exec` for security reasons.
 ```yaml
 hooks:
   entries:
-    - command: harnx-claude-compatible-hook-server --event PreToolUse --matcher bash_exec -- exit 2
+    - command: harnx-claude-compatible-hook-server --event PreToolUse --matcher bash_exec -- sh -c 'exit 2'
       status_message: "Blocking bash_exec for safety"
 ```
 

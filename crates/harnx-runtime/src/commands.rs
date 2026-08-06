@@ -892,7 +892,7 @@ async fn ask(
 
     if cluster == crate::config::LOCAL_CLUSTER_KEY {
         let mut supervisor = local_worker.lock().await;
-        crate::local_orchestrator::ensure_local_worker(&mut supervisor)
+        crate::local_orchestrator::ensure_local_worker(&mut supervisor, abort_signal.clone())
             .await
             .context("failed to ensure local NATS worker")?;
     }

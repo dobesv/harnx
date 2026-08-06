@@ -41,13 +41,15 @@ pub struct Args {
     #[arg(long)]
     pub persistent: bool,
 
-    /// Shell command run for hook requests.
-    #[arg(long)]
-    pub command: String,
-
     /// Package directory exposed to the command as HARNX_PACKAGE_DIR.
     #[arg(long)]
     pub package_dir: Option<PathBuf>,
+
+    /// Command run for hook requests, given after `--` as a program and its
+    /// arguments. Executed directly, so a hook wanting pipes, redirection or
+    /// variable expansion asks for a shell explicitly: `-- sh -c '...'`.
+    #[arg(trailing_var_arg = true, required = true, value_name = "COMMAND")]
+    pub command: Vec<String>,
 }
 
 /// Hook dispatch behavior when the server fails.
@@ -85,7 +87,14 @@ impl TryFrom<Args> for ClaudeCompatibleHook {
         if args.event.trim().is_empty() {
             bail!("hook event must not be empty");
         }
-        if args.command.trim().is_empty() {
+        // Only the program word must be present: later arguments may legitimately
+        // be empty strings, but an empty argv[0] reaches process creation and fails
+        // with a bare ENOENT.
+        if args
+            .command
+            .first()
+            .is_none_or(|program| program.trim().is_empty())
+        {
             bail!("hook command must not be empty");
         }
 
@@ -100,7 +109,7 @@ impl TryFrom<Args> for ClaudeCompatibleHook {
             },
             persistent: args.persistent,
             command: HookCommand {
-                command: args.command,
+                argv: args.command,
                 timeout: args.timeout,
                 package_dir: args.package_dir,
             },
@@ -156,7 +165,7 @@ mod tests {
         }
     }
 
-    fn hook(command: &str, persistent: bool) -> ClaudeCompatibleHook {
+    fn hook(command: &[&str], persistent: bool) -> ClaudeCompatibleHook {
         Args {
             name: "test-hook".to_string(),
             event: "PreToolUse".to_string(),
@@ -165,11 +174,17 @@ mod tests {
             timeout: Some(5),
             fail_policy: CliFailPolicy::Closed,
             persistent,
-            command: command.to_string(),
+            command: command.iter().map(|word| word.to_string()).collect(),
             package_dir: None,
         }
         .try_into()
         .expect("valid test hook")
+    }
+
+    /// Hooks needing shell syntax now ask for a shell explicitly.
+    #[cfg(unix)]
+    fn shell_hook(script: &str, persistent: bool) -> ClaudeCompatibleHook {
+        hook(&["sh", "-c", script], persistent)
     }
 
     #[test]
@@ -181,11 +196,12 @@ mod tests {
             "--event",
             "PreToolUse",
             "--persistent",
-            "--command",
+            "--",
             "true",
         ])
         .expect("parse persistent hook");
         assert!(args.persistent);
+        assert_eq!(args.command, vec!["true".to_string()]);
 
         assert!(Args::try_parse_from([
             "hook-server",
@@ -195,7 +211,7 @@ mod tests {
             "PreToolUse",
             "--type",
             "persistent",
-            "--command",
+            "--",
             "true",
         ])
         .is_err());
@@ -205,7 +221,10 @@ mod tests {
     #[tokio::test]
     async fn one_shot_exit_zero_parses_hook_result() {
         let cwd = tempfile::tempdir().expect("temp dir");
-        let runner = hook(r#"printf '%s' '{"additionalContext":"from-hook"}'"#, false);
+        let runner = hook(
+            &["printf", "%s", r#"{"additionalContext":"from-hook"}"#],
+            false,
+        );
 
         let outcome = runner.handle_hook(payload(cwd.path(), 1)).await;
 
@@ -220,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn one_shot_exit_two_blocks_with_stderr() {
         let cwd = tempfile::tempdir().expect("temp dir");
-        let runner = hook("printf '%s' 'denied by test' >&2; exit 2", false);
+        let runner = shell_hook("printf '%s' 'denied by test' >&2; exit 2", false);
 
         let outcome = runner.handle_hook(payload(cwd.path(), 1)).await;
 
@@ -237,7 +256,7 @@ mod tests {
     async fn one_shot_returns_mutated_tool_input() {
         let cwd = tempfile::tempdir().expect("temp dir");
         let runner = hook(
-            r#"printf '%s' '{"mutatedToolInput":{"command":"safe"}}'"#,
+            &["printf", "%s", r#"{"mutatedToolInput":{"command":"safe"}}"#],
             false,
         );
 
@@ -253,7 +272,7 @@ mod tests {
     #[tokio::test]
     async fn persistent_process_routes_two_id_framed_round_trips() {
         let cwd = tempfile::tempdir().expect("temp dir");
-        let runner = hook(
+        let runner = shell_hook(
             r#"count=0; while IFS= read -r line; do count=$((count + 1)); id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'); printf '{"id":"%s","mutatedToolInput":{"sequence":%s}}\n' "$id" "$count"; done"#,
             true,
         );
@@ -273,7 +292,7 @@ mod tests {
 
     #[test]
     fn hook_metadata_comes_from_configuration() {
-        let runner = hook("true", false);
+        let runner = hook(&["true"], false);
         assert_eq!(runner.name(), "test-hook");
         assert_eq!(
             runner.hooks(),

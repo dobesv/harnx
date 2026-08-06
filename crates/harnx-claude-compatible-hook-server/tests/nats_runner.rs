@@ -132,7 +132,10 @@ async fn command_hook_registers_and_answers_over_nats() -> Result<()> {
         timeout: Some(5),
         fail_policy: CliFailPolicy::Closed,
         persistent: false,
-        command: r#"printf '%s' '{"mutatedToolInput":{"overNats":true}}'"#.to_string(),
+        command: ["printf", "%s", r#"{"mutatedToolInput":{"overNats":true}}"#]
+            .iter()
+            .map(|word| word.to_string())
+            .collect(),
         package_dir: None,
     })?;
     let instance_id = InstanceId::new();
@@ -191,9 +194,9 @@ async fn command_hook_uses_env_name_with_end_of_options_separator() -> Result<()
             "PreToolUse",
             "--matcher",
             "exec",
-            "--command",
-            "printf '{}'",
             "--",
+            "printf",
+            "{}",
         ])
         .env(HARNX_HOOK_NAME, assigned_name)
         .env(HARNX_INSTANCE_ID, instance_id.as_str())

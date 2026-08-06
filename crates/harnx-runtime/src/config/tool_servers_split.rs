@@ -119,7 +119,7 @@ command: harnx-time-server
 hooks:
   max_resume: 3
   entries:
-    - command: "harnx-claude-compatible-hook-server --event PreToolUse --matcher time --timeout 30 --command /path/to/hook.sh"
+    - command: "harnx-claude-compatible-hook-server --event PreToolUse --matcher time --timeout 30 -- /path/to/hook.sh"
       status_message: "Checking time tool"
 "#;
         let config: ToolServerConfig = serde_yaml::from_str(yaml).unwrap();
@@ -130,7 +130,7 @@ hooks:
         let entry = &hooks.entries[0];
         assert_eq!(
             entry.command,
-            "harnx-claude-compatible-hook-server --event PreToolUse --matcher time --timeout 30 --command /path/to/hook.sh"
+            "harnx-claude-compatible-hook-server --event PreToolUse --matcher time --timeout 30 -- /path/to/hook.sh"
         );
         assert_eq!(entry.status_message.as_deref(), Some("Checking time tool"));
         assert!(entry.async_hook.is_none());

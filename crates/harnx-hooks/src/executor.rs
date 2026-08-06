@@ -16,29 +16,43 @@ pub const HARNX_PACKAGE_DIR_ENV: &str = "HARNX_PACKAGE_DIR";
 /// A hook command plus the parameters needed to spawn it. Bundling these keeps
 /// the spawn/dispatch signatures within the argument budget and centralizes how
 /// `HARNX_PACKAGE_DIR` is derived.
+///
+/// `argv` is executed directly, not through a shell. A hook that genuinely needs
+/// shell features asks for them explicitly with `sh -c '...'`, which keeps
+/// quoting the caller's problem instead of a lossy string round-trip.
 #[derive(Debug, Clone)]
 pub struct HookCommand {
-    pub command: String,
+    pub argv: Vec<String>,
     pub timeout: Option<u64>,
     pub package_dir: Option<PathBuf>,
 }
 
-/// Build the base shell `Command` for a hook, with `HARNX_PACKAGE_DIR` injected
-/// (the owning package dir, or the config dir when not owned by a package).
-/// Callers add stdio and working directory as needed.
-pub(crate) fn base_hook_command(command: &str, package_dir: Option<&Path>) -> Command {
+impl HookCommand {
+    /// Human-readable form for logs and error messages.
+    pub fn display(&self) -> String {
+        shell_words::join(&self.argv)
+    }
+}
+
+/// Build the base `Command` for a hook, with `HARNX_PACKAGE_DIR` injected (the
+/// owning package dir, or the config dir when not owned by a package). Callers
+/// add stdio and working directory as needed.
+///
+/// An empty argv yields an unnamed program, which fails to spawn and is
+/// reported by the caller's existing spawn-failure path. Callers already reject
+/// empty commands up front, so this needs no separate branch.
+pub(crate) fn base_hook_command(argv: &[String], package_dir: Option<&Path>) -> Command {
     let package_dir = package_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(harnx_core::config_paths::config_dir);
-    let mut cmd = Command::new(default_shell());
-    cmd.arg(default_shell_arg())
-        .arg(command)
+    let mut cmd = Command::new(argv.first().map(String::as_str).unwrap_or_default());
+    cmd.args(argv.get(1..).unwrap_or_default())
         .env(HARNX_PACKAGE_DIR_ENV, package_dir);
     cmd
 }
 
 pub async fn execute_command_hook(payload: &HookPayload, hook: &HookCommand) -> HookOutcome {
-    let command = hook.command.as_str();
+    let command = hook.display();
     let timeout_secs = hook.timeout;
     let event_name = payload.hook_event.event_name();
     debug!(
@@ -47,7 +61,7 @@ pub async fn execute_command_hook(payload: &HookPayload, hook: &HookCommand) -> 
     );
     let started_at = std::time::Instant::now();
 
-    let mut child = match base_hook_command(command, hook.package_dir.as_deref())
+    let mut child = match base_hook_command(&hook.argv, hook.package_dir.as_deref())
         .current_dir(&payload.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -187,26 +201,6 @@ fn continue_with_default() -> HookOutcome {
     }
 }
 
-#[cfg(unix)]
-pub(crate) fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string())
-}
-
-#[cfg(windows)]
-pub(crate) fn default_shell() -> String {
-    "cmd".to_string()
-}
-
-#[cfg(unix)]
-pub(crate) fn default_shell_arg() -> &'static str {
-    "-c"
-}
-
-#[cfg(windows)]
-pub(crate) fn default_shell_arg() -> &'static str {
-    "/C"
-}
-
 #[cfg(test)]
 mod tests {
     use super::{execute_command_hook, parse_success_output, HookCommand};
@@ -218,7 +212,7 @@ mod tests {
 
     fn hc(command: &str, timeout: Option<u64>, package_dir: Option<&Path>) -> HookCommand {
         HookCommand {
-            command: command.to_string(),
+            argv: crate::shell_argv(command),
             timeout,
             package_dir: package_dir.map(Path::to_path_buf),
         }

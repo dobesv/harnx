@@ -12,6 +12,7 @@ use harnx_runtime::config::LOCAL_CLUSTER_KEY;
 use harnx_runtime::local_orchestrator::{local_worker_lock_file, LocalWorkerSupervisor};
 use harnx_runtime::nats_session_log::NatsSessionLog;
 use harnx_runtime::nats_worker::worker_ready_subject;
+use harnx_runtime::utils::create_abort_signal;
 use harnx_runtime::{ThinClientConfig, ThinClientSession};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -242,7 +243,7 @@ async fn local_worker_supervisor_deduplicates_respawns_and_tears_down() {
     let (api_base, mock_task) = start_mock_openai().await;
     write_trivial_agent_config(root.path(), &api_base);
 
-    let mut owner = LocalWorkerSupervisor::start_with_worker_binary(&binary)
+    let mut owner = LocalWorkerSupervisor::start_with_worker_binary(&binary, create_abort_signal())
         .await
         .expect("start local worker owner");
     assert!(owner.is_worker_owner());
@@ -256,7 +257,7 @@ async fn local_worker_supervisor_deduplicates_respawns_and_tears_down() {
     );
     let first_pid = owner.worker_pid().expect("owned worker PID");
 
-    let joiner = LocalWorkerSupervisor::start_with_worker_binary(&binary)
+    let joiner = LocalWorkerSupervisor::start_with_worker_binary(&binary, create_abort_signal())
         .await
         .expect("join existing local worker");
     assert!(
@@ -270,7 +271,10 @@ async fn local_worker_supervisor_deduplicates_respawns_and_tears_down() {
     kill_process(first_pid);
     let deadline = Instant::now() + Duration::from_secs(5);
     let replacement_pid = loop {
-        owner.ensure().await.expect("respawn killed local worker");
+        owner
+            .ensure(create_abort_signal())
+            .await
+            .expect("respawn killed local worker");
         let pid = owner.worker_pid().expect("replacement worker PID");
         if pid != first_pid {
             break pid;

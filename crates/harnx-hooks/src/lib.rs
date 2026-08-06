@@ -63,6 +63,17 @@ pub use async_manager::{
 pub use dispatch::{dispatch_hooks, dispatch_hooks_with_options, DispatchOptions, InlineHookSpec};
 #[allow(unused_imports)]
 pub use executor::{execute_command_hook, HookCommand};
+
+/// Wrap a shell script as an argv for tests that exercise shell syntax
+/// (pipes, redirection, loops). Production hooks spell this out themselves.
+#[cfg(test)]
+pub(crate) fn shell_argv(script: &str) -> Vec<String> {
+    #[cfg(unix)]
+    let argv = ["sh", "-c", script];
+    #[cfg(windows)]
+    let argv = ["cmd", "/C", script];
+    argv.iter().map(|word| word.to_string()).collect()
+}
 pub use harnx_core::hooks::*;
 pub use matcher::CompiledMatcher;
 #[allow(unused_imports)]
