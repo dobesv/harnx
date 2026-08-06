@@ -32,16 +32,25 @@ fn apply_explicit_inputs(
     env: &AllowEnv,
 ) {
     for path in &inputs.read {
-        resolved.insert_read(absolute(path, cwd));
+        resolved.insert_read(absolute(path, cwd, env.home.as_deref()));
     }
     for path in &inputs.write {
-        resolved.insert_write_with_home(&absolute(path, cwd), env.home.as_deref());
+        resolved.insert_write_with_home(
+            &absolute(path, cwd, env.home.as_deref()),
+            env.home.as_deref(),
+        );
     }
     for path in &inputs.exec {
-        resolved.insert_exec_with_home(&absolute(path, cwd), env.home.as_deref());
+        resolved.insert_exec_with_home(
+            &absolute(path, cwd, env.home.as_deref()),
+            env.home.as_deref(),
+        );
     }
     for path in &inputs.rwx {
-        resolved.insert_rwx_with_home(&absolute(path, cwd), env.home.as_deref());
+        resolved.insert_rwx_with_home(
+            &absolute(path, cwd, env.home.as_deref()),
+            env.home.as_deref(),
+        );
     }
 }
 
@@ -82,11 +91,34 @@ fn apply_rules(resolved: &mut ResolvedAllowlist, rules: Vec<AllowRule>, env: &Al
     }
 }
 
-fn absolute(path: &Path, cwd: &Path) -> PathBuf {
+fn absolute(path: &Path, cwd: &Path, home: Option<&Path>) -> PathBuf {
+    let path = expand_home(path, home);
     if path.is_absolute() {
-        path.to_path_buf()
+        path
     } else {
         cwd.join(path)
+    }
+}
+
+/// Expand a leading `~`, which is not a relative path.
+///
+/// Allowlist entries come from config files and command lines that no shell
+/// has touched, so a written `~/.cache` arrives literally. Treating it as
+/// relative silently produced `<cwd>/~/.cache`; the sandbox then failed to set
+/// up that nonexistent directory and reported a bare "No such file or
+/// directory" naming neither the path nor the flag it came from.
+///
+/// `~user` is left alone: resolving another account's home needs a passwd
+/// lookup, and guessing would grant access to the wrong directory.
+fn expand_home(path: &Path, home: Option<&Path>) -> PathBuf {
+    let Some(home) = home else {
+        return path.to_path_buf();
+    };
+    let raw = path.to_string_lossy();
+    match raw.strip_prefix('~') {
+        Some("") => home.to_path_buf(),
+        Some(rest) if rest.starts_with('/') => home.join(rest.trim_start_matches('/')),
+        _ => path.to_path_buf(),
     }
 }
 
@@ -94,6 +126,48 @@ fn absolute(path: &Path, cwd: &Path) -> PathBuf {
 #[cfg(unix)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn leading_tilde_resolves_against_home_not_the_working_directory() {
+        let home = PathBuf::from("/home/example");
+        let cwd = PathBuf::from("/mnt/projects/repo");
+
+        assert_eq!(
+            absolute(Path::new("~/.cache"), &cwd, Some(&home)),
+            PathBuf::from("/home/example/.cache")
+        );
+        assert_eq!(absolute(Path::new("~"), &cwd, Some(&home)), home);
+        // Absolute and genuinely relative paths keep their existing behaviour.
+        assert_eq!(
+            absolute(Path::new("/etc"), &cwd, Some(&home)),
+            PathBuf::from("/etc")
+        );
+        assert_eq!(
+            absolute(Path::new("sub/dir"), &cwd, Some(&home)),
+            cwd.join("sub/dir")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn other_users_home_and_unknown_home_are_left_alone() {
+        let cwd = PathBuf::from("/mnt/projects/repo");
+        // Resolving ~someone needs a passwd lookup; guessing could grant access
+        // to the wrong directory, so it stays relative as before.
+        assert_eq!(
+            absolute(
+                Path::new("~other/data"),
+                &cwd,
+                Some(Path::new("/home/example"))
+            ),
+            cwd.join("~other/data")
+        );
+        assert_eq!(
+            absolute(Path::new("~/.cache"), &cwd, None),
+            cwd.join("~/.cache")
+        );
+    }
 
     #[cfg(unix)]
     #[test]
