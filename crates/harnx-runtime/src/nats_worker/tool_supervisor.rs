@@ -31,6 +31,10 @@ pub struct ToolServerStartConfig {
     instance_id: InstanceId,
     nats_url: String,
     token: String,
+    /// Send tool-server output to this process's own stdout/stderr instead of
+    /// the worker log. Set by foreground diagnostics, where routing a server's
+    /// explanation of its own failure into a file is the opposite of useful.
+    inherit_child_output: bool,
 }
 
 impl ToolServerStartConfig {
@@ -45,7 +49,14 @@ impl ToolServerStartConfig {
             instance_id,
             nats_url: nats_url.into(),
             token: token.into(),
+            inherit_child_output: false,
         }
+    }
+
+    /// Show tool-server output on this process's stdio rather than the worker log.
+    pub fn inheriting_child_output(mut self) -> Self {
+        self.inherit_child_output = true;
+        self
     }
 
     fn hook_start_config(&self) -> HookServerStartConfig {
@@ -391,6 +402,14 @@ fn tool_server_package_dir(server: &ToolServerConfig) -> PathBuf {
         .unwrap_or_else(harnx_core::config_paths::config_dir)
 }
 
+fn child_output_sink(config: &ToolServerStartConfig) -> Stdio {
+    if config.inherit_child_output {
+        Stdio::inherit()
+    } else {
+        crate::local_orchestrator::worker_output_sink()
+    }
+}
+
 fn spawn_tool_server(config: &ToolServerStartConfig, server: &ToolServerConfig) -> Result<Child> {
     let binary = resolve_tool_binary(server)?;
     let mut command = Command::new(&binary);
@@ -410,8 +429,8 @@ fn spawn_tool_server(config: &ToolServerStartConfig, server: &ToolServerConfig) 
         // Send output to the worker log instead of discarding it, so a tool
         // server that dies or complains on startup leaves a trace there rather
         // than silently timing out at registration.
-        .stdout(crate::local_orchestrator::worker_output_sink())
-        .stderr(crate::local_orchestrator::worker_output_sink())
+        .stdout(child_output_sink(config))
+        .stderr(child_output_sink(config))
         .kill_on_drop(true);
     configure_tool_process(&mut command);
     command.spawn().with_context(|| {

@@ -85,7 +85,8 @@ pub async fn diagnose_tool_servers(config: &GlobalConfig) -> Result<String> {
         DIAGNOSE_TIMEOUT.as_secs()
     );
 
-    let start = ToolServerStartConfig::new(client.clone(), instance_id.clone(), &url, &token);
+    let start = ToolServerStartConfig::new(client.clone(), instance_id.clone(), &url, &token)
+        .inheriting_child_output();
     let began = Instant::now();
     let supervisor =
         ToolServerSupervisor::start_local_with_timeout(start, &servers, DIAGNOSE_TIMEOUT).await?;
