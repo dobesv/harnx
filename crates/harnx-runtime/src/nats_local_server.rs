@@ -5,7 +5,6 @@
 //! details through an atomically replaced metadata file.
 
 use anyhow::{bail, Context, Result};
-use fs4::fs_std::FileExt;
 use harnx_core::config_paths::{
     nats_runtime_dir, nats_runtime_lock_file, nats_runtime_ports_file, nats_runtime_store_dir,
 };
@@ -104,8 +103,7 @@ pub async fn ensure_shared_server() -> Result<SharedNatsServer> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
 
     loop {
-        if lock_file
-            .try_lock_exclusive()
+        if crate::file_lock::try_lock_exclusive(&lock_file)
             .context("failed to acquire shared local NATS lock")?
         {
             return start_owned_server(lock_file).await;

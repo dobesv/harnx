@@ -16,6 +16,7 @@ pub mod bootstrap;
 pub mod client;
 pub mod commands;
 pub mod config;
+mod file_lock;
 pub mod local_orchestrator;
 pub mod nats_admin;
 pub mod nats_client_session;
