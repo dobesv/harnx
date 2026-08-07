@@ -61,7 +61,18 @@ const MessageContent = () => (
 
 const MyMessage = () => {
   const role = useAuiState((s) => s.message.role);
+  // An assistant message with no parts still gets .aui-message padding, so it
+  // shows up as a blank gap in the transcript. The promptless subscribe that
+  // hydrates a session leaves one behind: assistant-ui creates the message
+  // when the run starts, and a run carrying only a transcript snapshot never
+  // puts content in it. Streaming replies are unaffected -- they render as
+  // soon as the first part arrives.
+  const isEmpty = useAuiState(
+    (s) => s.message.role === 'assistant' && s.message.content.length === 0,
+  );
   const [systemExpanded, setSystemExpanded] = useState(false);
+
+  if (isEmpty) return null;
 
   if (role === 'system') {
     return (
