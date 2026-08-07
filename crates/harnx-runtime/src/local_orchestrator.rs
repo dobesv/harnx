@@ -7,7 +7,6 @@ use crate::config::{HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV, LOCAL_CLUSTER_KEY}
 use crate::nats_local_server::{ensure_shared_server, SharedNatsServer};
 use crate::nats_worker::worker_ready_subject;
 use anyhow::{bail, Context, Result};
-use fs4::fs_std::FileExt;
 use futures_util::StreamExt;
 use harnx_core::abort::AbortSignal;
 use harnx_core::config_paths::{nats_runtime_dir, state_path};
@@ -109,8 +108,7 @@ impl LocalWorkerSupervisor {
             .canonicalize()
             .with_context(|| format!("resolve worker binary {}", binary.as_ref().display()))?;
         let lock_file = open_worker_lock()?;
-        let owns_lock = lock_file
-            .try_lock_exclusive()
+        let owns_lock = crate::file_lock::try_lock_exclusive(&lock_file)
             .context("acquire local worker lock")?;
         let mut supervisor = Self {
             server,
@@ -170,12 +168,12 @@ impl LocalWorkerSupervisor {
             }
             return Ok(());
         }
-        let acquired = self
-            .lock_file
-            .as_ref()
-            .expect("worker lock file must exist while supervisor is alive")
-            .try_lock_exclusive()
-            .context("retry local worker lock")?;
+        let acquired = crate::file_lock::try_lock_exclusive(
+            self.lock_file
+                .as_ref()
+                .expect("worker lock file must exist while supervisor is alive"),
+        )
+        .context("retry local worker lock")?;
         if acquired {
             self.owns_lock = true;
             self.spawn_worker()?;

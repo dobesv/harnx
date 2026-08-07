@@ -26,7 +26,6 @@ duct = { workspace = true }
 fancy-regex = { workspace = true }
 fuzzy-matcher = { workspace = true }
 futures-util = { workspace = true }
-fs4 = { workspace = true }
 globset = { workspace = true }
 harnx-client = { path = "../harnx-client" }
 harnx-core = { path = "../harnx-core" }
