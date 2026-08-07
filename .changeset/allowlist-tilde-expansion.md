@@ -1,4 +1,8 @@
 ---
 harnx: patch
 ---
-Sandbox allowlist entries written with a leading `~` now resolve against the home directory. Config files and tool-server arguments are read without a shell, so `--allow-read ~/.config/foo` arrived literally and was treated as a relative path, producing `<cwd>/~/.config/foo`. That directory does not exist, so the sandbox failed during setup and every `bash_exec` call returned `sandboxing failure: No such file or directory` with no indication of which path was at fault. `~user` is still left alone, since resolving another account's home would need a passwd lookup.
+Sandbox allowlist entries are now granted exactly as written, and symlinks are resolved only when checking a path against them.
+
+Grants were previously canonicalised at insertion, which had two consequences. It widened a grant to wherever a symlink pointed, so allowing a link could hand over its target. And it lost the path callers actually use: on merged-`/usr` systems `/lib64` collapsed into the `/usr/lib64` entry already present, so the sandbox never mounted `/lib64` and every dynamically linked binary failed to start, because loaders are named absolutely as `/lib64/ld-linux-x86-64.so.2`. That surfaced as `bash_exec` failing every command with `sandboxing failure: No such file or directory`.
+
+A leading `~` in an allowlist entry now resolves against the home directory too. Config files and tool-server arguments are read without a shell, so `--allow-read ~/.config/foo` arrived literally and was treated as relative to the working directory. `~user` is left alone, since resolving another account's home would need a passwd lookup.
