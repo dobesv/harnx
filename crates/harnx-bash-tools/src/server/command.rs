@@ -69,6 +69,14 @@ impl BashServer {
             sb_args.push(OsString::from(command));
         }
         let sandbox_run_path = self.inner.sandbox_config.sandbox_run_path.clone();
+        // The sandbox reports its own setup failures from inside a PID
+        // namespace, where the message carries no indication of which path or
+        // binary was missing. Logging the invocation makes the failure
+        // reproducible outside harnx by pasting it into a shell.
+        log::debug!(
+            "sandbox exec: {}",
+            redacted_invocation(&sandbox_run_path, &sb_args)
+        );
         Ok(CommandWrap::with_new(sandbox_run_path, |command_wrap| {
             command_wrap
                 .args(&sb_args)
@@ -235,5 +243,92 @@ impl BashServer {
             stdout_str: String::from_utf8_lossy(&stdout_bytes).into_owned(),
             stderr_str: String::from_utf8_lossy(&stderr_bytes).into_owned(),
         })
+    }
+}
+
+/// Renders the invocation as a line that can be pasted into a shell, with
+/// `--env` values replaced by a placeholder.
+///
+/// Those values carry API keys and tokens. Quoting is not redaction: it only
+/// escapes syntax, so a token would land in the log verbatim. The command
+/// itself is kept, since reproducing it is the whole point of the line and it
+/// is the caller's own, already visible to anyone who can read this log.
+#[cfg(unix)]
+fn redacted_invocation(program: &Path, args: &[OsString]) -> String {
+    fn quote(value: &str) -> String {
+        shell_words::quote(value).into_owned()
+    }
+
+    let mut out = vec![quote(&program.to_string_lossy())];
+    let mut past_separator = false;
+    let mut env_value_next = false;
+    for arg in args {
+        if std::mem::take(&mut env_value_next) {
+            out.push(quote(&redact_env_value(arg)));
+            continue;
+        }
+        // A `--env` appearing after `--` belongs to the sandboxed command.
+        if !past_separator {
+            past_separator = arg == "--";
+            env_value_next = arg == "--env";
+        }
+        out.push(quote(&arg.to_string_lossy()));
+    }
+    out.join(" ")
+}
+
+/// `--env` also accepts a bare name, which names a variable to pass through
+/// from the ambient environment and so carries no value to hide.
+#[cfg(unix)]
+fn redact_env_value(arg: &std::ffi::OsStr) -> String {
+    let raw = arg.to_string_lossy();
+    match raw.split_once('=') {
+        Some((name, _)) => format!("{name}=<redacted>"),
+        None => raw.into_owned(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod redaction_tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn env_values_are_replaced_but_their_names_survive() {
+        let line = redacted_invocation(
+            Path::new("/usr/bin/harnx-sandbox-run"),
+            &args(&["--env", "EXA_API_KEY=secret-token", "--read", "/usr"]),
+        );
+
+        assert_eq!(
+            line,
+            // The placeholder is quoted like any other value, so the line stays
+            // safe to paste.
+            "/usr/bin/harnx-sandbox-run --env 'EXA_API_KEY=<redacted>' --read /usr"
+        );
+        assert!(!line.contains("secret-token"));
+    }
+
+    #[test]
+    fn a_bare_env_name_and_the_command_are_left_alone() {
+        let line = redacted_invocation(
+            Path::new("/usr/bin/harnx-sandbox-run"),
+            &args(&["--env", "PATH", "--", "bash", "-c", "echo --env hi"]),
+        );
+
+        assert_eq!(
+            line,
+            "/usr/bin/harnx-sandbox-run --env PATH -- bash -c 'echo --env hi'"
+        );
+    }
+
+    #[test]
+    fn a_path_needing_quoting_is_quoted() {
+        let line = redacted_invocation(Path::new("/opt/my tools/run"), &args(&["--read", "/usr"]));
+
+        assert_eq!(line, "'/opt/my tools/run' --read /usr");
     }
 }
