@@ -17,6 +17,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 
+mod command_completion;
+
 fn yaml_to_json(yaml: &str) -> serde_json::Value {
     serde_yaml::from_str::<serde_json::Value>(yaml)
         .unwrap_or_else(|_| serde_json::Value::String(yaml.to_string()))

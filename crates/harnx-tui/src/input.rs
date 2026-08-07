@@ -1941,13 +1941,7 @@ impl Tui {
 
         // If we're still typing the first word starting with '.', complete commands
         if parts.len() == 1 && cmd.starts_with('.') {
-            let filter = cmd;
-            let commands: Vec<(String, Option<String>)> = harnx_runtime::commands::COMMANDS
-                .iter()
-                .filter(|c| c.name.starts_with(filter))
-                .map(|c| (format!("{} ", c.name), Some(c.description.to_string())))
-                .collect();
-            return commands;
+            return crate::completion::command_name_completions(cmd);
         }
 
         // For multi-part commands, delegate to config's command_complete
