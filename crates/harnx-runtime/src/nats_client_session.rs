@@ -4,7 +4,7 @@
 //! `AgentRef::Remote { agent, cluster }`), the client runs in THIN mode:
 //! it posts the user message + control commands to NATS and renders events
 //! from the fan-out — it does NOT run `run_agent_loop` locally. A separate
-//! `harnx worker --cluster <key>` daemon executes the turn.
+//! `harnx-worker --cluster <key>` daemon executes the turn.
 //!
 //! ## Architecture
 //!

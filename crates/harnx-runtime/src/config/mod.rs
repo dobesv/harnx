@@ -41,6 +41,10 @@ pub const LOCAL_CLUSTER_KEY: &str = "__local__";
 pub const HARNX_NATS_URL_ENV: &str = "HARNX_NATS_URL";
 /// Worker handoff variable containing shared local NATS authentication token.
 pub const HARNX_NATS_TOKEN_ENV: &str = "HARNX_NATS_TOKEN";
+/// Overrides discovery of the `harnx-worker` binary a front-end spawns for the
+/// shared local cluster. Useful when the worker is not installed next to the
+/// front-end, and for tests that build both into a scratch directory.
+pub const HARNX_WORKER_BIN_ENV: &str = "HARNX_WORKER_BIN";
 pub(crate) use self::persistence_split::collect_tool_calls;
 pub use self::session_dump::render_session_dump;
 pub(crate) use self::session_log_split::{

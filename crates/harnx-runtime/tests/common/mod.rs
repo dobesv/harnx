@@ -99,8 +99,8 @@ async fn try_spawn_nats_once(
 }
 
 #[allow(dead_code)]
-pub fn harnx_binary() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("HARNX_BIN") {
+pub fn harnx_worker_binary() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("HARNX_WORKER_BIN") {
         let path = PathBuf::from(path);
         if path.is_file() {
             return Some(path);
@@ -112,7 +112,11 @@ pub fn harnx_binary() -> Option<PathBuf> {
     if path.file_name().is_some_and(|name| name == "deps") {
         path.pop();
     }
-    path.push(if cfg!(windows) { "harnx.exe" } else { "harnx" });
+    path.push(if cfg!(windows) {
+        "harnx-worker.exe"
+    } else {
+        "harnx-worker"
+    });
     path.is_file().then_some(path)
 }
 

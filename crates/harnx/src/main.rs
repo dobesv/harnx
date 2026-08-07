@@ -17,10 +17,8 @@ pub use harnx_core::safety as mcp_safety;
 pub use harnx_runtime::{client, commands, config, tool};
 pub use harnx_tui as tui;
 
-use crate::cli::{
-    Cli, Commands, DeleteSessionArgs, InfoSubcommands, SessionSubcommands, WorkerArgs,
-};
-use crate::client::{list_models, retry::call_with_retry_and_fallback, ModelType};
+use crate::cli::{Cli, Commands, DeleteSessionArgs, InfoSubcommands, SessionSubcommands};
+use crate::client::{list_models, ModelType};
 use crate::config::{
     list_agents, list_assistant_agents, load_env_file, macro_execute, render_agent_dump,
     render_session_dump, Config, GlobalConfig, Input, WorkingMode,
@@ -146,7 +144,6 @@ async fn run_command(command: &Commands) -> Result<()> {
                 run_session_delete_command(delete_args).await
             }
         },
-        Commands::Worker(worker_args) => run_worker_command(worker_args).await,
     }
 }
 
@@ -175,29 +172,6 @@ async fn run_session_delete_command(delete_args: &DeleteSessionArgs) -> Result<(
     }
 
     Ok(())
-}
-
-async fn run_worker_command(worker_args: &WorkerArgs) -> Result<()> {
-    let config = Arc::new(RwLock::new(Config::init(WorkingMode::Cmd, true).await?));
-    config.write().agent_variables = collect_agent_variables(&worker_args.agent_variable)?;
-    if worker_args.diagnose {
-        print!(
-            "{}",
-            harnx_runtime::nats_worker::diagnose_tool_servers(&config).await?
-        );
-        return Ok(());
-    }
-    let worker_id = worker_args
-        .worker_id
-        .clone()
-        .unwrap_or_else(harnx_runtime::nats_worker::new_remote_session_id);
-    let daemon =
-        harnx_runtime::nats_worker::WorkerDaemonConfig::new(worker_args.cluster.clone(), worker_id);
-    let call_fn: harnx_runtime::agent_loop::AgentCallFn =
-        std::sync::Arc::new(|input, config, abort| {
-            Box::pin(call_with_retry_and_fallback(input, config, abort))
-        });
-    harnx_runtime::nats_worker::run_worker_daemon(config, daemon, Some(call_fn)).await
 }
 
 fn legacy_info_flag(cli: &Cli) -> bool {

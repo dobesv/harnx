@@ -54,14 +54,20 @@ tls_key: "/etc/harnx/client-key.pem"
 
 ## Running Workers
 
-A worker joins a cluster and waits for session assignments.
+A worker is its own binary, `harnx-worker`. It joins a cluster and waits for
+session assignments.
 
 ```bash
-harnx worker --cluster local --worker-id worker-1
+harnx-worker --cluster local --worker-id worker-1
 ```
 
 - `--cluster`: The key from `nats_servers/`.
 - `--worker-id`: (Optional but recommended) A stable identity for the worker.
+
+For the default local cluster you don't run this yourself: `harnx` and
+`harnx-serve` spawn `harnx-worker` themselves. They look for it at
+`HARNX_WORKER_BIN` first, then next to the running front-end, then on `PATH` —
+so normally the worker just has to be installed alongside the front-end.
 
 You can run multiple workers for redundancy. If the active worker for a session dies, another worker will acquire the lease and resume execution.
 

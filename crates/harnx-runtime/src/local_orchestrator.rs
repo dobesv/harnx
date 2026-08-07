@@ -3,7 +3,9 @@
 //! One front-end owns the worker through `worker.lock`; other front-ends join
 //! the same broker and wait for that worker's readiness heartbeat.
 
-use crate::config::{HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV, LOCAL_CLUSTER_KEY};
+use crate::config::{
+    HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV, HARNX_WORKER_BIN_ENV, LOCAL_CLUSTER_KEY,
+};
 use crate::nats_local_server::{ensure_shared_server, SharedNatsServer};
 use crate::nats_worker::worker_ready_subject;
 use anyhow::{bail, Context, Result};
@@ -32,9 +34,59 @@ const MAX_WORKER_CRASHES: u32 = 3;
 /// Bytes of worker output shown when startup gives up.
 const WORKER_OUTPUT_TAIL_BYTES: u64 = 4096;
 
+/// Name of the worker executable front-ends spawn.
+const WORKER_BINARY: &str = if cfg!(windows) {
+    "harnx-worker.exe"
+} else {
+    "harnx-worker"
+};
+
 /// Path used to elect one local worker owner per user/broker.
 pub fn local_worker_lock_file() -> PathBuf {
     nats_runtime_dir().join("worker.lock")
+}
+
+/// Locate the `harnx-worker` binary a front-end should spawn.
+///
+/// `HARNX_WORKER_BIN` wins, then a sibling of the running front-end, then
+/// `PATH`. The sibling case is what makes an ordinary install work: front-end
+/// and worker land in the same `bin` directory, so neither has to be on `PATH`.
+pub fn resolve_worker_binary() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os(HARNX_WORKER_BIN_ENV) {
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            bail!(
+                "{HARNX_WORKER_BIN_ENV} points at {}, which is not a file",
+                path.display()
+            );
+        }
+        return Ok(path);
+    }
+
+    let current = std::env::current_exe().context("resolve current frontend executable")?;
+    let directory = current
+        .parent()
+        .context("current frontend executable has no parent directory")?;
+    // Integration tests run from `target/debug/deps`; the worker sits one level up.
+    let directory = if directory.file_name().is_some_and(|name| name == "deps") {
+        directory
+            .parent()
+            .context("test executable deps directory has no parent")?
+    } else {
+        directory
+    };
+    let sibling = directory.join(WORKER_BINARY);
+    if sibling.is_file() {
+        return Ok(sibling);
+    }
+
+    which::which(WORKER_BINARY).with_context(|| {
+        format!(
+            "worker binary '{WORKER_BINARY}' not found next to {} or on PATH; \
+             install it or set {HARNX_WORKER_BIN_ENV}",
+            current.display()
+        )
+    })
 }
 
 /// Keeps the shared broker alive and owns a worker subprocess when this
@@ -68,36 +120,15 @@ pub async fn ensure_local_worker(
 }
 
 impl LocalWorkerSupervisor {
-    /// Ensure the shared broker and local worker using the `harnx` executable.
-    /// Unified CLI callers use their current executable; standalone frontends
-    /// such as `harnx-serve` resolve `HARNX_BIN` or a sibling
-    /// `harnx` binary because they do not expose the `worker` subcommand.
+    /// Ensure the shared broker and local worker using the `harnx-worker`
+    /// executable found next to the running front-end.
     pub async fn start(abort_signal: AbortSignal) -> Result<Self> {
-        let current = std::env::current_exe().context("resolve current frontend executable")?;
-        let is_harnx = current
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name == "harnx");
-        let binary = if is_harnx {
-            current
-        } else if let Some(path) = std::env::var_os("HARNX_BIN") {
-            PathBuf::from(path)
-        } else {
-            let sibling = current.with_file_name(if cfg!(windows) { "harnx.exe" } else { "harnx" });
-            if !sibling.is_file() {
-                bail!(
-                    "frontend {} requires HARNX_BIN or sibling harnx binary to start local worker",
-                    current.display()
-                );
-            }
-            sibling
-        };
-        Self::start_with_worker_binary(binary, abort_signal).await
+        Self::start_with_worker_binary(resolve_worker_binary()?, abort_signal).await
     }
 
-    /// Ensure the shared broker and local worker using an explicit `harnx`
-    /// binary. Integration tests and front-end-specific binaries may use this
-    /// when their current executable does not expose the `worker` subcommand.
+    /// Ensure the shared broker and local worker using an explicit
+    /// `harnx-worker` binary. Integration tests use this when the worker they
+    /// want is not the one discovery would pick.
     pub async fn start_with_worker_binary(
         binary: impl AsRef<Path>,
         abort_signal: AbortSignal,
@@ -263,7 +294,6 @@ impl LocalWorkerSupervisor {
         }
         let mut command = Command::new(&self.worker_binary);
         command
-            .arg("worker")
             .arg("--cluster")
             .arg(LOCAL_CLUSTER_KEY)
             .arg("--worker-id")
@@ -432,3 +462,31 @@ fn configure_worker_process(command: &mut Command) {
 
 #[cfg(not(unix))]
 fn configure_worker_process(_command: &mut Command) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `HARNX_WORKER_BIN` wins over sibling/PATH discovery. Nextest gives each
+    /// test its own process, so setting the variable here is contained.
+    #[test]
+    fn worker_bin_override_wins() {
+        harnx_core::require_nextest();
+        let file = tempfile::NamedTempFile::new().expect("create fake worker binary");
+        unsafe { std::env::set_var(HARNX_WORKER_BIN_ENV, file.path()) };
+        assert_eq!(resolve_worker_binary().unwrap(), file.path());
+    }
+
+    /// A stale override must fail loudly instead of silently falling back to a
+    /// different worker than the operator asked for.
+    #[test]
+    fn worker_bin_override_rejects_missing_file() {
+        harnx_core::require_nextest();
+        unsafe { std::env::set_var(HARNX_WORKER_BIN_ENV, "/nonexistent/harnx-worker") };
+        let error = resolve_worker_binary().expect_err("missing override must fail");
+        assert!(
+            error.to_string().contains("/nonexistent/harnx-worker"),
+            "unexpected error: {error:#}"
+        );
+    }
+}

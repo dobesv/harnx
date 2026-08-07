@@ -16,6 +16,7 @@ what you need:
 |-------------------------|---------------------------------------------------------------------------------|--------------------------------------------------|
 | `harnx`                 | Terminal interface, TUI or non-interactive                                      | [Command-Line Guide](docs/command-line-guide.md) |
 | `harnx-serve`           | HTTP-only server, no TUI deps                                                   | [README](crates/harnx-serve/README.md)           |
+| `harnx-worker`          | NATS worker daemon that executes agent turns                                    | [README](crates/harnx-worker/README.md)          |
 | `harnx-pkg`             | Package manager for harnx agent configurations                                  | [Package System](docs/packages.md)               |
 | `harnx-bash-tools`      | Native toolset server exposing bash/subprocess execution with safety guards     | [Bash Toolset Server](docs/bash-mcp-server.md)   |
 | `harnx-fs-tools`        | Toolset server exposing filesystem operations with safety guards                 | [README](crates/harnx-fs-tools/README.md)       |
@@ -28,8 +29,11 @@ what you need:
 | `harnx-k8s-creds`       | Persistent hook that injects scoped Kubernetes credentials into sandboxed tools | [README](crates/harnx-k8s-creds/README.md)       |
 | `harnx-proxy-auth`      | TLS-intercepting auth proxy that injects credentials and runs hooks             | [README](crates/harnx-proxy-auth/README.md)      |
 
-Install whichever you need. Most users want just `harnx`; headless server
-deployments can skip the TUI deps by picking `harnx-serve` directly. MCP server
+Install whichever you need. Most users want `harnx` plus `harnx-worker`:
+`harnx` runs agent turns by handing them to a worker over NATS, and it spawns
+`harnx-worker` to do that. It looks for the worker at `HARNX_WORKER_BIN` first,
+then next to itself, then on `PATH`. Headless server deployments can skip the
+TUI deps by picking `harnx-serve` — it needs `harnx-worker` too. MCP server
 binaries (`harnx-mcp-*`) are needed only when configured as external servers.
 
 ### Install using asdf
