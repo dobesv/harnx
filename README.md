@@ -31,10 +31,10 @@ what you need:
 
 Install whichever you need. Most users want `harnx` plus `harnx-worker`:
 `harnx` runs agent turns by handing them to a worker over NATS, and it spawns
-`harnx-worker` from its own directory (or `PATH`, or `HARNX_WORKER_BIN`) to do
-that. Headless server deployments can skip the TUI deps by picking
-`harnx-serve` — it needs `harnx-worker` too. MCP server binaries
-(`harnx-mcp-*`) are needed only when configured as external servers.
+`harnx-worker` to do that. It looks for the worker at `HARNX_WORKER_BIN` first,
+then next to itself, then on `PATH`. Headless server deployments can skip the
+TUI deps by picking `harnx-serve` — it needs `harnx-worker` too. MCP server
+binaries (`harnx-mcp-*`) are needed only when configured as external servers.
 
 ### Install using asdf
 
