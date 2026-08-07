@@ -100,7 +100,7 @@ async fn run_http(args: Args) -> anyhow::Result<()> {
     let Args { host, port, .. } = args;
     let ct = CancellationToken::new();
     let config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
+        .with_legacy_session_mode(false)
         .with_json_response(true)
         .with_cancellation_token(ct.child_token())
         // Empty allowlist = accept any Host header. Required so external

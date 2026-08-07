@@ -2,9 +2,9 @@ use chrono::{Datelike, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 use jiff::{civil, Span, Timestamp};
 use rmcp::model::{
-    Annotations, CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Implementation,
-    ListToolsResult, Meta, PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool,
-    ToolAnnotations,
+    Annotations, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    Implementation, ListToolsResult, MetaObject, PaginatedRequestParams, Role, ServerCapabilities,
+    ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 
@@ -291,7 +291,7 @@ impl ServerHandler for TimeServer {
                 ),
             )
             .annotate(read_only.clone())
-            .with_meta(Meta(json!({
+            .with_meta(MetaObject(json!({
                 "call_template": "🕐 time{% if args.timezone %} ({{ args.timezone }}){% endif %}",
                 "result_template": "{{ result.content[0].text | default('') }}"
             }).as_object().unwrap().clone())),
@@ -354,7 +354,7 @@ impl ServerHandler for TimeServer {
                 ),
             )
             .annotate(read_only.clone())
-            .with_meta(Meta(json!({
+            .with_meta(MetaObject(json!({
                 "call_template": "🕐 convert{% if args.isoTimestamp %} {{ args.isoTimestamp }}{% endif %}{% if args.unixTimestamp %} unix={{ args.unixTimestamp }}{% endif %}{% if args.epochMillis %} ms={{ args.epochMillis }}{% endif %}{% if args.sourceTimezone %} from={{ args.sourceTimezone }}{% endif %}{% if args.offsetDays %} +{{ args.offsetDays }}d{% endif %}{% if args.offsetHours %} +{{ args.offsetHours }}h{% endif %}{% if args.offsetMinutes %} +{{ args.offsetMinutes }}m{% endif %}{% if args.offsetSeconds %} +{{ args.offsetSeconds }}s{% endif %}{% if args.timezone %} → {{ args.timezone }}{% endif %}",
                 "result_template": "{{ result.content[0].text | default('') }}"
             }).as_object().unwrap().clone())),
@@ -377,7 +377,7 @@ impl ServerHandler for TimeServer {
                     .idempotent(false)
                     .open_world(false),
             )
-            .with_meta(Meta(json!({
+            .with_meta(MetaObject(json!({
                 "call_template": "⏳ wait {{ args.seconds }}s",
                 "result_template": "{{ result.content[0].text | default('') }}"
             }).as_object().unwrap().clone())),
@@ -409,20 +409,34 @@ impl ServerHandler for TimeServer {
                     .idempotent(false)
                     .open_world(false),
             )
-            .with_meta(Meta(json!({
+            .with_meta(MetaObject(json!({
                 "call_template": "⏳ wait until {{ args.time }}{% if args.timezone %} ({{ args.timezone }}){% endif %}",
                 "result_template": "{{ result.content[0].text | default('') }}"
             }).as_object().unwrap().clone())),
         ];
 
-        Ok(ListToolsResult {
-            meta: None,
-            tools,
-            next_cursor: None,
-        })
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        self.dispatch_call_tool(request, _context)
+            .await
+            .map(Into::into)
+    }
+}
+
+impl TimeServer {
+    /// The tool dispatch, which always finishes in a single step.
+    ///
+    /// `call_tool` must return `CallToolResponse`, whose other variants cover
+    /// elicitation and long-running tasks that this server does not use.
+    /// Dispatching separately keeps every arm returning a plain
+    /// `CallToolResult`.
+    async fn dispatch_call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,

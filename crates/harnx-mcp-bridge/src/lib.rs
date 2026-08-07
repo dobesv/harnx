@@ -659,7 +659,7 @@ mod tests {
 
     #[test]
     fn maps_child_tool_meta_into_tool_spec() {
-        let meta = rmcp::model::Meta(
+        let meta = rmcp::model::MetaObject(
             serde_json::json!({ "call_template": "Running {{name}}" })
                 .as_object()
                 .expect("meta object")

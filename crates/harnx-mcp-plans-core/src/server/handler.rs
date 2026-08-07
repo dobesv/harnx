@@ -29,61 +29,75 @@ impl<S: PlanStore + 'static> ServerHandler for PlansServer<S> {
         let mut tools = vec![
                 Tool::new("list_plans", "List all plans with metadata and task/note counts.", Map::new())
                     .with_input_schema::<ListPlansParams>()
-                    .with_meta(Meta(json!({"call_template": "list plans", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(MetaObject(json!({"call_template": "list plans", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("add_plan", "Create a new plan with optional metadata. Set body with content (or body for compatibility). Keep body content under 1000 words per call; use update_plan with replace_in_content for targeted edits.", Map::new())
                     .with_input_schema::<AddPlanParams>()
-                    .with_meta(Meta(json!({"call_template": "create plan {{ args.name }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}){% endif %}{% if args.content %}\n{{ args.content | truncate(80) }}{% elif args.body %}\n{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(MetaObject(json!({"call_template": "create plan {{ args.name }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}){% endif %}{% if args.content %}\n{{ args.content | truncate(80) }}{% elif args.body %}\n{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("get_plan", "Read plan metadata, body, and list task/note IDs.", Map::new())
                     .with_input_schema::<GetPlanParams>()
-                    .with_meta(Meta(json!({"call_template": "read plan {{ args.name }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(MetaObject(json!({"call_template": "read plan {{ args.name }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("update_plan", "Update plan body and metadata. Creates plan if it doesn't exist. Use content or replace_content to rewrite body, append_content to extend it, or replace_in_content for surgical edits. Provide at most one body-edit parameter. Optionally batch-create tasks. Keep each write under 1000 words.", Map::new())
                     .with_input_schema::<UpdatePlanParams>()
-                    .with_meta(Meta(json!({"call_template": "update plan {{ args.name }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}){% endif %}{% if args.tasks %} [{{ args.tasks | length }} tasks]{% endif %}{% if args.content %}\n{{ args.content | truncate(80) }}{% elif args.replace_content %}\n{{ args.replace_content | truncate(80) }}{% endif %}{% if args.append_content %}\n+{{ args.append_content | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(MetaObject(json!({"call_template": "update plan {{ args.name }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}){% endif %}{% if args.tasks %} [{{ args.tasks | length }} tasks]{% endif %}{% if args.content %}\n{{ args.content | truncate(80) }}{% elif args.replace_content %}\n{{ args.replace_content | truncate(80) }}{% endif %}{% if args.append_content %}\n+{{ args.append_content | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("delete_plan", "Delete an entire plan and all its tasks and notes.", Map::new())
                     .with_input_schema::<DeletePlanParams>()
-                    .with_meta(Meta(json!({"call_template": "delete plan {{ args.name }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(MetaObject(json!({"call_template": "delete plan {{ args.name }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("list_tasks", "List tasks in a plan with optional filters.", Map::new())
                     .with_input_schema::<ListTasksParams>()
-                    .with_meta(Meta(json!({"call_template": "list tasks {{ args.plan }}{% if args.filter and args.filter != 'open' %} [{{ args.filter }}]{% endif %}{% if args.tag %} #{{ args.tag }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(MetaObject(json!({"call_template": "list tasks {{ args.plan }}{% if args.filter and args.filter != 'open' %} [{{ args.filter }}]{% endif %}{% if args.tag %} #{{ args.tag }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("add_task", "Create a task in a plan. Keep body under 1000 words; use update_task with replace_in_body for targeted edits.", Map::new())
                     .with_input_schema::<AddTaskParams>()
-                    .with_meta(Meta(json!({"call_template": "create task {{ args.plan }}/{{ args.title }}{% if args.status %} [{{ args.status }}]{% endif %}{% if args.assignee %} @{{ args.assignee }}{% endif %}{% if args.executor %} ▶{{ args.executor }}{% endif %}{% if args.tags %} #{{ args.tags | join(' #') }}{% endif %}{% if args.body %}\n{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(MetaObject(json!({"call_template": "create task {{ args.plan }}/{{ args.title }}{% if args.status %} [{{ args.status }}]{% endif %}{% if args.assignee %} @{{ args.assignee }}{% endif %}{% if args.executor %} ▶{{ args.executor }}{% endif %}{% if args.tags %} #{{ args.tags | join(' #') }}{% endif %}{% if args.body %}\n{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("get_task", "Read a task by ID within a plan.", Map::new())
                     .with_input_schema::<GetTaskParams>()
-                    .with_meta(Meta(json!({"call_template": "read task {{ args.plan }}/{{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(MetaObject(json!({"call_template": "read task {{ args.plan }}/{{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("update_task", "Update a task within its plan. Use replace_body to rewrite body, append_body to extend it, or replace_in_body for surgical edits. Keep each write under 1000 words.", Map::new())
                     .with_input_schema::<UpdateTaskParams>()
-                    .with_meta(Meta(json!({"call_template": "update task {{ args.plan }}/{{ args.id }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.status %} [{{ args.status }}]{% endif %}{% if args.assignee %} @{{ args.assignee }}{% endif %}{% if args.executor %} ▶{{ args.executor }}{% endif %}{% if args.tags %} #{{ args.tags | join(' #') }}{% endif %}{% if args.replace_body %}\n{{ args.replace_body | truncate(80) }}{% endif %}{% if args.append_body %}\n+{{ args.append_body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(MetaObject(json!({"call_template": "update task {{ args.plan }}/{{ args.id }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.status %} [{{ args.status }}]{% endif %}{% if args.assignee %} @{{ args.assignee }}{% endif %}{% if args.executor %} ▶{{ args.executor }}{% endif %}{% if args.tags %} #{{ args.tags | join(' #') }}{% endif %}{% if args.replace_body %}\n{{ args.replace_body | truncate(80) }}{% endif %}{% if args.append_body %}\n+{{ args.append_body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("delete_task", "Delete a task by ID.", Map::new())
                     .with_input_schema::<DeleteTaskParams>()
-                    .with_meta(Meta(json!({"call_template": "delete task {{ args.plan }}/{{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(MetaObject(json!({"call_template": "delete task {{ args.plan }}/{{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("list_notes", "List notes for a plan.", Map::new())
                     .with_input_schema::<ListNotesParams>()
-                    .with_meta(Meta(json!({"call_template": "list notes {{ args.plan }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(MetaObject(json!({"call_template": "list notes {{ args.plan }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("add_note", "Add a note to a plan. Keep body under 1000 words; use update_note with replace_in_body for targeted edits.", Map::new())
                     .with_input_schema::<AddNoteParams>()
-                    .with_meta(Meta(json!({"call_template": "add note {{ args.plan }}{% if args.summary %} — {{ args.summary | truncate(60) }}{% endif %}{% if args.author %} by {{ args.author }}{% endif %}{% if args.body %}\n{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(MetaObject(json!({"call_template": "add note {{ args.plan }}{% if args.summary %} — {{ args.summary | truncate(60) }}{% endif %}{% if args.author %} by {{ args.author }}{% endif %}{% if args.body %}\n{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("get_note", "Read a note from a plan.", Map::new())
                     .with_input_schema::<GetNoteParams>()
-                    .with_meta(Meta(json!({"call_template": "read note {{ args.plan }}/{{ args.note_id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(MetaObject(json!({"call_template": "read note {{ args.plan }}/{{ args.note_id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("update_note", "Update a note within a plan. Use replace_body, append_body, or replace_in_body for body edits. Keep each write under 1000 words.", Map::new())
                     .with_input_schema::<UpdateNoteParams>()
-                    .with_meta(Meta(json!({"call_template": "update note {{ args.plan }}/{{ args.note_id }}{% if args.summary %} — {{ args.summary | truncate(60) }}{% endif %}{% if args.replace_body %}\n{{ args.replace_body | truncate(80) }}{% endif %}{% if args.append_body %}\n+{{ args.append_body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(MetaObject(json!({"call_template": "update note {{ args.plan }}/{{ args.note_id }}{% if args.summary %} — {{ args.summary | truncate(60) }}{% endif %}{% if args.replace_body %}\n{{ args.replace_body | truncate(80) }}{% endif %}{% if args.append_body %}\n+{{ args.append_body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("delete_note", "Delete a note from a plan.", Map::new())
                     .with_input_schema::<DeleteNoteParams>()
-                    .with_meta(Meta(json!({"call_template": "delete note {{ args.plan }}/{{ args.note_id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(MetaObject(json!({"call_template": "delete note {{ args.plan }}/{{ args.note_id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
             ];
         for tool in &mut tools {
             self.meta.target_policy.apply_to_tool_schema(tool);
         }
-        Ok(ListToolsResult {
-            meta: None,
-            tools,
-            next_cursor: None,
-        })
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        self.dispatch_call_tool(request, _context)
+            .await
+            .map(Into::into)
+    }
+}
+
+impl<S: PlanStore + 'static> PlansServer<S> {
+    /// The tool dispatch, which always finishes in a single step.
+    ///
+    /// `call_tool` must return `CallToolResponse`, whose other variants cover
+    /// elicitation and long-running tasks that this server does not use.
+    /// Dispatching separately keeps every arm returning a plain
+    /// `CallToolResult`.
+    async fn dispatch_call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,

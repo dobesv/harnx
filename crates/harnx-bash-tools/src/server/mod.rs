@@ -15,8 +15,9 @@ use process_wrap::tokio::JobObject;
 use process_wrap::tokio::ProcessGroup;
 use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Implementation,
-    ListToolsResult, Meta, PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    Implementation, ListToolsResult, MetaObject, PaginatedRequestParams, Role, ServerCapabilities,
+    ServerInfo, Tool,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};

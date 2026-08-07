@@ -1,8 +1,9 @@
 use parking_lot::RwLock;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ErrorData, InitializeRequestParams, ListPromptsResult,
-    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, InitializeRequestParams,
+    ListPromptsResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    ServerCapabilities, ServerInfo,
 };
 use rmcp::service::{RequestContext, RoleClient, RoleServer, RunningService};
 use rmcp::Peer;
@@ -75,10 +76,17 @@ impl ServerHandler for RemoteProxyServer {
             .await
             .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
         let peer = service.peer().clone();
-        let mut info = peer
-            .peer_info()
-            .map(|info| (*info).clone())
-            .unwrap_or_else(|| self.get_info());
+        // Forward what the remote negotiated, but answer under this proxy's own
+        // identity. `peer_info` reports the identity as optional because a
+        // discovery response need not carry one; it is dropped either way, so
+        // only the negotiated fields are copied across.
+        let mut info = self.get_info();
+        if let Some(peer_info) = peer.peer_info() {
+            info.protocol_version = peer_info.protocol_version.clone();
+            info.capabilities = peer_info.capabilities.clone();
+            info.instructions = peer_info.instructions.clone();
+            info.meta = peer_info.meta.clone();
+        }
         info.server_info =
             rmcp::model::Implementation::new("harnx-mcp-remote", env!("CARGO_PKG_VERSION"));
         *self.peer.write() = Some(peer);
@@ -99,9 +107,10 @@ impl ServerHandler for RemoteProxyServer {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let peer = self.peer()?;
-        peer.call_tool(request).await.map_err(proxy_error)
+    ) -> Result<CallToolResponse, ErrorData> {
+        self.dispatch_call_tool(request, _context)
+            .await
+            .map(Into::into)
     }
 
     async fn list_prompts(
@@ -120,5 +129,22 @@ impl ServerHandler for RemoteProxyServer {
     ) -> Result<ListResourcesResult, ErrorData> {
         let peer = self.peer()?;
         peer.list_resources(request).await.map_err(proxy_error)
+    }
+}
+
+impl RemoteProxyServer {
+    /// The tool dispatch, which always finishes in a single step.
+    ///
+    /// `call_tool` must return `CallToolResponse`, whose other variants cover
+    /// elicitation and long-running tasks that this server does not use.
+    /// Dispatching separately keeps every arm returning a plain
+    /// `CallToolResult`.
+    async fn dispatch_call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let peer = self.peer()?;
+        peer.call_tool(request).await.map_err(proxy_error)
     }
 }

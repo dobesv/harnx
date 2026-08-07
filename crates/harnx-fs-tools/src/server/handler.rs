@@ -61,14 +61,28 @@ impl ServerHandler for FsServer {
                     .with_meta(make_tool_meta("⏪ rollback {{ args.commit_id | truncate(8, end='') }}{% if args.repo_path %} @ {{ args.repo_path }}{% endif %}")),
             ];
 
-        Ok(ListToolsResult {
-            meta: None,
-            tools,
-            next_cursor: None,
-        })
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        self.dispatch_call_tool(request, _context)
+            .await
+            .map(Into::into)
+    }
+}
+
+impl FsServer {
+    /// The tool dispatch, which always finishes in a single step.
+    ///
+    /// `call_tool` must return `CallToolResponse`, whose other variants cover
+    /// elicitation and long-running tasks that this server does not use.
+    /// Dispatching separately keeps every arm returning a plain
+    /// `CallToolResult`.
+    async fn dispatch_call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,

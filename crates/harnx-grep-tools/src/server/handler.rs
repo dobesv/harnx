@@ -1,7 +1,7 @@
 use rmcp::model::{
-    CallToolRequestMethod, CallToolRequestParams, CallToolResult, ContentBlock, ErrorData,
-    Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
-    ToolAnnotations,
+    CallToolRequestMethod, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+    ErrorData, Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
+    ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
@@ -79,14 +79,28 @@ impl ServerHandler for GrepServer {
                 .open_world(true),
         );
 
-        Ok(ListToolsResult {
-            meta: None,
-            tools: vec![grep_query],
-            next_cursor: None,
-        })
+        Ok(ListToolsResult::with_all_items(vec![grep_query]))
     }
 
     async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        self.dispatch_call_tool(request, _context)
+            .await
+            .map(Into::into)
+    }
+}
+
+impl GrepServer {
+    /// The tool dispatch, which always finishes in a single step.
+    ///
+    /// `call_tool` must return `CallToolResponse`, whose other variants cover
+    /// elicitation and long-running tasks that this server does not use.
+    /// Dispatching separately keeps every arm returning a plain
+    /// `CallToolResult`.
+    async fn dispatch_call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
