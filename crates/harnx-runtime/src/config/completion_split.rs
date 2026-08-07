@@ -1,6 +1,38 @@
 //! Command-line tab completion extracted from config/mod.rs for code health.
 use super::*;
 
+/// Commands whose second word is a fixed list.
+///
+/// Kept as data rather than match arms so `command_complete` only carries the
+/// cases that have to compute something.
+const FIXED_SUBCOMMANDS: &[(&str, &[&str])] = &[
+    (
+        ".delete",
+        &["agent", "session", "rag", "macro", "agent-data", "message"],
+    ),
+    (".drop", &["tool"]),
+    (
+        ".edit",
+        &["config", "agent", "session", "message", "rag-docs"],
+    ),
+    (
+        ".info",
+        &[
+            "session", "model", "agent", "rag", "tools", "theme", "mcp", "env",
+        ],
+    ),
+    (".mcp", &["list", "connect", "disconnect", "tools"]),
+    (".title", &["generate", "now"]),
+    (".use", &["tool"]),
+];
+
+fn fixed_subcommands(cmd: &str) -> Option<&'static [&'static str]> {
+    FIXED_SUBCOMMANDS
+        .iter()
+        .find(|(name, _)| *name == cmd)
+        .map(|(_, subcommands)| *subcommands)
+}
+
 impl Config {
     pub fn command_complete(
         &self,
@@ -20,16 +52,6 @@ impl Config {
                 ".rag" => map_completion_values(Self::list_rags()),
                 ".agent" => map_completion_values(precomputed_agents),
                 ".macro" => map_completion_values(Self::list_macros()),
-                ".info" => map_completion_values(vec![
-                    "session", "model", "agent", "rag", "tools", "theme", "mcp", "env",
-                ]),
-                ".mcp" => map_completion_values(vec!["list", "connect", "disconnect", "tools"]),
-                ".title" => map_completion_values(vec!["generate", "now"]),
-                ".use" => map_completion_values(vec!["tool"]),
-                ".drop" => map_completion_values(vec!["tool"]),
-                ".edit" => {
-                    map_completion_values(vec!["config", "agent", "session", "message", "rag-docs"])
-                }
                 ".starter" => match &self.agent {
                     Some(agent) => agent
                         .conversation_staters()
@@ -63,15 +85,9 @@ impl Config {
                         .map(|v| (format!("{v} "), None))
                         .collect()
                 }
-                ".delete" => map_completion_values(vec![
-                    "agent",
-                    "session",
-                    "rag",
-                    "macro",
-                    "agent-data",
-                    "message",
-                ]),
-                _ => vec![],
+                _ => fixed_subcommands(cmd)
+                    .map(|subcommands| map_completion_values(subcommands.to_vec()))
+                    .unwrap_or_default(),
             };
         } else if cmd == ".set" && args.len() == 2 {
             let candidates = match args[0] {

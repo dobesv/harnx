@@ -16,6 +16,8 @@ pub mod terminal;
 pub mod test_utils;
 pub mod types;
 
+mod completion;
+
 #[cfg(test)]
 mod tests;
 
