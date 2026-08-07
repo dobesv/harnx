@@ -55,8 +55,8 @@ fn skip_without_binaries() -> Option<PathBuf> {
         eprintln!("skipping local worker supervisor test: nats-server binary not found");
         return None;
     }
-    let Some(binary) = common::harnx_binary() else {
-        eprintln!("skipping local worker supervisor test: harnx binary not found");
+    let Some(binary) = common::harnx_worker_binary() else {
+        eprintln!("skipping local worker supervisor test: harnx-worker binary not found");
         return None;
     };
     Some(binary)

@@ -1,6 +1,6 @@
 use super::*;
 
-fn live_harnx_binary() -> Option<std::path::PathBuf> {
+fn live_worker_binary() -> Option<std::path::PathBuf> {
     if std::process::Command::new(
         std::env::var_os("NATS_SERVER_BIN").unwrap_or_else(|| "nats-server".into()),
     )
@@ -11,7 +11,7 @@ fn live_harnx_binary() -> Option<std::path::PathBuf> {
         eprintln!("skipping serve NATS smoke: nats-server not available");
         return None;
     }
-    if let Some(path) = std::env::var_os("HARNX_BIN").map(std::path::PathBuf::from) {
+    if let Some(path) = std::env::var_os("HARNX_WORKER_BIN").map(std::path::PathBuf::from) {
         if path.is_file() {
             return Some(path);
         }
@@ -20,7 +20,11 @@ fn live_harnx_binary() -> Option<std::path::PathBuf> {
     if directory.file_name().is_some_and(|name| name == "deps") {
         directory.pop();
     }
-    let binary = directory.join(if cfg!(windows) { "harnx.exe" } else { "harnx" });
+    let binary = directory.join(if cfg!(windows) {
+        "harnx-worker.exe"
+    } else {
+        "harnx-worker"
+    });
     binary.is_file().then_some(binary)
 }
 
@@ -104,7 +108,7 @@ async fn start_serve_smoke_openai() -> ServeSmokeOpenAi {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serve_thin_client_replays_prompt_queued_during_active_run() {
     harnx_core::require_nextest();
-    let Some(binary) = live_harnx_binary() else {
+    let Some(binary) = live_worker_binary() else {
         return;
     };
     let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
@@ -210,7 +214,7 @@ async fn assert_cancel_reached_worker(config: &harnx_runtime::config::Config, se
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serve_local_nats_smoke_streams_sse_events_and_cancel_publishes_control() {
     harnx_core::require_nextest();
-    let Some(binary) = live_harnx_binary() else {
+    let Some(binary) = live_worker_binary() else {
         return;
     };
     let _guard = harnx_runtime::client::TestStateGuard::new(None).await;

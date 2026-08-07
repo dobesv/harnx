@@ -97,27 +97,6 @@ pub enum Commands {
     Info(InfoArgs),
     /// Session management commands
     Session(SessionArgs),
-    /// Run a worker daemon for a configured or shared-local NATS cluster
-    Worker(WorkerArgs),
-}
-
-#[derive(Args, Debug, PartialEq, Eq)]
-pub struct WorkerArgs {
-    /// Cluster key from nats_servers/<name>.yaml, or __local__ with
-    /// HARNX_NATS_URL and HARNX_NATS_TOKEN handoff
-    #[arg(long)]
-    pub cluster: String,
-    /// Stable worker identity for leases and the durable consumer name.
-    /// Defaults to a generated id if omitted.
-    #[arg(long)]
-    pub worker_id: Option<String>,
-    /// Set agent variable pairs (format: --agent-variable key value or -x key value); can be repeated
-    #[arg(short = 'x', long, value_names = ["KEY", "VALUE"], num_args = 2, action = clap::ArgAction::Append)]
-    pub agent_variable: Vec<String>,
-    /// Start this worker's tool servers, report which ones registered, and
-    /// exit without serving sessions.
-    #[arg(long)]
-    pub diagnose: bool,
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -201,7 +180,7 @@ impl Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, InfoSubcommands, SessionSubcommands, WorkerArgs};
+    use super::{Cli, Commands, InfoSubcommands, SessionSubcommands};
     use clap::Parser;
 
     #[test]
@@ -240,35 +219,14 @@ mod tests {
         }
     }
 
+    /// The worker moved to the `harnx-worker` binary. `harnx worker` is no
+    /// longer a subcommand, so it falls through to the trailing prompt text
+    /// like any other unrecognized words.
     #[test]
-    fn parses_worker_agent_variables() {
-        let cli = Cli::try_parse_from([
-            "harnx",
-            "worker",
-            "--cluster",
-            "prod",
-            "--agent-variable",
-            "cloud_env",
-            "true",
-            "--agent-variable",
-            "debug",
-            "false",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Commands::Worker(WorkerArgs {
-                cluster,
-                worker_id,
-                agent_variable,
-                diagnose,
-            })) => {
-                assert_eq!(cluster, "prod");
-                assert_eq!(worker_id, None);
-                assert_eq!(agent_variable, vec!["cloud_env", "true", "debug", "false"]);
-                assert!(!diagnose);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
+    fn worker_is_no_longer_a_subcommand() {
+        let cli = Cli::try_parse_from(["harnx", "worker", "--cluster", "prod"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.text, vec!["worker", "--cluster", "prod"]);
     }
 }
 

@@ -37,6 +37,7 @@ members = [
     "crates/harnx-toolset",
     "crates/harnx-toolset-server",
     "crates/harnx-tui",
+    "crates/harnx-worker",
     "crates/harnx-proxy-auth",
     "crates/ratatui-widget-scrolling",
     "xtask",

@@ -125,7 +125,7 @@ jobs:
       shell: bash
       run: |
         $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }} \
-          -p harnx -p harnx-serve \
+          -p harnx -p harnx-serve -p harnx-worker \
           -p harnx-bash-tools -p harnx-fs-tools -p harnx-grep-tools -p harnx-plans-tools -p harnx-mcp-plans-github -p harnx-mcp-time \
           -p harnx-aws-creds -p harnx-k8s-creds -p harnx-pkg -p harnx-proxy-auth \
           -p harnx-sandbox-run \
@@ -149,6 +149,7 @@ jobs:
         archive_specs=(
           "harnx:harnx"
           "harnx-serve:harnx-serve"
+          "harnx-worker:harnx-worker"
           "harnx-bash-tools:harnx-bash-tools"
           "harnx-fs-tools:harnx-fs-tools"
           "harnx-grep-tools:harnx-grep-tools"
@@ -321,6 +322,8 @@ jobs:
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-serve-$V-x86_64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-worker-$V-x86_64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-bash-tools-$V-x86_64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-fs-tools-$V-x86_64-unknown-linux-musl.tar.gz" || true
@@ -347,6 +350,8 @@ jobs:
             --pattern "harnx-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-serve-$V-aarch64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-worker-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-bash-tools-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
@@ -384,7 +389,7 @@ jobs:
         run: |
           missing=0
           for dir in linux-amd64 linux-arm64; do
-            for bin in harnx harnx-serve harnx-bash-tools harnx-fs-tools harnx-grep-tools harnx-plans-tools harnx-mcp-plans-github harnx-mcp-time harnx-aws-creds harnx-k8s-creds harnx-pkg harnx-proxy-auth harnx-sandbox-run harnx-sandbox-exec; do
+            for bin in harnx harnx-serve harnx-worker harnx-bash-tools harnx-fs-tools harnx-grep-tools harnx-plans-tools harnx-mcp-plans-github harnx-mcp-time harnx-aws-creds harnx-k8s-creds harnx-pkg harnx-proxy-auth harnx-sandbox-run harnx-sandbox-exec; do
               if [ ! -f "$dir/$bin" ]; then
                 echo "ERROR: missing $dir/$bin"
                 missing=1

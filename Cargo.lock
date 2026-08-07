@@ -4279,6 +4279,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-worker"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "clap",
+ "harnx-core",
+ "harnx-runtime",
+ "parking_lot",
+ "tokio",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
