@@ -141,8 +141,12 @@ mod symlink_alias_tests {
             allowlist.exec_paths()
         );
         // Checking still resolves symlinks, so a path under the grant matches
-        // even when the caller names it canonically.
-        assert!(allowlist.contains_exec(real.join("libc.so")));
+        // even when the caller names it canonically. The file has to exist:
+        // a path that does not cannot be resolved, and matching then falls back
+        // to comparing it literally.
+        let under_grant = real.join("libc.so");
+        std::fs::write(&under_grant, b"").expect("create file under the grant");
+        assert!(allowlist.contains_exec(&under_grant));
     }
 
     #[test]

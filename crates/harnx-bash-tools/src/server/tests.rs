@@ -1559,8 +1559,10 @@ mod home_filtering {
         let _home = EnvVar::set("HOME", home.path());
         let server = server_with_sandbox(vec![home.path().to_path_buf()], enabled_sandbox_config());
         let pairs = collect_arg_pairs(&server.build_sandbox_args(home.path()));
-        let home = home.path().canonicalize().expect("canonical home");
-        let home = home.to_string_lossy().into_owned();
+        // Grants are emitted as written, not resolved. On macOS a temp dir sits
+        // under /var, a symlink to /private/var, so canonicalising here would
+        // expect a path the allowlist deliberately no longer produces.
+        let home = home.path().to_string_lossy().into_owned();
 
         assert!(pairs.contains(&("--read".into(), home.clone())));
         assert!(!pairs.contains(&("--write".into(), home.clone())));
@@ -1576,7 +1578,7 @@ mod home_filtering {
         let _home = EnvVar::set("HOME", home.path());
         let server = server_with_sandbox(vec![project.clone()], enabled_sandbox_config());
         let pairs = collect_arg_pairs(&server.build_sandbox_args(&project));
-        let project = project.canonicalize().expect("canonical project");
+        // Emitted as written; see the note in home_rwx_is_downgraded_to_read_only.
         let project = project.to_string_lossy().into_owned();
 
         assert!(pairs.contains(&("--write".into(), project.clone())));
