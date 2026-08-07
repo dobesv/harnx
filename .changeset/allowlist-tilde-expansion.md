@@ -1,7 +1,7 @@
 ---
 harnx: patch
 ---
-Sandbox allowlist entries are now granted exactly as written, and symlinks are resolved only when checking a path against them.
+Sandbox allowlist entries now keep the symlinks they were written with. A relative entry is still made absolute against the working directory, but nothing beyond that is resolved; symlinks are followed only when checking a path against a grant.
 
 Grants were previously canonicalised at insertion, which had two consequences. It widened a grant to wherever a symlink pointed, so allowing a link could hand over its target. And it lost the path callers actually use: on merged-`/usr` systems `/lib64` collapsed into the `/usr/lib64` entry already present, so the sandbox never mounted `/lib64` and every dynamically linked binary failed to start, because loaders are named absolutely as `/lib64/ld-linux-x86-64.so.2`. That surfaced as `bash_exec` failing every command with `sandboxing failure: No such file or directory`.
 

@@ -114,11 +114,15 @@ fn expand_home(path: &Path, home: Option<&Path>) -> PathBuf {
     let Some(home) = home else {
         return path.to_path_buf();
     };
-    let raw = path.to_string_lossy();
-    match raw.strip_prefix('~') {
-        Some("") => home.to_path_buf(),
-        Some(rest) if rest.starts_with('/') => home.join(rest.trim_start_matches('/')),
-        _ => path.to_path_buf(),
+    // Matching on components rather than on a lossy string: a path whose bytes
+    // are not valid UTF-8 would come back with replacement characters, and
+    // joining that onto the home directory names a different file. Comparing
+    // components also leaves `~user` alone for free, since `~user` is one
+    // component and does not have `~` as a prefix.
+    match path.strip_prefix("~") {
+        Ok(rest) if rest.as_os_str().is_empty() => home.to_path_buf(),
+        Ok(rest) => home.join(rest),
+        Err(_) => path.to_path_buf(),
     }
 }
 
@@ -146,6 +150,29 @@ mod tests {
         assert_eq!(
             absolute(Path::new("sub/dir"), &cwd, Some(&home)),
             cwd.join("sub/dir")
+        );
+    }
+
+    /// A filename does not have to be valid UTF-8. Converting one to a string
+    /// substitutes replacement characters, which would grant a path that is not
+    /// the one asked for.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_bytes_under_the_home_directory_survive_expansion() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let home = PathBuf::from("/home/example");
+        let cwd = PathBuf::from("/mnt/projects/repo");
+        let written = PathBuf::from(OsStr::from_bytes(b"~/\xff\xfe-cache"));
+
+        let resolved = absolute(&written, &cwd, Some(&home));
+
+        // Byte-exact: expanding through a lossy string yields the U+FFFD
+        // encoding here instead of the original 0xff 0xfe.
+        assert_eq!(
+            resolved,
+            PathBuf::from(OsStr::from_bytes(b"/home/example/\xff\xfe-cache"))
         );
     }
 
