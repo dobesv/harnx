@@ -5,7 +5,7 @@
 fix(commands): decouple `Command.name` from usage hints to fix tab-completion
 
 Commands whose registered name embedded usage syntax (e.g. `.rewind <n>`,
-`.edit message <n>`, `.info mcp [server]`) tab-completed to the literal usage
+`.edit message <n>`, `.info env [name]`) tab-completed to the literal usage
 string instead of a real command/subcommand.
 
 - Add a dedicated `Command.usage: Option<&'static str>` field plus a

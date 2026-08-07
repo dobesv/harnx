@@ -17,7 +17,7 @@ plan_ref: "decouple-command-usage-1168"
 ---
 ## Problem
 
-`Command.name` in the `COMMANDS` table doubled as both the dispatch/completion key and the `.help` usage-hint display. Commands whose names embedded usage syntax (e.g. `.rewind <n>`, `.edit message <n>`, `.info mcp [server]`) tab-completed to the literal usage string instead of a real command.
+`Command.name` in the `COMMANDS` table doubled as both the dispatch/completion key and the `.help` usage-hint display. Commands whose names embedded usage syntax (e.g. `.rewind <n>`, `.edit message <n>`, `.info env [name]`) tab-completed to the literal usage string instead of a real command.
 
 ## Symptoms
 
@@ -65,7 +65,7 @@ impl Command {
 }
 ```
 
-Names are now bare dispatch keys (`.rewind`, `.edit message`, `.info mcp`). `dump_help` recombines:
+Names are now bare dispatch keys (`.rewind`, `.edit message`, `.info env`). `dump_help` recombines:
 
 ```rust
 fn dump_help(output: &mut (dyn Write + Send)) -> Result<()> {
@@ -102,7 +102,7 @@ This follows the earlier `.title` fix in PR #103 but solves the problem at the d
 ## Prevention Strategies
 
 **Test Cases:**
-- `command_completions_separate_names_from_usage_and_offer_subcommands` in `harnx-tui/src/tests.rs` asserts:
+- `command_completions_separate_names_from_usage_and_offer_subcommands` in `harnx-tui/src/tests/command_completion.rs` asserts:
   - Completions never contain `<n>`, `[server]`, `[name]`, `<n>-<m>`
   - Deduplication: `.edit message` and `.delete message` appear exactly once
   - Subcommand sets are exact (`.edit`, `.delete` arms)
