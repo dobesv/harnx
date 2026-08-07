@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { AssistantRuntimeProvider, useThreadRuntime } from '@assistant-ui/react';
+import { AssistantRuntimeProvider, useAui } from '@assistant-ui/react';
 import type { AttachmentAdapter } from '@assistant-ui/react';
 import { useAgUiRuntime } from '@assistant-ui/react-ag-ui';
 import { HttpAgent } from '@ag-ui/client';
@@ -20,7 +20,7 @@ export interface ChatProviderProps {
 const EMPTY_STATE = {};
 
 const RuntimeSessionSubscriber = ({ enabled }: { enabled: boolean }) => {
-  const threadRuntime = useThreadRuntime();
+  const aui = useAui();
   // The initial promptless subscribe/hydrate must fire exactly once per mount.
   // React StrictMode double-invokes mount effects in dev (and the e2e suite runs
   // against the dev server), so an unguarded startRun opens two concurrent runs
@@ -32,10 +32,10 @@ const RuntimeSessionSubscriber = ({ enabled }: { enabled: boolean }) => {
   useEffect(() => {
     if (!enabled || startedRef.current) return;
     startedRef.current = true;
-    threadRuntime.startRun({
-      parentId: threadRuntime.getState().messages.at(-1)?.id ?? null,
+    aui.thread.startRun({
+      parentId: aui.thread.getState().messages.at(-1)?.id ?? null,
     });
-  }, [enabled, threadRuntime]);
+  }, [enabled, aui]);
 
   return null;
 };

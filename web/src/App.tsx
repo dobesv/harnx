@@ -4,9 +4,8 @@ import {
   MessagePrimitive,
   ComposerPrimitive,
   AttachmentPrimitive,
-  useThread,
-  useComposerRuntime,
-  useMessage,
+  useAui,
+  useAuiState,
 } from '@assistant-ui/react';
 import { MarkdownTextPrimitive } from '@assistant-ui/react-markdown';
 import { makeLightAsyncSyntaxHighlighter } from '@assistant-ui/react-syntax-highlighter';
@@ -61,8 +60,19 @@ const MessageContent = () => (
 );
 
 const MyMessage = () => {
-  const role = useMessage((state) => state.role);
+  const role = useAuiState((s) => s.message.role);
+  // An assistant message with no parts still gets .aui-message padding, so it
+  // shows up as a blank gap in the transcript. The promptless subscribe that
+  // hydrates a session leaves one behind: assistant-ui creates the message
+  // when the run starts, and a run carrying only a transcript snapshot never
+  // puts content in it. Streaming replies are unaffected -- they render as
+  // soon as the first part arrives.
+  const isEmpty = useAuiState(
+    (s) => s.message.role === 'assistant' && s.message.content.length === 0,
+  );
   const [systemExpanded, setSystemExpanded] = useState(false);
+
+  if (isEmpty) return null;
 
   if (role === 'system') {
     return (
@@ -89,7 +99,7 @@ const MyMessage = () => {
 };
 
 const CancelButton = ({ agentName, sessionId }: { agentName: string, sessionId: string }) => {
-  const isRunning = useThread((s) => s.isRunning);
+  const isRunning = useAuiState((s) => s.thread.isRunning);
   if (!isRunning) return null;
   return (
     <button
@@ -119,8 +129,8 @@ const MyComposer = ({
   sessionId: string;
 }) => {
   const { setErrorText } = useContext(PendingContext);
-  const isRunning = useThread(s => s.isRunning);
-  const composerRuntime = useComposerRuntime();
+  const isRunning = useAuiState(s => s.thread.isRunning);
+  const composerRuntime = useAui().composer;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [queuedMessage, setQueuedMessage] = useState<QueuedMessage | null>(null);
 
@@ -229,7 +239,7 @@ const MyComposer = ({
 };
 
 const RunStateMonitor = ({ onRunFinish }: { onRunFinish: () => void }) => {
-  const isRunning = useThread(s => s.isRunning);
+  const isRunning = useAuiState(s => s.thread.isRunning);
   const wasRunning = useRef(isRunning);
   useEffect(() => {
     if (wasRunning.current && !isRunning) {
@@ -280,7 +290,7 @@ const UsageIndicator = ({ usage }: { usage: UsageData }) => {
 const StatusBar = () => {
   const { statusText } = useContext(PendingContext);
   const { usage } = useContext(UsageContext);
-  const isRunning = useThread(s => s.isRunning);
+  const isRunning = useAuiState(s => s.thread.isRunning);
 
   if (!isRunning && !usage && !statusText) return null;
 
@@ -346,7 +356,7 @@ const BatchInterruptUI = () => {
 };
 
 const MyThread = ({ agentName, sessionId, onRunFinish }: { agentName: string, sessionId: string, onRunFinish: () => void }) => {
-  const isEmpty = useThread(s => s.messages.length === 0);
+  const isEmpty = useAuiState(s => s.thread.messages.length === 0);
 
   return (
     <ThreadPrimitive.Root className={`aui-thread ${isEmpty ? 'aui-thread-empty' : ''}`}>
