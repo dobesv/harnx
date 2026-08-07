@@ -14,9 +14,9 @@ use harnx_toolset_server::schema::object_schema_with_desc;
 
 use fancy_regex::Regex;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Implementation,
-    ListToolsResult, Meta, PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool,
-    ToolAnnotations,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    Implementation, ListToolsResult, MetaObject, PaginatedRequestParams, Role, ServerCapabilities,
+    ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{RequestContext, RoleServer};
@@ -56,8 +56,8 @@ pub struct FsServer {
 /// audience-aware renderer (`extract_user_display_text`), which surfaces
 /// every user-audience and unaudienced content block. That includes the
 /// history diff that mutating tools append after the summary.
-fn make_tool_meta(call_template: &str) -> Meta {
-    Meta(
+fn make_tool_meta(call_template: &str) -> MetaObject {
+    MetaObject(
         json!({ "call_template": call_template })
             .as_object()
             .unwrap()

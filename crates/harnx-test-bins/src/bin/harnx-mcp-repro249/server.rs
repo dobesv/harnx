@@ -1,6 +1,6 @@
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Implementation,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
@@ -41,18 +41,32 @@ impl ServerHandler for Repro249Server {
             ("additionalProperties".to_string(), Value::Bool(false)),
         ]);
 
-        Ok(ListToolsResult {
-            meta: None,
-            tools: vec![Tool::new(
-                TOOL_NAME,
-                "Deterministic fake MCP tool for the repro_249 tmux test.",
-                input_schema,
-            )],
-            next_cursor: None,
-        })
+        Ok(ListToolsResult::with_all_items(vec![Tool::new(
+            TOOL_NAME,
+            "Deterministic fake MCP tool for the repro_249 tmux test.",
+            input_schema,
+        )]))
     }
 
     async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        self.dispatch_call_tool(request, _context)
+            .await
+            .map(Into::into)
+    }
+}
+
+impl Repro249Server {
+    /// The tool dispatch, which always finishes in a single step.
+    ///
+    /// `call_tool` must return `CallToolResponse`, whose other variants cover
+    /// elicitation and long-running tasks that this server does not use.
+    /// Dispatching separately keeps every arm returning a plain
+    /// `CallToolResult`.
+    async fn dispatch_call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,

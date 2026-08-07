@@ -18,16 +18,14 @@ impl ServerHandler for BashServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult {
-            meta: None,
-            tools: vec![
+        Ok(ListToolsResult::with_all_items(vec![
                 Tool::new(
                     "exec",
                     "Execute a command and return truncated combined stdout/stderr. When output is cropped, stdout/stderr temp log files are included for later retrieval. Prefer head_lines/tail_lines/max_output_bytes params over piping to head/tail in the command string. Supports shebang lines: if the command starts with #!, the script is written to a temp file and executed with the named interpreter (python3, node, ruby, etc.) — prefer this over python3 -c or node -e for multi-line scripts.",
                     Map::new(),
                 )
                 .with_input_schema::<ExecCommandParams>()
-                .with_meta(Meta(json!({
+                .with_meta(MetaObject(json!({
                     "call_template": "```{{ args.command | shebang_lang }}\n$ {{ args.command | strip_shebang }}\n```{% if args.working_dir or args.timeout_secs or args.head_lines or args.tail_lines or args.max_output_bytes %}\n{% if args.working_dir %}({{ args.working_dir }}) {% endif %}{% if args.timeout_secs %}[{{ args.timeout_secs }}s] {% endif %}{% if args.head_lines is not none %}[head:{{ args.head_lines }}] {% endif %}{% if args.tail_lines is not none %}[tail_lines:{{ args.tail_lines }}] {% endif %}{% if args.max_output_bytes is not none %}[:{{ args.max_output_bytes }}b] {% endif %}{% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
@@ -36,7 +34,7 @@ impl ServerHandler for BashServer {
                     Map::new(),
                 )
                 .with_input_schema::<ReadExecLogParams>()
-                .with_meta(Meta(json!({
+                .with_meta(MetaObject(json!({
                     "call_template": "📋 log {{ args.execution_id }}/{{ args.stream }}{% if args.grep %} /{{ args.grep }}/{% endif %}{% if args.offset %} +{{ args.offset }}{% endif %}{% if args.limit %} [:{{ args.limit }}]{% endif %}{% if args.tail %} [tail:{{ args.tail }}]{% endif %}{% if args.head_lines is not none %} [head:{{ args.head_lines }}]{% endif %}{% if args.tail_lines is not none %} [tail_lines:{{ args.tail_lines }}]{% endif %}{% if args.max_output_bytes is not none %} [:{{ args.max_output_bytes }}b]{% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
@@ -45,7 +43,7 @@ impl ServerHandler for BashServer {
                     Map::new(),
                 )
                 .with_input_schema::<SpawnCommandParams>()
-                .with_meta(Meta(json!({
+                .with_meta(MetaObject(json!({
                     "call_template": "```{{ args.command | shebang_lang }}\n$ {{ args.command | strip_shebang }} &\n```{% if args.working_dir %}\n({{ args.working_dir }}) {% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
@@ -54,7 +52,7 @@ impl ServerHandler for BashServer {
                     Map::new(),
                 )
                 .with_input_schema::<WaitParams>()
-                .with_meta(Meta(json!({
+                .with_meta(MetaObject(json!({
                     "call_template": "⏳ wait {{ args.execution_id }}{% if args.timeout_secs %} [{{ args.timeout_secs }}s]{% endif %}{% if args.grep %} /{{ args.grep }}/{% endif %}{% if args.head_lines %} [head:{{ args.head_lines }}]{% endif %}{% if args.tail_lines %} [tail:{{ args.tail_lines }}]{% endif %}{% if args.max_output_bytes %} [:{{ args.max_output_bytes }}b]{% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
@@ -63,7 +61,7 @@ impl ServerHandler for BashServer {
                     Map::new(),
                 )
                 .with_input_schema::<TerminateParams>()
-                .with_meta(Meta(json!({
+                .with_meta(MetaObject(json!({
                     "call_template": "🛑 kill {{ args.execution_id }}{% if args.signal %} ({{ args.signal }}){% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
@@ -72,15 +70,33 @@ impl ServerHandler for BashServer {
                     Map::new(),
                 )
                 .with_input_schema::<RollbackParams>()
-                .with_meta(Meta(json!({
+                .with_meta(MetaObject(json!({
                     "call_template": "⏪ rollback {{ args.commit_id | truncate(8, end='') }}{% if args.repo_path %} @ {{ args.repo_path }}{% endif %}",
                 }).as_object().unwrap().clone())),
-            ],
-            next_cursor: None,
-        })
+            ]))
     }
 
     async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        self.dispatch_call_tool(request, _context)
+            .await
+            .map(Into::into)
+    }
+
+    async fn on_roots_list_changed(&self, _context: NotificationContext<RoleServer>) {}
+}
+
+impl BashServer {
+    /// The tool dispatch, which always finishes in a single step.
+    ///
+    /// `call_tool` must return `CallToolResponse`, whose other variants cover
+    /// elicitation and long-running tasks that this server does not use.
+    /// Dispatching separately keeps every arm returning a plain
+    /// `CallToolResult`.
+    async fn dispatch_call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
@@ -116,6 +132,4 @@ impl ServerHandler for BashServer {
             )),
         }
     }
-
-    async fn on_roots_list_changed(&self, _context: NotificationContext<RoleServer>) {}
 }

@@ -236,7 +236,7 @@ async fn run_http(
     let ct = CancellationToken::new();
     let factory_dir = plans_dir.clone();
     let config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
+        .with_legacy_session_mode(false)
         .with_json_response(true)
         .with_cancellation_token(ct.child_token())
         // Empty allowlist = accept any Host header. Required so external

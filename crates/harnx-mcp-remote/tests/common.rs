@@ -117,7 +117,7 @@ pub async fn spawn_http_test_server(
 ) -> Result<HttpTestServerHandle> {
     let shutdown = CancellationToken::new();
     let config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
+        .with_legacy_session_mode(false)
         .with_json_response(true)
         .with_cancellation_token(shutdown.child_token())
         .disable_allowed_hosts();
@@ -156,7 +156,7 @@ pub async fn spawn_http_test_server(
 pub async fn spawn_auth_guard_server(expected_auth: &'static str) -> Result<HttpTestServerHandle> {
     let shutdown = CancellationToken::new();
     let config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
+        .with_legacy_session_mode(false)
         .with_json_response(true)
         .with_cancellation_token(shutdown.child_token())
         .disable_allowed_hosts();

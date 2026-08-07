@@ -182,7 +182,7 @@ async fn run_http(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()> 
     let ct = CancellationToken::new();
     let factory_store = store.clone();
     let server_config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
+        .with_legacy_session_mode(false)
         .with_json_response(true)
         .with_cancellation_token(ct.child_token());
     let service_default_repo = default_repo.clone();
