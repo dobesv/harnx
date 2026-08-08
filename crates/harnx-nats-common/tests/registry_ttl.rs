@@ -149,3 +149,76 @@ async fn ensure_bucket_sets_ttl_and_reconciles_existing_bucket() -> Result<()> {
     assert_eq!(info.config.max_age, REGISTRATION_TTL);
     Ok(())
 }
+
+/// Re-requesting the replica count a bucket already has is a no-op: no error,
+/// and the stream still reports the same count.
+#[tokio::test]
+async fn ensure_bucket_reconciles_replicas_noop_when_already_matching() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: no nats-server binary available");
+        return Ok(());
+    };
+    let client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(&server.url)
+        .await
+        .context("connect test NATS client")?;
+    let jetstream = async_nats::jetstream::new(client);
+
+    ensure_bucket_with_ttl(&jetstream, "replicas_noop", REGISTRATION_TTL, 1)
+        .await
+        .context("create bucket at replicas=1")?;
+    // Same request again: nothing to reconcile, must still succeed.
+    ensure_bucket_with_ttl(&jetstream, "replicas_noop", REGISTRATION_TTL, 1)
+        .await
+        .context("re-ensure bucket at replicas=1")?;
+
+    let info = jetstream
+        .get_stream("KV_replicas_noop")
+        .await
+        .context("get backing stream")?
+        .info()
+        .await
+        .context("stream info")?
+        .clone();
+    assert_eq!(info.config.num_replicas, 1);
+    Ok(())
+}
+
+/// Raising the replica count on a bucket that already exists must never stop
+/// harnx starting, even on a dev server that cannot really host 3 copies.
+///
+/// This does not exercise a genuine "the cluster refused the raise" rejection:
+/// against a single, non-clustered `nats-server` (verified against 2.11.6),
+/// `update_stream` accepts any `num_replicas` value unconditionally --
+/// unlike creating a brand-new stream, which does reject `num_replicas > 1`
+/// with "replicas > 1 not supported in non-clustered mode". So on this
+/// harness the raise actually succeeds; what this test pins down is that
+/// `ensure_bucket_with_ttl` returns `Ok` either way, and that the `if let
+/// Err(..) = reconcile_bucket_config(..)` wrapping around the update in
+/// `ensure_bucket_with_ttl` is still in place and non-fatal. Demonstrating an
+/// actual rejection would need a real under-provisioned cluster (e.g. 2 nodes
+/// asked for `replicas: 3`), which this test suite does not stand up.
+#[tokio::test]
+async fn ensure_bucket_raising_replicas_on_existing_bucket_does_not_fail_startup() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: no nats-server binary available");
+        return Ok(());
+    };
+    let client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(&server.url)
+        .await
+        .context("connect test NATS client")?;
+    let jetstream = async_nats::jetstream::new(client);
+
+    ensure_bucket_with_ttl(&jetstream, "raise_replicas", REGISTRATION_TTL, 1)
+        .await
+        .context("create bucket at replicas=1")?;
+    ensure_bucket_with_ttl(&jetstream, "raise_replicas", REGISTRATION_TTL, 3)
+        .await
+        .context("raising replicas on an existing bucket must not fail startup")?;
+    Ok(())
+}

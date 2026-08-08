@@ -26,19 +26,7 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
         return Ok(());
     };
 
-    let config = Config {
-        nats_servers: vec![harnx_runtime::config::NatsServerConfig {
-            name: "local".to_string(),
-            url: server.url().to_string(),
-            token: None,
-            tls: None,
-            tls_cert: None,
-            tls_key: None,
-            tls_ca: None,
-            agents: vec![],
-        }],
-        ..Default::default()
-    };
+    let config = local_nats_config(server.url());
     let jetstream = config.nats_jetstream("local").await?;
     let session_id = "delete-me";
     let log = NatsSessionLog::new(jetstream.clone(), session_id);
@@ -117,6 +105,23 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
     delete_record(&index_store, session_id).await.ok();
 
     Ok(())
+}
+
+fn local_nats_config(url: &str) -> Config {
+    Config {
+        nats_servers: vec![harnx_runtime::config::NatsServerConfig {
+            name: "local".to_string(),
+            url: url.to_string(),
+            token: None,
+            replicas: None,
+            tls: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca: None,
+            agents: vec![],
+        }],
+        ..Default::default()
+    }
 }
 
 fn header(session_id: &str) -> SessionLogEntry {

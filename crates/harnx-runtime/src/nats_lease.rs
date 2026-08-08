@@ -1,3 +1,4 @@
+use crate::config::DEFAULT_BUCKET_REPLICAS;
 use crate::nats_metrics;
 use crate::nats_session_index::{self, update_record_with_revision, SessionIndexRecord};
 use anyhow::{anyhow, bail, Context, Result};
@@ -18,7 +19,6 @@ const LEASE_BUCKET: &str = "harnx_leases";
 const LEASE_KEY_PREFIX: &str = "sessions";
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 pub const DEFAULT_RENEW_INTERVAL: Duration = Duration::from_secs(10);
-pub const DEFAULT_BUCKET_REPLICAS: usize = 1;
 pub const DEFAULT_TOMBSTONE_TTL: Duration = Duration::from_secs(3600);
 const INDEX_REFRESH_RETRY_LIMIT: usize = 3;
 const INDEX_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);

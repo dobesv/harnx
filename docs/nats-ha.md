@@ -23,12 +23,21 @@ For development, a single NATS server with JetStream is sufficient:
 nats-server -js
 ```
 
-For production HA, run a NATS cluster with at least 3 nodes and set `replicas: 3` for JetStream assets.
+For production HA, run a NATS cluster with at least 3 nodes and set `replicas: 3`
+in the cluster's `nats_servers/<cluster_key>.yaml` (see the production example
+below) so the buckets harnx creates survive losing a node.
 
 ### JetStream Resources
 Harnx automatically manages the following JetStream resources:
 - **KV Bucket**: `harnx_leases` (Stores session leases with TTL).
+- **KV Buckets**: `harnx_tool_registry` and the hook registry/expectations
+  buckets (tool/hook server discovery, also TTL'd).
 - **Streams**: `SESSION_<id>` (Subject: `sessions.{id}.log`) stores the durable append-only session history.
+
+The tool and hook registry buckets are created with the `replicas` count from
+the cluster's config (`None` means 1, no HA). Set it to 3 to match a 3-node
+cluster; a mismatch between the two is what leaves a registry unable to
+tolerate a node loss.
 
 ## Configuration
 
@@ -45,6 +54,7 @@ url: "nats://localhost:4222"
 ```yaml
 url: "nats://nats.example.com:4222"
 token: "${NATS_TOKEN}"
+replicas: 3   # JetStream replica count for buckets harnx creates; defaults to 1
 tls: true
 tls_cert: "/etc/harnx/client-cert.pem"
 tls_key: "/etc/harnx/client-key.pem"

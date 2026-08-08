@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use harnx_core::instance::InstanceId;
+use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{
     ControlKind, ControlMessage, Registration, ToolInvokeError, ToolReply, ToolRequest, ToolSpec,
     Toolset, HDR_CALL_ID, HDR_IDEMPOTENCY_KEY,
@@ -225,7 +226,10 @@ impl TestHarness {
             serve_with_shutdown(
                 Arc::new(server_toolset),
                 server_instance_id,
-                server_client,
+                NatsConnection {
+                    client: server_client,
+                    replicas: 1,
+                },
                 server_shutdown,
             )
             .await

@@ -1,4 +1,4 @@
-use crate::config::{HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
+use crate::config::{HARNX_NATS_REPLICAS_ENV, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
 use anyhow::{bail, Context, Result};
 use async_nats::jetstream::{self, kv, stream};
 use futures_util::StreamExt;
@@ -30,6 +30,9 @@ pub struct HookServerStartConfig {
     instance_id: InstanceId,
     nats_url: String,
     token: String,
+    /// JetStream replica count for buckets this cluster's hook servers
+    /// create. `None` means 1; see `docs/nats-ha.md`.
+    replicas: Option<usize>,
 }
 
 impl HookServerStartConfig {
@@ -44,7 +47,19 @@ impl HookServerStartConfig {
             instance_id,
             nats_url: nats_url.into(),
             token: token.into(),
+            replicas: None,
         }
+    }
+
+    /// Set the JetStream replica count from the cluster this config connects to.
+    pub fn with_replicas(mut self, replicas: Option<usize>) -> Self {
+        self.replicas = replicas;
+        self
+    }
+
+    /// The replica count to actually use: the configured value, or 1 when unset.
+    fn resolved_replicas(&self) -> usize {
+        self.replicas.unwrap_or(1)
     }
 }
 
@@ -173,8 +188,8 @@ async fn prepare_hook_registrations(
     launch_plan: &[HookLaunch<'_>],
     supervisor: &mut HookServerSupervisor,
 ) -> Result<Vec<PreparedHook>> {
-    let registry = ensure_bucket(&config.client, HOOK_REGISTRY_BUCKET).await?;
-    let expectations = ensure_bucket(&config.client, HOOK_EXPECTATIONS_BUCKET).await?;
+    let registry = ensure_bucket_for(config, HOOK_REGISTRY_BUCKET).await?;
+    let expectations = ensure_bucket_for(config, HOOK_EXPECTATIONS_BUCKET).await?;
     let mut prepared = Vec::new();
     for launch in launch_plan {
         let key = hook_registration_key(&config.instance_id, &launch.name);
@@ -236,7 +251,7 @@ async fn spawn_enabled_hooks(
     prepared: Vec<PreparedHook>,
     supervisor: &mut HookServerSupervisor,
 ) -> Result<Vec<HookStartup>> {
-    let expectations = ensure_bucket(&config.client, HOOK_EXPECTATIONS_BUCKET).await?;
+    let expectations = ensure_bucket_for(config, HOOK_EXPECTATIONS_BUCKET).await?;
     let mut startups = Vec::new();
     for prepared in prepared {
         let mut child = match spawn_hook_server(config, &prepared.hook, &prepared.name) {
@@ -360,7 +375,7 @@ async fn start_hook_server(
             processes.lock().await.remove(&pid);
             let _ = child.start_kill();
             let _ = child.wait().await;
-            let expectations = ensure_bucket(&config.client, HOOK_EXPECTATIONS_BUCKET).await?;
+            let expectations = ensure_bucket_for(&config, HOOK_EXPECTATIONS_BUCKET).await?;
             publish_startup_rejector(
                 &expectations,
                 &config.instance_id,
@@ -412,6 +427,10 @@ fn spawn_hook_server(
         .env(HARNX_INSTANCE_ID, config.instance_id.as_str())
         .env(HARNX_NATS_URL_ENV, &config.nats_url)
         .env(HARNX_NATS_TOKEN_ENV, &config.token)
+        .env(
+            HARNX_NATS_REPLICAS_ENV,
+            config.resolved_replicas().to_string(),
+        )
         .stdin(Stdio::null())
         // Send output to the worker log so a hook server that exits before
         // registering explains itself instead of failing silently.
@@ -503,7 +522,7 @@ async fn replace_crashed_hook_route(
     // an empty route set. If both publications fail, retain the live route.
     let route = publish_marker_or_rejector(
         || async {
-            let expectations = ensure_bucket(client, HOOK_EXPECTATIONS_BUCKET).await?;
+            let expectations = ensure_bucket(client, HOOK_EXPECTATIONS_BUCKET, 1).await?;
             publish_registration(&expectations, &key, &marker).await
         },
         || publish_crash_rejector(client, instance_id, &rejector_name, &rejector_label),
@@ -594,13 +613,24 @@ fn decode_expected_registration(
     Ok(registration)
 }
 
-async fn ensure_bucket(client: &async_nats::Client, bucket: &str) -> Result<kv::Store> {
+/// `ensure_bucket` for the common case of a bucket that belongs to a
+/// configured cluster, so call sites don't have to spell out
+/// `&config.client` and `config.resolved_replicas()` every time.
+async fn ensure_bucket_for(config: &HookServerStartConfig, bucket: &str) -> Result<kv::Store> {
+    ensure_bucket(&config.client, bucket, config.resolved_replicas()).await
+}
+
+async fn ensure_bucket(
+    client: &async_nats::Client,
+    bucket: &str,
+    replicas: usize,
+) -> Result<kv::Store> {
     let jetstream = jetstream::new(client.clone());
     match jetstream
         .create_key_value(kv::Config {
             bucket: bucket.to_string(),
             history: 1,
-            num_replicas: 1,
+            num_replicas: replicas,
             storage: stream::StorageType::File,
             ..Default::default()
         })
@@ -708,7 +738,7 @@ pub async fn publish_crash_rejector(
     let key = hook_registration_key(instance_id, server);
 
     let expectation_result = async {
-        let expectations = ensure_bucket(client, HOOK_EXPECTATIONS_BUCKET).await?;
+        let expectations = ensure_bucket(client, HOOK_EXPECTATIONS_BUCKET, 1).await?;
         publish_registration(&expectations, &key, &registration).await
     }
     .await;
@@ -718,7 +748,7 @@ pub async fn publish_crash_rejector(
 
     // If the expectations path itself is unavailable, the registry bucket is a
     // second fail-closed publication path. The rejector still has no responder.
-    let registry = ensure_bucket(client, HOOK_REGISTRY_BUCKET).await?;
+    let registry = ensure_bucket(client, HOOK_REGISTRY_BUCKET, 1).await?;
     publish_registration(&registry, &key, &registration)
         .await
         .with_context(|| format!("publish crash rejector after {expectation_result:#?}"))

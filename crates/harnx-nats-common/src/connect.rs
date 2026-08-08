@@ -20,10 +20,24 @@ pub struct NatsEndpoint {
     pub name: String,
     pub url: String,
     pub token: Option<String>,
+    /// JetStream replica count for buckets created on this endpoint.
+    /// `None` means 1 (single replica, no HA).
+    pub replicas: Option<usize>,
     pub tls: Option<bool>,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     pub tls_ca: Option<String>,
+}
+
+/// A connected NATS client plus the JetStream replica count resolved for it.
+///
+/// `serve_with_shutdown` (harnx-toolset-server, harnx-hookset-server) already
+/// takes 4 arguments; bundling the replica count with the client it applies
+/// to avoids a fifth rather than growing past the repo's argument limit.
+#[derive(Debug, Clone)]
+pub struct NatsConnection {
+    pub client: async_nats::Client,
+    pub replicas: usize,
 }
 
 /// Which TLS setting is under discussion.
@@ -57,6 +71,9 @@ impl NatsEndpoint {
             name: "environment".to_string(),
             url,
             token: std::env::var("HARNX_NATS_TOKEN").ok(),
+            replicas: std::env::var("HARNX_NATS_REPLICAS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
             tls: std::env::var("HARNX_NATS_TLS")
                 .ok()
                 .map(|value| value == "1" || value == "true"),
@@ -64,6 +81,12 @@ impl NatsEndpoint {
             tls_key: std::env::var("HARNX_NATS_TLS_KEY").ok(),
             tls_ca: std::env::var("HARNX_NATS_TLS_CA").ok(),
         })
+    }
+
+    /// The JetStream replica count to actually use for buckets created on
+    /// this endpoint: the configured value, or 1 when unset.
+    pub fn resolved_replicas(&self) -> usize {
+        self.replicas.unwrap_or(1)
     }
 
     /// Connect using the options from [`Self::connect_options`].

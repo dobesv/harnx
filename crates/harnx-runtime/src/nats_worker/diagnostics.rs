@@ -61,14 +61,16 @@ pub async fn diagnose_tool_servers(config: &GlobalConfig) -> Result<String> {
                 .context("start the shared local NATS broker")?,
         ),
     };
-    let (url, token) = match &owned_broker {
-        Some(server) => (server.url.clone(), server.token.clone()),
+    // The auto-managed embedded broker is always single-node, so it never has
+    // a replica count; only a full environment handoff to a real cluster does.
+    let (url, token, replicas) = match &owned_broker {
+        Some(server) => (server.url.clone(), server.token.clone(), None),
         None => {
             let local = resolve_local_nats_server_config()
                 .await
                 .context("resolve the local NATS broker")?;
             let token = local.token.clone().context("local NATS requires a token")?;
-            (local.url, token)
+            (local.url, token, local.replicas)
         }
     };
     let client = async_nats::ConnectOptions::new()
@@ -86,13 +88,14 @@ pub async fn diagnose_tool_servers(config: &GlobalConfig) -> Result<String> {
     );
 
     let start = ToolServerStartConfig::new(client.clone(), instance_id.clone(), &url, &token)
-        .inheriting_child_output();
+        .inheriting_child_output()
+        .with_replicas(replicas);
     let began = Instant::now();
     let supervisor =
         ToolServerSupervisor::start_local_with_timeout(start, &servers, DIAGNOSE_TIMEOUT).await?;
     let elapsed = began.elapsed();
 
-    let registered = registered_tool_counts(&client, &instance_id).await;
+    let registered = registered_tool_counts(&client, &instance_id, replicas.unwrap_or(1)).await;
     let outcomes = collect_outcomes(&servers, &registered);
     render_outcomes(&mut report, &outcomes, elapsed);
     drop(supervisor);
@@ -104,9 +107,10 @@ pub async fn diagnose_tool_servers(config: &GlobalConfig) -> Result<String> {
 async fn registered_tool_counts(
     client: &async_nats::Client,
     instance_id: &InstanceId,
+    replicas: usize,
 ) -> HashMap<String, usize> {
     let mut counts = HashMap::new();
-    let Ok(registry) = ensure_registry_bucket(client).await else {
+    let Ok(registry) = ensure_registry_bucket(client, replicas).await else {
         return counts;
     };
     let Ok(keys) = registry.keys().await else {

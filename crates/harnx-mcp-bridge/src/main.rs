@@ -1,7 +1,7 @@
 use anyhow::Context;
 use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
 use harnx_mcp_bridge::{report_tools, Args, BridgeToolset};
-use harnx_nats_common::connect::NatsEndpoint;
+use harnx_nats_common::connect::{NatsConnection, NatsEndpoint};
 use harnx_toolset_server::serve_with_client;
 use std::sync::Arc;
 
@@ -33,11 +33,16 @@ async fn main() -> anyhow::Result<()> {
     // a slow/unreachable NATS cluster (bad DNS, stalled TLS handshake) must
     // not block the bridge from noticing the wrapped child has already died.
     let serve = async {
-        let client = NatsEndpoint::from_env()?.connect().await?;
+        let endpoint = NatsEndpoint::from_env()?;
+        let client = endpoint.connect().await?;
+        let connection = NatsConnection {
+            client,
+            replicas: endpoint.resolved_replicas(),
+        };
         serve_with_client(
             Arc::new(bridge),
             InstanceId::from_string(instance_id),
-            client,
+            connection,
         )
         .await
     };

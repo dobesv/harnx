@@ -322,7 +322,8 @@ async fn start_local_tool_servers(
             .token
             .as_deref()
             .context("local NATS tool servers require HARNX_NATS_TOKEN")?;
-        let start = ToolServerStartConfig::new(client, instance_id.clone(), &server.url, token);
+        let start = ToolServerStartConfig::new(client, instance_id.clone(), &server.url, token)
+            .with_replicas(server.replicas);
         ToolServerSupervisor::start_local(start, servers)
             .await
             .context("start local NATS tool servers")
@@ -346,7 +347,8 @@ async fn start_global_hooks(
             .token
             .as_deref()
             .context("local NATS hook servers require HARNX_NATS_TOKEN")?;
-        let start = HookServerStartConfig::new(client, instance_id.clone(), &server.url, token);
+        let start = HookServerStartConfig::new(client, instance_id.clone(), &server.url, token)
+            .with_replicas(server.replicas);
         HookServerSupervisor::start_local(start, hooks, "global")
             .await
             .context("start global NATS hook servers")
@@ -392,10 +394,18 @@ async fn start_subagent_toolset(
     let server_name = harnx_toolset::Toolset::name(toolset.as_ref()).to_string();
     let identity_token = harnx_toolset::server_identity_token(None, "", &server_name);
     let registration_key = harnx_toolset_server::registration_key(&instance_id, &identity_token);
+    // Sub-agent toolsets share the worker's own cluster connection, which by
+    // the time this runs almost always already has TOOL_REGISTRY_BUCKET open
+    // at the cluster's configured replica count (local tool servers register
+    // first); this fallback only matters if none ever ran.
+    let connection = harnx_nats_common::connect::NatsConnection {
+        client,
+        replicas: 1,
+    };
     let server = tokio::spawn(harnx_toolset_server::serve_with_client(
         toolset,
         instance_id,
-        client,
+        connection,
     ));
 
     let registration = tokio::time::timeout(Duration::from_secs(5), async {
@@ -627,7 +637,8 @@ async fn retry_unregistered_tool_servers(
     let Some(token) = local.token.as_deref() else {
         return Some(supervisor);
     };
-    let start = ToolServerStartConfig::new(client, instance_id.clone(), &local.url, token);
+    let start = ToolServerStartConfig::new(client, instance_id.clone(), &local.url, token)
+        .with_replicas(local.replicas);
     let retry = RetryConfig::default();
 
     // Retries never stop: a server the user fixes mid-session should come up

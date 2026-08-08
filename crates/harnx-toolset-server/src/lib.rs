@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv};
 use futures_util::StreamExt;
 use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
+use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{
     server_identity_token, ControlKind, ControlMessage, Registration, ToolErrorPayload,
     ToolInvokeError, ToolReply, ToolRequest, Toolset, HARNX_SERVER_CONFIG, HARNX_SERVER_PACKAGE,
@@ -111,35 +112,44 @@ where
         name: "explicit".to_string(),
         url: nats_url.to_string(),
         token: Some(token.to_string()),
+        replicas: None,
         tls: None,
         tls_cert: None,
         tls_key: None,
         tls_ca: None,
     };
     let client = endpoint.connect().await?;
-    serve_with_client(Arc::new(toolset), instance_id, client).await
+    // This entry point takes an explicit URL/token instead of the environment,
+    // so it has no way to read HARNX_NATS_REPLICAS either; callers that need a
+    // configured replica count go through `serve_with_shutdown` directly.
+    let connection = NatsConnection {
+        client,
+        replicas: 1,
+    };
+    serve_with_client(Arc::new(toolset), instance_id, connection).await
 }
 
-/// Serve a toolset using an existing NATS client.
+/// Serve a toolset using an existing NATS connection.
 pub async fn serve_with_client(
     toolset: Arc<dyn Toolset>,
     instance_id: InstanceId,
-    client: async_nats::Client,
+    connection: NatsConnection,
 ) -> Result<()> {
     // Never cancelled: this entry point has no shutdown signal of its own, so
     // it only ever exits through `serve_requests`' bail! conditions.
-    serve_with_shutdown(toolset, instance_id, client, CancellationToken::new()).await
+    serve_with_shutdown(toolset, instance_id, connection, CancellationToken::new()).await
 }
 
-/// Serve a toolset using an existing NATS client, exiting cleanly (and
+/// Serve a toolset using an existing NATS connection, exiting cleanly (and
 /// running exit cleanup while the connection is still usable) when
 /// `shutdown` is cancelled, in addition to the usual failure exits.
 pub async fn serve_with_shutdown(
     toolset: Arc<dyn Toolset>,
     instance_id: InstanceId,
-    client: async_nats::Client,
+    connection: NatsConnection,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    let NatsConnection { client, replicas } = connection;
     let server_name = toolset.name().to_owned();
     let package = std::env::var(HARNX_SERVER_PACKAGE)
         .ok()
@@ -170,7 +180,7 @@ pub async fn serve_with_shutdown(
         proto_version: TOOL_PROTOCOL_VERSION,
     };
     let jetstream = jetstream::new(client.clone());
-    let registry = ensure_registry_bucket(&jetstream).await?;
+    let registry = ensure_registry_bucket(&jetstream, replicas).await?;
     publish_registration(&registry, &instance_id, &registration).await?;
 
     let request_context = ToolRequestContext {
@@ -496,12 +506,15 @@ fn header_value(message: &async_nats::Message, name: &str) -> Option<String> {
         .map(|value| value.as_str().to_owned())
 }
 
-async fn ensure_registry_bucket(jetstream: &jetstream::Context) -> Result<kv::Store> {
+async fn ensure_registry_bucket(
+    jetstream: &jetstream::Context,
+    replicas: usize,
+) -> Result<kv::Store> {
     harnx_nats_common::registry::ensure_bucket_with_ttl(
         jetstream,
         TOOL_REGISTRY_BUCKET,
         harnx_nats_common::registry::REGISTRATION_TTL,
-        1,
+        replicas,
     )
     .await
 }
@@ -551,14 +564,17 @@ where
             harnx_core::instance::StandaloneMode::McpStdio
         ))
     })?;
-    let client = harnx_nats_common::connect::NatsEndpoint::from_env()?
-        .connect()
-        .await?;
+    let endpoint = harnx_nats_common::connect::NatsEndpoint::from_env()?;
+    let client = endpoint.connect().await?;
+    let connection = NatsConnection {
+        client,
+        replicas: endpoint.resolved_replicas(),
+    };
     let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
     serve_with_shutdown(
         toolset,
         InstanceId::from_string(instance_id),
-        client,
+        connection,
         shutdown,
     )
     .await

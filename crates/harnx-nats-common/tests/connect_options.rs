@@ -5,6 +5,7 @@ fn endpoint() -> NatsEndpoint {
         name: "probe".into(),
         url: "tls://localhost:4222".into(),
         token: None,
+        replicas: None,
         tls: Some(true),
         tls_cert: None,
         tls_key: None,

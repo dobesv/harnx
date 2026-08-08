@@ -3,12 +3,11 @@
 //! Session Header is canonical source of this metadata. This index stores a
 //! denormalized copy for enumeration only.
 
+use crate::config::DEFAULT_BUCKET_REPLICAS;
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv, stream};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-
-const DEFAULT_BUCKET_REPLICAS: usize = 1;
 
 pub const SESSION_INDEX_BUCKET: &str = "harnx_sessions";
 
@@ -339,6 +338,7 @@ mod tests {
             name: "test-cluster".into(),
             url: server_url.clone(),
             token: None,
+            replicas: None,
             tls: None,
             tls_cert: None,
             tls_key: None,
@@ -386,6 +386,7 @@ mod tests {
             name: "unreachable-cluster".into(),
             url: "nats://198.51.100.1:4222".into(), // non-routable, guaranteed to fail
             token: None,
+            replicas: None,
             tls: None,
             tls_cert: None,
             tls_key: None,
@@ -439,6 +440,7 @@ mod tests {
             name: "test-cluster".to_string(),
             url: server_url,
             token: None,
+            replicas: None,
             tls: None,
             tls_cert: None,
             tls_key: None,

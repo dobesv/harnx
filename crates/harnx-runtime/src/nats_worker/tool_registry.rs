@@ -53,13 +53,16 @@ pub(super) struct RegistrationWait<'a> {
     pub(super) timeout: Duration,
 }
 
-pub(super) async fn ensure_registry_bucket(client: &async_nats::Client) -> Result<kv::Store> {
+pub(super) async fn ensure_registry_bucket(
+    client: &async_nats::Client,
+    replicas: usize,
+) -> Result<kv::Store> {
     let jetstream = jetstream::new(client.clone());
     match jetstream
         .create_key_value(kv::Config {
             bucket: TOOL_REGISTRY_BUCKET.to_string(),
             history: 1,
-            num_replicas: 1,
+            num_replicas: replicas,
             storage: stream::StorageType::File,
             ..Default::default()
         })

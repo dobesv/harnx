@@ -3,7 +3,9 @@ use super::tool_registry::{
     ensure_registry_bucket, log_registry_contents, remove_registrations_for_config,
     wait_for_registration, RegistrationWait, SupervisedProcesses, SupervisedServer,
 };
-use crate::config::{ToolServerConfig, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
+use crate::config::{
+    ToolServerConfig, HARNX_NATS_REPLICAS_ENV, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV,
+};
 use crate::nats_tool_provider::NatsInFlightCalls;
 use anyhow::{Context, Result};
 use async_nats::jetstream::kv;
@@ -31,6 +33,9 @@ pub struct ToolServerStartConfig {
     instance_id: InstanceId,
     nats_url: String,
     token: String,
+    /// JetStream replica count for buckets this cluster's tool servers
+    /// create. `None` means 1; see `docs/nats-ha.md`.
+    replicas: Option<usize>,
     /// Send tool-server output to this process's own stdout/stderr instead of
     /// the worker log. Set by foreground diagnostics, where routing a server's
     /// explanation of its own failure into a file is the opposite of useful.
@@ -49,6 +54,7 @@ impl ToolServerStartConfig {
             instance_id,
             nats_url: nats_url.into(),
             token: token.into(),
+            replicas: None,
             inherit_child_output: false,
         }
     }
@@ -59,6 +65,12 @@ impl ToolServerStartConfig {
         self
     }
 
+    /// Set the JetStream replica count from the cluster this config connects to.
+    pub fn with_replicas(mut self, replicas: Option<usize>) -> Self {
+        self.replicas = replicas;
+        self
+    }
+
     fn hook_start_config(&self) -> HookServerStartConfig {
         HookServerStartConfig::new(
             self.client.clone(),
@@ -66,6 +78,7 @@ impl ToolServerStartConfig {
             self.nats_url.clone(),
             self.token.clone(),
         )
+        .with_replicas(self.replicas)
     }
 }
 
@@ -121,7 +134,9 @@ impl ToolServerSupervisor {
         servers: &[&ToolServerConfig],
         readiness_timeout: Duration,
     ) {
-        let registry = match ensure_registry_bucket(&config.client).await {
+        let registry = match ensure_registry_bucket(&config.client, config.replicas.unwrap_or(1))
+            .await
+        {
             Ok(registry) => registry,
             Err(error) => {
                 for server in servers {
@@ -425,6 +440,10 @@ fn spawn_tool_server(config: &ToolServerStartConfig, server: &ToolServerConfig) 
         .env(HARNX_INSTANCE_ID, config.instance_id.as_str())
         .env(HARNX_NATS_URL_ENV, &config.nats_url)
         .env(HARNX_NATS_TOKEN_ENV, &config.token)
+        .env(
+            HARNX_NATS_REPLICAS_ENV,
+            config.replicas.unwrap_or(1).to_string(),
+        )
         .stdin(Stdio::null())
         // Send output to the worker log instead of discarding it, so a tool
         // server that dies or complains on startup leaves a trace there rather

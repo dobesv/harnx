@@ -364,6 +364,7 @@ pub(super) fn spawn_metis_worker_with_hooks(
             name: "local".to_string(),
             url: url.to_string(),
             token: None,
+            replicas: None,
             tls: Some(false),
             tls_cert: None,
             tls_key: None,

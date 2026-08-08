@@ -522,6 +522,7 @@ mod tests {
             name: cluster.to_string(),
             url: server_url.to_string(),
             token: None,
+            replicas: None,
             tls: None,
             tls_cert: None,
             tls_key: None,

@@ -431,12 +431,15 @@ async fn agent_hook_start_config(
         let token = server
             .token
             .context("local NATS agent hooks require HARNX_NATS_TOKEN")?;
-        Result::<_>::Ok(HookServerStartConfig::new(
-            jetstream.client().clone(),
-            instance_id.clone(),
-            server.url,
-            token,
-        ))
+        Result::<_>::Ok(
+            HookServerStartConfig::new(
+                jetstream.client().clone(),
+                instance_id.clone(),
+                server.url,
+                token,
+            )
+            .with_replicas(server.replicas),
+        )
     }
     .await;
     match result {

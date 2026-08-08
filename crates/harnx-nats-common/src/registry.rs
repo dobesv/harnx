@@ -35,11 +35,16 @@ pub async fn ensure_bucket_with_ttl(
     // explaining.
     log::debug!("create_key_value for bucket '{bucket}' did not succeed: {create_error:#}");
 
-    // The bucket already exists. It may predate TTL support, so reconcile it.
-    if let Err(error) = reconcile_bucket_ttl(jetstream, bucket, ttl).await {
+    // The bucket already exists. It may predate TTL support, or its replica
+    // count may no longer match this config (an operator raised `replicas`
+    // after the bucket was first created), so reconcile both.
+    if let Err(error) = reconcile_bucket_config(jetstream, bucket, ttl, num_replicas).await {
         // A read-only or permission-limited connection can still use the
-        // bucket; losing expiry is a degradation, not a failure to start.
-        log::warn!("could not set max_age on bucket '{bucket}': {error:#}");
+        // bucket; losing expiry or the intended replica count is a
+        // degradation, not a failure to start. Raising replicas above what
+        // the cluster can support (e.g. `replicas: 3` against a single-node
+        // dev server) fails the same way and must not stop harnx starting.
+        log::warn!("could not reconcile config for bucket '{bucket}': {error:#}");
     }
 
     jetstream
@@ -49,10 +54,16 @@ pub async fn ensure_bucket_with_ttl(
         .with_context(|| format!("open KV bucket '{bucket}'"))
 }
 
-async fn reconcile_bucket_ttl(
+/// Bring an existing bucket's stream up to the requested TTL and replica
+/// count, in one `update_stream` call. Both drift independently of bucket
+/// creation: TTL predates this reconcile path, and replicas can be raised
+/// later by an operator editing cluster config after the bucket already
+/// exists (`num_replicas` is otherwise fixed at creation time).
+async fn reconcile_bucket_config(
     jetstream: &jetstream::Context,
     bucket: &str,
     ttl: Duration,
+    num_replicas: usize,
 ) -> Result<()> {
     let stream_name = format!("KV_{bucket}");
     let mut config = jetstream
@@ -64,7 +75,8 @@ async fn reconcile_bucket_ttl(
         .with_context(|| format!("stream info for '{stream_name}'"))?
         .config
         .clone();
-    if config.max_age == ttl {
+    let current_replicas = config.num_replicas;
+    if config.max_age == ttl && current_replicas == num_replicas {
         return Ok(());
     }
     config.max_age = ttl;
@@ -74,9 +86,15 @@ async fn reconcile_bucket_ttl(
     if config.duplicate_window > ttl {
         config.duplicate_window = ttl;
     }
-    jetstream
-        .update_stream(config)
-        .await
-        .with_context(|| format!("set max_age on '{stream_name}'"))?;
+    config.num_replicas = num_replicas;
+    // Changing replicas is a Raft peer-set change, not a metadata tweak: the
+    // server rejects it outright when the cluster can't support the new
+    // count (there's nothing to retry or wait for), so this is one attempt,
+    // reported by the caller rather than retried here.
+    jetstream.update_stream(config).await.with_context(|| {
+        format!(
+            "set max_age and replicas on '{stream_name}' (currently {current_replicas}, requested {num_replicas})"
+        )
+    })?;
     Ok(())
 }

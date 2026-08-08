@@ -23,6 +23,10 @@ pub struct NatsServerConfig {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// JetStream replica count for buckets harnx creates on this cluster.
+    /// Defaults to 1 when absent; see `docs/nats-ha.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -39,6 +43,12 @@ impl NatsServerConfig {
     pub fn set_name(&mut self, name: impl Into<String>) {
         self.name = name.into();
     }
+
+    /// The JetStream replica count to actually use for this cluster's
+    /// buckets: the configured value, or 1 when unset.
+    pub fn resolved_replicas(&self) -> usize {
+        self.replicas.unwrap_or(1)
+    }
 }
 
 /// Resolve connection details for the reserved shared-local cluster.
@@ -47,14 +57,22 @@ impl NatsServerConfig {
 /// of dynamic config. A complete environment handoff takes precedence; without
 /// one, details come from the auto-managed shared broker.
 pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
-    let (url, token) = match (
+    let (url, token, replicas) = match (
         std::env::var(HARNX_NATS_URL_ENV).ok(),
         std::env::var(HARNX_NATS_TOKEN_ENV).ok(),
     ) {
-        (Some(url), Some(token)) => (url, token),
+        (Some(url), Some(token)) => {
+            // Only a complete handoff can mean "this is a real cluster an
+            // operator configured"; the auto-managed broker below is always a
+            // single embedded process, so it never reads this.
+            let replicas = std::env::var(HARNX_NATS_REPLICAS_ENV)
+                .ok()
+                .and_then(|value| value.parse().ok());
+            (url, token, replicas)
+        }
         (None, None) => {
             let server = crate::nats_local_server::ensure_shared_server().await?;
-            (server.url.clone(), server.token.clone())
+            (server.url.clone(), server.token.clone(), None)
         }
         _ => bail!("{HARNX_NATS_URL_ENV} and {HARNX_NATS_TOKEN_ENV} must be set together"),
     };
@@ -63,6 +81,7 @@ pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
         name: LOCAL_CLUSTER_KEY.to_string(),
         url,
         token: Some(token),
+        replicas,
         tls: None,
         tls_cert: None,
         tls_key: None,
@@ -194,6 +213,7 @@ impl From<&NatsServerConfig> for NatsEndpoint {
             name: server.name.clone(),
             url: server.url.clone(),
             token: server.token.clone(),
+            replicas: server.replicas,
             tls: server.tls,
             tls_cert: server.tls_cert.clone(),
             tls_key: server.tls_key.clone(),
@@ -301,6 +321,7 @@ mod tests {
             name: "local".into(),
             url: "nats://${NATS_TOKEN}@localhost:4222".into(),
             token: Some("${NATS_TOKEN}".into()),
+            replicas: None,
             tls: Some(true),
             tls_cert: Some("${NATS_CERT}".into()),
             tls_key: Some("${NATS_KEY}".into()),
@@ -366,6 +387,35 @@ agents:
     }
 
     #[test]
+    fn parses_replicas_from_cluster_config() {
+        let server: NatsServerConfig =
+            serde_yaml::from_str("url: nats://localhost:4222\nreplicas: 3\n")
+                .expect("parse cluster config");
+        assert_eq!(server.replicas, Some(3));
+    }
+
+    #[test]
+    fn replicas_defaults_to_none_when_absent() {
+        let server: NatsServerConfig =
+            serde_yaml::from_str("url: nats://localhost:4222\n").expect("parse");
+        assert_eq!(server.replicas, None);
+    }
+
+    #[test]
+    fn resolved_replicas_defaults_to_one_when_absent() {
+        let server: NatsServerConfig =
+            serde_yaml::from_str("url: nats://localhost:4222\n").expect("parse");
+        assert_eq!(server.resolved_replicas(), 1);
+    }
+
+    #[test]
+    fn resolved_replicas_uses_configured_value() {
+        let server: NatsServerConfig =
+            serde_yaml::from_str("url: nats://localhost:4222\nreplicas: 3\n").expect("parse");
+        assert_eq!(server.resolved_replicas(), 3);
+    }
+
+    #[test]
     fn nats_server_config_parses_without_agents_key_for_back_compat() {
         let config: NatsServerConfig = serde_yaml::from_str(
             r#"
@@ -389,6 +439,7 @@ tls: false
             name: "mtls".into(),
             url: "tls://localhost:4222".into(),
             token: None,
+            replicas: None,
             tls: Some(true),
             tls_cert: Some("/tmp/client-cert.pem".into()),
             tls_key: None,

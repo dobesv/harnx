@@ -58,6 +58,7 @@ fn local_nats_config(spec: NatsServerSpec<'_>) -> Config {
             name: spec.name.to_string(),
             url: spec.url.to_string(),
             token: spec.token.map(str::to_string),
+            replicas: None,
             tls: None,
             tls_cert: None,
             tls_key: None,
