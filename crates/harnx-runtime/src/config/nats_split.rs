@@ -1,14 +1,11 @@
 //! NATS cluster config loading and connection helpers.
 use super::*;
 use anyhow::{bail, Context, Result};
-use async_nats::{jetstream, ConnectOptions};
+use async_nats::jetstream;
 use harnx_core::agent_config::AgentRole;
+use harnx_nats_common::connect::NatsEndpoint;
 use serde::{Deserialize, Serialize};
-use std::{
-    borrow::Cow,
-    io::BufReader,
-    path::{Path, PathBuf},
-};
+use std::{borrow::Cow, path::Path};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteAgentEntry {
@@ -148,9 +145,11 @@ impl Config {
                 .with_context(|| format!("Failed to connect to NATS cluster at '{}'", server.url));
         }
 
-        let options = build_nats_connect_options(server).with_context(|| {
-            format!("Invalid auth/TLS config for NATS cluster '{}'", server.name)
-        })?;
+        let options = NatsEndpoint::from(server)
+            .connect_options()
+            .with_context(|| {
+                format!("Invalid auth/TLS config for NATS cluster '{}'", server.name)
+            })?;
         options
             .connect(&server.url)
             .await
@@ -187,147 +186,20 @@ impl NatsServerConfig {
     }
 }
 
-fn build_nats_connect_options(server: &NatsServerConfig) -> Result<ConnectOptions> {
-    let mut options = ConnectOptions::new();
-    options = apply_nats_auth_options(options, server);
-    options = apply_nats_tls_options(options, server)?;
-
-    if should_require_tls(server) {
-        options = options.require_tls(true);
-    }
-
-    Ok(options)
-}
-
-fn apply_nats_auth_options(
-    mut options: ConnectOptions,
-    server: &NatsServerConfig,
-) -> ConnectOptions {
-    if let Some(token) = &server.token {
-        options = options.token(token.clone());
-    }
-    options
-}
-
-fn apply_nats_tls_options(
-    mut options: ConnectOptions,
-    server: &NatsServerConfig,
-) -> Result<ConnectOptions> {
-    reject_unsupported_tls_combo(server)?;
-    options = apply_client_certificate_options(options, server)?;
-    if let Some(tls_client) = build_custom_tls_client_config(server)? {
-        options = options.tls_client_config(tls_client);
-    }
-    Ok(options)
-}
-
-fn reject_unsupported_tls_combo(server: &NatsServerConfig) -> Result<()> {
-    // A custom `tls_ca` builds a dedicated rustls ClientConfig (below) which
-    // replaces any client certificate registered via `add_client_certificate`.
-    // async-nats 0.42 has no way to attach both a custom root store AND a client
-    // cert through its high-level options, so reject the combination explicitly
-    // rather than silently dropping the client certificate (which would make
-    // mTLS fail at handshake time with a confusing error).
-    if has_client_certificate(server) && server.tls_ca.is_some() {
-        bail!(
-            "NATS cluster '{}' sets both tls_ca and a client certificate (tls_cert/tls_key); \
-             this combination is not supported (the custom CA would override the client cert). \
-             Use a server cert chained to a publicly-trusted CA for mTLS, or drop tls_ca.",
-            server.name
-        );
-    }
-    Ok(())
-}
-
-fn apply_client_certificate_options(
-    mut options: ConnectOptions,
-    server: &NatsServerConfig,
-) -> Result<ConnectOptions> {
-    match (&server.tls_cert, &server.tls_key) {
-        (Some(cert), Some(key)) => {
-            let cert_path = validate_tls_path(server, "tls_cert", cert)?;
-            let key_path = validate_tls_path(server, "tls_key", key)?;
-            options = options.add_client_certificate(cert_path, key_path);
-            Ok(options)
+/// Convert a config-file cluster entry into the connect-options builder
+/// shared with the standalone tool/hook servers.
+impl From<&NatsServerConfig> for NatsEndpoint {
+    fn from(server: &NatsServerConfig) -> Self {
+        Self {
+            name: server.name.clone(),
+            url: server.url.clone(),
+            token: server.token.clone(),
+            tls: server.tls,
+            tls_cert: server.tls_cert.clone(),
+            tls_key: server.tls_key.clone(),
+            tls_ca: server.tls_ca.clone(),
         }
-        (Some(_), None) => bail!(
-            "NATS cluster '{}' sets tls_cert but missing tls_key",
-            server.name
-        ),
-        (None, Some(_)) => bail!(
-            "NATS cluster '{}' sets tls_key but missing tls_cert",
-            server.name
-        ),
-        (None, None) => Ok(options),
     }
-}
-
-fn build_custom_tls_client_config(
-    server: &NatsServerConfig,
-) -> Result<Option<async_nats::rustls::ClientConfig>> {
-    let Some(ca_path) = &server.tls_ca else {
-        return Ok(None);
-    };
-
-    let ca_path = validate_tls_path(server, "tls_ca", ca_path)?;
-    let ca_file = std::fs::File::open(&ca_path).with_context(|| {
-        format!(
-            "Failed to read tls_ca '{}' for NATS cluster '{}'",
-            ca_path.display(),
-            server.name
-        )
-    })?;
-    let certs = rustls_pemfile::certs(&mut BufReader::new(ca_file))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| {
-            format!(
-                "Failed to parse PEM certificates from tls_ca '{}' for NATS cluster '{}'",
-                ca_path.display(),
-                server.name
-            )
-        })?;
-    let mut root_store = async_nats::rustls::RootCertStore::empty();
-    let (added, ignored) = root_store.add_parsable_certificates(certs);
-    if added == 0 {
-        bail!(
-            "Failed to parse tls_ca '{}' for NATS cluster '{}' (ignored {ignored} certs)",
-            ca_path.display(),
-            server.name
-        );
-    }
-    let tls_client = async_nats::rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    Ok(Some(tls_client))
-}
-
-fn has_client_certificate(server: &NatsServerConfig) -> bool {
-    server.tls_cert.is_some() || server.tls_key.is_some()
-}
-
-fn should_require_tls(server: &NatsServerConfig) -> bool {
-    server.tls.unwrap_or(false) || has_client_certificate(server) || server.tls_ca.is_some()
-}
-
-fn validate_tls_path(server: &NatsServerConfig, field: &str, value: &str) -> Result<PathBuf> {
-    let path = PathBuf::from(value);
-    if !path.exists() {
-        bail!(
-            "NATS cluster '{}' {} path '{}' does not exist",
-            server.name,
-            field,
-            path.display()
-        );
-    }
-    if !path.is_file() {
-        bail!(
-            "NATS cluster '{}' {} path '{}' is not a file",
-            server.name,
-            field,
-            path.display()
-        );
-    }
-    Ok(path)
 }
 
 fn expand_env_option(value: &mut Option<String>) {
@@ -507,8 +379,12 @@ tls: false
         assert!(config.agents.is_empty());
     }
 
-    #[test]
-    fn build_nats_connect_options_rejects_partial_client_cert_config() {
+    // The TLS/mTLS rejection cases themselves now live with the builder in
+    // `harnx-nats-common::connect` (see `connect_options.rs`); this test only
+    // checks that `connect_nats_server` still routes through it correctly.
+    #[tokio::test]
+    async fn connect_nats_server_rejects_partial_client_cert_config() {
+        harnx_core::require_nextest();
         let server = NatsServerConfig {
             name: "mtls".into(),
             url: "tls://localhost:4222".into(),
@@ -520,43 +396,13 @@ tls: false
             agents: vec![],
         };
 
-        let error = build_nats_connect_options(&server).unwrap_err().to_string();
+        // `{:#}` prints the full anyhow chain; `connect_nats_server` wraps the
+        // builder's error in its own "Invalid auth/TLS config" context, so a
+        // plain `.to_string()` would only show that outer message.
+        let error = format!(
+            "{:#}",
+            Config::connect_nats_server(&server).await.unwrap_err()
+        );
         assert_error_mentions(&error, &["tls_cert", "tls_key", "mtls"]);
-    }
-
-    #[test]
-    fn build_nats_connect_options_rejects_missing_tls_file() {
-        let server = NatsServerConfig {
-            name: "secure".into(),
-            url: "tls://localhost:4222".into(),
-            token: Some("token".into()),
-            tls: Some(true),
-            tls_cert: Some("/definitely/missing-cert.pem".into()),
-            tls_key: Some("/definitely/missing-key.pem".into()),
-            tls_ca: None,
-            agents: vec![],
-        };
-
-        let error = build_nats_connect_options(&server).unwrap_err().to_string();
-        assert_error_mentions(&error, &["does not exist", "tls_cert", "secure"]);
-    }
-
-    #[test]
-    fn build_nats_connect_options_rejects_custom_ca_with_client_cert() {
-        // async-nats 0.42 cannot attach both a custom root store and a client
-        // cert; the combination must be rejected, not silently dropped.
-        let server = NatsServerConfig {
-            name: "alb".into(),
-            url: "tls://localhost:4222".into(),
-            token: None,
-            tls: Some(true),
-            tls_cert: Some("/tmp/client-cert.pem".into()),
-            tls_key: Some("/tmp/client-key.pem".into()),
-            tls_ca: Some("/tmp/ca.pem".into()),
-            agents: vec![],
-        };
-
-        let error = build_nats_connect_options(&server).unwrap_err().to_string();
-        assert_error_mentions(&error, &["tls_ca", "not supported", "alb"]);
     }
 }

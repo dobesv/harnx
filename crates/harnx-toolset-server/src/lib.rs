@@ -30,8 +30,6 @@ pub const TOOL_REGISTRY_BUCKET: &str = "harnx_tool_registry";
 pub const TOOL_PROTOCOL_VERSION: u32 = 1;
 pub const TOOL_SCHEMA_VERSION: u32 = 1;
 
-const HARNX_NATS_URL: &str = "HARNX_NATS_URL";
-const HARNX_NATS_TOKEN: &str = "HARNX_NATS_TOKEN";
 const IDEMPOTENCY_CACHE_TTL: Duration = Duration::from_secs(60);
 const IDEMPOTENCY_CACHE_MAX_ENTRIES: usize = 1_024;
 const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -109,11 +107,16 @@ where
     T: Toolset + 'static,
 {
     harnx_core::server_logging::init_server_logger();
-    let client = async_nats::ConnectOptions::new()
-        .token(token.to_owned())
-        .connect(nats_url)
-        .await
-        .with_context(|| format!("connect to NATS at {nats_url}"))?;
+    let endpoint = harnx_nats_common::connect::NatsEndpoint {
+        name: "explicit".to_string(),
+        url: nats_url.to_string(),
+        token: Some(token.to_string()),
+        tls: None,
+        tls_cert: None,
+        tls_key: None,
+        tls_ca: None,
+    };
+    let client = endpoint.connect().await?;
     serve_with_client(Arc::new(toolset), instance_id, client).await
 }
 
@@ -548,15 +551,9 @@ where
             harnx_core::instance::StandaloneMode::McpStdio
         ))
     })?;
-    let nats_url =
-        std::env::var(HARNX_NATS_URL).with_context(|| format!("{HARNX_NATS_URL} is required"))?;
-    let token = std::env::var(HARNX_NATS_TOKEN)
-        .with_context(|| format!("{HARNX_NATS_TOKEN} is required"))?;
-    let client = async_nats::ConnectOptions::new()
-        .token(token)
-        .connect(&nats_url)
-        .await
-        .with_context(|| format!("connect to NATS at {nats_url}"))?;
+    let client = harnx_nats_common::connect::NatsEndpoint::from_env()?
+        .connect()
+        .await?;
     let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
     serve_with_shutdown(
         toolset,

@@ -13,8 +13,6 @@ use tokio_util::sync::CancellationToken;
 
 pub use harnx_hookset::HOOK_REGISTRY_BUCKET;
 
-const HARNX_NATS_URL: &str = "HARNX_NATS_URL";
-const HARNX_NATS_TOKEN: &str = "HARNX_NATS_TOKEN";
 const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -30,11 +28,16 @@ pub async fn serve_over_nats<H: Hook + 'static>(
     nats_url: &str,
     token: &str,
 ) -> Result<()> {
-    let client = async_nats::ConnectOptions::new()
-        .token(token.to_owned())
-        .connect(nats_url)
-        .await
-        .with_context(|| format!("connect to NATS at {nats_url}"))?;
+    let endpoint = harnx_nats_common::connect::NatsEndpoint {
+        name: "explicit".to_string(),
+        url: nats_url.to_string(),
+        token: Some(token.to_string()),
+        tls: None,
+        tls_cert: None,
+        tls_key: None,
+        tls_ca: None,
+    };
+    let client = endpoint.connect().await?;
     serve_with_client(Arc::new(hook), instance_id, client).await
 }
 
@@ -258,15 +261,9 @@ pub async fn run_hookset_main<H: Hook + 'static>(hook: H) -> Result<()> {
             harnx_core::instance::StandaloneMode::WorkerLaunched
         ))
     })?;
-    let nats_url =
-        std::env::var(HARNX_NATS_URL).with_context(|| format!("{HARNX_NATS_URL} is required"))?;
-    let token = std::env::var(HARNX_NATS_TOKEN)
-        .with_context(|| format!("{HARNX_NATS_TOKEN} is required"))?;
-    let client = async_nats::ConnectOptions::new()
-        .token(token)
-        .connect(&nats_url)
-        .await
-        .with_context(|| format!("connect to NATS at {nats_url}"))?;
+    let client = harnx_nats_common::connect::NatsEndpoint::from_env()?
+        .connect()
+        .await?;
     let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
     serve_with_shutdown(
         Arc::new(hook),

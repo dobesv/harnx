@@ -8,6 +8,7 @@ publish = false
 anyhow = { workspace = true }
 async-nats = { workspace = true }
 log = { workspace = true }
+rustls-pemfile = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 

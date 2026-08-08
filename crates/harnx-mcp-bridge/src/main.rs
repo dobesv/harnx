@@ -1,7 +1,9 @@
 use anyhow::Context;
 use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
 use harnx_mcp_bridge::{report_tools, Args, BridgeToolset};
-use harnx_toolset_server::serve_over_nats;
+use harnx_nats_common::connect::NatsEndpoint;
+use harnx_toolset_server::serve_with_client;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,11 +29,10 @@ async fn main() -> anyhow::Result<()> {
             harnx_core::instance::StandaloneMode::ListTools
         ))
     })?;
-    let nats_url = std::env::var("HARNX_NATS_URL").context("HARNX_NATS_URL is required")?;
-    let token = std::env::var("HARNX_NATS_TOKEN").context("HARNX_NATS_TOKEN is required")?;
+    let client = NatsEndpoint::from_env()?.connect().await?;
 
     tokio::select! {
-        result = serve_over_nats(bridge, InstanceId::from_string(instance_id), &nats_url, &token) => result,
+        result = serve_with_client(Arc::new(bridge), InstanceId::from_string(instance_id), client) => result,
         _ = child_died.cancelled() => {
             log::warn!("wrapped MCP child exited; shutting down bridge");
             anyhow::bail!("wrapped MCP child exited")
