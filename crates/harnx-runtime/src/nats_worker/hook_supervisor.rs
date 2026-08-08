@@ -3,7 +3,7 @@ use anyhow::{bail, Context, Result};
 use async_nats::jetstream::{self, kv, stream};
 use futures_util::StreamExt;
 use harnx_core::hooks::{HookConfig, HooksConfig};
-use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
+use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_hooks::executor::HARNX_PACKAGE_DIR_ENV;
 use harnx_hookset::{
     FailPolicy, HookRegistration, HookSpec, HARNX_HOOK_NAME, HOOK_EXPECTATIONS_BUCKET,
@@ -27,7 +27,7 @@ const MAX_HOOKS_PER_SUPERVISOR: usize = 999;
 #[derive(Clone)]
 pub struct HookServerStartConfig {
     client: async_nats::Client,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     nats_url: String,
     token: String,
     /// JetStream replica count for buckets this cluster's hook servers
@@ -38,7 +38,7 @@ pub struct HookServerStartConfig {
 impl HookServerStartConfig {
     pub fn new(
         client: async_nats::Client,
-        instance_id: InstanceId,
+        instance_id: ServerScope,
         nats_url: impl Into<String>,
         token: impl Into<String>,
     ) -> Self {
@@ -68,7 +68,7 @@ pub struct HookServerSupervisor {
     processes: Arc<Mutex<HashMap<u32, String>>>,
     tasks: Vec<JoinHandle<()>>,
     client: async_nats::Client,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     registrations: Vec<String>,
 }
 
@@ -178,7 +178,7 @@ struct HookMonitor {
     server: String,
     display_label: String,
     registration: HookRegistration,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     client: async_nats::Client,
     processes: Arc<Mutex<HashMap<u32, String>>>,
 }
@@ -424,7 +424,7 @@ fn spawn_hook_server(
     command
         .env(HARNX_PACKAGE_DIR_ENV, package_dir)
         .env(HARNX_HOOK_NAME, name)
-        .env(HARNX_INSTANCE_ID, config.instance_id.as_str())
+        .env(HARNX_SERVER_SCOPE, config.instance_id.as_str())
         .env(HARNX_NATS_URL_ENV, &config.nats_url)
         .env(HARNX_NATS_TOKEN_ENV, &config.token)
         .env(
@@ -504,7 +504,7 @@ fn crash_marker(mut registration: HookRegistration, display_label: String) -> Ho
 
 async fn replace_crashed_hook_route(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     server: &str,
     marker: HookRegistration,
 ) {
@@ -542,7 +542,7 @@ async fn replace_crashed_hook_route(
 
 struct CrashRouteContext<'a> {
     client: &'a async_nats::Client,
-    instance_id: &'a InstanceId,
+    instance_id: &'a ServerScope,
     server: &'a str,
     rejector_name: &'a str,
 }
@@ -700,7 +700,7 @@ fn fail_closed_rejector(server: &str, display_label: &str) -> HookRegistration {
 
 async fn publish_startup_rejector(
     store: &kv::Store,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     server: &str,
     display_label: &str,
 ) -> Result<()> {
@@ -742,7 +742,7 @@ where
 #[doc(hidden)]
 pub async fn publish_crash_rejector(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     server: &str,
     display_label: &str,
 ) -> Result<()> {
@@ -779,7 +779,7 @@ async fn publish_registration(
     Ok(())
 }
 
-async fn remove_registration(client: &async_nats::Client, instance_id: &InstanceId, server: &str) {
+async fn remove_registration(client: &async_nats::Client, instance_id: &ServerScope, server: &str) {
     let jetstream = jetstream::new(client.clone());
     let Ok(store) = jetstream.get_key_value(HOOK_REGISTRY_BUCKET).await else {
         return;
@@ -791,7 +791,7 @@ async fn remove_registration(client: &async_nats::Client, instance_id: &Instance
 
 async fn remove_registration_and_expectation(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     server: &str,
 ) {
     let jetstream = jetstream::new(client.clone());

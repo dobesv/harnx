@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use harnx_core::instance::InstanceId;
+use harnx_core::instance::ServerScope;
 use harnx_fs_tools::{FsServer, FsToolset, ListDirectoryParams, ReadFileParams};
 use harnx_tool_allow::ResolvedAllowlist;
 use harnx_toolset::{
@@ -123,7 +123,7 @@ fn request_headers(call_id: &str, idempotency_key: &str) -> async_nats::HeaderMa
 
 async fn wait_for_registration(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> Result<Registration> {
     let jetstream = async_nats::jetstream::new(client.clone());
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -143,7 +143,7 @@ async fn wait_for_registration(
 
 async fn invoke(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     tool: &str,
     args: Value,
 ) -> Result<ToolReply> {
@@ -173,7 +173,7 @@ fn assert_content_envelope(value: &Value) {
     );
 }
 
-async fn assert_registration(client: &async_nats::Client, instance_id: &InstanceId) -> Result<()> {
+async fn assert_registration(client: &async_nats::Client, instance_id: &ServerScope) -> Result<()> {
     let registration = wait_for_registration(client, instance_id).await?;
     assert_eq!(registration.server, "fs");
     assert_eq!(registration.tools.len(), 9);
@@ -201,7 +201,7 @@ async fn assert_registration(client: &async_nats::Client, instance_id: &Instance
 
 async fn assert_write_read_round_trip(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     root_path: &Path,
 ) -> Result<Value> {
     let file_arg = root_path
@@ -232,7 +232,7 @@ async fn assert_write_read_round_trip(
 
 async fn assert_out_of_root_denied(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> Result<()> {
     let outside = tempfile::tempdir().context("create out-of-root directory")?;
     let outside_file = outside.path().join("outside.txt");
@@ -253,7 +253,7 @@ async fn assert_out_of_root_denied(
 
 async fn assert_envelope_parity(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     root_path: &Path,
     read_value: Value,
 ) -> Result<()> {
@@ -298,7 +298,7 @@ async fn fs_toolset_round_trips_over_nats_with_bridge_envelope_parity() -> Resul
     let mut allowlist = ResolvedAllowlist::new();
     allowlist.insert_rwx(&root_path);
     let toolset = FsToolset::new(allowlist);
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let server_url = server.url.clone();
     let server_instance_id = instance_id.clone();
     let server_task = tokio::spawn(async move {

@@ -317,7 +317,7 @@ pub(crate) fn tool_servers_matching_use_tools(
 async fn start_local_tool_servers(
     daemon: &WorkerDaemonConfig,
     client: async_nats::Client,
-    instance_id: &harnx_core::instance::InstanceId,
+    instance_id: &harnx_core::instance::ServerScope,
     servers: &[crate::config::ToolServerConfig],
 ) -> Option<ToolServerSupervisor> {
     if daemon.cluster != LOCAL_CLUSTER_KEY {
@@ -342,7 +342,7 @@ async fn start_local_tool_servers(
 async fn start_global_hooks(
     daemon: &WorkerDaemonConfig,
     client: async_nats::Client,
-    instance_id: &harnx_core::instance::InstanceId,
+    instance_id: &harnx_core::instance::ServerScope,
     hooks: &harnx_core::hooks::HooksConfig,
 ) -> Option<HookServerSupervisor> {
     if daemon.cluster != LOCAL_CLUSTER_KEY || hooks.entries.is_empty() {
@@ -389,7 +389,7 @@ fn optional_tool_server<T>(result: Result<T>) -> Option<T> {
 struct SubagentToolsetStart {
     agent: String,
     cluster: String,
-    instance_id: harnx_core::instance::InstanceId,
+    instance_id: harnx_core::instance::ServerScope,
     client: async_nats::Client,
     jetstream: jetstream::Context,
     replicas: usize,
@@ -504,7 +504,7 @@ async fn launch_worker_services(
     config: &GlobalConfig,
     daemon: &WorkerDaemonConfig,
     startup: &WorkerStartup,
-    instance_id: &harnx_core::instance::InstanceId,
+    instance_id: &harnx_core::instance::ServerScope,
 ) -> Result<WorkerServices> {
     // Announce readiness before starting tool servers, hooks and sub-agent
     // toolsets. Those can take tens of seconds — or never finish, when a server
@@ -576,7 +576,7 @@ struct BackgroundServicesCtx {
     daemon: WorkerDaemonConfig,
     client: async_nats::Client,
     jetstream: jetstream::Context,
-    instance_id: harnx_core::instance::InstanceId,
+    instance_id: harnx_core::instance::ServerScope,
     slot: Arc<Mutex<Option<BackgroundServices>>>,
     tools_attempted: tokio::sync::watch::Sender<bool>,
     replicas: usize,
@@ -641,7 +641,7 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
 async fn retry_unregistered_tool_servers(
     supervisor: Option<ToolServerSupervisor>,
     client: async_nats::Client,
-    instance_id: &harnx_core::instance::InstanceId,
+    instance_id: &harnx_core::instance::ServerScope,
     servers: &[ToolServerConfig],
 ) -> Option<ToolServerSupervisor> {
     let mut supervisor = supervisor?;
@@ -689,7 +689,8 @@ pub async fn run_worker_daemon(
     mut daemon: WorkerDaemonConfig,
     call_fn: Option<crate::agent_loop::AgentCallFn>,
 ) -> Result<()> {
-    let instance_id = harnx_core::instance::InstanceId::new();
+    let instance_id = harnx_core::instance::ServerScope::new();
+    log::info!("serving under scope '{}'", instance_id.as_str());
     let startup = prepare_worker_startup(&config, &daemon).await?;
     // `WorkerDaemonConfig::new` has no cluster to resolve against yet, so its
     // lease config carries the bare default; now that `daemon.cluster` is
@@ -738,7 +739,7 @@ struct ControlListenerCtx<'a> {
 
 struct WorkerRuntime {
     config: GlobalConfig,
-    instance_id: harnx_core::instance::InstanceId,
+    instance_id: harnx_core::instance::ServerScope,
     _background_services: Arc<Mutex<Option<BackgroundServices>>>,
     tools_attempted: tokio::sync::watch::Receiver<bool>,
     #[allow(dead_code)]

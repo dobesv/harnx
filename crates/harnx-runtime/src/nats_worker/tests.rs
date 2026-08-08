@@ -1567,7 +1567,7 @@ async fn registered_agent_provider(
     .expect("worker did not register configured agents");
     let provider = crate::nats_tool_provider::NatsToolProvider::discover(
         config,
-        harnx_core::instance::InstanceId::from_string(instance_id.clone()),
+        harnx_core::instance::ServerScope::from_string(instance_id.clone()),
         crate::nats_tool_provider::NatsInFlightCalls::default(),
         None,
     )

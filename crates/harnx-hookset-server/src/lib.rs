@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv};
 use futures_util::{stream::select_all, StreamExt};
 use harnx_core::hooks::{HookOutcome, HookPayload, HookResult, HookResultControl};
-use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
+use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_hookset::{Hook, HookRegistration, HookSpec, HOOK_PROTOCOL_VERSION, HOOK_SCHEMA_VERSION};
 use harnx_nats_common::connect::NatsConnection;
 use std::collections::HashSet;
@@ -18,14 +18,14 @@ const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// KV key for one worker instance's hook server registration.
-pub fn hook_registration_key(instance_id: &InstanceId, server: &str) -> String {
+pub fn hook_registration_key(instance_id: &ServerScope, server: &str) -> String {
     format!("{instance_id}.{server}")
 }
 
 /// Host a hook over Core NATS request-reply and publish its KV registration.
 pub async fn serve_over_nats<H: Hook + 'static>(
     hook: H,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     nats_url: &str,
     token: &str,
 ) -> Result<()> {
@@ -53,7 +53,7 @@ pub async fn serve_over_nats<H: Hook + 'static>(
 /// Serve a hook using an existing NATS connection.
 pub async fn serve_with_client(
     hook: Arc<dyn Hook>,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     connection: NatsConnection,
 ) -> Result<()> {
     // Never cancelled: this entry point has no shutdown signal of its own, so
@@ -66,7 +66,7 @@ pub async fn serve_with_client(
 /// `shutdown` is cancelled, in addition to the usual failure exits.
 pub async fn serve_with_shutdown(
     hook: Arc<dyn Hook>,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     connection: NatsConnection,
     shutdown: CancellationToken,
 ) -> Result<()> {
@@ -135,7 +135,7 @@ pub async fn serve_with_shutdown(
 /// so the function stays under the argument-count limit.
 struct RegistrationRefresh<'a> {
     registry: &'a kv::Store,
-    instance_id: &'a InstanceId,
+    instance_id: &'a ServerScope,
     registration: &'a HookRegistration,
     interval: &'a mut tokio::time::Interval,
 }
@@ -251,7 +251,7 @@ pub async fn ensure_hook_registry_bucket(
 /// Publish one hook server registration.
 pub async fn publish_hook_registration(
     registry: &kv::Store,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     registration: &HookRegistration,
 ) -> Result<u64> {
     let key = hook_registration_key(instance_id, &registration.server);
@@ -269,11 +269,13 @@ pub async fn publish_hook_registration(
 /// a chance to remove its own registration instead of leaving it for the TTL.
 pub async fn run_hookset_main<H: Hook + 'static>(hook: H) -> Result<()> {
     harnx_core::server_logging::init_server_logger();
-    let instance_id = std::env::var(HARNX_INSTANCE_ID).map_err(|_| {
+    let instance_id = std::env::var(HARNX_SERVER_SCOPE).map_err(|_| {
         anyhow::anyhow!(harnx_core::instance::missing_scope_message(
             harnx_core::instance::StandaloneMode::WorkerLaunched
         ))
     })?;
+    let scope = ServerScope::from_string(instance_id);
+    log::info!("serving under scope '{}'", scope.as_str());
     let endpoint = harnx_nats_common::connect::NatsEndpoint::from_env()?;
     let client = endpoint.connect().await?;
     let connection = NatsConnection {
@@ -281,11 +283,5 @@ pub async fn run_hookset_main<H: Hook + 'static>(hook: H) -> Result<()> {
         replicas: endpoint.resolved_replicas(),
     };
     let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
-    serve_with_shutdown(
-        Arc::new(hook),
-        InstanceId::from_string(instance_id),
-        connection,
-        shutdown,
-    )
-    .await
+    serve_with_shutdown(Arc::new(hook), scope, connection, shutdown).await
 }

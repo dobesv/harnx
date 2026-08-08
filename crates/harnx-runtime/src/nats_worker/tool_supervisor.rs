@@ -10,7 +10,7 @@ use crate::nats_tool_provider::NatsInFlightCalls;
 use anyhow::{Context, Result};
 use async_nats::jetstream::kv;
 use harnx_core::event::{AgentEvent, NoticeEvent};
-use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
+use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_core::sink::emit_agent_event;
 use harnx_hooks::executor::HARNX_PACKAGE_DIR_ENV;
 use harnx_toolset::{server_identity_token, HARNX_SERVER_CONFIG, HARNX_SERVER_PACKAGE};
@@ -30,7 +30,7 @@ const TOOL_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Clone)]
 pub struct ToolServerStartConfig {
     client: async_nats::Client,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     nats_url: String,
     token: String,
     /// JetStream replica count for buckets this cluster's tool servers
@@ -45,7 +45,7 @@ pub struct ToolServerStartConfig {
 impl ToolServerStartConfig {
     pub fn new(
         client: async_nats::Client,
-        instance_id: InstanceId,
+        instance_id: ServerScope,
         nats_url: impl Into<String>,
         token: impl Into<String>,
     ) -> Self {
@@ -437,7 +437,7 @@ fn spawn_tool_server(config: &ToolServerStartConfig, server: &ToolServerConfig) 
             server.package.as_deref().unwrap_or_default(),
         )
         .env(HARNX_SERVER_CONFIG, &server.name)
-        .env(HARNX_INSTANCE_ID, config.instance_id.as_str())
+        .env(HARNX_SERVER_SCOPE, config.instance_id.as_str())
         .env(HARNX_NATS_URL_ENV, &config.nats_url)
         .env(HARNX_NATS_TOKEN_ENV, &config.token)
         .env(
@@ -486,7 +486,7 @@ struct ToolMonitor {
     server: String,
     package: Option<String>,
     config: String,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     client: async_nats::Client,
     processes: SupervisedProcesses,
     in_flight: NatsInFlightCalls,

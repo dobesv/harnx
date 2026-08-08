@@ -3,7 +3,7 @@ mod common;
 
 use anyhow::{Context, Result};
 use harnx_core::hooks::{HookConfig, HookEvent, HookResultControl, HooksConfig};
-use harnx_core::instance::InstanceId;
+use harnx_core::instance::ServerScope;
 use harnx_hookset::{FailPolicy, HookRegistration, HOOK_EXPECTATIONS_BUCKET, HOOK_REGISTRY_BUCKET};
 use harnx_hookset_server::hook_registration_key;
 use harnx_runtime::nats_hook_provider::{HookDispatchMeta, NatsHookProvider};
@@ -81,7 +81,7 @@ fn ensure_hook_server_binary() -> Result<PathBuf> {
 struct TestNatsContext {
     _server: common::NatsServerHandle,
     client: async_nats::Client,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     start: HookServerStartConfig,
 }
 
@@ -98,7 +98,7 @@ async fn test_nats_context() -> Result<Option<TestNatsContext>> {
         .token(TOKEN.to_string())
         .connect(server.url())
         .await?;
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let start =
         HookServerStartConfig::new(client.clone(), instance_id.clone(), server.url(), TOKEN);
     Ok(Some(TestNatsContext {
@@ -123,7 +123,7 @@ async fn create_store(
 
 async fn dispatch_pre_tool(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     request_id: RequestId<'_>,
 ) -> Result<harnx_core::hooks::HookOutcome> {
     dispatch_event(
@@ -141,7 +141,7 @@ async fn dispatch_pre_tool(
 
 async fn dispatch_user_prompt(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     request_id: RequestId<'_>,
 ) -> Result<harnx_core::hooks::HookOutcome> {
     dispatch_event(
@@ -157,7 +157,7 @@ async fn dispatch_user_prompt(
 
 async fn dispatch_event(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     request_id: RequestId<'_>,
     event: HookEvent,
 ) -> Result<harnx_core::hooks::HookOutcome> {
@@ -192,7 +192,7 @@ async fn wait_until_removed(store: &async_nats::jetstream::kv::Store, key: &str)
 async fn run_scope_transitions(
     start: &HookServerStartConfig,
     store: &async_nats::jetstream::kv::Store,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> Result<()> {
     let scopes = [
         ("global", "PreToolUse"),

@@ -4,7 +4,7 @@ mod common;
 use anyhow::{Context, Result};
 use harnx_core::abort::create_abort_signal;
 use harnx_core::agent_config::AgentConfig;
-use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
+use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_core::tool::ToolCall;
 use harnx_runtime::config::agent::Agent;
 use harnx_runtime::config::{
@@ -125,7 +125,7 @@ fn config_for(agent_config: &AgentConfig) -> GlobalConfig {
 
 async fn wait_for_fs_registration(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> Result<Registration> {
     let store = async_nats::jetstream::new(client.clone())
         .get_key_value(TOOL_REGISTRY_BUCKET)
@@ -147,7 +147,7 @@ async fn wait_for_fs_registration(
 
 async fn assert_schema_contains(
     config: &GlobalConfig,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     agent_config: &AgentConfig,
     expected_name: &str,
 ) {
@@ -165,7 +165,7 @@ async fn assert_schema_contains(
 
 struct ReadAssertion<'a> {
     config: &'a GlobalConfig,
-    instance_id: &'a InstanceId,
+    instance_id: &'a ServerScope,
     package: &'a str,
     visible_name: &'a str,
     file: &'a Path,
@@ -213,7 +213,7 @@ struct E2eServer {
     _temp: tempfile::TempDir,
     _env: EnvGuard,
     _supervisor: ToolServerSupervisor,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     file: PathBuf,
     expected_content: &'static str,
 }
@@ -235,11 +235,11 @@ async fn start_e2e_server() -> Result<Option<E2eServer>> {
         .token(TOKEN.to_string())
         .connect(nats.url())
         .await?;
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let env = EnvGuard::install(&[
         (HARNX_NATS_URL_ENV, nats.url()),
         (HARNX_NATS_TOKEN_ENV, TOKEN),
-        (HARNX_INSTANCE_ID, instance_id.as_str()),
+        (HARNX_SERVER_SCOPE, instance_id.as_str()),
     ]);
     let start = ToolServerStartConfig::new(client.clone(), instance_id.clone(), nats.url(), TOKEN);
     let servers = [fs_server_config(&binary, temp.path())];

@@ -17,7 +17,7 @@ use crate::config::{
 };
 use anyhow::{Context, Result};
 use futures_util::TryStreamExt;
-use harnx_core::instance::InstanceId;
+use harnx_core::instance::ServerScope;
 use harnx_toolset::{server_identity_token, Registration};
 use harnx_toolset_server::registration_key;
 use std::collections::HashMap;
@@ -78,7 +78,7 @@ pub async fn diagnose_tool_servers(config: &GlobalConfig) -> Result<String> {
         .connect(&url)
         .await
         .with_context(|| format!("connect to the local NATS broker at {url}"))?;
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
 
     let mut report = format!(
         "Starting {} tool server(s) as instance {instance_id}\n\
@@ -106,7 +106,7 @@ pub async fn diagnose_tool_servers(config: &GlobalConfig) -> Result<String> {
 /// Tool count per identity token currently registered for this instance.
 async fn registered_tool_counts(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     replicas: usize,
 ) -> HashMap<String, usize> {
     let mut counts = HashMap::new();

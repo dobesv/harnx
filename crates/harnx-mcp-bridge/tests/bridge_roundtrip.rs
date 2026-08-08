@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use anyhow::{Context, Result};
-use harnx_core::instance::InstanceId;
+use harnx_core::instance::ServerScope;
 use harnx_mcp_bridge::BridgeToolset;
 use harnx_runtime::server_identity::ServerIdentity;
 use harnx_toolset::{
@@ -150,7 +150,7 @@ fn mock_mcp_binary() -> Result<PathBuf> {
 
 async fn wait_for_registration(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     identity_token: &str,
 ) -> Result<Registration> {
     let jetstream = async_nats::jetstream::new(client.clone());
@@ -187,7 +187,7 @@ async fn bridge_registers_plans_and_round_trips_an_invoke() -> Result<()> {
         ],
     )
     .await?;
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let server_instance_id = instance_id.clone();
     let nats_url = server.url.clone();
     let server_task =
@@ -264,7 +264,7 @@ async fn bridge_registers_raw_search_and_worker_composes_visible_name() -> Resul
         ],
     )
     .await?;
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let server_instance_id = instance_id.clone();
     let nats_url = server.url.clone();
     let server_task =
@@ -353,7 +353,7 @@ async fn bridge_binary_exits_when_wrapped_child_dies() -> Result<()> {
         return Ok(());
     };
     let plans_dir = tempfile::tempdir().context("create temporary plans directory")?;
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let mut bridge = tokio::process::Command::new(env!("CARGO_BIN_EXE_harnx-mcp-bridge"));
     bridge
         .arg("--name")
@@ -363,7 +363,7 @@ async fn bridge_binary_exits_when_wrapped_child_dies() -> Result<()> {
         .arg("--mcp-stdio")
         .arg("--dir")
         .arg(plans_dir.path())
-        .env("HARNX_INSTANCE_ID", instance_id.as_str())
+        .env("HARNX_SERVER_SCOPE", instance_id.as_str())
         .env("HARNX_NATS_URL", &server.url)
         .env("HARNX_NATS_TOKEN", TOKEN)
         .stdin(Stdio::null())
@@ -451,7 +451,7 @@ fn spawn_stalled_nats_listener() -> Result<StalledNatsListener> {
 async fn bridge_binary_exits_when_wrapped_child_dies_during_stalled_nats_connect() -> Result<()> {
     let stalled = spawn_stalled_nats_listener()?;
     let plans_dir = tempfile::tempdir().context("create temporary plans directory")?;
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let mut bridge = tokio::process::Command::new(env!("CARGO_BIN_EXE_harnx-mcp-bridge"));
     bridge
         .arg("--name")
@@ -461,7 +461,7 @@ async fn bridge_binary_exits_when_wrapped_child_dies_during_stalled_nats_connect
         .arg("--mcp-stdio")
         .arg("--dir")
         .arg(plans_dir.path())
-        .env("HARNX_INSTANCE_ID", instance_id.as_str())
+        .env("HARNX_SERVER_SCOPE", instance_id.as_str())
         .env("HARNX_NATS_URL", &stalled.url)
         .env_remove("HARNX_NATS_TOKEN")
         .stdin(Stdio::null())

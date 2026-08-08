@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use harnx_core::abort::create_abort_signal;
 use harnx_core::event::{AgentEvent, AgentEventSink, NoticeEvent};
-use harnx_core::instance::InstanceId;
+use harnx_core::instance::ServerScope;
 use harnx_core::tool::{ToolCall, ToolError, ToolProvider};
 use harnx_runtime::config::{Config, ToolServerConfig, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
 use harnx_runtime::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
@@ -131,7 +131,7 @@ fn time_server_binary() -> Result<PathBuf> {
 
 async fn wait_until_registration_removed(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> Result<()> {
     let store = async_nats::jetstream::new(client.clone())
         .get_key_value(TOOL_REGISTRY_BUCKET)
@@ -152,7 +152,7 @@ async fn wait_until_registration_removed(
 async fn assert_pilot_registration(
     supervisor: &ToolServerSupervisor,
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> Result<u32> {
     let pids = supervisor.server_pids().await;
     let (&pid, server_name) = pids.iter().next().context("time server PID")?;
@@ -167,7 +167,7 @@ async fn assert_pilot_registration(
     Ok(pid)
 }
 
-async fn assert_nats_eval_batch(instance_id: &InstanceId) -> Result<()> {
+async fn assert_nats_eval_batch(instance_id: &ServerScope) -> Result<()> {
     let config = Arc::new(RwLock::new(Config::default()));
     let context = harnx_runtime::tool::build_tool_eval_context(
         harnx_runtime::tool::BuildToolEvalContextParams::new(&config, instance_id)
@@ -198,7 +198,7 @@ async fn assert_nats_eval_batch(instance_id: &InstanceId) -> Result<()> {
 async fn assert_cancel_control(
     provider: &NatsToolProvider,
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> Result<()> {
     let mut controls = client.subscribe(instance_id.control_subject()).await?;
     client.flush().await?;
@@ -230,7 +230,7 @@ async fn assert_crash_failure(
     provider: &NatsToolProvider,
     pid: u32,
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> Result<()> {
     let kill_task = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -294,7 +294,7 @@ async fn time_over_nats_pilot_e2e_eval_cancel_and_crash() -> Result<()> {
         .token(TOKEN.to_string())
         .connect(server.url())
         .await?;
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let start =
         ToolServerStartConfig::new(client.clone(), instance_id.clone(), server.url(), TOKEN);
     let servers = [time_server_config(&binary)];
@@ -320,7 +320,7 @@ struct ReadinessTestFixture {
     _server: common::NatsServerHandle,
     _directory: tempfile::TempDir,
     client: async_nats::Client,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     sink: Arc<RecordingEventSink>,
     supervisor: ToolServerSupervisor,
 }
@@ -349,7 +349,7 @@ async fn start_readiness_test(
         .token(TOKEN.to_string())
         .connect(server.url())
         .await?;
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let start =
         ToolServerStartConfig::new(client.clone(), instance_id.clone(), server.url(), TOKEN);
     let mut fake_server = time_server_config(fake_binary.to_string_lossy().into_owned());
@@ -451,7 +451,7 @@ fn packaged_time_servers(binary: &str) -> [ToolServerConfig; 2] {
 #[cfg(target_os = "linux")]
 async fn assert_packaged_registrations(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> Result<(async_nats::jetstream::kv::Store, String, String)> {
     let alpha_key = registration_key(
         instance_id,
@@ -478,7 +478,7 @@ async fn assert_packaged_registrations(
 }
 
 #[cfg(target_os = "linux")]
-async fn assert_distinct_time_routes(instance_id: &InstanceId) -> Result<()> {
+async fn assert_distinct_time_routes(instance_id: &ServerScope) -> Result<()> {
     let provider = NatsToolProvider::discover(
         &Config::default(),
         instance_id.clone(),
@@ -548,7 +548,7 @@ async fn same_named_packaged_servers_use_distinct_identities_and_cleanup() -> Re
         return Ok(());
     };
     let binary = time_server_binary()?.to_string_lossy().into_owned();
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let _env = EnvGuard::install(&[
         (HARNX_NATS_URL_ENV, nats.url()),
         (HARNX_NATS_TOKEN_ENV, TOKEN),
@@ -587,7 +587,7 @@ async fn missing_tool_server_binary_warns_and_continues() -> Result<()> {
         .token(TOKEN.to_string())
         .connect(server.url())
         .await?;
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let start = ToolServerStartConfig::new(client, instance_id, server.url(), TOKEN);
     let servers = [time_server_config(missing)];
     let sink = Arc::new(RecordingEventSink::default());

@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use clap::Parser;
-use harnx_core::instance::HARNX_INSTANCE_ID;
+use harnx_core::instance::HARNX_SERVER_SCOPE;
 use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
@@ -192,7 +192,7 @@ fn spawn_handshake_progress(server_name: &str) -> tokio::task::JoinHandle<()> {
 /// launched by a worker and switch to a NATS protocol — `harnx-proxy-auth`,
 /// run as a stdio hook by a sandbox shim, does exactly that and then never
 /// answers the stdio handshake, so the wrapped server is never launched at all.
-const WORKER_NATS_ENV: [&str; 3] = [HARNX_INSTANCE_ID, "HARNX_NATS_URL", "HARNX_NATS_TOKEN"];
+const WORKER_NATS_ENV: [&str; 3] = [HARNX_SERVER_SCOPE, "HARNX_NATS_URL", "HARNX_NATS_TOKEN"];
 
 fn spawn_child(server_name: &str, program: &str, args: &[String]) -> anyhow::Result<SpawnedChild> {
     let mut command = Command::new(program);
@@ -595,13 +595,13 @@ mod tests {
         unsafe {
             std::env::set_var("HARNX_NATS_URL", "nats://127.0.0.1:1");
             std::env::set_var("HARNX_NATS_TOKEN", "unused");
-            std::env::set_var(super::HARNX_INSTANCE_ID, "worker-instance");
+            std::env::set_var(super::HARNX_SERVER_SCOPE, "worker-instance");
         }
 
         // Stands in for the shim: refuse to exec the real server if any of the
         // worker's identity survived into the child.
         let guard = format!(
-            r#"if [ -n "${{HARNX_NATS_URL:-}}" ] || [ -n "${{HARNX_NATS_TOKEN:-}}" ]                  || [ -n "${{HARNX_INSTANCE_ID:-}}" ]; then exit 3; fi
+            r#"if [ -n "${{HARNX_NATS_URL:-}}" ] || [ -n "${{HARNX_NATS_TOKEN:-}}" ]                  || [ -n "${{HARNX_SERVER_SCOPE:-}}" ]; then exit 3; fi
                exec {} --mcp-stdio"#,
             binary.display()
         );

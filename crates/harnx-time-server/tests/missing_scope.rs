@@ -4,7 +4,7 @@ use std::process::Command;
 fn missing_scope_names_how_to_launch_the_binary() {
     harnx_core::require_nextest();
     let output = Command::new(env!("CARGO_BIN_EXE_harnx-time-server"))
-        .env_remove("HARNX_INSTANCE_ID")
+        .env_remove("HARNX_SERVER_SCOPE")
         .env("HARNX_NATS_URL", "nats://127.0.0.1:4222")
         .env("HARNX_NATS_TOKEN", "unused")
         .output()

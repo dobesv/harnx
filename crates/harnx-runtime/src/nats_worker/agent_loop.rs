@@ -26,7 +26,7 @@ pub struct RunAgentLoopArgs<'a> {
     pub cluster_key: &'a str,
     pub session_id: &'a str,
     pub config: GlobalConfig,
-    pub instance_id: harnx_core::instance::InstanceId,
+    pub instance_id: harnx_core::instance::ServerScope,
     pub initial_input: Input,
     pub abort_signal: AbortSignal,
     pub call_fn: Option<crate::agent_loop::AgentCallFn>,
@@ -163,7 +163,7 @@ pub(crate) fn build_mid_turn_injection_callback(
 
 struct RepairOrphanToolCallsArgs<'a> {
     config: GlobalConfig,
-    instance_id: &'a harnx_core::instance::InstanceId,
+    instance_id: &'a harnx_core::instance::ServerScope,
     fence_token: Option<u64>,
     worker_id: Option<String>,
     session_id: &'a str,
@@ -263,7 +263,7 @@ struct PrepareAgentSessionParams<'a> {
     cluster_key: &'a str,
     session_id: &'a str,
     config: &'a GlobalConfig,
-    instance_id: &'a harnx_core::instance::InstanceId,
+    instance_id: &'a harnx_core::instance::ServerScope,
     initial_input: &'a Input,
     abort_signal: &'a AbortSignal,
     lease: Option<&'a Arc<NatsSessionLease>>,
@@ -302,7 +302,7 @@ async fn prepare_agent_session(
 
 struct AgentContextParams {
     config: GlobalConfig,
-    instance_id: harnx_core::instance::InstanceId,
+    instance_id: harnx_core::instance::ServerScope,
     abort_signal: AbortSignal,
     call_fn: Option<crate::agent_loop::AgentCallFn>,
     on_tool_round: Option<OnToolRoundFn>,
@@ -421,7 +421,7 @@ struct AgentLoopSegmentArgs {
 async fn agent_hook_start_config(
     cluster_key: &str,
     jetstream: &jetstream::Context,
-    instance_id: &harnx_core::instance::InstanceId,
+    instance_id: &harnx_core::instance::ServerScope,
 ) -> Option<HookServerStartConfig> {
     if cluster_key != LOCAL_CLUSTER_KEY {
         return None;
@@ -646,7 +646,7 @@ fn abort_resume_if_fenced(
 struct LoadOrRepairSessionParams<'a> {
     backend: &'a NatsSessionLogBackend,
     config: &'a GlobalConfig,
-    instance_id: &'a harnx_core::instance::InstanceId,
+    instance_id: &'a harnx_core::instance::ServerScope,
     input: &'a Input,
     lease: Option<&'a NatsSessionLease>,
     session_index: Option<&'a async_nats::jetstream::kv::Store>,
@@ -733,7 +733,7 @@ async fn load_or_repair_session(
 struct RepairOrphanCallsParams<'a> {
     backend: &'a NatsSessionLogBackend,
     config: &'a GlobalConfig,
-    instance_id: &'a harnx_core::instance::InstanceId,
+    instance_id: &'a harnx_core::instance::ServerScope,
     lease: Option<&'a NatsSessionLease>,
     session_id: &'a str,
     abort_signal: &'a AbortSignal,
@@ -1000,7 +1000,7 @@ fn build_tool_repair_context(config: &GlobalConfig) -> ToolRepairContext {
 
 async fn build_orphan_tool_eval_context(
     config: &GlobalConfig,
-    instance_id: &harnx_core::instance::InstanceId,
+    instance_id: &harnx_core::instance::ServerScope,
     repair: &ToolRepairContext,
 ) -> crate::tool::ToolEvalContext {
     crate::tool::build_tool_eval_context(crate::tool::BuildToolEvalContextParams {
@@ -1336,7 +1336,7 @@ mod tests {
     use crate::nats_hook_provider::{DiscoveredHook, NatsHookProvider};
     use chrono::{TimeZone, Utc};
     use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResult, HookResultControl};
-    use harnx_core::instance::InstanceId;
+    use harnx_core::instance::ServerScope;
     use harnx_core::message::{MessageContent, MessageRole};
     use harnx_core::session::SessionLogEntry;
     use harnx_hookset::{FailPolicy, HookSpec};
@@ -1349,7 +1349,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&seen);
         let provider = NatsHookProvider::from_request_handler(
-            InstanceId::from_string("session-start-test"),
+            ServerScope::from_string("session-start-test"),
             vec![DiscoveredHook {
                 server: "lifecycle".to_string(),
                 display_label: None,

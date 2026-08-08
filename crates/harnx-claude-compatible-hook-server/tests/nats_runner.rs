@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use harnx_claude_compatible_hook_server::{Args, ClaudeCompatibleHook, CliFailPolicy};
 use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResultControl};
-use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
+use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_hookset::{HookRegistration, HARNX_HOOK_NAME};
 use harnx_hookset_server::{hook_registration_key, serve_over_nats, HOOK_REGISTRY_BUCKET};
 use serde_json::json;
@@ -99,7 +99,7 @@ async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
 
 async fn wait_for_registration(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     server_name: &str,
 ) -> Result<HookRegistration> {
     let jetstream = async_nats::jetstream::new(client.clone());
@@ -138,7 +138,7 @@ async fn command_hook_registers_and_answers_over_nats() -> Result<()> {
             .collect(),
         package_dir: None,
     })?;
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let server_instance_id = instance_id.clone();
     let server_url = server.url.clone();
     let server_task = tokio::spawn(async move {
@@ -187,7 +187,7 @@ async fn command_hook_uses_env_name_with_end_of_options_separator() -> Result<()
         return Ok(());
     };
     let assigned_name = "hook-env-name-000";
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let child = Command::new(env!("CARGO_BIN_EXE_harnx-claude-compatible-hook-server"))
         .args([
             "--event",
@@ -199,7 +199,7 @@ async fn command_hook_uses_env_name_with_end_of_options_separator() -> Result<()
             "{}",
         ])
         .env(HARNX_HOOK_NAME, assigned_name)
-        .env(HARNX_INSTANCE_ID, instance_id.as_str())
+        .env(HARNX_SERVER_SCOPE, instance_id.as_str())
         .env("HARNX_NATS_URL", &server.url)
         .env("HARNX_NATS_TOKEN", TOKEN)
         .stdin(Stdio::null())
@@ -256,7 +256,7 @@ async fn sigterm_removes_the_hook_registration() -> Result<()> {
         return Ok(());
     };
     let assigned_name = "hook-sigterm-000";
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let child = Command::new(env!("CARGO_BIN_EXE_harnx-claude-compatible-hook-server"))
         .args([
             "--event",
@@ -268,7 +268,7 @@ async fn sigterm_removes_the_hook_registration() -> Result<()> {
             "{}",
         ])
         .env(HARNX_HOOK_NAME, assigned_name)
-        .env(HARNX_INSTANCE_ID, instance_id.as_str())
+        .env(HARNX_SERVER_SCOPE, instance_id.as_str())
         .env("HARNX_NATS_URL", &server.url)
         .env("HARNX_NATS_TOKEN", TOKEN)
         .stdin(Stdio::null())

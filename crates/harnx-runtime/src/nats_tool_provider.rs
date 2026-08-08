@@ -4,7 +4,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
-use harnx_core::instance::InstanceId;
+use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_core::tool::{JsonSchema, ToolDeclaration, ToolError, ToolProvider};
 use harnx_toolset::{
     ControlKind, ControlMessage, Registration, ToolErrorPayload, ToolReply, ToolRequest, ToolSpec,
@@ -42,7 +42,7 @@ enum InFlightFailure {
 }
 
 type InFlightMap = Mutex<HashMap<String, InFlightCall>>;
-static INSTANCE_IN_FLIGHT: OnceLock<std::sync::Mutex<HashMap<InstanceId, Weak<InFlightMap>>>> =
+static INSTANCE_IN_FLIGHT: OnceLock<std::sync::Mutex<HashMap<ServerScope, Weak<InFlightMap>>>> =
     OnceLock::new();
 
 /// Shared handle used by tool-process supervision to fail active NATS calls.
@@ -58,7 +58,7 @@ struct InFlightCall {
 
 impl NatsInFlightCalls {
     /// Return the process-wide handle shared by provider and supervisor for an instance.
-    pub fn for_instance(instance_id: &InstanceId) -> Self {
+    pub fn for_instance(instance_id: &ServerScope) -> Self {
         let registry = INSTANCE_IN_FLIGHT.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
         let mut registry = registry
             .lock()
@@ -113,7 +113,7 @@ impl NatsInFlightCalls {
 /// Core-NATS tool provider built from one turn's KV registration snapshot.
 pub struct NatsToolProvider {
     client: async_nats::Client,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     parent_session_id: Option<String>,
     tools: HashMap<String, RegisteredTool>,
     registrations: Vec<Registration>,
@@ -128,7 +128,7 @@ impl NatsToolProvider {
     /// Connect through runtime config and snapshot registered tools for this instance.
     pub async fn discover(
         config: &Config,
-        instance_id: InstanceId,
+        instance_id: ServerScope,
         in_flight: NatsInFlightCalls,
         active_package: Option<&str>,
     ) -> anyhow::Result<Self> {
@@ -226,6 +226,19 @@ impl NatsToolProvider {
     }
     pub fn in_flight_calls(&self) -> NatsInFlightCalls {
         self.in_flight.clone()
+    }
+
+    /// Describe this snapshot's discovery for the zero-registration guard.
+    ///
+    /// Reuses the registrations already fetched by [`Self::discover`] instead
+    /// of re-scanning the registry, so callers on the per-turn refresh path
+    /// don't pay for another KV round trip just to log a diagnostic.
+    pub fn discovery_report(&self) -> DiscoveryReport {
+        let found = self.registrations.len();
+        DiscoveryReport {
+            found,
+            message: discovery_message(&self.instance_id, found),
+        }
     }
 
     async fn publish_cancel(&self, call_id: &str) -> anyhow::Result<()> {
@@ -482,12 +495,28 @@ impl ToolProvider for NatsToolProvider {
     }
 }
 
+/// Open the tool registry bucket, treating "it doesn't exist yet" as absent
+/// rather than an error — no tool server has ever registered against this
+/// cluster, which the caller reports as zero registrations, not a failure.
+async fn open_registry_store(
+    jetstream: &async_nats::jetstream::Context,
+) -> anyhow::Result<Option<async_nats::jetstream::kv::Store>> {
+    use async_nats::jetstream::context::KeyValueErrorKind;
+    match jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await {
+        Ok(store) => Ok(Some(store)),
+        Err(error) if error.kind() == KeyValueErrorKind::GetBucket => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn registration_snapshot(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> anyhow::Result<Vec<Registration>> {
     let jetstream = async_nats::jetstream::new(client.clone());
-    let store = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await?;
+    let Some(store) = open_registry_store(&jetstream).await? else {
+        return Ok(Vec::new());
+    };
     let mut keys = store.keys().await?;
     let prefix = format!("{instance_id}.");
     let mut registrations = Vec::new();
@@ -511,6 +540,49 @@ async fn registration_snapshot(
         }
     }
     Ok(registrations)
+}
+
+/// What a discovery pass found, so a zero result can explain itself.
+///
+/// A worker that finds no tool servers under its scope looks identical to a
+/// deployment with none configured; this makes the difference visible to
+/// whoever is watching the logs.
+pub struct DiscoveryReport {
+    pub found: usize,
+    pub message: String,
+}
+
+fn discovery_message(scope: &ServerScope, found: usize) -> String {
+    if found == 0 {
+        format!(
+            "no tool servers are registered under scope '{}'; the model will \
+             see built-in tools only. Check that the servers carry the same \
+             {HARNX_SERVER_SCOPE} value.",
+            scope.as_str()
+        )
+    } else {
+        format!(
+            "discovered {found} tool server(s) under scope '{}'",
+            scope.as_str()
+        )
+    }
+}
+
+/// Scan the registry for `scope` and describe the result.
+///
+/// Runs its own prefix scan rather than reusing a cached [`NatsToolProvider`],
+/// so it also works as a standalone check against a scope no provider has
+/// discovered yet.
+pub async fn describe_discovery(
+    client: &async_nats::Client,
+    scope: &ServerScope,
+) -> anyhow::Result<DiscoveryReport> {
+    let registrations = registration_snapshot(client, scope).await?;
+    let found = registrations.len();
+    Ok(DiscoveryReport {
+        found,
+        message: discovery_message(scope, found),
+    })
 }
 
 #[cfg(test)]

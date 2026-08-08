@@ -7,7 +7,7 @@
 #![cfg(unix)]
 
 use anyhow::{Context, Result};
-use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
+use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_toolset_server::registration_key;
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -135,9 +135,9 @@ async fn sigterm_removes_the_registration() -> Result<()> {
         return Ok(());
     };
 
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let child = Command::new(env!("CARGO_BIN_EXE_harnx-time-server"))
-        .env(HARNX_INSTANCE_ID, instance_id.as_str())
+        .env(HARNX_SERVER_SCOPE, instance_id.as_str())
         .env("HARNX_NATS_URL", &server.url)
         .env("HARNX_NATS_TOKEN", TOKEN)
         .stdin(Stdio::null())

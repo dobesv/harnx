@@ -6,7 +6,7 @@ pub mod schema;
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv};
 use futures_util::StreamExt;
-use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
+use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{
     server_identity_token, ControlKind, ControlMessage, Registration, ToolErrorPayload,
@@ -73,7 +73,7 @@ struct ValidatedToolRequest {
 /// so the function stays under the argument-count limit.
 struct RegistrationRefresh<'a> {
     registry: &'a kv::Store,
-    instance_id: &'a InstanceId,
+    instance_id: &'a ServerScope,
     registration: &'a Registration,
     interval: &'a mut tokio::time::Interval,
 }
@@ -93,14 +93,14 @@ struct ToolSubscriptions<'a> {
 }
 
 /// KV key for one worker instance's tool server registration.
-pub fn registration_key(instance_id: &InstanceId, identity_token: &str) -> String {
+pub fn registration_key(instance_id: &ServerScope, identity_token: &str) -> String {
     format!("{instance_id}.{identity_token}")
 }
 
 /// Host a toolset over Core NATS request-reply and publish its KV registration.
 pub async fn serve_over_nats<T>(
     toolset: T,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     nats_url: &str,
     token: &str,
 ) -> Result<()>
@@ -132,7 +132,7 @@ where
 /// Serve a toolset using an existing NATS connection.
 pub async fn serve_with_client(
     toolset: Arc<dyn Toolset>,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     connection: NatsConnection,
 ) -> Result<()> {
     // Never cancelled: this entry point has no shutdown signal of its own, so
@@ -145,7 +145,7 @@ pub async fn serve_with_client(
 /// `shutdown` is cancelled, in addition to the usual failure exits.
 pub async fn serve_with_shutdown(
     toolset: Arc<dyn Toolset>,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     connection: NatsConnection,
     shutdown: CancellationToken,
 ) -> Result<()> {
@@ -521,7 +521,7 @@ async fn ensure_registry_bucket(
 
 async fn publish_registration(
     registry: &kv::Store,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     registration: &Registration,
 ) -> Result<u64> {
     let identity_token = server_identity_token(
@@ -559,11 +559,13 @@ where
         return Ok(());
     }
 
-    let instance_id = std::env::var(HARNX_INSTANCE_ID).map_err(|_| {
+    let instance_id = std::env::var(HARNX_SERVER_SCOPE).map_err(|_| {
         anyhow::anyhow!(harnx_core::instance::missing_scope_message(
             harnx_core::instance::StandaloneMode::McpStdio
         ))
     })?;
+    let scope = ServerScope::from_string(instance_id);
+    log::info!("serving under scope '{}'", scope.as_str());
     let endpoint = harnx_nats_common::connect::NatsEndpoint::from_env()?;
     let client = endpoint.connect().await?;
     let connection = NatsConnection {
@@ -571,13 +573,7 @@ where
         replicas: endpoint.resolved_replicas(),
     };
     let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
-    serve_with_shutdown(
-        toolset,
-        InstanceId::from_string(instance_id),
-        connection,
-        shutdown,
-    )
-    .await
+    serve_with_shutdown(toolset, scope, connection, shutdown).await
 }
 
 #[derive(Clone)]

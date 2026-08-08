@@ -1,5 +1,5 @@
 use anyhow::Context;
-use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
+use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_mcp_bridge::{report_tools, Args, BridgeToolset};
 use harnx_nats_common::connect::{NatsConnection, NatsEndpoint};
 use harnx_toolset_server::serve_with_client;
@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
         .context("--name is required when serving over NATS")?;
     let bridge = BridgeToolset::new(name, args.child).await?;
     let child_died = bridge.child_died_token();
-    let instance_id = std::env::var(HARNX_INSTANCE_ID).map_err(|_| {
+    let instance_id = std::env::var(HARNX_SERVER_SCOPE).map_err(|_| {
         anyhow::anyhow!(harnx_core::instance::missing_scope_message(
             harnx_core::instance::StandaloneMode::ListTools
         ))
@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         };
         serve_with_client(
             Arc::new(bridge),
-            InstanceId::from_string(instance_id),
+            ServerScope::from_string(instance_id),
             connection,
         )
         .await

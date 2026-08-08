@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use harnx_core::instance::InstanceId;
+use harnx_core::instance::ServerScope;
 use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{
     ControlKind, ControlMessage, Registration, ToolInvokeError, ToolReply, ToolRequest, ToolSpec,
@@ -177,7 +177,7 @@ fn request_headers(call_id: &str, idempotency_key: &str) -> async_nats::HeaderMa
 
 async fn wait_for_registration(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> Result<Registration> {
     let jetstream = async_nats::jetstream::new(client.clone());
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -203,7 +203,7 @@ struct TestHarness {
     server_task: Option<tokio::task::JoinHandle<Result<()>>>,
     shutdown: CancellationToken,
     client: async_nats::Client,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     toolset: TestToolset,
 }
 
@@ -212,7 +212,7 @@ impl TestHarness {
         let Some(server) = spawn_nats_server().await? else {
             return Ok(None);
         };
-        let instance_id = InstanceId::new();
+        let instance_id = ServerScope::new();
         let toolset = TestToolset::default();
         let shutdown = CancellationToken::new();
         let server_client = async_nats::ConnectOptions::new()

@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResultControl};
-use harnx_core::instance::InstanceId;
+use harnx_core::instance::ServerScope;
 use harnx_hookset::{FailPolicy, HookRegistration};
 use harnx_hookset_server::{hook_registration_key, serve_over_nats, HOOK_REGISTRY_BUCKET};
 use harnx_proxy_auth::hook::ProxyAuthHook;
@@ -90,7 +90,7 @@ async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
 
 async fn wait_for_registration(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> Result<HookRegistration> {
     let jetstream = async_nats::jetstream::new(client.clone());
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -124,7 +124,7 @@ async fn proxy_auth_registers_and_mutates_tool_env_over_nats() -> Result<()> {
         ca_cert_path.clone(),
         extra_env,
     );
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let server_instance_id = instance_id.clone();
     let server_url = server.url.clone();
     let server_task =

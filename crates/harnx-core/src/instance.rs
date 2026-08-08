@@ -1,14 +1,22 @@
 use std::fmt;
 use uuid::Uuid;
 
-/// Environment variable used to pass a worker's instance ID to tool servers.
-pub const HARNX_INSTANCE_ID: &str = "HARNX_INSTANCE_ID";
+/// Environment variable naming the scope a server registers under.
+///
+/// Assigned by whoever provisions a set of servers — a worker for its own
+/// children, or the operator for an independently deployed set — and shared by
+/// every member of that set. It namespaces every NATS subject and registry key,
+/// so worker and servers must carry the same value.
+pub const HARNX_SERVER_SCOPE: &str = "HARNX_SERVER_SCOPE";
 
-/// Process-lifetime identifier shared by a worker and all of its tool servers.
+/// Conventional scope for independently deployed servers shared by all sessions.
+pub const SHARED_SCOPE: &str = "shared";
+
+/// Identifier shared by a set of servers and the worker that talks to them.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct InstanceId(String);
+pub struct ServerScope(String);
 
-impl InstanceId {
+impl ServerScope {
     /// Create a new ID from this process's PID and a random UUID nonce.
     pub fn new() -> Self {
         Self(format!("{}-{}", std::process::id(), Uuid::new_v4()))
@@ -41,8 +49,9 @@ impl InstanceId {
 
 /// How a server binary can be run without a worker supplying its scope.
 ///
-/// The three ways differ per binary, and a free-form string let a caller pass a
-/// hint that doesn't correspond to any real flag.
+/// The three ways to run standalone are fixed, so a free-form hint would let a
+/// caller pass text matching no real flag — an enum keeps the hint honest, and
+/// keeps this file under CodeScene's string-argument threshold.
 pub enum StandaloneMode {
     /// Toolset servers: serve MCP over stdio instead of registering over NATS.
     McpStdio,
@@ -70,22 +79,22 @@ impl StandaloneMode {
 pub fn missing_scope_message(mode: StandaloneMode) -> String {
     let standalone_hint = mode.hint();
     format!(
-        "{HARNX_INSTANCE_ID} is not set.\n\
+        "{HARNX_SERVER_SCOPE} is not set.\n\
          This binary normally runs as a child of harnx-worker, which supplies it.\n\
          To run it standalone, use {standalone_hint}.\n\
-         Do not set {HARNX_INSTANCE_ID} by hand: it namespaces every NATS \
+         Do not set {HARNX_SERVER_SCOPE} by hand: it namespaces every NATS \
          subject and registry key, so a value that does not match the worker's \
          leaves this server undiscoverable."
     )
 }
 
-impl Default for InstanceId {
+impl Default for ServerScope {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl fmt::Display for InstanceId {
+impl fmt::Display for ServerScope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
@@ -97,8 +106,8 @@ mod tests {
 
     #[test]
     fn instance_ids_are_unique_and_include_process_id() {
-        let first = InstanceId::new();
-        let second = InstanceId::new();
+        let first = ServerScope::new();
+        let second = ServerScope::new();
 
         assert_ne!(first, second);
         let pid_prefix = format!("{}-", std::process::id());
@@ -108,7 +117,7 @@ mod tests {
 
     #[test]
     fn instance_subjects_are_wire_versioned_and_instance_scoped() {
-        let instance_id = InstanceId::new();
+        let instance_id = ServerScope::new();
 
         assert_eq!(
             instance_id.tool_subject("time", "now"),
