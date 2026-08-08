@@ -29,10 +29,21 @@ async fn main() -> anyhow::Result<()> {
             harnx_core::instance::StandaloneMode::ListTools
         ))
     })?;
-    let client = NatsEndpoint::from_env()?.connect().await?;
+    // Keep the connect attempt inside the same race as `serve_with_client`:
+    // a slow/unreachable NATS cluster (bad DNS, stalled TLS handshake) must
+    // not block the bridge from noticing the wrapped child has already died.
+    let serve = async {
+        let client = NatsEndpoint::from_env()?.connect().await?;
+        serve_with_client(
+            Arc::new(bridge),
+            InstanceId::from_string(instance_id),
+            client,
+        )
+        .await
+    };
 
     tokio::select! {
-        result = serve_with_client(Arc::new(bridge), InstanceId::from_string(instance_id), client) => result,
+        result = serve => result,
         _ = child_died.cancelled() => {
             log::warn!("wrapped MCP child exited; shutting down bridge");
             anyhow::bail!("wrapped MCP child exited")

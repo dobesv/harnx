@@ -11,9 +11,10 @@ use harnx_toolset_server::{
     registration_key, serve_over_nats, TOOL_REGISTRY_BUCKET, TOOL_SCHEMA_VERSION,
 };
 use serde_json::json;
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -398,6 +399,117 @@ async fn bridge_binary_exits_when_wrapped_child_dies() -> Result<()> {
     anyhow::ensure!(
         !status.success(),
         "bridge binary exited successfully after wrapped MCP child died"
+    );
+    Ok(())
+}
+
+/// A NATS-shaped TCP listener that accepts connections but never sends the
+/// server's initial protocol greeting, so `connect()` against it blocks
+/// forever without ever producing an error.
+///
+/// A genuinely unroutable address was considered instead, but its timing is
+/// not reliable enough for a test: some sandboxes fail the connection
+/// immediately ("network unreachable"), others hang for the OS's SYN-retry
+/// timeout (minutes on Linux), and which happens depends on the network
+/// namespace the test runs in. A local listener that accepts and stalls
+/// reproduces "connect() never resolves" deterministically and fast,
+/// regardless of platform.
+struct StalledNatsListener {
+    url: String,
+    // Held so the accepted sockets aren't closed (a close would let the
+    // client's connect error out and defeat the point of this listener).
+    _connections: Arc<Mutex<Vec<TcpStream>>>,
+    _accept_thread: std::thread::JoinHandle<()>,
+}
+
+fn spawn_stalled_nats_listener() -> Result<StalledNatsListener> {
+    let listener = TcpListener::bind("127.0.0.1:0").context("bind stalled NATS listener")?;
+    let port = listener.local_addr()?.port();
+    let connections = Arc::new(Mutex::new(Vec::new()));
+    let accepted = Arc::clone(&connections);
+    let accept_thread = std::thread::spawn(move || {
+        while let Ok((stream, _addr)) = listener.accept() {
+            accepted
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(stream);
+        }
+    });
+    Ok(StalledNatsListener {
+        url: format!("nats://127.0.0.1:{port}"),
+        _connections: connections,
+        _accept_thread: accept_thread,
+    })
+}
+
+/// Regression test for the initial NATS connect falling out of the
+/// child-death race: before the fix, `main` awaited `NatsEndpoint::connect()`
+/// as a plain step before the `tokio::select!` against `child_died`, so a
+/// child that died while the connect was still stalled left the bridge
+/// blocked instead of exiting.
+#[tokio::test(flavor = "multi_thread")]
+async fn bridge_binary_exits_when_wrapped_child_dies_during_stalled_nats_connect() -> Result<()> {
+    let stalled = spawn_stalled_nats_listener()?;
+    let plans_dir = tempfile::tempdir().context("create temporary plans directory")?;
+    let instance_id = InstanceId::new();
+    let mut bridge = tokio::process::Command::new(env!("CARGO_BIN_EXE_harnx-mcp-bridge"));
+    bridge
+        .arg("--name")
+        .arg("plans")
+        .arg("--")
+        .arg(plans_binary()?)
+        .arg("--mcp-stdio")
+        .arg("--dir")
+        .arg(plans_dir.path())
+        .env("HARNX_INSTANCE_ID", instance_id.as_str())
+        .env("HARNX_NATS_URL", &stalled.url)
+        .env_remove("HARNX_NATS_TOKEN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    let mut bridge = bridge.spawn().context("spawn harnx-mcp-bridge binary")?;
+    let bridge_pid = bridge.id().context("get bridge process ID")?;
+
+    // The wrapped child finishes its MCP handshake (and so shows up under the
+    // bridge in /proc) well before the stalled connect could ever resolve on
+    // its own; once it's there, the bridge is parked in `connect()`.
+    let child_deadline = Instant::now() + Duration::from_secs(10);
+    let wrapped_child_pid = loop {
+        match direct_child_pid(bridge_pid) {
+            Ok(pid) => break pid,
+            Err(_) if Instant::now() < child_deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    // SAFETY: wrapped_child_pid was read from the bridge process's direct children.
+    anyhow::ensure!(
+        unsafe { libc::kill(wrapped_child_pid as libc::pid_t, libc::SIGKILL) } == 0,
+        "kill wrapped MCP child {wrapped_child_pid}: {}",
+        std::io::Error::last_os_error()
+    );
+
+    // A tight deadline, not a fixed sleep, and deliberately shorter than
+    // async-nats's own 5s default `connection_timeout`: with the race intact
+    // this resolves in well under a second via the child-death branch. With
+    // the regression (connect awaited outside the select) the bridge instead
+    // blocks until that internal 5s timeout fires on its own, which this
+    // deadline is short enough to catch.
+    let status = match tokio::time::timeout(Duration::from_secs(2), bridge.wait()).await {
+        Ok(status) => status.context("wait for bridge binary")?,
+        Err(_) => {
+            let _ = bridge.kill().await;
+            let _ = bridge.wait().await;
+            anyhow::bail!(
+                "bridge binary did not exit promptly after wrapped MCP child died during a stalled NATS connect"
+            );
+        }
+    };
+    anyhow::ensure!(
+        !status.success(),
+        "bridge binary exited successfully after wrapped MCP child died during a stalled NATS connect"
     );
     Ok(())
 }
