@@ -54,6 +54,30 @@ pub async fn ensure_bucket_with_ttl(
         .with_context(|| format!("open KV bucket '{bucket}'"))
 }
 
+/// Raise (or lower) just the replica count on an existing bucket's stream,
+/// leaving every other stream setting untouched. A no-op, reported as `Ok`,
+/// when the count already matches.
+///
+/// For buckets whose expiry isn't TTL-based (`harnx_leases` uses tombstone
+/// limit markers instead of `max_age`; `harnx_sessions` has no expiry at
+/// all) and so don't go through [`ensure_bucket_with_ttl`], but still need
+/// the same "an operator raised `replicas` after this bucket already
+/// existed" reconcile that `ensure_bucket_with_ttl` gives TTL-based buckets.
+pub async fn reconcile_bucket_replicas(
+    jetstream: &jetstream::Context,
+    bucket: &str,
+    num_replicas: usize,
+) -> Result<()> {
+    let stream_name = format!("KV_{bucket}");
+    let mut config = fetch_stream_config(jetstream, &stream_name).await?;
+    if config.num_replicas == num_replicas {
+        return Ok(());
+    }
+    let current_replicas = config.num_replicas;
+    config.num_replicas = num_replicas;
+    update_stream_reporting_replicas(jetstream, &stream_name, config, current_replicas).await
+}
+
 /// Bring an existing bucket's stream up to the requested TTL and replica
 /// count, in one `update_stream` call. Both drift independently of bucket
 /// creation: TTL predates this reconcile path, and replicas can be raised
@@ -66,15 +90,7 @@ async fn reconcile_bucket_config(
     num_replicas: usize,
 ) -> Result<()> {
     let stream_name = format!("KV_{bucket}");
-    let mut config = jetstream
-        .get_stream(&stream_name)
-        .await
-        .with_context(|| format!("get stream '{stream_name}'"))?
-        .info()
-        .await
-        .with_context(|| format!("stream info for '{stream_name}'"))?
-        .config
-        .clone();
+    let mut config = fetch_stream_config(jetstream, &stream_name).await?;
     let current_replicas = config.num_replicas;
     if config.max_age == ttl && current_replicas == num_replicas {
         return Ok(());
@@ -87,13 +103,39 @@ async fn reconcile_bucket_config(
         config.duplicate_window = ttl;
     }
     config.num_replicas = num_replicas;
-    // Changing replicas is a Raft peer-set change, not a metadata tweak: the
-    // server rejects it outright when the cluster can't support the new
-    // count (there's nothing to retry or wait for), so this is one attempt,
-    // reported by the caller rather than retried here.
+    update_stream_reporting_replicas(jetstream, &stream_name, config, current_replicas).await
+}
+
+async fn fetch_stream_config(
+    jetstream: &jetstream::Context,
+    stream_name: &str,
+) -> Result<stream::Config> {
+    Ok(jetstream
+        .get_stream(stream_name)
+        .await
+        .with_context(|| format!("get stream '{stream_name}'"))?
+        .info()
+        .await
+        .with_context(|| format!("stream info for '{stream_name}'"))?
+        .config
+        .clone())
+}
+
+/// Apply a stream config change that includes a replica-count change.
+/// Changing replicas is a Raft peer-set change, not a metadata tweak: the
+/// server rejects it outright when the cluster can't support the new count
+/// (there's nothing to retry or wait for), so this is one attempt, reported
+/// by the caller rather than retried here.
+async fn update_stream_reporting_replicas(
+    jetstream: &jetstream::Context,
+    stream_name: &str,
+    config: stream::Config,
+    current_replicas: usize,
+) -> Result<()> {
+    let requested_replicas = config.num_replicas;
     jetstream.update_stream(config).await.with_context(|| {
         format!(
-            "set max_age and replicas on '{stream_name}' (currently {current_replicas}, requested {num_replicas})"
+            "update '{stream_name}' (replicas currently {current_replicas}, requested {requested_replicas})"
         )
     })?;
     Ok(())

@@ -332,11 +332,17 @@ pub async fn lease_holder_in(
         .with_context(|| format!("Failed to decode NATS lease record for session '{session_id}'"))
 }
 
+/// Open the lease bucket, creating it at `config.replicas` if it doesn't
+/// exist yet, or raising an existing bucket's replica count to match if an
+/// operator changed cluster config after the bucket was first created. This
+/// is the split-brain guard every session write is fenced against, so a
+/// bucket stuck at R=1 on a cluster configured for R=3 defeats the point of
+/// running a cluster at all.
 async fn ensure_lease_bucket(
     jetstream: &jetstream::Context,
     config: &NatsLeaseConfig,
 ) -> Result<kv::Store> {
-    match jetstream
+    let create = jetstream
         .create_key_value(kv::Config {
             bucket: config.bucket.clone(),
             history: 1,
@@ -345,20 +351,37 @@ async fn ensure_lease_bucket(
             storage: stream::StorageType::File,
             ..Default::default()
         })
-        .await
-    {
-        Ok(bucket) => Ok(bucket),
-        Err(_) => jetstream
-            .get_key_value(&config.bucket)
-            .await
-            .map_err(anyhow::Error::from)
-            .with_context(|| {
-                format!(
-                    "Failed to create or open NATS lease bucket '{}'",
-                    config.bucket
-                )
-            }),
+        .await;
+    if let Ok(bucket) = create {
+        return Ok(bucket);
     }
+
+    if let Err(error) = harnx_nats_common::registry::reconcile_bucket_replicas(
+        jetstream,
+        &config.bucket,
+        config.replicas,
+    )
+    .await
+    {
+        // A read-only or permission-limited connection can still use the
+        // bucket; losing the intended replica count is a degradation, not a
+        // failure to start.
+        log::warn!(
+            "could not reconcile replicas for lease bucket '{}': {error:#}",
+            config.bucket
+        );
+    }
+
+    jetstream
+        .get_key_value(&config.bucket)
+        .await
+        .map_err(anyhow::Error::from)
+        .with_context(|| {
+            format!(
+                "Failed to create or open NATS lease bucket '{}'",
+                config.bucket
+            )
+        })
 }
 
 fn spawn_renew_task(params: RenewTaskParams) -> JoinHandle<()> {

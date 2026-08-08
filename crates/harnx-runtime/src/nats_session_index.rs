@@ -3,7 +3,6 @@
 //! Session Header is canonical source of this metadata. This index stores a
 //! denormalized copy for enumeration only.
 
-use crate::config::DEFAULT_BUCKET_REPLICAS;
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv, stream};
 use futures_util::StreamExt;
@@ -29,26 +28,44 @@ pub fn session_index_key(session_id: &str) -> String {
     format!("sessions/{session_id}/meta")
 }
 
-pub async fn ensure_index_bucket(jetstream: &jetstream::Context) -> Result<kv::Store> {
-    match jetstream
+/// Open the session index bucket, creating it at `replicas` if it doesn't
+/// exist yet, or raising an existing bucket's replica count to match if an
+/// operator changed cluster config after the bucket was first created.
+pub async fn ensure_index_bucket(
+    jetstream: &jetstream::Context,
+    replicas: usize,
+) -> Result<kv::Store> {
+    let create = jetstream
         .create_key_value(kv::Config {
             bucket: SESSION_INDEX_BUCKET.to_string(),
             history: 1,
-            num_replicas: DEFAULT_BUCKET_REPLICAS,
+            num_replicas: replicas,
             storage: stream::StorageType::File,
             ..Default::default()
         })
-        .await
-    {
-        Ok(bucket) => Ok(bucket),
-        Err(_) => jetstream
-            .get_key_value(SESSION_INDEX_BUCKET)
-            .await
-            .map_err(anyhow::Error::from)
-            .with_context(|| {
-                format!("Failed to open session index bucket '{SESSION_INDEX_BUCKET}'")
-            }),
+        .await;
+    if let Ok(bucket) = create {
+        return Ok(bucket);
     }
+
+    if let Err(error) = harnx_nats_common::registry::reconcile_bucket_replicas(
+        jetstream,
+        SESSION_INDEX_BUCKET,
+        replicas,
+    )
+    .await
+    {
+        // A read-only or permission-limited connection can still use the
+        // bucket; losing the intended replica count is a degradation, not a
+        // failure to start.
+        log::warn!("could not reconcile replicas for bucket '{SESSION_INDEX_BUCKET}': {error:#}");
+    }
+
+    jetstream
+        .get_key_value(SESSION_INDEX_BUCKET)
+        .await
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("Failed to open session index bucket '{SESSION_INDEX_BUCKET}'"))
 }
 
 pub async fn put_record(store: &kv::Store, record: &SessionIndexRecord) -> Result<u64> {
@@ -237,7 +254,7 @@ mod tests {
 
     /// Ensure the session index bucket exists for testing.
     async fn ensure_test_bucket(jetstream: &async_nats::jetstream::Context) -> Store {
-        super::ensure_index_bucket(jetstream)
+        super::ensure_index_bucket(jetstream, 1)
             .await
             .expect("ensure bucket")
     }

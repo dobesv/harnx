@@ -346,7 +346,7 @@ mod tests {
         let cluster = unique_cluster_name("stale-delete");
         let config = test_config(&cluster, &server_url);
         let jetstream = config.nats_jetstream(&cluster).await.expect("jetstream");
-        let index_store = nats_session_index::ensure_index_bucket(&jetstream)
+        let index_store = nats_session_index::ensure_index_bucket(&jetstream, 1)
             .await
             .expect("index bucket");
         let lease_store = config
@@ -386,7 +386,7 @@ mod tests {
         let cluster = unique_cluster_name("fresh-keep");
         let config = test_config(&cluster, &server_url);
         let jetstream = config.nats_jetstream(&cluster).await.expect("jetstream");
-        let index_store = nats_session_index::ensure_index_bucket(&jetstream)
+        let index_store = nats_session_index::ensure_index_bucket(&jetstream, 1)
             .await
             .expect("index bucket");
         let session_id = unique_session_id("fresh-keep");
@@ -421,7 +421,7 @@ mod tests {
         let cluster = unique_cluster_name("lease-skip");
         let config = test_config(&cluster, &server_url);
         let jetstream = config.nats_jetstream(&cluster).await.expect("jetstream");
-        let index_store = nats_session_index::ensure_index_bucket(&jetstream)
+        let index_store = nats_session_index::ensure_index_bucket(&jetstream, 1)
             .await
             .expect("index bucket");
         let session_id = unique_session_id("lease-skip");
@@ -475,7 +475,7 @@ mod tests {
         let cluster = unique_cluster_name("leader-race");
         let config = test_config(&cluster, &server_url);
         let jetstream = config.nats_jetstream(&cluster).await.expect("jetstream");
-        let index_store = nats_session_index::ensure_index_bucket(&jetstream)
+        let index_store = nats_session_index::ensure_index_bucket(&jetstream, 1)
             .await
             .expect("index bucket");
         let session_id = unique_session_id("leader-race");

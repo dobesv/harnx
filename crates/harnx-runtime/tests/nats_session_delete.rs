@@ -55,7 +55,7 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
     let lease_key = NatsLeaseConfig::default().key_for_session(session_id);
     lease.stop_renewal_for_test().await;
 
-    let index_store = ensure_index_bucket(&jetstream).await?;
+    let index_store = ensure_index_bucket(&jetstream, 1).await?;
     let index_record = SessionIndexRecord {
         session_id: session_id.to_string(),
         agent_name: "oracle".to_string(),
@@ -104,6 +104,29 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
 
     delete_record(&index_store, session_id).await.ok();
 
+    Ok(())
+}
+
+/// Raising replicas on the session index bucket after it already exists
+/// must not fail startup, same as the lease and tool/hook registry buckets.
+/// Does not exercise a genuine "the cluster refused the raise" rejection —
+/// see `harnx-nats-common`'s `registry_ttl.rs` tests for why a single-node
+/// test server can't demonstrate that for an existing stream.
+#[tokio::test]
+async fn session_index_bucket_raising_replicas_does_not_fail_startup() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let config = local_nats_config(server.url());
+    let jetstream = config.nats_jetstream("local").await?;
+
+    ensure_index_bucket(&jetstream, 1)
+        .await
+        .context("create session index bucket at replicas=1")?;
+    ensure_index_bucket(&jetstream, 3)
+        .await
+        .context("raising replicas on an existing bucket must not fail startup")?;
     Ok(())
 }
 

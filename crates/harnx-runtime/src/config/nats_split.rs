@@ -130,7 +130,12 @@ impl Config {
             })
     }
 
-    async fn resolve_nats_server<'a>(
+    /// Resolve one cluster's config, whether it's a reserved dynamic identity
+    /// (`LOCAL_CLUSTER_KEY`) or a `nats_servers/<cluster_key>.yaml` entry.
+    ///
+    /// `pub(crate)` rather than private: `nats_worker::daemon` needs the
+    /// resolved `replicas` value before it connects, not just a client.
+    pub(crate) async fn resolve_nats_server<'a>(
         &'a self,
         cluster_key: &str,
     ) -> Result<Cow<'a, NatsServerConfig>> {

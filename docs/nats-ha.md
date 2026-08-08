@@ -29,15 +29,29 @@ below) so the buckets harnx creates survive losing a node.
 
 ### JetStream Resources
 Harnx automatically manages the following JetStream resources:
-- **KV Bucket**: `harnx_leases` (Stores session leases with TTL).
+- **KV Bucket**: `harnx_leases` — session leases with TTL. This is the
+  split-brain guard: every durable write is fenced on the lease's KV
+  revision, and a worker that loses its lease aborts. If this bucket can't
+  survive a node loss, neither can a session mid-turn on that node.
+- **KV Bucket**: `harnx_sessions` — the session enumeration index.
 - **KV Buckets**: `harnx_tool_registry` and the hook registry/expectations
-  buckets (tool/hook server discovery, also TTL'd).
+  buckets — tool/hook server discovery, also TTL'd.
 - **Streams**: `SESSION_<id>` (Subject: `sessions.{id}.log`) stores the durable append-only session history.
 
-The tool and hook registry buckets are created with the `replicas` count from
-the cluster's config (`None` means 1, no HA). Set it to 3 to match a 3-node
-cluster; a mismatch between the two is what leaves a registry unable to
+All of the KV buckets above are created with the `replicas` count from the
+cluster's config (`None` means 1, no HA). Set it to 3 to match a 3-node
+cluster; a mismatch between the two is what leaves a bucket unable to
 tolerate a node loss.
+
+**A bucket that has never existed before is created, not reconciled**, so
+`replicas` above what the cluster can actually provide (e.g. a production
+`replicas: 3` config pointed at a single-node dev server, before any of
+these buckets exist) makes creation fail outright, and harnx will not start
+against that cluster. This is intentional: failing loudly on a
+misconfiguration is better than silently running at `replicas: 1` while an
+operator believes they have HA. It only affects buckets that don't exist
+yet — a bucket created earlier at `replicas: 1` and later pointed at a
+`replicas: 3` config gets its replica count raised in place instead.
 
 ## Configuration
 

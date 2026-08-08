@@ -206,17 +206,22 @@ struct WorkerStartup {
     jetstream: jetstream::Context,
     client: async_nats::Client,
     consumer: jetstream::consumer::Consumer<pull::Config>,
+    /// JetStream replica count for `daemon.cluster`, resolved once here so
+    /// every bucket this worker creates (leases, session index, tool/hook
+    /// registries) agrees on it instead of drifting to a per-site default.
+    replicas: usize,
 }
 
 async fn prepare_worker_startup(
     config: &GlobalConfig,
     daemon: &WorkerDaemonConfig,
 ) -> Result<WorkerStartup> {
-    let (jetstream, client) = {
+    let (jetstream, client, replicas) = {
         let cfg = config.read().clone();
         let jetstream = cfg.nats_jetstream(&daemon.cluster).await?;
         let client = cfg.nats_client(&daemon.cluster).await?;
-        (jetstream, client)
+        let replicas = cfg.resolve_nats_server(&daemon.cluster).await?.replicas;
+        (jetstream, client, replicas.unwrap_or(1))
     };
     let subject = notify_subject(&daemon.cluster);
     let stream = ensure_notify_stream(&jetstream, &daemon.cluster, &subject).await?;
@@ -240,6 +245,7 @@ async fn prepare_worker_startup(
         jetstream,
         client,
         consumer,
+        replicas,
     })
 }
 
@@ -266,8 +272,9 @@ fn spawn_readiness_publisher(client: async_nats::Client, daemon: &WorkerDaemonCo
 
 async fn optional_session_index(
     jetstream: &jetstream::Context,
+    replicas: usize,
 ) -> Option<async_nats::jetstream::kv::Store> {
-    match nats_session_index::ensure_index_bucket(jetstream).await {
+    match nats_session_index::ensure_index_bucket(jetstream, replicas).await {
         Ok(store) => Some(store),
         Err(error) => {
             log::warn!(
@@ -377,13 +384,26 @@ fn optional_tool_server<T>(result: Result<T>) -> Option<T> {
     }
 }
 
-async fn start_subagent_toolset(
+/// Everything [`start_subagent_toolset`] needs, bundled so adding `replicas`
+/// didn't push it to a 6th bare argument.
+struct SubagentToolsetStart {
     agent: String,
     cluster: String,
     instance_id: harnx_core::instance::InstanceId,
     client: async_nats::Client,
     jetstream: jetstream::Context,
-) -> Result<JoinHandle<Result<()>>> {
+    replicas: usize,
+}
+
+async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandle<Result<()>>> {
+    let SubagentToolsetStart {
+        agent,
+        cluster,
+        instance_id,
+        client,
+        jetstream,
+        replicas,
+    } = start;
     let registration_context = jetstream.clone();
     let toolset = Arc::new(SubagentToolset::new(
         agent,
@@ -394,14 +414,7 @@ async fn start_subagent_toolset(
     let server_name = harnx_toolset::Toolset::name(toolset.as_ref()).to_string();
     let identity_token = harnx_toolset::server_identity_token(None, "", &server_name);
     let registration_key = harnx_toolset_server::registration_key(&instance_id, &identity_token);
-    // Sub-agent toolsets share the worker's own cluster connection, which by
-    // the time this runs almost always already has TOOL_REGISTRY_BUCKET open
-    // at the cluster's configured replica count (local tool servers register
-    // first); this fallback only matters if none ever ran.
-    let connection = harnx_nats_common::connect::NatsConnection {
-        client,
-        replicas: 1,
-    };
+    let connection = harnx_nats_common::connect::NatsConnection { client, replicas };
     let server = tokio::spawn(harnx_toolset_server::serve_with_client(
         toolset,
         instance_id,
@@ -515,9 +528,10 @@ async fn launch_worker_services(
         instance_id: instance_id.clone(),
         slot: Arc::clone(&background),
         tools_attempted: tools_attempted_tx,
+        replicas: startup.replicas,
     });
 
-    let session_index = optional_session_index(&startup.jetstream).await;
+    let session_index = optional_session_index(&startup.jetstream, startup.replicas).await;
     Ok(WorkerServices {
         background,
         session_index,
@@ -565,6 +579,7 @@ struct BackgroundServicesCtx {
     instance_id: harnx_core::instance::InstanceId,
     slot: Arc<Mutex<Option<BackgroundServices>>>,
     tools_attempted: tokio::sync::watch::Sender<bool>,
+    replicas: usize,
 }
 
 fn spawn_background_services(ctx: BackgroundServicesCtx) {
@@ -577,6 +592,7 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
             instance_id,
             slot,
             tools_attempted,
+            replicas,
         } = ctx;
         let (tool_servers, global_hooks) = configured_worker_services(&config);
         let tool_supervisor =
@@ -589,13 +605,14 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
 
         let mut subagent_tool_servers = Vec::new();
         for agent in list_agents() {
-            match start_subagent_toolset(
-                agent.clone(),
-                daemon.cluster.clone(),
-                instance_id.clone(),
-                client.clone(),
-                jetstream.clone(),
-            )
+            match start_subagent_toolset(SubagentToolsetStart {
+                agent: agent.clone(),
+                cluster: daemon.cluster.clone(),
+                instance_id: instance_id.clone(),
+                client: client.clone(),
+                jetstream: jetstream.clone(),
+                replicas,
+            })
             .await
             {
                 Ok(handle) => subagent_tool_servers.push(handle),
@@ -669,11 +686,16 @@ async fn retry_unregistered_tool_servers(
 /// KV lease, and execute the session (exactly one worker per session).
 pub async fn run_worker_daemon(
     config: GlobalConfig,
-    daemon: WorkerDaemonConfig,
+    mut daemon: WorkerDaemonConfig,
     call_fn: Option<crate::agent_loop::AgentCallFn>,
 ) -> Result<()> {
     let instance_id = harnx_core::instance::InstanceId::new();
     let startup = prepare_worker_startup(&config, &daemon).await?;
+    // `WorkerDaemonConfig::new` has no cluster to resolve against yet, so its
+    // lease config carries the bare default; now that `daemon.cluster` is
+    // resolved, the lease bucket agrees with everything else this worker
+    // creates instead of always sitting at the default.
+    daemon.lease.replicas = startup.replicas;
     let services = launch_worker_services(&config, &daemon, &startup, &instance_id).await?;
     let runtime = Arc::new(WorkerRuntime {
         config,

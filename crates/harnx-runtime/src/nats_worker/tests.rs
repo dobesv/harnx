@@ -2338,7 +2338,7 @@ async fn remote_session_activation_writes_session_index_record() {
         .await
         .expect("connect to test nats");
     let jetstream = async_nats::jetstream::new(client);
-    let store = ensure_index_bucket(&jetstream)
+    let store = ensure_index_bucket(&jetstream, 1)
         .await
         .expect("ensure session index bucket");
 
@@ -2385,7 +2385,7 @@ async fn remote_session_renew_updates_last_activity_without_clobbering_header_fi
         .await
         .expect("connect to test nats");
     let jetstream = async_nats::jetstream::new(client);
-    let store = ensure_index_bucket(&jetstream)
+    let store = ensure_index_bucket(&jetstream, 1)
         .await
         .expect("ensure session index bucket");
 
