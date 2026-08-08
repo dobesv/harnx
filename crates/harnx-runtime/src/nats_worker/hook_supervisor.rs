@@ -626,7 +626,7 @@ async fn ensure_bucket(
     replicas: usize,
 ) -> Result<kv::Store> {
     let jetstream = jetstream::new(client.clone());
-    match jetstream
+    let create = jetstream
         .create_key_value(kv::Config {
             bucket: bucket.to_string(),
             history: 1,
@@ -634,15 +634,27 @@ async fn ensure_bucket(
             storage: stream::StorageType::File,
             ..Default::default()
         })
-        .await
-    {
-        Ok(store) => Ok(store),
-        Err(_) => jetstream
-            .get_key_value(bucket)
-            .await
-            .map_err(anyhow::Error::from)
-            .with_context(|| format!("open hook KV bucket '{bucket}'")),
+        .await;
+    if let Ok(store) = create {
+        return Ok(store);
     }
+
+    // The bucket already exists (this covers both HOOK_REGISTRY_BUCKET and
+    // HOOK_EXPECTATIONS_BUCKET); raise its replicas to match config if an
+    // operator changed it after the bucket was first created. Never lowers
+    // (see reconcile_bucket_replicas), so a caller that only knows `1` can't
+    // downgrade a bucket another caller already raised.
+    if let Err(error) =
+        harnx_nats_common::registry::reconcile_bucket_replicas(&jetstream, bucket, replicas).await
+    {
+        log::warn!("could not reconcile replicas for bucket '{bucket}': {error:#}");
+    }
+
+    jetstream
+        .get_key_value(bucket)
+        .await
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("open hook KV bucket '{bucket}'"))
 }
 
 fn hook_display_label(hook: &HookConfig) -> String {

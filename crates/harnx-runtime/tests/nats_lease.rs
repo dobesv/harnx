@@ -283,5 +283,15 @@ async fn lease_bucket_raising_replicas_on_existing_bucket_does_not_fail_startup(
         second.is_some(),
         "raising replicas on the existing lease bucket must not fail startup"
     );
+
+    let info = js
+        .get_stream("KV_harnx_leases")
+        .await
+        .context("get backing stream")?
+        .info()
+        .await
+        .context("stream info")?
+        .clone();
+    assert_eq!(info.config.num_replicas, 3, "the raise must actually apply");
     Ok(())
 }

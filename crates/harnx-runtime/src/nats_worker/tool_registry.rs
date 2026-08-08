@@ -58,7 +58,7 @@ pub(super) async fn ensure_registry_bucket(
     replicas: usize,
 ) -> Result<kv::Store> {
     let jetstream = jetstream::new(client.clone());
-    match jetstream
+    let create = jetstream
         .create_key_value(kv::Config {
             bucket: TOOL_REGISTRY_BUCKET.to_string(),
             history: 1,
@@ -66,15 +66,30 @@ pub(super) async fn ensure_registry_bucket(
             storage: stream::StorageType::File,
             ..Default::default()
         })
-        .await
-    {
-        Ok(store) => Ok(store),
-        Err(_) => jetstream
-            .get_key_value(TOOL_REGISTRY_BUCKET)
-            .await
-            .map_err(anyhow::Error::from)
-            .context("open tool registry bucket"),
+        .await;
+    if let Ok(store) = create {
+        return Ok(store);
     }
+
+    // The bucket already exists; raise its replicas to match config if an
+    // operator changed it after the bucket was first created. Never lowers
+    // (see reconcile_bucket_replicas), so a caller that only knows `1` can't
+    // downgrade a bucket another caller already raised.
+    if let Err(error) = harnx_nats_common::registry::reconcile_bucket_replicas(
+        &jetstream,
+        TOOL_REGISTRY_BUCKET,
+        replicas,
+    )
+    .await
+    {
+        log::warn!("could not reconcile replicas for bucket '{TOOL_REGISTRY_BUCKET}': {error:#}");
+    }
+
+    jetstream
+        .get_key_value(TOOL_REGISTRY_BUCKET)
+        .await
+        .map_err(anyhow::Error::from)
+        .context("open tool registry bucket")
 }
 
 /// Dump every key in the tool registry when servers fail to register.

@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use harnx_nats_common::registry::{ensure_bucket_with_ttl, REGISTRATION_TTL};
+use async_nats::jetstream;
+use harnx_nats_common::registry::{
+    ensure_bucket_with_ttl, reconcile_bucket_replicas, REGISTRATION_TTL,
+};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -106,6 +109,32 @@ fn nats_server_binary() -> Option<PathBuf> {
     which::which("nats-server").ok()
 }
 
+/// Connect to `server` and wrap it as a JetStream context, the way every
+/// test in this file needs its NATS connection.
+async fn test_jetstream(server: &NatsServerHandle) -> Result<jetstream::Context> {
+    let client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(&server.url)
+        .await
+        .context("connect test NATS client")?;
+    Ok(jetstream::new(client))
+}
+
+/// The live replica count on a bucket's backing stream, read back from the
+/// server rather than assumed — the assertion every test in this file that
+/// claims to check a reconcile outcome actually needs.
+async fn live_num_replicas(jetstream: &jetstream::Context, bucket: &str) -> Result<usize> {
+    Ok(jetstream
+        .get_stream(format!("KV_{bucket}"))
+        .await
+        .with_context(|| format!("get backing stream for '{bucket}'"))?
+        .info()
+        .await
+        .with_context(|| format!("stream info for '{bucket}'"))?
+        .config
+        .num_replicas)
+}
+
 #[tokio::test]
 async fn ensure_bucket_sets_ttl_and_reconciles_existing_bucket() -> Result<()> {
     harnx_core::require_nextest();
@@ -113,12 +142,7 @@ async fn ensure_bucket_sets_ttl_and_reconciles_existing_bucket() -> Result<()> {
         eprintln!("skipping: no nats-server binary available");
         return Ok(());
     };
-    let client = async_nats::ConnectOptions::new()
-        .token(TOKEN.to_string())
-        .connect(&server.url)
-        .await
-        .context("connect test NATS client")?;
-    let jetstream = async_nats::jetstream::new(client);
+    let jetstream = test_jetstream(&server).await?;
 
     // Pre-create the bucket with no TTL, standing in for a bucket made by an
     // older build.
@@ -159,12 +183,7 @@ async fn ensure_bucket_reconciles_replicas_noop_when_already_matching() -> Resul
         eprintln!("skipping: no nats-server binary available");
         return Ok(());
     };
-    let client = async_nats::ConnectOptions::new()
-        .token(TOKEN.to_string())
-        .connect(&server.url)
-        .await
-        .context("connect test NATS client")?;
-    let jetstream = async_nats::jetstream::new(client);
+    let jetstream = test_jetstream(&server).await?;
 
     ensure_bucket_with_ttl(&jetstream, "replicas_noop", REGISTRATION_TTL, 1)
         .await
@@ -174,15 +193,7 @@ async fn ensure_bucket_reconciles_replicas_noop_when_already_matching() -> Resul
         .await
         .context("re-ensure bucket at replicas=1")?;
 
-    let info = jetstream
-        .get_stream("KV_replicas_noop")
-        .await
-        .context("get backing stream")?
-        .info()
-        .await
-        .context("stream info")?
-        .clone();
-    assert_eq!(info.config.num_replicas, 1);
+    assert_eq!(live_num_replicas(&jetstream, "replicas_noop").await?, 1);
     Ok(())
 }
 
@@ -195,8 +206,9 @@ async fn ensure_bucket_reconciles_replicas_noop_when_already_matching() -> Resul
 /// unlike creating a brand-new stream, which does reject `num_replicas > 1`
 /// with "replicas > 1 not supported in non-clustered mode". So on this
 /// harness the raise actually succeeds; what this test pins down is that
-/// `ensure_bucket_with_ttl` returns `Ok` either way, and that the `if let
-/// Err(..) = reconcile_bucket_config(..)` wrapping around the update in
+/// `ensure_bucket_with_ttl` returns `Ok` either way, that the raise actually
+/// lands on the live stream, and that the `if let Err(..) =
+/// reconcile_bucket_config(..)` wrapping around the update in
 /// `ensure_bucket_with_ttl` is still in place and non-fatal. Demonstrating an
 /// actual rejection would need a real under-provisioned cluster (e.g. 2 nodes
 /// asked for `replicas: 3`), which this test suite does not stand up.
@@ -207,12 +219,7 @@ async fn ensure_bucket_raising_replicas_on_existing_bucket_does_not_fail_startup
         eprintln!("skipping: no nats-server binary available");
         return Ok(());
     };
-    let client = async_nats::ConnectOptions::new()
-        .token(TOKEN.to_string())
-        .connect(&server.url)
-        .await
-        .context("connect test NATS client")?;
-    let jetstream = async_nats::jetstream::new(client);
+    let jetstream = test_jetstream(&server).await?;
 
     ensure_bucket_with_ttl(&jetstream, "raise_replicas", REGISTRATION_TTL, 1)
         .await
@@ -220,5 +227,64 @@ async fn ensure_bucket_raising_replicas_on_existing_bucket_does_not_fail_startup
     ensure_bucket_with_ttl(&jetstream, "raise_replicas", REGISTRATION_TTL, 3)
         .await
         .context("raising replicas on an existing bucket must not fail startup")?;
+
+    assert_eq!(
+        live_num_replicas(&jetstream, "raise_replicas").await?,
+        3,
+        "the raise must actually apply"
+    );
+    Ok(())
+}
+
+/// Reconcile never lowers replicas: a caller that only knows a smaller value
+/// than a bucket already has (e.g. a stale default, or a caller that never
+/// resolved the cluster's real config) must not be able to downgrade its
+/// actual fault tolerance. See `reconcile_bucket_replicas`'s doc comment for
+/// why — this is exactly the bug the hourly remote-session GC lease hit
+/// before it resolved its cluster's real `replicas`.
+#[tokio::test]
+async fn reconcile_bucket_replicas_never_lowers_an_existing_higher_count() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: no nats-server binary available");
+        return Ok(());
+    };
+    let jetstream = test_jetstream(&server).await?;
+
+    ensure_bucket_with_ttl(&jetstream, "no_lower", REGISTRATION_TTL, 1)
+        .await
+        .context("create bucket at replicas=1")?;
+
+    // Raise it out-of-band (bypassing our reconcile function) to stand in
+    // for a bucket a real cluster already correctly reconciled up to 3;
+    // `update_stream` accepts this unconditionally even on this
+    // non-clustered test server (see the doc comment two tests up).
+    let mut config = jetstream
+        .get_stream("KV_no_lower")
+        .await
+        .context("get backing stream")?
+        .info()
+        .await
+        .context("stream info")?
+        .config
+        .clone();
+    config.num_replicas = 3;
+    jetstream
+        .update_stream(config)
+        .await
+        .context("raise replicas out of band to simulate an already-reconciled bucket")?;
+
+    // A caller that only knows `1` (a stale default, or one that never
+    // resolved the cluster's actual configured value) must not drag this
+    // back down.
+    reconcile_bucket_replicas(&jetstream, "no_lower", 1)
+        .await
+        .context("reconcile with a lower request must not error")?;
+
+    assert_eq!(
+        live_num_replicas(&jetstream, "no_lower").await?,
+        3,
+        "reconcile must never lower an existing bucket's replicas"
+    );
     Ok(())
 }

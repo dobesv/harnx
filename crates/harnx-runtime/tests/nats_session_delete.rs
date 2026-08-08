@@ -13,6 +13,7 @@ use harnx_runtime::{
     nats_lease::NatsLeaseConfig,
     nats_session_index::{
         delete_record, ensure_index_bucket, get_record, put_record, SessionIndexRecord,
+        SESSION_INDEX_BUCKET,
     },
     nats_session_log::{stream_name_for_session, NatsSessionLog},
 };
@@ -127,6 +128,16 @@ async fn session_index_bucket_raising_replicas_does_not_fail_startup() -> Result
     ensure_index_bucket(&jetstream, 3)
         .await
         .context("raising replicas on an existing bucket must not fail startup")?;
+
+    let info = jetstream
+        .get_stream(format!("KV_{SESSION_INDEX_BUCKET}"))
+        .await
+        .context("get backing stream")?
+        .info()
+        .await
+        .context("stream info")?
+        .clone();
+    assert_eq!(info.config.num_replicas, 3, "the raise must actually apply");
     Ok(())
 }
 

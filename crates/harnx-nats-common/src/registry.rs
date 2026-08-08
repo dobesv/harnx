@@ -54,9 +54,19 @@ pub async fn ensure_bucket_with_ttl(
         .with_context(|| format!("open KV bucket '{bucket}'"))
 }
 
-/// Raise (or lower) just the replica count on an existing bucket's stream,
-/// leaving every other stream setting untouched. A no-op, reported as `Ok`,
-/// when the count already matches.
+/// Raise (never lower) just the replica count on an existing bucket's
+/// stream, leaving every other stream setting untouched. A no-op, reported
+/// as `Ok`, when the requested count is already met or exceeded.
+///
+/// Deliberately one-directional: a caller here only ever knows *a* replica
+/// count, not necessarily *the current cluster's* replica count (see
+/// `remote_session_cleanup.rs`'s hourly GC lease, which builds a
+/// `NatsLeaseConfig` with whatever default the caller left it at). Lowering
+/// on request would let a caller that doesn't know better silently downgrade
+/// an HA-critical bucket's actual fault tolerance every time it happens to
+/// run — far worse than leaving a bucket over-replicated relative to a
+/// request that undershoots. An operator genuinely scaling down replicas can
+/// recreate the bucket.
 ///
 /// For buckets whose expiry isn't TTL-based (`harnx_leases` uses tombstone
 /// limit markers instead of `max_age`; `harnx_sessions` has no expiry at
@@ -70,19 +80,23 @@ pub async fn reconcile_bucket_replicas(
 ) -> Result<()> {
     let stream_name = format!("KV_{bucket}");
     let mut config = fetch_stream_config(jetstream, &stream_name).await?;
-    if config.num_replicas == num_replicas {
+    let current_replicas = config.num_replicas;
+    if num_replicas <= current_replicas {
+        decline_lowering_replicas(bucket, current_replicas, num_replicas);
         return Ok(());
     }
-    let current_replicas = config.num_replicas;
     config.num_replicas = num_replicas;
     update_stream_reporting_replicas(jetstream, &stream_name, config, current_replicas).await
 }
 
-/// Bring an existing bucket's stream up to the requested TTL and replica
-/// count, in one `update_stream` call. Both drift independently of bucket
-/// creation: TTL predates this reconcile path, and replicas can be raised
-/// later by an operator editing cluster config after the bucket already
-/// exists (`num_replicas` is otherwise fixed at creation time).
+/// Bring an existing bucket's stream up to the requested TTL, and raise
+/// (never lower) its replica count, in one `update_stream` call when either
+/// changes. TTL moves freely in both directions — it predates this reconcile
+/// path and has no HA consequence — but replicas only ever go up, for the
+/// same reason [`reconcile_bucket_replicas`] never lowers them: a caller
+/// here doesn't necessarily know the cluster's actual configured count, and
+/// downgrading an HA-critical bucket's fault tolerance silently is worse
+/// than leaving it over-replicated.
 async fn reconcile_bucket_config(
     jetstream: &jetstream::Context,
     bucket: &str,
@@ -92,7 +106,11 @@ async fn reconcile_bucket_config(
     let stream_name = format!("KV_{bucket}");
     let mut config = fetch_stream_config(jetstream, &stream_name).await?;
     let current_replicas = config.num_replicas;
-    if config.max_age == ttl && current_replicas == num_replicas {
+    let raise_replicas = num_replicas > current_replicas;
+    if num_replicas < current_replicas {
+        decline_lowering_replicas(bucket, current_replicas, num_replicas);
+    }
+    if config.max_age == ttl && !raise_replicas {
         return Ok(());
     }
     config.max_age = ttl;
@@ -102,8 +120,16 @@ async fn reconcile_bucket_config(
     if config.duplicate_window > ttl {
         config.duplicate_window = ttl;
     }
-    config.num_replicas = num_replicas;
+    if raise_replicas {
+        config.num_replicas = num_replicas;
+    }
     update_stream_reporting_replicas(jetstream, &stream_name, config, current_replicas).await
+}
+
+fn decline_lowering_replicas(bucket: &str, current_replicas: usize, requested_replicas: usize) {
+    log::debug!(
+        "bucket '{bucket}' has {current_replicas} replicas; declining to lower to the requested {requested_replicas} (replicas never go down through reconcile — recreate the bucket to scale down deliberately)"
+    );
 }
 
 async fn fetch_stream_config(

@@ -29,13 +29,18 @@ below) so the buckets harnx creates survive losing a node.
 
 ### JetStream Resources
 Harnx automatically manages the following JetStream resources:
-- **KV Bucket**: `harnx_leases` — session leases with TTL. This is the
-  split-brain guard: every durable write is fenced on the lease's KV
-  revision, and a worker that loses its lease aborts. If this bucket can't
-  survive a node loss, neither can a session mid-turn on that node.
-- **KV Bucket**: `harnx_sessions` — the session enumeration index.
-- **KV Buckets**: `harnx_tool_registry` and the hook registry/expectations
-  buckets — tool/hook server discovery, also TTL'd.
+- **KV Bucket**: `harnx_leases` — session leases with a tombstone marker
+  after release (not a bucket-wide TTL). This is the split-brain guard:
+  every durable write is fenced on the lease's KV revision, and a worker
+  that loses its lease aborts. If this bucket can't survive a node loss,
+  neither can a session mid-turn on that node.
+- **KV Bucket**: `harnx_sessions` — the session enumeration index. No expiry.
+- **KV Bucket**: `harnx_tool_registry` — tool server discovery, with a
+  per-registration TTL.
+- **KV Buckets**: `harnx_hook_registry` and `harnx_hook_expectations` — hook
+  server discovery and its fail-closed fallback routes. Only the copies
+  opened by the standalone `harnx-hookset-server` binary carry a TTL; the
+  worker daemon's own copy of the same buckets does not set one.
 - **Streams**: `SESSION_<id>` (Subject: `sessions.{id}.log`) stores the durable append-only session history.
 
 All of the KV buckets above are created with the `replicas` count from the
@@ -50,8 +55,15 @@ these buckets exist) makes creation fail outright, and harnx will not start
 against that cluster. This is intentional: failing loudly on a
 misconfiguration is better than silently running at `replicas: 1` while an
 operator believes they have HA. It only affects buckets that don't exist
-yet — a bucket created earlier at `replicas: 1` and later pointed at a
-`replicas: 3` config gets its replica count raised in place instead.
+yet — a bucket created earlier at a lower `replicas` and later pointed at a
+higher one gets raised in place instead.
+
+**Reconcile only ever raises `replicas`, never lowers it.** Some callers
+(the hourly remote-session GC lease, for one) don't necessarily know the
+cluster's actual configured value at the point they touch a bucket; if
+reconcile lowered on request, one of those callers could silently downgrade
+an already-correctly-replicated bucket's fault tolerance. Genuinely scaling
+a bucket down requires recreating it.
 
 ## Configuration
 

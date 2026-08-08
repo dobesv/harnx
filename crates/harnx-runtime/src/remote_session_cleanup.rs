@@ -116,6 +116,21 @@ async fn acquire_gc_lease(
     gc_session_id: &str,
 ) -> anyhow::Result<Option<NatsSessionLease>> {
     let jetstream = config.nats_jetstream(cluster).await?;
+    // `NatsLeaseConfig::default()`'s `replicas` is always 1. Reconcile only
+    // ever raises an existing bucket's replicas now (see
+    // `reconcile_bucket_replicas`), so pinning that default here can no
+    // longer downgrade a bucket another creator already got right — but
+    // this GC task runs hourly against every configured cluster (see
+    // `run_periodic_remote_cleanup`) and could just as easily be the first
+    // thing to ever touch `harnx_leases` on a given cluster, in which case
+    // the initial `create_key_value` (not reconcile) sets the real replica
+    // count. Resolve the cluster's actual configured value so that first
+    // creation is already right, instead of leaning on a worker starting
+    // later to reconcile it up.
+    let replicas = config
+        .resolve_nats_server(cluster)
+        .await?
+        .resolved_replicas();
     NatsSessionLease::acquire(NatsLeaseAcquireParams {
         jetstream,
         session_id: gc_session_id,
@@ -124,6 +139,7 @@ async fn acquire_gc_lease(
         config: NatsLeaseConfig {
             ttl: Duration::from_secs(5),
             renew_interval: Duration::from_secs(1),
+            replicas,
             ..NatsLeaseConfig::default()
         },
         session_index: None,
