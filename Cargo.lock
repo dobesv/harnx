@@ -3561,6 +3561,7 @@ dependencies = [
  "harnx-hooks",
  "harnx-hookset",
  "harnx-hookset-server",
+ "libc",
  "serde_json",
  "tempfile",
  "tokio",
@@ -3768,6 +3769,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "which",
 ]
 
@@ -3919,6 +3921,7 @@ dependencies = [
  "log",
  "tempfile",
  "tokio",
+ "tokio-util",
  "which",
 ]
 
@@ -4236,17 +4239,22 @@ name = "harnx-time-server"
 version = "0.33.4"
 dependencies = [
  "anyhow",
+ "async-nats",
  "async-trait",
  "chrono",
  "chrono-tz",
+ "harnx-core",
  "harnx-toolset",
  "harnx-toolset-server",
  "iana-time-zone",
  "jiff",
+ "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
+ "which",
 ]
 
 [[package]]

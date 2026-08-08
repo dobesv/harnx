@@ -218,3 +218,96 @@ async fn command_hook_uses_env_name_with_end_of_options_separator() -> Result<()
     assert_eq!(registration.hooks[0].matcher.as_deref(), Some("exec"));
     Ok(())
 }
+
+/// Poll the hook registration key until it matches `present`, or fail at
+/// `deadline`. No blind sleeps: the assertion is only as slow as the actual
+/// state change.
+async fn wait_for_key_presence(
+    client: &async_nats::Client,
+    key: &str,
+    present: bool,
+    deadline: Instant,
+) -> Result<()> {
+    let jetstream = async_nats::jetstream::new(client.clone());
+    loop {
+        if let Ok(store) = jetstream.get_key_value(HOOK_REGISTRY_BUCKET).await {
+            let found = store.get(key).await?.is_some();
+            if found == present {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for hook registration '{key}' to become present={present}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Proves that a SIGTERM sent directly to a running
+/// `harnx-claude-compatible-hook-server` process (as Kubernetes would send
+/// to a pod) triggers deregistration, not just that the plumbing between a
+/// `CancellationToken` and the serve loop is wired correctly.
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_removes_the_hook_registration() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let assigned_name = "hook-sigterm-000";
+    let instance_id = InstanceId::new();
+    let child = Command::new(env!("CARGO_BIN_EXE_harnx-claude-compatible-hook-server"))
+        .args([
+            "--event",
+            "PreToolUse",
+            "--matcher",
+            "exec",
+            "--",
+            "printf",
+            "{}",
+        ])
+        .env(HARNX_HOOK_NAME, assigned_name)
+        .env(HARNX_INSTANCE_ID, instance_id.as_str())
+        .env("HARNX_NATS_URL", &server.url)
+        .env("HARNX_NATS_TOKEN", TOKEN)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn command hook for SIGTERM test")?;
+    let pid = child.id();
+    let mut hook_server = HookServerHandle(child);
+
+    let client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(&server.url)
+        .await?;
+    let key = hook_registration_key(&instance_id, assigned_name);
+
+    wait_for_key_presence(
+        &client,
+        &key,
+        true,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .await?;
+
+    let killed = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(
+        killed, 0,
+        "failed to send SIGTERM to harnx-claude-compatible-hook-server"
+    );
+
+    wait_for_key_presence(
+        &client,
+        &key,
+        false,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .context("hook registration should be gone soon after SIGTERM, not left to expire")?;
+
+    let _ = hook_server.0.wait();
+    Ok(())
+}

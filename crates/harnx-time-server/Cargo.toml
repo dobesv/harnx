@@ -24,3 +24,10 @@ tokio-util = { workspace = true }
 [[bin]]
 name = "harnx-time-server"
 path = "src/main.rs"
+
+[dev-dependencies]
+async-nats = { workspace = true }
+harnx-core = { path = "../harnx-core" }
+libc = { workspace = true }
+tempfile = { workspace = true }
+which = { workspace = true }

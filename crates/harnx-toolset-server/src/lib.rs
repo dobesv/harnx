@@ -522,7 +522,12 @@ async fn publish_registration(
         .with_context(|| format!("publish tool registration '{key}'"))
 }
 
-/// Run a toolset in MCP stdio mode when `--mcp-stdio` is present, otherwise NATS mode.
+/// Run a toolset in MCP stdio mode when `--mcp-stdio` is present, otherwise
+/// NATS mode.
+///
+/// In NATS mode, wires SIGTERM/Ctrl+C to a graceful stop so a pod killed by
+/// Kubernetes gets a chance to remove its own registration instead of
+/// leaving it for the TTL.
 pub async fn run_toolset_main<T>(toolset: T) -> Result<()>
 where
     T: Toolset + 'static,
@@ -549,7 +554,14 @@ where
         .connect(&nats_url)
         .await
         .with_context(|| format!("connect to NATS at {nats_url}"))?;
-    serve_with_client(toolset, InstanceId::from_string(instance_id), client).await
+    let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
+    serve_with_shutdown(
+        toolset,
+        InstanceId::from_string(instance_id),
+        client,
+        shutdown,
+    )
+    .await
 }
 
 #[derive(Clone)]

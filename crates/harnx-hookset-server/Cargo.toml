@@ -17,6 +17,7 @@ harnx-nats-common = { path = "../harnx-nats-common" }
 log = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

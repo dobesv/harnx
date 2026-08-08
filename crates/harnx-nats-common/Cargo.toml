@@ -8,6 +8,8 @@ publish = false
 anyhow = { workspace = true }
 async-nats = { workspace = true }
 log = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 harnx-core = { path = "../harnx-core" }

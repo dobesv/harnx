@@ -26,9 +26,14 @@ pub async fn ensure_bucket_with_ttl(
             ..Default::default()
         })
         .await;
-    if let Ok(store) = create {
-        return Ok(store);
-    }
+    let create_error = match create {
+        Ok(store) => return Ok(store),
+        Err(error) => error,
+    };
+    // The usual case here is "bucket already exists"; anything else is worth
+    // keeping around in case the fallback below also fails and needs
+    // explaining.
+    log::debug!("create_key_value for bucket '{bucket}' did not succeed: {create_error:#}");
 
     // The bucket already exists. It may predate TTL support, so reconcile it.
     if let Err(error) = reconcile_bucket_ttl(jetstream, bucket, ttl).await {

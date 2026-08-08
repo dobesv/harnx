@@ -9,6 +9,7 @@ use harnx_hookset::{Hook, HookRegistration, HookSpec, HOOK_PROTOCOL_VERSION, HOO
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 pub use harnx_hookset::HOOK_REGISTRY_BUCKET;
 
@@ -42,6 +43,20 @@ pub async fn serve_with_client(
     hook: Arc<dyn Hook>,
     instance_id: InstanceId,
     client: async_nats::Client,
+) -> Result<()> {
+    // Never cancelled: this entry point has no shutdown signal of its own, so
+    // it only ever exits through `serve_requests`' bail! conditions.
+    serve_with_shutdown(hook, instance_id, client, CancellationToken::new()).await
+}
+
+/// Serve a hook using an existing NATS client, exiting cleanly (and running
+/// exit cleanup while the connection is still usable) when `shutdown` is
+/// cancelled, in addition to the usual failure exits.
+pub async fn serve_with_shutdown(
+    hook: Arc<dyn Hook>,
+    instance_id: InstanceId,
+    client: async_nats::Client,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     let server = hook.name().to_owned();
     let hooks = hook.hooks();
@@ -82,7 +97,10 @@ pub async fn serve_with_client(
     let outcome = serve_requests(
         &client,
         &hook,
-        &mut requests,
+        HookSubscriptions {
+            requests: &mut requests,
+            shutdown,
+        },
         RegistrationRefresh {
             registry: &registry,
             instance_id: &instance_id,
@@ -109,15 +127,23 @@ struct RegistrationRefresh<'a> {
     interval: &'a mut tokio::time::Interval,
 }
 
+/// The subscriptions `serve_requests` polls, plus the signal that ends the
+/// loop on purpose. See `harnx-toolset-server`'s `ToolSubscriptions` for why
+/// `shutdown` is distinct from a subscription simply closing.
+struct HookSubscriptions<'a> {
+    requests: &'a mut futures_util::stream::SelectAll<async_nats::Subscriber>,
+    shutdown: CancellationToken,
+}
+
 async fn serve_requests(
     client: &async_nats::Client,
     hook: &Arc<dyn Hook>,
-    requests: &mut futures_util::stream::SelectAll<async_nats::Subscriber>,
+    subscriptions: HookSubscriptions<'_>,
     refresh: RegistrationRefresh<'_>,
 ) -> Result<()> {
     loop {
         tokio::select! {
-            request = requests.next() => {
+            request = subscriptions.requests.next() => {
                 let Some(request) = request else {
                     anyhow::bail!("hook request subscriptions closed");
                 };
@@ -136,6 +162,9 @@ async fn serve_requests(
                 {
                     log::warn!("refresh hook registration failed; retrying next interval: {error:#}");
                 }
+            }
+            _ = subscriptions.shutdown.cancelled() => {
+                return Ok(());
             }
         }
     }
@@ -219,6 +248,9 @@ pub async fn publish_hook_registration(
 }
 
 /// Read hook server settings from the environment and serve over NATS.
+///
+/// Wires SIGTERM/Ctrl+C to a graceful stop so a pod killed by Kubernetes gets
+/// a chance to remove its own registration instead of leaving it for the TTL.
 pub async fn run_hookset_main<H: Hook + 'static>(hook: H) -> Result<()> {
     harnx_core::server_logging::init_server_logger();
     let instance_id = std::env::var(HARNX_INSTANCE_ID)
@@ -227,11 +259,17 @@ pub async fn run_hookset_main<H: Hook + 'static>(hook: H) -> Result<()> {
         std::env::var(HARNX_NATS_URL).with_context(|| format!("{HARNX_NATS_URL} is required"))?;
     let token = std::env::var(HARNX_NATS_TOKEN)
         .with_context(|| format!("{HARNX_NATS_TOKEN} is required"))?;
-    serve_over_nats(
-        hook,
+    let client = async_nats::ConnectOptions::new()
+        .token(token)
+        .connect(&nats_url)
+        .await
+        .with_context(|| format!("connect to NATS at {nats_url}"))?;
+    let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
+    serve_with_shutdown(
+        Arc::new(hook),
         InstanceId::from_string(instance_id),
-        &nats_url,
-        &token,
+        client,
+        shutdown,
     )
     .await
 }
