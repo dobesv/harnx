@@ -125,7 +125,7 @@ tokio-rustls = "0.26"
 time = { version = "0.3.36", features = ["macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-jaq-all = { version = "0.2", features = ["formats"] }
+jaq-all = { version = "0.3", features = ["formats"] }
 indexmap = { version = "2.2.6", features = ["serde"] }
 hmac = "0.13.0"
 aws-config = { version = "1", features = ["sso"] }
