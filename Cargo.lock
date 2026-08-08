@@ -4339,15 +4339,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hashlink"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
-dependencies = [
- "hashbrown 0.15.5",
-]
-
-[[package]]
 name = "heapless"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4920,9 +4911,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jaq-all"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6071acf3aac775e865a510075f7efb30076b0a4077d2864393312761c8aa23fa"
+checksum = "b9729ff642d7995e5f6e4545ce25e699e9525cbe97ea63d5e75c7aeda9abec6c"
 dependencies = [
  "codesnake",
  "jaq-core",
@@ -4945,9 +4936,9 @@ dependencies = [
 
 [[package]]
 name = "jaq-fmts"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c199bdc175b37e68d6273bf581187743f8fd4aaa36dc8dfe091fde101298620b"
+checksum = "abe3b8669aa003e5d7a4ac187d411c4d50ae08aa08595ce3705f7298b70a0f3e"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -4967,9 +4958,9 @@ dependencies = [
 
 [[package]]
 name = "jaq-json"
-version = "2.0.1"
+version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4ec9aaad7340e6990c6c1878ef3b46dbec624e535d7f786cc9ddcf94f773d33"
+checksum = "48d801b0b57f10064c4e9f5a4f6c97d0ccf62649b179ff8ac23cd494a3120ee9"
 dependencies = [
  "bstr",
  "bytes",
@@ -7298,12 +7289,12 @@ dependencies = [
 
 [[package]]
 name = "saphyr-parser"
-version = "0.0.6"
+version = "0.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fb771b59f6b1985d1406325ec28f97cfb14256abcec4fdfb37b36a1766d6af7"
+checksum = "554aa12c59a0030f9b96ef955b83d07932371bbec0da172b6fac351da64b5c7e"
 dependencies = [
  "arraydeque",
- "hashlink",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
