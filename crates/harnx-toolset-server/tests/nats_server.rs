@@ -6,7 +6,7 @@ use harnx_toolset::{
     Toolset, HDR_CALL_ID, HDR_IDEMPOTENCY_KEY,
 };
 use harnx_toolset_server::{
-    registration_key, serve_over_nats, TOOL_REGISTRY_BUCKET, TOOL_SCHEMA_VERSION,
+    registration_key, serve_with_shutdown, TOOL_REGISTRY_BUCKET, TOOL_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
 use std::net::TcpListener;
@@ -196,7 +196,11 @@ async fn wait_for_registration(
 
 struct TestHarness {
     _server: NatsServerHandle,
-    server_task: tokio::task::JoinHandle<Result<()>>,
+    // `Option` so `shutdown()` can take this out without consuming the whole
+    // harness — dropping `_server` would kill nats-server out from under the
+    // rest of the test, which still needs it to inspect KV state afterward.
+    server_task: Option<tokio::task::JoinHandle<Result<()>>>,
+    shutdown: CancellationToken,
     client: async_nats::Client,
     instance_id: InstanceId,
     toolset: TestToolset,
@@ -209,11 +213,22 @@ impl TestHarness {
         };
         let instance_id = InstanceId::new();
         let toolset = TestToolset::default();
-        let server_url = server.url.clone();
+        let shutdown = CancellationToken::new();
+        let server_client = async_nats::ConnectOptions::new()
+            .token(TOKEN.to_string())
+            .connect(&server.url)
+            .await?;
         let server_toolset = toolset.clone();
         let server_instance_id = instance_id.clone();
+        let server_shutdown = shutdown.clone();
         let server_task = tokio::spawn(async move {
-            serve_over_nats(server_toolset, server_instance_id, &server_url, TOKEN).await
+            serve_with_shutdown(
+                Arc::new(server_toolset),
+                server_instance_id,
+                server_client,
+                server_shutdown,
+            )
+            .await
         });
         let client = async_nats::ConnectOptions::new()
             .token(TOKEN.to_string())
@@ -221,7 +236,8 @@ impl TestHarness {
             .await?;
         Ok(Some(Self {
             _server: server,
-            server_task,
+            server_task: Some(server_task),
+            shutdown,
             client,
             instance_id,
             toolset,
@@ -231,11 +247,25 @@ impl TestHarness {
     fn echo_subject(&self) -> String {
         self.instance_id.tool_subject("____test", "echo")
     }
+
+    /// Trigger a graceful shutdown and wait for `serve_with_shutdown` to
+    /// unwind and run its exit cleanup (deleting the KV registration), while
+    /// leaving the rest of the harness (including the still-running
+    /// nats-server) intact so the test can keep inspecting KV state
+    /// afterward.
+    async fn shutdown(&mut self) {
+        self.shutdown.cancel();
+        if let Some(server_task) = self.server_task.take() {
+            let _ = server_task.await;
+        }
+    }
 }
 
 impl Drop for TestHarness {
     fn drop(&mut self) {
-        self.server_task.abort();
+        if let Some(server_task) = self.server_task.take() {
+            server_task.abort();
+        }
     }
 }
 
@@ -426,4 +456,27 @@ async fn registers_invokes_caches_and_cancels() -> Result<()> {
     assert_concurrent_idempotency(&harness).await?;
     assert_early_failure_replies(&harness).await?;
     assert_cancellation(&harness).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn graceful_shutdown_removes_the_registration() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(mut harness) = TestHarness::start().await? else {
+        return Ok(());
+    };
+    assert_registration(&harness).await?;
+
+    let jetstream = async_nats::jetstream::new(harness.client.clone());
+    let registry = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await?;
+    let key = registration_key(&harness.instance_id, "____test");
+    assert!(registry.get(&key).await?.is_some());
+
+    harness.shutdown().await;
+
+    assert!(
+        registry.get(&key).await?.is_none(),
+        "registration should be gone immediately after a graceful shutdown, \
+         not left to expire"
+    );
+    Ok(())
 }

@@ -3763,6 +3763,7 @@ dependencies = [
  "futures-util",
  "harnx-core",
  "harnx-hookset",
+ "harnx-nats-common",
  "log",
  "serde_json",
  "tempfile",
@@ -3906,6 +3907,19 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
+]
+
+[[package]]
+name = "harnx-nats-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "harnx-core",
+ "log",
+ "tempfile",
+ "tokio",
+ "which",
 ]
 
 [[package]]
@@ -4262,6 +4276,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "harnx-core",
+ "harnx-nats-common",
  "harnx-toolset",
  "log",
  "rmcp",

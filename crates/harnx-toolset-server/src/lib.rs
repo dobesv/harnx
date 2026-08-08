@@ -4,7 +4,7 @@ pub mod content;
 pub mod schema;
 
 use anyhow::{Context, Result};
-use async_nats::jetstream::{self, kv, stream};
+use async_nats::jetstream::{self, kv};
 use futures_util::StreamExt;
 use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
 use harnx_toolset::{
@@ -70,6 +70,29 @@ struct ValidatedToolRequest {
     idempotency_key: String,
 }
 
+/// Everything `serve_requests` needs to keep the KV registration alive, bundled
+/// so the function stays under the argument-count limit.
+struct RegistrationRefresh<'a> {
+    registry: &'a kv::Store,
+    instance_id: &'a InstanceId,
+    registration: &'a Registration,
+    interval: &'a mut tokio::time::Interval,
+}
+
+/// The subscriptions `serve_requests` polls, plus the signal that ends the
+/// loop on purpose. Bundled for the same reason as `RegistrationRefresh`.
+///
+/// `shutdown` is distinct from a subscription simply closing: losing a
+/// subscription usually means the whole NATS connection is gone, at which
+/// point the exit-cleanup delete can't reach the server either (the TTL is
+/// the backstop). Cancelling `shutdown` exits the loop while the connection
+/// is still healthy, so the delete actually lands.
+struct ToolSubscriptions<'a> {
+    tool_requests: &'a mut async_nats::Subscriber,
+    controls: &'a mut async_nats::Subscriber,
+    shutdown: CancellationToken,
+}
+
 /// KV key for one worker instance's tool server registration.
 pub fn registration_key(instance_id: &InstanceId, identity_token: &str) -> String {
     format!("{instance_id}.{identity_token}")
@@ -94,10 +117,25 @@ where
     serve_with_client(Arc::new(toolset), instance_id, client).await
 }
 
+/// Serve a toolset using an existing NATS client.
 pub async fn serve_with_client(
     toolset: Arc<dyn Toolset>,
     instance_id: InstanceId,
     client: async_nats::Client,
+) -> Result<()> {
+    // Never cancelled: this entry point has no shutdown signal of its own, so
+    // it only ever exits through `serve_requests`' bail! conditions.
+    serve_with_shutdown(toolset, instance_id, client, CancellationToken::new()).await
+}
+
+/// Serve a toolset using an existing NATS client, exiting cleanly (and
+/// running exit cleanup while the connection is still usable) when
+/// `shutdown` is cancelled, in addition to the usual failure exits.
+pub async fn serve_with_shutdown(
+    toolset: Arc<dyn Toolset>,
+    instance_id: InstanceId,
+    client: async_nats::Client,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     let server_name = toolset.name().to_owned();
     let package = std::env::var(HARNX_SERVER_PACKAGE)
@@ -142,24 +180,58 @@ pub async fn serve_with_client(
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     refresh.tick().await;
 
+    let outcome = serve_requests(
+        &request_context,
+        ToolSubscriptions {
+            tool_requests: &mut tool_requests,
+            controls: &mut controls,
+            shutdown,
+        },
+        RegistrationRefresh {
+            registry: &registry,
+            instance_id: &instance_id,
+            registration: &registration,
+            interval: &mut refresh,
+        },
+    )
+    .await;
+
+    // Best-effort: the TTL is the backstop when this cannot run.
+    let key = registration_key(&instance_id, &identity_token);
+    if let Err(error) = registry.delete(&key).await {
+        log::warn!("could not remove tool registration '{key}' on shutdown: {error}");
+    }
+    outcome
+}
+
+async fn serve_requests(
+    request_context: &ToolRequestContext,
+    subscriptions: ToolSubscriptions<'_>,
+    refresh: RegistrationRefresh<'_>,
+) -> Result<()> {
     loop {
         tokio::select! {
-            request = tool_requests.next() => {
+            request = subscriptions.tool_requests.next() => {
                 let Some(request) = request else {
                     anyhow::bail!("tool request subscription closed");
                 };
                 spawn_tool_request(request_context.clone(), request);
             }
-            control = controls.next() => {
+            control = subscriptions.controls.next() => {
                 let Some(control) = control else {
                     anyhow::bail!("control subscription closed");
                 };
                 handle_control(control, &request_context.in_flight).await;
             }
-            _ = refresh.tick() => {
-                if let Err(error) = publish_registration(&registry, &instance_id, &registration).await {
+            _ = refresh.interval.tick() => {
+                if let Err(error) =
+                    publish_registration(refresh.registry, refresh.instance_id, refresh.registration).await
+                {
                     log::warn!("refresh tool registration failed; retrying next interval: {error:#}");
                 }
+            }
+            _ = subscriptions.shutdown.cancelled() => {
+                return Ok(());
             }
         }
     }
@@ -422,23 +494,13 @@ fn header_value(message: &async_nats::Message, name: &str) -> Option<String> {
 }
 
 async fn ensure_registry_bucket(jetstream: &jetstream::Context) -> Result<kv::Store> {
-    match jetstream
-        .create_key_value(kv::Config {
-            bucket: TOOL_REGISTRY_BUCKET.to_string(),
-            history: 1,
-            num_replicas: 1,
-            storage: stream::StorageType::File,
-            ..Default::default()
-        })
-        .await
-    {
-        Ok(store) => Ok(store),
-        Err(_) => jetstream
-            .get_key_value(TOOL_REGISTRY_BUCKET)
-            .await
-            .map_err(anyhow::Error::from)
-            .with_context(|| format!("open tool registry bucket '{TOOL_REGISTRY_BUCKET}'")),
-    }
+    harnx_nats_common::registry::ensure_bucket_with_ttl(
+        jetstream,
+        TOOL_REGISTRY_BUCKET,
+        harnx_nats_common::registry::REGISTRATION_TTL,
+        1,
+    )
+    .await
 }
 
 async fn publish_registration(

@@ -23,6 +23,7 @@ members = [
     "crates/harnx-mcp-plans-core",
     "crates/harnx-mcp-plans-github",
     "crates/harnx-mcp-history",
+    "crates/harnx-nats-common",
     "crates/harnx-pkg",
     "crates/harnx-rag",
     "crates/harnx-render",

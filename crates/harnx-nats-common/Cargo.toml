@@ -1,0 +1,16 @@
+[package]
+name = "harnx-nats-common"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+async-nats = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+harnx-core = { path = "../harnx-core" }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+which = { workspace = true }

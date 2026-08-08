@@ -1,7 +1,7 @@
 //! Server-side adapter for hosting a [`harnx_hookset::Hook`] over Core NATS.
 
 use anyhow::{Context, Result};
-use async_nats::jetstream::{self, kv, stream};
+use async_nats::jetstream::{self, kv};
 use futures_util::{stream::select_all, StreamExt};
 use harnx_core::hooks::{HookOutcome, HookPayload, HookResult, HookResultControl};
 use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
@@ -79,6 +79,42 @@ pub async fn serve_with_client(
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     refresh.tick().await;
 
+    let outcome = serve_requests(
+        &client,
+        &hook,
+        &mut requests,
+        RegistrationRefresh {
+            registry: &registry,
+            instance_id: &instance_id,
+            registration: &registration,
+            interval: &mut refresh,
+        },
+    )
+    .await;
+
+    // Best-effort: the TTL is the backstop when this cannot run.
+    let key = hook_registration_key(&instance_id, &server);
+    if let Err(error) = registry.delete(&key).await {
+        log::warn!("could not remove hook registration '{key}' on shutdown: {error}");
+    }
+    outcome
+}
+
+/// Everything `serve_requests` needs to keep the KV registration alive, bundled
+/// so the function stays under the argument-count limit.
+struct RegistrationRefresh<'a> {
+    registry: &'a kv::Store,
+    instance_id: &'a InstanceId,
+    registration: &'a HookRegistration,
+    interval: &'a mut tokio::time::Interval,
+}
+
+async fn serve_requests(
+    client: &async_nats::Client,
+    hook: &Arc<dyn Hook>,
+    requests: &mut futures_util::stream::SelectAll<async_nats::Subscriber>,
+    refresh: RegistrationRefresh<'_>,
+) -> Result<()> {
     loop {
         tokio::select! {
             request = requests.next() => {
@@ -86,16 +122,18 @@ pub async fn serve_with_client(
                     anyhow::bail!("hook request subscriptions closed");
                 };
                 let client = client.clone();
-                let hook = Arc::clone(&hook);
-                let specs = registration.hooks.clone();
+                let hook = Arc::clone(hook);
+                let specs = refresh.registration.hooks.clone();
                 tokio::spawn(async move {
                     if let Err(error) = handle_hook_request(client, hook, &specs, request).await {
                         log::warn!("handle hook request failed: {error:#}");
                     }
                 });
             }
-            _ = refresh.tick() => {
-                if let Err(error) = publish_hook_registration(&registry, &instance_id, &registration).await {
+            _ = refresh.interval.tick() => {
+                if let Err(error) =
+                    publish_hook_registration(refresh.registry, refresh.instance_id, refresh.registration).await
+                {
                     log::warn!("refresh hook registration failed; retrying next interval: {error:#}");
                 }
             }
@@ -156,27 +194,13 @@ async fn handle_hook_request(
 
 /// Create or open the hook registration KV bucket.
 pub async fn ensure_hook_registry_bucket(jetstream: &jetstream::Context) -> Result<kv::Store> {
-    match jetstream
-        .create_key_value(kv::Config {
-            bucket: HOOK_REGISTRY_BUCKET.to_string(),
-            history: 1,
-            num_replicas: 1,
-            storage: stream::StorageType::File,
-            ..Default::default()
-        })
-        .await
-    {
-        Ok(store) => Ok(store),
-        Err(create_error) => jetstream
-            .get_key_value(HOOK_REGISTRY_BUCKET)
-            .await
-            .map_err(anyhow::Error::from)
-            .with_context(|| {
-                format!(
-                    "open hook registry bucket '{HOOK_REGISTRY_BUCKET}' after create failed: {create_error}"
-                )
-            }),
-    }
+    harnx_nats_common::registry::ensure_bucket_with_ttl(
+        jetstream,
+        HOOK_REGISTRY_BUCKET,
+        harnx_nats_common::registry::REGISTRATION_TTL,
+        1,
+    )
+    .await
 }
 
 /// Publish one hook server registration.
