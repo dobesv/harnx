@@ -39,6 +39,46 @@ impl InstanceId {
     }
 }
 
+/// How a server binary can be run without a worker supplying its scope.
+///
+/// The three ways differ per binary, and a free-form string let a caller pass a
+/// hint that doesn't correspond to any real flag.
+pub enum StandaloneMode {
+    /// Toolset servers: serve MCP over stdio instead of registering over NATS.
+    McpStdio,
+    /// harnx-mcp-bridge: report the wrapped server's tools and exit.
+    ListTools,
+    /// Hook servers: no standalone mode; the worker launches them from config.
+    WorkerLaunched,
+}
+
+impl StandaloneMode {
+    fn hint(&self) -> &'static str {
+        match self {
+            Self::McpStdio => "--mcp-stdio",
+            Self::ListTools => "--list-tools",
+            Self::WorkerLaunched => "a hooks entry in your config, which the worker launches",
+        }
+    }
+}
+
+/// Explain a missing scope in terms of how the binary is meant to be launched.
+///
+/// The bare "variable is required" form sent operators looking for a value to
+/// invent, when the real answer is either "let the worker launch this" or "use
+/// the standalone stdio mode".
+pub fn missing_scope_message(mode: StandaloneMode) -> String {
+    let standalone_hint = mode.hint();
+    format!(
+        "{HARNX_INSTANCE_ID} is not set.\n\
+         This binary normally runs as a child of harnx-worker, which supplies it.\n\
+         To run it standalone, use {standalone_hint}.\n\
+         Do not set {HARNX_INSTANCE_ID} by hand: it namespaces every NATS \
+         subject and registry key, so a value that does not match the worker's \
+         leaves this server undiscoverable."
+    )
+}
+
 impl Default for InstanceId {
     fn default() -> Self {
         Self::new()

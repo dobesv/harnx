@@ -22,8 +22,11 @@ async fn main() -> anyhow::Result<()> {
         .context("--name is required when serving over NATS")?;
     let bridge = BridgeToolset::new(name, args.child).await?;
     let child_died = bridge.child_died_token();
-    let instance_id = std::env::var(HARNX_INSTANCE_ID)
-        .with_context(|| format!("{HARNX_INSTANCE_ID} is required"))?;
+    let instance_id = std::env::var(HARNX_INSTANCE_ID).map_err(|_| {
+        anyhow::anyhow!(harnx_core::instance::missing_scope_message(
+            harnx_core::instance::StandaloneMode::ListTools
+        ))
+    })?;
     let nats_url = std::env::var("HARNX_NATS_URL").context("HARNX_NATS_URL is required")?;
     let token = std::env::var("HARNX_NATS_TOKEN").context("HARNX_NATS_TOKEN is required")?;
 

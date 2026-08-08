@@ -253,8 +253,11 @@ pub async fn publish_hook_registration(
 /// a chance to remove its own registration instead of leaving it for the TTL.
 pub async fn run_hookset_main<H: Hook + 'static>(hook: H) -> Result<()> {
     harnx_core::server_logging::init_server_logger();
-    let instance_id = std::env::var(HARNX_INSTANCE_ID)
-        .with_context(|| format!("{HARNX_INSTANCE_ID} is required"))?;
+    let instance_id = std::env::var(HARNX_INSTANCE_ID).map_err(|_| {
+        anyhow::anyhow!(harnx_core::instance::missing_scope_message(
+            harnx_core::instance::StandaloneMode::WorkerLaunched
+        ))
+    })?;
     let nats_url =
         std::env::var(HARNX_NATS_URL).with_context(|| format!("{HARNX_NATS_URL} is required"))?;
     let token = std::env::var(HARNX_NATS_TOKEN)
