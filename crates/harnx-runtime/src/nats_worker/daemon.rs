@@ -352,18 +352,24 @@ pub(crate) fn tool_servers_matching_use_tools(
         .collect()
 }
 
+/// Whether this worker should launch its own tool servers.
+///
+/// A worker with nothing configured to spawn must not resolve a broker
+/// address, because resolving falls back to starting a shared NATS server.
+/// Mirrors `start_global_hooks`'s `hooks.entries.is_empty()` check. Pulled out
+/// of `start_local_tool_servers` so the decision itself — not a copy of it —
+/// is what tests exercise.
+fn should_start_tool_servers(manage_servers: bool, servers: &[ToolServerConfig]) -> bool {
+    manage_servers && !servers.is_empty()
+}
+
 async fn start_local_tool_servers(
     daemon: &WorkerDaemonConfig,
     client: async_nats::Client,
     instance_id: &harnx_core::instance::ServerScope,
     servers: &[crate::config::ToolServerConfig],
 ) -> Option<ToolServerSupervisor> {
-    // Mirrors `start_global_hooks`'s `hooks.entries.is_empty()` check: a worker
-    // with nothing configured to spawn must not resolve a local NATS server
-    // (and, with no broker address handed down, start one) just to spawn
-    // nothing. Without this, every `manage_servers` worker with an empty
-    // `tool_servers` list pays a shared-broker startup on every call.
-    if !daemon.manage_servers || servers.is_empty() {
+    if !should_start_tool_servers(daemon.manage_servers, servers) {
         return None;
     }
     let result = async {
@@ -382,28 +388,25 @@ async fn start_local_tool_servers(
     optional_tool_server(result)
 }
 
-/// Test entry point for [`start_local_tool_servers`]'s `manage_servers` gate.
+/// Test entry point for [`start_local_tool_servers`].
 ///
 /// Public for regression coverage that a consuming worker (the default) never
-/// spawns child tool servers. Not part of the crate's real API — production
-/// code always goes through [`start_local_tool_servers`] with an already
-/// connected client obtained during worker startup.
+/// spawns child tool servers, and that a managing worker with nothing
+/// configured spawns none either. Not part of the crate's real API —
+/// production code always goes through [`start_local_tool_servers`] with an
+/// already connected client obtained during worker startup.
+///
+/// Deliberately does none of `start_local_tool_servers`'s own gating here: it
+/// builds a client and calls straight through, so a regression in the real
+/// function's guard shows up as this shim actually starting a tool-server
+/// supervisor (or, without a reachable broker, hanging/erroring on the
+/// connect) instead of silently returning `None` from a copy of the check.
 #[doc(hidden)]
 pub async fn start_local_tool_servers_for_test(
     daemon: &WorkerDaemonConfig,
     config: &GlobalConfig,
 ) -> Option<ToolServerSupervisor> {
-    if !daemon.manage_servers {
-        return None;
-    }
     let (servers, _hooks) = configured_worker_services(config);
-    // Same short-circuit as `start_local_tool_servers`: skip the connect
-    // entirely when there is nothing to spawn, so this shim doesn't need a
-    // live NATS server (or trigger a shared-broker startup) just to prove
-    // that case.
-    if servers.is_empty() {
-        return None;
-    }
     let server = resolve_local_nats_server_config().await.ok()?;
     let token = server.token.as_deref()?;
     let client = async_nats::ConnectOptions::new()
@@ -1480,7 +1483,8 @@ impl WorkerRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        configured_worker_services, optional_tool_server, tool_servers_matching_use_tools,
+        configured_worker_services, optional_tool_server, should_start_tool_servers,
+        tool_servers_matching_use_tools,
     };
     use crate::config::ToolServerConfig;
 
@@ -1495,6 +1499,23 @@ mod tests {
             package: None,
             hooks: None,
         }
+    }
+
+    #[test]
+    fn should_start_tool_servers_requires_managing_and_a_nonempty_list() {
+        let servers = vec![tool_server("time")];
+        assert!(
+            should_start_tool_servers(true, &servers),
+            "managing with servers configured must start them"
+        );
+        assert!(
+            !should_start_tool_servers(true, &[]),
+            "managing with nothing configured must not resolve a broker to spawn nothing"
+        );
+        assert!(
+            !should_start_tool_servers(false, &servers),
+            "a consuming worker must not spawn its own tool servers"
+        );
     }
 
     #[test]
