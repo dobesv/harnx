@@ -11,7 +11,7 @@ use super::subagent_toolset::SubagentToolset;
 use super::tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
 use crate::config::{
     list_agents, resolve_local_nats_server_config, server_display_name, Config, GlobalConfig,
-    Input, ToolServerConfig, LOCAL_CLUSTER_KEY,
+    Input, ToolServerConfig,
 };
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use crate::nats_metrics;
@@ -25,6 +25,7 @@ use async_nats::jetstream::{
 };
 use chrono::Utc;
 use futures_util::StreamExt;
+use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_core::retry_config::RetryConfig;
 use harnx_engine::retry::compute_backoff_delay;
 use serde::{Deserialize, Serialize};
@@ -57,16 +58,53 @@ pub struct WorkerDaemonConfig {
     pub cluster: String,
     pub worker_id: String,
     pub lease: NatsLeaseConfig,
+    /// Whether this worker launches its own tool and hook servers as child
+    /// processes (and mints a scope for them) rather than discovering
+    /// independently deployed ones under a configured scope.
+    pub manage_servers: bool,
 }
 
 impl WorkerDaemonConfig {
+    /// A worker that discovers independently deployed servers rather than
+    /// launching its own. Callers that want the old all-in-one behavior use
+    /// [`Self::managing`] instead.
     pub fn new(cluster: impl Into<String>, worker_id: impl Into<String>) -> Self {
         Self {
             cluster: cluster.into(),
             worker_id: worker_id.into(),
             lease: NatsLeaseConfig::default(),
+            manage_servers: false,
         }
     }
+
+    /// A worker that launches its own tool and hook servers as child processes.
+    pub fn managing(cluster: impl Into<String>, worker_id: impl Into<String>) -> Self {
+        Self {
+            manage_servers: true,
+            ..Self::new(cluster, worker_id)
+        }
+    }
+}
+
+/// Resolve the scope this worker addresses servers under.
+///
+/// A worker that manages its own servers mints a fresh scope for them, same
+/// as before this flag existed. A worker pointed at independently deployed
+/// servers has no scope of its own to mint — it must be told, via
+/// `HARNX_SERVER_SCOPE`, which one those servers registered under.
+pub fn resolve_worker_scope(manage_servers: bool) -> Result<ServerScope> {
+    if manage_servers {
+        return Ok(ServerScope::new());
+    }
+    std::env::var(HARNX_SERVER_SCOPE)
+        .map(ServerScope::from_string)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "{HARNX_SERVER_SCOPE} is required without --manage-servers: a worker \
+                 that does not launch its own servers must be told which scope to \
+                 discover them under"
+            )
+        })
 }
 
 /// Activation request published by a client to wake/claim a session.
@@ -320,7 +358,7 @@ async fn start_local_tool_servers(
     instance_id: &harnx_core::instance::ServerScope,
     servers: &[crate::config::ToolServerConfig],
 ) -> Option<ToolServerSupervisor> {
-    if daemon.cluster != LOCAL_CLUSTER_KEY {
+    if !daemon.manage_servers {
         return None;
     }
     let result = async {
@@ -339,13 +377,39 @@ async fn start_local_tool_servers(
     optional_tool_server(result)
 }
 
+/// Test entry point for [`start_local_tool_servers`]'s `manage_servers` gate.
+///
+/// Public for regression coverage that a consuming worker (the default) never
+/// spawns child tool servers. Not part of the crate's real API — production
+/// code always goes through [`start_local_tool_servers`] with an already
+/// connected client obtained during worker startup.
+#[doc(hidden)]
+pub async fn start_local_tool_servers_for_test(
+    daemon: &WorkerDaemonConfig,
+    config: &GlobalConfig,
+) -> Option<ToolServerSupervisor> {
+    if !daemon.manage_servers {
+        return None;
+    }
+    let (servers, _hooks) = configured_worker_services(config);
+    let server = resolve_local_nats_server_config().await.ok()?;
+    let token = server.token.as_deref()?;
+    let client = async_nats::ConnectOptions::new()
+        .token(token.to_string())
+        .connect(&server.url)
+        .await
+        .ok()?;
+    let instance_id = harnx_core::instance::ServerScope::new();
+    start_local_tool_servers(daemon, client, &instance_id, &servers).await
+}
+
 async fn start_global_hooks(
     daemon: &WorkerDaemonConfig,
     client: async_nats::Client,
     instance_id: &harnx_core::instance::ServerScope,
     hooks: &harnx_core::hooks::HooksConfig,
 ) -> Option<HookServerSupervisor> {
-    if daemon.cluster != LOCAL_CLUSTER_KEY || hooks.entries.is_empty() {
+    if !daemon.manage_servers || hooks.entries.is_empty() {
         return None;
     }
     let result = async {
@@ -689,7 +753,7 @@ pub async fn run_worker_daemon(
     mut daemon: WorkerDaemonConfig,
     call_fn: Option<crate::agent_loop::AgentCallFn>,
 ) -> Result<()> {
-    let instance_id = harnx_core::instance::ServerScope::new();
+    let instance_id = resolve_worker_scope(daemon.manage_servers)?;
     log::info!("serving under scope '{}'", instance_id.as_str());
     let startup = prepare_worker_startup(&config, &daemon).await?;
     // `WorkerDaemonConfig::new` has no cluster to resolve against yet, so its
@@ -704,6 +768,7 @@ pub async fn run_worker_daemon(
         _background_services: services.background,
         tools_attempted: services.tools_attempted,
         cluster: daemon.cluster.clone(),
+        manage_servers: daemon.manage_servers,
         worker_id: daemon.worker_id.clone(),
         lease: daemon.lease,
         jetstream: startup.jetstream,
@@ -744,6 +809,7 @@ struct WorkerRuntime {
     tools_attempted: tokio::sync::watch::Receiver<bool>,
     #[allow(dead_code)]
     cluster: String,
+    manage_servers: bool,
     worker_id: String,
     lease: NatsLeaseConfig,
     jetstream: jetstream::Context,
@@ -1156,6 +1222,7 @@ impl WorkerRuntime {
                 run_agent_loop_with_nats_inner(
                     RunAgentLoopArgs {
                         cluster_key: &self.cluster,
+                        manage_servers: self.manage_servers,
                         session_id: &activation.session_id,
                         config: per_session.clone(),
                         instance_id: self.instance_id.clone(),

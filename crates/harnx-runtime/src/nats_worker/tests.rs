@@ -314,7 +314,7 @@ fn spawn_metis_worker_with_fast_renew(
     url: &str,
     call_fn: crate::agent_loop::AgentCallFn,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-    let mut daemon = crate::nats_worker::WorkerDaemonConfig::new("local", "worker-metis");
+    let mut daemon = crate::nats_worker::WorkerDaemonConfig::managing("local", "worker-metis");
     // ttl must stay > renew_interval; keep a comfortable margin.
     daemon.lease.renew_interval = Duration::from_millis(300);
     daemon.lease.ttl = Duration::from_secs(5);
@@ -328,7 +328,7 @@ fn spawn_metis_worker_with_call_fn(
     spawn_metis_worker_with_call_fn_and_daemon(
         url,
         call_fn,
-        crate::nats_worker::WorkerDaemonConfig::new("local", "worker-metis"),
+        crate::nats_worker::WorkerDaemonConfig::managing("local", "worker-metis"),
     )
 }
 

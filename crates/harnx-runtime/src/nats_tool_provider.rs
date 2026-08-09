@@ -139,7 +139,17 @@ impl NatsToolProvider {
 
         let mut registrations = registration_snapshot(&client, &instance_id)
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|error| {
+                // Degrading to zero tools is intended when a scope has none
+                // registered; going silent about a KV scan that outright
+                // failed is not — it looked identical to "no tools configured"
+                // in the logs.
+                log::warn!(
+                    "tool registration discovery failed under scope '{}': {error:#}",
+                    instance_id.as_str()
+                );
+                Vec::new()
+            });
         registrations.sort_by_key(|registration| match registration.package.as_deref() {
             Some(package) if Some(package) == active_package => 0,
             None => usize::from(active_package.is_some()),

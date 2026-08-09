@@ -89,12 +89,12 @@ async fn new_remote_session_fires_session_start_hook_exactly_once() {
     let _nats_url = TestEnvGuard::new(HARNX_NATS_URL_ENV, &url);
     let _nats_token = TestEnvGuard::new(HARNX_NATS_TOKEN_ENV, "session-start-token");
 
-    // Hook servers only launch for the reserved local cluster, which resolves
-    // its connection from the environment handoff set above.
+    // Hook servers only launch when the worker manages its own, which
+    // resolves its connection from the environment handoff set above.
     let worker = spawn_metis_worker_with_hooks(
         &url,
         fixed_prompt_call_fn("stub remote reply over nats"),
-        WorkerDaemonConfig::new(LOCAL_CLUSTER_KEY, "worker-metis"),
+        WorkerDaemonConfig::managing(LOCAL_CLUSTER_KEY, "worker-metis"),
         Some(session_start_marker_hook(&marker)),
     );
 

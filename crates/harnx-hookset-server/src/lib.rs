@@ -17,7 +17,9 @@ pub use harnx_hookset::HOOK_REGISTRY_BUCKET;
 const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// KV key for one worker instance's hook server registration.
+/// KV key for one hook server's registration under a scope. The scope may
+/// belong to a worker's own children or to an independently deployed set with
+/// no worker at all.
 pub fn hook_registration_key(instance_id: &ServerScope, server: &str) -> String {
     format!("{instance_id}.{server}")
 }

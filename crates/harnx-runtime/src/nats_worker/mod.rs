@@ -43,9 +43,11 @@ pub use agent_loop::{
 };
 pub use backend::{FencedSessionLogSink, NatsSessionLogBackend};
 pub use control::{control_subject, publish_control_command, ControlCommand};
+#[doc(hidden)]
+pub use daemon::start_local_tool_servers_for_test;
 pub use daemon::{
-    new_remote_session_id, notify_subject, publish_session_activate, run_worker_daemon,
-    worker_ready_subject, SessionActivate, WorkerDaemonConfig,
+    new_remote_session_id, notify_subject, publish_session_activate, resolve_worker_scope,
+    run_worker_daemon, worker_ready_subject, SessionActivate, WorkerDaemonConfig,
 };
 pub use diagnostics::diagnose_tool_servers;
 #[doc(hidden)]

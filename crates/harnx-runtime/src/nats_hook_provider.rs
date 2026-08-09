@@ -128,7 +128,9 @@ impl HookRequestDispatcher for HandlerHookRequester {
     }
 }
 
-/// Discovers and dispatches hooks registered for one worker instance.
+/// Discovers and dispatches hooks registered under a scope. That scope may be
+/// a worker's own children or an independently deployed set of hook servers
+/// no worker launched.
 pub struct NatsHookProvider {
     client: Option<async_nats::Client>,
     instance_id: ServerScope,

@@ -263,6 +263,7 @@ async fn run_worker_turn(params: WorkerTurnParams<'_>) -> Result<()> {
     let input = harnx_runtime::config::input::from_str(&global_config, prompt, None);
     run_agent_loop_with_nats(RunAgentLoopArgs {
         cluster_key,
+        manage_servers: false,
         session_id,
         config: global_config,
         instance_id: harnx_core::instance::ServerScope::new(),
@@ -389,7 +390,7 @@ async fn spawn_worker_daemon_with_call_fn(
     worker_id: &str,
     call_fn: harnx_runtime::agent_loop::AgentCallFn,
 ) -> tokio::task::JoinHandle<Result<()>> {
-    let worker_config = WorkerDaemonConfig::new("local", worker_id);
+    let worker_config = WorkerDaemonConfig::managing("local", worker_id);
     let daemon = tokio::spawn({
         let cfg = config.clone();
         async move { run_worker_daemon(cfg, worker_config, Some(call_fn)).await }
@@ -588,7 +589,7 @@ async fn mid_tool_round_user_message_is_injected_once_into_same_turn() -> Result
     };
 
     let config = local_nats_runtime_config(server.url());
-    let worker_config = WorkerDaemonConfig::new("local", "worker-mid-round");
+    let worker_config = WorkerDaemonConfig::managing("local", "worker-mid-round");
     let daemon = tokio::spawn({
         let cfg = config.clone();
         async move { run_worker_daemon(cfg, worker_config, Some(mid_round_call_fn())).await }
@@ -658,7 +659,7 @@ async fn end_of_turn_reread_runs_continuation_turn_with_same_activation() -> Res
         url: server.url(),
         token: None,
     })));
-    let worker_config = WorkerDaemonConfig::new("local", "worker-reread");
+    let worker_config = WorkerDaemonConfig::managing("local", "worker-reread");
     let daemon = tokio::spawn({
         let cfg = config.clone();
         async move { run_worker_daemon(cfg, worker_config, Some(end_turn_call_fn())).await }
@@ -766,7 +767,7 @@ async fn idle_concurrent_messages_fold_in_seq_order_into_single_turn() -> Result
     })));
     let calls = Arc::new(AtomicUsize::new(0));
     let prompts = Arc::new(AsyncMutex::new(Vec::<String>::new()));
-    let worker_config = WorkerDaemonConfig::new("local", "worker-fold");
+    let worker_config = WorkerDaemonConfig::managing("local", "worker-fold");
     let daemon = tokio::spawn({
         let cfg = config.clone();
         let calls = calls.clone();
@@ -989,9 +990,9 @@ async fn dispatch_runs_exactly_one_worker_per_activation_and_reactivation_is_noo
     let counter_one = Arc::new(AtomicUsize::new(0));
     let counter_two = Arc::new(AtomicUsize::new(0));
 
-    let mut cfg_one = WorkerDaemonConfig::new("local", "worker-one");
+    let mut cfg_one = WorkerDaemonConfig::managing("local", "worker-one");
     cfg_one.lease = fast_lease.clone();
-    let mut cfg_two = WorkerDaemonConfig::new("local", "worker-two");
+    let mut cfg_two = WorkerDaemonConfig::managing("local", "worker-two");
     cfg_two.lease = fast_lease.clone();
 
     let config_one = cluster_config(server.url());
@@ -1250,6 +1251,7 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
     let result = run_agent_loop_with_nats_inner(
         RunAgentLoopArgs {
             cluster_key: "local",
+            manage_servers: false,
             session_id,
             config,
             instance_id: harnx_core::instance::ServerScope::new(),
@@ -1799,7 +1801,7 @@ async fn retracted_user_message_is_not_executed_by_worker() -> Result<()> {
     let prompts = Arc::new(AsyncMutex::new(Vec::<String>::new()));
 
     let config = local_nats_runtime_config(server.url());
-    let worker_config = WorkerDaemonConfig::new("local", "worker-retract");
+    let worker_config = WorkerDaemonConfig::managing("local", "worker-retract");
     let daemon = tokio::spawn({
         let cfg = config.clone();
         let calls = counter.clone();

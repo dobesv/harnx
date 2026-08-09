@@ -99,13 +99,51 @@ harnx-worker --cluster local --worker-id worker-1
 
 - `--cluster`: The key from `nats_servers/`.
 - `--worker-id`: (Optional but recommended) A stable identity for the worker.
+- `--manage-servers`: Launch this worker's own tool and hook servers as child
+  processes. Without it, the worker discovers independently deployed servers
+  under `HARNX_SERVER_SCOPE` instead — see
+  [Independently Deployed Tool and Hook Servers](#independently-deployed-tool-and-hook-servers)
+  below.
 
 For the default local cluster you don't run this yourself: `harnx` and
-`harnx-serve` spawn `harnx-worker` themselves. They look for it at
-`HARNX_WORKER_BIN` first, then next to the running front-end, then on `PATH` —
-so normally the worker just has to be installed alongside the front-end.
+`harnx-serve` spawn `harnx-worker` themselves, always with `--manage-servers`.
+They look for it at `HARNX_WORKER_BIN` first, then next to the running
+front-end, then on `PATH` — so normally the worker just has to be installed
+alongside the front-end.
 
 You can run multiple workers for redundancy. If the active worker for a session dies, another worker will acquire the lease and resume execution.
+
+### Independently Deployed Tool and Hook Servers
+
+By default a worker launches its own tool and hook servers as child processes
+and assigns them a scope. To run them as their own containers instead, give
+every process the same `HARNX_SERVER_SCOPE` and leave `--manage-servers` off:
+
+```bash
+# Tool server container
+HARNX_NATS_URL=nats://nats:4222 HARNX_NATS_TOKEN=… \
+  HARNX_SERVER_SCOPE=shared harnx-time-server
+
+# Worker container
+HARNX_NATS_URL=nats://nats:4222 HARNX_NATS_TOKEN=… \
+  HARNX_SERVER_SCOPE=shared harnx-worker --cluster prod
+```
+
+Both sides must carry the same scope value. A mismatch is not an error — the
+worker finds no servers and logs that it searched an empty scope.
+
+Servers deployed this way must not depend on the worker's filesystem: each
+container has its own. `harnx-fs-tools` and `harnx-bash-tools` are therefore
+not suitable for this mode.
+
+A shared scope is reachable by every worker holding cluster credentials. The
+instance header on each request records which worker called, but is not
+checked by the server, so NATS account permissions are the enforcement
+boundary.
+
+Each worker also serves its own sub-agent toolset in-process. When several
+workers share a scope they all register that toolset under the same key and
+join one queue group, so any worker may serve any sub-agent request.
 
 ## Using Remote Agents
 

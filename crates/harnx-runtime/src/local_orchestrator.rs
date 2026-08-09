@@ -292,24 +292,44 @@ impl LocalWorkerSupervisor {
         if self.child.is_some() {
             return Ok(());
         }
-        let mut command = Command::new(&self.worker_binary);
-        command
-            .arg("--cluster")
-            .arg(LOCAL_CLUSTER_KEY)
-            .arg("--worker-id")
-            .arg(LOCAL_WORKER_ID)
-            .env(HARNX_NATS_URL_ENV, &self.server.url)
-            .env(HARNX_NATS_TOKEN_ENV, &self.server.token)
-            .stdin(Stdio::null())
-            .stdout(worker_output_sink())
-            .stderr(worker_output_sink())
-            .kill_on_drop(true);
-        configure_worker_process(&mut command);
+        let mut command =
+            build_local_worker_command(&self.worker_binary, &self.server.url, &self.server.token);
         self.child = Some(command.spawn().with_context(|| {
             format!("spawn local worker from {}", self.worker_binary.display())
         })?);
         Ok(())
     }
+}
+
+/// Build the local worker subprocess command.
+///
+/// `--manage-servers` is what keeps local behavior unchanged now that the
+/// worker no longer infers "launch my own tool/hook servers" from the cluster
+/// key: the front-end owns the local worker's whole lifecycle, so it always
+/// wants the all-in-one shape. Split out (rather than inlined in
+/// `spawn_worker`) so a test can assert on the constructed argv without
+/// spawning a real process or a live broker.
+#[doc(hidden)]
+pub fn build_local_worker_command(
+    worker_binary: &Path,
+    nats_url: &str,
+    nats_token: &str,
+) -> Command {
+    let mut command = Command::new(worker_binary);
+    command
+        .arg("--cluster")
+        .arg(LOCAL_CLUSTER_KEY)
+        .arg("--worker-id")
+        .arg(LOCAL_WORKER_ID)
+        .arg("--manage-servers")
+        .env(HARNX_NATS_URL_ENV, nats_url)
+        .env(HARNX_NATS_TOKEN_ENV, nats_token)
+        .stdin(Stdio::null())
+        .stdout(worker_output_sink())
+        .stderr(worker_output_sink())
+        .kill_on_drop(true);
+    configure_worker_process(&mut command);
+    command
 }
 
 impl Drop for LocalWorkerSupervisor {

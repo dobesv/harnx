@@ -158,15 +158,27 @@ pub async fn discover_nats_tool_provider_cached(
     }
 
     // Don't hold the process-wide lock while connecting to NATS or scanning KV.
-    let provider = NatsToolProvider::discover(
+    let provider = match NatsToolProvider::discover(
         config,
         instance_id.clone(),
         NatsInFlightCalls::for_instance(instance_id),
         active_package,
     )
     .await
-    .ok()
-    .map(Arc::new);
+    {
+        Ok(provider) => Some(Arc::new(provider)),
+        Err(error) => {
+            // A connect/subscribe failure here is distinct from "no tools
+            // registered" (handled inside `discover` itself) — without this,
+            // it produced no provider and no log, the same silent-degradation
+            // this cache exists to avoid.
+            log::warn!(
+                "NATS tool discovery failed under scope '{}': {error:#}",
+                instance_id.as_str()
+            );
+            None
+        }
+    };
     cache_discovery(cache, key, provider.clone(), Instant::now());
     provider
 }

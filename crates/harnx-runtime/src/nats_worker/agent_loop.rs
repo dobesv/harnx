@@ -3,7 +3,7 @@
 use super::backend::{FencedSessionLogSink, NatsSessionLogBackend};
 use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use crate::agent_loop::OnToolRoundFn;
-use crate::config::{resolve_local_nats_server_config, GlobalConfig, Input, LOCAL_CLUSTER_KEY};
+use crate::config::{resolve_local_nats_server_config, GlobalConfig, Input};
 use crate::nats_event_sink::NatsEventSink;
 use crate::nats_hook_provider::{
     dispatch_hook_event, HookDispatchMeta, HookEventDispatch, NatsHookProvider,
@@ -24,6 +24,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Clone)]
 pub struct RunAgentLoopArgs<'a> {
     pub cluster_key: &'a str,
+    /// Whether this worker launches its own agent-level hook servers (session
+    /// and handoff hooks) rather than discovering independently deployed ones.
+    pub manage_servers: bool,
     pub session_id: &'a str,
     pub config: GlobalConfig,
     pub instance_id: harnx_core::instance::ServerScope,
@@ -188,6 +191,7 @@ pub async fn run_agent_loop_with_nats(args: RunAgentLoopArgs<'_>) -> Result<()> 
 pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Result<()> {
     let RunAgentLoopArgs {
         cluster_key,
+        manage_servers,
         session_id,
         config,
         instance_id,
@@ -218,7 +222,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
     .await?;
 
     let hook_start_config =
-        agent_hook_start_config(cluster_key, &jetstream_ctx, &instance_id).await;
+        agent_hook_start_config(manage_servers, &jetstream_ctx, &instance_id).await;
     let mut hook_supervisor = None;
     reconcile_agent_hooks(
         &mut hook_supervisor,
@@ -419,11 +423,11 @@ struct AgentLoopSegmentArgs {
 }
 
 async fn agent_hook_start_config(
-    cluster_key: &str,
+    manage_servers: bool,
     jetstream: &jetstream::Context,
     instance_id: &harnx_core::instance::ServerScope,
 ) -> Option<HookServerStartConfig> {
-    if cluster_key != LOCAL_CLUSTER_KEY {
+    if !manage_servers {
         return None;
     }
     let result = async {
