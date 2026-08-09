@@ -222,7 +222,8 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
     .await?;
 
     let hook_start_config =
-        agent_hook_start_config(manage_servers, &jetstream_ctx, &instance_id).await;
+        resolve_agent_hook_start_config(manage_servers, &config, &jetstream_ctx, &instance_id)
+            .await;
     let mut hook_supervisor = None;
     reconcile_agent_hooks(
         &mut hook_supervisor,
@@ -422,12 +423,32 @@ struct AgentLoopSegmentArgs {
     hook_supervisor: Option<HookServerSupervisor>,
 }
 
-async fn agent_hook_start_config(
+/// Resolve the active agent's hooks and hand them to [`agent_hook_start_config`].
+///
+/// Split out of `run_agent_loop_with_nats_inner` to keep that function under
+/// the line-count threshold; `reconcile_agent_hooks` re-resolves the same
+/// hooks a few lines later (a config read, not worth threading through).
+async fn resolve_agent_hook_start_config(
     manage_servers: bool,
+    config: &GlobalConfig,
     jetstream: &jetstream::Context,
     instance_id: &harnx_core::instance::ServerScope,
 ) -> Option<HookServerStartConfig> {
-    if !manage_servers {
+    let hooks = agent_resolved_hooks(config);
+    agent_hook_start_config(manage_servers, &hooks, jetstream, instance_id).await
+}
+
+async fn agent_hook_start_config(
+    manage_servers: bool,
+    hooks: &harnx_core::hooks::HooksConfig,
+    jetstream: &jetstream::Context,
+    instance_id: &harnx_core::instance::ServerScope,
+) -> Option<HookServerStartConfig> {
+    // This runs once per activation, so unlike the worker-startup gates it
+    // pays for a local NATS server resolution (and, absent a broker address,
+    // a shared-server startup) on every turn unless we also check that the
+    // active agent actually has hooks to launch — mirrors `start_global_hooks`.
+    if !manage_servers || hooks.entries.is_empty() {
         return None;
     }
     let result = async {

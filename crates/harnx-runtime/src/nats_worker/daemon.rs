@@ -358,7 +358,12 @@ async fn start_local_tool_servers(
     instance_id: &harnx_core::instance::ServerScope,
     servers: &[crate::config::ToolServerConfig],
 ) -> Option<ToolServerSupervisor> {
-    if !daemon.manage_servers {
+    // Mirrors `start_global_hooks`'s `hooks.entries.is_empty()` check: a worker
+    // with nothing configured to spawn must not resolve a local NATS server
+    // (and, with no broker address handed down, start one) just to spawn
+    // nothing. Without this, every `manage_servers` worker with an empty
+    // `tool_servers` list pays a shared-broker startup on every call.
+    if !daemon.manage_servers || servers.is_empty() {
         return None;
     }
     let result = async {
@@ -392,6 +397,13 @@ pub async fn start_local_tool_servers_for_test(
         return None;
     }
     let (servers, _hooks) = configured_worker_services(config);
+    // Same short-circuit as `start_local_tool_servers`: skip the connect
+    // entirely when there is nothing to spawn, so this shim doesn't need a
+    // live NATS server (or trigger a shared-broker startup) just to prove
+    // that case.
+    if servers.is_empty() {
+        return None;
+    }
     let server = resolve_local_nats_server_config().await.ok()?;
     let token = server.token.as_deref()?;
     let client = async_nats::ConnectOptions::new()
