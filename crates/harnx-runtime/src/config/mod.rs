@@ -45,7 +45,11 @@ pub const HARNX_NATS_TOKEN_ENV: &str = "HARNX_NATS_TOKEN";
 /// harnx creates on the shared local cluster. Only meaningful when a complete
 /// environment handoff (see `resolve_local_nats_server_config`) points that
 /// cluster at a real multi-node deployment; absent otherwise.
-pub const HARNX_NATS_REPLICAS_ENV: &str = "HARNX_NATS_REPLICAS";
+///
+/// Re-exported from `harnx-nats-common` rather than declared here so this and
+/// `NatsEndpoint::from_env`'s copy can never drift to different names or
+/// different parsing.
+pub use harnx_nats_common::connect::HARNX_NATS_REPLICAS_ENV;
 /// Default JetStream replica count for buckets harnx creates that aren't
 /// wired to a cluster's configured `replicas` (currently `harnx_leases` and
 /// `harnx_sessions`; see `nats_lease` and `nats_session_index`). Shared here,

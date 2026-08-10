@@ -68,9 +68,11 @@ pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
             // Only a complete handoff can mean "this is a real cluster an
             // operator configured"; the auto-managed broker below is always a
             // single embedded, TLS-less process, so it never reads any of this.
-            let replicas = std::env::var(HARNX_NATS_REPLICAS_ENV)
-                .ok()
-                .and_then(|value| value.parse().ok());
+            //
+            // Shares `NatsEndpoint::from_env`'s parsing so an operator's typo
+            // (e.g. "3x") fails loudly here too instead of silently resolving
+            // to a single-replica bucket.
+            let replicas = harnx_nats_common::connect::parse_replicas_env()?;
             // Same env var names as `NatsEndpoint::from_env`: a worker
             // resolving its own discovery client and the child tool/hook
             // servers it spawns must agree on TLS, or a worker on a TLS
@@ -301,6 +303,27 @@ mod tests {
         let server = resolve_local_nats_server_config().await.unwrap();
 
         assert_authenticated_local_server(&server, "nats://127.0.0.1:4555", "handoff-token");
+    }
+
+    /// An operator's typo in `HARNX_NATS_REPLICAS` (e.g. "3x") must fail
+    /// startup loudly, not silently resolve to a single-replica bucket.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn local_cluster_env_handoff_rejects_an_unparseable_replicas_value() {
+        harnx_core::require_nextest();
+        let _lock = env_lock();
+        let _url = EnvGuard::new(
+            HARNX_NATS_URL_ENV,
+            std::path::Path::new("nats://127.0.0.1:4555"),
+        );
+        let _token = EnvGuard::new(HARNX_NATS_TOKEN_ENV, std::path::Path::new("handoff-token"));
+        let _replicas = EnvGuard::new(HARNX_NATS_REPLICAS_ENV, std::path::Path::new("3x"));
+
+        let error = resolve_local_nats_server_config()
+            .await
+            .expect_err("an unparseable replicas value must not default to 1");
+
+        assert_error_mentions(&error.to_string(), &["HARNX_NATS_REPLICAS"]);
     }
 
     /// A worker on a TLS cluster must be able to discover tool/hook servers

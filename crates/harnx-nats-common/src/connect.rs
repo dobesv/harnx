@@ -26,6 +26,34 @@ pub const HARNX_NATS_TLS_CERT_ENV: &str = "HARNX_NATS_TLS_CERT";
 pub const HARNX_NATS_TLS_KEY_ENV: &str = "HARNX_NATS_TLS_KEY";
 /// Env var carrying a custom CA bundle path for TLS.
 pub const HARNX_NATS_TLS_CA_ENV: &str = "HARNX_NATS_TLS_CA";
+/// Env var carrying the JetStream replica count for buckets harnx creates.
+///
+/// Read by both [`NatsEndpoint::from_env`] (standalone tool/hook servers) and
+/// `harnx-runtime`'s `resolve_local_nats_server_config` (worker-side
+/// discovery) — the same name and the same parsing via [`parse_replicas_env`],
+/// so a typo can't make one side see a replicated bucket while the other
+/// silently downgrades to a single replica.
+pub const HARNX_NATS_REPLICAS_ENV: &str = "HARNX_NATS_REPLICAS";
+
+/// Parse [`HARNX_NATS_REPLICAS_ENV`]: `Ok(None)` when unset (callers default
+/// to 1 replica), `Ok(Some(n))` when it parses, `Err` when it's set to
+/// something that isn't a valid replica count.
+///
+/// Unset is not an error — most deployments never set this. Set-but-invalid
+/// must be, because silently falling back to `None`/1 here is exactly the
+/// silent single-replica downgrade an operator who set this variable is
+/// trying to avoid.
+pub fn parse_replicas_env() -> Result<Option<usize>> {
+    match std::env::var(HARNX_NATS_REPLICAS_ENV) {
+        Ok(value) => value.parse::<usize>().map(Some).with_context(|| {
+            format!("{HARNX_NATS_REPLICAS_ENV}={value:?} is not a valid replica count")
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("{HARNX_NATS_REPLICAS_ENV} is not valid unicode"))
+        }
+    }
+}
 
 /// Connection details for one NATS endpoint: URL plus optional auth/TLS.
 ///
@@ -84,13 +112,12 @@ impl NatsEndpoint {
     /// receives them.
     pub fn from_env() -> Result<Self> {
         let url = std::env::var("HARNX_NATS_URL").context("HARNX_NATS_URL is required")?;
+        let replicas = parse_replicas_env()?;
         Ok(Self {
             name: "environment".to_string(),
             url,
             token: std::env::var("HARNX_NATS_TOKEN").ok(),
-            replicas: std::env::var("HARNX_NATS_REPLICAS")
-                .ok()
-                .and_then(|value| value.parse().ok()),
+            replicas,
             tls: std::env::var(HARNX_NATS_TLS_ENV)
                 .ok()
                 .map(|value| value == "1" || value == "true"),
