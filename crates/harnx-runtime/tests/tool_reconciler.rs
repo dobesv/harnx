@@ -215,19 +215,20 @@ impl Drop for EnvGuard {
     }
 }
 
-/// Resolve a workspace binary, building it with `cargo build -p <crate_name>`
+/// Resolve a workspace binary by its crate/binary name (the two always match
+/// for the servers this test builds), building it with `cargo build -p <name>`
 /// if a package-scoped test run has not produced it yet. Mirrors
 /// `fs_server_binary` in `package_tool_naming_e2e.rs`.
-fn resolve_binary(crate_name: &str, bin_stem: &str) -> anyhow::Result<PathBuf> {
+fn resolve_binary(name: &str) -> anyhow::Result<PathBuf> {
     let mut path = std::env::current_exe()?;
     path.pop();
-    if path.file_name().is_some_and(|name| name == "deps") {
+    if path.file_name().is_some_and(|dir| dir == "deps") {
         path.pop();
     }
     path.push(if cfg!(windows) {
-        format!("{bin_stem}.exe")
+        format!("{name}.exe")
     } else {
-        bin_stem.to_string()
+        name.to_string()
     });
     if path.is_file() {
         return Ok(path);
@@ -239,36 +240,35 @@ fn resolve_binary(crate_name: &str, bin_stem: &str) -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("resolve workspace root"))?
         .to_path_buf();
     let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .args(["build", "-p", crate_name])
+        .args(["build", "-p", name])
         .current_dir(workspace)
         .status()?;
-    anyhow::ensure!(status.success(), "building {crate_name} failed");
-    anyhow::ensure!(path.is_file(), "{bin_stem} not found at {}", path.display());
+    anyhow::ensure!(status.success(), "building {name} failed");
+    anyhow::ensure!(path.is_file(), "{name} not found at {}", path.display());
     Ok(path)
+}
+
+/// A minimal agent fixture: the name `retrieve_agent` loads it by, and the
+/// `use_tools` selector that decides which tool server its session gets.
+/// Bundling the two avoids threading a `(name, use_tools)` string pair
+/// through every helper that needs one or the other.
+struct AgentFixture {
+    name: &'static str,
+    use_tools: &'static str,
 }
 
 /// Write a minimal agent file `retrieve_agent` can load by name: no `model:`
 /// (so agent resolution needs no configured client), just a `use_tools`
 /// selector naming which tool server this agent's session should get.
-fn write_agent(agents_dir: &Path, name: &str, use_tools: &str) -> anyhow::Result<()> {
+fn write_agent(agents_dir: &Path, agent: &AgentFixture) -> anyhow::Result<()> {
     std::fs::write(
-        agents_dir.join(format!("{name}.md")),
-        format!("---\nuse_tools: {use_tools}\n---\nstub agent instructions\n"),
+        agents_dir.join(format!("{}.md", agent.name)),
+        format!(
+            "---\nuse_tools: {}\n---\nstub agent instructions\n",
+            agent.use_tools
+        ),
     )?;
     Ok(())
-}
-
-fn tool_server_config(name: &str, command: PathBuf, args: Vec<String>) -> ToolServerConfig {
-    ToolServerConfig {
-        name: name.to_string(),
-        command: command.to_string_lossy().into_owned(),
-        args,
-        env: Default::default(),
-        enabled: true,
-        description: None,
-        package: None,
-        hooks: None,
-    }
 }
 
 /// Config names of every server currently registered, regardless of which
@@ -321,16 +321,48 @@ async fn await_registered(client: &async_nats::Client, config_name: &str) -> any
 
 async fn activate(
     jetstream: &async_nats::jetstream::Context,
-    session_id: &str,
-    agent: &str,
+    activation: &SessionActivate,
 ) -> anyhow::Result<()> {
-    publish_session_activate(
-        jetstream,
-        LOCAL_CLUSTER_KEY,
-        &SessionActivate::new(session_id, agent),
-    )
-    .await?;
+    publish_session_activate(jetstream, LOCAL_CLUSTER_KEY, activation).await?;
     Ok(())
+}
+
+/// Build the worker config for the e2e test: a `time` server with no args and
+/// a `plans` server pointed at `plans_dir`. Pulled out of the test body,
+/// which was over the large-method threshold with this inlined.
+fn e2e_worker_config(
+    time_binary: PathBuf,
+    plans_binary: PathBuf,
+    plans_dir: &Path,
+) -> GlobalConfig {
+    Arc::new(RwLock::new(Config {
+        tool_servers: vec![
+            ToolServerConfig {
+                name: "time".to_string(),
+                command: time_binary.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                env: Default::default(),
+                enabled: true,
+                description: None,
+                package: None,
+                hooks: None,
+            },
+            ToolServerConfig {
+                name: "plans".to_string(),
+                command: plans_binary.to_string_lossy().into_owned(),
+                args: vec![
+                    "--dir".to_string(),
+                    plans_dir.to_string_lossy().into_owned(),
+                ],
+                env: Default::default(),
+                enabled: true,
+                description: None,
+                package: None,
+                hooks: None,
+            },
+        ],
+        ..Config::default()
+    }))
 }
 
 /// A trivial stub: ends every turn immediately with no tool calls. What
@@ -362,14 +394,23 @@ async fn a_session_only_starts_the_servers_its_agent_uses() -> anyhow::Result<()
         return Ok(());
     };
 
-    let time_binary = resolve_binary("harnx-time-server", "harnx-time-server")?;
-    let plans_binary = resolve_binary("harnx-plans-tools", "harnx-plans-tools")?;
+    let time_binary = resolve_binary("harnx-time-server")?;
+    let plans_binary = resolve_binary("harnx-plans-tools")?;
+
+    const AGENT_TIME: AgentFixture = AgentFixture {
+        name: "agent-time",
+        use_tools: "time_*",
+    };
+    const AGENT_PLANS: AgentFixture = AgentFixture {
+        name: "agent-plans",
+        use_tools: "plans_*",
+    };
 
     let config_root = tempfile::tempdir()?;
     let agents_dir = config_root.path().join("agents");
     std::fs::create_dir_all(&agents_dir)?;
-    write_agent(&agents_dir, "agent-time", "time_*")?;
-    write_agent(&agents_dir, "agent-plans", "plans_*")?;
+    write_agent(&agents_dir, &AGENT_TIME)?;
+    write_agent(&agents_dir, &AGENT_PLANS)?;
 
     let plans_dir = tempfile::tempdir()?;
 
@@ -383,20 +424,7 @@ async fn a_session_only_starts_the_servers_its_agent_uses() -> anyhow::Result<()
         ("HARNX_CONFIG_DIR", &config_root.path().to_string_lossy()),
     ]);
 
-    let config: GlobalConfig = Arc::new(RwLock::new(Config {
-        tool_servers: vec![
-            tool_server_config("time", time_binary, Vec::new()),
-            tool_server_config(
-                "plans",
-                plans_binary,
-                vec![
-                    "--dir".to_string(),
-                    plans_dir.path().to_string_lossy().into_owned(),
-                ],
-            ),
-        ],
-        ..Config::default()
-    }));
+    let config = e2e_worker_config(time_binary, plans_binary, plans_dir.path());
 
     let daemon = WorkerDaemonConfig::managing(LOCAL_CLUSTER_KEY, "tool-reconciler-e2e");
     let worker_config = config.clone();
@@ -410,7 +438,7 @@ async fn a_session_only_starts_the_servers_its_agent_uses() -> anyhow::Result<()
         .await?;
     let jetstream = async_nats::jetstream::new(client.clone());
 
-    activate(&jetstream, "s1", "agent-time").await?;
+    activate(&jetstream, &SessionActivate::new("s1", AGENT_TIME.name)).await?;
     await_registered(&client, "time").await?;
 
     assert!(
@@ -421,7 +449,7 @@ async fn a_session_only_starts_the_servers_its_agent_uses() -> anyhow::Result<()
         "no active session uses the plans server, so it must not be running"
     );
 
-    activate(&jetstream, "s2", "agent-plans").await?;
+    activate(&jetstream, &SessionActivate::new("s2", AGENT_PLANS.name)).await?;
     await_registered(&client, "plans").await?;
     assert!(
         registered_config_names(&client)

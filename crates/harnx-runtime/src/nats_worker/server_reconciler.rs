@@ -44,6 +44,34 @@ struct Running {
     idle_since: Option<Instant>,
 }
 
+/// Add `session_id` as a user of `server` in `state`. Queues `server` onto
+/// `to_start` exactly when this is its first user (no entry existed yet) —
+/// pulled out of `session_started`'s loop so that loop body is a single call
+/// with no conditional of its own.
+fn add_user_or_queue_start(
+    state: &mut HashMap<String, Running>,
+    to_start: &mut Vec<ToolServerConfig>,
+    session_id: &str,
+    server: ToolServerConfig,
+) {
+    match state.get_mut(&server.name) {
+        Some(entry) => {
+            entry.users.insert(session_id.to_string());
+            entry.idle_since = None;
+        }
+        None => {
+            state.insert(
+                server.name.clone(),
+                Running {
+                    users: HashSet::from([session_id.to_string()]),
+                    idle_since: None,
+                },
+            );
+            to_start.push(server);
+        }
+    }
+}
+
 /// Reference-counts tool servers by [`ToolServerConfig::name`] across the
 /// sessions that requested them, starting a server on its first user and
 /// stopping it `linger` after its last user goes away.
@@ -70,22 +98,7 @@ impl ServerReconciler {
         {
             let mut state = self.state.lock().await;
             for server in servers {
-                match state.get_mut(&server.name) {
-                    Some(entry) => {
-                        entry.users.insert(session_id.to_string());
-                        entry.idle_since = None;
-                    }
-                    None => {
-                        state.insert(
-                            server.name.clone(),
-                            Running {
-                                users: HashSet::from([session_id.to_string()]),
-                                idle_since: None,
-                            },
-                        );
-                        to_start.push(server);
-                    }
-                }
+                add_user_or_queue_start(&mut state, &mut to_start, session_id, server);
             }
         }
         // Never hold `state` across a launcher await: starting a process and
@@ -93,21 +106,26 @@ impl ServerReconciler {
         // here would serialize every session activation behind whichever
         // server is slowest to come up.
         for server in to_start {
-            if let Err(error) = self.launcher.start(&server).await {
-                // One unusable server must not cost the session the others it
-                // asked for. There is deliberately no background retry loop
-                // for it: on-demand starting means the next session that
-                // wants this server tries fresh, since it isn't in `state`.
-                // The trade-off is real — a session already running when a
-                // broken server gets fixed will not see it come back; only a
-                // later activation will. The old worker-wide retry loop this
-                // replaced covered that case, at the cost of retrying forever
-                // in the background for a server no active session wanted.
-                log::warn!("tool server '{}' unavailable: {error:#}", server.name);
-                self.state.lock().await.remove(&server.name);
-            }
+            self.start_or_forget(server).await;
         }
         self.sweep().await;
+    }
+
+    /// Start `server` and, on failure, remove it from `state` rather than
+    /// leave it counted as running.
+    ///
+    /// There is deliberately no background retry loop for a failed start:
+    /// on-demand starting means the next session that wants this server
+    /// tries fresh, since it isn't in `state`. The trade-off is real — a
+    /// session already running when a broken server gets fixed will not see
+    /// it come back; only a later activation will. The old worker-wide retry
+    /// loop this replaced covered that case, at the cost of retrying forever
+    /// in the background for a server no active session wanted.
+    async fn start_or_forget(&self, server: ToolServerConfig) {
+        if let Err(error) = self.launcher.start(&server).await {
+            log::warn!("tool server '{}' unavailable: {error:#}", server.name);
+            self.state.lock().await.remove(&server.name);
+        }
     }
 
     /// Remove `session_id` from every server's user set. A server that drops
