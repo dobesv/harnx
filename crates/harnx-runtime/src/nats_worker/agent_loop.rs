@@ -250,6 +250,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
     // Run unified agent loop
     // Persistence goes through shared Config.save_message entry construction; append_event routes sink
     run_agent_loop_segment(AgentLoopSegmentArgs {
+        manage_servers,
         config,
         ctx,
         input: initial_input,
@@ -411,6 +412,11 @@ async fn dispatch_session_start(params: SessionStartDispatch<'_>) {
 }
 
 struct AgentLoopSegmentArgs {
+    /// Carried through handoffs so a handoff target's hooks can be
+    /// re-resolved with the same manage-vs-discover gate the activation used
+    /// (see `prepare_nats_handoff`); a worker that discovers independently
+    /// deployed servers must not start local supervisors at handoff either.
+    manage_servers: bool,
     config: GlobalConfig,
     ctx: crate::agent_loop::AgentLoopContext,
     input: Input,
@@ -485,6 +491,7 @@ fn run_agent_loop_segment(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
     Box::pin(async move {
         let AgentLoopSegmentArgs {
+            manage_servers,
             config,
             ctx,
             input,
@@ -506,6 +513,7 @@ fn run_agent_loop_segment(
             } => {
                 let handoff_input = crate::config::input::from_str(&config, &prompt, None);
                 let handoff_args = AgentLoopSegmentArgs {
+                    manage_servers,
                     config,
                     ctx,
                     input: handoff_input,
@@ -586,14 +594,37 @@ async fn prepare_nats_handoff(
         .context("NATS handoff missing session after activation")?;
     attach_session_to_config(&args.config, new_session, &new_backend, Some(&new_lease));
     args.lease = Some(new_lease);
+    reconcile_handoff_target_hooks(&mut args, &new_session_id).await;
+    Ok((args, new_event_sink))
+}
+
+/// Re-resolve `hook_start_config` against the handoff target's hooks, then
+/// reconcile the supervisor against it.
+///
+/// `hook_start_config` was resolved once at activation, from the activation
+/// agent's own hooks (or lack of them). Reusing it unchanged here means a
+/// handoff to an agent WITH hooks that the activation agent lacked never
+/// starts them: `reconcile_hook_supervisor` just no-ops on a `None` start.
+/// `use_agent` (above, in `prepare_nats_handoff`) has already switched
+/// `args.config` to the target agent by the time this runs, so re-resolving
+/// against it reflects the target's hooks instead. `resolve_agent_hook_start_config`
+/// still returns `None` without ever touching the broker when the target has
+/// no hooks either, so a hookless handoff costs nothing extra.
+async fn reconcile_handoff_target_hooks(args: &mut AgentLoopSegmentArgs, new_session_id: &str) {
+    args.hook_start_config = resolve_agent_hook_start_config(
+        args.manage_servers,
+        &args.config,
+        &args.jetstream_ctx,
+        &args.ctx.instance_id,
+    )
+    .await;
     reconcile_agent_hooks(
         &mut args.hook_supervisor,
         args.hook_start_config.as_ref(),
         &args.config,
-        &new_session_id,
+        new_session_id,
     )
     .await;
-    Ok((args, new_event_sink))
 }
 
 fn agent_resolved_hooks(config: &GlobalConfig) -> harnx_core::hooks::HooksConfig {
