@@ -89,7 +89,7 @@ impl StandaloneMode {
 pub fn missing_scope_message(mode: StandaloneMode) -> String {
     let hint = mode.hint();
     format!(
-        "{HARNX_SERVER_SCOPE} is not set.\n\
+        "{HARNX_SERVER_SCOPE} is not set to a non-empty value.\n\
          This binary normally runs as a child of harnx-worker, which supplies it.\n\
          To proceed, {hint}.\n\
          If you are instead deploying this server independently of any worker \
@@ -98,6 +98,23 @@ pub fn missing_scope_message(mode: StandaloneMode) -> String {
          every NATS subject and registry key, so a mismatched value leaves \
          this server undiscoverable."
     )
+}
+
+/// Read [`HARNX_SERVER_SCOPE`] from the environment and build a
+/// [`ServerScope`] from it, treating an empty value the same as an absent one.
+///
+/// `std::env::var` returns `Ok("")` when the variable is set but empty.
+/// `ServerScope::from_string("")` would happily build a scope that strips no
+/// prefix from any subject or registration key: the server starts and
+/// registers normally, and no worker configured for a real scope can ever
+/// find it. There is no way to fail closed here other than rejecting the
+/// value up front, the same as if it had never been set.
+pub fn scope_from_env(mode: StandaloneMode) -> anyhow::Result<ServerScope> {
+    std::env::var(HARNX_SERVER_SCOPE)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(ServerScope::from_string)
+        .ok_or_else(|| anyhow::anyhow!(missing_scope_message(mode)))
 }
 
 impl Default for ServerScope {

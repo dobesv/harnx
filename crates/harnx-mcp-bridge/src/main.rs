@@ -1,5 +1,4 @@
 use anyhow::Context;
-use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_mcp_bridge::{report_tools, Args, BridgeToolset};
 use harnx_nats_common::connect::{NatsConnection, NatsEndpoint};
 use harnx_toolset_server::serve_with_shutdown;
@@ -24,12 +23,8 @@ async fn main() -> anyhow::Result<()> {
         .context("--name is required when serving over NATS")?;
     let bridge = BridgeToolset::new(name, args.child).await?;
     let child_died = bridge.child_died_token();
-    let instance_id = std::env::var(HARNX_SERVER_SCOPE).map_err(|_| {
-        anyhow::anyhow!(harnx_core::instance::missing_scope_message(
-            harnx_core::instance::StandaloneMode::ListTools
-        ))
-    })?;
-    let scope = ServerScope::from_string(instance_id);
+    let scope =
+        harnx_core::instance::scope_from_env(harnx_core::instance::StandaloneMode::ListTools)?;
     log::info!("serving under scope '{}'", scope.as_str());
     // SIGTERM/Ctrl+C get a chance to deregister before the process exits, the
     // same as the toolset/hookset binaries this bridge otherwise mirrors: an

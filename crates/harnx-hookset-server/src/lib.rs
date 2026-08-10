@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv};
 use futures_util::{stream::select_all, StreamExt};
 use harnx_core::hooks::{HookOutcome, HookPayload, HookResult, HookResultControl};
-use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
+use harnx_core::instance::ServerScope;
 use harnx_hookset::{Hook, HookRegistration, HookSpec, HOOK_PROTOCOL_VERSION, HOOK_SCHEMA_VERSION};
 use harnx_nats_common::connect::NatsConnection;
 use std::collections::HashSet;
@@ -271,12 +271,8 @@ pub async fn publish_hook_registration(
 /// a chance to remove its own registration instead of leaving it for the TTL.
 pub async fn run_hookset_main<H: Hook + 'static>(hook: H) -> Result<()> {
     harnx_core::server_logging::init_server_logger();
-    let instance_id = std::env::var(HARNX_SERVER_SCOPE).map_err(|_| {
-        anyhow::anyhow!(harnx_core::instance::missing_scope_message(
-            harnx_core::instance::StandaloneMode::WorkerLaunched
-        ))
-    })?;
-    let scope = ServerScope::from_string(instance_id);
+    let scope =
+        harnx_core::instance::scope_from_env(harnx_core::instance::StandaloneMode::WorkerLaunched)?;
     log::info!("serving under scope '{}'", scope.as_str());
     let endpoint = harnx_nats_common::connect::NatsEndpoint::from_env()?;
     let client = endpoint.connect().await?;

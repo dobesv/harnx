@@ -6,7 +6,7 @@ pub mod schema;
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv};
 use futures_util::StreamExt;
-use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
+use harnx_core::instance::ServerScope;
 use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{
     server_identity_token, ControlKind, ControlMessage, Registration, ToolErrorPayload,
@@ -559,12 +559,8 @@ where
         return Ok(());
     }
 
-    let instance_id = std::env::var(HARNX_SERVER_SCOPE).map_err(|_| {
-        anyhow::anyhow!(harnx_core::instance::missing_scope_message(
-            harnx_core::instance::StandaloneMode::McpStdio
-        ))
-    })?;
-    let scope = ServerScope::from_string(instance_id);
+    let scope =
+        harnx_core::instance::scope_from_env(harnx_core::instance::StandaloneMode::McpStdio)?;
     log::info!("serving under scope '{}'", scope.as_str());
     let endpoint = harnx_nats_common::connect::NatsEndpoint::from_env()?;
     let client = endpoint.connect().await?;
