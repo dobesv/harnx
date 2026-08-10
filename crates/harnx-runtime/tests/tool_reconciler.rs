@@ -12,9 +12,12 @@ use harnx_runtime::config::{
     Config, GlobalConfig, ToolServerConfig, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV,
     LOCAL_CLUSTER_KEY,
 };
-use harnx_runtime::nats_worker::server_reconciler::{ServerLauncher, ServerReconciler};
+use harnx_runtime::nats_worker::server_reconciler::{
+    ServerLauncher, ServerReconciler, SupervisorLauncher,
+};
 use harnx_runtime::nats_worker::{
-    publish_session_activate, run_worker_daemon, SessionActivate, WorkerDaemonConfig,
+    publish_session_activate, run_worker_daemon, SessionActivate, ToolServerStartConfig,
+    WorkerDaemonConfig,
 };
 use harnx_toolset::Registration;
 use harnx_toolset_server::TOOL_REGISTRY_BUCKET;
@@ -510,4 +513,73 @@ async fn a_session_only_starts_the_servers_its_agent_uses() -> anyhow::Result<()
     );
 
     Ok(())
+}
+
+/// Poll the registry with a deadline until `config_name` no longer appears.
+async fn await_deregistered(client: &async_nats::Client, config_name: &str) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if !registered_config_names(client)
+            .await
+            .iter()
+            .any(|name| name == config_name)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "'{config_name}' registration was not removed within the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// `SupervisorLauncher::stop` must actually deregister, not just drop the
+/// supervisor: `ToolServerSupervisor` relies on its monitor tasks' own exit
+/// path for that (see `tool_supervisor.rs`), and `Drop` only aborts those
+/// tasks past the point where they'd run it. A bare drop leaves the
+/// registration behind until its 90s TTL expires — long after `stop`
+/// returned — so a session that starts moments later can be handed a tool
+/// backed by an already-dead process.
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_a_server_actually_removes_its_registration() -> anyhow::Result<()> {
+    harnx_core::require_nextest();
+    let Some(nats) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
+        auth_token: Some(E2E_TOKEN.to_string()),
+    })
+    .await?
+    else {
+        eprintln!("skipping: nats-server binary not available");
+        return Ok(());
+    };
+
+    let time_binary = resolve_binary("harnx-time-server")?;
+    let client = async_nats::ConnectOptions::new()
+        .token(E2E_TOKEN.to_string())
+        .connect(nats.url())
+        .await?;
+    let instance_id = harnx_core::instance::ServerScope::new();
+    let start = ToolServerStartConfig::new(client.clone(), instance_id, nats.url(), E2E_TOKEN);
+    let launcher = Arc::new(SupervisorLauncher::new(start));
+    // Zero linger: `session_ended` stops the server on the same call that
+    // drops its last user, so the test doesn't need to wait out a real
+    // linger window to exercise `stop`.
+    let reconciler = ServerReconciler::new(launcher, Duration::ZERO);
+
+    let time_server = ToolServerConfig {
+        name: "time".to_string(),
+        command: time_binary.to_string_lossy().into_owned(),
+        args: Vec::new(),
+        env: Default::default(),
+        enabled: true,
+        description: None,
+        package: None,
+        hooks: None,
+    };
+
+    reconciler.session_started("s1", vec![time_server]).await;
+    await_registered(&client, "time").await?;
+
+    reconciler.session_ended("s1").await;
+    await_deregistered(&client, "time").await
 }

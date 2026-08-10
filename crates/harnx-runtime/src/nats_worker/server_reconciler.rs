@@ -179,9 +179,10 @@ impl ServerReconciler {
     }
 }
 
-/// Production [`ServerLauncher`]: wraps [`ToolServerSupervisor`], which kills
-/// its children on drop, so removing a server from `running` here is enough
-/// to stop it.
+/// Production [`ServerLauncher`]: wraps [`ToolServerSupervisor`]. `stop`
+/// explicitly calls `ToolServerSupervisor::shutdown` rather than relying on a
+/// bare drop, so the child's registration and any co-located hook
+/// registrations are actually removed before the process is gone.
 pub struct SupervisorLauncher {
     start: ToolServerStartConfig,
     running: Mutex<HashMap<String, ToolServerSupervisor>>,
@@ -224,7 +225,13 @@ impl ServerLauncher for SupervisorLauncher {
     }
 
     async fn stop(&self, config_name: &str) {
-        self.running.lock().await.remove(config_name);
+        // `shutdown` (not a bare drop) is what actually deregisters: it waits
+        // for each child to exit and lets its monitor's own exit path remove
+        // the tool registration, then shuts down co-located hook supervisors,
+        // which have no `Drop` at all.
+        if let Some(supervisor) = self.running.lock().await.remove(config_name) {
+            supervisor.shutdown().await;
+        }
     }
 }
 

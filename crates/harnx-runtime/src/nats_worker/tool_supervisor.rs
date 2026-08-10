@@ -25,7 +25,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
 const TOOL_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -130,6 +130,11 @@ pub struct ToolServerSupervisor {
     /// Enabled servers that have not registered yet. Retried in the background
     /// by the worker, so this shrinks as late registrations land.
     unregistered: Vec<SupervisedServer>,
+    /// Wakes every monitor task's wait so `shutdown` can kill its child and
+    /// let the monitor's own exit path (registration removal) run, instead of
+    /// aborting past it. `Drop` still aborts `tasks` directly as a fallback
+    /// for a supervisor that gets dropped without `shutdown` ever running.
+    shutdown_signal: Arc<Notify>,
 }
 
 impl ToolServerSupervisor {
@@ -152,6 +157,7 @@ impl ToolServerSupervisor {
             processes: Arc::clone(&processes),
             tasks: Vec::new(),
             hook_supervisors: Vec::new(),
+            shutdown_signal: Arc::new(Notify::new()),
             unregistered: Vec::new(),
         };
         let enabled: Vec<_> = servers.iter().filter(|server| server.enabled).collect();
@@ -274,6 +280,24 @@ impl ToolServerSupervisor {
             .map(|(pid, server)| (*pid, server.config.clone()))
             .collect()
     }
+
+    /// Kill every supervised child, wait for it to actually exit, and remove
+    /// its tool registration; then shut down every co-located hook
+    /// supervisor. Unlike letting this value simply drop, this is what
+    /// actually deregisters: each monitor task's own exit path (which calls
+    /// `remove_registrations_for_config`) only runs if the task is allowed to
+    /// observe its child's exit, and `HookServerSupervisor` has no `Drop` at
+    /// all — only its explicit `shutdown` removes registrations and
+    /// expectations.
+    pub async fn shutdown(mut self) {
+        self.shutdown_signal.notify_waiters();
+        for task in std::mem::take(&mut self.tasks) {
+            let _ = task.await;
+        }
+        for mut hooks in std::mem::take(&mut self.hook_supervisors) {
+            hooks.shutdown().await;
+        }
+    }
 }
 
 /// Names of servers with a live child process, so retries neither double-spawn
@@ -346,6 +370,7 @@ async fn spawn_enabled_tool_servers(
 ) {
     let processes = Arc::clone(&supervisor.processes);
     let in_flight = NatsInFlightCalls::for_instance(&config.instance_id);
+    let shutdown_signal = Arc::clone(&supervisor.shutdown_signal);
     for server in servers {
         // A server whose child is still alive is slow, not dead — give the
         // existing process more time rather than stacking a second copy.
@@ -375,6 +400,7 @@ async fn spawn_enabled_tool_servers(
                     client: config.client.clone(),
                     processes: Arc::clone(&processes),
                     in_flight: in_flight.clone(),
+                    shutdown_signal: Arc::clone(&shutdown_signal),
                 }));
             }
             Err(error) => warn_server_failure(&server.name, format!("{error:#}")),
@@ -551,7 +577,32 @@ struct ToolMonitor {
     client: async_nats::Client,
     processes: SupervisedProcesses,
     in_flight: NatsInFlightCalls,
+    shutdown_signal: Arc<Notify>,
 }
+
+/// Outcome of waiting for a child: either it exited on its own (a crash, from
+/// this task's point of view — nothing here asked for that) or `shutdown`
+/// killed it deliberately.
+enum ChildExit {
+    Crashed(std::io::Result<std::process::ExitStatus>),
+    Shutdown,
+}
+
+/// Wait for the child to exit on its own, or, once `shutdown_signal` fires,
+/// kill it and wait for that exit. Killing here rather than only relying on
+/// `kill_on_drop` is what lets this task reach its own cleanup below
+/// (registration removal) instead of a `Drop`/abort racing past it.
+async fn wait_for_child_or_shutdown(child: &mut Child, shutdown_signal: &Notify) -> ChildExit {
+    tokio::select! {
+        status = wait_for_child(child) => ChildExit::Crashed(status),
+        _ = shutdown_signal.notified() => {
+            let _ = child.start_kill();
+            let _ = wait_for_child(child).await;
+            ChildExit::Shutdown
+        }
+    }
+}
+
 fn spawn_child_monitor(monitor: ToolMonitor) -> JoinHandle<()> {
     let ToolMonitor {
         mut child,
@@ -563,18 +614,24 @@ fn spawn_child_monitor(monitor: ToolMonitor) -> JoinHandle<()> {
         client,
         processes,
         in_flight,
+        shutdown_signal,
     } = monitor;
     tokio::spawn(async move {
-        let status = wait_for_child(&mut child).await;
+        let exit = wait_for_child_or_shutdown(&mut child, &shutdown_signal).await;
         processes.lock().await.remove(&pid);
-        let exit = match status {
-            Ok(status) => status
-                .code()
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| status.to_string()),
-            Err(error) => format!("wait error: {error}"),
+        let message = match exit {
+            ChildExit::Shutdown => format!("tool server '{server}' stopped"),
+            ChildExit::Crashed(status) => {
+                let exit = match status {
+                    Ok(status) => status
+                        .code()
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| status.to_string()),
+                    Err(error) => format!("wait error: {error}"),
+                };
+                format!("tool server '{server}' crashed, exit {exit}")
+            }
         };
-        let message = format!("tool server '{server}' crashed, exit {exit}");
         emit_warning(message.clone());
         remove_registrations_for_config(
             &client,
