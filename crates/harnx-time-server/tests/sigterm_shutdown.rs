@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
+use harnx_toolset::{HARNX_SERVER_CONFIG, HARNX_SERVER_PACKAGE};
 use harnx_toolset_server::registration_key;
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -154,6 +155,12 @@ async fn sigterm_removes_the_registration() -> Result<()> {
         .env(HARNX_SERVER_SCOPE, instance_id.as_str())
         .env("HARNX_NATS_URL", &server.url)
         .env("HARNX_NATS_TOKEN", TOKEN)
+        // The child inherits this test process's environment by default; an
+        // exported HARNX_SERVER_PACKAGE or HARNX_SERVER_CONFIG would change
+        // the identity token the server registers under, so IDENTITY_TOKEN
+        // above (computed for the empty case) would no longer match.
+        .env_remove(HARNX_SERVER_PACKAGE)
+        .env_remove(HARNX_SERVER_CONFIG)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

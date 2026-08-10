@@ -34,7 +34,7 @@ harnx-fetch = { path = "../harnx-fetch" }
 harnx-hooks = { path = "../harnx-hooks" }
 harnx-hookset = { path = "../harnx-hookset" }
 harnx-hookset-server = { path = "../harnx-hookset-server" }
-harnx-nats-common = { path = "../harnx-nats-common" }
+harnx-nats-common = { workspace = true }
 harnx-toolset = { path = "../harnx-toolset" }
 harnx-toolset-server = { path = "../harnx-toolset-server" }
 harnx-rag = { path = "../harnx-rag" }
