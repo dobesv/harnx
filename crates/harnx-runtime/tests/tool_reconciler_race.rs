@@ -102,11 +102,35 @@ impl ServerLauncher for GatedLauncher {
 /// not silently joined to an entry that teardown is about to delete out
 /// from under it (see `server_reconciler.rs` module docs on `Slot`).
 ///
-/// The whole scenario is driven by two oneshot gates rather than any sleep:
+/// The scenario is driven by two oneshot gates rather than any sleep:
 /// `entered_stop` proves the test has actually reached the window between
 /// "teardown begun" and "entry removed" before it acts, and `release_stop`
 /// lets teardown finish only once the racing session has had its chance to
 /// observe that window.
+///
+/// That second half needs its own proof, or the test only *looks* like it
+/// exercises the race. `claim_or_wait`'s `Slot::Stopping` branch and its
+/// `None` branch (a plain fresh start, no race at all) end in the exact same
+/// externally observable outcome — a second `start` call — so nothing in
+/// this test's final assertions can tell them apart. Spawning `joining` and
+/// sending on `release_stop` right after, with no `.await` in between, would
+/// prove nothing: `joining` might not have been polled even once yet, in
+/// which case it takes the `None` branch once teardown finishes, and the
+/// test would pass without ever exercising `Slot::Stopping` at all.
+///
+/// `tokio::task::yield_now`'s documented contract — "other pending tasks
+/// will be run first" — is what closes that gap: on the current-thread
+/// runtime `#[tokio::test]` defaults to, `joining` is the only other task
+/// ready to run, so yielding guarantees the executor polls it at least once
+/// before this task resumes. One poll is enough to reach `Slot::Stopping`
+/// and park there: `claim_or_wait` takes the lock (uncontended, resolves
+/// without suspending), reads the current slot — which is `Stopping` here,
+/// independently proven by `entered_stop` already having fired — and hits
+/// `waiter.changed().await`, which isn't ready yet. That is the only branch
+/// whose first poll can return `Pending`; the `Running`/`None` branches both
+/// `return` synchronously. So after the yield below, `joining` is
+/// deterministically parked on the same `done` receiver `sweep` is about to
+/// drop, not racing to get there.
 #[tokio::test]
 async fn a_session_that_arrives_mid_teardown_gets_a_fresh_running_server() {
     harnx_core::require_nextest();
@@ -139,6 +163,11 @@ async fn a_session_that_arrives_mid_teardown_gets_a_fresh_running_server() {
                 .await;
         }
     });
+
+    // See the doc comment above: this is what proves `joining` actually
+    // reached and parked on `Slot::Stopping`'s wait, rather than merely
+    // finding the entry already gone once teardown finished.
+    tokio::task::yield_now().await;
 
     release_stop
         .send(())
