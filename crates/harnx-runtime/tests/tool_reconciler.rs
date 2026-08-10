@@ -180,6 +180,120 @@ async fn a_server_that_fails_to_start_is_not_counted_as_running() {
     );
 }
 
+/// A launcher whose `stop` blocks on a gate the test controls, so a test can
+/// hold a teardown open for exactly as long as it needs and no longer — no
+/// sleeps, no timing guesses. `entered_stop` fires the moment `stop` is
+/// called (so the test knows it is safe to act "during" the teardown), and
+/// `stop` itself doesn't return until the test sends on `release_stop`.
+struct GatedLauncher {
+    started: Mutex<Vec<String>>,
+    stopped: Mutex<Vec<String>>,
+    entered_stop: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release_stop: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl GatedLauncher {
+    fn new() -> (
+        Arc<Self>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let launcher = Arc::new(Self {
+            started: Mutex::new(Vec::new()),
+            stopped: Mutex::new(Vec::new()),
+            entered_stop: Mutex::new(Some(entered_tx)),
+            release_stop: Mutex::new(Some(release_rx)),
+        });
+        (launcher, entered_rx, release_tx)
+    }
+}
+
+#[async_trait]
+impl ServerLauncher for GatedLauncher {
+    async fn start(&self, server: &ToolServerConfig) -> anyhow::Result<()> {
+        self.started.lock().unwrap().push(server.name.clone());
+        Ok(())
+    }
+    async fn stop(&self, config_name: &str) {
+        self.stopped.lock().unwrap().push(config_name.to_string());
+        if let Some(entered) = self.entered_stop.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        let release = self.release_stop.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+    }
+}
+
+/// A session that asks for a server while `sweep` is mid-teardown of that
+/// same name must end up with a running, registered server of its own —
+/// not silently joined to an entry that teardown is about to delete out
+/// from under it (see `server_reconciler.rs` module docs on `Slot`).
+///
+/// The whole scenario is driven by two oneshot gates rather than any sleep:
+/// `entered_stop` proves the test has actually reached the window between
+/// "teardown begun" and "entry removed" before it acts, and `release_stop`
+/// lets teardown finish only once the racing session has had its chance to
+/// observe that window.
+#[tokio::test]
+async fn a_session_that_arrives_mid_teardown_gets_a_fresh_running_server() {
+    harnx_core::require_nextest();
+    let (launcher, entered_stop, release_stop) = GatedLauncher::new();
+    let reconciler = Arc::new(ServerReconciler::new(launcher.clone(), Duration::ZERO));
+
+    reconciler
+        .session_started("s1", vec![tool_server("time")])
+        .await;
+
+    // `linger` is zero, so dropping s1's only use of "time" sweeps
+    // immediately and calls `stop`, which the fake now blocks inside until
+    // `release_stop` is sent below. Run it on its own task since it won't
+    // return until then.
+    let ending = tokio::spawn({
+        let reconciler = reconciler.clone();
+        async move { reconciler.session_ended("s1").await }
+    });
+
+    entered_stop
+        .await
+        .expect("session_ended's sweep should have called stop on 'time'");
+
+    // s2 asks for the same name while that teardown is still in flight.
+    let joining = tokio::spawn({
+        let reconciler = reconciler.clone();
+        async move {
+            reconciler
+                .session_started("s2", vec![tool_server("time")])
+                .await;
+        }
+    });
+
+    release_stop
+        .send(())
+        .expect("stop is still parked on this gate waiting to be released");
+
+    ending.await.expect("session_ended task panicked");
+    joining.await.expect("session_started task panicked");
+
+    assert_eq!(
+        reconciler.running().await,
+        vec!["time"],
+        "a session that raced a teardown for the same name must end up with \
+         a running, registered server, not silently none"
+    );
+    assert_eq!(
+        launcher.started.lock().unwrap().as_slice(),
+        ["time", "time"],
+        "the racing session must trigger its own fresh start once the old \
+         process is actually gone, not just join an entry that sweep is \
+         about to delete out from under it"
+    );
+    assert_eq!(launcher.stopped.lock().unwrap().as_slice(), ["time"]);
+}
+
 /// A launcher whose `start` takes a fixed amount of time, for pinning
 /// `session_started`'s concurrency: several of these in one call should take
 /// about as long as the slowest one, not their sum.

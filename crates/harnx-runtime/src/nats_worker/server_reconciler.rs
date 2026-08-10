@@ -20,7 +20,7 @@ use harnx_core::instance::ServerScope;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 /// How long an idle tool server lingers with no sessions using it before the
 /// reconciler actually stops it. Long enough that back-to-back sessions (a
@@ -38,38 +38,32 @@ pub trait ServerLauncher: Send + Sync {
     async fn stop(&self, config_name: &str);
 }
 
-/// One server's current users and, once none remain, when the last one left.
-struct Running {
-    users: HashSet<String>,
-    idle_since: Option<Instant>,
-}
-
-/// Add `session_id` as a user of `server` in `state`. Queues `server` onto
-/// `to_start` exactly when this is its first user (no entry existed yet) —
-/// pulled out of `session_started`'s loop so that loop body is a single call
-/// with no conditional of its own.
-fn add_user_or_queue_start(
-    state: &mut HashMap<String, Running>,
-    to_start: &mut Vec<ToolServerConfig>,
-    session_id: &str,
-    server: ToolServerConfig,
-) {
-    match state.get_mut(&server.name) {
-        Some(entry) => {
-            entry.users.insert(session_id.to_string());
-            entry.idle_since = None;
-        }
-        None => {
-            state.insert(
-                server.name.clone(),
-                Running {
-                    users: HashSet::from([session_id.to_string()]),
-                    idle_since: None,
-                },
-            );
-            to_start.push(server);
-        }
-    }
+/// One server's status in `ServerReconciler::state`.
+enum Slot {
+    /// Believed to be a live, registered process. `idle_since` is set the
+    /// moment `users` drops to empty and cleared the moment a new user
+    /// joins.
+    Running {
+        users: HashSet<String>,
+        idle_since: Option<Instant>,
+    },
+    /// `sweep` has begun tearing this name down and is awaiting
+    /// `ServerLauncher::stop` outside the lock. Nothing may turn this back
+    /// into `Running` in place — the process really is on its way out — so a
+    /// session that wants this name while it's `Stopping` waits for `done`
+    /// to resolve and then starts fresh (see `claim_or_wait`). `sweep`
+    /// guarantees the entry is removed under the same lock before it lets
+    /// `done` resolve, so a waiter that wakes and re-checks always finds
+    /// `None`, never a second `Stopping`.
+    ///
+    /// This variant is what closes the race a same-tick `stop` used to hide:
+    /// once `stop` started actually awaiting process exit and KV
+    /// deregistration instead of dropping a `HashMap` entry, the window
+    /// between "teardown begins" and "entry removed" stopped being
+    /// negligible, and a session arriving in that window would join an
+    /// entry `sweep` was about to delete out from under it — ending up with
+    /// no server and no error.
+    Stopping { done: watch::Receiver<()> },
 }
 
 /// Reference-counts tool servers by [`ToolServerConfig::name`] across the
@@ -77,7 +71,7 @@ fn add_user_or_queue_start(
 /// stopping it `linger` after its last user goes away.
 pub struct ServerReconciler {
     launcher: Arc<dyn ServerLauncher>,
-    state: Mutex<HashMap<String, Running>>,
+    state: Mutex<HashMap<String, Slot>>,
     linger: Duration,
 }
 
@@ -92,15 +86,20 @@ impl ServerReconciler {
 
     /// Register `session_id` as a user of each of `servers`, starting any
     /// that have no other user yet. A server already running for another
-    /// session is reused, not restarted.
+    /// session is reused, not restarted. A server mid-teardown is waited out
+    /// and then started fresh — see `claim_or_wait`.
     pub async fn session_started(&self, session_id: &str, servers: Vec<ToolServerConfig>) {
-        let mut to_start = Vec::new();
-        {
-            let mut state = self.state.lock().await;
-            for server in servers {
-                add_user_or_queue_start(&mut state, &mut to_start, session_id, server);
-            }
-        }
+        // Claim each name concurrently, not one at a time: a name that is
+        // mid-teardown can make `claim_or_wait` wait a while, and that must
+        // not delay a different server this same session also asked for.
+        let claims = servers
+            .into_iter()
+            .map(|server| self.claim_or_wait(session_id, server));
+        let to_start: Vec<ToolServerConfig> = futures_util::future::join_all(claims)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
         // Never hold `state` across a launcher await: starting a process and
         // waiting on its registration can take seconds, and holding the lock
         // here would serialize every session activation behind whichever
@@ -115,6 +114,51 @@ impl ServerReconciler {
             .map(|server| self.start_or_forget(server));
         futures_util::future::join_all(starts).await;
         self.sweep().await;
+    }
+
+    /// Register `session_id` as a user of `server`, first waiting out any
+    /// teardown already in flight for the same name. Returns `Some(server)`
+    /// exactly when this call must start it itself: either it is the first
+    /// user of a freshly inserted entry, or the entry it waited on finished
+    /// tearing down, in which case it is now gone and needs a fresh start
+    /// same as a first user would. Either way the caller starts it outside
+    /// the lock.
+    async fn claim_or_wait(
+        &self,
+        session_id: &str,
+        server: ToolServerConfig,
+    ) -> Option<ToolServerConfig> {
+        loop {
+            let mut waiter = {
+                let mut state = self.state.lock().await;
+                match state.get_mut(&server.name) {
+                    Some(Slot::Running { users, idle_since }) => {
+                        users.insert(session_id.to_string());
+                        *idle_since = None;
+                        return None;
+                    }
+                    Some(Slot::Stopping { done }) => done.clone(),
+                    None => {
+                        state.insert(
+                            server.name.clone(),
+                            Slot::Running {
+                                users: HashSet::from([session_id.to_string()]),
+                                idle_since: None,
+                            },
+                        );
+                        return Some(server);
+                    }
+                }
+            };
+            // A `watch` channel, not a `Notify`: `sweep` sends (or, on its
+            // last iteration, just drops the sender) only after it has
+            // already removed the entry under the same lock, but that send
+            // can happen before this task ever gets here to await it. A
+            // `Notify::notify_waiters` sent in that window would be lost;
+            // `watch`'s "changed since this receiver was cloned" semantics
+            // cannot miss it.
+            let _ = waiter.changed().await;
+        }
     }
 
     /// Start `server` and, on failure, remove it from `state` rather than
@@ -140,9 +184,11 @@ impl ServerReconciler {
     pub async fn session_ended(&self, session_id: &str) {
         {
             let mut state = self.state.lock().await;
-            for entry in state.values_mut() {
-                if entry.users.remove(session_id) && entry.users.is_empty() {
-                    entry.idle_since = Some(Instant::now());
+            for slot in state.values_mut() {
+                if let Slot::Running { users, idle_since } = slot {
+                    if users.remove(session_id) && users.is_empty() {
+                        *idle_since = Some(Instant::now());
+                    }
                 }
             }
         }
@@ -150,30 +196,65 @@ impl ServerReconciler {
     }
 
     /// Stop servers whose linger window has passed with no users left.
+    ///
+    /// Moves each expired entry to `Slot::Stopping` before releasing the
+    /// lock and awaiting `stop`, rather than leaving the `Running` entry in
+    /// place until `stop` returns: a session that asks for this name during
+    /// that window must not be handed a place in an entry that is already on
+    /// its way out (see `claim_or_wait`). The transition happens under the
+    /// same lock as the expiry check, so two concurrent sweeps can't both
+    /// pick the same name and call `stop` on it twice.
     async fn sweep(&self) {
-        let expired: Vec<String> = {
-            let state = self.state.lock().await;
-            state
+        let expired: Vec<(String, watch::Sender<()>)> = {
+            let mut state = self.state.lock().await;
+            let names: Vec<String> = state
                 .iter()
-                .filter(|(_, entry)| {
+                .filter_map(|(name, slot)| match slot {
                     // `>=` rather than `>`: with `linger` at zero this must
                     // fire on the same call that dropped the last user.
-                    entry
-                        .idle_since
-                        .is_some_and(|since| since.elapsed() >= self.linger)
+                    Slot::Running { idle_since, .. }
+                        if idle_since.is_some_and(|since| since.elapsed() >= self.linger) =>
+                    {
+                        Some(name.clone())
+                    }
+                    _ => None,
                 })
-                .map(|(name, _)| name.clone())
+                .collect();
+            names
+                .into_iter()
+                .map(|name| {
+                    let (done_tx, done_rx) = watch::channel(());
+                    state.insert(name.clone(), Slot::Stopping { done: done_rx });
+                    (name, done_tx)
+                })
                 .collect()
         };
-        for name in expired {
+        for (name, done) in expired {
             self.launcher.stop(&name).await;
             self.state.lock().await.remove(&name);
+            // Wakes any `claim_or_wait` loop parked on this name's `done`
+            // clone: dropping the sender closes the channel, and `changed`
+            // reports that the same as a value change. The entry is already
+            // gone by the time this runs, so whoever wakes retries into a
+            // fresh start rather than a second `Stopping`.
+            drop(done);
         }
     }
 
-    /// Sorted names of servers currently tracked as running, for tests.
+    /// Sorted names of servers currently believed running, for tests. A name
+    /// mid-teardown (`Slot::Stopping`) is deliberately excluded — it is not
+    /// running, it is on its way out.
     pub async fn running(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.state.lock().await.keys().cloned().collect();
+        let mut names: Vec<String> = self
+            .state
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(name, slot)| match slot {
+                Slot::Running { .. } => Some(name.clone()),
+                Slot::Stopping { .. } => None,
+            })
+            .collect();
         names.sort();
         names
     }
