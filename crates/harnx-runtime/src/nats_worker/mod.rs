@@ -27,6 +27,7 @@ mod control;
 mod daemon;
 mod diagnostics;
 mod hook_supervisor;
+pub mod server_reconciler;
 mod subagent_toolset;
 mod tool_registry;
 mod tool_supervisor;

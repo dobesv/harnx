@@ -7,6 +7,10 @@ use super::agent_loop::{
 use super::backend::NatsSessionLogBackend;
 use super::control::{control_subject, ControlCommand};
 use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
+use super::server_reconciler::{
+    all_enabled_tool_servers, build_server_reconciler, tool_servers_for_activation,
+    ServerReconciler,
+};
 use super::subagent_toolset::SubagentToolset;
 use super::tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
 use crate::config::{
@@ -26,8 +30,6 @@ use async_nats::jetstream::{
 use chrono::Utc;
 use futures_util::StreamExt;
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
-use harnx_core::retry_config::RetryConfig;
-use harnx_engine::retry::compute_backoff_delay;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,10 +46,6 @@ const WORK_NOTIFY_STREAM_PREFIX: &str = "WORK_NOTIFY_";
 const WORK_NOTIFY_CONSUMER_PREFIX: &str = "worker-";
 const WORK_NOTIFY_ACK_WAIT: Duration = Duration::from_secs(30);
 const WORK_NOTIFY_INACTIVE_THRESHOLD: Duration = Duration::from_secs(60 * 60);
-/// Per-attempt registration wait for a background tool-server retry. Shorter
-/// than the first attempt because the backoff between rounds, not this timeout,
-/// is what gives a slow server time to come up.
-const TOOL_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest a session start will wait for the first tool-server registration
 /// round. Above the round's own budget, so it only fires if that round wedges.
 const INITIAL_TOOL_REGISTRATION_WAIT: Duration = Duration::from_secs(30);
@@ -359,7 +357,10 @@ pub(crate) fn tool_servers_matching_use_tools(
 /// Mirrors `start_global_hooks`'s `hooks.entries.is_empty()` check. Pulled out
 /// of `start_local_tool_servers` so the decision itself — not a copy of it —
 /// is what tests exercise.
-fn should_start_tool_servers(manage_servers: bool, servers: &[ToolServerConfig]) -> bool {
+pub(super) fn should_start_tool_servers(
+    manage_servers: bool,
+    servers: &[ToolServerConfig],
+) -> bool {
     manage_servers && !servers.is_empty()
 }
 
@@ -534,13 +535,17 @@ struct WorkerServices {
     background: Arc<Mutex<Option<BackgroundServices>>>,
     session_index: Option<async_nats::jetstream::kv::Store>,
     tools_attempted: tokio::sync::watch::Receiver<bool>,
+    /// `None` for a consuming worker, or a managing worker with nothing
+    /// configured to spawn. Tool servers now start on demand per session
+    /// (see `handle_activation`) rather than as one batch here.
+    server_reconciler: Option<Arc<ServerReconciler>>,
 }
 
-/// Tool servers, hooks and sub-agent toolsets, started after the worker has
-/// already announced readiness. Held only to keep the children alive for the
-/// worker's lifetime.
+/// Hooks and sub-agent toolsets, started after the worker has already
+/// announced readiness. Held only to keep the children alive for the
+/// worker's lifetime. Tool servers are no longer part of this: they start
+/// per session through `WorkerRuntime::server_reconciler`.
 struct BackgroundServices {
-    _tool_supervisor: Option<ToolServerSupervisor>,
     _global_hook_supervisor: Option<HookServerSupervisor>,
     _subagent_tool_servers: Vec<JoinHandle<Result<()>>>,
 }
@@ -579,26 +584,78 @@ fn namespaced_selector(selector: &str, package: Option<&str>) -> Option<String> 
     (namespaced != selector).then_some(namespaced)
 }
 
+/// Install the activation's agent into the per-session config.
+///
+/// Mirrors the local `use_agent_by_name` flow: file-backed variable defaults
+/// (`variables: [{name, path}]`) must be read off disk and folded into the
+/// agent's shared variables before anything renders the prompt template, or
+/// an agent like `pantheon/sisyphus` fails with an undefined value on its
+/// first render.
+///
+/// An agent the worker simply does not have is not fatal — the session falls
+/// back to the worker's own configuration, as it has always done. Anything
+/// else is: an agent whose file is present but unreadable, unparseable, or
+/// names a model the worker cannot resolve must not silently answer as some
+/// other agent.
+///
+/// `pub(super)`: also used by `server_reconciler::tool_servers_for_activation`
+/// to resolve which servers a session's agent needs, on a throwaway config
+/// clone, before the real per-session config below is built.
+pub(super) fn install_activation_agent(per_session: &GlobalConfig, agent_name: &str) -> Result<()> {
+    let retrieved = per_session.read().retrieve_agent(agent_name);
+    let mut agent = match retrieved {
+        Ok(agent) => agent,
+        // No file and no built-in by this name: nothing to load.
+        Err(error) if !Config::agent_file(agent_name).exists() => {
+            log::warn!(
+                "activation agent '{agent_name}' not available, using worker config: {error:#}"
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error).context(format!("load agent '{agent_name}'")),
+    };
+    crate::config::agent::resolve_file_defaults(&mut agent)
+        .with_context(|| format!("resolve file-backed variables for agent '{agent_name}'"))?;
+    let mut cfg = per_session.write();
+    cfg.use_agent_obj(agent)
+        .with_context(|| format!("activate agent '{agent_name}'"))?;
+    cfg.require_agent_shared_variables()
+        .with_context(|| format!("initialize variables for agent '{agent_name}'"))
+}
+
 async fn launch_worker_services(
     config: &GlobalConfig,
     daemon: &WorkerDaemonConfig,
     startup: &WorkerStartup,
     instance_id: &harnx_core::instance::ServerScope,
 ) -> Result<WorkerServices> {
-    // Announce readiness before starting tool servers, hooks and sub-agent
-    // toolsets. Those can take tens of seconds — or never finish, when a server
-    // is misconfigured — and none of them are required for the worker to accept
-    // and run a session. Gating readiness on them made a single broken tool
-    // server stall the front-end past its startup deadline, which turned an
-    // intentionally non-fatal degradation into an unusable CLI.
+    // Announce readiness before starting hooks and sub-agent toolsets. Those
+    // can take tens of seconds — or never finish, when a server is
+    // misconfigured — and neither is required for the worker to accept and
+    // run a session. Gating readiness on them made a single broken server
+    // stall the front-end past its startup deadline, which turned an
+    // intentionally non-fatal degradation into an unusable CLI. Tool servers
+    // no longer start here at all: each session's own servers start (and are
+    // waited on) in `handle_activation` when that session activates.
     spawn_readiness_publisher(startup.client.clone(), daemon);
 
     let background = Arc::new(Mutex::new(None));
-    // Sessions snapshot the tool registry when they start, so a session that
-    // began before the first registration round finished would see no tools at
-    // all. Activation waits on this instead — the cost lands on the first turn,
-    // where it is visible and cancellable, rather than on worker readiness.
-    let (tools_attempted_tx, tools_attempted) = tokio::sync::watch::channel(false);
+    // There is no longer a global tool-server registration round for a
+    // session to wait on: `handle_activation` waits on the servers it just
+    // asked the reconciler to start instead. Start this already-settled so
+    // `await_initial_tool_registration` is a no-op, kept for the hooks/
+    // sub-agent-toolset background task shape rather than removed outright.
+    let (_tools_attempted_tx, tools_attempted) = tokio::sync::watch::channel(true);
+
+    let all_tool_servers = all_enabled_tool_servers(config);
+    let server_reconciler = build_server_reconciler(
+        daemon,
+        startup.client.clone(),
+        instance_id,
+        &all_tool_servers,
+    )
+    .await;
+
     spawn_background_services(BackgroundServicesCtx {
         config: config.clone(),
         daemon: daemon.clone(),
@@ -606,7 +663,6 @@ async fn launch_worker_services(
         jetstream: startup.jetstream.clone(),
         instance_id: instance_id.clone(),
         slot: Arc::clone(&background),
-        tools_attempted: tools_attempted_tx,
         replicas: startup.replicas,
     });
 
@@ -615,14 +671,17 @@ async fn launch_worker_services(
         background,
         session_index,
         tools_attempted,
+        server_reconciler,
     })
 }
 
-/// Block until the first tool-server registration round has finished, so the
-/// session's registry snapshot includes whatever managed to come up.
-///
-/// Returns without waiting once the round is done, making this free for every
-/// turn after the first. A server that never registers costs this wait once.
+/// Historically blocked until the first tool-server registration round had
+/// finished, so a session's registry snapshot included whatever managed to
+/// come up. Tool servers now start per session (`handle_activation` awaits
+/// `ServerReconciler::session_started` directly), so `tools_attempted` is
+/// already settled by the time this runs and it returns immediately. Kept
+/// rather than removed so a future global round has somewhere to plug back
+/// in without re-threading `handle_activation`.
 async fn await_initial_tool_registration(tools_attempted: &tokio::sync::watch::Receiver<bool>) {
     if *tools_attempted.borrow() {
         return;
@@ -657,7 +716,6 @@ struct BackgroundServicesCtx {
     jetstream: jetstream::Context,
     instance_id: harnx_core::instance::ServerScope,
     slot: Arc<Mutex<Option<BackgroundServices>>>,
-    tools_attempted: tokio::sync::watch::Sender<bool>,
     replicas: usize,
 }
 
@@ -670,15 +728,11 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
             jetstream,
             instance_id,
             slot,
-            tools_attempted,
             replicas,
         } = ctx;
-        let (tool_servers, global_hooks) = configured_worker_services(&config);
-        let tool_supervisor =
-            start_local_tool_servers(&daemon, client.clone(), &instance_id, &tool_servers).await;
-        // Release waiting activations as soon as the first round settles, even
-        // if some servers failed — they are retried below without blocking.
-        let _ = tools_attempted.send(true);
+        // Tool servers aren't started here anymore — each session's own
+        // servers start on demand through `WorkerRuntime::server_reconciler`.
+        let (_worker_tool_servers, global_hooks) = configured_worker_services(&config);
         let global_hook_supervisor =
             start_global_hooks(&daemon, client.clone(), &instance_id, &global_hooks).await;
 
@@ -702,63 +756,11 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
             }
         }
 
-        let tool_supervisor =
-            retry_unregistered_tool_servers(tool_supervisor, client, &instance_id, &tool_servers)
-                .await;
-
         *slot.lock().await = Some(BackgroundServices {
-            _tool_supervisor: tool_supervisor,
             _global_hook_supervisor: global_hook_supervisor,
             _subagent_tool_servers: subagent_tool_servers,
         });
     });
-}
-
-/// Keep respawning tool servers that never registered, backing off between
-/// rounds. Runs after readiness, so a server that stays broken degrades the
-/// available tools instead of blocking the worker.
-async fn retry_unregistered_tool_servers(
-    supervisor: Option<ToolServerSupervisor>,
-    client: async_nats::Client,
-    instance_id: &harnx_core::instance::ServerScope,
-    servers: &[ToolServerConfig],
-) -> Option<ToolServerSupervisor> {
-    let mut supervisor = supervisor?;
-    if supervisor.unregistered_servers().is_empty() {
-        return Some(supervisor);
-    }
-    let Ok(local) = resolve_local_nats_server_config().await else {
-        return Some(supervisor);
-    };
-    let Some(token) = local.token.as_deref() else {
-        return Some(supervisor);
-    };
-    let start = ToolServerStartConfig::new(client, instance_id.clone(), &local.url, token)
-        .with_replicas(local.replicas);
-    let retry = RetryConfig::default();
-
-    // Retries never stop: a server the user fixes mid-session should come up
-    // without restarting harnx. The attempt counter only feeds the backoff
-    // curve, so saturate it rather than letting it wrap.
-    let mut attempt: u32 = 0;
-    loop {
-        let delay = compute_backoff_delay(&retry, attempt);
-        attempt = attempt.saturating_add(1);
-        let pending = supervisor.unregistered_servers().join(", ");
-        log::warn!(
-            "tool servers not registered ({pending}); retrying in {}s",
-            delay.as_secs_f64()
-        );
-        tokio::time::sleep(delay).await;
-        let still_missing = supervisor
-            .retry_unregistered(&start, servers, TOOL_RETRY_TIMEOUT)
-            .await;
-        if !still_missing {
-            log::info!("all tool servers registered");
-            break;
-        }
-    }
-    Some(supervisor)
 }
 
 /// Run a worker daemon: pull `SessionActivate` notifications, claim each via a
@@ -782,6 +784,7 @@ pub async fn run_worker_daemon(
         instance_id,
         _background_services: services.background,
         tools_attempted: services.tools_attempted,
+        server_reconciler: services.server_reconciler,
         cluster: daemon.cluster.clone(),
         manage_servers: daemon.manage_servers,
         worker_id: daemon.worker_id.clone(),
@@ -822,6 +825,9 @@ struct WorkerRuntime {
     instance_id: harnx_core::instance::ServerScope,
     _background_services: Arc<Mutex<Option<BackgroundServices>>>,
     tools_attempted: tokio::sync::watch::Receiver<bool>,
+    /// `None` for a consuming worker, or a managing worker with nothing
+    /// configured to spawn anywhere.
+    server_reconciler: Option<Arc<ServerReconciler>>,
     #[allow(dead_code)]
     cluster: String,
     manage_servers: bool,
@@ -842,6 +848,24 @@ impl WorkerRuntime {
         let mut active = self.active.lock().await;
         active.retain(|_, handle| !handle.is_finished());
         active.contains_key(session_id)
+    }
+
+    /// A worker that doesn't manage its own servers, or has nothing
+    /// configured to spawn anywhere, has no reconciler and this is a no-op.
+    async fn start_session_tool_servers(&self, activation: &SessionActivate) {
+        let Some(reconciler) = &self.server_reconciler else {
+            return;
+        };
+        let servers = tool_servers_for_activation(&self.config, &activation.agent);
+        reconciler
+            .session_started(&activation.session_id, servers)
+            .await;
+    }
+
+    async fn end_session_tool_servers(&self, session_id: &str) {
+        if let Some(reconciler) = &self.server_reconciler {
+            reconciler.session_ended(session_id).await;
+        }
     }
 
     async fn acquire_activation_lease(
@@ -903,6 +927,10 @@ impl WorkerRuntime {
             return Ok(());
         };
 
+        // Start (or reuse) this session's own agent's tool servers before the
+        // registry snapshot below is taken, so it sees them.
+        self.start_session_tool_servers(&activation).await;
+
         // The session snapshots the tool registry below, so give the first
         // registration round a chance to finish before that snapshot is taken.
         await_initial_tool_registration(&self.tools_attempted).await;
@@ -942,6 +970,11 @@ impl WorkerRuntime {
             let result = worker
                 .execute_session(activation, Arc::clone(&lease), abort_signal, control_task)
                 .await;
+            // `active` is only pruned lazily (see `already_running`'s
+            // `retain`), so this is the one place a finished session's tool
+            // servers can be released — do it before the metrics/log lines
+            // below, which already mark the session as done.
+            worker.end_session_tool_servers(&task_session_id).await;
             nats_metrics::active_session_finished();
             let snapshot = nats_metrics::snapshot();
             log::info!(
@@ -1112,41 +1145,6 @@ impl WorkerRuntime {
         )
     }
 
-    /// Install the activation's agent into the per-session config.
-    ///
-    /// Mirrors the local `use_agent_by_name` flow: file-backed variable
-    /// defaults (`variables: [{name, path}]`) must be read off disk and folded
-    /// into the agent's shared variables before anything renders the prompt
-    /// template, or an agent like `pantheon/sisyphus` fails with an undefined
-    /// value on its first render.
-    ///
-    /// An agent the worker simply does not have is not fatal — the session
-    /// falls back to the worker's own configuration, as it has always done.
-    /// Anything else is: an agent whose file is present but unreadable,
-    /// unparseable, or names a model the worker cannot resolve must not
-    /// silently answer as some other agent.
-    fn install_activation_agent(per_session: &GlobalConfig, agent_name: &str) -> Result<()> {
-        let retrieved = per_session.read().retrieve_agent(agent_name);
-        let mut agent = match retrieved {
-            Ok(agent) => agent,
-            // No file and no built-in by this name: nothing to load.
-            Err(error) if !Config::agent_file(agent_name).exists() => {
-                log::warn!(
-                    "activation agent '{agent_name}' not available, using worker config: {error:#}"
-                );
-                return Ok(());
-            }
-            Err(error) => return Err(error).context(format!("load agent '{agent_name}'")),
-        };
-        crate::config::agent::resolve_file_defaults(&mut agent)
-            .with_context(|| format!("resolve file-backed variables for agent '{agent_name}'"))?;
-        let mut cfg = per_session.write();
-        cfg.use_agent_obj(agent)
-            .with_context(|| format!("activate agent '{agent_name}'"))?;
-        cfg.require_agent_shared_variables()
-            .with_context(|| format!("initialize variables for agent '{agent_name}'"))
-    }
-
     async fn execute_session(
         &self,
         activation: SessionActivate,
@@ -1160,7 +1158,7 @@ impl WorkerRuntime {
             let base = self.config.read().clone();
             Arc::new(parking_lot::RwLock::new(base))
         };
-        let agent_setup = Self::install_activation_agent(&per_session, &activation.agent);
+        let agent_setup = install_activation_agent(&per_session, &activation.agent);
 
         // Create event sink for live fan-out. `new` seeds `after_seq` from stream once.
         let event_sink = crate::nats_event_sink::NatsEventSink::new(
