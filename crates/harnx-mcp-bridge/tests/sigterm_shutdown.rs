@@ -74,21 +74,35 @@ async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
         .spawn()
         .context("spawn nats-server")?;
     let url = format!("nats://127.0.0.1:{port}");
+
+    match wait_for_nats_ready(&mut child, &url).await {
+        Ok(()) => Ok(Some(NatsServerHandle {
+            url,
+            _store_dir: store_dir,
+            child,
+        })),
+        Err(error) => {
+            // `wait_for_nats_ready` can fail with the child still running (a
+            // flush error mid-connect, or the deadline passing without it
+            // ever becoming ready) — dropping `Child` here would leak the
+            // process and leave it holding its port and store directory
+            // instead of killing it.
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
+        }
+    }
+}
+
+async fn wait_for_nats_ready(child: &mut Child, url: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         match async_nats::ConnectOptions::new()
             .token(TOKEN.to_string())
-            .connect(&url)
+            .connect(url)
             .await
         {
-            Ok(client) => {
-                client.flush().await.context("flush NATS test client")?;
-                return Ok(Some(NatsServerHandle {
-                    url,
-                    _store_dir: store_dir,
-                    child,
-                }));
-            }
+            Ok(client) => return client.flush().await.context("flush NATS test client"),
             Err(error) if child.try_wait()?.is_some() => {
                 anyhow::bail!("nats-server exited during startup: {error}");
             }
