@@ -2,7 +2,7 @@ use anyhow::Context;
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_mcp_bridge::{report_tools, Args, BridgeToolset};
 use harnx_nats_common::connect::{NatsConnection, NatsEndpoint};
-use harnx_toolset_server::serve_with_client;
+use harnx_toolset_server::serve_with_shutdown;
 use std::sync::Arc;
 
 #[tokio::main]
@@ -29,7 +29,14 @@ async fn main() -> anyhow::Result<()> {
             harnx_core::instance::StandaloneMode::ListTools
         ))
     })?;
-    // Keep the connect attempt inside the same race as `serve_with_client`:
+    let scope = ServerScope::from_string(instance_id);
+    log::info!("serving under scope '{}'", scope.as_str());
+    // SIGTERM/Ctrl+C get a chance to deregister before the process exits, the
+    // same as the toolset/hookset binaries this bridge otherwise mirrors: an
+    // independently deployed bridge pod has no parent supervisor to clean up
+    // after it, and Kubernetes terminates pods with SIGTERM.
+    let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
+    // Keep the connect attempt inside the same race as the signal above:
     // a slow/unreachable NATS cluster (bad DNS, stalled TLS handshake) must
     // not block the bridge from noticing the wrapped child has already died.
     let serve = async {
@@ -39,12 +46,7 @@ async fn main() -> anyhow::Result<()> {
             client,
             replicas: endpoint.resolved_replicas(),
         };
-        serve_with_client(
-            Arc::new(bridge),
-            ServerScope::from_string(instance_id),
-            connection,
-        )
-        .await
+        serve_with_shutdown(Arc::new(bridge), scope, connection, shutdown).await
     };
 
     tokio::select! {

@@ -22,7 +22,10 @@ impl ServerScope {
         Self(format!("{}-{}", std::process::id(), Uuid::new_v4()))
     }
 
-    /// Reconstruct an ID received through the worker environment.
+    /// Reconstruct an ID from `HARNX_SERVER_SCOPE`. Usually set by a worker
+    /// for the children it launches, but an operator sets it directly too
+    /// when deploying tool/hook servers independently of any worker (see
+    /// `docs/nats-ha.md`).
     pub fn from_string(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -62,11 +65,18 @@ pub enum StandaloneMode {
 }
 
 impl StandaloneMode {
+    /// A full clause describing what to do about the missing scope, phrased
+    /// so it reads correctly whether or not a true standalone mode exists —
+    /// `WorkerLaunched` has none, so its own text says so instead of the
+    /// generic "run standalone with X" wrapper the other two variants use.
     fn hint(&self) -> &'static str {
         match self {
-            Self::McpStdio => "--mcp-stdio",
-            Self::ListTools => "--list-tools",
-            Self::WorkerLaunched => "a hooks entry in your config, which the worker launches",
+            Self::McpStdio => "run it standalone with --mcp-stdio",
+            Self::ListTools => "run it standalone with --list-tools",
+            Self::WorkerLaunched => {
+                "configure a hooks entry in your config; there is no standalone \
+                 mode for hook servers, the worker always launches them"
+            }
         }
     }
 }
@@ -77,14 +87,16 @@ impl StandaloneMode {
 /// invent, when the real answer is either "let the worker launch this" or "use
 /// the standalone stdio mode".
 pub fn missing_scope_message(mode: StandaloneMode) -> String {
-    let standalone_hint = mode.hint();
+    let hint = mode.hint();
     format!(
         "{HARNX_SERVER_SCOPE} is not set.\n\
          This binary normally runs as a child of harnx-worker, which supplies it.\n\
-         To run it standalone, use {standalone_hint}.\n\
-         Do not set {HARNX_SERVER_SCOPE} by hand: it namespaces every NATS \
-         subject and registry key, so a value that does not match the worker's \
-         leaves this server undiscoverable."
+         To proceed, {hint}.\n\
+         If you are instead deploying this server independently of any worker \
+         (see docs/nats-ha.md), set {HARNX_SERVER_SCOPE} yourself to a value \
+         every worker and server in the set shares exactly — it namespaces \
+         every NATS subject and registry key, so a mismatched value leaves \
+         this server undiscoverable."
     )
 }
 
