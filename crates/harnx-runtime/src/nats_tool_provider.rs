@@ -505,16 +505,39 @@ impl ToolProvider for NatsToolProvider {
     }
 }
 
-/// Open the tool registry bucket, treating "it doesn't exist yet" as absent
-/// rather than an error — no tool server has ever registered against this
-/// cluster, which the caller reports as zero registrations, not a failure.
+/// Open the tool registry bucket, treating "the stream genuinely doesn't
+/// exist yet" as absent rather than an error — no tool server has ever
+/// registered against this cluster, which the caller reports as zero
+/// registrations, not a failure.
+///
+/// `get_key_value` wraps *every* `get_stream` failure — a broker outage, a
+/// permissions error, a timeout, not just "not found" — in
+/// `KeyValueErrorKind::GetBucket`. Matching on that kind alone (as this used
+/// to) turns any of those into "zero tools registered", silently, which is
+/// the exact failure class the zero-registration warning exists to catch.
+/// Check the stream directly first and match the specific JetStream
+/// STREAM_NOT_FOUND error code instead, the same way
+/// `nats_hook_provider::optional_bucket_snapshot` already does for hooks —
+/// that check is the narrower, correct one; this makes the tool side match
+/// it rather than the other way around.
 async fn open_registry_store(
     jetstream: &async_nats::jetstream::Context,
 ) -> anyhow::Result<Option<async_nats::jetstream::kv::Store>> {
-    use async_nats::jetstream::context::KeyValueErrorKind;
-    match jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await {
-        Ok(store) => Ok(Some(store)),
-        Err(error) if error.kind() == KeyValueErrorKind::GetBucket => Ok(None),
+    use async_nats::jetstream::{context::GetStreamErrorKind, ErrorCode};
+    match jetstream
+        .get_stream(format!("KV_{TOOL_REGISTRY_BUCKET}"))
+        .await
+    {
+        Ok(_) => Ok(Some(jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await?)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                GetStreamErrorKind::JetStream(ref error)
+                    if error.kind() == ErrorCode::STREAM_NOT_FOUND
+            ) =>
+        {
+            Ok(None)
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -676,5 +699,86 @@ mod tests {
             declarations[0].result_template.as_deref(),
             Some("Called {{tool}}")
         );
+    }
+
+    /// `open_registry_store` used to map every `get_stream` failure that
+    /// `get_key_value` classifies as `KeyValueErrorKind::GetBucket` to
+    /// `Ok(None)` — "zero tools registered" — even though `GetBucket` covers
+    /// far more than "the stream doesn't exist yet" (see the doc comment on
+    /// `open_registry_store`). A broker with JetStream disabled reproduces
+    /// exactly that: the stream lookup fails, but not with the JetStream
+    /// STREAM_NOT_FOUND code, so it must propagate as an error rather than
+    /// silently becoming "no tools".
+    #[test]
+    fn open_registry_store_propagates_a_non_not_found_stream_error() {
+        harnx_core::require_nextest();
+        let Some(server) = spawn_nats_server_without_jetstream() else {
+            eprintln!(
+                "skipping open_registry_store_propagates_a_non_not_found_stream_error: \
+                 nats-server binary not found"
+            );
+            return;
+        };
+        let runtime = tokio::runtime::Runtime::new().expect("build a tokio runtime");
+        let result = runtime.block_on(async {
+            let client = async_nats::connect(&server.url)
+                .await
+                .expect("connect to the JetStream-disabled nats-server");
+            let jetstream = async_nats::jetstream::new(client);
+            super::open_registry_store(&jetstream).await
+        });
+        let error = result.expect_err(
+            "a stream lookup failure that is not STREAM_NOT_FOUND must propagate, not become \
+             Ok(None)",
+        );
+        assert!(
+            !error.to_string().is_empty(),
+            "propagated error should carry a message"
+        );
+    }
+
+    struct JetstreamDisabledNatsServer {
+        url: String,
+        child: std::process::Child,
+    }
+
+    impl Drop for JetstreamDisabledNatsServer {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Spawns a real `nats-server` with JetStream turned OFF, so a
+    /// `get_stream` call fails for a reason other than "not found" without
+    /// needing to fake a broker outage or wait out a request timeout.
+    fn spawn_nats_server_without_jetstream() -> Option<JetstreamDisabledNatsServer> {
+        let binary = std::env::var_os("NATS_SERVER_BIN")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.exists())
+            .or_else(|| which::which("nats-server").ok())?;
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("allocate a free TCP port");
+        let port = listener.local_addr().expect("read bound port").port();
+        drop(listener);
+        let child = std::process::Command::new(&binary)
+            .arg("-p")
+            .arg(port.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn nats-server");
+        let url = format!("nats://127.0.0.1:{port}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("nats-server did not open its port before the deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Some(JetstreamDisabledNatsServer { url, child })
     }
 }
