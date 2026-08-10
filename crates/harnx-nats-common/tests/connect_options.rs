@@ -84,6 +84,35 @@ fn parse_replicas_env_rejects_an_unparseable_value_instead_of_defaulting() {
     std::env::remove_var("HARNX_NATS_REPLICAS");
 }
 
+/// `build_custom_tls_client_config` used to call
+/// `async_nats::rustls::ClientConfig::builder()`, which resolves rustls'
+/// process-default `CryptoProvider`. This workspace links both `ring` (via
+/// async-nats) and `aws-lc-rs` (via the AWS SDK stack), so no crate-feature
+/// default is unambiguous and nothing in production calls
+/// `CryptoProvider::install_default` — the combination `docs/nats-ha.md`
+/// recommends (`tls_ca` for a custom CA) panicked instead of returning an
+/// error. This test builds a real CA PEM and exercises exactly that
+/// configuration.
+#[test]
+fn connect_options_succeeds_with_a_custom_tls_ca() {
+    harnx_core::require_nextest();
+    let ca = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate a self-signed CA cert for the test");
+    let dir = tempfile::tempdir().expect("create temp dir for the CA PEM");
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, ca.cert.pem()).expect("write CA PEM");
+
+    let mut ep = endpoint();
+    ep.tls_ca = Some(ca_path.to_string_lossy().into_owned());
+
+    let options = ep.connect_options();
+    assert!(
+        options.is_ok(),
+        "connect_options() with tls_ca set must not panic and must succeed, got: {:?}",
+        options.err()
+    );
+}
+
 #[test]
 fn from_env_rejects_an_unparseable_replicas_value() {
     harnx_core::require_nextest();

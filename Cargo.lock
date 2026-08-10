@@ -3920,6 +3920,7 @@ dependencies = [
  "async-nats",
  "harnx-core",
  "log",
+ "rcgen",
  "rustls-pemfile",
  "tempfile",
  "tokio",

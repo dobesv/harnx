@@ -243,9 +243,27 @@ impl NatsEndpoint {
                 self.name
             );
         }
-        let tls_client = async_nats::rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        // `ClientConfig::builder()` resolves rustls' *process-default* crypto
+        // provider, which panics ("cannot be resolved using a combination of
+        // the crate features and process default") whenever more than one
+        // provider feature is compiled in and nothing has called
+        // `CryptoProvider::install_default`. That ambiguity is real here: the
+        // workspace pulls in both `ring` (via async-nats/tokio-rustls) and
+        // `aws-lc-rs` (via the AWS SDK's hyper-rustls stack), and no
+        // production binary installs a default. `builder_with_provider` picks
+        // the provider explicitly instead of depending on whatever else
+        // happens to be linked into the process, so it can't be broken by an
+        // unrelated dependency bump. `ring` is the provider async-nats itself
+        // defaults to (its `ring` feature is what we enable), so this matches
+        // the crypto backend already used for connections that don't set a
+        // custom `tls_ca`.
+        let tls_client = async_nats::rustls::ClientConfig::builder_with_provider(
+            std::sync::Arc::new(async_nats::rustls::crypto::ring::default_provider()),
+        )
+        .with_safe_default_protocol_versions()
+        .context("build rustls ClientConfig with the ring CryptoProvider")?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
         Ok(Some(tls_client))
     }
 
