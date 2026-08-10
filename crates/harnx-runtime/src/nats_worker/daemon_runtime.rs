@@ -82,13 +82,17 @@ impl WorkerRuntime {
     /// A worker that doesn't manage its own servers, or has nothing
     /// configured to spawn anywhere, has no reconciler and this is a no-op.
     ///
-    /// Bounded by `SESSION_TOOL_SERVER_START_TIMEOUT`, comfortably under the
-    /// activation ack window: a session degraded to fewer tools is far better
-    /// than an unacked activation that JetStream redelivers forever. On
-    /// timeout the reconciler task is left running rather than aborted — it
-    /// still finishes starting (or gives up on) each server and updates
-    /// `ServerReconciler`'s own bookkeeping correctly; this call just stops
-    /// waiting for it.
+    /// Only the actual server start (`ServerReconciler::start_claimed`) is
+    /// bounded by `SESSION_TOOL_SERVER_START_TIMEOUT` and, on timeout, left
+    /// running in the background rather than aborted — a session degraded to
+    /// fewer tools is far better than an unacked activation that JetStream
+    /// redelivers forever. Registering this session as a user
+    /// (`ServerReconciler::claim_users`) is awaited directly, unbounded and
+    /// un-detached: `end_session_tool_servers` can run as soon as this
+    /// activation's ack fails, or when the session ends, and must always see
+    /// an accurate registration to release. A registration that instead
+    /// landed later, from an abandoned background task, would pin its server
+    /// as a "user" that no future `session_ended` call can ever remove.
     pub(super) async fn start_session_tool_servers(&self, activation: &SessionActivate) {
         let Some(reconciler) = self.server_reconciler.clone() else {
             return;
@@ -97,15 +101,18 @@ impl WorkerRuntime {
         if servers.is_empty() {
             return;
         }
-        let server_names = servers
+        let to_start = reconciler
+            .claim_users(&activation.session_id, servers)
+            .await;
+        if to_start.is_empty() {
+            return;
+        }
+        let server_names = to_start
             .iter()
             .map(|server| server.name.clone())
             .collect::<Vec<_>>()
             .join(", ");
-        let session_id = activation.session_id.clone();
-        let task = tokio::spawn(async move {
-            reconciler.session_started(&session_id, servers).await;
-        });
+        let task = tokio::spawn(async move { reconciler.start_claimed(to_start).await });
         match tokio::time::timeout(SESSION_TOOL_SERVER_START_TIMEOUT, task).await {
             Ok(Ok(())) => {}
             Ok(Err(join_error)) => {

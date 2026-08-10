@@ -86,18 +86,54 @@ impl ServerReconciler {
     /// that have no other user yet. A server already running for another
     /// session is reused, not restarted. A server mid-teardown is waited out
     /// and then started fresh — see `claim_or_wait`.
+    ///
+    /// Split into [`Self::claim_users`] (registration) and
+    /// [`Self::start_claimed`] (the slow part) so a caller that wants to bound
+    /// only the slow part — see `WorkerRuntime::start_session_tool_servers`,
+    /// which times out and detaches `start_claimed` into the background but
+    /// must not do that to `claim_users` — can call them separately instead.
     pub async fn session_started(&self, session_id: &str, servers: Vec<ToolServerConfig>) {
+        let to_start = self.claim_users(session_id, servers).await;
+        self.start_claimed(to_start).await;
+    }
+
+    /// Register `session_id` as a user of each of `servers`, returning the
+    /// subset that actually need starting (first user of a fresh entry, or
+    /// waited out a teardown and must start fresh).
+    ///
+    /// Always run this to completion before any call to [`Self::session_ended`]
+    /// for the same `session_id` — once it returns, `session_ended` is
+    /// guaranteed to see (and release) every registration it made, even if
+    /// the caller then abandons [`Self::start_claimed`] to a timeout. A
+    /// caller that instead spawns this whole registration step into the
+    /// background and times out on it can lose the race: `session_ended`
+    /// runs first, sees nothing to release, and the registration that lands
+    /// afterward pins the server as a "user" that will never end.
+    pub async fn claim_users(
+        &self,
+        session_id: &str,
+        servers: Vec<ToolServerConfig>,
+    ) -> Vec<ToolServerConfig> {
         // Claim each name concurrently, not one at a time: a name that is
         // mid-teardown can make `claim_or_wait` wait a while, and that must
         // not delay a different server this same session also asked for.
         let claims = servers
             .into_iter()
             .map(|server| self.claim_or_wait(session_id, server));
-        let to_start: Vec<ToolServerConfig> = futures_util::future::join_all(claims)
+        futures_util::future::join_all(claims)
             .await
             .into_iter()
             .flatten()
-            .collect();
+            .collect()
+    }
+
+    /// Start every server [`Self::claim_users`] said needs it, then sweep.
+    ///
+    /// Safe to time out or abandon into the background: the only effect of
+    /// skipping this is that `to_start`'s servers stay unregistered for this
+    /// activation (degraded tools, not a correctness bug), because the user
+    /// registration this depends on already landed in `claim_users`.
+    pub async fn start_claimed(&self, to_start: Vec<ToolServerConfig>) {
         // Never hold `state` across a launcher await: starting a process and
         // waiting on its registration can take seconds, and holding the lock
         // here would serialize every session activation behind whichever
