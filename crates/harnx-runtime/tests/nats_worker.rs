@@ -1760,8 +1760,6 @@ fn injection_decision_points_use_leader_authoritative_read() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let agent_loop = std::fs::read_to_string(manifest_dir.join("src/nats_worker/agent_loop.rs"))
         .expect("agent_loop.rs must be readable");
-    let daemon = std::fs::read_to_string(manifest_dir.join("src/nats_worker/daemon.rs"))
-        .expect("daemon.rs must be readable");
 
     assert!(
         agent_loop.contains("build_mid_turn_injection_callback"),
@@ -1776,18 +1774,33 @@ fn injection_decision_points_use_leader_authoritative_read() {
         "agent_loop.rs must not route mid-turn injection through load_events_consistent_async"
     );
 
+    // The turn-decision logic that used to live entirely in daemon.rs is now
+    // split across the daemon_* siblings it was extracted into (turn-input
+    // derivation and session execution), so check the whole family rather
+    // than one file that no longer contains all three decision points.
+    let daemon_family = ["daemon", "daemon_turn_input", "daemon_session_exec"]
+        .iter()
+        .map(|name| {
+            std::fs::read_to_string(manifest_dir.join(format!("src/nats_worker/{name}.rs")))
+                .unwrap_or_else(|error| panic!("{name}.rs must be readable: {error}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
     assert_eq!(
-        daemon
+        daemon_family
             .lines()
             .filter(|line| line.contains("load_events_latest_async()"))
             .count(),
         3,
-        "daemon.rs must use load_events_latest_async at exact 3 decision points"
+        "daemon.rs's turn-decision logic must use load_events_latest_async at exact 3 decision points"
     );
     assert_eq!(
-        daemon.matches("load_events_consistent_async").count(),
+        daemon_family
+            .matches("load_events_consistent_async")
+            .count(),
         0,
-        "daemon.rs must not use load_events_consistent_async at #917 decision points"
+        "daemon.rs's turn-decision logic must not use load_events_consistent_async at #917 decision points"
     );
 }
 

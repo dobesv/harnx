@@ -8,10 +8,8 @@
 //! sessions, and let a server linger after its count hits zero before it is
 //! actually stopped.
 
-use super::daemon::{
-    configured_worker_services, install_activation_agent, should_start_tool_servers,
-    WorkerDaemonConfig,
-};
+use super::daemon::{install_activation_agent, WorkerDaemonConfig};
+use super::daemon_background::{configured_worker_services, should_start_tool_servers};
 use super::tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
 use crate::config::{resolve_local_nats_server_config, GlobalConfig, ToolServerConfig};
 use anyhow::Context;

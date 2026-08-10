@@ -9,6 +9,7 @@ use harnx_hookset_server::hook_registration_key;
 use harnx_runtime::nats_hook_provider::{HookDispatchMeta, NatsHookProvider};
 use harnx_runtime::nats_worker::{
     publish_crash_rejector, reconcile_hook_supervisor, HookServerStartConfig, HookServerSupervisor,
+    RejectorTarget,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -652,7 +653,15 @@ async fn crash_rejector_falls_back_to_registry_and_blocks_gate_events() -> Resul
     let friendly_label = "hook server crashed: Direct fallback guard";
     let key = hook_registration_key(&instance_id, &rejector_server);
 
-    publish_crash_rejector(&client, &instance_id, &rejector_server, friendly_label).await?;
+    publish_crash_rejector(
+        &client,
+        &instance_id,
+        RejectorTarget {
+            server: &rejector_server,
+            display_label: friendly_label,
+        },
+    )
+    .await?;
 
     assert!(
         expectations.get(&key).await?.is_none(),

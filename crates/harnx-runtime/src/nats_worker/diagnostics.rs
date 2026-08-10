@@ -8,7 +8,7 @@
 //! front-end run that exits after its turn, which routinely ends before slow
 //! servers finish and leaves the interesting part unobserved.
 
-use super::daemon::configured_worker_services;
+use super::daemon_background::configured_worker_services;
 use super::tool_registry::ensure_registry_bucket;
 use super::tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
 use crate::config::{
