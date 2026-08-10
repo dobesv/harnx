@@ -380,7 +380,8 @@ async fn start_local_tool_servers(
             .as_deref()
             .context("local NATS tool servers require HARNX_NATS_TOKEN")?;
         let start = ToolServerStartConfig::new(client, instance_id.clone(), &server.url, token)
-            .with_replicas(server.replicas);
+            .with_replicas(server.replicas)
+            .with_tls(&harnx_nats_common::connect::NatsEndpoint::from(&server));
         ToolServerSupervisor::start_local(start, servers)
             .await
             .context("start local NATS tool servers")
@@ -435,7 +436,8 @@ async fn start_global_hooks(
             .as_deref()
             .context("local NATS hook servers require HARNX_NATS_TOKEN")?;
         let start = HookServerStartConfig::new(client, instance_id.clone(), &server.url, token)
-            .with_replicas(server.replicas);
+            .with_replicas(server.replicas)
+            .with_tls(&harnx_nats_common::connect::NatsEndpoint::from(&server));
         HookServerSupervisor::start_local(start, hooks, "global")
             .await
             .context("start global NATS hook servers")

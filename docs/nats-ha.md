@@ -129,6 +129,18 @@ HARNX_NATS_URL=nats://nats:4222 HARNX_NATS_TOKEN=… \
   HARNX_SERVER_SCOPE=shared harnx-worker --cluster prod
 ```
 
+**`--cluster prod` alone is not enough for the worker container.** `--cluster`
+only tells the worker which `nats_servers/<cluster>.yaml` to use for the
+*session* connection (leases, session log, control plane). Discovering tool
+and hook servers is a separate connection that never reads that file — it
+always resolves from `HARNX_NATS_URL`/`HARNX_NATS_TOKEN` (and, on a TLS or
+mTLS cluster, `HARNX_NATS_TLS`, `HARNX_NATS_TLS_CERT`, `HARNX_NATS_TLS_KEY`,
+`HARNX_NATS_TLS_CA`) in the worker's own environment. A worker pod must carry
+these env vars *in addition to* `--cluster`, even when `prod.yaml` already
+has the same URL and TLS settings — otherwise the worker connects fine for
+sessions but can't discover any tool or hook server, or (on a TLS cluster)
+can't discover them at all because that connection falls back to plaintext.
+
 Both sides must carry the same scope value. A mismatch is not an error — the
 worker finds no servers and logs that it searched an empty scope.
 
@@ -238,3 +250,9 @@ Harnx tracks internal counters (exported to logs and future metrics endpoints):
 
 ## TLS Support Note
 Harnx supports TLS and mTLS for NATS connections. While token authentication and config-based TLS have been verified, automated PKI-backed integration tests for live TLS handshakes are ongoing.
+
+Config-based TLS (`tls`/`tls_cert`/`tls_key`/`tls_ca` in `nats_servers/<cluster>.yaml`)
+covers the client and worker session connection. It does **not** cover tool/hook
+discovery — see
+[Independently Deployed Tool and Hook Servers](#independently-deployed-tool-and-hook-servers)
+for the separate `HARNX_NATS_TLS*` env vars that connection needs.

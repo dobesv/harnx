@@ -3,7 +3,10 @@ use super::*;
 use anyhow::{bail, Context, Result};
 use async_nats::jetstream;
 use harnx_core::agent_config::AgentRole;
-use harnx_nats_common::connect::NatsEndpoint;
+use harnx_nats_common::connect::{
+    NatsEndpoint, HARNX_NATS_TLS_CA_ENV, HARNX_NATS_TLS_CERT_ENV, HARNX_NATS_TLS_ENV,
+    HARNX_NATS_TLS_KEY_ENV,
+};
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, path::Path};
 
@@ -57,22 +60,40 @@ impl NatsServerConfig {
 /// of dynamic config. A complete environment handoff takes precedence; without
 /// one, details come from the auto-managed shared broker.
 pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
-    let (url, token, replicas) = match (
+    let (url, token, replicas, tls, tls_cert, tls_key, tls_ca) = match (
         std::env::var(HARNX_NATS_URL_ENV).ok(),
         std::env::var(HARNX_NATS_TOKEN_ENV).ok(),
     ) {
         (Some(url), Some(token)) => {
             // Only a complete handoff can mean "this is a real cluster an
             // operator configured"; the auto-managed broker below is always a
-            // single embedded process, so it never reads this.
+            // single embedded, TLS-less process, so it never reads any of this.
             let replicas = std::env::var(HARNX_NATS_REPLICAS_ENV)
                 .ok()
                 .and_then(|value| value.parse().ok());
-            (url, token, replicas)
+            // Same env var names as `NatsEndpoint::from_env`: a worker
+            // resolving its own discovery client and the child tool/hook
+            // servers it spawns must agree on TLS, or a worker on a TLS
+            // cluster spawns children that can't reach the broker.
+            let tls = std::env::var(HARNX_NATS_TLS_ENV)
+                .ok()
+                .map(|value| value == "1" || value == "true");
+            let tls_cert = std::env::var(HARNX_NATS_TLS_CERT_ENV).ok();
+            let tls_key = std::env::var(HARNX_NATS_TLS_KEY_ENV).ok();
+            let tls_ca = std::env::var(HARNX_NATS_TLS_CA_ENV).ok();
+            (url, token, replicas, tls, tls_cert, tls_key, tls_ca)
         }
         (None, None) => {
             let server = crate::nats_local_server::ensure_shared_server().await?;
-            (server.url.clone(), server.token.clone(), None)
+            (
+                server.url.clone(),
+                server.token.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
         }
         _ => bail!("{HARNX_NATS_URL_ENV} and {HARNX_NATS_TOKEN_ENV} must be set together"),
     };
@@ -82,10 +103,10 @@ pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
         url,
         token: Some(token),
         replicas,
-        tls: None,
-        tls_cert: None,
-        tls_key: None,
-        tls_ca: None,
+        tls,
+        tls_cert,
+        tls_key,
+        tls_ca,
         agents: vec![],
     })
 }
@@ -280,6 +301,52 @@ mod tests {
         let server = resolve_local_nats_server_config().await.unwrap();
 
         assert_authenticated_local_server(&server, "nats://127.0.0.1:4555", "handoff-token");
+    }
+
+    /// A worker on a TLS cluster must be able to discover tool/hook servers
+    /// over TLS too: `resolve_local_nats_server_config` backs
+    /// `NatsToolProvider`/`NatsHookProvider` discovery (both call
+    /// `config.nats_client(LOCAL_CLUSTER_KEY)`), so it must read the same
+    /// `HARNX_NATS_TLS*` variables `NatsEndpoint::from_env` does, or that
+    /// discovery silently stays plaintext regardless of cluster config.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn local_cluster_env_handoff_carries_tls_settings() {
+        harnx_core::require_nextest();
+        let _lock = env_lock();
+        let _url = EnvGuard::new(
+            HARNX_NATS_URL_ENV,
+            std::path::Path::new("tls://127.0.0.1:4555"),
+        );
+        let _token = EnvGuard::new(HARNX_NATS_TOKEN_ENV, std::path::Path::new("handoff-token"));
+        let _tls = EnvGuard::new("HARNX_NATS_TLS", std::path::Path::new("true"));
+        let _cert = EnvGuard::new(
+            "HARNX_NATS_TLS_CERT",
+            std::path::Path::new("/tmp/client-cert.pem"),
+        );
+        let _key = EnvGuard::new(
+            "HARNX_NATS_TLS_KEY",
+            std::path::Path::new("/tmp/client-key.pem"),
+        );
+        let _ca = EnvGuard::new("HARNX_NATS_TLS_CA", std::path::Path::new("/tmp/ca.pem"));
+
+        let server = resolve_local_nats_server_config().await.unwrap();
+
+        let actual = (
+            server.tls,
+            server.tls_cert.as_deref(),
+            server.tls_key.as_deref(),
+            server.tls_ca.as_deref(),
+        );
+        assert_eq!(
+            actual,
+            (
+                Some(true),
+                Some("/tmp/client-cert.pem"),
+                Some("/tmp/client-key.pem"),
+                Some("/tmp/ca.pem"),
+            )
+        );
     }
 
     #[tokio::test]

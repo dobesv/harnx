@@ -10,6 +10,10 @@ use harnx_hookset::{
     HOOK_PROTOCOL_VERSION, HOOK_REGISTRY_BUCKET, HOOK_SCHEMA_VERSION,
 };
 use harnx_hookset_server::hook_registration_key;
+use harnx_nats_common::connect::{
+    NatsEndpoint, HARNX_NATS_TLS_CA_ENV, HARNX_NATS_TLS_CERT_ENV, HARNX_NATS_TLS_ENV,
+    HARNX_NATS_TLS_KEY_ENV,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -33,6 +37,12 @@ pub struct HookServerStartConfig {
     /// JetStream replica count for buckets this cluster's hook servers
     /// create. `None` means 1; see `docs/nats-ha.md`.
     replicas: Option<usize>,
+    /// TLS/mTLS settings for `nats_url`, mirrored into spawned children's
+    /// environment. `None`/absent means no TLS.
+    tls: Option<bool>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    tls_ca: Option<String>,
 }
 
 impl HookServerStartConfig {
@@ -48,12 +58,29 @@ impl HookServerStartConfig {
             nats_url: nats_url.into(),
             token: token.into(),
             replicas: None,
+            tls: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca: None,
         }
     }
 
     /// Set the JetStream replica count from the cluster this config connects to.
     pub fn with_replicas(mut self, replicas: Option<usize>) -> Self {
         self.replicas = replicas;
+        self
+    }
+
+    /// Copy TLS/mTLS settings from `endpoint` (built from the cluster this
+    /// config connects to) so spawned hook servers are told to use the same
+    /// ones. Only `endpoint`'s TLS fields are read. Without this, a worker
+    /// discovering over TLS spawns hook children that connect plaintext and
+    /// can never reach the broker.
+    pub fn with_tls(mut self, endpoint: &NatsEndpoint) -> Self {
+        self.tls = endpoint.tls;
+        self.tls_cert = endpoint.tls_cert.clone();
+        self.tls_key = endpoint.tls_key.clone();
+        self.tls_ca = endpoint.tls_ca.clone();
         self
     }
 
@@ -398,6 +425,25 @@ fn hook_server_name(run_id: &str, order_index: usize) -> String {
     format!("hook-{run_id}-{order_index:03}")
 }
 
+/// Mirror this config's TLS/mTLS settings into the child's environment, using
+/// the exact same variable names `NatsEndpoint::from_env` reads. A spawned
+/// hook server that can't see these connects plaintext to a TLS-only broker
+/// and never reaches it.
+fn apply_tls_env(command: &mut Command, config: &HookServerStartConfig) {
+    if let Some(tls) = config.tls {
+        command.env(HARNX_NATS_TLS_ENV, if tls { "true" } else { "false" });
+    }
+    if let Some(cert) = &config.tls_cert {
+        command.env(HARNX_NATS_TLS_CERT_ENV, cert);
+    }
+    if let Some(key) = &config.tls_key {
+        command.env(HARNX_NATS_TLS_KEY_ENV, key);
+    }
+    if let Some(ca) = &config.tls_ca {
+        command.env(HARNX_NATS_TLS_CA_ENV, ca);
+    }
+}
+
 fn spawn_hook_server(
     config: &HookServerStartConfig,
     hook: &HookConfig,
@@ -430,7 +476,9 @@ fn spawn_hook_server(
         .env(
             HARNX_NATS_REPLICAS_ENV,
             config.resolved_replicas().to_string(),
-        )
+        );
+    apply_tls_env(&mut command, config);
+    command
         .stdin(Stdio::null())
         // Send output to the worker log so a hook server that exits before
         // registering explains itself instead of failing silently.

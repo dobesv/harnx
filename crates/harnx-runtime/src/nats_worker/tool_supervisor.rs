@@ -13,6 +13,10 @@ use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_core::sink::emit_agent_event;
 use harnx_hooks::executor::HARNX_PACKAGE_DIR_ENV;
+use harnx_nats_common::connect::{
+    NatsEndpoint, HARNX_NATS_TLS_CA_ENV, HARNX_NATS_TLS_CERT_ENV, HARNX_NATS_TLS_ENV,
+    HARNX_NATS_TLS_KEY_ENV,
+};
 use harnx_toolset::{server_identity_token, HARNX_SERVER_CONFIG, HARNX_SERVER_PACKAGE};
 use harnx_toolset_server::registration_key;
 use std::collections::{HashMap, HashSet};
@@ -36,6 +40,13 @@ pub struct ToolServerStartConfig {
     /// JetStream replica count for buckets this cluster's tool servers
     /// create. `None` means 1; see `docs/nats-ha.md`.
     replicas: Option<usize>,
+    /// TLS/mTLS settings for `nats_url`, mirrored into spawned children's
+    /// environment. `None`/absent means no TLS, same as the shared local
+    /// broker this worker falls back to when no cluster config says otherwise.
+    tls: Option<bool>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    tls_ca: Option<String>,
     /// Send tool-server output to this process's own stdout/stderr instead of
     /// the worker log. Set by foreground diagnostics, where routing a server's
     /// explanation of its own failure into a file is the opposite of useful.
@@ -55,6 +66,10 @@ impl ToolServerStartConfig {
             nats_url: nats_url.into(),
             token: token.into(),
             replicas: None,
+            tls: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca: None,
             inherit_child_output: false,
         }
     }
@@ -71,6 +86,30 @@ impl ToolServerStartConfig {
         self
     }
 
+    /// Copy TLS/mTLS settings from `endpoint` (built from the cluster this
+    /// config connects to) so spawned tool servers are told to use the same
+    /// ones. Only `endpoint`'s TLS fields are read; url/token/replicas are
+    /// already carried separately. Without this, a worker discovering over
+    /// TLS spawns children that connect plaintext and can never reach the
+    /// broker.
+    pub fn with_tls(mut self, endpoint: &NatsEndpoint) -> Self {
+        self.tls = endpoint.tls;
+        self.tls_cert = endpoint.tls_cert.clone();
+        self.tls_key = endpoint.tls_key.clone();
+        self.tls_ca = endpoint.tls_ca.clone();
+        self
+    }
+
+    fn tls_endpoint(&self) -> NatsEndpoint {
+        NatsEndpoint {
+            tls: self.tls,
+            tls_cert: self.tls_cert.clone(),
+            tls_key: self.tls_key.clone(),
+            tls_ca: self.tls_ca.clone(),
+            ..Default::default()
+        }
+    }
+
     fn hook_start_config(&self) -> HookServerStartConfig {
         HookServerStartConfig::new(
             self.client.clone(),
@@ -79,6 +118,7 @@ impl ToolServerStartConfig {
             self.token.clone(),
         )
         .with_replicas(self.replicas)
+        .with_tls(&self.tls_endpoint())
     }
 }
 
@@ -425,6 +465,25 @@ fn child_output_sink(config: &ToolServerStartConfig) -> Stdio {
     }
 }
 
+/// Mirror this config's TLS/mTLS settings into the child's environment, using
+/// the exact same variable names `NatsEndpoint::from_env` reads. A spawned
+/// server that can't see these connects plaintext to a TLS-only broker and
+/// never reaches it.
+fn apply_tls_env(command: &mut Command, config: &ToolServerStartConfig) {
+    if let Some(tls) = config.tls {
+        command.env(HARNX_NATS_TLS_ENV, if tls { "true" } else { "false" });
+    }
+    if let Some(cert) = &config.tls_cert {
+        command.env(HARNX_NATS_TLS_CERT_ENV, cert);
+    }
+    if let Some(key) = &config.tls_key {
+        command.env(HARNX_NATS_TLS_KEY_ENV, key);
+    }
+    if let Some(ca) = &config.tls_ca {
+        command.env(HARNX_NATS_TLS_CA_ENV, ca);
+    }
+}
+
 fn spawn_tool_server(config: &ToolServerStartConfig, server: &ToolServerConfig) -> Result<Child> {
     let binary = resolve_tool_binary(server)?;
     let mut command = Command::new(&binary);
@@ -443,7 +502,9 @@ fn spawn_tool_server(config: &ToolServerStartConfig, server: &ToolServerConfig) 
         .env(
             HARNX_NATS_REPLICAS_ENV,
             config.replicas.unwrap_or(1).to_string(),
-        )
+        );
+    apply_tls_env(&mut command, config);
+    command
         .stdin(Stdio::null())
         // Send output to the worker log instead of discarding it, so a tool
         // server that dies or complains on startup leaves a trace there rather

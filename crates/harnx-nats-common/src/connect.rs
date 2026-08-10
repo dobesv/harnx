@@ -10,6 +10,23 @@ use std::{io::BufReader, path::PathBuf};
 use anyhow::{bail, Context, Result};
 use async_nats::ConnectOptions;
 
+/// Env var enabling TLS for a standalone tool/hook server's broker connection.
+/// `"1"` or `"true"` enables it; see [`NatsEndpoint::should_require_tls`] for
+/// how this combines with the client-certificate/CA settings below.
+///
+/// Shared here (rather than declared separately per crate) because
+/// `harnx-runtime`'s worker-side discovery (`resolve_local_nats_server_config`)
+/// and the standalone tool/hook server binaries (`NatsEndpoint::from_env`)
+/// both need the exact same env var names — a worker that reads a differently
+/// spelled variable than the child it spawns would silently never see TLS.
+pub const HARNX_NATS_TLS_ENV: &str = "HARNX_NATS_TLS";
+/// Env var carrying the client certificate path for mTLS.
+pub const HARNX_NATS_TLS_CERT_ENV: &str = "HARNX_NATS_TLS_CERT";
+/// Env var carrying the client key path for mTLS.
+pub const HARNX_NATS_TLS_KEY_ENV: &str = "HARNX_NATS_TLS_KEY";
+/// Env var carrying a custom CA bundle path for TLS.
+pub const HARNX_NATS_TLS_CA_ENV: &str = "HARNX_NATS_TLS_CA";
+
 /// Connection details for one NATS endpoint: URL plus optional auth/TLS.
 ///
 /// Built either from a `NatsServerConfig` (config-file clusters, see
@@ -74,12 +91,12 @@ impl NatsEndpoint {
             replicas: std::env::var("HARNX_NATS_REPLICAS")
                 .ok()
                 .and_then(|value| value.parse().ok()),
-            tls: std::env::var("HARNX_NATS_TLS")
+            tls: std::env::var(HARNX_NATS_TLS_ENV)
                 .ok()
                 .map(|value| value == "1" || value == "true"),
-            tls_cert: std::env::var("HARNX_NATS_TLS_CERT").ok(),
-            tls_key: std::env::var("HARNX_NATS_TLS_KEY").ok(),
-            tls_ca: std::env::var("HARNX_NATS_TLS_CA").ok(),
+            tls_cert: std::env::var(HARNX_NATS_TLS_CERT_ENV).ok(),
+            tls_key: std::env::var(HARNX_NATS_TLS_KEY_ENV).ok(),
+            tls_ca: std::env::var(HARNX_NATS_TLS_CA_ENV).ok(),
         })
     }
 

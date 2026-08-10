@@ -61,16 +61,23 @@ pub async fn diagnose_tool_servers(config: &GlobalConfig) -> Result<String> {
                 .context("start the shared local NATS broker")?,
         ),
     };
-    // The auto-managed embedded broker is always single-node, so it never has
-    // a replica count; only a full environment handoff to a real cluster does.
-    let (url, token, replicas) = match &owned_broker {
-        Some(server) => (server.url.clone(), server.token.clone(), None),
+    // The auto-managed embedded broker is always single-node and TLS-less, so
+    // only a full environment handoff to a real cluster ever has a replica
+    // count or TLS settings to carry into the spawned tool servers below.
+    let (url, token, replicas, tls_endpoint) = match &owned_broker {
+        Some(server) => (
+            server.url.clone(),
+            server.token.clone(),
+            None,
+            harnx_nats_common::connect::NatsEndpoint::default(),
+        ),
         None => {
             let local = resolve_local_nats_server_config()
                 .await
                 .context("resolve the local NATS broker")?;
+            let tls_endpoint = harnx_nats_common::connect::NatsEndpoint::from(&local);
             let token = local.token.clone().context("local NATS requires a token")?;
-            (local.url, token, local.replicas)
+            (local.url, token, local.replicas, tls_endpoint)
         }
     };
     let client = async_nats::ConnectOptions::new()
@@ -89,7 +96,8 @@ pub async fn diagnose_tool_servers(config: &GlobalConfig) -> Result<String> {
 
     let start = ToolServerStartConfig::new(client.clone(), instance_id.clone(), &url, &token)
         .inheriting_child_output()
-        .with_replicas(replicas);
+        .with_replicas(replicas)
+        .with_tls(&tls_endpoint);
     let began = Instant::now();
     let supervisor =
         ToolServerSupervisor::start_local_with_timeout(start, &servers, DIAGNOSE_TIMEOUT).await?;

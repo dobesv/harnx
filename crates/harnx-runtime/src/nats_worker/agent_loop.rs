@@ -453,6 +453,9 @@ async fn agent_hook_start_config(
     }
     let result = async {
         let server = resolve_local_nats_server_config().await?;
+        // Read before `server.token` moves out below: `NatsEndpoint::from`
+        // borrows the whole config, which a partial move would then forbid.
+        let tls_endpoint = harnx_nats_common::connect::NatsEndpoint::from(&server);
         let token = server
             .token
             .context("local NATS agent hooks require HARNX_NATS_TOKEN")?;
@@ -463,7 +466,8 @@ async fn agent_hook_start_config(
                 server.url,
                 token,
             )
-            .with_replicas(server.replicas),
+            .with_replicas(server.replicas)
+            .with_tls(&tls_endpoint),
         )
     }
     .await;
