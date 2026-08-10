@@ -834,6 +834,14 @@ struct ControlListenerCtx<'a> {
     abort_signal: &'a crate::utils::AbortSignal,
 }
 
+/// Borrowed parameters for [`WorkerRuntime::prepare_and_ack_activation`].
+struct ActivationAckCtx<'a> {
+    activation: &'a SessionActivate,
+    message: &'a async_nats::jetstream::Message,
+    lease: &'a Arc<NatsSessionLease>,
+    abort_signal: &'a crate::utils::AbortSignal,
+}
+
 struct WorkerRuntime {
     config: GlobalConfig,
     instance_id: harnx_core::instance::ServerScope,
@@ -958,6 +966,38 @@ impl WorkerRuntime {
         }
     }
 
+    /// Subscribe control and acknowledge the activation, in that order.
+    /// `start_session_tool_servers` already registered this session as a tool-
+    /// server user before either step ran; no task exists yet to release that
+    /// on completion (that happens inside the spawned task `handle_activation`
+    /// creates once this returns `Ok`), so either failure here must release it
+    /// itself or the server stays pinned running for the rest of the worker's
+    /// lifetime.
+    async fn prepare_and_ack_activation(
+        &self,
+        ctx: ActivationAckCtx<'_>,
+    ) -> Result<JoinHandle<()>> {
+        let control_task = match self
+            .prepare_activation_control(ctx.activation, ctx.lease, ctx.abort_signal)
+            .await
+        {
+            Ok(task) => task,
+            Err(error) => {
+                self.end_session_tool_servers(&ctx.activation.session_id)
+                    .await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = ctx.message.ack().await {
+            control_task.abort();
+            let _ = ctx.lease.release().await;
+            self.end_session_tool_servers(&ctx.activation.session_id)
+                .await;
+            return Err(anyhow::anyhow!("ack SessionActivate: {error}"));
+        }
+        Ok(control_task)
+    }
+
     async fn handle_activation(
         self: &Arc<Self>,
         message: async_nats::jetstream::Message,
@@ -992,17 +1032,17 @@ impl WorkerRuntime {
         );
 
         let abort_signal = crate::utils::create_abort_signal();
-        // Core-NATS control must be subscribed before activation is acknowledged.
+        // Core-NATS control must be subscribed before activation is
+        // acknowledged; either failing releases the lease and this session's
+        // tool-server refcount (see `prepare_and_ack_activation`).
         let control_task = self
-            .prepare_activation_control(&activation, &lease, &abort_signal)
+            .prepare_and_ack_activation(ActivationAckCtx {
+                activation: &activation,
+                message: &message,
+                lease: &lease,
+                abort_signal: &abort_signal,
+            })
             .await?;
-
-        // We hold the lease and control is ready: ack activation and spawn execution.
-        if let Err(error) = message.ack().await {
-            control_task.abort();
-            let _ = lease.release().await;
-            return Err(anyhow::anyhow!("ack SessionActivate: {error}"));
-        }
         let worker = Arc::clone(self);
         let session_id = activation.session_id.clone();
         let task_session_id = session_id.clone();
