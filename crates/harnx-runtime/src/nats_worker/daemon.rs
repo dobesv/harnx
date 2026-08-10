@@ -49,6 +49,18 @@ const WORK_NOTIFY_INACTIVE_THRESHOLD: Duration = Duration::from_secs(60 * 60);
 /// Longest a session start will wait for the first tool-server registration
 /// round. Above the round's own budget, so it only fires if that round wedges.
 const INITIAL_TOOL_REGISTRATION_WAIT: Duration = Duration::from_secs(30);
+/// Longest `handle_activation` waits for this session's own tool servers to
+/// start before giving up and continuing anyway.
+///
+/// Deliberately well under `WORK_NOTIFY_ACK_WAIT`: tool-server starts now run
+/// concurrently (see `ServerReconciler::session_started`), so this only needs
+/// to cover one server's own startup timeout plus margin, not the sum of
+/// several. Comfortably clearing this margin matters because JetStream
+/// redelivers an unacked activation at `WORK_NOTIFY_ACK_WAIT` with
+/// `max_deliver: -1` — a session that never manages to ack loops forever,
+/// each redelivery re-acquiring the lease and fencing the still-running
+/// previous attempt.
+const SESSION_TOOL_SERVER_START_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Configuration for a worker daemon instance.
 #[derive(Debug, Clone)]
@@ -854,14 +866,49 @@ impl WorkerRuntime {
 
     /// A worker that doesn't manage its own servers, or has nothing
     /// configured to spawn anywhere, has no reconciler and this is a no-op.
+    ///
+    /// Bounded by `SESSION_TOOL_SERVER_START_TIMEOUT`, comfortably under the
+    /// activation ack window: a session degraded to fewer tools is far better
+    /// than an unacked activation that JetStream redelivers forever. On
+    /// timeout the reconciler task is left running rather than aborted — it
+    /// still finishes starting (or gives up on) each server and updates
+    /// `ServerReconciler`'s own bookkeeping correctly; this call just stops
+    /// waiting for it.
     async fn start_session_tool_servers(&self, activation: &SessionActivate) {
-        let Some(reconciler) = &self.server_reconciler else {
+        let Some(reconciler) = self.server_reconciler.clone() else {
             return;
         };
         let servers = tool_servers_for_activation(&self.config, &activation.agent);
-        reconciler
-            .session_started(&activation.session_id, servers)
-            .await;
+        if servers.is_empty() {
+            return;
+        }
+        let server_names = servers
+            .iter()
+            .map(|server| server.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let session_id = activation.session_id.clone();
+        let task = tokio::spawn(async move {
+            reconciler.session_started(&session_id, servers).await;
+        });
+        match tokio::time::timeout(SESSION_TOOL_SERVER_START_TIMEOUT, task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(join_error)) => {
+                log::warn!(
+                    "session '{}' tool-server startup task panicked: {join_error}",
+                    activation.session_id
+                );
+            }
+            Err(_) => {
+                log::warn!(
+                    "session '{}' tool-server startup ({}) exceeded {}s; continuing this \
+                     activation without waiting further (still starting in the background)",
+                    activation.session_id,
+                    server_names,
+                    SESSION_TOOL_SERVER_START_TIMEOUT.as_secs()
+                );
+            }
+        }
     }
 
     async fn end_session_tool_servers(&self, session_id: &str) {

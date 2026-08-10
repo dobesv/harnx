@@ -177,6 +177,56 @@ async fn a_server_that_fails_to_start_is_not_counted_as_running() {
     );
 }
 
+/// A launcher whose `start` takes a fixed amount of time, for pinning
+/// `session_started`'s concurrency: several of these in one call should take
+/// about as long as the slowest one, not their sum.
+#[derive(Default)]
+struct SlowLauncher {
+    delay: Duration,
+    started: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl ServerLauncher for SlowLauncher {
+    async fn start(&self, server: &ToolServerConfig) -> anyhow::Result<()> {
+        tokio::time::sleep(self.delay).await;
+        self.started.lock().unwrap().push(server.name.clone());
+        Ok(())
+    }
+    async fn stop(&self, _config_name: &str) {}
+}
+
+#[tokio::test]
+async fn session_started_starts_multiple_servers_concurrently_not_sequentially() {
+    harnx_core::require_nextest();
+    let launcher = Arc::new(SlowLauncher {
+        delay: Duration::from_millis(200),
+        started: Mutex::new(Vec::new()),
+    });
+    let reconciler = ServerReconciler::new(launcher.clone(), Duration::ZERO);
+
+    let began = Instant::now();
+    reconciler
+        .session_started(
+            "s1",
+            vec![
+                tool_server("time"),
+                tool_server("plans"),
+                tool_server("weather"),
+            ],
+        )
+        .await;
+    let elapsed = began.elapsed();
+
+    assert_eq!(launcher.started.lock().unwrap().len(), 3);
+    assert!(
+        elapsed < Duration::from_millis(450),
+        "three 200ms server starts should overlap (~200ms total) rather than sum \
+         sequentially (~600ms); the activation ack window can't afford the sum once \
+         more than a couple of servers are configured. took {elapsed:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // End-to-end: a real managing worker starts only the servers its active
 // sessions' agents use. Built on the pattern in `package_tool_naming_e2e.rs`.

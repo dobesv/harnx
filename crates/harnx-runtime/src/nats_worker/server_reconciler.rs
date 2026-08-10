@@ -105,9 +105,15 @@ impl ServerReconciler {
         // waiting on its registration can take seconds, and holding the lock
         // here would serialize every session activation behind whichever
         // server is slowest to come up.
-        for server in to_start {
-            self.start_or_forget(server).await;
-        }
+        //
+        // Start them concurrently rather than one at a time: sequential starts
+        // sum each server's own startup timeout (three servers, one missing a
+        // binary, is 3x that timeout), which the caller must fit inside the
+        // activation's own ack window.
+        let starts = to_start
+            .into_iter()
+            .map(|server| self.start_or_forget(server));
+        futures_util::future::join_all(starts).await;
         self.sweep().await;
     }
 
