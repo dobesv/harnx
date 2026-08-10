@@ -25,8 +25,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 const TOOL_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -130,11 +131,17 @@ pub struct ToolServerSupervisor {
     /// Enabled servers that have not registered yet. Retried in the background
     /// by the worker, so this shrinks as late registrations land.
     unregistered: Vec<SupervisedServer>,
-    /// Wakes every monitor task's wait so `shutdown` can kill its child and
-    /// let the monitor's own exit path (registration removal) run, instead of
-    /// aborting past it. `Drop` still aborts `tasks` directly as a fallback
-    /// for a supervisor that gets dropped without `shutdown` ever running.
-    shutdown_signal: Arc<Notify>,
+    /// Tells every monitor task to kill its child and let the monitor's own
+    /// exit path (registration removal) run, instead of `shutdown` aborting
+    /// past it. A `CancellationToken`, not a `Notify`: `notify_waiters` only
+    /// wakes tasks already parked on `notified()` at the moment it's called,
+    /// so a monitor that hasn't reached its wait yet would miss the signal
+    /// and wait for its child to exit on its own — which, for a tool server,
+    /// is never. Cancellation is durable state, not a point-in-time wakeup,
+    /// so a monitor that checks it late still sees it. `Drop` still aborts
+    /// `tasks` directly as a fallback for a supervisor that gets dropped
+    /// without `shutdown` ever running.
+    shutdown_signal: CancellationToken,
 }
 
 impl ToolServerSupervisor {
@@ -157,7 +164,7 @@ impl ToolServerSupervisor {
             processes: Arc::clone(&processes),
             tasks: Vec::new(),
             hook_supervisors: Vec::new(),
-            shutdown_signal: Arc::new(Notify::new()),
+            shutdown_signal: CancellationToken::new(),
             unregistered: Vec::new(),
         };
         let enabled: Vec<_> = servers.iter().filter(|server| server.enabled).collect();
@@ -290,7 +297,7 @@ impl ToolServerSupervisor {
     /// all — only its explicit `shutdown` removes registrations and
     /// expectations.
     pub async fn shutdown(mut self) {
-        self.shutdown_signal.notify_waiters();
+        self.shutdown_signal.cancel();
         for task in std::mem::take(&mut self.tasks) {
             let _ = task.await;
         }
@@ -370,7 +377,7 @@ async fn spawn_enabled_tool_servers(
 ) {
     let processes = Arc::clone(&supervisor.processes);
     let in_flight = NatsInFlightCalls::for_instance(&config.instance_id);
-    let shutdown_signal = Arc::clone(&supervisor.shutdown_signal);
+    let shutdown_signal = supervisor.shutdown_signal.clone();
     for server in servers {
         // A server whose child is still alive is slow, not dead — give the
         // existing process more time rather than stacking a second copy.
@@ -400,7 +407,7 @@ async fn spawn_enabled_tool_servers(
                     client: config.client.clone(),
                     processes: Arc::clone(&processes),
                     in_flight: in_flight.clone(),
-                    shutdown_signal: Arc::clone(&shutdown_signal),
+                    shutdown_signal: shutdown_signal.clone(),
                 }));
             }
             Err(error) => warn_server_failure(&server.name, format!("{error:#}")),
@@ -577,7 +584,7 @@ struct ToolMonitor {
     client: async_nats::Client,
     processes: SupervisedProcesses,
     in_flight: NatsInFlightCalls,
-    shutdown_signal: Arc<Notify>,
+    shutdown_signal: CancellationToken,
 }
 
 /// Outcome of waiting for a child: either it exited on its own (a crash, from
@@ -592,10 +599,19 @@ enum ChildExit {
 /// kill it and wait for that exit. Killing here rather than only relying on
 /// `kill_on_drop` is what lets this task reach its own cleanup below
 /// (registration removal) instead of a `Drop`/abort racing past it.
-async fn wait_for_child_or_shutdown(child: &mut Child, shutdown_signal: &Notify) -> ChildExit {
+///
+/// `shutdown_signal.cancelled()`, not a `Notify::notified()`: cancellation is
+/// durable, so a monitor that reaches this `select!` only after `shutdown`
+/// already called `cancel()` still observes it immediately, rather than
+/// waiting on a wakeup that already fired for whichever waiters existed at
+/// the time.
+async fn wait_for_child_or_shutdown(
+    child: &mut Child,
+    shutdown_signal: &CancellationToken,
+) -> ChildExit {
     tokio::select! {
         status = wait_for_child(child) => ChildExit::Crashed(status),
-        _ = shutdown_signal.notified() => {
+        _ = shutdown_signal.cancelled() => {
             let _ = child.start_kill();
             let _ = wait_for_child(child).await;
             ChildExit::Shutdown
@@ -722,5 +738,44 @@ mod tests {
             tool_server_package_dir(&server),
             harnx_core::config_paths::config_dir()
         );
+    }
+
+    /// Regression: a monitor task that reaches `wait_for_child_or_shutdown`
+    /// *after* `shutdown` already signaled must still see the shutdown, not
+    /// hang waiting for the child to exit on its own (which, for a live tool
+    /// server, is never). `Notify::notify_waiters()` would lose this exact
+    /// ordering — it only wakes waiters already parked on `notified()` at the
+    /// moment it's called — which is why the signal is a `CancellationToken`
+    /// instead: cancellation is durable state, observed correctly no matter
+    /// when a caller checks it.
+    ///
+    /// Unix-only: uses `sleep` as a real, portable, definitely-alive child;
+    /// Windows CI has no equivalent without extra ceremony this doesn't need.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_for_child_or_shutdown_observes_a_cancellation_that_already_fired() {
+        harnx_core::require_nextest();
+        let shutdown_signal = CancellationToken::new();
+        // Cancel before anything has ever polled `cancelled()` on this
+        // token — the exact ordering the old `Notify` lost.
+        shutdown_signal.cancel();
+
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_child_or_shutdown(&mut child, &shutdown_signal),
+        )
+        .await
+        .expect(
+            "wait_for_child_or_shutdown must observe an already-fired \
+             cancellation, not hang waiting for the child to exit on its own",
+        );
+
+        assert!(matches!(exit, ChildExit::Shutdown));
     }
 }
