@@ -308,6 +308,62 @@ async fn sigterm_removes_the_hook_registration() -> Result<()> {
     .await
     .context("hook registration should be gone soon after SIGTERM, not left to expire")?;
 
-    let _ = hook_server.0.wait();
+    wait_for_process_exit(&mut hook_server.0, Instant::now() + Duration::from_secs(5))
+        .await
+        .context("harnx-claude-compatible-hook-server did not exit after SIGTERM")?;
+    Ok(())
+}
+
+/// Poll for process exit under a deadline instead of `Child::wait()`, which
+/// blocks forever if the child never exits and would hang the whole suite.
+/// If the deadline passes, this returns an error rather than waiting further
+/// -- `HookServerHandle`'s `Drop` (kill + wait) still runs when the caller
+/// propagates that error, so the child is cleaned up either way.
+async fn wait_for_process_exit(child: &mut Child, deadline: Instant) -> Result<()> {
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "process (pid {:?}) did not exit before the deadline",
+                child.id()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// `Child::wait()` blocks forever on a process that never exits; the whole
+/// point of `wait_for_process_exit` is to bound that. Prove it actually
+/// times out (rather than happening to work only because the SIGTERM test's
+/// child always exits) using a real child that outlives the deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_for_process_exit_times_out_on_a_process_that_never_exits() -> Result<()> {
+    harnx_core::require_nextest();
+    let mut child = Command::new("sleep")
+        .arg("60")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn a long-running child")?;
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(300);
+    let result = wait_for_process_exit(&mut child, deadline).await;
+    let elapsed = started.elapsed();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        result.is_err(),
+        "a process that never exits must time out, not hang the test"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "wait_for_process_exit took {elapsed:?}, far past its 300ms deadline"
+    );
     Ok(())
 }
