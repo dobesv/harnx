@@ -5,13 +5,18 @@ use harnx_core::instance::ServerScope;
 use harnx_hookset::{
     FailPolicy, Hook, HookRegistration, HookSpec, HOOK_PROTOCOL_VERSION, HOOK_SCHEMA_VERSION,
 };
-use harnx_hookset_server::{hook_registration_key, serve_over_nats, HOOK_REGISTRY_BUCKET};
+use harnx_hookset_server::{
+    hook_registration_key, serve_over_nats, serve_with_shutdown, HOOK_REGISTRY_BUCKET,
+};
+use harnx_nats_common::connect::NatsConnection;
 use serde_json::json;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 
 const TOKEN: &str = "hookset-server-test-token";
 
@@ -220,6 +225,127 @@ async fn hookset_registers_and_serves_hook_over_nats() -> Result<()> {
     );
 
     server_task.abort();
+    drop(server);
+    Ok(())
+}
+
+async fn registration_revision(client: &async_nats::Client, key: &str) -> Result<Option<u64>> {
+    let jetstream = async_nats::jetstream::new(client.clone());
+    // The bucket may not exist yet if no hook server has published to this
+    // scope. That is "no revision yet", not a failure worth propagating here.
+    let Ok(store) = jetstream.get_key_value(HOOK_REGISTRY_BUCKET).await else {
+        return Ok(None);
+    };
+    Ok(store.entry(key).await?.map(|entry| entry.revision))
+}
+
+async fn wait_for_revision_beyond(
+    client: &async_nats::Client,
+    key: &str,
+    previous: u64,
+) -> Result<u64> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(revision) = registration_revision(client, key).await? {
+            if revision > previous {
+                return Ok(revision);
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for registration revision to advance past {previous}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn connect_test_client(url: &str) -> Result<async_nats::Client> {
+    async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(url)
+        .await
+        .context("connect test NATS client")
+}
+
+/// A rolling deploy publishes the replacement's registration under the same
+/// `{scope}.{server}` key before the old instance finishes shutting down
+/// (new pod ready before old pod terminates is Kubernetes' normal sequence).
+/// The old instance's shutdown must delete only its own registration, never
+/// the replacement's.
+#[tokio::test(flavor = "multi_thread")]
+async fn old_instances_shutdown_does_not_delete_a_replacements_registration() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let instance_id = ServerScope::new();
+    let key = hook_registration_key(&instance_id, "echo");
+    let client = connect_test_client(&server.url).await?;
+
+    let old_shutdown = CancellationToken::new();
+    let old_connection = NatsConnection {
+        client: connect_test_client(&server.url).await?,
+        replicas: 1,
+    };
+    let old_task = {
+        let instance_id = instance_id.clone();
+        let shutdown = old_shutdown.clone();
+        tokio::spawn(async move {
+            serve_with_shutdown(Arc::new(EchoHook), instance_id, old_connection, shutdown).await
+        })
+    };
+    let old_revision = wait_for_revision_beyond(&client, &key, 0).await?;
+
+    // Start the replacement under the SAME scope while the old instance is
+    // still running, publishing over the same key with a newer revision.
+    let new_shutdown = CancellationToken::new();
+    let new_connection = NatsConnection {
+        client: connect_test_client(&server.url).await?,
+        replicas: 1,
+    };
+    let new_task = {
+        let instance_id = instance_id.clone();
+        let shutdown = new_shutdown.clone();
+        tokio::spawn(async move {
+            serve_with_shutdown(Arc::new(EchoHook), instance_id, new_connection, shutdown).await
+        })
+    };
+    let new_revision = wait_for_revision_beyond(&client, &key, old_revision).await?;
+    assert!(new_revision > old_revision);
+
+    // Now tell the OLD instance to shut down. Its unconditional delete used
+    // to remove whatever is currently at `key` -- the replacement's entry.
+    old_shutdown.cancel();
+    old_task
+        .await
+        .context("join old instance task")?
+        .context("old instance exited with an error")?;
+
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let store = jetstream.get_key_value(HOOK_REGISTRY_BUCKET).await?;
+    assert!(
+        store.get(&key).await?.is_some(),
+        "old instance's shutdown deleted the replacement's registration"
+    );
+    let revision_after_old_shutdown = registration_revision(&client, &key)
+        .await?
+        .expect("registration entry should still exist");
+    assert_eq!(
+        revision_after_old_shutdown, new_revision,
+        "the surviving registration must be the replacement's, not a re-published old one"
+    );
+
+    // The replacement's own shutdown should still delete its own, current
+    // registration -- the conditional delete must not become a no-op.
+    new_shutdown.cancel();
+    new_task
+        .await
+        .context("join replacement task")?
+        .context("replacement exited with an error")?;
+    assert!(
+        store.get(&key).await?.is_none(),
+        "the replacement's own shutdown must delete its own current registration"
+    );
+
     drop(server);
     Ok(())
 }

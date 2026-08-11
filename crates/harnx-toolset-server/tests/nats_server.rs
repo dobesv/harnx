@@ -462,6 +462,105 @@ async fn registers_invokes_caches_and_cancels() -> Result<()> {
     assert_cancellation(&harness).await
 }
 
+async fn registration_revision(client: &async_nats::Client, key: &str) -> Result<Option<u64>> {
+    let jetstream = async_nats::jetstream::new(client.clone());
+    // The bucket may not exist yet if no tool server has published to this
+    // scope. That is "no revision yet", not a failure worth propagating here.
+    let Ok(store) = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await else {
+        return Ok(None);
+    };
+    Ok(store.entry(key).await?.map(|entry| entry.revision))
+}
+
+async fn wait_for_revision_beyond(
+    client: &async_nats::Client,
+    key: &str,
+    previous: u64,
+) -> Result<u64> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(revision) = registration_revision(client, key).await? {
+            if revision > previous {
+                return Ok(revision);
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for registration revision to advance past {previous}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A rolling deploy publishes the replacement's registration under the same
+/// `{scope}.{identity_token}` key before the old instance finishes shutting
+/// down (new pod ready before old pod terminates is Kubernetes' normal
+/// sequence). The old instance's shutdown must delete only its own
+/// registration, never the replacement's.
+#[tokio::test(flavor = "multi_thread")]
+async fn old_instances_shutdown_does_not_delete_a_replacements_registration() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(mut harness) = TestHarness::start().await? else {
+        return Ok(());
+    };
+    let key = registration_key(&harness.instance_id, "____test");
+    let old_revision = wait_for_revision_beyond(&harness.client, &key, 0).await?;
+
+    let new_shutdown = CancellationToken::new();
+    let new_client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(&harness._server.url)
+        .await?;
+    let new_task = {
+        let instance_id = harness.instance_id.clone();
+        let shutdown = new_shutdown.clone();
+        tokio::spawn(async move {
+            serve_with_shutdown(
+                Arc::new(TestToolset::default()),
+                instance_id,
+                NatsConnection {
+                    client: new_client,
+                    replicas: 1,
+                },
+                shutdown,
+            )
+            .await
+        })
+    };
+    let new_revision = wait_for_revision_beyond(&harness.client, &key, old_revision).await?;
+    assert!(new_revision > old_revision);
+
+    // Shut down the OLD instance. Its unconditional delete used to remove
+    // whatever is currently at `key` -- the replacement's entry.
+    harness.shutdown().await;
+
+    let jetstream = async_nats::jetstream::new(harness.client.clone());
+    let store = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await?;
+    assert!(
+        store.get(&key).await?.is_some(),
+        "old instance's shutdown deleted the replacement's registration"
+    );
+    let revision_after_old_shutdown = registration_revision(&harness.client, &key)
+        .await?
+        .expect("registration entry should still exist");
+    assert_eq!(
+        revision_after_old_shutdown, new_revision,
+        "the surviving registration must be the replacement's, not a re-published old one"
+    );
+
+    // The replacement's own shutdown should still delete its own, current
+    // registration -- the conditional delete must not become a no-op.
+    new_shutdown.cancel();
+    new_task
+        .await
+        .context("join replacement task")?
+        .context("replacement exited with an error")?;
+    assert!(
+        store.get(&key).await?.is_none(),
+        "the replacement's own shutdown must delete its own current registration"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn graceful_shutdown_removes_the_registration() -> Result<()> {
     harnx_core::require_nextest();

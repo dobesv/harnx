@@ -76,6 +76,11 @@ struct RegistrationRefresh<'a> {
     instance_id: &'a ServerScope,
     registration: &'a Registration,
     interval: &'a mut tokio::time::Interval,
+    /// The revision of our own last-published registration, so shutdown can
+    /// delete it conditionally instead of unconditionally (see the delete
+    /// call in `serve_with_shutdown`). Updated after every successful
+    /// refresh publish, not just the initial one.
+    revision: &'a mut u64,
 }
 
 /// The subscriptions `serve_requests` polls, plus the signal that ends the
@@ -181,7 +186,7 @@ pub async fn serve_with_shutdown(
     };
     let jetstream = jetstream::new(client.clone());
     let registry = ensure_registry_bucket(&jetstream, replicas).await?;
-    publish_registration(&registry, &instance_id, &registration).await?;
+    let mut revision = publish_registration(&registry, &instance_id, &registration).await?;
 
     let request_context = ToolRequestContext {
         client: client.clone(),
@@ -205,16 +210,37 @@ pub async fn serve_with_shutdown(
             instance_id: &instance_id,
             registration: &registration,
             interval: &mut refresh,
+            revision: &mut revision,
         },
     )
     .await;
 
     // Best-effort: the TTL is the backstop when this cannot run.
     let key = registration_key(&instance_id, &identity_token);
-    if let Err(error) = registry.delete(&key).await {
-        log::warn!("could not remove tool registration '{key}' on shutdown: {error}");
-    }
+    delete_own_registration(&registry, &key, revision).await;
     outcome
+}
+
+/// Delete `key` on shutdown, but only if `revision` (our own last-published
+/// one) is still current. On a rolling deploy, a replacement instance
+/// publishes under this same key before this one finishes shutting down
+/// (new pod ready before old pod terminates is Kubernetes' normal sequence);
+/// an unconditional delete here would remove the replacement's registration
+/// instead of this one's. `delete_expect_revision` fails harmlessly in that
+/// case, so it's not treated as an error worth warning about.
+async fn delete_own_registration(registry: &kv::Store, key: &str, revision: u64) {
+    match registry.delete_expect_revision(key, Some(revision)).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == kv::DeleteErrorKind::WrongLastRevision => {
+            log::debug!(
+                "tool registration '{key}' was already replaced by a newer instance; \
+                 not deleting it"
+            );
+        }
+        Err(error) => {
+            log::warn!("could not remove tool registration '{key}' on shutdown: {error}");
+        }
+    }
 }
 
 async fn serve_requests(
@@ -237,10 +263,11 @@ async fn serve_requests(
                 handle_control(control, &request_context.in_flight).await;
             }
             _ = refresh.interval.tick() => {
-                if let Err(error) =
-                    publish_registration(refresh.registry, refresh.instance_id, refresh.registration).await
-                {
-                    log::warn!("refresh tool registration failed; retrying next interval: {error:#}");
+                match publish_registration(refresh.registry, refresh.instance_id, refresh.registration).await {
+                    Ok(new_revision) => *refresh.revision = new_revision,
+                    Err(error) => {
+                        log::warn!("refresh tool registration failed; retrying next interval: {error:#}");
+                    }
                 }
             }
             _ = subscriptions.shutdown.cancelled() => {
