@@ -1,10 +1,12 @@
 //! Server-side adapters for hosting a [`harnx_toolset::Toolset`].
 
 pub mod content;
+mod drain;
 pub mod schema;
 
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv};
+use drain::InFlightRequests;
 use futures_util::StreamExt;
 use harnx_core::instance::ServerScope;
 use harnx_nats_common::connect::NatsConnection;
@@ -61,6 +63,9 @@ struct ToolRequestContext {
     toolset: Arc<dyn Toolset>,
     in_flight: InFlight,
     reply_cache: ReplyCache,
+    /// Tracks tool requests currently being processed, so shutdown can
+    /// drain them before deregistering (see the `drain` module).
+    active_requests: InFlightRequests,
 }
 
 struct ValidatedToolRequest {
@@ -188,11 +193,13 @@ pub async fn serve_with_shutdown(
     let registry = ensure_registry_bucket(&jetstream, replicas).await?;
     let mut revision = publish_registration(&registry, &instance_id, &registration).await?;
 
+    let (active_requests, active_requests_rx) = InFlightRequests::new();
     let request_context = ToolRequestContext {
         client: client.clone(),
         toolset,
         in_flight: Arc::new(Mutex::new(HashMap::new())),
         reply_cache: Arc::new(Mutex::new(HashMap::new())),
+        active_requests,
     };
     let mut refresh = tokio::time::interval(REGISTRATION_REFRESH_INTERVAL);
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -214,6 +221,12 @@ pub async fn serve_with_shutdown(
         },
     )
     .await;
+
+    // Give callers already waiting on a reply a chance to get one instead of
+    // blocking on their own 60s timeout: wait for in-flight requests to
+    // finish before deregistering, bounded so a stuck invocation can't stall
+    // shutdown forever.
+    drain::drain(active_requests_rx).await;
 
     // Best-effort: the TTL is the backstop when this cannot run.
     let key = registration_key(&instance_id, &identity_token);
@@ -278,7 +291,9 @@ async fn serve_requests(
 }
 
 fn spawn_tool_request(context: ToolRequestContext, message: async_nats::Message) {
+    let in_flight = context.active_requests.enter();
     tokio::spawn(async move {
+        let _in_flight = in_flight;
         if let Err(error) = process_tool_request(&context, message).await {
             log::warn!("harnx tool request failed: {error:#}");
         }

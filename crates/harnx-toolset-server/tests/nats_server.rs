@@ -1,282 +1,23 @@
+mod common;
+
 use anyhow::{Context, Result};
-use async_trait::async_trait;
-use harnx_core::instance::ServerScope;
+use common::{request_headers, wait_for_registration, TestHarness, TestToolset, TOKEN};
 use harnx_nats_common::connect::NatsConnection;
-use harnx_toolset::{
-    ControlKind, ControlMessage, Registration, ToolInvokeError, ToolReply, ToolRequest, ToolSpec,
-    Toolset, HDR_CALL_ID, HDR_IDEMPOTENCY_KEY,
-};
-use harnx_toolset_server::{
-    registration_key, serve_with_shutdown, TOOL_REGISTRY_BUCKET, TOOL_SCHEMA_VERSION,
-};
-use serde_json::{json, Value};
-use std::net::TcpListener;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use harnx_toolset::{ControlKind, ControlMessage, ToolReply, ToolRequest};
+use harnx_toolset_server::{registration_key, serve_with_shutdown, TOOL_REGISTRY_BUCKET};
+use serde_json::json;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tempfile::TempDir;
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-
-const TOKEN: &str = "toolset-test-token";
-
-struct NatsServerHandle {
-    url: String,
-    _store_dir: TempDir,
-    child: Child,
-}
-
-impl Drop for NatsServerHandle {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
-    let Some(binary) = nats_server_binary() else {
-        eprintln!("skipping NATS integration test: nats-server binary not found");
-        return Ok(None);
-    };
-
-    const MAX_START_ATTEMPTS: usize = 5;
-    for attempt in 1..=MAX_START_ATTEMPTS {
-        let listener = TcpListener::bind("127.0.0.1:0").context("allocate NATS test port")?;
-        let port = listener.local_addr()?.port();
-        drop(listener);
-        let store_dir = tempfile::tempdir().context("create NATS test store")?;
-        let mut child = Command::new(&binary)
-            .arg("-js")
-            .arg("-sd")
-            .arg(store_dir.path())
-            .arg("-p")
-            .arg(port.to_string())
-            .arg("--auth")
-            .arg(TOKEN)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("spawn nats-server")?;
-        let url = format!("nats://127.0.0.1:{port}");
-
-        match wait_for_nats_ready(&mut child, &url).await {
-            Ok(()) => {
-                return Ok(Some(NatsServerHandle {
-                    url,
-                    _store_dir: store_dir,
-                    child,
-                }));
-            }
-            Err(error) => {
-                let exited_during_startup = child.try_wait()?.is_some();
-                let _ = child.kill();
-                let _ = child.wait();
-                if exited_during_startup && attempt < MAX_START_ATTEMPTS {
-                    eprintln!(
-                        "nats-server exited during startup attempt {attempt}; retrying with a new port: {error:#}"
-                    );
-                    continue;
-                }
-                return Err(error).context(format!(
-                    "start nats-server after {attempt} attempt{}",
-                    if attempt == 1 { "" } else { "s" }
-                ));
-            }
-        }
-    }
-
-    unreachable!("NATS startup loop always returns")
-}
-
-async fn wait_for_nats_ready(child: &mut Child, url: &str) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let result = async_nats::ConnectOptions::new()
-            .token(TOKEN.to_string())
-            .connect(url)
-            .await;
-        match result {
-            Ok(client) => return client.flush().await.context("flush NATS test client"),
-            Err(error) if child.try_wait()?.is_some() => {
-                anyhow::bail!("nats-server exited during startup: {error}");
-            }
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(error) => return Err(error).context("wait for nats-server readiness"),
-        }
-    }
-}
-
-fn nats_server_binary() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("NATS_SERVER_BIN") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    which::which("nats-server").ok()
-}
-
-#[derive(Clone, Default)]
-struct TestToolset {
-    echo_invocations: Arc<AtomicUsize>,
-    slow_started: Arc<Notify>,
-}
-
-#[async_trait]
-impl Toolset for TestToolset {
-    fn name(&self) -> &str {
-        "test"
-    }
-
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![ToolSpec {
-            name: "echo".to_string(),
-            description: "echo input".to_string(),
-            input_schema: json!({ "type": "object" }),
-            idempotent_hint: false,
-            read_only_hint: false,
-            timeout_secs: None,
-            meta: None,
-        }]
-    }
-
-    async fn invoke(
-        &self,
-        tool: &str,
-        args: Value,
-        cancel: CancellationToken,
-    ) -> Result<Value, ToolInvokeError> {
-        match tool {
-            "echo" => {
-                self.echo_invocations.fetch_add(1, Ordering::SeqCst);
-                if let Some(delay_ms) = args.get("delay_ms").and_then(Value::as_u64) {
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                }
-                Ok(args)
-            }
-            "slow" => {
-                self.slow_started.notify_one();
-                cancel.cancelled().await;
-                Err(ToolInvokeError::Fatal("cancelled".to_string()))
-            }
-            _ => Err(ToolInvokeError::Recoverable("unknown tool".to_string())),
-        }
-    }
-}
-
-fn request_headers(call_id: &str, idempotency_key: &str) -> async_nats::HeaderMap {
-    let mut headers = async_nats::HeaderMap::new();
-    headers.insert(HDR_CALL_ID, call_id);
-    headers.insert(HDR_IDEMPOTENCY_KEY, idempotency_key);
-    headers
-}
-
-async fn wait_for_registration(
-    client: &async_nats::Client,
-    instance_id: &ServerScope,
-) -> Result<Registration> {
-    let jetstream = async_nats::jetstream::new(client.clone());
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(store) = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await {
-            let key = registration_key(instance_id, "____test");
-            if let Some(value) = store.get(&key).await? {
-                return serde_json::from_slice(&value).context("decode registration");
-            }
-        }
-        if Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for tool registration");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-struct TestHarness {
-    _server: NatsServerHandle,
-    // `Option` so `shutdown()` can take this out without consuming the whole
-    // harness — dropping `_server` would kill nats-server out from under the
-    // rest of the test, which still needs it to inspect KV state afterward.
-    server_task: Option<tokio::task::JoinHandle<Result<()>>>,
-    shutdown: CancellationToken,
-    client: async_nats::Client,
-    instance_id: ServerScope,
-    toolset: TestToolset,
-}
-
-impl TestHarness {
-    async fn start() -> Result<Option<Self>> {
-        let Some(server) = spawn_nats_server().await? else {
-            return Ok(None);
-        };
-        let instance_id = ServerScope::new();
-        let toolset = TestToolset::default();
-        let shutdown = CancellationToken::new();
-        let server_client = async_nats::ConnectOptions::new()
-            .token(TOKEN.to_string())
-            .connect(&server.url)
-            .await?;
-        let server_toolset = toolset.clone();
-        let server_instance_id = instance_id.clone();
-        let server_shutdown = shutdown.clone();
-        let server_task = tokio::spawn(async move {
-            serve_with_shutdown(
-                Arc::new(server_toolset),
-                server_instance_id,
-                NatsConnection {
-                    client: server_client,
-                    replicas: 1,
-                },
-                server_shutdown,
-            )
-            .await
-        });
-        let client = async_nats::ConnectOptions::new()
-            .token(TOKEN.to_string())
-            .connect(&server.url)
-            .await?;
-        Ok(Some(Self {
-            _server: server,
-            server_task: Some(server_task),
-            shutdown,
-            client,
-            instance_id,
-            toolset,
-        }))
-    }
-
-    fn echo_subject(&self) -> String {
-        self.instance_id.tool_subject("____test", "echo")
-    }
-
-    /// Trigger a graceful shutdown and wait for `serve_with_shutdown` to
-    /// unwind and run its exit cleanup (deleting the KV registration), while
-    /// leaving the rest of the harness (including the still-running
-    /// nats-server) intact so the test can keep inspecting KV state
-    /// afterward.
-    async fn shutdown(&mut self) {
-        self.shutdown.cancel();
-        if let Some(server_task) = self.server_task.take() {
-            let _ = server_task.await;
-        }
-    }
-}
-
-impl Drop for TestHarness {
-    fn drop(&mut self) {
-        if let Some(server_task) = self.server_task.take() {
-            server_task.abort();
-        }
-    }
-}
 
 async fn assert_registration(harness: &TestHarness) -> Result<()> {
     let registration = wait_for_registration(&harness.client, &harness.instance_id).await?;
     assert_eq!(registration.server, "test");
-    assert_eq!(registration.schema_version, TOOL_SCHEMA_VERSION);
+    assert_eq!(
+        registration.schema_version,
+        harnx_toolset_server::TOOL_SCHEMA_VERSION
+    );
     Ok(())
 }
 
@@ -401,7 +142,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
         parent_session_id: None,
     };
     let mut headers = async_nats::HeaderMap::new();
-    headers.insert(HDR_CALL_ID, missing_key.call_id.as_str());
+    headers.insert(harnx_toolset::HDR_CALL_ID, missing_key.call_id.as_str());
     request_early_failure(
         harness,
         headers,
@@ -580,6 +321,92 @@ async fn graceful_shutdown_removes_the_registration() -> Result<()> {
         registry.get(&key).await?.is_none(),
         "registration should be gone immediately after a graceful shutdown, \
          not left to expire"
+    );
+    Ok(())
+}
+
+/// Shutdown must drain in-flight requests before deregistering, so a caller
+/// already waiting on a reply gets one instead of blocking on its own 60s
+/// timeout.
+///
+/// Uses `echo` with `delay_ms` rather than `slow` + a cancel control message:
+/// once `serve_requests` returns (because shutdown was cancelled), the main
+/// loop stops polling the `controls` subscription, so a control message sent
+/// after that point would never be picked up. `delay_ms` needs nothing from
+/// the main loop -- the delay runs inside the already-spawned request task.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_drains_in_flight_requests_before_deregistering() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(mut harness) = TestHarness::start().await? else {
+        return Ok(());
+    };
+    assert_registration(&harness).await?;
+
+    let request = ToolRequest {
+        call_id: "call-drain".to_string(),
+        tool: "echo".to_string(),
+        args: json!({"delay_ms": 500}),
+        parent_session_id: None,
+    };
+    let delayed_request = harness.client.request_with_headers(
+        harness.instance_id.tool_subject("____test", "echo"),
+        request_headers(&request.call_id, "logical-drain"),
+        serde_json::to_vec(&request)?.into(),
+    );
+    tokio::pin!(delayed_request);
+
+    // Wait for the handler to have started (and thus be counted as
+    // in-flight) without waiting for its delay to elapse.
+    let started_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if harness.toolset.echo_invocations.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        if Instant::now() >= started_deadline {
+            anyhow::bail!("timed out waiting for the delayed echo request to start");
+        }
+        tokio::select! {
+            result = &mut delayed_request => {
+                anyhow::bail!("delayed request completed before it should have: {result:?}")
+            }
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+
+    // The request is now in flight, sleeping out its delay. Trigger shutdown
+    // and confirm it does NOT deregister while the request is still running.
+    harness.shutdown.cancel();
+    let server_task = harness
+        .server_task
+        .take()
+        .expect("server task should still be present");
+    assert!(
+        !server_task.is_finished(),
+        "shutdown must wait for the in-flight request, not deregister immediately"
+    );
+
+    let jetstream = async_nats::jetstream::new(harness.client.clone());
+    let registry = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await?;
+    let key = registration_key(&harness.instance_id, "____test");
+    assert!(
+        registry.get(&key).await?.is_some(),
+        "registration must still be present while the request is in flight"
+    );
+
+    // The caller waiting on the delayed request must still get a reply.
+    let message = tokio::time::timeout(Duration::from_secs(2), &mut delayed_request).await??;
+    let reply: ToolReply = serde_json::from_slice(&message.payload)?;
+    assert!(reply.result.is_ok(), "got: {reply:?}");
+
+    // Now that the in-flight request finished, shutdown should proceed
+    // promptly rather than waiting out the full drain deadline.
+    tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .context("shutdown did not complete promptly after the in-flight request finished")?
+        .context("join server task")??;
+    assert!(
+        registry.get(&key).await?.is_none(),
+        "registration should be gone once the in-flight request finished and shutdown completed"
     );
     Ok(())
 }
