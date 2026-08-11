@@ -134,8 +134,19 @@ impl NatsEndpoint {
     }
 
     /// Connect using the options from [`Self::connect_options`].
+    ///
+    /// `connect_options()` itself stays synchronous (see its doc comment and
+    /// `connect_options.rs`'s tests, which call it directly), so a
+    /// `tls_ca`-configured endpoint's CA-file read runs here instead, inside
+    /// `spawn_blocking`. `NatsEndpoint` is a handful of cheap `String`/
+    /// `Option<String>` fields, so cloning it to satisfy `spawn_blocking`'s
+    /// `'static` bound doesn't cost anything worth avoiding.
     pub async fn connect(&self) -> Result<async_nats::Client> {
-        self.connect_options()?
+        let endpoint = self.clone();
+        let options = tokio::task::spawn_blocking(move || endpoint.connect_options())
+            .await
+            .context("connect_options task panicked")??;
+        options
             .connect(&self.url)
             .await
             .with_context(|| format!("connect to NATS at {}", self.url))

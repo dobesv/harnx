@@ -113,6 +113,23 @@ fn connect_options_succeeds_with_a_custom_tls_ca() {
     );
 }
 
+/// `connect()` moves the `tls_ca` file read into `spawn_blocking` so it
+/// doesn't block a Tokio runtime worker thread; this checks that a missing
+/// CA path still surfaces as an error naming the path, not a panic or a
+/// silent success, once routed through that blocking task.
+#[tokio::test]
+async fn connect_rejects_a_missing_tls_ca_without_blocking_the_runtime() {
+    harnx_core::require_nextest();
+    let mut ep = endpoint();
+    ep.url = "tls://127.0.0.1:0".into();
+    ep.tls_ca = Some("/definitely/missing-ca.pem".into());
+
+    let error = ep.connect().await.expect_err("missing tls_ca must error");
+    let message = error.to_string();
+    assert!(message.contains("missing-ca.pem"), "got: {message}");
+    assert!(message.contains("does not exist"), "got: {message}");
+}
+
 #[test]
 fn from_env_rejects_an_unparseable_replicas_value() {
     harnx_core::require_nextest();
