@@ -1793,14 +1793,14 @@ fn injection_decision_points_use_leader_authoritative_read() {
             .filter(|line| line.contains("load_events_latest_async()"))
             .count(),
         3,
-        "daemon.rs's turn-decision logic must use load_events_latest_async at exact 3 decision points"
+        "the daemon family's turn-decision logic must use load_events_latest_async at exactly 3 decision points"
     );
     assert_eq!(
         daemon_family
             .matches("load_events_consistent_async")
             .count(),
         0,
-        "daemon.rs's turn-decision logic must not use load_events_consistent_async at #917 decision points"
+        "the daemon family's turn-decision logic must not use load_events_consistent_async"
     );
 }
 
