@@ -770,16 +770,38 @@ def provider_diff_sections(
     return [(heading, lines) for heading, lines in candidates if lines]
 
 
+def ordered_providers(
+    new_provider_models: dict[str, dict[str, dict[str, Any]]],
+    old_by_provider: dict[str, dict[str, dict[str, Any]]],
+) -> list[str]:
+    """Providers to emit, in `PROVIDER_ORDER` first then alphabetical.
+
+    Includes providers already in the YAML, not just `PROVIDER_ORDER` and
+    whatever LiteLLM returned: a hand-added provider block in neither list was
+    never visited, so every one of its models was dropped on the floor.
+    """
+    return PROVIDER_ORDER + sorted(
+        provider
+        for provider in {*new_provider_models, *old_by_provider}
+        if provider not in PROVIDER_ORDER
+    )
+
+
 def build_diff_summary(
     old_by_provider: dict[str, dict[str, dict[str, Any]]],
     new_by_provider: OrderedDict[str, list[dict[str, Any]]],
 ) -> str:
     lines = ["Model catalog diff summary", ""]
     any_changes = False
-    for provider, new_models_list in new_by_provider.items():
+    # Old-only providers last: a provider the generated catalog drops entirely
+    # still has to be reported, or losing a whole block reads as "no changes".
+    providers = list(new_by_provider) + [
+        provider for provider in old_by_provider if provider not in new_by_provider
+    ]
+    for provider in providers:
         sections = provider_diff_sections(
             old_by_provider.get(provider, {}),
-            {model["name"]: model for model in new_models_list},
+            {model["name"]: model for model in new_by_provider.get(provider, [])},
         )
         if not sections:
             continue
@@ -828,9 +850,7 @@ def main() -> int:
         new_provider_models[provider][model_name] = model
 
     final_provider_models: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
-    provider_order = PROVIDER_ORDER + sorted(
-        provider for provider in new_provider_models.keys() if provider not in PROVIDER_ORDER
-    )
+    provider_order = ordered_providers(new_provider_models, old_by_provider)
 
     for provider in provider_order:
         old_models = old_by_provider.get(provider, {})

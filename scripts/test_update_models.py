@@ -210,7 +210,11 @@ class TestAdaptiveEffortVariants(unittest.TestCase):
                 if provider == "bedrock"
                 else "claude-opus-4-8"
             )
-            patches += [v["patches"][0] for v in um.thinking_variants(base, provider)]
+            patches += [
+                patch
+                for variant in um.thinking_variants(base, provider)
+                for patch in variant["patches"]
+            ]
         for patch in patches:
             for assignment in patch.split("|"):
                 lhs = assignment.split("=")[0].strip()
@@ -566,6 +570,32 @@ class TestBuildDiffSummary(unittest.TestCase):
         summary = self._summary([".body.a = 1"], [".body.a = 1"])
         self.assertIn("No model additions", summary)
         self.assertNotIn("- request patch changes:", summary)
+
+    def test_provider_missing_from_new_catalog_is_reported_as_removed(self) -> None:
+        # Dropping a whole provider block must not read as "no changes".
+        old = {"someprovider": {"m": {"name": "m"}}}
+        summary = um.build_diff_summary(old, OrderedDict())
+        self.assertIn("someprovider:", summary)
+        self.assertIn("removed", summary)
+        self.assertNotIn("No model additions", summary)
+
+
+class TestOrderedProviders(unittest.TestCase):
+    """A provider already in models.yaml but in neither PROVIDER_ORDER nor the
+    LiteLLM response used to be skipped entirely, silently deleting its models."""
+
+    def test_provider_only_in_existing_yaml_is_included(self) -> None:
+        order = um.ordered_providers({}, {"handrolled": {"m": {"name": "m"}}})
+        self.assertIn("handrolled", order)
+
+    def test_provider_only_from_litellm_is_included(self) -> None:
+        order = um.ordered_providers({"fresh": {"m": {"name": "m"}}}, {})
+        self.assertIn("fresh", order)
+
+    def test_known_providers_keep_their_order_and_appear_once(self) -> None:
+        order = um.ordered_providers({"claude": {}}, {"openai": {}})
+        self.assertEqual(order[: len(um.PROVIDER_ORDER)], um.PROVIDER_ORDER)
+        self.assertEqual(len(order), len(set(order)))
 
 
 if __name__ == "__main__":
