@@ -23,12 +23,47 @@ For development, a single NATS server with JetStream is sufficient:
 nats-server -js
 ```
 
-For production HA, run a NATS cluster with at least 3 nodes and set `replicas: 3` for JetStream assets.
+For production HA, run a NATS cluster with at least 3 nodes and set `replicas: 3`
+in the cluster's `nats_servers/<cluster_key>.yaml` (see the production example
+below) so the buckets harnx creates survive losing a node.
 
 ### JetStream Resources
 Harnx automatically manages the following JetStream resources:
-- **KV Bucket**: `harnx_leases` (Stores session leases with TTL).
+- **KV Bucket**: `harnx_leases` — session leases with a tombstone marker
+  after release (not a bucket-wide TTL). This is the split-brain guard:
+  every durable write is fenced on the lease's KV revision, and a worker
+  that loses its lease aborts. If this bucket can't survive a node loss,
+  neither can a session mid-turn on that node.
+- **KV Bucket**: `harnx_sessions` — the session enumeration index. No expiry.
+- **KV Bucket**: `harnx_tool_registry` — tool server discovery, with a
+  per-registration TTL.
+- **KV Buckets**: `harnx_hook_registry` and `harnx_hook_expectations` — hook
+  server discovery and its fail-closed fallback routes. Only the copies
+  opened by the standalone `harnx-hookset-server` binary carry a TTL; the
+  worker daemon's own copy of the same buckets does not set one.
 - **Streams**: `SESSION_<id>` (Subject: `sessions.{id}.log`) stores the durable append-only session history.
+
+All of the KV buckets above are created with the `replicas` count from the
+cluster's config (`None` means 1, no HA). Set it to 3 to match a 3-node
+cluster; a mismatch between the two is what leaves a bucket unable to
+tolerate a node loss.
+
+**A bucket that has never existed before is created, not reconciled**, so
+`replicas` above what the cluster can actually provide (e.g. a production
+`replicas: 3` config pointed at a single-node dev server, before any of
+these buckets exist) makes creation fail outright, and harnx will not start
+against that cluster. This is intentional: failing loudly on a
+misconfiguration is better than silently running at `replicas: 1` while an
+operator believes they have HA. It only affects buckets that don't exist
+yet — a bucket created earlier at a lower `replicas` and later pointed at a
+higher one gets raised in place instead.
+
+**Reconcile only ever raises `replicas`, never lowers it.** Some callers
+(the hourly remote-session GC lease, for one) don't necessarily know the
+cluster's actual configured value at the point they touch a bucket; if
+reconcile lowered on request, one of those callers could silently downgrade
+an already-correctly-replicated bucket's fault tolerance. Genuinely scaling
+a bucket down requires recreating it.
 
 ## Configuration
 
@@ -45,6 +80,7 @@ url: "nats://localhost:4222"
 ```yaml
 url: "nats://nats.example.com:4222"
 token: "${NATS_TOKEN}"
+replicas: 3   # JetStream replica count for buckets harnx creates; defaults to 1
 tls: true
 tls_cert: "/etc/harnx/client-cert.pem"
 tls_key: "/etc/harnx/client-key.pem"
@@ -63,13 +99,63 @@ harnx-worker --cluster local --worker-id worker-1
 
 - `--cluster`: The key from `nats_servers/`.
 - `--worker-id`: (Optional but recommended) A stable identity for the worker.
+- `--manage-servers`: Launch this worker's own tool and hook servers as child
+  processes. Without it, the worker discovers independently deployed servers
+  under `HARNX_SERVER_SCOPE` instead — see
+  [Independently Deployed Tool and Hook Servers](#independently-deployed-tool-and-hook-servers)
+  below.
 
 For the default local cluster you don't run this yourself: `harnx` and
-`harnx-serve` spawn `harnx-worker` themselves. They look for it at
-`HARNX_WORKER_BIN` first, then next to the running front-end, then on `PATH` —
-so normally the worker just has to be installed alongside the front-end.
+`harnx-serve` spawn `harnx-worker` themselves, always with `--manage-servers`.
+They look for it at `HARNX_WORKER_BIN` first, then next to the running
+front-end, then on `PATH` — so normally the worker just has to be installed
+alongside the front-end.
 
 You can run multiple workers for redundancy. If the active worker for a session dies, another worker will acquire the lease and resume execution.
+
+### Independently Deployed Tool and Hook Servers
+
+By default a worker launches its own tool and hook servers as child processes
+and assigns them a scope. To run them as their own containers instead, give
+every process the same `HARNX_SERVER_SCOPE` and leave `--manage-servers` off:
+
+```bash
+# Tool server container
+HARNX_NATS_URL=nats://nats:4222 HARNX_NATS_TOKEN=… \
+  HARNX_SERVER_SCOPE=shared harnx-time-server
+
+# Worker container
+HARNX_NATS_URL=nats://nats:4222 HARNX_NATS_TOKEN=… \
+  HARNX_SERVER_SCOPE=shared harnx-worker --cluster prod
+```
+
+**`--cluster prod` alone is not enough for the worker container.** `--cluster`
+only tells the worker which `nats_servers/<cluster>.yaml` to use for the
+*session* connection (leases, session log, control plane). Discovering tool
+and hook servers is a separate connection that never reads that file — it
+always resolves from `HARNX_NATS_URL`/`HARNX_NATS_TOKEN` (and, on a TLS or
+mTLS cluster, `HARNX_NATS_TLS`, `HARNX_NATS_TLS_CERT`, `HARNX_NATS_TLS_KEY`,
+`HARNX_NATS_TLS_CA`) in the worker's own environment. A worker pod must carry
+these env vars *in addition to* `--cluster`, even when `prod.yaml` already
+has the same URL and TLS settings — otherwise the worker connects fine for
+sessions but can't discover any tool or hook server, or (on a TLS cluster)
+can't discover them at all because that connection falls back to plaintext.
+
+Both sides must carry the same scope value. A mismatch is not an error — the
+worker finds no servers and logs that it searched an empty scope.
+
+Servers deployed this way must not depend on the worker's filesystem: each
+container has its own. `harnx-fs-tools` and `harnx-bash-tools` are therefore
+not suitable for this mode.
+
+A shared scope is reachable by every worker holding cluster credentials. The
+instance header on each request records which worker called, but is not
+checked by the server, so NATS account permissions are the enforcement
+boundary.
+
+Each worker also serves its own sub-agent toolset in-process. When several
+workers share a scope they all register that toolset under the same key and
+join one queue group, so any worker may serve any sub-agent request.
 
 ## Using Remote Agents
 
@@ -164,3 +250,9 @@ Harnx tracks internal counters (exported to logs and future metrics endpoints):
 
 ## TLS Support Note
 Harnx supports TLS and mTLS for NATS connections. While token authentication and config-based TLS have been verified, automated PKI-backed integration tests for live TLS handshakes are ongoing.
+
+Config-based TLS (`tls`/`tls_cert`/`tls_key`/`tls_ca` in `nats_servers/<cluster>.yaml`)
+covers the client and worker session connection. It does **not** cover tool/hook
+discovery — see
+[Independently Deployed Tool and Hook Servers](#independently-deployed-tool-and-hook-servers)
+for the separate `HARNX_NATS_TLS*` env vars that connection needs.

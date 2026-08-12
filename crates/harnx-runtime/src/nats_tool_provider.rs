@@ -4,7 +4,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
-use harnx_core::instance::InstanceId;
+use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_core::tool::{JsonSchema, ToolDeclaration, ToolError, ToolProvider};
 use harnx_toolset::{
     ControlKind, ControlMessage, Registration, ToolErrorPayload, ToolReply, ToolRequest, ToolSpec,
@@ -42,7 +42,7 @@ enum InFlightFailure {
 }
 
 type InFlightMap = Mutex<HashMap<String, InFlightCall>>;
-static INSTANCE_IN_FLIGHT: OnceLock<std::sync::Mutex<HashMap<InstanceId, Weak<InFlightMap>>>> =
+static INSTANCE_IN_FLIGHT: OnceLock<std::sync::Mutex<HashMap<ServerScope, Weak<InFlightMap>>>> =
     OnceLock::new();
 
 /// Shared handle used by tool-process supervision to fail active NATS calls.
@@ -58,7 +58,7 @@ struct InFlightCall {
 
 impl NatsInFlightCalls {
     /// Return the process-wide handle shared by provider and supervisor for an instance.
-    pub fn for_instance(instance_id: &InstanceId) -> Self {
+    pub fn for_instance(instance_id: &ServerScope) -> Self {
         let registry = INSTANCE_IN_FLIGHT.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
         let mut registry = registry
             .lock()
@@ -113,7 +113,7 @@ impl NatsInFlightCalls {
 /// Core-NATS tool provider built from one turn's KV registration snapshot.
 pub struct NatsToolProvider {
     client: async_nats::Client,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     parent_session_id: Option<String>,
     tools: HashMap<String, RegisteredTool>,
     registrations: Vec<Registration>,
@@ -128,7 +128,7 @@ impl NatsToolProvider {
     /// Connect through runtime config and snapshot registered tools for this instance.
     pub async fn discover(
         config: &Config,
-        instance_id: InstanceId,
+        instance_id: ServerScope,
         in_flight: NatsInFlightCalls,
         active_package: Option<&str>,
     ) -> anyhow::Result<Self> {
@@ -139,7 +139,17 @@ impl NatsToolProvider {
 
         let mut registrations = registration_snapshot(&client, &instance_id)
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|error| {
+                // Degrading to zero tools is intended when a scope has none
+                // registered; going silent about a KV scan that outright
+                // failed is not — it looked identical to "no tools configured"
+                // in the logs.
+                log::warn!(
+                    "tool registration discovery failed under scope '{}': {error:#}",
+                    instance_id.as_str()
+                );
+                Vec::new()
+            });
         registrations.sort_by_key(|registration| match registration.package.as_deref() {
             Some(package) if Some(package) == active_package => 0,
             None => usize::from(active_package.is_some()),
@@ -226,6 +236,19 @@ impl NatsToolProvider {
     }
     pub fn in_flight_calls(&self) -> NatsInFlightCalls {
         self.in_flight.clone()
+    }
+
+    /// Describe this snapshot's discovery for the zero-registration guard.
+    ///
+    /// Reuses the registrations already fetched by [`Self::discover`] instead
+    /// of re-scanning the registry, so callers on the per-turn refresh path
+    /// don't pay for another KV round trip just to log a diagnostic.
+    pub fn discovery_report(&self) -> DiscoveryReport {
+        let found = self.registrations.len();
+        DiscoveryReport {
+            found,
+            message: discovery_message(&self.instance_id, found),
+        }
     }
 
     async fn publish_cancel(&self, call_id: &str) -> anyhow::Result<()> {
@@ -482,12 +505,51 @@ impl ToolProvider for NatsToolProvider {
     }
 }
 
+/// Open the tool registry bucket, treating "the stream genuinely doesn't
+/// exist yet" as absent rather than an error — no tool server has ever
+/// registered against this cluster, which the caller reports as zero
+/// registrations, not a failure.
+///
+/// `get_key_value` wraps *every* `get_stream` failure — a broker outage, a
+/// permissions error, a timeout, not just "not found" — in
+/// `KeyValueErrorKind::GetBucket`. Matching on that kind alone (as this used
+/// to) turns any of those into "zero tools registered", silently, which is
+/// the exact failure class the zero-registration warning exists to catch.
+/// Check the stream directly first and match the specific JetStream
+/// STREAM_NOT_FOUND error code instead, the same way
+/// `nats_hook_provider::optional_bucket_snapshot` already does for hooks —
+/// that check is the narrower, correct one; this makes the tool side match
+/// it rather than the other way around.
+async fn open_registry_store(
+    jetstream: &async_nats::jetstream::Context,
+) -> anyhow::Result<Option<async_nats::jetstream::kv::Store>> {
+    use async_nats::jetstream::{context::GetStreamErrorKind, ErrorCode};
+    match jetstream
+        .get_stream(format!("KV_{TOOL_REGISTRY_BUCKET}"))
+        .await
+    {
+        Ok(_) => Ok(Some(jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await?)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                GetStreamErrorKind::JetStream(ref error)
+                    if error.kind() == ErrorCode::STREAM_NOT_FOUND
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn registration_snapshot(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> anyhow::Result<Vec<Registration>> {
     let jetstream = async_nats::jetstream::new(client.clone());
-    let store = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await?;
+    let Some(store) = open_registry_store(&jetstream).await? else {
+        return Ok(Vec::new());
+    };
     let mut keys = store.keys().await?;
     let prefix = format!("{instance_id}.");
     let mut registrations = Vec::new();
@@ -511,6 +573,49 @@ async fn registration_snapshot(
         }
     }
     Ok(registrations)
+}
+
+/// What a discovery pass found, so a zero result can explain itself.
+///
+/// A worker that finds no tool servers under its scope looks identical to a
+/// deployment with none configured; this makes the difference visible to
+/// whoever is watching the logs.
+pub struct DiscoveryReport {
+    pub found: usize,
+    pub message: String,
+}
+
+fn discovery_message(scope: &ServerScope, found: usize) -> String {
+    if found == 0 {
+        format!(
+            "no tool servers are registered under scope '{}'; the model will \
+             see built-in tools only. Check that the servers carry the same \
+             {HARNX_SERVER_SCOPE} value.",
+            scope.as_str()
+        )
+    } else {
+        format!(
+            "discovered {found} tool server(s) under scope '{}'",
+            scope.as_str()
+        )
+    }
+}
+
+/// Scan the registry for `scope` and describe the result.
+///
+/// Runs its own prefix scan rather than reusing a cached [`NatsToolProvider`],
+/// so it also works as a standalone check against a scope no provider has
+/// discovered yet.
+pub async fn describe_discovery(
+    client: &async_nats::Client,
+    scope: &ServerScope,
+) -> anyhow::Result<DiscoveryReport> {
+    let registrations = registration_snapshot(client, scope).await?;
+    let found = registrations.len();
+    Ok(DiscoveryReport {
+        found,
+        message: discovery_message(scope, found),
+    })
 }
 
 #[cfg(test)]
@@ -594,5 +699,86 @@ mod tests {
             declarations[0].result_template.as_deref(),
             Some("Called {{tool}}")
         );
+    }
+
+    /// `open_registry_store` used to map every `get_stream` failure that
+    /// `get_key_value` classifies as `KeyValueErrorKind::GetBucket` to
+    /// `Ok(None)` — "zero tools registered" — even though `GetBucket` covers
+    /// far more than "the stream doesn't exist yet" (see the doc comment on
+    /// `open_registry_store`). A broker with JetStream disabled reproduces
+    /// exactly that: the stream lookup fails, but not with the JetStream
+    /// STREAM_NOT_FOUND code, so it must propagate as an error rather than
+    /// silently becoming "no tools".
+    #[test]
+    fn open_registry_store_propagates_a_non_not_found_stream_error() {
+        harnx_core::require_nextest();
+        let Some(server) = spawn_nats_server_without_jetstream() else {
+            eprintln!(
+                "skipping open_registry_store_propagates_a_non_not_found_stream_error: \
+                 nats-server binary not found"
+            );
+            return;
+        };
+        let runtime = tokio::runtime::Runtime::new().expect("build a tokio runtime");
+        let result = runtime.block_on(async {
+            let client = async_nats::connect(&server.url)
+                .await
+                .expect("connect to the JetStream-disabled nats-server");
+            let jetstream = async_nats::jetstream::new(client);
+            super::open_registry_store(&jetstream).await
+        });
+        let error = result.expect_err(
+            "a stream lookup failure that is not STREAM_NOT_FOUND must propagate, not become \
+             Ok(None)",
+        );
+        assert!(
+            !error.to_string().is_empty(),
+            "propagated error should carry a message"
+        );
+    }
+
+    struct JetstreamDisabledNatsServer {
+        url: String,
+        child: std::process::Child,
+    }
+
+    impl Drop for JetstreamDisabledNatsServer {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Spawns a real `nats-server` with JetStream turned OFF, so a
+    /// `get_stream` call fails for a reason other than "not found" without
+    /// needing to fake a broker outage or wait out a request timeout.
+    fn spawn_nats_server_without_jetstream() -> Option<JetstreamDisabledNatsServer> {
+        let binary = std::env::var_os("NATS_SERVER_BIN")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.exists())
+            .or_else(|| which::which("nats-server").ok())?;
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("allocate a free TCP port");
+        let port = listener.local_addr().expect("read bound port").port();
+        drop(listener);
+        let child = std::process::Command::new(&binary)
+            .arg("-p")
+            .arg(port.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn nats-server");
+        let url = format!("nats://127.0.0.1:{port}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("nats-server did not open its port before the deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Some(JetstreamDisabledNatsServer { url, child })
     }
 }

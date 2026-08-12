@@ -1,48 +1,78 @@
 //! Server-side adapter for hosting a [`harnx_hookset::Hook`] over Core NATS.
 
 use anyhow::{Context, Result};
-use async_nats::jetstream::{self, kv, stream};
+use async_nats::jetstream::{self, kv};
 use futures_util::{stream::select_all, StreamExt};
 use harnx_core::hooks::{HookOutcome, HookPayload, HookResult, HookResultControl};
-use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
+use harnx_core::instance::ServerScope;
 use harnx_hookset::{Hook, HookRegistration, HookSpec, HOOK_PROTOCOL_VERSION, HOOK_SCHEMA_VERSION};
+use harnx_nats_common::connect::NatsConnection;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 pub use harnx_hookset::HOOK_REGISTRY_BUCKET;
 
-const HARNX_NATS_URL: &str = "HARNX_NATS_URL";
-const HARNX_NATS_TOKEN: &str = "HARNX_NATS_TOKEN";
 const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// KV key for one worker instance's hook server registration.
-pub fn hook_registration_key(instance_id: &InstanceId, server: &str) -> String {
+/// KV key for one hook server's registration under a scope. The scope may
+/// belong to a worker's own children or to an independently deployed set with
+/// no worker at all.
+pub fn hook_registration_key(instance_id: &ServerScope, server: &str) -> String {
     format!("{instance_id}.{server}")
 }
 
 /// Host a hook over Core NATS request-reply and publish its KV registration.
 pub async fn serve_over_nats<H: Hook + 'static>(
     hook: H,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     nats_url: &str,
     token: &str,
 ) -> Result<()> {
-    let client = async_nats::ConnectOptions::new()
-        .token(token.to_owned())
-        .connect(nats_url)
-        .await
-        .with_context(|| format!("connect to NATS at {nats_url}"))?;
-    serve_with_client(Arc::new(hook), instance_id, client).await
+    let endpoint = harnx_nats_common::connect::NatsEndpoint {
+        name: "explicit".to_string(),
+        url: nats_url.to_string(),
+        token: Some(token.to_string()),
+        replicas: None,
+        tls: None,
+        tls_cert: None,
+        tls_key: None,
+        tls_ca: None,
+    };
+    let client = endpoint.connect().await?;
+    // This entry point takes an explicit URL/token instead of the environment,
+    // so it has no way to read HARNX_NATS_REPLICAS either; callers that need a
+    // configured replica count go through `serve_with_shutdown` directly.
+    let connection = NatsConnection {
+        client,
+        replicas: 1,
+    };
+    serve_with_client(Arc::new(hook), instance_id, connection).await
 }
 
-/// Serve a hook using an existing NATS client.
+/// Serve a hook using an existing NATS connection.
 pub async fn serve_with_client(
     hook: Arc<dyn Hook>,
-    instance_id: InstanceId,
-    client: async_nats::Client,
+    instance_id: ServerScope,
+    connection: NatsConnection,
 ) -> Result<()> {
+    // Never cancelled: this entry point has no shutdown signal of its own, so
+    // it only ever exits through `serve_requests`' bail! conditions.
+    serve_with_shutdown(hook, instance_id, connection, CancellationToken::new()).await
+}
+
+/// Serve a hook using an existing NATS connection, exiting cleanly (and
+/// running exit cleanup while the connection is still usable) when
+/// `shutdown` is cancelled, in addition to the usual failure exits.
+pub async fn serve_with_shutdown(
+    hook: Arc<dyn Hook>,
+    instance_id: ServerScope,
+    connection: NatsConnection,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let NatsConnection { client, replicas } = connection;
     let server = hook.name().to_owned();
     let hooks = hook.hooks();
     let mut events = HashSet::new();
@@ -72,32 +102,111 @@ pub async fn serve_with_client(
         proto_version: HOOK_PROTOCOL_VERSION,
     };
     let jetstream = jetstream::new(client.clone());
-    let registry = ensure_hook_registry_bucket(&jetstream).await?;
-    publish_hook_registration(&registry, &instance_id, &registration).await?;
+    let registry = ensure_hook_registry_bucket(&jetstream, replicas).await?;
+    let mut revision = publish_hook_registration(&registry, &instance_id, &registration).await?;
 
     let mut refresh = tokio::time::interval(REGISTRATION_REFRESH_INTERVAL);
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     refresh.tick().await;
 
+    let outcome = serve_requests(
+        &client,
+        &hook,
+        HookSubscriptions {
+            requests: &mut requests,
+            shutdown,
+        },
+        RegistrationRefresh {
+            registry: &registry,
+            instance_id: &instance_id,
+            registration: &registration,
+            interval: &mut refresh,
+            revision: &mut revision,
+        },
+    )
+    .await;
+
+    // Best-effort: the TTL is the backstop when this cannot run.
+    let key = hook_registration_key(&instance_id, &server);
+    delete_own_registration(&registry, &key, revision).await;
+    outcome
+}
+
+/// Delete `key` on shutdown, but only if `revision` (our own last-published
+/// one) is still current. On a rolling deploy, a replacement instance
+/// publishes under this same key before this one finishes shutting down
+/// (new pod ready before old pod terminates is Kubernetes' normal sequence);
+/// an unconditional delete here would remove the replacement's registration
+/// instead of this one's. `delete_expect_revision` fails harmlessly in that
+/// case, so it's not treated as an error worth warning about.
+async fn delete_own_registration(registry: &kv::Store, key: &str, revision: u64) {
+    match registry.delete_expect_revision(key, Some(revision)).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == kv::DeleteErrorKind::WrongLastRevision => {
+            log::debug!(
+                "hook registration '{key}' was already replaced by a newer instance; \
+                 not deleting it"
+            );
+        }
+        Err(error) => {
+            log::warn!("could not remove hook registration '{key}' on shutdown: {error}");
+        }
+    }
+}
+
+/// Everything `serve_requests` needs to keep the KV registration alive, bundled
+/// so the function stays under the argument-count limit.
+struct RegistrationRefresh<'a> {
+    registry: &'a kv::Store,
+    instance_id: &'a ServerScope,
+    registration: &'a HookRegistration,
+    interval: &'a mut tokio::time::Interval,
+    /// The revision of our own last-published registration, so shutdown can
+    /// delete it conditionally instead of unconditionally (see the delete
+    /// call in `serve_with_shutdown`). Updated after every successful
+    /// refresh publish, not just the initial one.
+    revision: &'a mut u64,
+}
+
+/// The subscriptions `serve_requests` polls, plus the signal that ends the
+/// loop on purpose. See `harnx-toolset-server`'s `ToolSubscriptions` for why
+/// `shutdown` is distinct from a subscription simply closing.
+struct HookSubscriptions<'a> {
+    requests: &'a mut futures_util::stream::SelectAll<async_nats::Subscriber>,
+    shutdown: CancellationToken,
+}
+
+async fn serve_requests(
+    client: &async_nats::Client,
+    hook: &Arc<dyn Hook>,
+    subscriptions: HookSubscriptions<'_>,
+    refresh: RegistrationRefresh<'_>,
+) -> Result<()> {
     loop {
         tokio::select! {
-            request = requests.next() => {
+            request = subscriptions.requests.next() => {
                 let Some(request) = request else {
                     anyhow::bail!("hook request subscriptions closed");
                 };
                 let client = client.clone();
-                let hook = Arc::clone(&hook);
-                let specs = registration.hooks.clone();
+                let hook = Arc::clone(hook);
+                let specs = refresh.registration.hooks.clone();
                 tokio::spawn(async move {
                     if let Err(error) = handle_hook_request(client, hook, &specs, request).await {
                         log::warn!("handle hook request failed: {error:#}");
                     }
                 });
             }
-            _ = refresh.tick() => {
-                if let Err(error) = publish_hook_registration(&registry, &instance_id, &registration).await {
-                    log::warn!("refresh hook registration failed; retrying next interval: {error:#}");
+            _ = refresh.interval.tick() => {
+                match publish_hook_registration(refresh.registry, refresh.instance_id, refresh.registration).await {
+                    Ok(new_revision) => *refresh.revision = new_revision,
+                    Err(error) => {
+                        log::warn!("refresh hook registration failed; retrying next interval: {error:#}");
+                    }
                 }
+            }
+            _ = subscriptions.shutdown.cancelled() => {
+                return Ok(());
             }
         }
     }
@@ -155,34 +264,23 @@ async fn handle_hook_request(
 }
 
 /// Create or open the hook registration KV bucket.
-pub async fn ensure_hook_registry_bucket(jetstream: &jetstream::Context) -> Result<kv::Store> {
-    match jetstream
-        .create_key_value(kv::Config {
-            bucket: HOOK_REGISTRY_BUCKET.to_string(),
-            history: 1,
-            num_replicas: 1,
-            storage: stream::StorageType::File,
-            ..Default::default()
-        })
-        .await
-    {
-        Ok(store) => Ok(store),
-        Err(create_error) => jetstream
-            .get_key_value(HOOK_REGISTRY_BUCKET)
-            .await
-            .map_err(anyhow::Error::from)
-            .with_context(|| {
-                format!(
-                    "open hook registry bucket '{HOOK_REGISTRY_BUCKET}' after create failed: {create_error}"
-                )
-            }),
-    }
+pub async fn ensure_hook_registry_bucket(
+    jetstream: &jetstream::Context,
+    replicas: usize,
+) -> Result<kv::Store> {
+    harnx_nats_common::registry::ensure_bucket_with_ttl(
+        jetstream,
+        HOOK_REGISTRY_BUCKET,
+        harnx_nats_common::registry::REGISTRATION_TTL,
+        replicas,
+    )
+    .await
 }
 
 /// Publish one hook server registration.
 pub async fn publish_hook_registration(
     registry: &kv::Store,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     registration: &HookRegistration,
 ) -> Result<u64> {
     let key = hook_registration_key(instance_id, &registration.server);
@@ -195,19 +293,20 @@ pub async fn publish_hook_registration(
 }
 
 /// Read hook server settings from the environment and serve over NATS.
+///
+/// Wires SIGTERM/Ctrl+C to a graceful stop so a pod killed by Kubernetes gets
+/// a chance to remove its own registration instead of leaving it for the TTL.
 pub async fn run_hookset_main<H: Hook + 'static>(hook: H) -> Result<()> {
     harnx_core::server_logging::init_server_logger();
-    let instance_id = std::env::var(HARNX_INSTANCE_ID)
-        .with_context(|| format!("{HARNX_INSTANCE_ID} is required"))?;
-    let nats_url =
-        std::env::var(HARNX_NATS_URL).with_context(|| format!("{HARNX_NATS_URL} is required"))?;
-    let token = std::env::var(HARNX_NATS_TOKEN)
-        .with_context(|| format!("{HARNX_NATS_TOKEN} is required"))?;
-    serve_over_nats(
-        hook,
-        InstanceId::from_string(instance_id),
-        &nats_url,
-        &token,
-    )
-    .await
+    let scope =
+        harnx_core::instance::scope_from_env(harnx_core::instance::StandaloneMode::WorkerLaunched)?;
+    log::info!("serving under scope '{}'", scope.as_str());
+    let endpoint = harnx_nats_common::connect::NatsEndpoint::from_env()?;
+    let client = endpoint.connect().await?;
+    let connection = NatsConnection {
+        client,
+        replicas: endpoint.resolved_replicas(),
+    };
+    let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
+    serve_with_shutdown(Arc::new(hook), scope, connection, shutdown).await
 }

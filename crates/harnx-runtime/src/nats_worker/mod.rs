@@ -25,8 +25,16 @@ mod agent_loop;
 mod backend;
 mod control;
 mod daemon;
+mod daemon_background;
+mod daemon_runtime;
+mod daemon_session_exec;
+mod daemon_turn_input;
 mod diagnostics;
+mod hook_crash;
+mod hook_process;
+mod hook_registration;
 mod hook_supervisor;
+pub mod server_reconciler;
 mod subagent_toolset;
 mod tool_registry;
 mod tool_supervisor;
@@ -44,11 +52,13 @@ pub use agent_loop::{
 pub use backend::{FencedSessionLogSink, NatsSessionLogBackend};
 pub use control::{control_subject, publish_control_command, ControlCommand};
 pub use daemon::{
-    new_remote_session_id, notify_subject, publish_session_activate, run_worker_daemon,
-    worker_ready_subject, SessionActivate, WorkerDaemonConfig,
+    new_remote_session_id, notify_subject, publish_session_activate, resolve_worker_scope,
+    run_worker_daemon, worker_ready_subject, SessionActivate, WorkerDaemonConfig,
 };
+#[doc(hidden)]
+pub use daemon_background::start_local_tool_servers_for_test;
 pub use diagnostics::diagnose_tool_servers;
 #[doc(hidden)]
-pub use hook_supervisor::publish_crash_rejector;
+pub use hook_crash::{publish_crash_rejector, RejectorTarget};
 pub use hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 pub use tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};

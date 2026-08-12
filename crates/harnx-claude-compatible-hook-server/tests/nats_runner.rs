@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use harnx_claude_compatible_hook_server::{Args, ClaudeCompatibleHook, CliFailPolicy};
 use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResultControl};
-use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
+use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_hookset::{HookRegistration, HARNX_HOOK_NAME};
 use harnx_hookset_server::{hook_registration_key, serve_over_nats, HOOK_REGISTRY_BUCKET};
 use serde_json::json;
@@ -99,7 +99,7 @@ async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
 
 async fn wait_for_registration(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     server_name: &str,
 ) -> Result<HookRegistration> {
     let jetstream = async_nats::jetstream::new(client.clone());
@@ -138,7 +138,7 @@ async fn command_hook_registers_and_answers_over_nats() -> Result<()> {
             .collect(),
         package_dir: None,
     })?;
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let server_instance_id = instance_id.clone();
     let server_url = server.url.clone();
     let server_task = tokio::spawn(async move {
@@ -187,7 +187,7 @@ async fn command_hook_uses_env_name_with_end_of_options_separator() -> Result<()
         return Ok(());
     };
     let assigned_name = "hook-env-name-000";
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let child = Command::new(env!("CARGO_BIN_EXE_harnx-claude-compatible-hook-server"))
         .args([
             "--event",
@@ -199,7 +199,7 @@ async fn command_hook_uses_env_name_with_end_of_options_separator() -> Result<()
             "{}",
         ])
         .env(HARNX_HOOK_NAME, assigned_name)
-        .env(HARNX_INSTANCE_ID, instance_id.as_str())
+        .env(HARNX_SERVER_SCOPE, instance_id.as_str())
         .env("HARNX_NATS_URL", &server.url)
         .env("HARNX_NATS_TOKEN", TOKEN)
         .stdin(Stdio::null())
@@ -216,5 +216,154 @@ async fn command_hook_uses_env_name_with_end_of_options_separator() -> Result<()
     let registration = wait_for_registration(&client, &instance_id, assigned_name).await?;
     assert_eq!(registration.server, assigned_name);
     assert_eq!(registration.hooks[0].matcher.as_deref(), Some("exec"));
+    Ok(())
+}
+
+/// Poll the hook registration key until it matches `present`, or fail at
+/// `deadline`. No blind sleeps: the assertion is only as slow as the actual
+/// state change.
+async fn wait_for_key_presence(
+    client: &async_nats::Client,
+    key: &str,
+    present: bool,
+    deadline: Instant,
+) -> Result<()> {
+    let jetstream = async_nats::jetstream::new(client.clone());
+    loop {
+        if let Ok(store) = jetstream.get_key_value(HOOK_REGISTRY_BUCKET).await {
+            let found = store.get(key).await?.is_some();
+            if found == present {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for hook registration '{key}' to become present={present}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Proves that a SIGTERM sent directly to a running
+/// `harnx-claude-compatible-hook-server` process (as Kubernetes would send
+/// to a pod) triggers deregistration, not just that the plumbing between a
+/// `CancellationToken` and the serve loop is wired correctly.
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_removes_the_hook_registration() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let assigned_name = "hook-sigterm-000";
+    let instance_id = ServerScope::new();
+    let child = Command::new(env!("CARGO_BIN_EXE_harnx-claude-compatible-hook-server"))
+        .args([
+            "--event",
+            "PreToolUse",
+            "--matcher",
+            "exec",
+            "--",
+            "printf",
+            "{}",
+        ])
+        .env(HARNX_HOOK_NAME, assigned_name)
+        .env(HARNX_SERVER_SCOPE, instance_id.as_str())
+        .env("HARNX_NATS_URL", &server.url)
+        .env("HARNX_NATS_TOKEN", TOKEN)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn command hook for SIGTERM test")?;
+    let pid = child.id();
+    let mut hook_server = HookServerHandle(child);
+
+    let client = async_nats::ConnectOptions::new()
+        .token(TOKEN.to_string())
+        .connect(&server.url)
+        .await?;
+    let key = hook_registration_key(&instance_id, assigned_name);
+
+    wait_for_key_presence(
+        &client,
+        &key,
+        true,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .await?;
+
+    let killed = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(
+        killed, 0,
+        "failed to send SIGTERM to harnx-claude-compatible-hook-server"
+    );
+
+    wait_for_key_presence(
+        &client,
+        &key,
+        false,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .context("hook registration should be gone soon after SIGTERM, not left to expire")?;
+
+    wait_for_process_exit(&mut hook_server.0, Instant::now() + Duration::from_secs(5))
+        .await
+        .context("harnx-claude-compatible-hook-server did not exit after SIGTERM")?;
+    Ok(())
+}
+
+/// Poll for process exit under a deadline instead of `Child::wait()`, which
+/// blocks forever if the child never exits and would hang the whole suite.
+/// If the deadline passes, this returns an error rather than waiting further
+/// -- `HookServerHandle`'s `Drop` (kill + wait) still runs when the caller
+/// propagates that error, so the child is cleaned up either way.
+async fn wait_for_process_exit(child: &mut Child, deadline: Instant) -> Result<()> {
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "process (pid {:?}) did not exit before the deadline",
+                child.id()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// `Child::wait()` blocks forever on a process that never exits; the whole
+/// point of `wait_for_process_exit` is to bound that. Prove it actually
+/// times out (rather than happening to work only because the SIGTERM test's
+/// child always exits) using a real child that outlives the deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_for_process_exit_times_out_on_a_process_that_never_exits() -> Result<()> {
+    harnx_core::require_nextest();
+    let mut child = Command::new("sleep")
+        .arg("60")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn a long-running child")?;
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(300);
+    let result = wait_for_process_exit(&mut child, deadline).await;
+    let elapsed = started.elapsed();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        result.is_err(),
+        "a process that never exits must time out, not hang the test"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "wait_for_process_exit took {elapsed:?}, far past its 300ms deadline"
+    );
     Ok(())
 }

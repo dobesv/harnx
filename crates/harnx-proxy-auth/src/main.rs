@@ -170,7 +170,7 @@ async fn run_dispatch_mode(runtime: DispatchRuntime) -> Result<()> {
 
 fn nats_mode_enabled() -> bool {
     [
-        harnx_core::instance::HARNX_INSTANCE_ID,
+        harnx_core::instance::HARNX_SERVER_SCOPE,
         "HARNX_NATS_URL",
         "HARNX_NATS_TOKEN",
     ]

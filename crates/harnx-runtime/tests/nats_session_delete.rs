@@ -13,6 +13,7 @@ use harnx_runtime::{
     nats_lease::NatsLeaseConfig,
     nats_session_index::{
         delete_record, ensure_index_bucket, get_record, put_record, SessionIndexRecord,
+        SESSION_INDEX_BUCKET,
     },
     nats_session_log::{stream_name_for_session, NatsSessionLog},
 };
@@ -26,19 +27,7 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
         return Ok(());
     };
 
-    let config = Config {
-        nats_servers: vec![harnx_runtime::config::NatsServerConfig {
-            name: "local".to_string(),
-            url: server.url().to_string(),
-            token: None,
-            tls: None,
-            tls_cert: None,
-            tls_key: None,
-            tls_ca: None,
-            agents: vec![],
-        }],
-        ..Default::default()
-    };
+    let config = local_nats_config(server.url());
     let jetstream = config.nats_jetstream("local").await?;
     let session_id = "delete-me";
     let log = NatsSessionLog::new(jetstream.clone(), session_id);
@@ -67,7 +56,7 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
     let lease_key = NatsLeaseConfig::default().key_for_session(session_id);
     lease.stop_renewal_for_test().await;
 
-    let index_store = ensure_index_bucket(&jetstream).await?;
+    let index_store = ensure_index_bucket(&jetstream, 1).await?;
     let index_record = SessionIndexRecord {
         session_id: session_id.to_string(),
         agent_name: "oracle".to_string(),
@@ -117,6 +106,56 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
     delete_record(&index_store, session_id).await.ok();
 
     Ok(())
+}
+
+/// Raising replicas on the session index bucket after it already exists
+/// must not fail startup, same as the lease and tool/hook registry buckets.
+/// Does not exercise a genuine "the cluster refused the raise" rejection —
+/// see `harnx-nats-common`'s `registry_ttl.rs` tests for why a single-node
+/// test server can't demonstrate that for an existing stream.
+#[tokio::test]
+async fn session_index_bucket_raising_replicas_does_not_fail_startup() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let config = local_nats_config(server.url());
+    let jetstream = config.nats_jetstream("local").await?;
+
+    ensure_index_bucket(&jetstream, 1)
+        .await
+        .context("create session index bucket at replicas=1")?;
+    ensure_index_bucket(&jetstream, 3)
+        .await
+        .context("raising replicas on an existing bucket must not fail startup")?;
+
+    let info = jetstream
+        .get_stream(format!("KV_{SESSION_INDEX_BUCKET}"))
+        .await
+        .context("get backing stream")?
+        .info()
+        .await
+        .context("stream info")?
+        .clone();
+    assert_eq!(info.config.num_replicas, 3, "the raise must actually apply");
+    Ok(())
+}
+
+fn local_nats_config(url: &str) -> Config {
+    Config {
+        nats_servers: vec![harnx_runtime::config::NatsServerConfig {
+            name: "local".to_string(),
+            url: url.to_string(),
+            token: None,
+            replicas: None,
+            tls: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca: None,
+            agents: vec![],
+        }],
+        ..Default::default()
+    }
 }
 
 fn header(session_id: &str) -> SessionLogEntry {

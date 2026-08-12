@@ -29,7 +29,7 @@ pub fn build_context(
     working_dir: Option<PathBuf>,
 ) -> AgentLoopContext {
     AgentLoopContext {
-        instance_id: harnx_core::instance::InstanceId::new(),
+        instance_id: harnx_core::instance::ServerScope::new(),
         config: prompt_config,
         abort_signal,
         call_fn,

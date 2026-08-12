@@ -216,7 +216,7 @@ fn build_emit_fns(
 
 async fn resolve_nats_providers(
     config: &Config,
-    instance_id: &harnx_core::instance::InstanceId,
+    instance_id: &harnx_core::instance::ServerScope,
     active_package: Option<&str>,
     injected_hook_provider: Option<Arc<NatsHookProvider>>,
 ) -> (Option<Arc<NatsToolProvider>>, Option<Arc<NatsHookProvider>>) {
@@ -562,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn instance_id_is_preserved_in_tool_eval_context() {
         let config = Arc::new(RwLock::new(Config::default()));
-        let instance_id = harnx_core::instance::InstanceId::new();
+        let instance_id = harnx_core::instance::ServerScope::new();
 
         let context =
             build_tool_eval_context(BuildToolEvalContextParams::new(&config, &instance_id)).await;
@@ -586,7 +586,7 @@ mod tests {
         let result = eval_tool_calls(
             &build_tool_eval_context(BuildToolEvalContextParams::new(
                 &config,
-                &harnx_core::instance::InstanceId::new(),
+                &harnx_core::instance::ServerScope::new(),
             ))
             .await,
             calls,
@@ -617,7 +617,7 @@ mod tests {
             .map(str::to_string);
         assert_eq!(pkg.as_deref(), Some("pantheon"));
         let ctx = build_tool_eval_context(
-            BuildToolEvalContextParams::new(&config, &harnx_core::instance::InstanceId::new())
+            BuildToolEvalContextParams::new(&config, &harnx_core::instance::ServerScope::new())
                 .with_current_agent_package(pkg),
         )
         .await;
@@ -628,7 +628,7 @@ mod tests {
             harnx_core::package_namespace::pkg_from_qualified("daedalus").map(str::to_string);
         assert_eq!(bare, None);
         let ctx = build_tool_eval_context(
-            BuildToolEvalContextParams::new(&config, &harnx_core::instance::InstanceId::new())
+            BuildToolEvalContextParams::new(&config, &harnx_core::instance::ServerScope::new())
                 .with_current_agent_package(bare),
         )
         .await;
@@ -646,7 +646,7 @@ mod tests {
         // non-terminal test process it denies, so this returns Deny.
         let ctx = build_tool_eval_context(BuildToolEvalContextParams::new(
             &config,
-            &harnx_core::instance::InstanceId::new(),
+            &harnx_core::instance::ServerScope::new(),
         ))
         .await;
         let call = ToolCall::new("t".to_string(), serde_json::json!({}), None, None);
@@ -661,7 +661,7 @@ mod tests {
             .set_tui_confirm_tool_use(Some(Arc::new(|_, _, _| ToolUseConfirmation::Approve)));
         let ctx = build_tool_eval_context(BuildToolEvalContextParams::new(
             &config,
-            &harnx_core::instance::InstanceId::new(),
+            &harnx_core::instance::ServerScope::new(),
         ))
         .await;
         assert!(matches!(
@@ -915,7 +915,7 @@ mod tests {
             make_decl_with_templates("bash_exec", None, Some("OK: {{ result.content[0].text }}")),
         );
         let eval_ctx = ToolEvalContext {
-            instance_id: harnx_core::instance::InstanceId::new(),
+            instance_id: harnx_core::instance::ServerScope::new(),
             render: Some(ToolEvalRenderContext {
                 decl_map: Arc::new(decl_map),
             }),

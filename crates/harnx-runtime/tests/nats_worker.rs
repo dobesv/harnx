@@ -58,6 +58,7 @@ fn local_nats_config(spec: NatsServerSpec<'_>) -> Config {
             name: spec.name.to_string(),
             url: spec.url.to_string(),
             token: spec.token.map(str::to_string),
+            replicas: None,
             tls: None,
             tls_cert: None,
             tls_key: None,
@@ -262,9 +263,10 @@ async fn run_worker_turn(params: WorkerTurnParams<'_>) -> Result<()> {
     let input = harnx_runtime::config::input::from_str(&global_config, prompt, None);
     run_agent_loop_with_nats(RunAgentLoopArgs {
         cluster_key,
+        manage_servers: false,
         session_id,
         config: global_config,
-        instance_id: harnx_core::instance::InstanceId::new(),
+        instance_id: harnx_core::instance::ServerScope::new(),
         initial_input: input,
         abort_signal: create_abort_signal(),
         call_fn: Some(call_fn),
@@ -388,7 +390,7 @@ async fn spawn_worker_daemon_with_call_fn(
     worker_id: &str,
     call_fn: harnx_runtime::agent_loop::AgentCallFn,
 ) -> tokio::task::JoinHandle<Result<()>> {
-    let worker_config = WorkerDaemonConfig::new("local", worker_id);
+    let worker_config = WorkerDaemonConfig::managing("local", worker_id);
     let daemon = tokio::spawn({
         let cfg = config.clone();
         async move { run_worker_daemon(cfg, worker_config, Some(call_fn)).await }
@@ -587,7 +589,7 @@ async fn mid_tool_round_user_message_is_injected_once_into_same_turn() -> Result
     };
 
     let config = local_nats_runtime_config(server.url());
-    let worker_config = WorkerDaemonConfig::new("local", "worker-mid-round");
+    let worker_config = WorkerDaemonConfig::managing("local", "worker-mid-round");
     let daemon = tokio::spawn({
         let cfg = config.clone();
         async move { run_worker_daemon(cfg, worker_config, Some(mid_round_call_fn())).await }
@@ -657,7 +659,7 @@ async fn end_of_turn_reread_runs_continuation_turn_with_same_activation() -> Res
         url: server.url(),
         token: None,
     })));
-    let worker_config = WorkerDaemonConfig::new("local", "worker-reread");
+    let worker_config = WorkerDaemonConfig::managing("local", "worker-reread");
     let daemon = tokio::spawn({
         let cfg = config.clone();
         async move { run_worker_daemon(cfg, worker_config, Some(end_turn_call_fn())).await }
@@ -765,7 +767,7 @@ async fn idle_concurrent_messages_fold_in_seq_order_into_single_turn() -> Result
     })));
     let calls = Arc::new(AtomicUsize::new(0));
     let prompts = Arc::new(AsyncMutex::new(Vec::<String>::new()));
-    let worker_config = WorkerDaemonConfig::new("local", "worker-fold");
+    let worker_config = WorkerDaemonConfig::managing("local", "worker-fold");
     let daemon = tokio::spawn({
         let cfg = config.clone();
         let calls = calls.clone();
@@ -988,9 +990,9 @@ async fn dispatch_runs_exactly_one_worker_per_activation_and_reactivation_is_noo
     let counter_one = Arc::new(AtomicUsize::new(0));
     let counter_two = Arc::new(AtomicUsize::new(0));
 
-    let mut cfg_one = WorkerDaemonConfig::new("local", "worker-one");
+    let mut cfg_one = WorkerDaemonConfig::managing("local", "worker-one");
     cfg_one.lease = fast_lease.clone();
-    let mut cfg_two = WorkerDaemonConfig::new("local", "worker-two");
+    let mut cfg_two = WorkerDaemonConfig::managing("local", "worker-two");
     cfg_two.lease = fast_lease.clone();
 
     let config_one = cluster_config(server.url());
@@ -1249,9 +1251,10 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
     let result = run_agent_loop_with_nats_inner(
         RunAgentLoopArgs {
             cluster_key: "local",
+            manage_servers: false,
             session_id,
             config,
-            instance_id: harnx_core::instance::InstanceId::new(),
+            instance_id: harnx_core::instance::ServerScope::new(),
             initial_input: input,
             abort_signal: create_abort_signal(),
             call_fn: Some(counting_stub_call_fn(Arc::new(AtomicUsize::new(0)))),
@@ -1757,8 +1760,6 @@ fn injection_decision_points_use_leader_authoritative_read() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let agent_loop = std::fs::read_to_string(manifest_dir.join("src/nats_worker/agent_loop.rs"))
         .expect("agent_loop.rs must be readable");
-    let daemon = std::fs::read_to_string(manifest_dir.join("src/nats_worker/daemon.rs"))
-        .expect("daemon.rs must be readable");
 
     assert!(
         agent_loop.contains("build_mid_turn_injection_callback"),
@@ -1773,18 +1774,33 @@ fn injection_decision_points_use_leader_authoritative_read() {
         "agent_loop.rs must not route mid-turn injection through load_events_consistent_async"
     );
 
+    // The turn-decision logic that used to live entirely in daemon.rs is now
+    // split across the daemon_* siblings it was extracted into (turn-input
+    // derivation and session execution), so check the whole family rather
+    // than one file that no longer contains all three decision points.
+    let daemon_family = ["daemon", "daemon_turn_input", "daemon_session_exec"]
+        .iter()
+        .map(|name| {
+            std::fs::read_to_string(manifest_dir.join(format!("src/nats_worker/{name}.rs")))
+                .unwrap_or_else(|error| panic!("{name}.rs must be readable: {error}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
     assert_eq!(
-        daemon
+        daemon_family
             .lines()
             .filter(|line| line.contains("load_events_latest_async()"))
             .count(),
         3,
-        "daemon.rs must use load_events_latest_async at exact 3 decision points"
+        "the daemon family's turn-decision logic must use load_events_latest_async at exactly 3 decision points"
     );
     assert_eq!(
-        daemon.matches("load_events_consistent_async").count(),
+        daemon_family
+            .matches("load_events_consistent_async")
+            .count(),
         0,
-        "daemon.rs must not use load_events_consistent_async at #917 decision points"
+        "the daemon family's turn-decision logic must not use load_events_consistent_async"
     );
 }
 
@@ -1798,7 +1814,7 @@ async fn retracted_user_message_is_not_executed_by_worker() -> Result<()> {
     let prompts = Arc::new(AsyncMutex::new(Vec::<String>::new()));
 
     let config = local_nats_runtime_config(server.url());
-    let worker_config = WorkerDaemonConfig::new("local", "worker-retract");
+    let worker_config = WorkerDaemonConfig::managing("local", "worker-retract");
     let daemon = tokio::spawn({
         let cfg = config.clone();
         let calls = counter.clone();

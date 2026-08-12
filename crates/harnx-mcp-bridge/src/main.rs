@@ -1,7 +1,8 @@
 use anyhow::Context;
-use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
 use harnx_mcp_bridge::{report_tools, Args, BridgeToolset};
-use harnx_toolset_server::serve_over_nats;
+use harnx_nats_common::connect::{NatsConnection, NatsEndpoint};
+use harnx_toolset_server::serve_with_shutdown;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -22,13 +23,29 @@ async fn main() -> anyhow::Result<()> {
         .context("--name is required when serving over NATS")?;
     let bridge = BridgeToolset::new(name, args.child).await?;
     let child_died = bridge.child_died_token();
-    let instance_id = std::env::var(HARNX_INSTANCE_ID)
-        .with_context(|| format!("{HARNX_INSTANCE_ID} is required"))?;
-    let nats_url = std::env::var("HARNX_NATS_URL").context("HARNX_NATS_URL is required")?;
-    let token = std::env::var("HARNX_NATS_TOKEN").context("HARNX_NATS_TOKEN is required")?;
+    let scope =
+        harnx_core::instance::scope_from_env(harnx_core::instance::StandaloneMode::ListTools)?;
+    log::info!("serving under scope '{}'", scope.as_str());
+    // SIGTERM/Ctrl+C get a chance to deregister before the process exits, the
+    // same as the toolset/hookset binaries this bridge otherwise mirrors: an
+    // independently deployed bridge pod has no parent supervisor to clean up
+    // after it, and Kubernetes terminates pods with SIGTERM.
+    let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
+    // Keep the connect attempt inside the same race as the signal above:
+    // a slow/unreachable NATS cluster (bad DNS, stalled TLS handshake) must
+    // not block the bridge from noticing the wrapped child has already died.
+    let serve = async {
+        let endpoint = NatsEndpoint::from_env()?;
+        let client = endpoint.connect().await?;
+        let connection = NatsConnection {
+            client,
+            replicas: endpoint.resolved_replicas(),
+        };
+        serve_with_shutdown(Arc::new(bridge), scope, connection, shutdown).await
+    };
 
     tokio::select! {
-        result = serve_over_nats(bridge, InstanceId::from_string(instance_id), &nats_url, &token) => result,
+        result = serve => result,
         _ = child_died.cancelled() => {
             log::warn!("wrapped MCP child exited; shutting down bridge");
             anyhow::bail!("wrapped MCP child exited")

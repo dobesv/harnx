@@ -8,7 +8,7 @@ use crate::nats_tool_provider::NatsInFlightCalls;
 use anyhow::{bail, Context, Result};
 use async_nats::jetstream::{self, kv, stream};
 use futures_util::{StreamExt, TryStreamExt};
-use harnx_core::instance::InstanceId;
+use harnx_core::instance::ServerScope;
 use harnx_toolset::{server_identity_token, Registration};
 use harnx_toolset_server::{registration_key, TOOL_REGISTRY_BUCKET};
 use std::collections::HashMap;
@@ -47,31 +47,49 @@ pub(super) type SupervisedProcesses = Arc<Mutex<HashMap<u32, SupervisedServer>>>
 pub(super) struct RegistrationWait<'a> {
     pub(super) processes: &'a SupervisedProcesses,
     pub(super) identity: SupervisedServer,
-    pub(super) instance_id: &'a InstanceId,
+    pub(super) instance_id: &'a ServerScope,
     pub(super) key: &'a str,
     pub(super) deadline: Instant,
     pub(super) timeout: Duration,
 }
 
-pub(super) async fn ensure_registry_bucket(client: &async_nats::Client) -> Result<kv::Store> {
+pub(super) async fn ensure_registry_bucket(
+    client: &async_nats::Client,
+    replicas: usize,
+) -> Result<kv::Store> {
     let jetstream = jetstream::new(client.clone());
-    match jetstream
+    let create = jetstream
         .create_key_value(kv::Config {
             bucket: TOOL_REGISTRY_BUCKET.to_string(),
             history: 1,
-            num_replicas: 1,
+            num_replicas: replicas,
             storage: stream::StorageType::File,
             ..Default::default()
         })
-        .await
-    {
-        Ok(store) => Ok(store),
-        Err(_) => jetstream
-            .get_key_value(TOOL_REGISTRY_BUCKET)
-            .await
-            .map_err(anyhow::Error::from)
-            .context("open tool registry bucket"),
+        .await;
+    if let Ok(store) = create {
+        return Ok(store);
     }
+
+    // The bucket already exists; raise its replicas to match config if an
+    // operator changed it after the bucket was first created. Never lowers
+    // (see reconcile_bucket_replicas), so a caller that only knows `1` can't
+    // downgrade a bucket another caller already raised.
+    if let Err(error) = harnx_nats_common::registry::reconcile_bucket_replicas(
+        &jetstream,
+        TOOL_REGISTRY_BUCKET,
+        replicas,
+    )
+    .await
+    {
+        log::warn!("could not reconcile replicas for bucket '{TOOL_REGISTRY_BUCKET}': {error:#}");
+    }
+
+    jetstream
+        .get_key_value(TOOL_REGISTRY_BUCKET)
+        .await
+        .map_err(anyhow::Error::from)
+        .context("open tool registry bucket")
 }
 
 /// Dump every key in the tool registry when servers fail to register.
@@ -79,7 +97,7 @@ pub(super) async fn ensure_registry_bucket(client: &async_nats::Client) -> Resul
 /// Distinguishes the two failure shapes that look identical from the outside: a
 /// server that never published anything, versus one that published under a key
 /// the watcher does not match.
-pub(super) async fn log_registry_contents(registry: &kv::Store, instance_id: &InstanceId) {
+pub(super) async fn log_registry_contents(registry: &kv::Store, instance_id: &ServerScope) {
     let keys = match registry.keys().await {
         Ok(keys) => keys.try_collect::<Vec<_>>().await,
         Err(error) => {
@@ -224,7 +242,7 @@ fn entry_completes_registration(entry: &kv::Entry, wait: &RegistrationWait<'_>) 
 
 pub(super) async fn remove_registrations_for_config(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     package: Option<&str>,
     config: &str,
     failure: Option<(&NatsInFlightCalls, &str)>,

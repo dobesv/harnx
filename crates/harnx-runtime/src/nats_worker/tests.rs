@@ -314,7 +314,7 @@ fn spawn_metis_worker_with_fast_renew(
     url: &str,
     call_fn: crate::agent_loop::AgentCallFn,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-    let mut daemon = crate::nats_worker::WorkerDaemonConfig::new("local", "worker-metis");
+    let mut daemon = crate::nats_worker::WorkerDaemonConfig::managing("local", "worker-metis");
     // ttl must stay > renew_interval; keep a comfortable margin.
     daemon.lease.renew_interval = Duration::from_millis(300);
     daemon.lease.ttl = Duration::from_secs(5);
@@ -328,7 +328,7 @@ fn spawn_metis_worker_with_call_fn(
     spawn_metis_worker_with_call_fn_and_daemon(
         url,
         call_fn,
-        crate::nats_worker::WorkerDaemonConfig::new("local", "worker-metis"),
+        crate::nats_worker::WorkerDaemonConfig::managing("local", "worker-metis"),
     )
 }
 
@@ -364,6 +364,7 @@ pub(super) fn spawn_metis_worker_with_hooks(
             name: "local".to_string(),
             url: url.to_string(),
             token: None,
+            replicas: None,
             tls: Some(false),
             tls_cert: None,
             tls_key: None,
@@ -1566,7 +1567,7 @@ async fn registered_agent_provider(
     .expect("worker did not register configured agents");
     let provider = crate::nats_tool_provider::NatsToolProvider::discover(
         config,
-        harnx_core::instance::InstanceId::from_string(instance_id.clone()),
+        harnx_core::instance::ServerScope::from_string(instance_id.clone()),
         crate::nats_tool_provider::NatsInFlightCalls::default(),
         None,
     )
@@ -2337,7 +2338,7 @@ async fn remote_session_activation_writes_session_index_record() {
         .await
         .expect("connect to test nats");
     let jetstream = async_nats::jetstream::new(client);
-    let store = ensure_index_bucket(&jetstream)
+    let store = ensure_index_bucket(&jetstream, 1)
         .await
         .expect("ensure session index bucket");
 
@@ -2384,7 +2385,7 @@ async fn remote_session_renew_updates_last_activity_without_clobbering_header_fi
         .await
         .expect("connect to test nats");
     let jetstream = async_nats::jetstream::new(client);
-    let store = ensure_index_bucket(&jetstream)
+    let store = ensure_index_bucket(&jetstream, 1)
         .await
         .expect("ensure session index bucket");
 

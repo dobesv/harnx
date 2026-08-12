@@ -13,9 +13,11 @@ async-nats = { workspace = true }
 futures-util = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 harnx-hookset = { path = "../harnx-hookset" }
+harnx-nats-common = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

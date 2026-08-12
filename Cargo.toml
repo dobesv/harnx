@@ -23,6 +23,7 @@ members = [
     "crates/harnx-mcp-plans-core",
     "crates/harnx-mcp-plans-github",
     "crates/harnx-mcp-history",
+    "crates/harnx-nats-common",
     "crates/harnx-pkg",
     "crates/harnx-rag",
     "crates/harnx-render",
@@ -164,6 +165,7 @@ ratatui_widget_scrolling = "0.1.0"
 jiff = { version = "0.2.23", features = ["serde"] }
 jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs", "use_pem"] }
 reqwest = { version = "0.13.0", features = ["json", "multipart", "socks", "rustls", "stream"], default-features = false }
+harnx-nats-common = { path = "crates/harnx-nats-common" }
 syntect = { version = "5.0.0", features = ["parsing", "regex-onig", "plist-load"], default-features = false }
 arboard = { version = "3.3.0", default-features = false }
 harnx-session = { path = "crates/harnx-session" }

@@ -235,7 +235,7 @@ impl TestEnv {
         let handle = tokio::spawn(async move {
             let _ = run_worker_daemon(
                 config,
-                WorkerDaemonConfig::new("local", worker_id),
+                WorkerDaemonConfig::managing("local", worker_id),
                 Some(call_fn),
             )
             .await;

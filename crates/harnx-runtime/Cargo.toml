@@ -34,6 +34,7 @@ harnx-fetch = { path = "../harnx-fetch" }
 harnx-hooks = { path = "../harnx-hooks" }
 harnx-hookset = { path = "../harnx-hookset" }
 harnx-hookset-server = { path = "../harnx-hookset-server" }
+harnx-nats-common = { workspace = true }
 harnx-toolset = { path = "../harnx-toolset" }
 harnx-toolset-server = { path = "../harnx-toolset-server" }
 harnx-rag = { path = "../harnx-rag" }
@@ -50,7 +51,6 @@ parking_lot = { workspace = true }
 path-absolutize = { workspace = true }
 reqwest = { workspace = true }
 reqwest-eventsource = { workspace = true }
-rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

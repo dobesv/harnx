@@ -1,0 +1,4 @@
+---
+harnx: major
+---
+**Breaking:** `HARNX_INSTANCE_ID` is renamed to `HARNX_SERVER_SCOPE`; the old name is no longer read at all. If you set `HARNX_INSTANCE_ID` by hand anywhere (a deployment manifest, a wrapper script, an independently deployed tool/hook server pod), rename it to `HARNX_SERVER_SCOPE`. What happens if you don't depends on the process: `harnx-toolset-server`, `harnx-hookset-server`, `harnx-mcp-bridge`, and a worker run without `--manage-servers` all fail to start, since none of them ever fell back to minting a scope of their own. A worker run *with* `--manage-servers` is unaffected either way — it always mints its own scope for the tool/hook servers it launches and never reads this variable. It is set automatically in normal use; set it explicitly only when deploying tool or hook servers independently of a worker.

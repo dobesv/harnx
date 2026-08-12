@@ -1267,7 +1267,7 @@ fn test_hook_provider(
         }
     });
     Some(Arc::new(NatsHookProvider::from_request_handler(
-        harnx_core::instance::InstanceId::from_string("session-actor-test"),
+        harnx_core::instance::ServerScope::from_string("session-actor-test"),
         discovered,
         handler,
     )))

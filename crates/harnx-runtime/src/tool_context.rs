@@ -5,7 +5,7 @@ use crate::nats_hook_provider::NatsHookProvider;
 use crate::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
 use crate::tool::CompletionText;
 use crate::utils::AbortSignal;
-use harnx_core::instance::InstanceId;
+use harnx_core::instance::ServerScope;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 /// Shared runtime state for one tool-evaluation round.
 pub struct ToolRoundParams<'a> {
     pub config: &'a GlobalConfig,
-    pub instance_id: &'a InstanceId,
+    pub instance_id: &'a ServerScope,
     pub input: &'a Input,
     pub completion: CompletionText<'a>,
     pub abort_signal: &'a AbortSignal,
@@ -27,7 +27,7 @@ pub struct ToolRoundParams<'a> {
 /// Inputs used to assemble the provider and rendering context for a tool round.
 pub struct BuildToolEvalContextParams<'a> {
     pub config: &'a GlobalConfig,
-    pub instance_id: &'a InstanceId,
+    pub instance_id: &'a ServerScope,
     pub agent_use_tools: Option<&'a str>,
     pub current_agent_package: Option<String>,
     pub working_dir: Option<&'a Path>,
@@ -36,7 +36,7 @@ pub struct BuildToolEvalContextParams<'a> {
 }
 
 impl<'a> BuildToolEvalContextParams<'a> {
-    pub fn new(config: &'a GlobalConfig, instance_id: &'a InstanceId) -> Self {
+    pub fn new(config: &'a GlobalConfig, instance_id: &'a ServerScope) -> Self {
         Self {
             config,
             instance_id,
@@ -81,8 +81,8 @@ impl AgentLoopContext {
 
 const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
-type HookDiscoveryCache = std::sync::Mutex<HashMap<InstanceId, CachedDiscovery<NatsHookProvider>>>;
-type ToolDiscoveryKey = (InstanceId, Option<String>);
+type HookDiscoveryCache = std::sync::Mutex<HashMap<ServerScope, CachedDiscovery<NatsHookProvider>>>;
+type ToolDiscoveryKey = (ServerScope, Option<String>);
 type ToolDiscoveryCache =
     std::sync::Mutex<HashMap<ToolDiscoveryKey, CachedDiscovery<NatsToolProvider>>>;
 static NATS_HOOK_DISCOVERY_CACHE: OnceLock<HookDiscoveryCache> = OnceLock::new();
@@ -127,7 +127,7 @@ fn cache_discovery<K: Eq + std::hash::Hash, T>(
 /// Discover NATS hooks at most once per instance during each refresh interval.
 pub async fn discover_nats_hook_provider_cached(
     config: &Config,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> Option<Arc<NatsHookProvider>> {
     let cache = NATS_HOOK_DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let now = Instant::now();
@@ -147,7 +147,7 @@ pub async fn discover_nats_hook_provider_cached(
 
 pub async fn discover_nats_tool_provider_cached(
     config: &Config,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     active_package: Option<&str>,
 ) -> Option<Arc<NatsToolProvider>> {
     let cache = NATS_TOOL_DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
@@ -158,22 +158,34 @@ pub async fn discover_nats_tool_provider_cached(
     }
 
     // Don't hold the process-wide lock while connecting to NATS or scanning KV.
-    let provider = NatsToolProvider::discover(
+    let provider = match NatsToolProvider::discover(
         config,
         instance_id.clone(),
         NatsInFlightCalls::for_instance(instance_id),
         active_package,
     )
     .await
-    .ok()
-    .map(Arc::new);
+    {
+        Ok(provider) => Some(Arc::new(provider)),
+        Err(error) => {
+            // A connect/subscribe failure here is distinct from "no tools
+            // registered" (handled inside `discover` itself) — without this,
+            // it produced no provider and no log, the same silent-degradation
+            // this cache exists to avoid.
+            log::warn!(
+                "NATS tool discovery failed under scope '{}': {error:#}",
+                instance_id.as_str()
+            );
+            None
+        }
+    };
     cache_discovery(cache, key, provider.clone(), Instant::now());
     provider
 }
 
 /// Refresh declarations before completion request construction.
-pub async fn refresh_nats_tool_declarations(config: &GlobalConfig, instance_id: &InstanceId) {
-    // Gate on the broker address, not on `HARNX_INSTANCE_ID`. The worker creates
+pub async fn refresh_nats_tool_declarations(config: &GlobalConfig, instance_id: &ServerScope) {
+    // Gate on the broker address, not on `HARNX_SERVER_SCOPE`. The worker creates
     // its instance id in-process and only ever exports it to the children it
     // spawns, so an instance-id check is false in the one process that runs this
     // — every turn discovered zero tools and the model saw built-ins only.
@@ -195,6 +207,18 @@ pub async fn refresh_nats_tool_declarations(config: &GlobalConfig, instance_id: 
         active_package.as_deref(),
     )
     .await;
+    if let Some(provider) = &provider {
+        // A mismatched scope is silent otherwise: the worker scans one prefix,
+        // a typo'd server registers under another, and this turn's declarations
+        // just come back empty — indistinguishable from having no tools
+        // configured at all.
+        let report = provider.discovery_report();
+        if report.found == 0 {
+            log::warn!("{}", report.message);
+        } else {
+            log::debug!("{}", report.message);
+        }
+    }
     let declarations = provider
         .as_ref()
         .map(|provider| provider.declarations_for_use_tools(Some("*")))
@@ -247,7 +271,7 @@ mod tests {
                 Duration::from_secs(1),
                 refresh_nats_tool_declarations(
                     &config,
-                    &InstanceId::from_string("non-worker-refresh-test"),
+                    &ServerScope::from_string("non-worker-refresh-test"),
                 ),
             )
             .await
@@ -260,7 +284,7 @@ mod tests {
     #[test]
     fn hook_discovery_cache_reuses_arc_until_ttl_expires() {
         let cache = std::sync::Mutex::new(HashMap::new());
-        let instance_id = InstanceId::from_string("cache-test");
+        let instance_id = ServerScope::from_string("cache-test");
         let discovered_at = Instant::now();
         let first = Arc::new(());
         cache_discovery(
@@ -309,7 +333,7 @@ mod tests {
     #[test]
     fn tool_discovery_cache_populates_and_expires_at_refresh_interval() {
         let cache = std::sync::Mutex::new(HashMap::new());
-        let instance_id = InstanceId::from_string("tool-cache-test");
+        let instance_id = ServerScope::from_string("tool-cache-test");
         let discovered_at = Instant::now();
         let provider = Arc::new(());
         cache_discovery(
@@ -339,8 +363,8 @@ mod tests {
 
     #[test]
     fn hook_discovery_cache_preserves_none_until_ttl_expires() {
-        let cache = std::sync::Mutex::new(HashMap::<InstanceId, CachedDiscovery<()>>::new());
-        let instance_id = InstanceId::from_string("none-cache-test");
+        let cache = std::sync::Mutex::new(HashMap::<ServerScope, CachedDiscovery<()>>::new());
+        let instance_id = ServerScope::from_string("none-cache-test");
         let discovered_at = Instant::now();
         cache_discovery(&cache, instance_id.clone(), None, discovered_at);
 

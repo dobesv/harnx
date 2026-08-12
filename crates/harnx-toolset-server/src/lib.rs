@@ -1,12 +1,15 @@
 //! Server-side adapters for hosting a [`harnx_toolset::Toolset`].
 
 pub mod content;
+mod drain;
 pub mod schema;
 
 use anyhow::{Context, Result};
-use async_nats::jetstream::{self, kv, stream};
+use async_nats::jetstream::{self, kv};
+use drain::InFlightRequests;
 use futures_util::StreamExt;
-use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
+use harnx_core::instance::ServerScope;
+use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{
     server_identity_token, ControlKind, ControlMessage, Registration, ToolErrorPayload,
     ToolInvokeError, ToolReply, ToolRequest, Toolset, HARNX_SERVER_CONFIG, HARNX_SERVER_PACKAGE,
@@ -30,8 +33,6 @@ pub const TOOL_REGISTRY_BUCKET: &str = "harnx_tool_registry";
 pub const TOOL_PROTOCOL_VERSION: u32 = 1;
 pub const TOOL_SCHEMA_VERSION: u32 = 1;
 
-const HARNX_NATS_URL: &str = "HARNX_NATS_URL";
-const HARNX_NATS_TOKEN: &str = "HARNX_NATS_TOKEN";
 const IDEMPOTENCY_CACHE_TTL: Duration = Duration::from_secs(60);
 const IDEMPOTENCY_CACHE_MAX_ENTRIES: usize = 1_024;
 const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -62,6 +63,9 @@ struct ToolRequestContext {
     toolset: Arc<dyn Toolset>,
     in_flight: InFlight,
     reply_cache: ReplyCache,
+    /// Tracks tool requests currently being processed, so shutdown can
+    /// drain them before deregistering (see the `drain` module).
+    active_requests: InFlightRequests,
 }
 
 struct ValidatedToolRequest {
@@ -70,15 +74,43 @@ struct ValidatedToolRequest {
     idempotency_key: String,
 }
 
+/// Everything `serve_requests` needs to keep the KV registration alive, bundled
+/// so the function stays under the argument-count limit.
+struct RegistrationRefresh<'a> {
+    registry: &'a kv::Store,
+    instance_id: &'a ServerScope,
+    registration: &'a Registration,
+    interval: &'a mut tokio::time::Interval,
+    /// The revision of our own last-published registration, so shutdown can
+    /// delete it conditionally instead of unconditionally (see the delete
+    /// call in `serve_with_shutdown`). Updated after every successful
+    /// refresh publish, not just the initial one.
+    revision: &'a mut u64,
+}
+
+/// The subscriptions `serve_requests` polls, plus the signal that ends the
+/// loop on purpose. Bundled for the same reason as `RegistrationRefresh`.
+///
+/// `shutdown` is distinct from a subscription simply closing: losing a
+/// subscription usually means the whole NATS connection is gone, at which
+/// point the exit-cleanup delete can't reach the server either (the TTL is
+/// the backstop). Cancelling `shutdown` exits the loop while the connection
+/// is still healthy, so the delete actually lands.
+struct ToolSubscriptions<'a> {
+    tool_requests: &'a mut async_nats::Subscriber,
+    controls: &'a mut async_nats::Subscriber,
+    shutdown: CancellationToken,
+}
+
 /// KV key for one worker instance's tool server registration.
-pub fn registration_key(instance_id: &InstanceId, identity_token: &str) -> String {
+pub fn registration_key(instance_id: &ServerScope, identity_token: &str) -> String {
     format!("{instance_id}.{identity_token}")
 }
 
 /// Host a toolset over Core NATS request-reply and publish its KV registration.
 pub async fn serve_over_nats<T>(
     toolset: T,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     nats_url: &str,
     token: &str,
 ) -> Result<()>
@@ -86,19 +118,48 @@ where
     T: Toolset + 'static,
 {
     harnx_core::server_logging::init_server_logger();
-    let client = async_nats::ConnectOptions::new()
-        .token(token.to_owned())
-        .connect(nats_url)
-        .await
-        .with_context(|| format!("connect to NATS at {nats_url}"))?;
-    serve_with_client(Arc::new(toolset), instance_id, client).await
+    let endpoint = harnx_nats_common::connect::NatsEndpoint {
+        name: "explicit".to_string(),
+        url: nats_url.to_string(),
+        token: Some(token.to_string()),
+        replicas: None,
+        tls: None,
+        tls_cert: None,
+        tls_key: None,
+        tls_ca: None,
+    };
+    let client = endpoint.connect().await?;
+    // This entry point takes an explicit URL/token instead of the environment,
+    // so it has no way to read HARNX_NATS_REPLICAS either; callers that need a
+    // configured replica count go through `serve_with_shutdown` directly.
+    let connection = NatsConnection {
+        client,
+        replicas: 1,
+    };
+    serve_with_client(Arc::new(toolset), instance_id, connection).await
 }
 
+/// Serve a toolset using an existing NATS connection.
 pub async fn serve_with_client(
     toolset: Arc<dyn Toolset>,
-    instance_id: InstanceId,
-    client: async_nats::Client,
+    instance_id: ServerScope,
+    connection: NatsConnection,
 ) -> Result<()> {
+    // Never cancelled: this entry point has no shutdown signal of its own, so
+    // it only ever exits through `serve_requests`' bail! conditions.
+    serve_with_shutdown(toolset, instance_id, connection, CancellationToken::new()).await
+}
+
+/// Serve a toolset using an existing NATS connection, exiting cleanly (and
+/// running exit cleanup while the connection is still usable) when
+/// `shutdown` is cancelled, in addition to the usual failure exits.
+pub async fn serve_with_shutdown(
+    toolset: Arc<dyn Toolset>,
+    instance_id: ServerScope,
+    connection: NatsConnection,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let NatsConnection { client, replicas } = connection;
     let server_name = toolset.name().to_owned();
     let package = std::env::var(HARNX_SERVER_PACKAGE)
         .ok()
@@ -129,44 +190,110 @@ pub async fn serve_with_client(
         proto_version: TOOL_PROTOCOL_VERSION,
     };
     let jetstream = jetstream::new(client.clone());
-    let registry = ensure_registry_bucket(&jetstream).await?;
-    publish_registration(&registry, &instance_id, &registration).await?;
+    let registry = ensure_registry_bucket(&jetstream, replicas).await?;
+    let mut revision = publish_registration(&registry, &instance_id, &registration).await?;
 
+    let (active_requests, active_requests_rx) = InFlightRequests::new();
     let request_context = ToolRequestContext {
         client: client.clone(),
         toolset,
         in_flight: Arc::new(Mutex::new(HashMap::new())),
         reply_cache: Arc::new(Mutex::new(HashMap::new())),
+        active_requests,
     };
     let mut refresh = tokio::time::interval(REGISTRATION_REFRESH_INTERVAL);
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     refresh.tick().await;
 
+    let outcome = serve_requests(
+        &request_context,
+        ToolSubscriptions {
+            tool_requests: &mut tool_requests,
+            controls: &mut controls,
+            shutdown,
+        },
+        RegistrationRefresh {
+            registry: &registry,
+            instance_id: &instance_id,
+            registration: &registration,
+            interval: &mut refresh,
+            revision: &mut revision,
+        },
+    )
+    .await;
+
+    // Give callers already waiting on a reply a chance to get one instead of
+    // blocking on their own 60s timeout: wait for in-flight requests to
+    // finish before deregistering, bounded so a stuck invocation can't stall
+    // shutdown forever.
+    drain::drain(active_requests_rx).await;
+
+    // Best-effort: the TTL is the backstop when this cannot run.
+    let key = registration_key(&instance_id, &identity_token);
+    delete_own_registration(&registry, &key, revision).await;
+    outcome
+}
+
+/// Delete `key` on shutdown, but only if `revision` (our own last-published
+/// one) is still current. On a rolling deploy, a replacement instance
+/// publishes under this same key before this one finishes shutting down
+/// (new pod ready before old pod terminates is Kubernetes' normal sequence);
+/// an unconditional delete here would remove the replacement's registration
+/// instead of this one's. `delete_expect_revision` fails harmlessly in that
+/// case, so it's not treated as an error worth warning about.
+async fn delete_own_registration(registry: &kv::Store, key: &str, revision: u64) {
+    match registry.delete_expect_revision(key, Some(revision)).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == kv::DeleteErrorKind::WrongLastRevision => {
+            log::debug!(
+                "tool registration '{key}' was already replaced by a newer instance; \
+                 not deleting it"
+            );
+        }
+        Err(error) => {
+            log::warn!("could not remove tool registration '{key}' on shutdown: {error}");
+        }
+    }
+}
+
+async fn serve_requests(
+    request_context: &ToolRequestContext,
+    subscriptions: ToolSubscriptions<'_>,
+    refresh: RegistrationRefresh<'_>,
+) -> Result<()> {
     loop {
         tokio::select! {
-            request = tool_requests.next() => {
+            request = subscriptions.tool_requests.next() => {
                 let Some(request) = request else {
                     anyhow::bail!("tool request subscription closed");
                 };
                 spawn_tool_request(request_context.clone(), request);
             }
-            control = controls.next() => {
+            control = subscriptions.controls.next() => {
                 let Some(control) = control else {
                     anyhow::bail!("control subscription closed");
                 };
                 handle_control(control, &request_context.in_flight).await;
             }
-            _ = refresh.tick() => {
-                if let Err(error) = publish_registration(&registry, &instance_id, &registration).await {
-                    log::warn!("refresh tool registration failed; retrying next interval: {error:#}");
+            _ = refresh.interval.tick() => {
+                match publish_registration(refresh.registry, refresh.instance_id, refresh.registration).await {
+                    Ok(new_revision) => *refresh.revision = new_revision,
+                    Err(error) => {
+                        log::warn!("refresh tool registration failed; retrying next interval: {error:#}");
+                    }
                 }
+            }
+            _ = subscriptions.shutdown.cancelled() => {
+                return Ok(());
             }
         }
     }
 }
 
 fn spawn_tool_request(context: ToolRequestContext, message: async_nats::Message) {
+    let in_flight = context.active_requests.enter();
     tokio::spawn(async move {
+        let _in_flight = in_flight;
         if let Err(error) = process_tool_request(&context, message).await {
             log::warn!("harnx tool request failed: {error:#}");
         }
@@ -421,29 +548,22 @@ fn header_value(message: &async_nats::Message, name: &str) -> Option<String> {
         .map(|value| value.as_str().to_owned())
 }
 
-async fn ensure_registry_bucket(jetstream: &jetstream::Context) -> Result<kv::Store> {
-    match jetstream
-        .create_key_value(kv::Config {
-            bucket: TOOL_REGISTRY_BUCKET.to_string(),
-            history: 1,
-            num_replicas: 1,
-            storage: stream::StorageType::File,
-            ..Default::default()
-        })
-        .await
-    {
-        Ok(store) => Ok(store),
-        Err(_) => jetstream
-            .get_key_value(TOOL_REGISTRY_BUCKET)
-            .await
-            .map_err(anyhow::Error::from)
-            .with_context(|| format!("open tool registry bucket '{TOOL_REGISTRY_BUCKET}'")),
-    }
+async fn ensure_registry_bucket(
+    jetstream: &jetstream::Context,
+    replicas: usize,
+) -> Result<kv::Store> {
+    harnx_nats_common::registry::ensure_bucket_with_ttl(
+        jetstream,
+        TOOL_REGISTRY_BUCKET,
+        harnx_nats_common::registry::REGISTRATION_TTL,
+        replicas,
+    )
+    .await
 }
 
 async fn publish_registration(
     registry: &kv::Store,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     registration: &Registration,
 ) -> Result<u64> {
     let identity_token = server_identity_token(
@@ -460,7 +580,12 @@ async fn publish_registration(
         .with_context(|| format!("publish tool registration '{key}'"))
 }
 
-/// Run a toolset in MCP stdio mode when `--mcp-stdio` is present, otherwise NATS mode.
+/// Run a toolset in MCP stdio mode when `--mcp-stdio` is present, otherwise
+/// NATS mode.
+///
+/// In NATS mode, wires SIGTERM/Ctrl+C to a graceful stop so a pod killed by
+/// Kubernetes gets a chance to remove its own registration instead of
+/// leaving it for the TTL.
 pub async fn run_toolset_main<T>(toolset: T) -> Result<()>
 where
     T: Toolset + 'static,
@@ -476,18 +601,17 @@ where
         return Ok(());
     }
 
-    let instance_id = std::env::var(HARNX_INSTANCE_ID)
-        .with_context(|| format!("{HARNX_INSTANCE_ID} is required"))?;
-    let nats_url =
-        std::env::var(HARNX_NATS_URL).with_context(|| format!("{HARNX_NATS_URL} is required"))?;
-    let token = std::env::var(HARNX_NATS_TOKEN)
-        .with_context(|| format!("{HARNX_NATS_TOKEN} is required"))?;
-    let client = async_nats::ConnectOptions::new()
-        .token(token)
-        .connect(&nats_url)
-        .await
-        .with_context(|| format!("connect to NATS at {nats_url}"))?;
-    serve_with_client(toolset, InstanceId::from_string(instance_id), client).await
+    let scope =
+        harnx_core::instance::scope_from_env(harnx_core::instance::StandaloneMode::McpStdio)?;
+    log::info!("serving under scope '{}'", scope.as_str());
+    let endpoint = harnx_nats_common::connect::NatsEndpoint::from_env()?;
+    let client = endpoint.connect().await?;
+    let connection = NatsConnection {
+        client,
+        replicas: endpoint.resolved_replicas(),
+    };
+    let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
+    serve_with_shutdown(toolset, scope, connection, shutdown).await
 }
 
 #[derive(Clone)]

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResult, HookResultControl};
-use harnx_core::instance::InstanceId;
+use harnx_core::instance::ServerScope;
 use harnx_hookset::{
     FailPolicy, HookRegistration, HookSpec, HOOK_EXPECTATIONS_BUCKET, HOOK_REGISTRY_BUCKET,
 };
@@ -57,10 +57,10 @@ pub async fn dispatch_hook_event(params: HookEventDispatch<'_>) -> HookOutcome {
 }
 
 /// Discover hooks for binaries launched inside a worker process tree.
-/// Frontends without `HARNX_INSTANCE_ID` use no-op hook dispatch.
+/// Frontends without `HARNX_SERVER_SCOPE` use no-op hook dispatch.
 pub async fn discover_process_nats_hook_provider(config: &Config) -> Option<Arc<NatsHookProvider>> {
-    let instance_id = std::env::var(harnx_core::instance::HARNX_INSTANCE_ID).ok()?;
-    NatsHookProvider::discover(config, InstanceId::from_string(instance_id))
+    let instance_id = std::env::var(harnx_core::instance::HARNX_SERVER_SCOPE).ok()?;
+    NatsHookProvider::discover(config, ServerScope::from_string(instance_id))
         .await
         .ok()
         .map(Arc::new)
@@ -128,16 +128,18 @@ impl HookRequestDispatcher for HandlerHookRequester {
     }
 }
 
-/// Discovers and dispatches hooks registered for one worker instance.
+/// Discovers and dispatches hooks registered under a scope. That scope may be
+/// a worker's own children or an independently deployed set of hook servers
+/// no worker launched.
 pub struct NatsHookProvider {
     client: Option<async_nats::Client>,
-    instance_id: InstanceId,
+    instance_id: ServerScope,
     hooks: Vec<DiscoveredHook>,
     dispatcher: Arc<dyn HookRequestDispatcher>,
 }
 
 impl NatsHookProvider {
-    pub async fn discover(config: &Config, instance_id: InstanceId) -> Result<Self> {
+    pub async fn discover(config: &Config, instance_id: ServerScope) -> Result<Self> {
         let client = config.nats_client(LOCAL_CLUSTER_KEY).await?;
         let hooks = hooks_or_fail_closed_guard(registration_snapshot(&client, &instance_id).await);
         Ok(Self::from_hooks(client, instance_id, hooks))
@@ -147,7 +149,7 @@ impl NatsHookProvider {
     #[doc(hidden)]
     pub async fn discover_with_client(
         client: async_nats::Client,
-        instance_id: InstanceId,
+        instance_id: ServerScope,
     ) -> Result<Self> {
         let hooks = hooks_or_fail_closed_guard(registration_snapshot(&client, &instance_id).await);
         Ok(Self::from_hooks(client, instance_id, hooks))
@@ -155,7 +157,7 @@ impl NatsHookProvider {
 
     pub fn from_hooks(
         client: async_nats::Client,
-        instance_id: InstanceId,
+        instance_id: ServerScope,
         hooks: Vec<DiscoveredHook>,
     ) -> Self {
         let dispatcher = Arc::new(NatsHookRequester {
@@ -173,7 +175,7 @@ impl NatsHookProvider {
     /// Used by consumers that test NATS-only dispatch without a broker.
     #[doc(hidden)]
     pub fn from_request_handler(
-        instance_id: InstanceId,
+        instance_id: ServerScope,
         hooks: Vec<DiscoveredHook>,
         handler: Arc<HookRequestHandler>,
     ) -> Self {
@@ -198,7 +200,7 @@ impl NatsHookProvider {
 
     #[cfg(test)]
     fn from_dispatcher(
-        instance_id: InstanceId,
+        instance_id: ServerScope,
         hooks: Vec<DiscoveredHook>,
         dispatcher: Arc<dyn HookRequestDispatcher>,
     ) -> Self {
@@ -338,7 +340,7 @@ pub fn matching_hooks<'a>(
 
 struct PreHookDispatch<'a> {
     dispatcher: &'a dyn HookRequestDispatcher,
-    instance_id: &'a InstanceId,
+    instance_id: &'a ServerScope,
     hooks: &'a [DiscoveredHook],
     meta: &'a HookDispatchMeta,
 }
@@ -441,7 +443,7 @@ async fn dispatch_pre_tool_use_with(params: PreHookDispatch<'_>, event: &HookEve
 
 struct EventDispatch<'a> {
     dispatcher: &'a dyn HookRequestDispatcher,
-    instance_id: &'a InstanceId,
+    instance_id: &'a ServerScope,
     hooks: &'a [DiscoveredHook],
     meta: &'a HookDispatchMeta,
     pending: Option<Arc<Mutex<Option<String>>>>,
@@ -679,7 +681,7 @@ fn hooks_or_fail_closed_guard(snapshot: Result<Vec<DiscoveredHook>>) -> Vec<Disc
 }
 async fn registration_snapshot(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> Result<Vec<DiscoveredHook>> {
     let registrations = optional_bucket_snapshot(client, instance_id, HOOK_REGISTRY_BUCKET)
         .await?
@@ -708,7 +710,7 @@ async fn registration_snapshot(
 
 async fn optional_bucket_snapshot(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     bucket: &str,
 ) -> Result<Option<Vec<DiscoveredHook>>> {
     let jetstream = async_nats::jetstream::new(client.clone());
@@ -729,7 +731,7 @@ async fn optional_bucket_snapshot(
 
 async fn bucket_snapshot(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     bucket: &str,
 ) -> Result<Vec<DiscoveredHook>> {
     let jetstream = async_nats::jetstream::new(client.clone());
@@ -950,7 +952,7 @@ mod tests {
             hook("three", "PreToolUse", None, 2),
         ];
 
-        let instance_id = InstanceId::from_string("test");
+        let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
@@ -986,7 +988,7 @@ mod tests {
             hook("two", "PreToolUse", None, 1),
         ];
 
-        let instance_id = InstanceId::from_string("test");
+        let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
@@ -1015,7 +1017,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_non_tool_event_dispatches_to_its_nats_subject() {
-        let instance_id = InstanceId::from_string("test");
+        let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
@@ -1058,7 +1060,7 @@ mod tests {
             hook("one", "UserPromptSubmit", None, 0),
             hook("two", "UserPromptSubmit", None, 1),
         ];
-        let instance_id = InstanceId::from_string("test");
+        let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
@@ -1094,7 +1096,7 @@ mod tests {
             },
         }]);
         let hooks = vec![hook("server", "Stop", None, 0)];
-        let instance_id = InstanceId::from_string("test");
+        let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
@@ -1266,7 +1268,7 @@ mod tests {
             },
         ]);
         let provider = NatsHookProvider::from_dispatcher(
-            InstanceId::from_string("test"),
+            ServerScope::from_string("test"),
             vec![
                 hook("first", "PreToolUse", Some("exec"), 0),
                 hook("second", "PreToolUse", Some("exec"), 1),
@@ -1319,7 +1321,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let provider = NatsHookProvider::from_dispatcher(
-            InstanceId::from_string("test"),
+            ServerScope::from_string("test"),
             vec![hook("lifecycle", "SessionStart", None, 0)],
             dispatcher.clone(),
         );
@@ -1353,7 +1355,7 @@ mod tests {
     #[tokio::test]
     async fn resume_count_is_serialized_for_pre_tool_dispatch() {
         let dispatcher = stub(vec![continue_outcome(None)]);
-        let instance_id = InstanceId::from_string("test");
+        let instance_id = ServerScope::from_string("test");
         let hooks = vec![hook("server", "PreToolUse", Some("exec"), 0)];
         let meta = HookDispatchMeta {
             session_id: "session".to_string(),
@@ -1384,7 +1386,7 @@ mod tests {
             result: HookResult::default(),
         }]);
         let hooks = vec![hook("approval", "PreToolUse", Some("exec"), 0)];
-        let instance_id = InstanceId::from_string("test");
+        let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
@@ -1415,7 +1417,7 @@ mod tests {
         assert_eq!(hooks.len(), 2);
         let dispatcher = stub(Vec::new());
         let provider =
-            NatsHookProvider::from_dispatcher(InstanceId::from_string("test"), hooks, dispatcher);
+            NatsHookProvider::from_dispatcher(ServerScope::from_string("test"), hooks, dispatcher);
         let meta = || HookDispatchMeta {
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),

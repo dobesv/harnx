@@ -233,3 +233,65 @@ async fn lease_loss_is_signalled_on_watch() -> Result<()> {
     assert!(!lease.is_held());
     Ok(())
 }
+
+/// The lease bucket is the split-brain guard every session write is fenced
+/// against, so it must never be stuck at R=1 once an operator raises
+/// `replicas` in cluster config, and raising it must never fail worker
+/// startup. Acquiring against the same fixed `harnx_leases` bucket twice with
+/// different `config.replicas` exercises exactly the "bucket already exists,
+/// reconcile its replica count" path this test covers.
+///
+/// Does not exercise a genuine "the cluster refused the raise" rejection —
+/// see `harnx-nats-common`'s `registry_ttl.rs` tests for why a single-node
+/// test server can't demonstrate that for an existing stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lease_bucket_raising_replicas_on_existing_bucket_does_not_fail_startup() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: nats-server not available");
+        return Ok(());
+    };
+    let js = jetstream(server.url()).await?;
+
+    let first = NatsSessionLease::acquire(harnx_runtime::nats_lease::NatsLeaseAcquireParams {
+        jetstream: js.clone(),
+        session_id: "replicas-raise-1",
+        worker_id: "worker-a".to_string(),
+        generation: 1,
+        config: NatsLeaseConfig {
+            replicas: 1,
+            ..fast_lease_config()
+        },
+        session_index: None,
+    })
+    .await?;
+    assert!(first.is_some(), "first acquire creates the lease bucket");
+
+    let second = NatsSessionLease::acquire(harnx_runtime::nats_lease::NatsLeaseAcquireParams {
+        jetstream: js.clone(),
+        session_id: "replicas-raise-2",
+        worker_id: "worker-b".to_string(),
+        generation: 1,
+        config: NatsLeaseConfig {
+            replicas: 3,
+            ..fast_lease_config()
+        },
+        session_index: None,
+    })
+    .await?;
+    assert!(
+        second.is_some(),
+        "raising replicas on the existing lease bucket must not fail startup"
+    );
+
+    let info = js
+        .get_stream("KV_harnx_leases")
+        .await
+        .context("get backing stream")?
+        .info()
+        .await
+        .context("stream info")?
+        .clone();
+    assert_eq!(info.config.num_replicas, 3, "the raise must actually apply");
+    Ok(())
+}

@@ -8,7 +8,7 @@
 //! front-end run that exits after its turn, which routinely ends before slow
 //! servers finish and leaves the interesting part unobserved.
 
-use super::daemon::configured_worker_services;
+use super::daemon_background::configured_worker_services;
 use super::tool_registry::ensure_registry_bucket;
 use super::tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
 use crate::config::{
@@ -17,7 +17,7 @@ use crate::config::{
 };
 use anyhow::{Context, Result};
 use futures_util::TryStreamExt;
-use harnx_core::instance::InstanceId;
+use harnx_core::instance::ServerScope;
 use harnx_toolset::{server_identity_token, Registration};
 use harnx_toolset_server::registration_key;
 use std::collections::HashMap;
@@ -61,14 +61,23 @@ pub async fn diagnose_tool_servers(config: &GlobalConfig) -> Result<String> {
                 .context("start the shared local NATS broker")?,
         ),
     };
-    let (url, token) = match &owned_broker {
-        Some(server) => (server.url.clone(), server.token.clone()),
+    // The auto-managed embedded broker is always single-node and TLS-less, so
+    // only a full environment handoff to a real cluster ever has a replica
+    // count or TLS settings to carry into the spawned tool servers below.
+    let (url, token, replicas, tls_endpoint) = match &owned_broker {
+        Some(server) => (
+            server.url.clone(),
+            server.token.clone(),
+            None,
+            harnx_nats_common::connect::NatsEndpoint::default(),
+        ),
         None => {
             let local = resolve_local_nats_server_config()
                 .await
                 .context("resolve the local NATS broker")?;
+            let tls_endpoint = harnx_nats_common::connect::NatsEndpoint::from(&local);
             let token = local.token.clone().context("local NATS requires a token")?;
-            (local.url, token)
+            (local.url, token, local.replicas, tls_endpoint)
         }
     };
     let client = async_nats::ConnectOptions::new()
@@ -76,7 +85,7 @@ pub async fn diagnose_tool_servers(config: &GlobalConfig) -> Result<String> {
         .connect(&url)
         .await
         .with_context(|| format!("connect to the local NATS broker at {url}"))?;
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
 
     let mut report = format!(
         "Starting {} tool server(s) as instance {instance_id}\n\
@@ -86,13 +95,15 @@ pub async fn diagnose_tool_servers(config: &GlobalConfig) -> Result<String> {
     );
 
     let start = ToolServerStartConfig::new(client.clone(), instance_id.clone(), &url, &token)
-        .inheriting_child_output();
+        .inheriting_child_output()
+        .with_replicas(replicas)
+        .with_tls(&tls_endpoint);
     let began = Instant::now();
     let supervisor =
         ToolServerSupervisor::start_local_with_timeout(start, &servers, DIAGNOSE_TIMEOUT).await?;
     let elapsed = began.elapsed();
 
-    let registered = registered_tool_counts(&client, &instance_id).await;
+    let registered = registered_tool_counts(&client, &instance_id, replicas.unwrap_or(1)).await;
     let outcomes = collect_outcomes(&servers, &registered);
     render_outcomes(&mut report, &outcomes, elapsed);
     drop(supervisor);
@@ -103,10 +114,11 @@ pub async fn diagnose_tool_servers(config: &GlobalConfig) -> Result<String> {
 /// Tool count per identity token currently registered for this instance.
 async fn registered_tool_counts(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
+    replicas: usize,
 ) -> HashMap<String, usize> {
     let mut counts = HashMap::new();
-    let Ok(registry) = ensure_registry_bucket(client).await else {
+    let Ok(registry) = ensure_registry_bucket(client, replicas).await else {
         return counts;
     };
     let Ok(keys) = registry.keys().await else {

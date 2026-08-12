@@ -92,6 +92,25 @@ No allow variables or CLI options means deny-all for filesystem and bash tool se
 
 `HARNX_BASH_ENV_PASSTHROUGH` remains a comma-separated list of host environment variable names forwarded into bash or sandbox-run child processes. Example: `HARNX_BASH_ENV_PASSTHROUGH=GITHUB_TOKEN,SSH_AUTH_SOCK`.
 
+## NATS Transport Envs
+
+These are set for you in normal use. Tool and hook servers receive them from
+whichever process launched them.
+
+- `HARNX_NATS_URL` — NATS server or cluster URL.
+- `HARNX_NATS_TOKEN` — token auth for that connection.
+- `HARNX_NATS_TLS`, `HARNX_NATS_TLS_CERT`, `HARNX_NATS_TLS_KEY`, `HARNX_NATS_TLS_CA` — TLS settings, matching the keys in `nats_servers/<cluster>.yaml`.
+- `HARNX_NATS_REPLICAS` — JetStream replica count for buckets harnx creates.
+- `HARNX_SERVER_SCOPE` — the scope a tool or hook server registers under.
+
+**Do not set `HARNX_SERVER_SCOPE` yourself unless you are deploying servers
+independently.** It namespaces every NATS subject and registry key. A worker
+only finds servers carrying the exact same value, and a mismatch fails silently
+— the worker simply sees no tools. Setting it in a container's global
+environment is worse: several harnx binaries treat its presence as "I was
+launched by a worker, speak NATS", so a stdio-launched hook would stop
+answering its stdio handshake.
+
 ## Generic Envs
 
 - **HTTPS_PROXY / ALL_PROXY**: Proxy settings for network requests.

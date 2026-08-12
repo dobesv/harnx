@@ -42,6 +42,11 @@ struct Cli {
     /// exit without serving sessions.
     #[arg(long)]
     diagnose: bool,
+    /// Launch this worker's tool and hook servers as child processes instead of
+    /// discovering independently deployed ones. Local runs set this; cloud
+    /// deployments leave it off and supply HARNX_SERVER_SCOPE.
+    #[arg(long)]
+    manage_servers: bool,
 }
 
 #[tokio::main]
@@ -64,7 +69,11 @@ async fn main() -> Result<()> {
     let worker_id = cli
         .worker_id
         .unwrap_or_else(harnx_runtime::nats_worker::new_remote_session_id);
-    let daemon = harnx_runtime::nats_worker::WorkerDaemonConfig::new(cli.cluster, worker_id);
+    let daemon = if cli.manage_servers {
+        harnx_runtime::nats_worker::WorkerDaemonConfig::managing(cli.cluster, worker_id)
+    } else {
+        harnx_runtime::nats_worker::WorkerDaemonConfig::new(cli.cluster, worker_id)
+    };
     // `None` selects the agent loop's default call path
     // (`call_with_retry_and_fallback`), which is what the worker wants.
     harnx_runtime::nats_worker::run_worker_daemon(config, daemon, None).await
@@ -116,5 +125,15 @@ mod tests {
         .unwrap();
         assert_eq!(cli.worker_id.as_deref(), Some("local"));
         assert!(cli.diagnose);
+    }
+
+    #[test]
+    fn manage_servers_defaults_to_off_and_is_settable() {
+        let cli = Cli::try_parse_from(["harnx-worker", "--cluster", "prod"]).unwrap();
+        assert!(!cli.manage_servers);
+
+        let cli =
+            Cli::try_parse_from(["harnx-worker", "--cluster", "prod", "--manage-servers"]).unwrap();
+        assert!(cli.manage_servers);
     }
 }

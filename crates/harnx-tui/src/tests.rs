@@ -7631,6 +7631,7 @@ async fn session_picker_delivery_path_carries_error() {
         name: "unreachable-cluster".into(),
         url: "nats://198.51.100.1:4222".into(), // non-routable, guaranteed to fail
         token: None,
+        replicas: None,
         tls: None,
         tls_cert: None,
         tls_key: None,

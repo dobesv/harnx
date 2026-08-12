@@ -628,7 +628,7 @@ Harnx dispatches all hook events natively over NATS microservices using the `har
 
 ### Hook Server Supervision and Scopes
 
-Hook processes are managed by a worker-side `HookServerSupervisor`. On startup, the supervisor injects NATS transport identity (`HARNX_INSTANCE_ID`, `HARNX_NATS_URL`, `HARNX_NATS_TOKEN`) and package context (`HARNX_PACKAGE_DIR`), spawns the hook process, awaits JetStream Key-Value registry readiness, and ensures processes terminate cleanly when their scope ends.
+Hook processes are managed by a worker-side `HookServerSupervisor`. On startup, the supervisor injects NATS transport identity (`HARNX_SERVER_SCOPE`, `HARNX_NATS_URL`, `HARNX_NATS_TOKEN`) and package context (`HARNX_PACKAGE_DIR`), spawns the hook process, awaits JetStream Key-Value registry readiness, and ensures processes terminate cleanly when their scope ends.
 
 Hooks are scoped according to where they are configured:
 

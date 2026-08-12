@@ -3,7 +3,7 @@ mod common;
 
 use anyhow::Result;
 use harnx_core::abort::create_abort_signal;
-use harnx_core::instance::{InstanceId, HARNX_INSTANCE_ID};
+use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_core::tool::{ToolError, ToolProvider};
 use harnx_runtime::config::{Config, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
 use harnx_runtime::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
@@ -28,16 +28,16 @@ struct EnvGuard {
 }
 
 impl EnvGuard {
-    fn install(url: &str, token: &str, instance_id: &InstanceId) -> Self {
+    fn install(url: &str, token: &str, instance_id: &ServerScope) -> Self {
         let guard = Self {
             url: std::env::var_os(HARNX_NATS_URL_ENV),
             token: std::env::var_os(HARNX_NATS_TOKEN_ENV),
-            instance_id: std::env::var_os(HARNX_INSTANCE_ID),
+            instance_id: std::env::var_os(HARNX_SERVER_SCOPE),
         };
         unsafe {
             std::env::set_var(HARNX_NATS_URL_ENV, url);
             std::env::set_var(HARNX_NATS_TOKEN_ENV, token);
-            std::env::set_var(HARNX_INSTANCE_ID, instance_id.as_str());
+            std::env::set_var(HARNX_SERVER_SCOPE, instance_id.as_str());
         }
         guard
     }
@@ -55,14 +55,14 @@ impl Drop for EnvGuard {
                 None => std::env::remove_var(HARNX_NATS_TOKEN_ENV),
             }
             match self.instance_id.take() {
-                Some(value) => std::env::set_var(HARNX_INSTANCE_ID, value),
-                None => std::env::remove_var(HARNX_INSTANCE_ID),
+                Some(value) => std::env::set_var(HARNX_SERVER_SCOPE, value),
+                None => std::env::remove_var(HARNX_SERVER_SCOPE),
             }
         }
     }
 }
 
-async fn wait_for_registry(client: &async_nats::Client, instance_id: &InstanceId) -> Result<()> {
+async fn wait_for_registry(client: &async_nats::Client, instance_id: &ServerScope) -> Result<()> {
     let jetstream = async_nats::jetstream::new(client.clone());
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -84,7 +84,7 @@ async fn wait_for_registry(client: &async_nats::Client, instance_id: &InstanceId
 
 async fn set_wait_timeout(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
     timeout_secs: u64,
 ) -> Result<()> {
     let store = async_nats::jetstream::new(client.clone())
@@ -110,7 +110,7 @@ async fn set_wait_timeout(
 
 async fn add_collision_registration(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> Result<()> {
     let jetstream = async_nats::jetstream::new(client.clone());
     let store = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await?;
@@ -144,7 +144,7 @@ async fn add_collision_registration(
 
 async fn add_duplicate_registrations(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> Result<()> {
     let store = async_nats::jetstream::new(client.clone())
         .get_key_value(TOOL_REGISTRY_BUCKET)
@@ -246,7 +246,7 @@ async fn assert_per_call_timeout_enforced(provider: &NatsToolProvider) -> Result
     Ok(())
 }
 
-async fn assert_context_declarations_and_precedence(instance_id: &InstanceId) {
+async fn assert_context_declarations_and_precedence(instance_id: &ServerScope) {
     let config = Arc::new(RwLock::new(Config::default()));
     let context = harnx_runtime::tool::build_tool_eval_context(
         harnx_runtime::tool::BuildToolEvalContextParams::new(&config, instance_id)
@@ -339,7 +339,7 @@ async fn nats_tool_provider_end_to_end_declarations_cancel_and_precedence() -> R
     else {
         return Ok(());
     };
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let _env = EnvGuard::install(server.url(), TOKEN, &instance_id);
     let server_url = server.url.clone();
     let server_instance = instance_id.clone();

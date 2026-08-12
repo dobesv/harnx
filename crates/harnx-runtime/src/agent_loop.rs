@@ -82,7 +82,7 @@ pub type OnTextResponseFn = Arc<
 /// frontend `LocalSet`.
 pub struct AgentLoopContext {
     pub config: GlobalConfig,
-    pub instance_id: harnx_core::instance::InstanceId,
+    pub instance_id: harnx_core::instance::ServerScope,
     pub abort_signal: AbortSignal,
     /// Optional custom LLM call function. `None` → uses the default
     /// non-streaming `call_with_retry_and_fallback`.
@@ -1039,7 +1039,7 @@ mod tests {
         on_tool_round: OnToolRoundFn,
     ) -> AgentLoopContext {
         AgentLoopContext {
-            instance_id: harnx_core::instance::InstanceId::new(),
+            instance_id: harnx_core::instance::ServerScope::new(),
             config: global_config,
             abort_signal: create_abort_signal(),
             call_fn: Some(call_fn),

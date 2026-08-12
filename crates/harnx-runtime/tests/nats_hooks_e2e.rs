@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use harnx_core::event::{AgentEvent, AgentEventSink, NoticeEvent};
 use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResult, HookResultControl};
-use harnx_core::instance::InstanceId;
+use harnx_core::instance::ServerScope;
 use harnx_hookset::{FailPolicy, Hook, HookRegistration, HookSpec};
 use harnx_hookset_server::{hook_registration_key, serve_over_nats, HOOK_REGISTRY_BUCKET};
 use harnx_runtime::config::Config;
@@ -141,7 +141,7 @@ async fn nats_hooks_deny_mutate_and_deliver_post_results() -> Result<()> {
     let Some(server) = spawn_nats_server().await? else {
         return Ok(());
     };
-    let instance_id = InstanceId::new();
+    let instance_id = ServerScope::new();
     let server_url = server.url.clone();
     let hook_instance_id = instance_id.clone();
     let hook_task = tokio::spawn(async move {
@@ -230,7 +230,7 @@ fn post_event(tool_input: Value) -> HookEvent {
 
 async fn wait_for_registration(
     client: &async_nats::Client,
-    instance_id: &InstanceId,
+    instance_id: &ServerScope,
 ) -> Result<HookRegistration> {
     let jetstream = async_nats::jetstream::new(client.clone());
     let deadline = Instant::now() + Duration::from_secs(10);

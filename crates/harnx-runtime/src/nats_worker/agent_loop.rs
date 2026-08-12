@@ -3,7 +3,7 @@
 use super::backend::{FencedSessionLogSink, NatsSessionLogBackend};
 use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use crate::agent_loop::OnToolRoundFn;
-use crate::config::{resolve_local_nats_server_config, GlobalConfig, Input, LOCAL_CLUSTER_KEY};
+use crate::config::{resolve_local_nats_server_config, GlobalConfig, Input};
 use crate::nats_event_sink::NatsEventSink;
 use crate::nats_hook_provider::{
     dispatch_hook_event, HookDispatchMeta, HookEventDispatch, NatsHookProvider,
@@ -24,9 +24,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Clone)]
 pub struct RunAgentLoopArgs<'a> {
     pub cluster_key: &'a str,
+    /// Whether this worker launches its own agent-level hook servers (session
+    /// and handoff hooks) rather than discovering independently deployed ones.
+    pub manage_servers: bool,
     pub session_id: &'a str,
     pub config: GlobalConfig,
-    pub instance_id: harnx_core::instance::InstanceId,
+    pub instance_id: harnx_core::instance::ServerScope,
     pub initial_input: Input,
     pub abort_signal: AbortSignal,
     pub call_fn: Option<crate::agent_loop::AgentCallFn>,
@@ -163,7 +166,7 @@ pub(crate) fn build_mid_turn_injection_callback(
 
 struct RepairOrphanToolCallsArgs<'a> {
     config: GlobalConfig,
-    instance_id: &'a harnx_core::instance::InstanceId,
+    instance_id: &'a harnx_core::instance::ServerScope,
     fence_token: Option<u64>,
     worker_id: Option<String>,
     session_id: &'a str,
@@ -188,6 +191,7 @@ pub async fn run_agent_loop_with_nats(args: RunAgentLoopArgs<'_>) -> Result<()> 
 pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Result<()> {
     let RunAgentLoopArgs {
         cluster_key,
+        manage_servers,
         session_id,
         config,
         instance_id,
@@ -218,7 +222,8 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
     .await?;
 
     let hook_start_config =
-        agent_hook_start_config(cluster_key, &jetstream_ctx, &instance_id).await;
+        resolve_agent_hook_start_config(manage_servers, &config, &jetstream_ctx, &instance_id)
+            .await;
     let mut hook_supervisor = None;
     reconcile_agent_hooks(
         &mut hook_supervisor,
@@ -245,6 +250,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
     // Run unified agent loop
     // Persistence goes through shared Config.save_message entry construction; append_event routes sink
     run_agent_loop_segment(AgentLoopSegmentArgs {
+        manage_servers,
         config,
         ctx,
         input: initial_input,
@@ -263,7 +269,7 @@ struct PrepareAgentSessionParams<'a> {
     cluster_key: &'a str,
     session_id: &'a str,
     config: &'a GlobalConfig,
-    instance_id: &'a harnx_core::instance::InstanceId,
+    instance_id: &'a harnx_core::instance::ServerScope,
     initial_input: &'a Input,
     abort_signal: &'a AbortSignal,
     lease: Option<&'a Arc<NatsSessionLease>>,
@@ -302,7 +308,7 @@ async fn prepare_agent_session(
 
 struct AgentContextParams {
     config: GlobalConfig,
-    instance_id: harnx_core::instance::InstanceId,
+    instance_id: harnx_core::instance::ServerScope,
     abort_signal: AbortSignal,
     call_fn: Option<crate::agent_loop::AgentCallFn>,
     on_tool_round: Option<OnToolRoundFn>,
@@ -406,6 +412,11 @@ async fn dispatch_session_start(params: SessionStartDispatch<'_>) {
 }
 
 struct AgentLoopSegmentArgs {
+    /// Carried through handoffs so a handoff target's hooks can be
+    /// re-resolved with the same manage-vs-discover gate the activation used
+    /// (see `prepare_nats_handoff`); a worker that discovers independently
+    /// deployed servers must not start local supervisors at handoff either.
+    manage_servers: bool,
     config: GlobalConfig,
     ctx: crate::agent_loop::AgentLoopContext,
     input: Input,
@@ -418,25 +429,52 @@ struct AgentLoopSegmentArgs {
     hook_supervisor: Option<HookServerSupervisor>,
 }
 
-async fn agent_hook_start_config(
-    cluster_key: &str,
+/// Resolve the active agent's hooks and hand them to [`agent_hook_start_config`].
+///
+/// Split out of `run_agent_loop_with_nats_inner` to keep that function under
+/// the line-count threshold; `reconcile_agent_hooks` re-resolves the same
+/// hooks a few lines later (a config read, not worth threading through).
+async fn resolve_agent_hook_start_config(
+    manage_servers: bool,
+    config: &GlobalConfig,
     jetstream: &jetstream::Context,
-    instance_id: &harnx_core::instance::InstanceId,
+    instance_id: &harnx_core::instance::ServerScope,
 ) -> Option<HookServerStartConfig> {
-    if cluster_key != LOCAL_CLUSTER_KEY {
+    let hooks = agent_resolved_hooks(config);
+    agent_hook_start_config(manage_servers, &hooks, jetstream, instance_id).await
+}
+
+async fn agent_hook_start_config(
+    manage_servers: bool,
+    hooks: &harnx_core::hooks::HooksConfig,
+    jetstream: &jetstream::Context,
+    instance_id: &harnx_core::instance::ServerScope,
+) -> Option<HookServerStartConfig> {
+    // This runs once per activation, so unlike the worker-startup gates it
+    // pays for a local NATS server resolution (and, absent a broker address,
+    // a shared-server startup) on every turn unless we also check that the
+    // active agent actually has hooks to launch — mirrors `start_global_hooks`.
+    if !manage_servers || hooks.entries.is_empty() {
         return None;
     }
     let result = async {
         let server = resolve_local_nats_server_config().await?;
+        // Read before `server.token` moves out below: `NatsEndpoint::from`
+        // borrows the whole config, which a partial move would then forbid.
+        let tls_endpoint = harnx_nats_common::connect::NatsEndpoint::from(&server);
         let token = server
             .token
             .context("local NATS agent hooks require HARNX_NATS_TOKEN")?;
-        Result::<_>::Ok(HookServerStartConfig::new(
-            jetstream.client().clone(),
-            instance_id.clone(),
-            server.url,
-            token,
-        ))
+        Result::<_>::Ok(
+            HookServerStartConfig::new(
+                jetstream.client().clone(),
+                instance_id.clone(),
+                server.url,
+                token,
+            )
+            .with_replicas(server.replicas)
+            .with_tls(&tls_endpoint),
+        )
     }
     .await;
     match result {
@@ -453,6 +491,7 @@ fn run_agent_loop_segment(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
     Box::pin(async move {
         let AgentLoopSegmentArgs {
+            manage_servers,
             config,
             ctx,
             input,
@@ -474,6 +513,7 @@ fn run_agent_loop_segment(
             } => {
                 let handoff_input = crate::config::input::from_str(&config, &prompt, None);
                 let handoff_args = AgentLoopSegmentArgs {
+                    manage_servers,
                     config,
                     ctx,
                     input: handoff_input,
@@ -554,14 +594,37 @@ async fn prepare_nats_handoff(
         .context("NATS handoff missing session after activation")?;
     attach_session_to_config(&args.config, new_session, &new_backend, Some(&new_lease));
     args.lease = Some(new_lease);
+    reconcile_handoff_target_hooks(&mut args, &new_session_id).await;
+    Ok((args, new_event_sink))
+}
+
+/// Re-resolve `hook_start_config` against the handoff target's hooks, then
+/// reconcile the supervisor against it.
+///
+/// `hook_start_config` was resolved once at activation, from the activation
+/// agent's own hooks (or lack of them). Reusing it unchanged here means a
+/// handoff to an agent WITH hooks that the activation agent lacked never
+/// starts them: `reconcile_hook_supervisor` just no-ops on a `None` start.
+/// `use_agent` (above, in `prepare_nats_handoff`) has already switched
+/// `args.config` to the target agent by the time this runs, so re-resolving
+/// against it reflects the target's hooks instead. `resolve_agent_hook_start_config`
+/// still returns `None` without ever touching the broker when the target has
+/// no hooks either, so a hookless handoff costs nothing extra.
+async fn reconcile_handoff_target_hooks(args: &mut AgentLoopSegmentArgs, new_session_id: &str) {
+    args.hook_start_config = resolve_agent_hook_start_config(
+        args.manage_servers,
+        &args.config,
+        &args.jetstream_ctx,
+        &args.ctx.instance_id,
+    )
+    .await;
     reconcile_agent_hooks(
         &mut args.hook_supervisor,
         args.hook_start_config.as_ref(),
         &args.config,
-        &new_session_id,
+        new_session_id,
     )
     .await;
-    Ok((args, new_event_sink))
 }
 
 fn agent_resolved_hooks(config: &GlobalConfig) -> harnx_core::hooks::HooksConfig {
@@ -643,7 +706,7 @@ fn abort_resume_if_fenced(
 struct LoadOrRepairSessionParams<'a> {
     backend: &'a NatsSessionLogBackend,
     config: &'a GlobalConfig,
-    instance_id: &'a harnx_core::instance::InstanceId,
+    instance_id: &'a harnx_core::instance::ServerScope,
     input: &'a Input,
     lease: Option<&'a NatsSessionLease>,
     session_index: Option<&'a async_nats::jetstream::kv::Store>,
@@ -730,7 +793,7 @@ async fn load_or_repair_session(
 struct RepairOrphanCallsParams<'a> {
     backend: &'a NatsSessionLogBackend,
     config: &'a GlobalConfig,
-    instance_id: &'a harnx_core::instance::InstanceId,
+    instance_id: &'a harnx_core::instance::ServerScope,
     lease: Option<&'a NatsSessionLease>,
     session_id: &'a str,
     abort_signal: &'a AbortSignal,
@@ -997,7 +1060,7 @@ fn build_tool_repair_context(config: &GlobalConfig) -> ToolRepairContext {
 
 async fn build_orphan_tool_eval_context(
     config: &GlobalConfig,
-    instance_id: &harnx_core::instance::InstanceId,
+    instance_id: &harnx_core::instance::ServerScope,
     repair: &ToolRepairContext,
 ) -> crate::tool::ToolEvalContext {
     crate::tool::build_tool_eval_context(crate::tool::BuildToolEvalContextParams {
@@ -1333,7 +1396,7 @@ mod tests {
     use crate::nats_hook_provider::{DiscoveredHook, NatsHookProvider};
     use chrono::{TimeZone, Utc};
     use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResult, HookResultControl};
-    use harnx_core::instance::InstanceId;
+    use harnx_core::instance::ServerScope;
     use harnx_core::message::{MessageContent, MessageRole};
     use harnx_core::session::SessionLogEntry;
     use harnx_hookset::{FailPolicy, HookSpec};
@@ -1346,7 +1409,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&seen);
         let provider = NatsHookProvider::from_request_handler(
-            InstanceId::from_string("session-start-test"),
+            ServerScope::from_string("session-start-test"),
             vec![DiscoveredHook {
                 server: "lifecycle".to_string(),
                 display_label: None,
