@@ -1,5 +1,5 @@
 use crate::ag_ui::AppResponse;
-use crate::agent_scoped_config;
+use crate::load_nats_session;
 use crate::session_actor::{
     InterruptResume, InterruptResumePayload, InterruptResumeStatus, PromptResult, SessionCommand,
     SessionHandle, SessionInfo, SessionKey, SessionPromptOptions, SessionRegistry, SessionState,
@@ -179,7 +179,7 @@ async fn handle_get(
     key: SessionKey,
     persistence: PersistenceKind,
 ) -> anyhow::Result<AppResponse> {
-    if !session_exists(config, &key) && !registry.has_session(&key) {
+    if !session_exists(config, &key).await && !registry.has_session(&key) {
         return json_rpc_response(
             StatusCode::NOT_FOUND,
             json_rpc_error(
@@ -265,7 +265,7 @@ async fn handle_prompt(
         );
     }
 
-    if !registry.has_session(&key) && !session_exists(config, &key) {
+    if !registry.has_session(&key) && !session_exists(config, &key).await {
         return json_rpc_response(
             StatusCode::NOT_FOUND,
             json_rpc_error(
@@ -439,7 +439,7 @@ async fn handle_cancel(
     registry: &SessionRegistry,
     key: SessionKey,
 ) -> anyhow::Result<AppResponse> {
-    if !registry.has_session(&key) && !session_exists(config, &key) {
+    if !registry.has_session(&key) && !session_exists(config, &key).await {
         return json_rpc_response(
             StatusCode::NOT_FOUND,
             json_rpc_error(
@@ -489,12 +489,10 @@ async fn handle_cancel(
     )
 }
 
-fn session_exists(config: &harnx_runtime::config::Config, key: &SessionKey) -> bool {
-    let Ok(config) = agent_scoped_config(config, &key.agent) else {
-        return false;
-    };
-    let session_path = config.session_file(&key.session);
-    harnx_runtime::config::session::load(&config, &key.session, &session_path).is_ok()
+async fn session_exists(config: &harnx_runtime::config::Config, key: &SessionKey) -> bool {
+    load_nats_session(config, &key.session)
+        .await
+        .is_ok_and(|session| session.agent_name.as_deref() == Some(key.agent.as_str()))
 }
 
 fn session_state_json(state: &SessionState) -> Value {
@@ -640,14 +638,36 @@ mod tests {
         })
         .await;
 
+        let base_config = crate::session_actor::load_base_config_for_tests();
+        let mut persisted = base_config.clone();
+        persisted.use_agent_by_name("plain").expect("scope agent");
+        persisted
+            .use_session(Some("rpc-get"))
+            .expect("load filesystem test session");
+        let messages = persisted
+            .session
+            .as_ref()
+            .expect("persisted test session")
+            .messages
+            .clone();
+        crate::test_support::seed_nats_session(
+            &base_config,
+            crate::test_support::NatsSessionSeed {
+                agent: "plain",
+                session_id: "rpc-get",
+                messages: &messages,
+            },
+        )
+        .await;
+
         let response = handle_ag_ui_rpc_bytes(
             Method::POST,
             "plain",
             "rpc-get",
             Bytes::from(json!({"jsonrpc":"2.0","id":1,"method":"session/get"}).to_string()),
-            &crate::session_actor::load_base_config_for_tests(),
+            &base_config,
             &registry,
-            PersistenceKind::Filesystem,
+            PersistenceKind::Nats,
         )
         .await
         .expect("rpc response");
@@ -656,7 +676,7 @@ mod tests {
         assert_eq!(body["jsonrpc"], "2.0");
         assert_eq!(body["id"], 1);
         assert_eq!(body["result"]["capabilities"]["multiClient"], true);
-        assert_eq!(body["result"]["capabilities"]["persistence"], "filesystem");
+        assert_eq!(body["result"]["capabilities"]["persistence"], "nats");
         assert_eq!(body["result"]["state"]["status"], "idle");
         assert!(body["result"]["history_snapshot"]
             .as_array()

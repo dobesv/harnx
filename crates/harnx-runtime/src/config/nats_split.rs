@@ -8,7 +8,16 @@ use harnx_nats_common::connect::{
     HARNX_NATS_TLS_KEY_ENV,
 };
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, path::Path};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::LazyLock,
+};
+
+static LOCAL_NATS_HANDLES: LazyLock<
+    tokio::sync::Mutex<HashMap<PathBuf, crate::nats_local_server::SharedNatsServer>>,
+> = LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteAgentEntry {
@@ -86,7 +95,19 @@ pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
             (url, token, replicas, tls, tls_cert, tls_key, tls_ca)
         }
         (None, None) => {
-            let server = crate::nats_local_server::ensure_shared_server().await?;
+            // Keep an owner handle alive independently of worker startup. Session
+            // enumeration and history reads are valid frontend operations before
+            // a worker has been launched; dropping this handle would kill a broker
+            // we just started and leave its returned URL pointing at a dead port.
+            let key = harnx_core::config_paths::nats_runtime_ports_file();
+            let mut handles = LOCAL_NATS_HANDLES.lock().await;
+            if !handles.contains_key(&key) {
+                let server = crate::nats_local_server::ensure_shared_server().await?;
+                handles.insert(key.clone(), server);
+            }
+            let server = handles
+                .get(&key)
+                .expect("local NATS handle inserted or already present");
             (
                 server.url.clone(),
                 server.token.clone(),
