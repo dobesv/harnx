@@ -368,11 +368,16 @@ def apply_openai_endpoint_default(
 def claude_adaptive_patch(effort: str) -> str:
     """Request-body patch enabling adaptive thinking at a given effort level for
     the Claude/Vertex AI body shape. Sampling params are stripped because they
-    also 400 on adaptive-only Opus models."""
+    also 400 on adaptive-only Opus models.
+
+    `output_config` is assigned as a whole object rather than via
+    `.body.output_config.effort`: jaq, unlike jq, does not create the missing
+    intermediate object, so the nested form errors at request time and takes
+    the rest of the pipeline down with it."""
     return (
         "del(.body.temperature) | del(.body.top_p) | "
         '.body.thinking = {"type":"adaptive"} | '
-        f'.body.output_config.effort = "{effort}"'
+        f'.body.output_config = {{"effort":"{effort}"}}'
     )
 
 
@@ -716,6 +721,55 @@ def compare_price_fields(old_model: dict[str, Any], new_model: dict[str, Any]) -
     return changes
 
 
+def price_change_lines(
+    old_models: dict[str, dict[str, Any]],
+    new_models: dict[str, dict[str, Any]],
+    shared: list[str],
+) -> list[str]:
+    lines = []
+    for name in shared:
+        changes = compare_price_fields(old_models[name], new_models[name])
+        if changes:
+            lines.append(f"- {name}: {', '.join(changes)}")
+    return lines
+
+
+def patch_change_lines(
+    old_models: dict[str, dict[str, Any]],
+    new_models: dict[str, dict[str, Any]],
+    shared: list[str],
+) -> list[str]:
+    lines = []
+    for name in shared:
+        old_patches = old_models[name].get("patches")
+        new_patches = new_models[name].get("patches")
+        if old_patches != new_patches:
+            lines.append(f"- {name}:")
+            lines.append(f"    old: {old_patches}")
+            lines.append(f"    new: {new_patches}")
+    return lines
+
+
+def provider_diff_sections(
+    old_models: dict[str, dict[str, Any]],
+    new_models: dict[str, dict[str, Any]],
+) -> list[tuple[str, list[str]]]:
+    """`(heading, lines)` per kind of change in one provider, empty sections
+    dropped — so an empty result means the provider is unchanged."""
+    shared = sorted(set(new_models) & set(old_models), key=provider_sort_key)
+    added = sorted(set(new_models) - set(old_models), key=provider_sort_key)
+    removed = sorted(set(old_models) - set(new_models), key=provider_sort_key)
+    candidates = [
+        ("added", [f"- {name}" for name in added]),
+        ("removed", [f"- {name}" for name in removed]),
+        ("pricing changes", price_change_lines(old_models, new_models, shared)),
+        # A regenerated patch differing from the shipped one is how a hand-fixed
+        # expression silently gets reverted, so it has to show up here too.
+        ("request patch changes", patch_change_lines(old_models, new_models, shared)),
+    ]
+    return [(heading, lines) for heading, lines in candidates if lines]
+
+
 def build_diff_summary(
     old_by_provider: dict[str, dict[str, dict[str, Any]]],
     new_by_provider: OrderedDict[str, list[dict[str, Any]]],
@@ -723,31 +777,20 @@ def build_diff_summary(
     lines = ["Model catalog diff summary", ""]
     any_changes = False
     for provider, new_models_list in new_by_provider.items():
-        old_models = old_by_provider.get(provider, {})
-        new_models = {model["name"]: model for model in new_models_list}
-        added = sorted(set(new_models) - set(old_models), key=provider_sort_key)
-        removed = sorted(set(old_models) - set(new_models), key=provider_sort_key)
-        price_changes = []
-        for name in sorted(set(new_models) & set(old_models), key=provider_sort_key):
-            changes = compare_price_fields(old_models[name], new_models[name])
-            if changes:
-                price_changes.append(f"- {name}: {', '.join(changes)}")
-
-        if added or removed or price_changes:
-            any_changes = True
-            lines.append(f"{provider}:")
-            if added:
-                lines.append("- added:")
-                lines.extend([f"  - {name}" for name in added])
-            if removed:
-                lines.append("- removed:")
-                lines.extend([f"  - {name}" for name in removed])
-            if price_changes:
-                lines.append("- pricing changes:")
-                lines.extend([f"  {item}" for item in price_changes])
-            lines.append("")
+        sections = provider_diff_sections(
+            old_by_provider.get(provider, {}),
+            {model["name"]: model for model in new_models_list},
+        )
+        if not sections:
+            continue
+        any_changes = True
+        lines.append(f"{provider}:")
+        for heading, section_lines in sections:
+            lines.append(f"- {heading}:")
+            lines.extend([f"  {line}" for line in section_lines])
+        lines.append("")
     if not any_changes:
-        lines.append("No model additions, removals, or pricing changes.")
+        lines.append("No model additions, removals, pricing, or request patch changes.")
     return "\n".join(lines).rstrip()
 
 

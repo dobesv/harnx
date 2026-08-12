@@ -60,6 +60,18 @@ jobs:
         env:
           RUSTFLAGS: --deny warnings
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # This PR is auto-merge labelled, so the patch guard has to run here and
+      # not only in the PR's own CI.
+      - name: Validate shipped request patches
+        run: cargo nextest run -p harnx-client --test models_yaml_patches
+        env:
+          RUSTFLAGS: --deny warnings
+
       - name: Check for changes
         id: changes
         run: |
