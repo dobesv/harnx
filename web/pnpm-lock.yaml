@@ -21,8 +21,8 @@ importers:
         specifier: 0.14.10
         version: 0.14.10(@assistant-ui/react@0.15.11(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       '@assistant-ui/react-syntax-highlighter':
-        specifier: 0.14.4
-        version: 0.14.4(@assistant-ui/react-markdown@0.14.10(@assistant-ui/react@0.15.11(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@assistant-ui/react@0.15.11(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@types/react@19.2.18)(react-syntax-highlighter@16.1.1(react@19.2.8))(react@19.2.8)
+        specifier: 0.14.5
+        version: 0.14.5(@assistant-ui/react-markdown@0.14.10(@assistant-ui/react@0.15.11(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@assistant-ui/react@0.15.11(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@types/react@19.2.18)(react-syntax-highlighter@16.1.1(react@19.2.8))(react@19.2.8)
       react:
         specifier: ^19.2.7
         version: 19.2.8
@@ -159,8 +159,8 @@ packages:
       '@types/react':
         optional: true
 
-  '@assistant-ui/react-syntax-highlighter@0.14.4':
-    resolution: {integrity: sha512-R+GWsf4TpZ3wcF4k0MEjmNiAY81YOkexWrqIMuJQbLT6tqnh1MTCJDNxdMIKtiNasQqaDJ/PBtkF1bLF+AuThw==}
+  '@assistant-ui/react-syntax-highlighter@0.14.5':
+    resolution: {integrity: sha512-5pc6KSeT65ArDxxlBuSwRdG1SvCPVm1rubKHbhtcr52UGvSQ4KwebKVYifURRywVXi8DvVrLye/a9AMCZAoN0g==}
     peerDependencies:
       '@assistant-ui/react': ^0.15.0
       '@assistant-ui/react-markdown': ^0.14.8
@@ -2732,7 +2732,7 @@ snapshots:
       - react-dom
       - supports-color
 
-  '@assistant-ui/react-syntax-highlighter@0.14.4(@assistant-ui/react-markdown@0.14.10(@assistant-ui/react@0.15.11(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@assistant-ui/react@0.15.11(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@types/react@19.2.18)(react-syntax-highlighter@16.1.1(react@19.2.8))(react@19.2.8)':
+  '@assistant-ui/react-syntax-highlighter@0.14.5(@assistant-ui/react-markdown@0.14.10(@assistant-ui/react@0.15.11(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@assistant-ui/react@0.15.11(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@types/react@19.2.18)(react-syntax-highlighter@16.1.1(react@19.2.8))(react@19.2.8)':
     dependencies:
       '@assistant-ui/react': 0.15.11(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       '@assistant-ui/react-markdown': 0.14.10(@assistant-ui/react@0.15.11(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
