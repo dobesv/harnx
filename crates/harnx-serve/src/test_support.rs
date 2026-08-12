@@ -142,6 +142,9 @@ pub async fn seed_nats_session(config: &Config, seed: NatsSessionSeed<'_>) {
         nats_session_log::NatsSessionLog,
     };
 
+    crate::ensure_frontend_nats_owner()
+        .await
+        .expect("local NATS owner");
     let mut scoped = config.clone();
     scoped.use_agent_by_name(seed.agent).expect("seed agent");
     let mut session =

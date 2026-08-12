@@ -34,17 +34,21 @@ use parking_lot::RwLock;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     convert::Infallible,
     net::IpAddr,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::SystemTime,
 };
 use tokio::{net::TcpListener, sync::oneshot};
 use tokio_graceful::Shutdown;
 
 const DEFAULT_MODEL_NAME: &str = "default";
+
+static LOCAL_NATS_HANDLES: LazyLock<
+    tokio::sync::Mutex<HashMap<PathBuf, harnx_runtime::nats_local_server::SharedNatsServer>>,
+> = LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
 /// Maximum upload size in bytes (20 MiB).
 /// Enforced during streaming to prevent OOM from oversized payloads.
@@ -1213,6 +1217,7 @@ fn session_recency_ordering(
 }
 
 async fn agent_sessions_json(config: &Config, agent: &str) -> Result<Vec<Value>> {
+    ensure_frontend_nats_owner().await?;
     let mut sessions: Vec<_> = config
         .list_remote_sessions_with_meta(LOCAL_CLUSTER_KEY)
         .await?
@@ -1251,6 +1256,7 @@ pub(crate) async fn load_nats_session(
     config: &Config,
     session: &str,
 ) -> Result<harnx_core::session::Session> {
+    ensure_frontend_nats_owner().await?;
     let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
     let log = harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, session.to_string());
     let entries = log
@@ -1262,6 +1268,23 @@ pub(crate) async fn load_nats_session(
     }
     harnx_runtime::nats_session_log::load_session_from_entries(&entries, session)
         .map_err(|err| anyhow!("Failed to reconstruct session history for '{session}': {err}"))
+}
+
+#[doc(hidden)]
+pub async fn ensure_frontend_nats_owner() -> Result<()> {
+    if std::env::var_os("HARNX_NATS_URL").is_some()
+        && std::env::var_os("HARNX_NATS_TOKEN").is_some()
+    {
+        return Ok(());
+    }
+
+    let key = harnx_core::config_paths::nats_runtime_ports_file();
+    let mut handles = LOCAL_NATS_HANDLES.lock().await;
+    if !handles.contains_key(&key) {
+        let server = harnx_runtime::nats_local_server::ensure_shared_server().await?;
+        handles.insert(key.clone(), server);
+    }
+    Ok(())
 }
 
 fn format_system_time(value: SystemTime) -> String {
