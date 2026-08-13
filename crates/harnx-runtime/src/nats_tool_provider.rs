@@ -757,28 +757,47 @@ mod tests {
             .map(std::path::PathBuf::from)
             .filter(|path| path.exists())
             .or_else(|| which::which("nats-server").ok())?;
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("allocate a free TCP port");
-        let port = listener.local_addr().expect("read bound port").port();
-        drop(listener);
+        // `-p -1` lets nats-server take a free port from the kernel and keep it.
+        // Allocating one here and dropping the listener first left a window for a
+        // concurrently starting server to claim the same port.
+        let ports_dir = tempfile::tempdir().expect("create NATS ports dir");
         let child = std::process::Command::new(&binary)
+            .arg("-a")
+            .arg("127.0.0.1")
             .arg("-p")
-            .arg(port.to_string())
+            .arg("-1")
+            .arg("--ports_file_dir")
+            .arg(ports_dir.path())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn nats-server");
-        let url = format!("nats://127.0.0.1:{port}");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-                break;
+        let url = loop {
+            if let Some(url) = read_first_nats_url(ports_dir.path()) {
+                break url;
             }
             if std::time::Instant::now() >= deadline {
-                panic!("nats-server did not open its port before the deadline");
+                panic!("nats-server did not report its port before the deadline");
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        };
         Some(JetstreamDisabledNatsServer { url, child })
+    }
+
+    /// nats-server names its ports file `<executable_name>_<pid>.ports`, so scan
+    /// the (private) directory instead of rebuilding the name — `NATS_SERVER_BIN`
+    /// may point at a differently named binary. A parse failure means the file is
+    /// still being written; the caller retries.
+    fn read_first_nats_url(dir: &std::path::Path) -> Option<String> {
+        for entry in std::fs::read_dir(dir).ok()? {
+            let path = entry.ok()?.path();
+            if path.extension().is_some_and(|ext| ext == "ports") {
+                let contents = std::fs::read_to_string(&path).ok()?;
+                let parsed: serde_json::Value = serde_json::from_str(&contents).ok()?;
+                return Some(parsed.get("nats")?.get(0)?.as_str()?.to_string());
+            }
+        }
+        None
     }
 }
