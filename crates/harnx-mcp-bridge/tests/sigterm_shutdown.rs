@@ -11,7 +11,6 @@ use anyhow::{Context, Result};
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_toolset::server_identity_token;
 use harnx_toolset_server::registration_key;
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -22,6 +21,7 @@ const TOKEN: &str = "mcp-bridge-sigterm-test-token";
 struct NatsServerHandle {
     url: String,
     _store_dir: TempDir,
+    _ports_dir: TempDir,
     child: Child,
 }
 
@@ -57,28 +57,35 @@ async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
         return Ok(None);
     };
 
-    let listener = TcpListener::bind("127.0.0.1:0").context("allocate NATS test port")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
     let store_dir = tempfile::tempdir().context("create NATS test store")?;
+    let ports_dir = tempfile::tempdir().context("create NATS ports dir")?;
     let mut child = Command::new(binary)
         .arg("-js")
         .arg("-sd")
         .arg(store_dir.path())
+        .arg("-a")
+        .arg("127.0.0.1")
         .arg("-p")
-        .arg(port.to_string())
+        .arg("-1")
         .arg("--auth")
         .arg(TOKEN)
+        .arg("--ports_file_dir")
+        .arg(ports_dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .context("spawn nats-server")?;
-    let url = format!("nats://127.0.0.1:{port}");
+    let url = read_nats_ports_file(
+        ports_dir.path(),
+        &mut child,
+        Instant::now() + Duration::from_secs(15),
+    )?;
 
     match wait_for_nats_ready(&mut child, &url).await {
         Ok(()) => Ok(Some(NatsServerHandle {
             url,
             _store_dir: store_dir,
+            _ports_dir: ports_dir,
             child,
         })),
         Err(error) => {
@@ -228,4 +235,47 @@ async fn sigterm_removes_the_bridge_registration() -> Result<()> {
 
     let _ = bridge.0.wait();
     Ok(())
+}
+
+/// Read the client URL out of the ports file nats-server writes once it has
+/// bound its listeners.
+///
+/// The file is named `<executable_name>_<pid>.ports`, so it's found by scanning
+/// the (private) directory rather than by rebuilding the name — `NATS_SERVER_BIN`
+/// can point at a differently named binary. nats-server writes into the file
+/// directly rather than renaming it into place, so a partial read is possible;
+/// failing to parse is treated the same as not-yet-written.
+fn read_nats_ports_file(
+    dir: &std::path::Path,
+    child: &mut Child,
+    deadline: Instant,
+) -> Result<String> {
+    loop {
+        if let Some(url) = first_nats_client_url(dir) {
+            return Ok(url);
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("nats-server exited during startup: {status}");
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for the nats-server ports file in {}",
+                dir.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn first_nats_client_url(dir: &std::path::Path) -> Option<String> {
+    for entry in std::fs::read_dir(dir).ok()? {
+        let path = entry.ok()?.path();
+        if path.extension().is_some_and(|ext| ext == "ports") {
+            let contents = std::fs::read_to_string(&path).ok()?;
+            let parsed: serde_json::Value = serde_json::from_str(&contents).ok()?;
+            let url = parsed.get("nats")?.get(0)?.as_str()?;
+            return Some(url.to_string());
+        }
+    }
+    None
 }

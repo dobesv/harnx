@@ -3922,6 +3922,7 @@ dependencies = [
  "log",
  "rcgen",
  "rustls-pemfile",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",

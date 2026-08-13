@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -9,6 +8,7 @@ use tokio::time::sleep;
 pub struct NatsServerHandle {
     pub url: String,
     _store_dir: TempDir,
+    _ports_dir: TempDir,
     child: Child,
 }
 
@@ -64,15 +64,19 @@ async fn try_spawn_nats_once(
     binary: &std::path::Path,
     options: &SpawnNatsServerOptions,
 ) -> Result<NatsServerHandle> {
-    let port = free_tcp_port()?;
     let store_dir = tempfile::tempdir().context("Failed to create temp NATS store dir")?;
+    let ports_dir = tempfile::tempdir().context("Failed to create temp NATS ports dir")?;
     let mut command = Command::new(binary);
     command
         .arg("-js")
         .arg("-sd")
         .arg(store_dir.path())
+        .arg("-a")
+        .arg("127.0.0.1")
         .arg("-p")
-        .arg(port.to_string());
+        .arg("-1")
+        .arg("--ports_file_dir")
+        .arg(ports_dir.path());
     if let Some(token) = &options.auth_token {
         command.arg("--auth").arg(token);
     }
@@ -82,10 +86,19 @@ async fn try_spawn_nats_once(
         .spawn()
         .with_context(|| format!("Failed to spawn {}", binary.display()))?;
 
-    let url = format!("nats://127.0.0.1:{port}");
+    let url = match read_nats_ports_file(
+        ports_dir.path(),
+        &mut child,
+        Instant::now() + Duration::from_secs(15),
+    ) {
+        Ok(url) => url,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
     if let Err(e) = wait_for_nats_ready(&url, options.auth_token.as_deref()).await {
-        // Readiness failed (likely the port was stolen by a parallel server);
-        // reap this child so the retry starts clean.
         let _ = child.kill();
         let _ = child.wait();
         return Err(e);
@@ -94,6 +107,7 @@ async fn try_spawn_nats_once(
     Ok(NatsServerHandle {
         url,
         _store_dir: store_dir,
+        _ports_dir: ports_dir,
         child,
     })
 }
@@ -129,13 +143,6 @@ fn nats_server_binary() -> Option<PathBuf> {
     }
 
     which::which("nats-server").ok()
-}
-
-fn free_tcp_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("Failed to allocate free TCP port")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
 }
 
 async fn wait_for_nats_ready(url: &str, auth_token: Option<&str>) -> Result<()> {
@@ -187,4 +194,47 @@ async fn wait_for_nats_ready(url: &str, auth_token: Option<&str>) -> Result<()> 
             }
         }
     }
+}
+
+/// Read the client URL out of the ports file nats-server writes once it has
+/// bound its listeners.
+///
+/// The file is named `<executable_name>_<pid>.ports`, so it's found by scanning
+/// the (private) directory rather than by rebuilding the name — `NATS_SERVER_BIN`
+/// can point at a differently named binary. nats-server writes into the file
+/// directly rather than renaming it into place, so a partial read is possible;
+/// failing to parse is treated the same as not-yet-written.
+fn read_nats_ports_file(
+    dir: &std::path::Path,
+    child: &mut Child,
+    deadline: Instant,
+) -> Result<String> {
+    loop {
+        if let Some(url) = first_nats_client_url(dir) {
+            return Ok(url);
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("nats-server exited during startup: {status}");
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for the nats-server ports file in {}",
+                dir.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn first_nats_client_url(dir: &std::path::Path) -> Option<String> {
+    for entry in std::fs::read_dir(dir).ok()? {
+        let path = entry.ok()?.path();
+        if path.extension().is_some_and(|ext| ext == "ports") {
+            let contents = std::fs::read_to_string(&path).ok()?;
+            let parsed: serde_json::Value = serde_json::from_str(&contents).ok()?;
+            let url = parsed.get("nats")?.get(0)?.as_str()?;
+            return Some(url.to_string());
+        }
+    }
+    None
 }
