@@ -1194,7 +1194,7 @@ async fn e2e_success_criterion_9_legacy_endpoints_and_history_unchanged() {
         MessageRole::User,
         MessageContent::Text("history please".into()),
     )];
-    harnx_serve::test_support::seed_nats_session(
+    if !harnx_serve::test_support::seed_nats_session(
         &config,
         harnx_serve::test_support::NatsSessionSeed {
             agent: "plain",
@@ -1202,7 +1202,10 @@ async fn e2e_success_criterion_9_legacy_endpoints_and_history_unchanged() {
             messages: &messages,
         },
     )
-    .await;
+    .await
+    {
+        return;
+    }
 
     // Build a real Server and exercise the legacy P1 endpoints directly
     let global_config: GlobalConfig = Arc::new(parking_lot::RwLock::new(config.clone()));

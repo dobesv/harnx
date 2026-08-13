@@ -611,6 +611,21 @@ mod tests {
         serde_json::from_slice(&body).expect("json body")
     }
 
+    async fn seed_rpc_session(
+        config: &harnx_runtime::config::Config,
+        messages: &[harnx_core::message::Message],
+    ) -> bool {
+        crate::test_support::seed_nats_session(
+            config,
+            crate::test_support::NatsSessionSeed {
+                agent: "plain",
+                session_id: "rpc-get",
+                messages,
+            },
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn rpc_session_get_known_session_returns_state_history_and_capabilities() {
         let _guard = TestStateGuard::new(None).await;
@@ -650,15 +665,9 @@ mod tests {
             .expect("persisted test session")
             .messages
             .clone();
-        crate::test_support::seed_nats_session(
-            &base_config,
-            crate::test_support::NatsSessionSeed {
-                agent: "plain",
-                session_id: "rpc-get",
-                messages: &messages,
-            },
-        )
-        .await;
+        if !seed_rpc_session(&base_config, &messages).await {
+            return;
+        }
 
         let response = handle_ag_ui_rpc_bytes(
             Method::POST,

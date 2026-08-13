@@ -134,7 +134,11 @@ pub struct NatsSessionSeed<'a> {
 }
 
 /// Seed the local NATS store with a complete session for control-plane tests.
-pub async fn seed_nats_session(config: &Config, seed: NatsSessionSeed<'_>) {
+///
+/// Returns `false` when the optional `nats-server` test dependency is not
+/// installed, allowing NATS-backed tests to follow the workspace convention
+/// of skipping on platforms whose CI jobs do not provide the binary.
+pub async fn seed_nats_session(config: &Config, seed: NatsSessionSeed<'_>) -> bool {
     use harnx_core::session::SessionLogEntry;
     use harnx_runtime::{
         config::LOCAL_CLUSTER_KEY,
@@ -142,9 +146,13 @@ pub async fn seed_nats_session(config: &Config, seed: NatsSessionSeed<'_>) {
         nats_session_log::NatsSessionLog,
     };
 
-    crate::ensure_frontend_nats_owner()
-        .await
-        .expect("local NATS owner");
+    if let Err(error) = crate::ensure_frontend_nats_owner().await {
+        if error.to_string().contains("nats-server binary not found") {
+            eprintln!("skipping NATS-backed harnx-serve test: {error}");
+            return false;
+        }
+        panic!("local NATS owner: {error:#}");
+    }
     let mut scoped = config.clone();
     scoped.use_agent_by_name(seed.agent).expect("seed agent");
     let mut session =
@@ -192,6 +200,7 @@ pub async fn seed_nats_session(config: &Config, seed: NatsSessionSeed<'_>) {
     )
     .await
     .expect("put session index record");
+    true
 }
 
 pub fn unique_test_config_dir(scope: &str) -> PathBuf {
