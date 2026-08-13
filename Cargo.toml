@@ -55,6 +55,19 @@ repository = "https://github.com/dobesv/harnx"
 categories = ["command-line-utilities"]
 keywords = ["chatgpt", "llm", "cli", "ai", "tui"]
 
+[profile.dev]
+# Full debuginfo (the `dev` default) is what makes a workspace rebuild able to
+# take the machine down: cargo runs one rustc per core by default, and the
+# workspace's ~60 test binaries then link with full DWARF. Measured on a 24-core
+# box rebuilding harnx-core and everything downstream: peak 32.7 GB across the
+# toolchain and load 131, versus 18.0 GB and load 62 with line tables only.
+#
+# Line tables keep file:line in panic backtraces, which is what test failures
+# actually need. What's lost is variable inspection under a debugger — set this
+# back to `2` (or `cargo build --config 'profile.dev.debug=2'`) for a session
+# where you need to step through code in gdb/lldb.
+debug = "line-tables-only"
+
 [profile.release]
 lto = true
 # Keep symbols and line tables (don't strip) so crash backtraces in released
