@@ -194,9 +194,37 @@ class TestAdaptiveEffortVariants(unittest.TestCase):
         xhigh = next(v for v in variants if v["name"].endswith(":xhigh"))
         patch = xhigh["patches"][0]
         self.assertIn('"type":"adaptive"', patch)
-        self.assertIn('.body.output_config.effort = "xhigh"', patch)
+        # Whole-object assignment: jaq won't create the intermediate object.
+        self.assertIn('.body.output_config = {"effort":"xhigh"}', patch)
         self.assertIn("del(.body.temperature)", patch)
         self.assertNotIn("budget_tokens", patch)
+
+    def test_no_generated_patch_assigns_into_a_nested_path(self) -> None:
+        # jaq does not create missing intermediate objects, so an assignment
+        # into `.body.<obj>.<field>` errors at request time and aborts the rest
+        # of the pipeline. Every generated patch must assign whole containers.
+        patches = [um.claude_adaptive_patch(um.BASE_EFFORT), um.BEDROCK_THINKING_PATCH]
+        for provider in ("claude", "vertexai", "bedrock"):
+            base = self._base(
+                "us.anthropic.claude-opus-4-6"
+                if provider == "bedrock"
+                else "claude-opus-4-8"
+            )
+            patches += [
+                patch
+                for variant in um.thinking_variants(base, provider)
+                for patch in variant["patches"]
+            ]
+        for patch in patches:
+            for assignment in patch.split("|"):
+                lhs = assignment.split("=")[0].strip()
+                if not lhs.startswith("."):
+                    continue
+                self.assertLessEqual(
+                    lhs.count("."),
+                    2,
+                    f"patch assigns into a nested path: {assignment.strip()!r}",
+                )
 
     def test_effort_variant_requires_max_tokens(self) -> None:
         # Adaptive-only Opus rejects requests without an explicit max_tokens.
@@ -222,7 +250,7 @@ class TestAdaptiveEffortVariants(unittest.TestCase):
             um.apply_base_thinking(model, provider)
             self.assertEqual(len(model["patches"]), 1)
             self.assertIn('"type":"adaptive"', model["patches"][0])
-            self.assertIn('.body.output_config.effort = "high"', model["patches"][0])
+            self.assertIn('.body.output_config = {"effort":"high"}', model["patches"][0])
             self.assertTrue(model.get("require_max_tokens"))
 
     def test_apply_base_thinking_skips_manual_models(self) -> None:
@@ -521,6 +549,53 @@ class TestOrderedModel(unittest.TestCase):
         # name must come before input_price which must come before patches
         self.assertLess(keys.index("name"), keys.index("input_price"))
         self.assertLess(keys.index("input_price"), keys.index("patches"))
+
+
+class TestBuildDiffSummary(unittest.TestCase):
+    """A regenerated patch differing from the shipped one has to show up in the
+    summary — that summary is the PR body for an auto-merge-labelled PR."""
+
+    def _summary(self, old_patches: list[str], new_patches: list[str]) -> str:
+        old = {"claude": {"m": {"name": "m", "patches": old_patches}}}
+        new = OrderedDict(claude=[{"name": "m", "patches": new_patches}])
+        return um.build_diff_summary(old, new)
+
+    def test_patch_change_reported(self) -> None:
+        summary = self._summary([".body.a = 1"], [".body.a = 2"])
+        self.assertIn("request patch changes", summary)
+        self.assertIn(".body.a = 1", summary)
+        self.assertIn(".body.a = 2", summary)
+
+    def test_identical_patches_report_no_changes(self) -> None:
+        summary = self._summary([".body.a = 1"], [".body.a = 1"])
+        self.assertIn("No model additions", summary)
+        self.assertNotIn("- request patch changes:", summary)
+
+    def test_provider_missing_from_new_catalog_is_reported_as_removed(self) -> None:
+        # Dropping a whole provider block must not read as "no changes".
+        old = {"someprovider": {"m": {"name": "m"}}}
+        summary = um.build_diff_summary(old, OrderedDict())
+        self.assertIn("someprovider:", summary)
+        self.assertIn("removed", summary)
+        self.assertNotIn("No model additions", summary)
+
+
+class TestOrderedProviders(unittest.TestCase):
+    """A provider already in models.yaml but in neither PROVIDER_ORDER nor the
+    LiteLLM response used to be skipped entirely, silently deleting its models."""
+
+    def test_provider_only_in_existing_yaml_is_included(self) -> None:
+        order = um.ordered_providers({}, {"handrolled": {"m": {"name": "m"}}})
+        self.assertIn("handrolled", order)
+
+    def test_provider_only_from_litellm_is_included(self) -> None:
+        order = um.ordered_providers({"fresh": {"m": {"name": "m"}}}, {})
+        self.assertIn("fresh", order)
+
+    def test_known_providers_keep_their_order_and_appear_once(self) -> None:
+        order = um.ordered_providers({"claude": {}}, {"openai": {}})
+        self.assertEqual(order[: len(um.PROVIDER_ORDER)], um.PROVIDER_ORDER)
+        self.assertEqual(len(order), len(set(order)))
 
 
 if __name__ == "__main__":
