@@ -65,7 +65,14 @@ jobs:
         DOWNLOAD_URL="https://github.com/nats-io/nats-server/releases/download/${VERSION}/${ASSET}"
         BINDIR="${HOME}/.local/bin"
         mkdir -p "${BINDIR}"
-        curl -sL "${DOWNLOAD_URL}" | tar -xzf - -C "${BINDIR}" --strip-components=1 "nats-server-${VERSION}-linux-amd64/nats-server"
+        TMPDIR_DL="$(mktemp -d)"
+        # Download to a file rather than piping into tar. A retry can't resume a
+        # stream tar has already started reading, and an HTTP error body piped to
+        # tar surfaces as "tar: Error is not recoverable" instead of naming the
+        # failed download.
+        curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 2 \
+          --location --silent --show-error --fail --output "${TMPDIR_DL}/${ASSET}" "${DOWNLOAD_URL}"
+        tar -xzf "${TMPDIR_DL}/${ASSET}" -C "${BINDIR}" --strip-components=1 "nats-server-${VERSION}-linux-amd64/nats-server"
         chmod +x "${BINDIR}/nats-server"
         echo "${BINDIR}" >> "${GITHUB_PATH}"
       shell: bash
@@ -88,7 +95,11 @@ jobs:
         DOWNLOAD_URL="https://github.com/nats-io/nats-server/releases/download/${VERSION}/${ASSET}"
         BINDIR="${HOME}/.local/bin"
         mkdir -p "${BINDIR}"
-        curl -sL "${DOWNLOAD_URL}" | tar -xzf - -C "${BINDIR}" --strip-components=1 "nats-server-${VERSION}-darwin-${NATS_ARCH}/nats-server"
+        TMPDIR_DL="$(mktemp -d)"
+        # See the Linux step for why this downloads to a file first.
+        curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 2 \
+          --location --silent --show-error --fail --output "${TMPDIR_DL}/${ASSET}" "${DOWNLOAD_URL}"
+        tar -xzf "${TMPDIR_DL}/${ASSET}" -C "${BINDIR}" --strip-components=1 "nats-server-${VERSION}-darwin-${NATS_ARCH}/nats-server"
         chmod +x "${BINDIR}/nats-server"
         echo "${BINDIR}" >> "${GITHUB_PATH}"
       shell: bash
