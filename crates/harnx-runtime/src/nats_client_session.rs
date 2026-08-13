@@ -473,7 +473,36 @@ impl ThinClientSession {
         if !turn_complete {
             let entries = self.load_durable_entries().await?;
             (final_response, turn_error) = Self::extract_turn_outcome(&entries, user_msg_seq);
+            if let Ok(effective) =
+                harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)
+            {
+                cached_effective = Some(effective);
+            }
         }
+
+        // Render what the worker already published before reporting the turn's
+        // terminal state.
+        //
+        // Notices — retry warnings, "exhausted retries", fallback transitions —
+        // are ephemeral advisories, published from a detached task. The terminal
+        // error is a durable log entry, found by polling. The two have no ordering
+        // relationship, so breaking out of the loop the moment the log reads
+        // complete abandoned advisories that were already in flight: they arrived
+        // after the error, or were dropped with `pending_advisories` and never
+        // shown at all. Losing the last "exhausted retries" line is the visible
+        // case — it's the only explanation a user gets for a fallback.
+        //
+        // No waiting on the subscription: an earlier version of this spent up to
+        // 250ms hoping in-flight advisories would land, which delayed turn
+        // completion enough to trip the sub-agent idle-timeout watchdog
+        // (`subagent_idle_timeout_resets_on_child_activity` failed 5/5). Flushing
+        // what has already been received costs nothing and never delays a turn.
+        flush_pending_advisories(
+            &mut pending_advisories,
+            cached_effective.as_deref(),
+            &event_sink,
+            &mut emitted_logical_seqs,
+        );
 
         if let Some(error) = &turn_error {
             render_error_entry(error, &event_sink);
