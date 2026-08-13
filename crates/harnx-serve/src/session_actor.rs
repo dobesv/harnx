@@ -40,15 +40,6 @@ use tokio::{
 
 const DEFAULT_REAP_TTL: Duration = Duration::from_secs(5);
 const COMMAND_BUFFER: usize = 32;
-// AG-UI event broadcast channel capacity.
-//
-// Kept at 64 despite Oracle's concern about race timing when Web UI attaches:
-// - Late subscribers receive a history snapshot on subscribe, so they won't miss
-//   events that fired before attachment.
-// - AG-UI events are small JSON objects (~100-500 bytes); 64 slots ~= 32KB worst-case.
-// - A larger buffer (e.g., 256) would only delay backpressure, not eliminate the race.
-// - The correct fix for the race is consumer-side: Web UI should subscribe before/atomically
-//   with requesting the run, not after. That's a caller contract, not a buffer-sizing issue.
 const BROADCAST_BUFFER: usize = 64;
 const FAR_FUTURE_SECS: u64 = 365 * 24 * 60 * 60;
 
@@ -489,6 +480,22 @@ fn test_injection_channel(
     }
 }
 impl SessionActor {
+    fn prompt_config(&self) -> GlobalConfig {
+        prompt_config_for_agent_session_from_global(
+            &self.actor_config.base_config,
+            &self.key,
+            self.actor_config.call_fn.is_some(),
+        )
+    }
+
+    fn event_context(&self) -> SessionEventContext {
+        SessionEventContext::new(
+            self.actor_config.base_config.clone(),
+            self.key.clone(),
+            self.history_snapshot.clone(),
+        )
+    }
+
     async fn run(mut self) {
         let far_future = Instant::now() + Duration::from_secs(FAR_FUTURE_SECS);
         let reap_sleep = sleep_until(far_future);
@@ -537,7 +544,7 @@ impl SessionActor {
             SessionCommand::Subscribe { reply } => {
                 self.subscribers += 1;
                 self.cancel_reap(reap_sleep);
-                self.refresh_history_snapshot();
+                self.refresh_history_snapshot().await;
                 let _ = reply.send(SubscribeResult {
                     snapshot: self.history_snapshot.clone(),
                     events: self.broadcast_tx.subscribe(),
@@ -559,7 +566,7 @@ impl SessionActor {
                 let _ = reply.send(());
             }
             SessionCommand::Get { reply } => {
-                self.refresh_history_snapshot();
+                self.refresh_history_snapshot().await;
                 let _ = reply.send(self.session_info());
             }
             SessionCommand::Unsubscribe => {
@@ -615,7 +622,7 @@ impl SessionActor {
     ) {
         self.run_done_task = None;
         self.active_run = None;
-        self.refresh_history_snapshot();
+        self.refresh_history_snapshot().await;
         match &done.result {
             Ok(harnx_runtime::LoopResult::Completed) => self.finish_completed_run(&done),
             Ok(harnx_runtime::LoopResult::HandoffRequested {
@@ -743,6 +750,7 @@ impl SessionActor {
                 let prompt_config = prompt_config_for_agent_session_from_global(
                     &self.actor_config.base_config,
                     &self.key,
+                    self.actor_config.call_fn.is_some(),
                 );
                 let new_session_id = prompt_config.write().new_session_id();
                 match new_session_id {
@@ -783,8 +791,7 @@ impl SessionActor {
         reap_sleep: &mut std::pin::Pin<&mut Sleep>,
     ) -> RunId {
         self.cancel_reap(reap_sleep);
-        let prompt_config =
-            prompt_config_for_agent_session_from_global(&self.actor_config.base_config, &self.key);
+        let prompt_config = self.prompt_config();
         configure_tool_confirmation(&prompt_config, &options.resume);
         let run_id = RunId::random();
         let thread_id = derive_thread_id(&self.key.session);
@@ -804,7 +811,7 @@ impl SessionActor {
         let sink = Arc::new(BroadcastEventSender::new(
             self.broadcast_tx.clone(),
             MessageId::random(),
-            SessionEventContext::new(self.actor_config.base_config.clone(), self.key.clone()),
+            self.event_context(),
         ));
         let sink_for_task = sink.clone();
         let attachment_refs = options.attachment_refs.clone();
@@ -875,8 +882,7 @@ impl SessionActor {
         done: &RunFinished,
         attachment_refs: &[String],
     ) -> Option<PendingInterruptBatch> {
-        let prompt_config =
-            prompt_config_for_agent_session_from_global(&self.actor_config.base_config, &self.key);
+        let prompt_config = self.prompt_config();
         let session = prompt_config.read().session.clone()?;
         let tool_message = session.messages.last()?;
         let MessageContent::ToolCalls(tool_calls) = &tool_message.content else {
@@ -958,9 +964,29 @@ impl SessionActor {
             && !self.is_running()
     }
 
-    fn refresh_history_snapshot(&mut self) {
-        self.history_snapshot =
-            load_history_snapshot(&self.actor_config.base_config, &self.key).unwrap_or_default();
+    async fn refresh_history_snapshot(&mut self) {
+        self.history_snapshot = if self.actor_config.call_fn.is_some() {
+            let prompt_config = prompt_config_for_agent_session_from_global(
+                &self.actor_config.base_config,
+                &self.key,
+                true,
+            );
+            let snapshot = prompt_config
+                .read()
+                .session
+                .as_ref()
+                .map(|session| crate::ag_ui::history_messages_for_snapshot(&session.messages))
+                .unwrap_or_default();
+            snapshot
+        } else {
+            match crate::load_nats_session(&self.actor_config.base_config, &self.key.session).await
+            {
+                Ok(session) if session.agent_name.as_deref() == Some(self.key.agent.as_str()) => {
+                    crate::ag_ui::history_messages_for_snapshot(&session.messages)
+                }
+                _ => Vec::new(),
+            }
+        };
     }
 }
 
@@ -978,15 +1004,20 @@ struct BroadcastEventSender {
 struct SessionEventContext {
     base_config: Config,
     key: SessionKey,
+    history_snapshot: Vec<AgUiMessage>,
 }
 
 impl SessionEventContext {
-    fn new(base_config: Config, key: SessionKey) -> Self {
-        Self { base_config, key }
+    fn new(base_config: Config, key: SessionKey, history_snapshot: Vec<AgUiMessage>) -> Self {
+        Self {
+            base_config,
+            key,
+            history_snapshot,
+        }
     }
 
     fn history_snapshot(&self) -> Vec<AgUiMessage> {
-        load_history_snapshot(&self.base_config, &self.key).unwrap_or_default()
+        self.history_snapshot.clone()
     }
 
     fn usage_context(&self) -> Option<crate::ag_ui::UsageContextSnapshot> {
@@ -1043,8 +1074,7 @@ impl SessionActor {
         reap_sleep: &mut std::pin::Pin<&mut Sleep>,
     ) -> RunId {
         self.cancel_reap(reap_sleep);
-        let prompt_config =
-            prompt_config_for_agent_session_from_global(&self.actor_config.base_config, &self.key);
+        let prompt_config = self.prompt_config();
 
         let run_id = RunId::random();
         let thread_id = derive_thread_id(&self.key.session);
@@ -1075,8 +1105,7 @@ impl SessionActor {
         let done_tx = self.run_done_tx.clone();
         let run_id_for_task = run_id.clone();
         let thread_id_for_task = thread_id.clone();
-        let session_event_context =
-            SessionEventContext::new(self.actor_config.base_config.clone(), self.key.clone());
+        let session_event_context = self.event_context();
         let sink = Arc::new(BroadcastEventSender::new(
             event_tx,
             MessageId::random(),
@@ -1276,13 +1305,22 @@ fn test_hook_provider(
 fn prompt_config_for_agent_session_from_global(
     base_config: &Config,
     key: &SessionKey,
+    filesystem: bool,
 ) -> GlobalConfig {
     let prompt_config = harnx_session::fork_prompt_config(base_config);
     {
         let mut cfg = prompt_config.write();
         cfg.use_agent_by_name(&key.agent).expect("set actor agent");
-        cfg.use_session(Some(&key.session))
-            .expect("set actor session");
+        if filesystem {
+            cfg.use_session(Some(&key.session))
+                .expect("set actor session");
+        } else {
+            let mut session =
+                config::session::new(&cfg, &key.session, None).expect("create NATS actor session");
+            session.id = key.session.clone();
+            session.session_id = Some(key.session.clone());
+            cfg.session = Some(session);
+        }
     }
     prompt_config
 }
@@ -1301,7 +1339,7 @@ fn usage_context_snapshot(
     base_config: &Config,
     key: &SessionKey,
 ) -> Option<crate::ag_ui::UsageContextSnapshot> {
-    let prompt_config = prompt_config_for_agent_session_from_global(base_config, key);
+    let prompt_config = prompt_config_for_agent_session_from_global(base_config, key, false);
     let config = prompt_config.read();
     let session = config.session.as_ref()?;
     let (context_tokens, percent) = session.tokens_usage();
@@ -1311,20 +1349,6 @@ fn usage_context_snapshot(
         max_context_tokens,
         context_percent: max_context_tokens.map(|_| percent),
     })
-}
-
-fn load_history_snapshot(
-    base_config: &Config,
-    key: &SessionKey,
-) -> anyhow::Result<Vec<AgUiMessage>> {
-    let prompt_config = prompt_config_for_agent_session_from_global(base_config, key);
-    let messages = prompt_config
-        .read()
-        .session
-        .as_ref()
-        .map(|session| crate::ag_ui::history_messages_for_snapshot(&session.messages))
-        .unwrap_or_default();
-    Ok(messages)
 }
 
 fn derive_thread_id(session: &str) -> ThreadId {
@@ -1440,7 +1464,7 @@ mod tests {
     fn load_session_messages(agent: &str, session_id: &str) -> Vec<Message> {
         let key = key(agent, session_id);
         let base_config = load_base_config_for_tests();
-        let prompt_config = prompt_config_for_agent_session_from_global(&base_config, &key);
+        let prompt_config = prompt_config_for_agent_session_from_global(&base_config, &key, true);
         let messages = prompt_config
             .read()
             .session

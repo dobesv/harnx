@@ -34,17 +34,21 @@ use parking_lot::RwLock;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     convert::Infallible,
     net::IpAddr,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::SystemTime,
 };
 use tokio::{net::TcpListener, sync::oneshot};
 use tokio_graceful::Shutdown;
 
 const DEFAULT_MODEL_NAME: &str = "default";
+
+static LOCAL_NATS_HANDLES: LazyLock<
+    tokio::sync::Mutex<HashMap<PathBuf, harnx_runtime::nats_local_server::SharedNatsServer>>,
+> = LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
 /// Maximum upload size in bytes (20 MiB).
 /// Enforced during streaming to prevent OOM from oversized payloads.
@@ -238,14 +242,16 @@ impl Server {
     }
 
     #[doc(hidden)]
-    pub fn list_sessions_json(&self, agent: &str) -> Result<Value> {
-        Ok(Value::Array(agent_sessions_json(&self.config, agent)?))
+    pub async fn list_sessions_json(&self, agent: &str) -> Result<Value> {
+        Ok(Value::Array(
+            agent_sessions_json(&self.config, agent).await?,
+        ))
     }
 
     #[doc(hidden)]
     pub async fn list_session_history(&self, agent: &str, session: &str) -> Result<Value> {
         use http_body_util::BodyExt;
-        let resp = self.session_history_json(agent, session)?;
+        let resp = self.session_history_json(agent, session).await?;
         let body = resp.into_body().collect().await?.to_bytes();
         Ok(serde_json::from_slice(&body)?)
     }
@@ -491,7 +497,7 @@ impl Server {
             AgentsRoute::Agent => {
                 match negotiate_agents_route(&method, req.headers(), agent_route)? {
                     AgentsRepresentation::Html => self.agent_html_page(&agent_name),
-                    AgentsRepresentation::Json => self.agent_json(&agent_name),
+                    AgentsRepresentation::Json => self.agent_json(&agent_name).await,
                     AgentsRepresentation::AgUiSse | AgentsRepresentation::AgUiRpc => {
                         Err(anyhow!("Not Acceptable"))
                     }
@@ -499,7 +505,7 @@ impl Server {
             }
             AgentsRoute::Sessions => {
                 match negotiate_agents_route(&method, req.headers(), agent_route)? {
-                    AgentsRepresentation::Json => self.sessions_json(&agent_name),
+                    AgentsRepresentation::Json => self.sessions_json(&agent_name).await,
                     AgentsRepresentation::Html
                     | AgentsRepresentation::AgUiSse
                     | AgentsRepresentation::AgUiRpc => Err(anyhow!("Not Acceptable")),
@@ -512,24 +518,19 @@ impl Server {
                         self.session_html_page(&agent_name, &session_name)
                     }
                     AgentsRepresentation::Json => {
-                        self.session_history_json(&agent_name, &session_name)
+                        self.session_history_json(&agent_name, &session_name).await
                     }
                     AgentsRepresentation::AgUiSse => {
                         self.ag_ui_run_route(req, &agent_name, &session_name).await
                     }
                     AgentsRepresentation::AgUiRpc => {
-                        let persistence = if self.config.nats_servers.is_empty() {
-                            PersistenceKind::Filesystem
-                        } else {
-                            PersistenceKind::Nats
-                        };
                         handle_ag_ui_rpc(
                             req,
                             &agent_name,
                             &session_name,
                             &self.config,
                             &self.session_registry,
-                            persistence,
+                            PersistenceKind::Nats,
                         )
                         .await
                     }
@@ -554,8 +555,8 @@ impl Server {
         Ok(res)
     }
 
-    fn agent_json(&self, agent: &str) -> Result<AppResponse> {
-        let sessions = agent_sessions_json(&self.config, agent)?;
+    async fn agent_json(&self, agent: &str) -> Result<AppResponse> {
+        let sessions = agent_sessions_json(&self.config, agent).await?;
         let description = self
             .agents
             .iter()
@@ -570,8 +571,10 @@ impl Server {
         json_response(data)
     }
 
-    fn sessions_json(&self, agent: &str) -> Result<AppResponse> {
-        json_response(Value::Array(agent_sessions_json(&self.config, agent)?))
+    async fn sessions_json(&self, agent: &str) -> Result<AppResponse> {
+        json_response(Value::Array(
+            agent_sessions_json(&self.config, agent).await?,
+        ))
     }
 
     async fn upload_session_attachments<B>(&self, req: hyper::Request<B>) -> Result<AppResponse>
@@ -685,15 +688,8 @@ impl Server {
         )
     }
 
-    fn session_history_json(&self, agent: &str, session: &str) -> Result<AppResponse> {
-        let config = agent_scoped_config(&self.config, agent)?;
-        let session_path = config.session_file(session);
-        if !session_path.exists() {
-            bail!("Not Found");
-        }
-
-        let loaded_session = harnx_runtime::config::session::load(&config, session, &session_path)
-            .map_err(|err| anyhow!("Failed to load session history for '{session}': {err}"))?;
+    async fn session_history_json(&self, agent: &str, session: &str) -> Result<AppResponse> {
+        let loaded_session = load_nats_session(&self.config, session).await?;
         if loaded_session.agent_name.as_deref() != Some(agent) {
             bail!("Not Found");
         }
@@ -1220,9 +1216,11 @@ fn session_recency_ordering(
         .then_with(|| right.id.cmp(&left.id))
 }
 
-fn agent_sessions_json(config: &Config, agent: &str) -> Result<Vec<Value>> {
-    let mut sessions: Vec<_> = agent_scoped_config(config, agent)?
-        .list_sessions_with_meta()
+async fn agent_sessions_json(config: &Config, agent: &str) -> Result<Vec<Value>> {
+    ensure_frontend_nats_owner().await?;
+    let mut sessions: Vec<_> = config
+        .list_remote_sessions_with_meta(LOCAL_CLUSTER_KEY)
+        .await?
         .into_iter()
         // Per-agent endpoints must not leak sessions without agent attribution or for other agents.
         // Missing/empty agent_name stays excluded from per-agent lists until a later backfill pass.
@@ -1252,6 +1250,41 @@ fn agent_sessions_json(config: &Config, agent: &str) -> Result<Vec<Value>> {
             Value::Object(value)
         })
         .collect())
+}
+
+pub(crate) async fn load_nats_session(
+    config: &Config,
+    session: &str,
+) -> Result<harnx_core::session::Session> {
+    ensure_frontend_nats_owner().await?;
+    let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
+    let log = harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, session.to_string());
+    let entries = log
+        .load_events_async()
+        .await
+        .map_err(|err| anyhow!("Failed to load session history for '{session}': {err}"))?;
+    if entries.is_empty() {
+        bail!("Not Found");
+    }
+    harnx_runtime::nats_session_log::load_session_from_entries(&entries, session)
+        .map_err(|err| anyhow!("Failed to reconstruct session history for '{session}': {err}"))
+}
+
+#[doc(hidden)]
+pub async fn ensure_frontend_nats_owner() -> Result<()> {
+    if std::env::var_os("HARNX_NATS_URL").is_some()
+        && std::env::var_os("HARNX_NATS_TOKEN").is_some()
+    {
+        return Ok(());
+    }
+
+    let key = harnx_core::config_paths::nats_runtime_ports_file();
+    let mut handles = LOCAL_NATS_HANDLES.lock().await;
+    if !handles.contains_key(&key) {
+        let server = harnx_runtime::nats_local_server::ensure_shared_server().await?;
+        handles.insert(key.clone(), server);
+    }
+    Ok(())
 }
 
 fn format_system_time(value: SystemTime) -> String {
@@ -1744,161 +1777,6 @@ mod tests {
             .collect();
 
         assert_eq!(filtered, vec![json!({"session_id": "alpha"})]);
-    }
-
-    #[test]
-    fn agent_scoped_resolution_lists_and_loads_agent_sessions() {
-        let sandbox = TestConfigSandbox::new();
-        sandbox.write_agent("plain", "You are plain.");
-        sandbox.write_agent("other", "You are other.");
-        let config = sandbox.config();
-
-        let scoped = agent_scoped_config(&config, "plain").expect("scope config");
-        let agent_session_path = scoped.session_file("akjG7w");
-        std::fs::create_dir_all(
-            agent_session_path
-                .parent()
-                .expect("agent session parent directory"),
-        )
-        .expect("create agent sessions dir");
-        let flat_session_path = config.session_file("flat-only");
-        std::fs::create_dir_all(
-            flat_session_path
-                .parent()
-                .expect("flat session parent directory"),
-        )
-        .expect("create flat sessions dir");
-
-        let prompt_config = harnx_session::fork_prompt_config(&config);
-        {
-            let mut prompt = prompt_config.write();
-            prompt.use_agent_by_name("plain").expect("set agent");
-            prompt.use_session(Some("akjG7w")).expect("open session");
-            let session = prompt.session.as_mut().expect("session loaded");
-            session.messages.push(Message::new(
-                MessageRole::User,
-                harnx_core::message::MessageContent::Text("hi from scoped dir".into()),
-            ));
-            harnx_runtime::config::session::save(
-                session,
-                "agent-real",
-                &agent_session_path,
-                false,
-                None,
-            )
-            .expect("save scoped session");
-        }
-
-        std::fs::write(
-            &flat_session_path,
-            concat!(
-                "type: header
-",
-                "session_id: flat-only
-",
-                "working_dir: /tmp/project
-",
-                "agent_name: plain
-",
-                "---
-",
-                "type: message
-",
-                "role: user
-",
-                "content: hi from flat dir
-",
-            ),
-        )
-        .expect("write flat session");
-
-        let listed = agent_sessions_json(&config, "plain").expect("list scoped sessions");
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].get("session_id"), Some(&json!("akjG7w")));
-        assert!(listed[0].get("updated_at").is_some());
-
-        let loaded =
-            harnx_runtime::config::session::load(&scoped, "agent-real", &agent_session_path)
-                .expect("load scoped session");
-        assert_eq!(loaded.agent_name.as_deref(), Some("plain"));
-        assert!(!loaded.messages.is_empty());
-        assert_eq!(
-            history_message_content(loaded.messages.last().expect("latest message")),
-            "hi from scoped dir"
-        );
-        assert!(!scoped.session_file("flat-only").exists());
-    }
-
-    #[test]
-    fn agent_sessions_json_orders_by_recency_desc() {
-        use std::time::{Duration, UNIX_EPOCH};
-
-        let sandbox = TestConfigSandbox::new();
-        sandbox.write_agent("plain", "You are plain.");
-        let config = sandbox.config();
-
-        // Persist three sessions for the same agent via the real save API, then
-        // stamp distinct mtimes. Ordering must be most-recently-modified first,
-        // independent of id order.
-        let scoped = agent_scoped_config(&config, "plain").expect("scope config");
-        let write_session = |session_id: &str, mtime: SystemTime| {
-            let path = scoped.session_file(session_id);
-            std::fs::create_dir_all(path.parent().expect("session parent"))
-                .expect("create sessions dir");
-
-            let prompt_config = harnx_session::fork_prompt_config(&config);
-            {
-                let mut prompt = prompt_config.write();
-                prompt.use_agent_by_name("plain").expect("set agent");
-                prompt.use_session(Some(session_id)).expect("open session");
-                let session = prompt.session.as_mut().expect("session loaded");
-                session.messages.push(Message::new(
-                    MessageRole::User,
-                    harnx_core::message::MessageContent::Text("hi".into()),
-                ));
-                harnx_runtime::config::session::save(session, "agent-real", &path, false, None)
-                    .expect("save scoped session");
-            }
-
-            std::fs::File::options()
-                .write(true)
-                .open(&path)
-                .expect("open session for mtime")
-                .set_modified(mtime)
-                .expect("set mtime");
-        };
-
-        let base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        // Deliberately write in non-recency, non-alpha order.
-        write_session("bbb", base + Duration::from_secs(20)); // newest
-        write_session("aaa", base + Duration::from_secs(10)); // middle
-        write_session("ccc", base); // oldest
-
-        let listed = agent_sessions_json(&config, "plain").expect("list scoped sessions");
-        assert_eq!(listed.len(), 3, "all three sessions listed");
-
-        // Every entry surfaces updated_at, and the list is ordered most-recent-first.
-        let updated_at: Vec<&str> = listed
-            .iter()
-            .map(|session| {
-                session
-                    .get("updated_at")
-                    .and_then(Value::as_str)
-                    .expect("updated_at present")
-            })
-            .collect();
-
-        let mut sorted_desc = updated_at.clone();
-        sorted_desc.sort_by(|left, right| right.cmp(left));
-        assert_eq!(
-            updated_at, sorted_desc,
-            "sessions must be ordered by updated_at descending"
-        );
-        // Confirm the stamped mtimes actually differ so the ordering check is meaningful.
-        assert!(
-            updated_at[0] > updated_at[1] && updated_at[1] > updated_at[2],
-            "distinct descending timestamps expected, got {updated_at:?}"
-        );
     }
 
     #[test]

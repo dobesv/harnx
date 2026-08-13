@@ -127,6 +127,82 @@ impl Drop for TestConfigSandbox {
     }
 }
 
+pub struct NatsSessionSeed<'a> {
+    pub agent: &'a str,
+    pub session_id: &'a str,
+    pub messages: &'a [harnx_core::message::Message],
+}
+
+/// Seed the local NATS store with a complete session for control-plane tests.
+///
+/// Returns `false` when the optional `nats-server` test dependency is not
+/// installed, allowing NATS-backed tests to follow the workspace convention
+/// of skipping on platforms whose CI jobs do not provide the binary.
+pub async fn seed_nats_session(config: &Config, seed: NatsSessionSeed<'_>) -> bool {
+    use harnx_core::session::SessionLogEntry;
+    use harnx_runtime::{
+        config::LOCAL_CLUSTER_KEY,
+        nats_session_index::{self, SessionIndexRecord},
+        nats_session_log::NatsSessionLog,
+    };
+
+    if let Err(error) = crate::ensure_frontend_nats_owner().await {
+        if error.to_string().contains("nats-server binary not found") {
+            eprintln!("skipping NATS-backed harnx-serve test: {error}");
+            return false;
+        }
+        panic!("local NATS owner: {error:#}");
+    }
+    let mut scoped = config.clone();
+    scoped.use_agent_by_name(seed.agent).expect("seed agent");
+    let mut session =
+        harnx_runtime::config::session::new(&scoped, seed.session_id, None).expect("seed session");
+    session.id = seed.session_id.to_string();
+    session.session_id = Some(seed.session_id.to_string());
+
+    let jetstream = config
+        .nats_jetstream(LOCAL_CLUSTER_KEY)
+        .await
+        .expect("local NATS context");
+    let log = NatsSessionLog::new(jetstream.clone(), seed.session_id.to_string());
+    log.append_event_async(&session.build_header_entry())
+        .await
+        .expect("append session header");
+    for message in seed.messages {
+        log.append_event_async(&SessionLogEntry::Message {
+            id: message.id.clone(),
+            role: message.role,
+            content: message.content.clone(),
+            timestamp: message.log_timestamp,
+            fence_token: None,
+        })
+        .await
+        .expect("append session message");
+    }
+
+    let index = nats_session_index::ensure_index_bucket(&jetstream, 1)
+        .await
+        .expect("session index");
+    nats_session_index::put_record(
+        &index,
+        &SessionIndexRecord {
+            session_id: seed.session_id.to_string(),
+            agent_name: seed.agent.to_string(),
+            working_dir: session.working_dir,
+            git_branch: session.git_branch,
+            git_remote: session.git_remote,
+            title: None,
+            last_activity: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("current time")
+                .as_secs(),
+        },
+    )
+    .await
+    .expect("put session index record");
+    true
+}
+
 pub fn unique_test_config_dir(scope: &str) -> PathBuf {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -8,7 +8,11 @@ use std::{
 
 use anyhow::anyhow;
 use bytes::Bytes;
-use harnx_core::{event::ContentBlock, message::Message, tool::ToolCall};
+use harnx_core::{
+    event::ContentBlock,
+    message::{Message, MessageContent, MessageRole},
+    tool::ToolCall,
+};
 use harnx_runtime::{
     client::{CompletionTokenUsage, TestStateGuard},
     config::Config,
@@ -1186,37 +1190,22 @@ async fn e2e_success_criterion_9_legacy_endpoints_and_history_unchanged() {
     let sandbox = TestConfigSandbox::new();
     sandbox.write_agent("plain", "You are plain.");
     let config = sandbox.config();
-    let call_fn: AgentCallFn = Arc::new(|_input, _config, _abort| {
-        Box::pin(async {
-            Ok((
-                "assistant legacy".to_string(),
-                None,
-                Vec::<ToolCall>::new(),
-                CompletionTokenUsage::default(),
-            ))
-        })
-    });
-    let registry =
-        SessionRegistry::new_for_tests(config.clone(), Duration::from_secs(30), Some(call_fn));
-
-    // Create a run via AG-UI SSE to have a session persisted
-    let response = open_sse(
+    let messages = [Message::new(
+        MessageRole::User,
+        MessageContent::Text("history please".into()),
+    )];
+    if !harnx_serve::test_support::seed_nats_session(
         &config,
-        &registry,
-        "plain",
-        "criteria-9",
-        json!([{"id":Uuid::new_v4(),"role":"user","content":"history please"}]),
+        harnx_serve::test_support::NatsSessionSeed {
+            agent: "plain",
+            session_id: "criteria-9",
+            messages: &messages,
+        },
     )
-    .await;
-    let _ = read_sse_until(response, Duration::from_secs(10), |read| {
-        read.events.iter().any(|event| {
-            matches!(
-                event["type"].as_str(),
-                Some("RUN_FINISHED") | Some("RUN_ERROR")
-            )
-        })
-    })
-    .await;
+    .await
+    {
+        return;
+    }
 
     // Build a real Server and exercise the legacy P1 endpoints directly
     let global_config: GlobalConfig = Arc::new(parking_lot::RwLock::new(config.clone()));
@@ -1225,6 +1214,7 @@ async fn e2e_success_criterion_9_legacy_endpoints_and_history_unchanged() {
     // Hit GET /v1/agents/{agent}/sessions (agent enumeration) via real handler
     let sessions = server
         .list_sessions_json("plain")
+        .await
         .expect("sessions response");
     assert!(
         sessions.as_array().map(|a| a.len() == 1).unwrap_or(false),
