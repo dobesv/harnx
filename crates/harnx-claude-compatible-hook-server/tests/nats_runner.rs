@@ -79,7 +79,7 @@ async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
         .spawn()
         .context("spawn nats-server")?;
     let deadline = Instant::now() + Duration::from_secs(15);
-    let url = read_ports_file(ports_dir.path(), &mut child, deadline)?;
+    let url = read_nats_ports_file(ports_dir.path(), &mut child, deadline).await?;
     loop {
         match async_nats::ConnectOptions::new()
             .token(TOKEN.to_string())
@@ -114,25 +114,37 @@ async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
 /// can point at a differently named binary. nats-server writes into the file
 /// directly rather than renaming it into place, so a partial read is possible;
 /// failing to parse is treated the same as not-yet-written.
-fn read_ports_file(dir: &Path, child: &mut Child, deadline: Instant) -> Result<String> {
+async fn read_nats_ports_file(dir: &Path, child: &mut Child, deadline: Instant) -> Result<String> {
     loop {
-        if let Some(url) = first_client_url(dir) {
+        if let Some(url) = first_nats_client_url(dir) {
             return Ok(url);
         }
-        if let Some(status) = child.try_wait()? {
-            anyhow::bail!("nats-server exited during startup: {status}");
+        // `std::process::Child` does not kill on drop, so every failure path here
+        // has to reap the server or it keeps running after the test gives up.
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                anyhow::bail!("nats-server exited during startup: {status}")
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("poll nats-server during startup");
+            }
         }
         if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
             anyhow::bail!(
                 "timed out waiting for the nats-server ports file in {}",
                 dir.display()
             );
         }
-        std::thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
-fn first_client_url(dir: &Path) -> Option<String> {
+fn first_nats_client_url(dir: &Path) -> Option<String> {
     for entry in std::fs::read_dir(dir).ok()? {
         let path = entry.ok()?.path();
         if path.extension().is_some_and(|ext| ext == "ports") {

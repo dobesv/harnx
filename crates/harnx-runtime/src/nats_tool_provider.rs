@@ -761,7 +761,7 @@ mod tests {
         // Allocating one here and dropping the listener first left a window for a
         // concurrently starting server to claim the same port.
         let ports_dir = tempfile::tempdir().expect("create NATS ports dir");
-        let child = std::process::Command::new(&binary)
+        let mut child = std::process::Command::new(&binary)
             .arg("-a")
             .arg("127.0.0.1")
             .arg("-p")
@@ -778,6 +778,10 @@ mod tests {
                 break url;
             }
             if std::time::Instant::now() >= deadline {
+                // Reap first: Child does not kill on drop, so panicking here would
+                // leave nats-server running for the rest of the test binary.
+                let _ = child.kill();
+                let _ = child.wait();
                 panic!("nats-server did not report its port before the deadline");
             }
             std::thread::sleep(std::time::Duration::from_millis(20));

@@ -90,7 +90,9 @@ async fn try_spawn_nats_once(
         ports_dir.path(),
         &mut child,
         Instant::now() + Duration::from_secs(15),
-    ) {
+    )
+    .await
+    {
         Ok(url) => url,
         Err(e) => {
             let _ = child.kill();
@@ -204,7 +206,7 @@ async fn wait_for_nats_ready(url: &str, auth_token: Option<&str>) -> Result<()> 
 /// can point at a differently named binary. nats-server writes into the file
 /// directly rather than renaming it into place, so a partial read is possible;
 /// failing to parse is treated the same as not-yet-written.
-fn read_nats_ports_file(
+async fn read_nats_ports_file(
     dir: &std::path::Path,
     child: &mut Child,
     deadline: Instant,
@@ -213,16 +215,28 @@ fn read_nats_ports_file(
         if let Some(url) = first_nats_client_url(dir) {
             return Ok(url);
         }
-        if let Some(status) = child.try_wait()? {
-            anyhow::bail!("nats-server exited during startup: {status}");
+        // `std::process::Child` does not kill on drop, so every failure path here
+        // has to reap the server or it keeps running after the test gives up.
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                anyhow::bail!("nats-server exited during startup: {status}")
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("poll nats-server during startup");
+            }
         }
         if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
             anyhow::bail!(
                 "timed out waiting for the nats-server ports file in {}",
                 dir.display()
             );
         }
-        std::thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
