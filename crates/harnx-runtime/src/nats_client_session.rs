@@ -480,6 +480,16 @@ impl ThinClientSession {
                 harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)
             {
                 cached_effective = Some(effective);
+                // Paired with the cache refresh everywhere else. If the loop
+                // exited before any reload succeeded — a closed subscription, or
+                // a cancel before the first completion tick — this is the first
+                // reconstruction, and without it live Message and ToolCalls rows
+                // never get their LogSeqAssigned.
+                emit_all_logical_seqs_for_window(
+                    cached_effective.as_deref(),
+                    &event_sink,
+                    &mut emitted_logical_seqs,
+                );
             }
         }
 
