@@ -11,7 +11,6 @@ use harnx_core::config_paths::{
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -23,6 +22,9 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_millis(100);
 const SPAWN_ATTEMPTS: usize = 5;
+/// How long to wait for nats-server to write its ports file. Generous: it is
+/// written as soon as the listeners are bound, well before JetStream is ready.
+const PORT_REPORT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Authenticated connection details for the shared local NATS server.
 ///
@@ -213,8 +215,7 @@ async fn start_owned_server(lock_file: File) -> Result<SharedNatsServer> {
 }
 
 async fn spawn_once(binary: &Path, config_path: &Path, token: &str) -> Result<(Child, u16)> {
-    let port = free_tcp_port()?;
-    write_server_config_atomically(config_path, port, token)?;
+    write_server_config_atomically(config_path, token)?;
 
     let mut command = Command::new(binary);
     command
@@ -228,13 +229,69 @@ async fn spawn_once(binary: &Path, config_path: &Path, token: &str) -> Result<(C
         .spawn()
         .with_context(|| format!("failed to spawn {}", binary.display()))?;
 
+    let child_pid = child.id();
+    let port = match read_bound_port(&mut child, child_pid).await {
+        Ok(port) => port,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
     let url = format!("nats://127.0.0.1:{port}");
     if let Err(error) = wait_for_nats_ready(&url, token, &mut child).await {
         let _ = child.kill();
         let _ = child.wait();
+        remove_ports_file(port_report_path(child_pid));
         return Err(error);
     }
+    // nats-server removes its own ports file on a clean exit, but this server is
+    // usually killed, so drop it now that the port is known and republished in
+    // harnx's ports.json.
+    remove_ports_file(port_report_path(child_pid));
     Ok((child, port))
+}
+
+/// Wait for nats-server to report the port it bound.
+///
+/// The file is matched on the child's pid rather than on the executable name,
+/// which the caller can override, and which also makes leftover reports from
+/// earlier runs impossible to confuse for this one. nats-server writes into the
+/// file rather than renaming it into place, so a parse failure is treated the
+/// same as not-yet-written.
+async fn read_bound_port(child: &mut Child, pid: u32) -> Result<u16> {
+    let path = port_report_path(pid);
+    let deadline = Instant::now() + PORT_REPORT_TIMEOUT;
+    loop {
+        if let Some(port) = parse_reported_port(&path) {
+            return Ok(port);
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("shared local NATS exited during startup: {status}");
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "shared local NATS did not report its port within {}s",
+                PORT_REPORT_TIMEOUT.as_secs()
+            );
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn port_report_path(pid: u32) -> PathBuf {
+    nats_runtime_dir().join(format!("nats-server_{pid}.ports"))
+}
+
+fn parse_reported_port(path: &Path) -> Option<u16> {
+    let contents = fs::read_to_string(path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    let url = parsed.get("nats")?.get(0)?.as_str()?;
+    url.rsplit_once(':')?.1.parse().ok()
+}
+
+fn remove_ports_file(path: PathBuf) {
+    remove_file_if_present(&path, "shared local NATS ports report");
 }
 
 #[cfg(target_os = "linux")]
@@ -423,19 +480,20 @@ fn parse_major_minor(version: &str) -> Option<(u64, u64)> {
     })
 }
 
-fn free_tcp_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .context("failed to allocate a port for shared local NATS")?;
-    Ok(listener.local_addr()?.port())
-}
-
-fn write_server_config_atomically(destination: &Path, port: u16, token: &str) -> Result<()> {
+/// Write the server config. `port: -1` asks nats-server to take a free port from
+/// the kernel and keep it, and `ports_file_dir` is how it reports back what it
+/// bound. Allocating the port here and closing the listener before nats-server
+/// opened it left a window where another process could claim it, which showed up
+/// as a spawn attempt dying immediately.
+fn write_server_config_atomically(destination: &Path, token: &str) -> Result<()> {
     let runtime_dir = nats_runtime_dir();
     let store_dir = serde_json::to_string(&nats_runtime_store_dir())
         .context("failed to encode shared local NATS store path")?;
+    let ports_dir = serde_json::to_string(&runtime_dir)
+        .context("failed to encode shared local NATS ports directory")?;
     let token = serde_json::to_string(token).context("failed to encode shared local NATS token")?;
     let config = format!(
-        "host: \"127.0.0.1\"\nport: {port}\njetstream {{ store_dir: {store_dir} }}\nauthorization {{ token: {token} }}\n"
+        "host: \"127.0.0.1\"\nport: -1\nports_file_dir: {ports_dir}\njetstream {{ store_dir: {store_dir} }}\nauthorization {{ token: {token} }}\n"
     );
     let mut temporary = NamedTempFile::new_in(&runtime_dir).with_context(|| {
         format!(
