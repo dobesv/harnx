@@ -396,6 +396,7 @@ impl ThinClientSession {
                                 cached_effective.as_deref(),
                                 &event_sink,
                                 &mut emitted_logical_seqs,
+                                AdvisoryFlush::Live,
                             );
                         }
                         if self.is_turn_complete(&entries, user_msg_seq) {
@@ -426,6 +427,7 @@ impl ThinClientSession {
                                     cached_effective.as_deref(),
                                     &event_sink,
                                     &mut emitted_logical_seqs,
+                                    AdvisoryFlush::Live,
                                 );
                             }
                             // Poll durable log for turn completion, but at most
@@ -447,6 +449,7 @@ impl ThinClientSession {
                                             cached_effective.as_deref(),
                                             &event_sink,
                                             &mut emitted_logical_seqs,
+                                            AdvisoryFlush::Live,
                                         );
                                     }
                                     if self.is_turn_complete(&entries, user_msg_seq) {
@@ -502,6 +505,7 @@ impl ThinClientSession {
             cached_effective.as_deref(),
             &event_sink,
             &mut emitted_logical_seqs,
+            AdvisoryFlush::Final,
         );
 
         if let Some(error) = &turn_error {
@@ -770,28 +774,44 @@ fn emit_live_logical_seq_for_physical(
     Some(logical_index)
 }
 
+/// Whether another flush can still happen for this turn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdvisoryFlush {
+    /// Mid-turn. With no reconstructed log to decorate against, advisories stay
+    /// queued so a later flush can stamp them.
+    Live,
+    /// Last flush of the turn. Nothing runs after this, so holding an advisory
+    /// means losing it — emit it undecorated instead.
+    Final,
+}
+
 fn flush_pending_advisories(
     pending_advisories: &mut VecDeque<crate::nats_event_sink::AdvisoryEnvelope>,
     effective_entries: Option<&[(u64, SessionLogEntry)]>,
     sink: &Arc<dyn AgentEventSink>,
     emitted_logical_seqs: &mut HashSet<usize>,
+    mode: AdvisoryFlush,
 ) {
-    let Some(effective_entries) = effective_entries else {
-        return;
+    let window = match effective_entries {
+        Some(entries) => Some(active_context_window(entries)),
+        // Reconstruction failed, or no durable load has succeeded yet.
+        None if mode == AdvisoryFlush::Live => return,
+        None => None,
     };
-    let window = active_context_window(effective_entries);
     while let Some(envelope) = pending_advisories.pop_front() {
         // `after_seq` may point at a physical mutation entry (for example the
         // worker's header EditEntries append) that reconstruction intentionally
         // removes. Sequence decoration is therefore best-effort; never hold a
         // live streaming advisory forever merely because that physical seq has
         // no effective logical entry.
-        let _ = emit_live_logical_seq_for_physical(
-            envelope.after_seq,
-            &window,
-            sink,
-            emitted_logical_seqs,
-        );
+        if let Some(window) = &window {
+            let _ = emit_live_logical_seq_for_physical(
+                envelope.after_seq,
+                window,
+                sink,
+                emitted_logical_seqs,
+            );
+        }
         if !matches!(
             envelope.event,
             AgentEvent::Session(SessionEvent::LogSeqAssigned { .. })
@@ -972,6 +992,50 @@ mod tests {
             self.count.fetch_add(1, Ordering::SeqCst);
             self.events.lock().unwrap().push(event);
         }
+    }
+
+    /// A turn's last flush must not swallow notices just because the durable log
+    /// could not be reconstructed. Holding them there loses them, and losing the
+    /// "exhausted retries" warning is the whole reason this queue gets flushed.
+    #[test]
+    fn final_flush_emits_advisories_when_the_log_cannot_be_reconstructed() {
+        use harnx_core::event::NoticeEvent;
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let sink: Arc<dyn AgentEventSink> = Arc::new(TestSink {
+            count: Arc::clone(&count),
+            events: Mutex::new(Vec::new()),
+        });
+        let mut pending = VecDeque::from(vec![crate::nats_event_sink::AdvisoryEnvelope::new(
+            7,
+            AgentEvent::Notice(NoticeEvent::Warning("exhausted retries".to_string())),
+        )]);
+        let mut emitted = HashSet::new();
+
+        // Live: nothing to decorate against, so wait for a later flush.
+        flush_pending_advisories(&mut pending, None, &sink, &mut emitted, AdvisoryFlush::Live);
+        assert_eq!(pending.len(), 1, "live flush must retain, not drop");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "live flush must not emit yet"
+        );
+
+        // Final: no later flush exists, so emit undecorated rather than lose it.
+        flush_pending_advisories(
+            &mut pending,
+            None,
+            &sink,
+            &mut emitted,
+            AdvisoryFlush::Final,
+        );
+        assert!(pending.is_empty(), "final flush must drain the queue");
+        // The point of the test: drained AND delivered, not drained by dropping.
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "final flush must emit the notice, not discard it"
+        );
     }
 
     fn test_entries(entries: &[(u64, MessageRole, &str)]) -> Vec<(u64, SessionLogEntry)> {
