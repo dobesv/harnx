@@ -472,24 +472,36 @@ impl ThinClientSession {
             }
         }
 
-        // Re-load durable log to get final state if we haven't already
+        // Re-load durable log to get final state if we haven't already.
+        //
+        // The error is held rather than propagated with `?`: returning here would
+        // skip the final flush below and lose advisories that had already been
+        // received, which is the whole point of that flush. They get emitted
+        // undecorated (no reload means no window), then the error is returned.
+        let mut final_reload_error = None;
         if !turn_complete {
-            let entries = self.load_durable_entries().await?;
-            (final_response, turn_error) = Self::extract_turn_outcome(&entries, user_msg_seq);
-            if let Ok(effective) =
-                harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)
-            {
-                cached_effective = Some(effective);
-                // Paired with the cache refresh everywhere else. If the loop
-                // exited before any reload succeeded — a closed subscription, or
-                // a cancel before the first completion tick — this is the first
-                // reconstruction, and without it live Message and ToolCalls rows
-                // never get their LogSeqAssigned.
-                emit_all_logical_seqs_for_window(
-                    cached_effective.as_deref(),
-                    &event_sink,
-                    &mut emitted_logical_seqs,
-                );
+            match self.load_durable_entries().await {
+                Ok(entries) => {
+                    (final_response, turn_error) =
+                        Self::extract_turn_outcome(&entries, user_msg_seq);
+                    if let Ok(effective) =
+                        harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)
+                    {
+                        cached_effective = Some(effective);
+                        // Paired with the cache refresh everywhere else. If the
+                        // loop exited before any reload succeeded — a closed
+                        // subscription, or a cancel before the first completion
+                        // tick — this is the first reconstruction, and without it
+                        // live Message and ToolCalls rows never get their
+                        // LogSeqAssigned.
+                        emit_all_logical_seqs_for_window(
+                            cached_effective.as_deref(),
+                            &event_sink,
+                            &mut emitted_logical_seqs,
+                        );
+                    }
+                }
+                Err(error) => final_reload_error = Some(error),
             }
         }
 
@@ -517,6 +529,10 @@ impl ThinClientSession {
             &mut emitted_logical_seqs,
             AdvisoryFlush::Final,
         );
+
+        if let Some(error) = final_reload_error {
+            return Err(error);
+        }
 
         if let Some(error) = &turn_error {
             render_error_entry(error, &event_sink);
