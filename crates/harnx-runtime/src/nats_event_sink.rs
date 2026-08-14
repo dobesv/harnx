@@ -86,6 +86,13 @@ pub struct NatsEventSink {
     /// Stale-low values are safe (a caught-up client just drops that advisory;
     /// advisory delivery is lossy by contract).
     after_seq: Arc<AtomicU64>,
+    /// Ordered hand-off to the single publisher task. `emit` stamps and enqueues
+    /// synchronously; one task drains this FIFO so advisories reach NATS in
+    /// emission order. Previously `emit` spawned a task per event, which let
+    /// concurrent publishes finish in any order — a warning and the notice that
+    /// followed it could arrive swapped, and no consumer could recover the
+    /// intended sequence.
+    publisher: tokio::sync::mpsc::UnboundedSender<AdvisoryEnvelope>,
 }
 
 impl NatsEventSink {
@@ -111,10 +118,21 @@ impl NatsEventSink {
                 .unwrap_or(0),
             Err(_) => 0,
         };
+        let subject = events_subject(&session_id);
+        let (publisher, mut rx) = tokio::sync::mpsc::unbounded_channel::<AdvisoryEnvelope>();
+        let publisher_client = client.clone();
+        let publisher_subject = subject.clone();
+        // Ends when every clone of this sink is dropped and the channel closes.
+        tokio::spawn(async move {
+            while let Some(envelope) = rx.recv().await {
+                publish_envelope(&publisher_client, &publisher_subject, envelope).await;
+            }
+        });
         Self {
             client,
-            subject: events_subject(&session_id),
+            subject,
             after_seq: Arc::new(AtomicU64::new(seed)),
+            publisher,
         }
     }
 
@@ -136,33 +154,41 @@ impl NatsEventSink {
     /// round-trip — `after_seq` comes from the cached atomic.
     pub async fn publish_event(&self, event: AgentEvent) {
         let after_seq = self.after_seq.load(Ordering::Relaxed);
-        let envelope = AdvisoryEnvelope::new(after_seq, event);
-        match envelope.to_bytes() {
-            Ok(payload) => {
-                if let Err(e) = self
-                    .client
-                    .publish(self.subject.clone(), payload.into())
-                    .await
-                {
-                    log::debug!("advisory event publish failed (lossy-OK): {e}");
-                }
+        publish_envelope(
+            &self.client,
+            &self.subject,
+            AdvisoryEnvelope::new(after_seq, event),
+        )
+        .await;
+    }
+}
+
+/// Publish one advisory. Best-effort core NATS (non-durable); failures are
+/// logged, never propagated.
+async fn publish_envelope(client: &async_nats::Client, subject: &str, envelope: AdvisoryEnvelope) {
+    match envelope.to_bytes() {
+        Ok(payload) => {
+            if let Err(e) = client.publish(subject.to_string(), payload.into()).await {
+                log::debug!("advisory event publish failed (lossy-OK): {e}");
             }
-            Err(e) => log::debug!("failed to serialize advisory event: {e}"),
         }
+        Err(e) => log::debug!("failed to serialize advisory event: {e}"),
     }
 }
 
 impl AgentEventSink for NatsEventSink {
     fn emit(&self, event: AgentEvent) {
-        // The trait method is sync but publish is async. Fire-and-forget onto
-        // the current runtime so the agent loop is never blocked, and so this
-        // works on any runtime flavor (block_in_place would panic on a
-        // current-thread runtime). Advisory delivery is lossy by contract, so
-        // dropping on a missing runtime handle is acceptable.
-        let sink = self.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move { sink.publish_event(event).await });
-        }
+        // Stamp `after_seq` and enqueue synchronously, so both the ordering hint
+        // and the queue position reflect the order events were emitted in. The
+        // publisher task then sends them one at a time.
+        //
+        // This used to spawn a task per event, which never blocked the agent loop
+        // but also gave up ordering: N detached publishes race, so a notice could
+        // overtake the one emitted before it. Enqueuing is just as non-blocking
+        // and needs no runtime handle. Delivery stays lossy by contract — a send
+        // failure means the publisher task is gone, and is dropped as before.
+        let after_seq = self.after_seq.load(Ordering::Relaxed);
+        let _ = self.publisher.send(AdvisoryEnvelope::new(after_seq, event));
     }
 }
 
