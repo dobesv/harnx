@@ -47,6 +47,13 @@ impl BashServer {
             extra_env,
         } = spec;
         let mut sb_args = self.build_sandbox_args(working_dir);
+        // The server writes shebang scripts and execution logs here. Grant the
+        // helper access to its own private directory even when callers use a
+        // deliberately narrow filesystem allowlist.
+        sb_args.push(OsString::from("--write"));
+        sb_args.push(exec_dir.as_os_str().to_owned());
+        sb_args.push(OsString::from("--exec"));
+        sb_args.push(exec_dir.as_os_str().to_owned());
         sb_args.push(OsString::from("--working-dir"));
         sb_args.push(working_dir.as_os_str().to_owned());
         if let Some(extra_env) = extra_env {

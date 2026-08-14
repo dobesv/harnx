@@ -99,7 +99,7 @@ pub async fn execute_tool_round_with_persistence(
     let dry_run = config.read().dry_run;
 
     if persistence.persist_tool_calls && !dry_run {
-        config.write().save_session_tool_calls(
+        config.write().append_session_tool_calls(
             input,
             completion.output,
             completion.thought,
@@ -128,29 +128,45 @@ pub async fn execute_tool_round_with_persistence(
             if ToolApprovalInterrupt::from_error(&err).is_some() {
                 return Err(err);
             }
-            let fallback: Vec<ToolResult> = tool_calls
-                .into_iter()
-                .map(|call| {
-                    ToolResult::new(
-                        call,
-                        serde_json::json!({
-                            "error": format!("tool execution failed: {err:#}")
-                        }),
-                    )
-                })
-                .collect();
             if !dry_run {
-                let fallback = populate_result_markdown(fallback, &eval_ctx);
-                let _ = config.write().save_session_tool_results(&fallback);
+                persist_failed_tool_results(config, tool_calls, &eval_ctx, &err)?;
             }
             return Err(err);
         }
     };
     let results = populate_result_markdown(results, &eval_ctx);
     if !dry_run {
-        config.write().save_session_tool_results(&results)?;
+        config.write().append_session_tool_results(&results)?;
     }
     Ok(results)
+}
+
+fn persist_failed_tool_results(
+    config: &GlobalConfig,
+    tool_calls: Vec<ToolCall>,
+    eval_ctx: &ToolEvalContext,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let fallback = tool_calls
+        .into_iter()
+        .map(|call| {
+            ToolResult::new(
+                call,
+                serde_json::json!({
+                    "error": format!("tool execution failed: {error:#}")
+                }),
+            )
+        })
+        .collect();
+    let fallback = populate_result_markdown(fallback, eval_ctx);
+    config
+        .write()
+        .append_session_tool_results(&fallback)
+        .map_err(|persist_error| {
+            anyhow::anyhow!(
+                "{error:#}; additionally failed to persist fallback tool results: {persist_error:#}"
+            )
+        })
 }
 
 fn build_dispatch_hook_fn(

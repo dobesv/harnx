@@ -5,6 +5,18 @@ use crate::utils::{edit_file, temp_file, AbortSignal};
 use anyhow::{anyhow, bail, Context, Result};
 use harnx_core::session_reconstruct::active_context_window;
 
+pub(crate) async fn clear_remote_session(
+    config: &GlobalConfig,
+    abort_signal: &AbortSignal,
+) -> Result<()> {
+    let thin = remote_thin_session(config, abort_signal).await?;
+    let log = NatsSessionLog::new(thin.jetstream().clone(), thin.session_id().to_string());
+    log.append_event_async(&SessionLogEntry::Clear)
+        .await
+        .context("Failed to persist session clear in NATS")?;
+    Ok(())
+}
+
 impl Config {
     pub(crate) fn edit_message_text_with_tui_hooks(
         &mut self,
@@ -421,17 +433,16 @@ pub async fn load_remote_transcript_for_render(
 ) -> Result<RemoteTranscriptState> {
     let log = NatsSessionLog::new(thin.jetstream().clone(), thin.session_id().to_string());
     let entries = log.load_events_async().await?;
-    let effective_entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)
+    transcript_state_from_entries(&entries, thin.session_id())
+}
+
+fn transcript_state_from_entries(
+    entries: &[(u64, SessionLogEntry)],
+    session_id: &str,
+) -> Result<RemoteTranscriptState> {
+    let effective_entries = harnx_core::session_reconstruct::apply_log_mutations_nats(entries)
         .context("failed to reconstruct remote session log for transcript render")?;
     let window = active_context_window(&effective_entries);
-
-    if window.boundary_index().is_none() {
-        return Ok(RemoteTranscriptState {
-            compressed_messages: vec![],
-            messages: vec![],
-            compaction_summary: None,
-        });
-    }
 
     let raw_entries = effective_entries
         .iter()
@@ -442,8 +453,7 @@ pub async fn load_remote_transcript_for_render(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut session =
-        super::session::replay_log_entries_for_external(&raw_entries, thin.session_id())?;
+    let mut session = super::session::replay_log_entries_for_external(&raw_entries, session_id)?;
 
     renumber_remote_messages_for_window(
         &mut session.compressed_messages,
@@ -619,4 +629,47 @@ pub(crate) async fn load_remote_session_for_render(
         logical_targets,
         last_seen_stream_seq,
     })
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    use super::*;
+    use harnx_core::message::{MessageContent, MessageRole};
+
+    fn message(seq: u64, role: MessageRole, text: &str) -> (u64, SessionLogEntry) {
+        (
+            seq,
+            SessionLogEntry::Message {
+                id: None,
+                timestamp: None,
+                fence_token: None,
+                role,
+                content: MessageContent::Text(text.to_string()),
+            },
+        )
+    }
+
+    #[test]
+    fn transcript_render_uses_entire_headerless_nats_log() {
+        let entries = vec![
+            message(1, MessageRole::User, "prior question"),
+            message(2, MessageRole::Assistant, "prior answer"),
+        ];
+
+        let state = transcript_state_from_entries(&entries, "legacy-session")
+            .expect("reconstruct headerless NATS transcript");
+        let rows = state
+            .messages
+            .iter()
+            .map(|message| (message.role, message.content.to_text(), message.log_seq))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rows,
+            vec![
+                (MessageRole::User, "prior question".to_string(), Some(0)),
+                (MessageRole::Assistant, "prior answer".to_string(), Some(1)),
+            ]
+        );
+    }
 }

@@ -31,7 +31,6 @@ pub mod nats_tool_provider;
 pub mod nats_worker;
 pub mod remote_session_cleanup;
 pub mod server_identity;
-pub mod session_cleanup;
 pub mod session_history;
 pub mod test_utils;
 pub mod tool;

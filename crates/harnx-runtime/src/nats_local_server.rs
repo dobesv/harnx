@@ -9,6 +9,7 @@ use harnx_core::config_paths::{
     nats_runtime_dir, nats_runtime_lock_file, nats_runtime_ports_file, nats_runtime_store_dir,
 };
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -25,6 +26,8 @@ const SPAWN_ATTEMPTS: usize = 5;
 /// How long to wait for nats-server to write its ports file. Generous: it is
 /// written as soon as the listeners are bound, well before JetStream is ready.
 const PORT_REPORT_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(unix)]
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Authenticated connection details for the shared local NATS server.
 ///
@@ -73,12 +76,31 @@ impl Drop for ServerOwner {
     fn drop(&mut self) {
         // Keep lock held until child has exited and stale discovery metadata has
         // been removed. A waiter can only become owner after cleanup completes.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        stop_server(&mut self.child);
         remove_metadata_if_nonce_matches(&self.nonce);
         remove_file_if_present(&self.config_path, "shared local NATS config");
         let _ = self.lock_file.unlock();
     }
+}
+
+fn stop_server(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        if result == 0 {
+            let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+            while Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -232,7 +254,8 @@ async fn spawn_once(binary: &Path, config_path: &Path, token: &str) -> Result<(C
         .with_context(|| format!("failed to spawn {}", binary.display()))?;
 
     let child_pid = child.id();
-    let port = match read_bound_port(&mut child, child_pid).await {
+    let ports_path = port_report_path(binary, child_pid);
+    let port = match read_bound_port(&mut child, &ports_path).await {
         Ok(port) => port,
         Err(error) => {
             let _ = child.kill();
@@ -244,28 +267,24 @@ async fn spawn_once(binary: &Path, config_path: &Path, token: &str) -> Result<(C
     if let Err(error) = wait_for_nats_ready(&url, token, &mut child).await {
         let _ = child.kill();
         let _ = child.wait();
-        remove_ports_file(port_report_path(child_pid));
+        remove_ports_file(ports_path);
         return Err(error);
     }
     // nats-server removes its own ports file on a clean exit, but this server is
     // usually killed, so drop it now that the port is known and republished in
     // harnx's ports.json.
-    remove_ports_file(port_report_path(child_pid));
+    remove_ports_file(ports_path);
     Ok((child, port))
 }
 
 /// Wait for nats-server to report the port it bound.
 ///
-/// The file is matched on the child's pid rather than on the executable name,
-/// which the caller can override, and which also makes leftover reports from
-/// earlier runs impossible to confuse for this one. nats-server writes into the
-/// file rather than renaming it into place, so a parse failure is treated the
-/// same as not-yet-written.
-async fn read_bound_port(child: &mut Child, pid: u32) -> Result<u16> {
-    let path = port_report_path(pid);
+/// nats-server writes into the file rather than renaming it into place, so a
+/// parse failure is treated the same as not-yet-written.
+async fn read_bound_port(child: &mut Child, path: &Path) -> Result<u16> {
     let deadline = Instant::now() + PORT_REPORT_TIMEOUT;
     loop {
-        if let Some(port) = parse_reported_port(&path) {
+        if let Some(port) = parse_reported_port(path) {
             return Ok(port);
         }
         if let Some(status) = child.try_wait()? {
@@ -281,8 +300,13 @@ async fn read_bound_port(child: &mut Child, pid: u32) -> Result<u16> {
     }
 }
 
-fn port_report_path(pid: u32) -> PathBuf {
-    nats_runtime_dir().join(format!("nats-server_{pid}.ports"))
+fn port_report_path(binary: &Path, pid: u32) -> PathBuf {
+    let executable_name = binary
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("nats-server"));
+    let mut report_name = executable_name.to_os_string();
+    report_name.push(format!("_{pid}.ports"));
+    nats_runtime_dir().join(report_name)
 }
 
 fn parse_reported_port(path: &Path) -> Option<u16> {
@@ -595,7 +619,18 @@ fn remove_file_if_present(path: &Path, description: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_major_minor;
+    use super::{parse_major_minor, port_report_path};
+    use std::path::Path;
+
+    #[test]
+    fn ports_report_uses_launched_executable_name() {
+        let path = port_report_path(Path::new("custom-nats-server.exe"), 42);
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("custom-nats-server.exe_42.ports")
+        );
+    }
 
     #[test]
     fn parses_supported_nats_version_output() {

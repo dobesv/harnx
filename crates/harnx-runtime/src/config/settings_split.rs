@@ -1,5 +1,5 @@
 //! Reserved for config/mod.rs cluster extraction (code health). Currently unused.
-use super::{session_lock::SessionLock, update_rag, Config, GlobalConfig};
+use super::{update_rag, Config, GlobalConfig};
 use crate::client::ModelType;
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -31,7 +31,6 @@ impl Config {
             "max_output_tokens" => {
                 Self::update_optional_isize(config, value, Config::set_max_output_tokens)
             }
-            "save_session" => Self::update_optional_bool(config, value, Config::set_save_session),
             "compress_threshold" => {
                 Self::update_optional_usize(config, value, Config::set_compress_threshold)
             }
@@ -67,33 +66,6 @@ impl Config {
         if title.is_empty() {
             bail!("Usage: .set title <text>");
         }
-
-        let session_path = {
-            let guard = config.read();
-            let session = guard
-                .session
-                .as_ref()
-                .context("No active session to set a title on")?;
-            if session.save_session() == Some(false) {
-                None
-            } else {
-                session
-                    .path
-                    .as_deref()
-                    .map(std::path::PathBuf::from)
-                    .or_else(|| {
-                        session
-                            .sessions_dir
-                            .as_ref()
-                            .map(|dir| dir.join(format!("{}.yaml", session.id)))
-                    })
-                    .or_else(|| Some(guard.session_file(&session.id)))
-            }
-        };
-        let _lock = match session_path.as_ref() {
-            Some(session_path) => Some(SessionLock::acquire(session_path)?),
-            None => None,
-        };
 
         {
             let mut guard = config.write();
@@ -136,16 +108,6 @@ impl Config {
         config: &GlobalConfig,
         value: &str,
         setter: impl Fn(&mut Config, Option<isize>),
-    ) -> Result<()> {
-        let value = parse_value(value)?;
-        setter(&mut config.write(), value);
-        Ok(())
-    }
-
-    fn update_optional_bool(
-        config: &GlobalConfig,
-        value: &str,
-        setter: impl Fn(&mut Config, Option<bool>),
     ) -> Result<()> {
         let value = parse_value(value)?;
         setter(&mut config.write(), value);
@@ -278,14 +240,6 @@ impl Config {
         }
     }
 
-    pub fn set_save_session(&mut self, value: Option<bool>) {
-        if let Some(session) = self.session.as_mut() {
-            session.set_save_session(value);
-        } else {
-            self.save_session = value;
-        }
-    }
-
     pub fn set_compress_threshold(&mut self, value: Option<usize>) {
         if let Some(session) = self.session.as_mut() {
             session.set_compress_threshold(value);
@@ -380,18 +334,10 @@ mod title_command_tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn config_with_session(dir: &std::path::Path) -> GlobalConfig {
+    fn config_with_session(_dir: &std::path::Path) -> GlobalConfig {
         let mut config = Config::default();
         let mut session = crate::config::session::new(&config, "title-test", None).unwrap();
-        session.set_sessions_dir(dir.to_path_buf());
-        crate::config::session::save(
-            &mut session,
-            "title-test",
-            &dir.join("title-test.yaml"),
-            false,
-            None,
-        )
-        .unwrap();
+        crate::config::session::attach_memory_log(&mut session);
         config.session = Some(session);
         Arc::new(RwLock::new(config))
     }
@@ -409,12 +355,6 @@ mod title_command_tests {
         // Frozen: auto-regeneration is disabled after a manual title.
         assert_eq!(session.title_last_updated_tokens(), usize::MAX);
         assert!(!session.need_generate_title(50_000));
-
-        // The manual title is persisted to the log with manual: true.
-        let persisted = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
-        assert!(persisted.contains("type: title"));
-        assert!(persisted.contains("title: My Custom Session Title"));
-        assert!(persisted.contains("manual: true"));
     }
 
     #[test]

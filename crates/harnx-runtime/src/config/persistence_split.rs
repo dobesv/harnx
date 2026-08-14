@@ -45,10 +45,10 @@ impl Config {
     /// Record an assistant tool-call request BEFORE the tools execute.
     /// Writes a `ToolCalls` entry to the session log and pushes a
     /// pending Tool message in-memory.  Must be paired with a
-    /// [`save_session_tool_results`] call once outputs are available.
+    /// [`append_session_tool_results`] call once outputs are available.
     ///
-    /// Errors if no session is active or persistence fails.
-    pub fn save_session_tool_calls(
+    /// No-ops if no session is active; errors if persistence fails.
+    pub fn append_session_tool_calls(
         &mut self,
         input: &Input,
         output: &str,
@@ -75,9 +75,6 @@ impl Config {
         thought: Option<&str>,
         tool_results: &[crate::tool::ToolResult],
     ) -> Result<()> {
-        // NATS persistence path: use block_in_place for async writes
-
-        // Local file persistence path (existing behavior)
         let request = SessionSaveRequest::new(input, output, thought);
         let Some(session) = self.session_for_save(&request) else {
             return Ok(());

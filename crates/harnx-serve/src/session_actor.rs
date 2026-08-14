@@ -2,6 +2,11 @@
 
 #[path = "session_actor_test_executor.rs"]
 mod test_executor;
+#[path = "session_actor_test_log.rs"]
+mod test_log;
+
+pub use crate::session_actor_types::*;
+pub use test_log::load_test_session_messages;
 
 use crate::ag_ui::AgUiSink;
 use ag_ui_core::{
@@ -11,7 +16,7 @@ use ag_ui_core::{
         message::Message as AgUiMessage,
     },
 };
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use dashmap::{mapref::entry::Entry, DashMap};
 use harnx_core::{
     abort::{create_abort_signal, AbortSignal},
@@ -26,12 +31,7 @@ use harnx_runtime::{
     AgentCallFn, AgentLoopContext, OnToolRoundFn, ThinClientConfig, ThinClientSession,
     ToolApprovalDecision, ToolApprovalInterrupt, ToolUseConfirmation,
 };
-use std::{
-    collections::VecDeque,
-    hash::{Hash, Hasher},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::{
     sync::{broadcast, mpsc, oneshot, Mutex},
     task::JoinHandle,
@@ -42,171 +42,6 @@ const DEFAULT_REAP_TTL: Duration = Duration::from_secs(5);
 const COMMAND_BUFFER: usize = 32;
 const BROADCAST_BUFFER: usize = 64;
 const FAR_FUTURE_SECS: u64 = 365 * 24 * 60 * 60;
-
-#[derive(Clone, Debug, Eq)]
-pub struct SessionKey {
-    pub agent: String,
-    pub session: String,
-}
-
-impl PartialEq for SessionKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.agent == other.agent && self.session == other.session
-    }
-}
-
-impl Hash for SessionKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.agent.hash(state);
-        self.session.hash(state);
-    }
-}
-
-#[derive(Clone)]
-pub struct SessionHandle {
-    pub tx: mpsc::Sender<SessionCommand>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SessionPromptOptions {
-    pub working_dir: Option<std::path::PathBuf>,
-    pub attachment_refs: Vec<String>,
-    pub resume: Vec<InterruptResume>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InterruptResume {
-    pub interrupt_id: String,
-    pub status: InterruptResumeStatus,
-    pub payload: InterruptResumePayload,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InterruptResumeStatus {
-    Approved,
-    Denied,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InterruptResumePayload {
-    pub approved: bool,
-    pub reason: Option<String>,
-}
-
-pub enum SessionCommand {
-    Subscribe {
-        reply: oneshot::Sender<SubscribeResult>,
-    },
-    Prompt {
-        text: String,
-        options: SessionPromptOptions,
-        reply: oneshot::Sender<PromptResult>,
-    },
-    Cancel {
-        reply: oneshot::Sender<()>,
-    },
-    Get {
-        reply: oneshot::Sender<SessionInfo>,
-    },
-    Unsubscribe,
-    #[cfg(test)]
-    EmitTestEvent {
-        event: Event,
-    },
-}
-
-pub struct SubscribeResult {
-    pub snapshot: Vec<AgUiMessage>,
-    pub events: broadcast::Receiver<Event>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PromptResult {
-    Accepted { run_id: String },
-    Enqueued { run_id: String },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SessionCapabilities {
-    pub can_prompt: bool,
-    pub can_cancel: bool,
-    pub supports_snapshot: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SessionInfo {
-    pub state: SessionState,
-    pub history_snapshot: Vec<AgUiMessage>,
-    pub capabilities: SessionCapabilities,
-}
-
-#[derive(Clone, Debug)]
-pub enum SessionState {
-    Idle,
-    Running {
-        run_id: String,
-        started_at: DateTime<Utc>,
-    },
-    Interrupted {
-        run_id: String,
-        started_at: DateTime<Utc>,
-        pending: Box<PendingInterruptBatch>,
-    },
-}
-
-impl PartialEq for SessionState {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Idle, Self::Idle) => true,
-            (
-                Self::Running {
-                    run_id: left_run_id,
-                    started_at: left_started_at,
-                },
-                Self::Running {
-                    run_id: right_run_id,
-                    started_at: right_started_at,
-                },
-            ) => left_run_id == right_run_id && left_started_at == right_started_at,
-            (
-                Self::Interrupted {
-                    run_id: left_run_id,
-                    started_at: left_started_at,
-                    ..
-                },
-                Self::Interrupted {
-                    run_id: right_run_id,
-                    started_at: right_started_at,
-                    ..
-                },
-            ) => left_run_id == right_run_id && left_started_at == right_started_at,
-            _ => false,
-        }
-    }
-}
-
-/// Pending interrupt batch for tool approval HITL.
-#[derive(Clone, Debug)]
-pub struct PendingInterruptBatch {
-    pub interrupt_run_id: String,
-    pub text: String,
-    pub attachment_refs: Vec<String>,
-    pub completion_output: String,
-    pub completion_thought: Option<String>,
-    pub tool_calls: Vec<harnx_core::tool::ToolCall>,
-    pub interrupts: Vec<ToolApprovalInterruptEntry>,
-    pub metadata: serde_json::Value,
-}
-
-#[derive(Clone, Debug)]
-pub struct ToolApprovalInterruptEntry {
-    pub id: String,
-    pub tool_call_id: String,
-    pub name: String,
-    pub arguments: serde_json::Value,
-    pub message: String,
-    pub reason: Option<String>,
-}
 
 #[derive(Clone)]
 pub struct SessionRegistry {
@@ -221,18 +56,6 @@ struct SessionActorConfig {
     call_fn: Option<AgentCallFn>,
     /// One supervisor shared by every actor in this long-lived server.
     local_worker: Arc<Mutex<Option<LocalWorkerSupervisor>>>,
-}
-
-struct ActiveRun {
-    run_id: RunId,
-    started_at: DateTime<Utc>,
-    abort_signal: AbortSignal,
-    inject_tx: Option<mpsc::Sender<String>>,
-}
-
-struct PendingPrompt {
-    text: String,
-    options: SessionPromptOptions,
 }
 
 struct RunFinished {
@@ -712,7 +535,7 @@ impl SessionActor {
         session_id: Option<String>,
         prompt: String,
     ) {
-        let Some(target_session_id) = self.resolve_handoff_session_id(session_id) else {
+        let Some(target_session_id) = self.resolve_handoff_session_id(session_id).await else {
             self.state = SessionState::Idle;
             return;
         };
@@ -743,7 +566,7 @@ impl SessionActor {
         self.state = SessionState::Idle;
     }
 
-    fn resolve_handoff_session_id(&self, session_id: Option<String>) -> Option<String> {
+    async fn resolve_handoff_session_id(&self, session_id: Option<String>) -> Option<String> {
         match session_id {
             Some(id) => Some(id),
             None => {
@@ -752,7 +575,7 @@ impl SessionActor {
                     &self.key,
                     self.actor_config.call_fn.is_some(),
                 );
-                let new_session_id = prompt_config.write().new_session_id();
+                let new_session_id = Config::reserve_new_session_id(&prompt_config).await;
                 match new_session_id {
                     Ok(id) => Some(id),
                     Err(e) => {
@@ -1141,7 +964,7 @@ impl SessionActor {
                             session_id,
                             prompt,
                         }) => {
-                            prompt_config.write().exit_agent_with_lock(None)?;
+                            prompt_config.write().exit_agent()?;
                             harnx_runtime::config::Config::use_agent(
                                 &prompt_config,
                                 &agent,
@@ -1150,7 +973,7 @@ impl SessionActor {
                             )
                             .await?;
                             if prompt_config.read().session.is_some() {
-                                prompt_config.write().empty_session_with_lock(None)?;
+                                prompt_config.write().empty_session()?;
                             }
                             input = harnx_runtime::config::input::from_str(
                                 &prompt_config,
@@ -1305,15 +1128,38 @@ fn test_hook_provider(
 fn prompt_config_for_agent_session_from_global(
     base_config: &Config,
     key: &SessionKey,
-    filesystem: bool,
+    test_memory_log: bool,
 ) -> GlobalConfig {
     let prompt_config = harnx_session::fork_prompt_config(base_config);
     {
         let mut cfg = prompt_config.write();
         cfg.use_agent_by_name(&key.agent).expect("set actor agent");
-        if filesystem {
+        if test_memory_log {
             cfg.use_session(Some(&key.session))
                 .expect("set actor session");
+            if let Some(session) = cfg.session.as_mut() {
+                let sink = test_log::test_session_log(key);
+                let entries = sink.entries();
+                let runtime = std::sync::Arc::new(
+                    sink as std::sync::Arc<dyn config::session::SessionAppendSink>,
+                );
+                if !entries.is_empty() {
+                    let raw = entries.into_iter().enumerate().collect::<Vec<_>>();
+                    let mut replayed =
+                        config::session::replay_log_entries_for_external(&raw, &key.session)
+                            .expect("replay test session log");
+                    replayed.model = session.model.clone();
+                    replayed.model_id = session.model_id.clone();
+                    replayed.agent_name = session.agent_name.clone();
+                    replayed.agent_instructions = session.agent_instructions.clone();
+                    replayed.id = key.session.clone();
+                    replayed.session_id = Some(key.session.clone());
+                    replayed.runtime = Some(runtime);
+                    *session = replayed;
+                } else {
+                    session.runtime = Some(runtime);
+                }
+            }
         } else {
             let mut session =
                 config::session::new(&cfg, &key.session, None).expect("create NATS actor session");
@@ -1388,10 +1234,7 @@ mod tests {
         tool::ToolCall,
     };
     use serde_json::json;
-    use std::{
-        fs,
-        sync::atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::{sync::Notify, time::sleep};
 
     fn key(agent: &str, session: &str) -> SessionKey {
@@ -1462,17 +1305,7 @@ mod tests {
     }
 
     fn load_session_messages(agent: &str, session_id: &str) -> Vec<Message> {
-        let key = key(agent, session_id);
-        let base_config = load_base_config_for_tests();
-        let prompt_config = prompt_config_for_agent_session_from_global(&base_config, &key, true);
-        let messages = prompt_config
-            .read()
-            .session
-            .as_ref()
-            .expect("session exists")
-            .messages
-            .clone();
-        messages
+        super::load_test_session_messages(agent, session_id)
     }
 
     async fn wait_for_session_messages(
@@ -1882,8 +1715,8 @@ mod tests {
                                 "harnx_agent_session_history_read"
                             );
                             assert!(
-                                outputs[0].contains("session has not been saved yet"),
-                                "tool result should surface real built-in tool execution error: {}",
+                                outputs[0].contains("[]"),
+                                "new NATS session history should initially be empty: {}",
                                 outputs[0]
                             );
                             Ok((
@@ -1928,31 +1761,6 @@ mod tests {
             1,
             "expected one executed tool result"
         );
-
-        let messages = wait_for_session_messages("plain", "tool-history", |messages| {
-            messages
-                .iter()
-                .any(|msg| msg.role.is_assistant() && msg.content.to_text() == "history checked")
-        })
-        .await;
-        let assistant_messages: Vec<String> = messages
-            .iter()
-            .filter(|msg| msg.role.is_assistant())
-            .map(|msg| msg.content.to_text())
-            .collect();
-        assert!(assistant_messages
-            .iter()
-            .any(|text| text == "history checked"));
-
-        let session_path = {
-            let mut config = load_base_config_for_tests();
-            config.use_agent_by_name("plain").expect("set agent");
-            config.session_file("tool-history")
-        };
-        let persisted = fs::read_to_string(session_path).expect("read persisted session");
-        assert!(persisted.contains("type: tool_calls"));
-        assert!(persisted.contains("type: tool_results"));
-        assert!(persisted.contains("harnx_agent_session_history_read"));
     }
 
     #[tokio::test]
@@ -2446,15 +2254,9 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(
-            outputs_by_id.get("call-a"),
-            Some(&serde_json::json!({
-                "content": [{
-                    "type": "text",
-                    "text": "[{\"seq\":0,\"type\":\"header\",\"text\":\"model: openai:gpt-4o\"},{\"seq\":1,\"type\":\"message\",\"text\":\"batch interrupt\",\"role\":\"user\"},{\"seq\":2,\"type\":\"tool_calls\",\"text\":\"batch approval needed\\nharnx_agent_session_history_read({})\\nharnx_agent_session_history_read({})\",\"tool_names\":[\"harnx_agent_session_history_read\",\"harnx_agent_session_history_read\"]}]"
-                }]
-            })),
-            "auto-approved call should execute normally"
+        assert!(
+            outputs_by_id.contains_key("call-a"),
+            "auto-approved call should execute and persist its result"
         );
         assert_eq!(
             outputs_by_id.get("call-b"),

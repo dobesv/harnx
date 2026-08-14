@@ -1,7 +1,5 @@
-use super::input::*;
 use super::session_externalize::{
-    externalize_content, externalize_persisted_messages, externalize_tool_result_content,
-    record_externalized,
+    externalize_content, externalize_tool_result_content, record_externalized,
 };
 use super::*;
 use crate::nats_client_session::new_client_message_id;
@@ -9,62 +7,44 @@ use crate::nats_client_session::new_client_message_id;
 pub use harnx_core::session::{Session, SessionLogEntry};
 
 use std::any::Any;
-use std::fs::OpenOptions;
-use std::io::Write as IoWrite;
-use std::sync::{Arc, Mutex};
-
-use crate::config::session_lock::SessionLock;
+use std::sync::Arc;
 
 pub trait SessionAppendSink: Send + Sync + Any {
+    /// Append an entry and return its one-based durable sequence number.
     fn append(&self, entry: &SessionLogEntry) -> Result<u64>;
-
-    /// Reset any internal sequence cache so the next append re-derives from file.
-    /// Default no-op; overridden by FileSessionLogSink.
-    fn reset_seq_cache(&self) {}
 }
 
-#[derive(Debug)]
-pub(crate) struct FileSessionLogSink {
-    log: Mutex<FileSessionLog>,
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MemorySessionLogSink {
+    entries: std::sync::Mutex<Vec<SessionLogEntry>>,
 }
 
-impl FileSessionLogSink {
-    pub(crate) fn new(path: &Path, session_name: &str, header: SessionLogEntry) -> Self {
-        Self {
-            log: Mutex::new(FileSessionLog::new_with_header(path, session_name, header)),
-        }
-    }
-}
-
-impl SessionAppendSink for FileSessionLogSink {
+#[cfg(test)]
+impl SessionAppendSink for MemorySessionLogSink {
     fn append(&self, entry: &SessionLogEntry) -> Result<u64> {
-        let mut log = self
-            .log
-            .lock()
-            .map_err(|_| anyhow::anyhow!("file session log sink mutex poisoned"))?;
-        log.append_event(entry)
+        let mut entries = self.entries.lock().expect("memory session log poisoned");
+        entries.push(entry.clone());
+        Ok(entries.len() as u64)
     }
+}
 
-    fn reset_seq_cache(&self) {
-        let Ok(mut log) = self.log.lock() else {
-            return;
-        };
-        log.next_seq = None;
-    }
+#[cfg(test)]
+pub(crate) fn attach_memory_log(session: &mut Session) {
+    session.runtime = Some(Arc::new(
+        Arc::new(MemorySessionLogSink::default()) as Arc<dyn SessionAppendSink>
+    ));
 }
 
 use crate::client::{CompletionTokenUsage, Message, MessageContent, MessageRole};
 use harnx_core::{
     event::{AgentEvent, SessionEvent},
-    session_log::SessionLog,
     sink::emit_agent_event,
 };
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Deserialize;
-use std::fs::{read_to_string, write};
-use std::path::Path;
 
 use crate::utils::{
     session_name::{decode_timestamp_session_id, generate_session_id, git_branch, git_remote},
@@ -80,11 +60,10 @@ pub fn new(config: &Config, name: &str, working_dir: Option<&std::path::Path>) -
     {
         name.to_string()
     } else {
-        generate_session_id(|candidate| config.session_file(candidate).exists())
+        generate_session_id(|_| false)
     };
     let mut session = Session {
         id: name.to_string(),
-        save_session: config.save_session,
         session_id: Some(session_id),
         working_dir: working_dir
             .map(std::path::Path::to_path_buf)
@@ -104,52 +83,6 @@ pub fn new(config: &Config, name: &str, working_dir: Option<&std::path::Path>) -
     };
     session.set_agent(&agent)?;
     session.dirty = false;
-    Ok(session)
-}
-
-pub fn load(config: &Config, name: &str, path: &Path) -> Result<Session> {
-    let content = read_to_string(path)
-        .with_context(|| format!("Failed to load session {} at {}", name, path.display()))?;
-
-    // Detect format: new log format has "type: header" as the first
-    // meaningful line. Old format files are silently treated as empty
-    // sessions (no crash, but content is not loaded).
-    let session = if Session::is_log_format(&content) {
-        load_from_log(config, name, path, &content)?
-    } else {
-        // Old format: create a fresh session so we don't crash.
-        let mut session = new(config, name, None)?;
-        apply_name_and_path(&mut session, name, path, config)?;
-        session
-    };
-
-    Ok(session)
-}
-
-pub(crate) fn load_from_log(
-    config: &Config,
-    name: &str,
-    path: &Path,
-    content: &str,
-) -> Result<Session> {
-    let log = FileSessionLog::new(path, name);
-    let raw_entries = log.load_events()?;
-    debug_assert_eq!(
-        raw_entries.len(),
-        collect_raw_log_entries(content, name)?.len(),
-        "FileSessionLog::load_events changed entry count"
-    );
-    let replay_entries: Vec<_> = raw_entries
-        .iter()
-        .map(|(seq, entry)| (*seq as usize, entry.clone()))
-        .collect();
-    let mut session = replay_log_entries_for_external(&replay_entries, name)?;
-    session.log_entry_count = raw_entries.len();
-
-    session.model =
-        crate::client::retrieve_model(&config.clients, &session.model_id, ModelType::Chat)?;
-    apply_name_and_path(&mut session, name, path, config)?;
-    session.update_tokens();
     Ok(session)
 }
 
@@ -183,7 +116,7 @@ fn build_effective_log_entries(
     harnx_core::session_reconstruct::apply_log_mutations_with_name(raw_entries, name)
 }
 
-pub(crate) fn replay_log_entries_for_external(
+pub fn replay_log_entries_for_external(
     raw_entries: &[(usize, SessionLogEntry)],
     name: &str,
 ) -> Result<Session> {
@@ -204,7 +137,6 @@ pub(crate) fn replay_log_entries_for_external(
                 temperature,
                 top_p,
                 use_tools,
-                save_session,
                 compress_threshold,
                 agent_name,
                 session_id,
@@ -221,7 +153,6 @@ pub(crate) fn replay_log_entries_for_external(
                 session.temperature = temperature;
                 session.top_p = top_p;
                 session.use_tools = use_tools;
-                session.save_session = save_session;
                 session.compress_threshold = compress_threshold;
                 session.agent_name = agent_name;
                 session.session_id = session_id;
@@ -456,238 +387,33 @@ fn assemble_tool_message(
     )
 }
 
-#[derive(Debug)]
-pub(crate) struct FileSessionLog {
-    path: std::path::PathBuf,
-    session_name: String,
-    next_seq: Option<u64>,
-    initial_header: Option<SessionLogEntry>,
-}
-
-impl FileSessionLog {
-    fn new(path: &Path, session_name: &str) -> Self {
-        Self {
-            path: path.to_path_buf(),
-            session_name: session_name.to_string(),
-            next_seq: None,
-            initial_header: None,
-        }
-    }
-
-    pub(crate) fn new_for_reload(path: &Path, session_name: &str) -> Self {
-        Self::new(path, session_name)
-    }
-
-    fn new_with_header(path: &Path, session_name: &str, header: SessionLogEntry) -> Self {
-        Self {
-            path: path.to_path_buf(),
-            session_name: session_name.to_string(),
-            next_seq: None,
-            initial_header: Some(header),
-        }
-    }
-}
-
-impl SessionLog for FileSessionLog {
-    // Caller must hold SessionLock for this session.
-    fn append_event(&mut self, entry: &SessionLogEntry) -> Result<u64> {
-        // Initialize header if this is the first entry and file doesn't exist yet.
-        // Use append+create mode to avoid truncating a concurrent process's write.
-        // MUST happen BEFORE deriving assigned_seq so the header counts as doc 0
-        // and the first real entry gets seq 1 (matching original semantics).
-        if !self.path.exists() || self.path.metadata().is_ok_and(|m| m.len() == 0) {
-            if let Some(header) = &self.initial_header {
-                ensure_parent_exists(&self.path)?;
-                let content = serde_yaml::to_string(header).with_context(|| {
-                    format!(
-                        "Failed to serialize session header in '{}'",
-                        self.session_name
-                    )
-                })?;
-                // Open with append+create to avoid truncating another process's concurrent write.
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.path)
-                    .with_context(|| {
-                        format!(
-                            "Failed to open session {} at {} for header init",
-                            self.session_name,
-                            self.path.display()
-                        )
-                    })?;
-                // Check if file is empty (another process may have written header while we waited).
-                let is_empty = file.metadata().map(|m| m.len() == 0).unwrap_or(true);
-                if is_empty {
-                    file.write_all(content.as_bytes()).with_context(|| {
-                        format!(
-                            "Failed to initialize session {} at {}",
-                            self.session_name,
-                            self.path.display()
-                        )
-                    })?;
-                }
-            }
-        }
-
-        // Now re-derive the current document count from the file while we hold
-        // the in-process Mutex. Never trust the cached next_seq for assignment.
-        // After header init above, the file has the header (doc 0), so first entry gets seq 1.
-        let entries = self.load_events().unwrap_or_default();
-        let assigned_seq = entries.len() as u64;
-
-        let yaml = serde_yaml::to_string(entry)
-            .with_context(|| format!("Failed to serialize log entry in '{}'", self.session_name))?;
-        let mut data = String::from("---\n");
-        data.push_str(&yaml);
-        let mut file = OpenOptions::new().append(true).open(&self.path)?;
-        file.write_all(data.as_bytes())?;
-        self.next_seq = Some(assigned_seq + 1);
-        Ok(assigned_seq)
-    }
-
-    fn load_events(&self) -> Result<Vec<(u64, SessionLogEntry)>> {
-        let content = read_to_string(&self.path).with_context(|| {
-            format!(
-                "Failed to load session {} at {}",
-                self.session_name,
-                self.path.display()
-            )
-        })?;
-        collect_raw_log_entries(&content, &self.session_name).map(|entries| {
-            entries
-                .into_iter()
-                .map(|(seq, entry)| (seq as u64, entry))
-                .collect()
-        })
-    }
-
-    fn replay_from(&self, seq: u64) -> Result<Vec<SessionLogEntry>> {
-        Ok(self
-            .load_events()?
-            .into_iter()
-            .filter(|(entry_seq, _)| *entry_seq >= seq)
-            .map(|(_, entry)| entry)
-            .collect())
-    }
-}
-
-pub(crate) fn apply_name_and_path(
-    session: &mut Session,
-    name: &str,
-    path: &Path,
-    config: &Config,
-) -> Result<()> {
-    session.id = name.to_string();
-    session.path = Some(path.display().to_string());
-
-    session.agent_prompt = session.agent_instructions.clone();
-    if let Some(agent_name) = &session.agent_name {
-        if let Ok(agent) = config.retrieve_agent(agent_name) {
-            // Only re-render the prompt when the session does not already have
-            // resolved agent data from the log.  If agent_variables is
-            // non-empty the session was restored from disk with its own
-            // variable values; re-rendering with the current agent definition
-            // would overwrite those resolved values.  Similarly, if
-            // agent_prompt differs from agent_instructions the session log
-            // already stored a rendered prompt — preserve it.
-            let prompt_is_unresolved = session.agent_variables().is_empty()
-                && session.agent_prompt == session.agent_instructions;
-            if prompt_is_unresolved {
-                session.agent_prompt = agent.interpolated_instructions()?;
-            }
-            if session.use_tools.is_none() {
-                session.use_tools = agent.use_tools();
-            }
-            if session.model_fallbacks.is_empty() {
-                session.model_fallbacks = agent.model_fallbacks().to_vec();
-            }
-            if session.compaction_agent.is_none() {
-                session.compaction_agent = agent.compaction_agent().map(str::to_string);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Initialize the session log file with a header entry.
-/// Called lazily on the first append_event when a path hasn't been
-/// established yet.  Best-effort: filesystem errors are silently
-/// ignored so the session can still be used in-memory.
-/// Caller must hold SessionLock for this session before calling.
-pub fn ensure_log_file(session: &mut Session) {
-    if session.save_session() == Some(false) {
-        return;
-    }
-    if session.path.is_some() {
-        return;
-    }
-    let Some(sessions_dir) = session.sessions_dir.clone() else {
-        return;
-    };
-
-    let session_path = sessions_dir.join(format!("{}.yaml", session.id));
-    if ensure_parent_exists(&session_path).is_err() {
-        return;
-    }
-
-    // Check if file already exists to avoid overwriting concurrent process's data.
-    if session_path.exists() {
-        // Read back the entry count from the existing file.
-        if let Ok(content) = read_to_string(&session_path) {
-            let count = serde_yaml::Deserializer::from_str(&content).count();
-            session.path = Some(session_path.display().to_string());
-            session.log_entry_count = count;
-        }
-        return;
-    }
-
-    let header = session.build_header_entry();
-    let Ok(content) = serde_yaml::to_string(&header) else {
-        return;
-    };
-    // The caller holds SessionLock, so we can safely use write() here.
-    // But use OpenOptions::append+create for consistency with append_event.
-    if let Ok(mut file) = OpenOptions::new()
-        .create_new(true)
-        .append(true)
-        .open(&session_path)
-    {
-        if file.write_all(content.as_bytes()).is_ok() {
-            session.path = Some(session_path.display().to_string());
-            session.log_entry_count = 1;
-        }
-    }
-}
-
-/// Append a log entry to the session file.
-/// Lazily initializes the log file on the first call.
-/// Returns true if the entry was successfully written.
+/// Append a log entry through the session's runtime persistence sink.
 pub fn append_event(session: &mut Session, entry: &SessionLogEntry) -> bool {
     if let Some(runtime) = session.runtime.as_ref() {
         if let Some(append_sink) = runtime.downcast_ref::<Arc<dyn SessionAppendSink>>() {
             return match append_sink.append(entry) {
                 Ok(seq) => {
-                    session.log_entry_count = seq as usize + 1;
+                    session.log_entry_count = seq as usize;
                     true
                 }
-                Err(_) => false,
+                Err(error) => {
+                    log::warn!(
+                        "session append failed: session_id={} entry_type={} error={error}",
+                        session.id(),
+                        crate::session_history::entry_type(entry)
+                    );
+                    false
+                }
             };
         }
     }
 
-    ensure_log_file(session);
-    let Some(path_str) = &session.path else {
-        return false;
-    };
-    let mut log = FileSessionLog::new(Path::new(path_str), &session.id);
-    match log.append_event(entry) {
-        Ok(seq) => {
-            session.log_entry_count = seq as usize + 1;
-            true
-        }
-        Err(_) => false,
-    }
+    log::warn!(
+        "session append dropped: no persistence sink attached (session_id={} entry_type={})",
+        session.id(),
+        crate::session_history::entry_type(entry)
+    );
+    false
 }
 
 /// Append a `Title` log entry and update the in-memory session title state.
@@ -710,10 +436,6 @@ pub fn record_title(session: &mut Session, title: String, manual: bool, tokens: 
 
 pub fn render(session: &Session) -> Result<String> {
     let mut items = vec![];
-
-    if let Some(path) = &session.path {
-        items.push(("path", path.to_string()));
-    }
 
     items.push((
         "model",
@@ -748,10 +470,6 @@ pub fn render(session: &Session) -> Result<String> {
         items.push(("model_fallbacks", session.model_fallbacks.join(",")));
     }
 
-    if let Some(save_session) = session.save_session() {
-        items.push(("save_session", save_session.to_string()));
-    }
-
     if let Some(compress_threshold) = session.compress_threshold {
         items.push(("compress_threshold", compress_threshold.to_string()));
     }
@@ -779,32 +497,6 @@ pub fn render(session: &Session) -> Result<String> {
     Ok(lines.join("\n"))
 }
 
-pub fn exit(
-    session: &mut Session,
-    session_dir: &Path,
-    is_tui: bool,
-    lock: Option<&SessionLock>,
-) -> Result<()> {
-    if session.save_session() == Some(false) && !session.save_session_this_time {
-        return Ok(());
-    }
-    if !session.dirty {
-        // Nothing new to persist, but print the path if the log file exists.
-        if is_tui {
-            if let Some(path) = &session.path {
-                crate::utils::emit_info(format!("✓ Session saved at '{path}'."));
-            }
-        }
-        return Ok(());
-    }
-    // Session has unsaved changes that were not yet appended (e.g. legacy
-    // callers or sessions that didn't go through init_log). Do a full save.
-    let session_name = session.id.clone();
-    let session_path = session_dir.join(format!("{}.yaml", session.id));
-    save(session, &session_name, &session_path, is_tui, lock)?;
-    Ok(())
-}
-
 /// Appends YAML log entry/entries for `msg` to `content`.
 ///
 /// Tool-role messages containing `MessageContent::ToolCalls` are split
@@ -814,171 +506,6 @@ pub fn exit(
 /// single `message` entry.
 fn persisted_message_id() -> String {
     new_client_message_id()
-}
-
-fn append_message_entries(content: &mut String, msg: &Message, session_id: &str) -> Result<()> {
-    if msg.role == MessageRole::Tool {
-        if let MessageContent::ToolCalls(tc) = &msg.content {
-            let calls: Vec<crate::tool::ToolCall> =
-                tc.tool_results.iter().map(|r| r.call.clone()).collect();
-            let tool_calls_entry = SessionLogEntry::ToolCalls {
-                text: tc.text.clone(),
-                thought: tc.thought.clone(),
-                calls,
-                timestamp: None,
-                fence_token: None,
-            };
-            content.push_str("---\n");
-            content
-                .push_str(&serde_yaml::to_string(&tool_calls_entry).with_context(|| {
-                    format!("Failed to serialize tool_calls in '{session_id}'")
-                })?);
-
-            let results: Vec<harnx_core::session::ToolOutput> = tc
-                .tool_results
-                .iter()
-                .map(|r| harnx_core::session::ToolOutput {
-                    id: r.call.id.clone(),
-                    name: r.call.name.clone(),
-                    output: r.output.clone(),
-                    markdown: r.markdown.clone(),
-                    content: r.content.clone(),
-                    switch_agent: r.switch_agent.clone(),
-                })
-                .collect();
-            let tool_results_entry = SessionLogEntry::ToolResults {
-                results,
-                timestamp: None,
-            };
-            content.push_str("---\n");
-            content.push_str(
-                &serde_yaml::to_string(&tool_results_entry).with_context(|| {
-                    format!("Failed to serialize tool_results in '{session_id}'")
-                })?,
-            );
-            return Ok(());
-        }
-    }
-
-    let entry = SessionLogEntry::Message {
-        id: msg.id.clone().or_else(|| Some(persisted_message_id())),
-        role: msg.role,
-        content: msg.content.clone(),
-        timestamp: None,
-        fence_token: None,
-    };
-    content.push_str("---\n");
-    content.push_str(
-        &serde_yaml::to_string(&entry)
-            .with_context(|| format!("Failed to serialize message in '{session_id}'"))?,
-    );
-    Ok(())
-}
-
-/// Full save: rewrites the entire session file in log format.
-/// Used as a fallback when events were not incrementally appended.
-///
-/// # Lock discipline
-/// If `lock` is `None`, this function acquires a SessionLock for the duration of the save.
-/// If `lock` is `Some(_)`, the caller already holds the lock (e.g., from agent loop).
-/// File::lock is NOT re-entrant, so we must avoid double-acquire.
-pub fn save(
-    session: &mut Session,
-    session_name: &str,
-    session_path: &Path,
-    is_tui: bool,
-    _lock: Option<&SessionLock>,
-) -> Result<()> {
-    // Acquire lock if caller doesn't already hold it. The owned guard (when we
-    // self-acquire) MUST live for the whole function so the OS lock is held
-    // across the file rewrite below; binding it to `_owned_guard` keeps it
-    // alive until function return (RAII). Propagate acquisition errors instead
-    // of silently writing unlocked.
-    let _owned_guard = match _lock {
-        Some(_) => None,
-        None => Some(SessionLock::acquire(session_path)?),
-    };
-
-    ensure_parent_exists(session_path)?;
-
-    session.path = Some(session_path.display().to_string());
-
-    // Externalize any still-inline image data URIs across all messages (e.g.
-    // first-turn images persisted before incremental externalization, or
-    // legacy sessions loaded with inline base64) so the rewritten transcript
-    // never carries inline base64. Idempotent: existing cid refs are skipped.
-    externalize_persisted_messages(session, session_path);
-
-    // Write in the new log format.
-    let mut content = serde_yaml::to_string(&session.build_header_entry())
-        .with_context(|| format!("Failed to serialize session header for '{}'", session.id))?;
-    for msg in &session.compressed_messages {
-        append_message_entries(&mut content, msg, &session.id)?;
-    }
-    if !session.compressed_messages.is_empty() {
-        // Write a compress entry to mark the boundary.
-        // Only write it and skip the first message if the first message
-        // is actually a system message from compression.
-        let wrote_compress = if let Some(system_msg) = session.messages.first() {
-            if system_msg.role == MessageRole::System {
-                let compress_entry = SessionLogEntry::Compress {
-                    prompt: system_msg.content.to_text(),
-                };
-                content.push_str("---\n");
-                content.push_str(&serde_yaml::to_string(&compress_entry).with_context(|| {
-                    format!("Failed to serialize compress entry in '{}'", session.id)
-                })?);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        // Write remaining messages (skip the system message from compress only if we wrote a compress entry).
-        let start_idx = if wrote_compress { 1 } else { 0 };
-        for msg in session.messages.iter().skip(start_idx) {
-            append_message_entries(&mut content, msg, &session.id)?;
-        }
-    } else {
-        for msg in &session.messages {
-            append_message_entries(&mut content, msg, &session.id)?;
-        }
-    }
-    if !session.data_urls.is_empty() {
-        let entry = SessionLogEntry::DataUrls {
-            urls: session.data_urls.clone(),
-        };
-        content.push_str("---\n");
-        content.push_str(
-            &serde_yaml::to_string(&entry)
-                .with_context(|| format!("Failed to serialize data_urls in '{}'", session.id))?,
-        );
-    }
-
-    write(session_path, &content).with_context(|| {
-        format!(
-            "Failed to write session '{}' to '{}'",
-            session.id,
-            session_path.display()
-        )
-    })?;
-
-    if is_tui {
-        crate::utils::emit_info(format!(
-            "✓ Saved the session to '{}'.",
-            session_path.display()
-        ));
-    }
-
-    if session.id() != session_name {
-        session.id = session_name.to_string()
-    }
-
-    session.log_entry_count = serde_yaml::Deserializer::from_str(&content).count();
-    session.dirty = false;
-
-    Ok(())
 }
 
 pub fn to_agent(session: &Session) -> Agent {
@@ -1024,7 +551,7 @@ pub fn compress_keeping_recent(session: &mut Session, prompt: String, keep_from:
 /// Re-append an in-memory message to the session log as the entry (or the
 /// `ToolCalls`+`ToolResults` pair) it round-trips from, returning the log_seq of
 /// its first entry. Used to re-log the preserved suffix after a `Compress`
-/// event so the on-disk layout is self-describing (no stored index).
+/// event so the NATS log is self-describing (no stored index).
 fn relog_message(session: &mut Session, msg: &Message) -> usize {
     let seq = session.next_seq();
     let message_id = msg.id.clone();
@@ -1140,129 +667,6 @@ pub fn add_assistant_text(
     Ok(())
 }
 
-#[cfg(test)]
-mod working_dir_tests {
-    use super::*;
-    use crate::tool::ToolCall;
-    use harnx_core::input::Input;
-    use harnx_core::message::{Message, MessageContent, MessageRole};
-    use harnx_core::session::SessionLogEntry;
-    use std::fs;
-    use tempfile::TempDir;
-
-    fn make_message(content: &str) -> Message {
-        Message {
-            role: MessageRole::User,
-            content: MessageContent::Text(content.to_string()),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn new_uses_explicit_working_dir_when_provided() {
-        let root = TempDir::new().unwrap();
-        fs::create_dir_all(root.path().join("data").join("sessions")).unwrap();
-        fs::create_dir_all(root.path().join("state")).unwrap();
-        let config = Config {
-            sessions_dir_override: Some(root.path().join("sessions")),
-            ..Default::default()
-        };
-        fs::create_dir_all(config.sessions_dir()).unwrap();
-        let working_dir = root.path().join("repo-a");
-        fs::create_dir_all(&working_dir).unwrap();
-
-        let session = new(&config, "session-a", Some(&working_dir)).unwrap();
-        assert_eq!(
-            session.working_dir.as_deref(),
-            Some(working_dir.to_str().unwrap())
-        );
-    }
-
-    #[test]
-    fn session_log_header_persists_distinct_working_dirs_per_session() {
-        let root = TempDir::new().unwrap();
-        fs::create_dir_all(root.path().join("data").join("sessions")).unwrap();
-        fs::create_dir_all(root.path().join("state")).unwrap();
-        let config = Config {
-            sessions_dir_override: Some(root.path().join("sessions")),
-            ..Default::default()
-        };
-        fs::create_dir_all(config.sessions_dir()).unwrap();
-        let working_dir_a = root.path().join("repo-a");
-        let working_dir_b = root.path().join("repo-b");
-        fs::create_dir_all(&working_dir_a).unwrap();
-        fs::create_dir_all(&working_dir_b).unwrap();
-
-        let mut session_a = new(&config, "session-a", Some(&working_dir_a)).unwrap();
-        session_a.messages.push(make_message("hello from a"));
-        add_tool_calls(
-            &mut session_a,
-            &Input::new(
-                "".to_string(),
-                ("".to_string(), vec![]),
-                config.extract_agent().into_config(),
-            ),
-            "out",
-            None,
-            &[ToolCall::new(
-                "noop".to_string(),
-                serde_json::json!({}),
-                None,
-                None,
-            )],
-        )
-        .unwrap();
-        save(
-            &mut session_a,
-            "session-a",
-            &config.session_file("session-a"),
-            false,
-            None,
-        )
-        .unwrap();
-        let log_a = fs::read_to_string(config.session_file("session-a")).unwrap();
-
-        let mut session_b = new(&config, "session-b", Some(&working_dir_b)).unwrap();
-        session_b.messages.push(make_message("hello from b"));
-        save(
-            &mut session_b,
-            "session-b",
-            &config.session_file("session-b"),
-            false,
-            None,
-        )
-        .unwrap();
-        let log_b = fs::read_to_string(config.session_file("session-b")).unwrap();
-
-        let header_a =
-            serde_yaml::from_str::<SessionLogEntry>(log_a.split("\n---\n").next().unwrap())
-                .unwrap();
-        let header_b =
-            serde_yaml::from_str::<SessionLogEntry>(log_b.split("\n---\n").next().unwrap())
-                .unwrap();
-
-        match header_a {
-            SessionLogEntry::Header { working_dir, .. } => {
-                assert_eq!(
-                    working_dir.as_deref(),
-                    Some(working_dir_a.to_str().unwrap())
-                );
-            }
-            other => panic!("expected header entry, got {other:?}"),
-        }
-        match header_b {
-            SessionLogEntry::Header { working_dir, .. } => {
-                assert_eq!(
-                    working_dir.as_deref(),
-                    Some(working_dir_b.to_str().unwrap())
-                );
-            }
-            other => panic!("expected header entry, got {other:?}"),
-        }
-        assert_ne!(working_dir_a, working_dir_b);
-    }
-}
-
 /// Record that the LLM issued tool calls.  Called BEFORE the tools
 /// actually execute, so the transcript captures what was requested
 /// even if the process is interrupted mid-round.  Writes a
@@ -1337,10 +741,7 @@ pub fn add_tool_calls(
 pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResult]) -> Result<()> {
     // Resolve the attachments dir up front so we don't need to borrow `session`
     // again while the `pending` mutable borrow below is live.
-    let attachments_dir = session
-        .path
-        .as_deref()
-        .map(|p| crate::config::attachments::attachments_dir_for(std::path::Path::new(p)));
+    let attachments_dir = super::session_externalize::attachments_dir(session);
     let mut cid_urls = std::collections::HashMap::new();
 
     let Some(last) = session.messages.last_mut() else {
@@ -1376,7 +777,8 @@ pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResul
     }
 
     // Externalize inline image data URIs in tool-result content to cid refs
-    // before persisting, freeing the in-memory base64. Files are written now;
+    // before persisting, freeing the in-memory base64 when an attachment store
+    // is configured;
     // the cid -> filename map is logged as a DataUrls entry after the
     // ToolResults entry (below) so the ToolCalls/ToolResults pairing on replay
     // is not split.
@@ -1543,15 +945,25 @@ pub fn append_message(session: &mut Session, role: MessageRole, content: Message
     append_session_message(session, role, content)
 }
 
-pub fn clear_messages(session: &mut Session) {
+fn clear_messages_in_memory(session: &mut Session) {
     session.messages.clear();
     session.compressed_messages.clear();
     session.data_urls.clear();
     session.completion_usage = CompletionTokenUsage::default();
     session.update_tokens();
+}
+
+pub fn clear_messages(session: &mut Session) -> Result<()> {
     if !append_event(session, &SessionLogEntry::Clear) {
         session.dirty = true;
+        bail!("Failed to persist session clear")
     }
+    clear_messages_in_memory(session);
+    Ok(())
+}
+
+pub(crate) fn clear_messages_after_persisted_clear(session: &mut Session) {
+    clear_messages_in_memory(session);
 }
 
 pub fn echo_messages(session: &Session, input: &Input) -> String {
@@ -1564,13 +976,9 @@ pub fn echo_messages(session: &Session, input: &Input) -> String {
 /// it affects only the returned messages, never the stored session.
 pub fn build_messages(session: &Session, input: &Input) -> Result<Vec<Message>> {
     let messages = build_messages_inner(session, input)?;
-    // No longer call expand_message_attachments here - it's now conditional
-    // based on client capability, called from prepare_completion_data
     Ok(messages)
 }
 
-/// Expand the `cid:` image references in a single message's content — both
-/// plain content arrays and tool-result content — to inline `data:` URIs.
 fn expand_message(
     encoder: &dyn crate::config::attachments::AttachmentEncoder,
     dir: &std::path::Path,
@@ -1581,43 +989,28 @@ fn expand_message(
             crate::config::attachments::expand_parts(encoder, dir, parts)
         }
         MessageContent::ToolCalls(tool_calls) => {
-            let mut res = Ok(());
-            for tool_result in tool_calls.tool_results.iter_mut() {
-                if let Err(err) =
+            for tool_result in &mut tool_calls.tool_results {
+                if let Err(error) =
                     crate::config::attachments::expand_parts(encoder, dir, &mut tool_result.content)
                 {
-                    res = Err(err);
+                    log::warn!("attachment expansion failed: {error}");
                 }
             }
-            res
+            Ok(())
         }
         MessageContent::Text(_) => Ok(()),
     };
-    if let Err(err) = result {
-        log::warn!("attachment expansion failed: {err}");
+    if let Err(error) = result {
+        log::warn!("attachment expansion failed: {error}");
     }
 }
 
-/// Replace `cid:` image references in outgoing messages with inline `data:`
-/// URIs (base64 backend). Walks both plain content arrays and tool-result
-/// content. No-op when the session has no attachments dir / no cid refs.
-///
-/// NOTE: This function is NO LONGER called from `build_messages`. The base64
-/// pre-pass is now conditional on the client capability:
-/// - For clients with `expands_attachments_internally() == true` (Gemini native),
-///   `prepare_completion_data` skips this entirely, leaving raw `cid:` refs.
-/// - For all other providers, this is called from `prepare_completion_data` to
-///   expand `cid:` refs to base64 data: URLs before the client sees them.
 pub(crate) fn expand_message_attachments(session: &Session, messages: &mut [Message]) {
-    // A `cid:` ref only ever enters a message via the externalize-on-save path,
-    // which requires a session path — so no path means no refs to expand.
-    let Some(path) = session.path.as_ref() else {
+    let Some(dir) = super::session_externalize::attachments_dir(session) else {
         return;
     };
-
-    let dir = crate::config::attachments::attachments_dir_for(std::path::Path::new(path));
     let encoder = crate::config::attachments::Base64Encoder;
-    for message in messages.iter_mut() {
+    for message in messages {
         expand_message(&encoder, &dir, &mut message.content);
     }
 }
@@ -1688,7 +1081,9 @@ mod tests {
     use super::*;
 
     fn test_session() -> Session {
-        new(&Config::default(), "test", None).unwrap()
+        let mut session = new(&Config::default(), "test", None).unwrap();
+        attach_memory_log(&mut session);
+        session
     }
 
     fn message_view(messages: &[Message]) -> Vec<(MessageRole, String)> {
@@ -1890,66 +1285,6 @@ prompt: summary
     }
 
     #[test]
-    fn compress_keeping_recent_reload_matches_in_memory() {
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-
-        session.messages = vec![
-            Message::new(
-                MessageRole::System,
-                MessageContent::Text("base prompt".to_string()),
-            ),
-            Message::new(MessageRole::User, MessageContent::Text("q1".to_string())),
-            Message::new(
-                MessageRole::Assistant,
-                MessageContent::Text("a1".to_string()),
-            ),
-            Message::new(MessageRole::User, MessageContent::Text("q2".to_string())),
-            Message::new(
-                MessageRole::Assistant,
-                MessageContent::Text("a2".to_string()),
-            ),
-        ];
-
-        // Persist the message entries to a real log file so the compress entry
-        // is appended incrementally on top of them.
-        super::save(
-            &mut session,
-            "test",
-            &tmp.path().join("test.yaml"),
-            false,
-            None,
-        )
-        .unwrap();
-
-        // Compact the prefix, keeping the last two messages verbatim.
-        super::compress_keeping_recent(&mut session, "rolling summary".to_string(), 3);
-
-        let in_memory = message_view(&session.messages);
-
-        let persisted = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
-        let reloaded = super::load_from_log_for_test(&persisted);
-
-        assert_eq!(
-            message_view(&reloaded.messages),
-            in_memory,
-            "reloaded messages must equal the in-memory result of compress_keeping_recent"
-        );
-        // Sanity: the recent suffix survived rather than being dropped.
-        assert!(reloaded
-            .messages
-            .iter()
-            .any(|m| m.content.to_text() == "q2"));
-        assert!(reloaded
-            .messages
-            .iter()
-            .any(|m| m.content.to_text() == "a2"));
-    }
-
-    #[test]
     fn set_agent_to_agent_round_trip_preserves_model_fallbacks() {
         let agent = Agent::new(AgentConfig::from_markdown(
             "test",
@@ -1981,140 +1316,6 @@ prompt: summary
         assert!(output.contains("- google:gemini"));
     }
 
-    /// Test that timestamps are persisted to log entries and survive reload.
-    #[test]
-    fn timestamp_persists_across_session_reload() {
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-
-        let config = Config::default();
-        let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
-        let input = crate::config::input::from_str(&global_config, "hello", Some(agent.clone()));
-
-        // Add a user message
-        super::begin_turn(&mut session, &input, "response").unwrap();
-
-        // Verify the log file contains the timestamp field
-        let path = session.path.clone().unwrap();
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            content.contains("timestamp:"),
-            "log should contain timestamp field"
-        );
-
-        // Parse the log entries directly
-        let entries: Vec<(usize, SessionLogEntry)> = serde_yaml::Deserializer::from_str(&content)
-            .enumerate()
-            .map(|(seq, doc)| {
-                let entry = SessionLogEntry::deserialize(doc).expect("valid entry");
-                (seq, entry)
-            })
-            .collect();
-
-        // Find a Message entry and verify it has a timestamp
-        for (_, entry) in &entries {
-            if let SessionLogEntry::Message { timestamp, .. } = entry {
-                assert!(timestamp.is_some(), "message entry should have a timestamp");
-                return;
-            }
-        }
-        panic!("no Message entry found in session log");
-    }
-
-    /// The tool round splits into two independent log entries: a
-    /// `tool_calls` event written immediately after the LLM returns,
-    /// and a matching `tool_results` event after execution. In memory
-    /// they collapse into a single `Message(Tool, ToolCalls)` carrying
-    /// the outputs.
-    #[test]
-    fn add_tool_calls_and_results_saves_two_entries() {
-        use crate::tool::{ToolCall, ToolResult};
-        use serde_json::json;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-
-        let config = Config::default();
-        let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
-        let input = crate::config::input::from_str(&global_config, "hello", Some(agent.clone()));
-
-        let call = ToolCall {
-            name: "test_tool".to_string(),
-            arguments: json!({"arg": "val"}),
-            id: Some("call_1".to_string()),
-            thought_signature: None,
-        };
-
-        super::add_tool_calls(
-            &mut session,
-            &input,
-            "I'll call a tool",
-            None,
-            std::slice::from_ref(&call),
-        )
-        .unwrap();
-        // Before results arrive, the in-memory last message is a
-        // pending Tool message with placeholder error outputs.
-        assert_eq!(session.messages.last().unwrap().role, MessageRole::Tool);
-
-        let results = vec![ToolResult::new(call, json!({"result": "ok"}))];
-        super::add_tool_results(&mut session, &results).unwrap();
-
-        // Check the in-memory outputs got filled in.
-        let last = session.messages.last().unwrap();
-        assert_eq!(last.role, MessageRole::Tool);
-        let MessageContent::ToolCalls(tc) = &last.content else {
-            panic!("expected ToolCalls content");
-        };
-        assert_eq!(tc.tool_results.len(), 1);
-        assert_eq!(tc.tool_results[0].output, json!({"result": "ok"}));
-
-        // On disk: separate ToolCalls and ToolResults events.
-        let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
-        assert!(
-            content.contains("type: tool_calls"),
-            "file should contain a tool_calls entry"
-        );
-        assert!(
-            content.contains("type: tool_results"),
-            "file should contain a tool_results entry"
-        );
-        assert!(
-            content.contains("test_tool"),
-            "file should contain the tool name"
-        );
-
-        // Now a second round with a plain text reply — continuation
-        // detection should skip the duplicate user message.
-        // The agent loop always calls merge_tool_results before the next
-        // LLM call (setting tool_calls on the input), so the continuation
-        // input must carry those tool results to be recognised as a
-        // mid-round continuation rather than a fresh user prompt.
-        let input2 = input.merge_tool_results("I'll call a tool".to_string(), None, results);
-        super::add_assistant_text(&mut session, &input2, "final answer", None).unwrap();
-
-        let user_count = session
-            .messages
-            .iter()
-            .filter(|m| m.role == MessageRole::User)
-            .count();
-        assert_eq!(
-            user_count, 1,
-            "continuation detection should prevent duplicate user messages"
-        );
-        assert_eq!(
-            session.messages.last().unwrap().content.to_text(),
-            "final answer"
-        );
-    }
-
     /// Regression test for #390: a fresh user message sent after a
     /// session that ended with a Tool message (e.g. Ctrl-C mid-round,
     /// then resume) must NOT be dropped.
@@ -2130,9 +1331,8 @@ prompt: summary
         use serde_json::json;
         use tempfile::TempDir;
 
-        let tmp = TempDir::new().unwrap();
+        let _tmp = TempDir::new().unwrap();
         let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
 
         let config = Config::default();
         let agent = config.extract_agent();
@@ -2189,9 +1389,8 @@ prompt: summary
         use serde_json::json;
         use tempfile::TempDir;
 
-        let tmp = TempDir::new().unwrap();
+        let _tmp = TempDir::new().unwrap();
         let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
 
         let config = Config::default();
         let agent = config.extract_agent();
@@ -2229,231 +1428,6 @@ prompt: summary
             "fresh user message must be persisted; messages: {:#?}",
             session.messages
         );
-    }
-
-    /// Regression test: when the LLM emits multiple tool calls with
-    /// the same id (rare but observed, e.g. around agent handoffs),
-    /// `eval_tool_calls` dedupes before execution. `add_tool_calls`
-    /// must dedup identically so the pending slots / log entries match
-    /// the eventual results — otherwise the unmatched pending slot
-    /// persists as a "tool response pending" placeholder and the LLM
-    /// sees two results with the same tool_use_id on the next turn.
-    #[test]
-    fn add_tool_calls_dedupes_duplicate_ids() {
-        use crate::tool::{ToolCall, ToolResult};
-        use serde_json::json;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-
-        let config = Config::default();
-        let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
-        let input = crate::config::input::from_str(&global_config, "run bash", Some(agent));
-
-        // Two calls share an id (LLM bug); one has a unique id.
-        let dup_1 = ToolCall {
-            name: "Bash".to_string(),
-            arguments: json!({"command": "pwd"}),
-            id: Some("toolu_dup".to_string()),
-            thought_signature: None,
-        };
-        let dup_2 = ToolCall {
-            name: "Bash".to_string(),
-            arguments: json!({"command": "ls"}),
-            id: Some("toolu_dup".to_string()),
-            thought_signature: None,
-        };
-        let unique = ToolCall {
-            name: "Bash".to_string(),
-            arguments: json!({"command": "echo hi"}),
-            id: Some("toolu_unique".to_string()),
-            thought_signature: None,
-        };
-
-        super::add_tool_calls(
-            &mut session,
-            &input,
-            "calling tools",
-            None,
-            &[dup_1, dup_2.clone(), unique.clone()],
-        )
-        .unwrap();
-
-        // Simulate eval_tool_calls's dedup: it keeps the LAST call for
-        // each duplicate id, so the executor runs dup_2 and unique.
-        let results = vec![
-            ToolResult::new(dup_2, json!({"stdout": "ls-output"})),
-            ToolResult::new(unique, json!({"stdout": "hi"})),
-        ];
-        super::add_tool_results(&mut session, &results).unwrap();
-
-        // In-memory state should have exactly 2 slots — no orphan pending.
-        let last = session.messages.last().unwrap();
-        let MessageContent::ToolCalls(tc) = &last.content else {
-            panic!("expected ToolCalls content");
-        };
-        assert_eq!(
-            tc.tool_results.len(),
-            2,
-            "pending slots should be deduped to match eval_tool_calls"
-        );
-        for slot in &tc.tool_results {
-            let output_str = slot.output.to_string();
-            assert!(
-                !output_str.contains("tool response pending"),
-                "no slot should retain the pending placeholder, got: {output_str}"
-            );
-        }
-
-        // The on-disk log must not contain the pending-placeholder string.
-        let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
-        assert!(
-            !content.contains("tool response pending"),
-            "log should never persist pending-placeholder outputs, got:\n{content}"
-        );
-
-        // And the tool_results entry should contain two unique ids, not three.
-        let dup_id_occurrences = content.matches("toolu_dup").count();
-        assert_eq!(
-            dup_id_occurrences, 2,
-            "toolu_dup should appear once in tool_calls and once in tool_results (not more)"
-        );
-    }
-
-    /// Verify that a session file with an orphan `tool_calls` entry
-    /// (process crashed mid-round) is repaired on load by
-    /// synthesizing lost-response error outputs for every pending
-    /// call.
-    #[test]
-    fn load_repairs_orphan_tool_calls_at_eof() {
-        use crate::tool::ToolCall;
-        use serde_json::json;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-
-        let config = Config::default();
-        let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
-        let input = crate::config::input::from_str(&global_config, "hello", Some(agent));
-
-        let call = ToolCall {
-            name: "my_tool".to_string(),
-            arguments: json!({"x": 1}),
-            id: Some("c1".to_string()),
-            thought_signature: None,
-        };
-        super::add_tool_calls(&mut session, &input, "calling tool", None, &[call]).unwrap();
-        // Deliberately do NOT call add_tool_results — simulates a
-        // crash mid-round.
-
-        // Parse the log directly (same path as super::load, minus
-        // model resolution which needs a fully-configured catalog).
-        let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
-        let reloaded = super::load_from_log_for_test(&content);
-
-        let last = reloaded
-            .messages
-            .last()
-            .expect("session should have messages");
-        assert_eq!(last.role, MessageRole::Tool);
-        let MessageContent::ToolCalls(tc) = &last.content else {
-            panic!("expected ToolCalls content");
-        };
-        assert_eq!(tc.tool_results.len(), 1);
-        let output_str = tc.tool_results[0].output.to_string();
-        assert!(
-            output_str.contains("tool response lost"),
-            "expected synthesized lost-response error, got: {output_str}"
-        );
-    }
-
-    /// Regression test for #390 (orphan-repair path): after a crash
-    /// mid-tool-round the session is repaired on reload (orphan tool
-    /// calls get a synthesised "lost" result so the tail is a proper
-    /// `Tool` message).  A fresh user prompt sent to that repaired
-    /// session must still be included in `build_messages` — not dropped
-    /// because the session tail happens to be `Tool`.
-    #[test]
-    fn fresh_message_after_orphan_repair_is_included_in_build_messages() {
-        use crate::tool::ToolCall;
-        use serde_json::json;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-
-        let config = Config::default();
-        let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
-        let input = crate::config::input::from_str(&global_config, "first query", Some(agent));
-
-        // Write tool_calls but NOT tool_results — simulates crash mid-round.
-        let call = ToolCall {
-            name: "Bash".to_string(),
-            arguments: json!({"command": "ls"}),
-            id: Some("orphan_c1".to_string()),
-            thought_signature: None,
-        };
-        super::add_tool_calls(&mut session, &input, "running bash", None, &[call]).unwrap();
-
-        // Reload — orphan repair synthesises a lost-response Tool tail.
-        let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
-        let repaired = super::load_from_log_for_test(&content);
-        assert_eq!(
-            repaired.messages.last().unwrap().role,
-            MessageRole::Tool,
-            "repaired session tail must be Tool"
-        );
-
-        // Fresh user prompt after resume — no tool_calls on the input.
-        let fresh_input =
-            crate::config::input::from_str(&global_config, "fresh prompt after crash", None);
-        let messages = super::build_messages(&repaired, &fresh_input).unwrap();
-
-        assert!(
-            messages
-                .iter()
-                .filter(|m| m.role.is_user())
-                .any(|m| m.content.to_text().contains("fresh prompt after crash")),
-            "fresh user message must be included in build_messages after orphan repair; \
-             got: {messages:#?}"
-        );
-    }
-
-    /// Round-trip: write a full session (plain-text + tool round) and
-    /// reload it through `load_from_log`.  Verify the in-memory
-    /// messages are reconstructed correctly.
-    #[test]
-    fn append_message_persists_timestamp_and_reloads() {
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-
-        let config = Config::default();
-        let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
-        let input = crate::config::input::from_str(&global_config, "hello", Some(agent));
-
-        super::add_assistant_text(&mut session, &input, "world", None).unwrap();
-
-        let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
-        assert!(content.contains("timestamp:"));
-
-        let reloaded = super::load_from_log_for_test(&content);
-        let last = reloaded
-            .messages
-            .last()
-            .expect("assistant message reloaded");
-        assert!(last.log_timestamp.is_some());
     }
 
     #[test]
@@ -2503,70 +1477,6 @@ content: legacy reply
     }
 
     #[test]
-    fn session_round_trips_through_load() {
-        use crate::tool::{ToolCall, ToolResult};
-        use serde_json::json;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-
-        let config = Config::default();
-        let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
-
-        let call = ToolCall {
-            name: "search".to_string(),
-            arguments: json!({"query": "test"}),
-            id: Some("c1".to_string()),
-            thought_signature: None,
-        };
-        let results = vec![ToolResult::new(
-            call.clone(),
-            json!({"results": ["a", "b"]}),
-        )];
-
-        let input1 =
-            crate::config::input::from_str(&global_config, "find test", Some(agent.clone()));
-        super::add_tool_calls(&mut session, &input1, "searching...", None, &[call]).unwrap();
-        super::add_tool_results(&mut session, &results).unwrap();
-
-        let input2 = crate::config::input::from_str(&global_config, "find test", Some(agent));
-        super::add_assistant_text(&mut session, &input2, "found results", None).unwrap();
-
-        // Parse the log directly (same path as super::load, minus
-        // model resolution which needs a fully-configured catalog).
-        let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
-        let reloaded = super::load_from_log_for_test(&content);
-
-        assert_eq!(
-            reloaded.messages.len(),
-            session.messages.len(),
-            "reloaded message count should match"
-        );
-        assert_eq!(
-            reloaded.messages.last().unwrap().content.to_text(),
-            "found results",
-            "final reloaded message should preserve the last assistant output"
-        );
-        // The Tool message should have its outputs intact.
-        let tool_msg = reloaded
-            .messages
-            .iter()
-            .find(|m| m.role == MessageRole::Tool)
-            .expect("session should contain a Tool message");
-        let MessageContent::ToolCalls(tc) = &tool_msg.content else {
-            panic!("expected ToolCalls content on the Tool message");
-        };
-        assert_eq!(
-            tc.tool_results[0].output,
-            json!({"results": ["a", "b"]}),
-            "reloaded tool output should match what we wrote"
-        );
-    }
-
-    #[test]
     fn legacy_tool_result_without_content_loads_with_empty_content() {
         use serde_json::json;
 
@@ -2574,7 +1484,6 @@ content: legacy reply
 type: header
 model: test:model
 agent: default
-save_session: true
 ---
 type: user
 text: find test
@@ -2612,216 +1521,6 @@ results:
             tc.tool_results[0].content.is_empty(),
             "legacy sessions without content field should load as empty Vec"
         );
-    }
-
-    #[test]
-    fn session_serialization_omits_empty_tool_result_content() {
-        use crate::tool::{ToolCall, ToolResult};
-        use serde_json::json;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-
-        let config = Config::default();
-        let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
-
-        let call = ToolCall {
-            name: "search".to_string(),
-            arguments: json!({"query": "test"}),
-            id: Some("c1".to_string()),
-            thought_signature: None,
-        };
-        let result = ToolResult::new(call.clone(), json!({"results": ["a", "b"]}));
-
-        let input = crate::config::input::from_str(&global_config, "find test", Some(agent));
-        super::add_tool_calls(&mut session, &input, "searching...", None, &[call]).unwrap();
-        super::add_tool_results(&mut session, &[result]).unwrap();
-
-        let serialized = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
-        let tool_results_doc = serialized
-            .split("---")
-            .find(|doc| doc.contains("type: tool_results"))
-            .expect("persisted session should contain tool_results document");
-        assert!(
-            !tool_results_doc.contains("content:"),
-            "empty tool result content should be omitted from persisted tool_results YAML"
-        );
-    }
-
-    #[test]
-    fn tool_result_image_content_survives_add_tool_results_and_build_messages() {
-        use crate::tool::{ToolCall, ToolResult};
-        use harnx_core::message::{ImageUrl, MessageContentPart};
-        use serde_json::json;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let mut session = test_session();
-        // The session needs a path for cid: refs to be persisted
-        session.set_sessions_dir(tmp.path().to_path_buf());
-        let session_path = tmp
-            .path()
-            .join("test-session.yaml")
-            .to_string_lossy()
-            .to_string();
-        session.path = Some(session_path);
-
-        let config = Config::default();
-        let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
-        let input = crate::config::input::from_str(&global_config, "inspect image", Some(agent));
-
-        // Start with a data: URL - will be converted to cid: when persisted
-        let data_uri = "data:image/png;base64,AAAA".to_string();
-        let call = ToolCall {
-            name: "read".to_string(),
-            arguments: json!({"path": "chart.png"}),
-            id: Some("c1".to_string()),
-            thought_signature: None,
-        };
-        let result = ToolResult {
-            call: call.clone(),
-            output: json!({
-                "content": [{
-                    "type": "image",
-                    "mime_type": "image/png",
-                    "data": "<image: image/png, 4 base64 chars>"
-                }]
-            }),
-            markdown: None,
-            content: vec![MessageContentPart::ImageUrl {
-                image_url: ImageUrl {
-                    url: data_uri.clone(),
-                },
-            }],
-            switch_agent: None,
-        };
-
-        super::add_tool_calls(&mut session, &input, "reading...", None, &[call]).unwrap();
-        super::add_tool_results(&mut session, &[result]).unwrap();
-
-        // build_messages no longer expands cid: refs - that's now done in
-        // prepare_completion_data based on client capability
-        let messages = super::build_messages(&session, &input).unwrap();
-        let tool_message = messages
-            .iter()
-            .find(|message| message.role == MessageRole::Tool)
-            .expect("tool message should be present");
-        let MessageContent::ToolCalls(tool_calls) = &tool_message.content else {
-            panic!("expected tool-call message, got {tool_message:#?}");
-        };
-        assert_eq!(tool_calls.tool_results.len(), 1);
-        assert_eq!(tool_calls.tool_results[0].content.len(), 1);
-        // The URL will be a cid: ref since the message was persisted to disk
-        match &tool_calls.tool_results[0].content[0] {
-            MessageContentPart::ImageUrl { image_url } => {
-                // After persistence, data: URLs become cid: refs
-                assert!(
-                    image_url.url.starts_with("cid:"),
-                    "Expected cid: ref, got {}",
-                    image_url.url
-                );
-            }
-            other => panic!("expected ImageUrl content part, got {other:#?}"),
-        }
-        assert_eq!(
-            tool_calls.tool_results[0].output,
-            json!({
-                "content": [{
-                    "type": "image",
-                    "mime_type": "image/png",
-                    "data": "<image: image/png, 4 base64 chars>"
-                }]
-            })
-        );
-    }
-
-    #[test]
-    fn session_persistence_round_trips_tool_result_image_content_with_redacted_output() {
-        use crate::tool::{ToolCall, ToolResult};
-        use harnx_core::message::{ImageUrl, MessageContentPart};
-        use serde_json::json;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-
-        let config = Config::default();
-        let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
-
-        let base64_payload = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".repeat(8);
-        let data_uri = format!("data:image/png;base64,{base64_payload}");
-        let call = ToolCall {
-            name: "read".to_string(),
-            arguments: json!({"path": "chart.png"}),
-            id: Some("c1".to_string()),
-            thought_signature: None,
-        };
-        let redacted_output = json!({
-            "content": [{
-                "type": "image",
-                "mime_type": "image/png",
-                "data": format!("<image: image/png, {} base64 chars>", base64_payload.len())
-            }]
-        });
-        let result = ToolResult {
-            call: call.clone(),
-            output: redacted_output.clone(),
-            markdown: None,
-            content: vec![MessageContentPart::ImageUrl {
-                image_url: ImageUrl {
-                    url: data_uri.clone(),
-                },
-            }],
-            switch_agent: None,
-        };
-
-        let input = crate::config::input::from_str(&global_config, "inspect image", Some(agent));
-        super::add_tool_calls(&mut session, &input, "reading...", None, &[call]).unwrap();
-        super::add_tool_results(&mut session, &[result]).unwrap();
-
-        let persisted = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
-        assert!(persisted.contains("<image: image/png,"));
-        assert!(
-            persisted.contains("cid:"),
-            "tool-result image is referenced by cid"
-        );
-        assert!(
-            !persisted.contains(&base64_payload),
-            "tool-result base64 must not be inlined in the transcript"
-        );
-        let dir = crate::config::attachments::attachments_dir_for(std::path::Path::new(
-            session.path.as_ref().unwrap(),
-        ));
-        assert_eq!(std::fs::read_dir(&dir).unwrap().flatten().count(), 1);
-
-        let reloaded = super::load_from_log_for_test(&persisted);
-        let MessageContent::ToolCalls(tool_calls) = &reloaded
-            .messages
-            .iter()
-            .find(|message| message.role == MessageRole::Tool)
-            .expect("reloaded tool message should be present")
-            .content
-        else {
-            panic!("expected reloaded tool-call message");
-        };
-        assert_eq!(tool_calls.tool_results.len(), 1);
-        assert_eq!(tool_calls.tool_results[0].content.len(), 1);
-        match &tool_calls.tool_results[0].content[0] {
-            MessageContentPart::ImageUrl { image_url } => {
-                assert!(
-                    image_url.url.starts_with("cid:"),
-                    "reloaded content keeps cid ref"
-                );
-            }
-            other => panic!("expected ImageUrl content part, got {other:#?}"),
-        }
-        assert_eq!(tool_calls.tool_results[0].output, redacted_output);
     }
 
     #[test]
@@ -3152,48 +1851,6 @@ replacements:
     }
 
     #[test]
-    fn load_tracks_log_entry_count_and_append_event_increments_next_seq() {
-        use tempfile::TempDir;
-
-        let content = r#"type: header
-model: test
----
-type: message
-role: user
-content: first
----
-type: message
-role: assistant
-content: second
-"#;
-
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("session.yaml");
-        std::fs::write(&path, content).unwrap();
-
-        let mut session = super::load_from_log_for_test(content);
-        session.path = Some(path.display().to_string());
-
-        assert_eq!(session.log_entry_count, 3);
-        assert_eq!(session.next_seq(), 3);
-
-        let appended = super::append_event(
-            &mut session,
-            &SessionLogEntry::Message {
-                id: None,
-                timestamp: None,
-                fence_token: None,
-                role: MessageRole::User,
-                content: MessageContent::Text("third".to_string()),
-            },
-        );
-
-        assert!(appended);
-        assert_eq!(session.log_entry_count, 4);
-        assert_eq!(session.next_seq(), 4);
-    }
-
-    #[test]
     fn render_shows_session_title_and_manual_state() {
         let mut session = test_session();
 
@@ -3262,9 +1919,8 @@ content: second
         use serde_json::json;
         use tempfile::TempDir;
 
-        let tmp = TempDir::new().unwrap();
+        let _tmp = TempDir::new().unwrap();
         let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
 
         let config = Config::default();
         let agent = config.extract_agent();
@@ -3382,9 +2038,8 @@ content: second
         use serde_json::json;
         use tempfile::TempDir;
 
-        let tmp = TempDir::new().unwrap();
+        let _tmp = TempDir::new().unwrap();
         let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
 
         let config = Config::default();
         let agent = config.extract_agent();
@@ -3451,86 +2106,6 @@ content: second
     }
 
     #[test]
-    fn save_externalizes_inline_image_content() {
-        use harnx_core::message::{ImageUrl, MessageContent, MessageContentPart};
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-
-        let base64_payload = "QUJDREVG".repeat(64);
-        let data_uri = format!("data:image/png;base64,{base64_payload}");
-        session.messages.push(Message::new(
-            MessageRole::User,
-            MessageContent::Array(vec![MessageContentPart::ImageUrl {
-                image_url: ImageUrl { url: data_uri },
-            }]),
-        ));
-
-        let path = tmp.path().join("s1.yaml");
-        super::save(&mut session, "s1", &path, false, None).unwrap();
-
-        let persisted = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            persisted.contains("cid:"),
-            "saved transcript references a cid"
-        );
-        assert!(
-            !persisted.contains(&base64_payload),
-            "no inline base64 in saved transcript"
-        );
-        let dir = crate::config::attachments::attachments_dir_for(&path);
-        assert_eq!(std::fs::read_dir(&dir).unwrap().flatten().count(), 1);
-    }
-
-    #[test]
-    fn externalize_content_rewrites_image_to_cid_and_writes_file() {
-        use harnx_core::message::{ImageUrl, MessageContent, MessageContentPart};
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-        super::ensure_log_file(&mut session);
-        assert!(session.path.is_some(), "ensure_log_file should set a path");
-
-        let base64_payload = "QUJDREVG".repeat(64);
-        let data_uri = format!("data:image/png;base64,{base64_payload}");
-        let mut content = MessageContent::Array(vec![
-            MessageContentPart::Text {
-                text: "look".into(),
-            },
-            MessageContentPart::ImageUrl {
-                image_url: ImageUrl { url: data_uri },
-            },
-        ]);
-
-        let map = super::session_externalize::externalize_content(&session, &mut content);
-        assert_eq!(map.len(), 1, "one cid recorded");
-        assert!(
-            map.keys().next().unwrap().starts_with("cid:"),
-            "map is keyed by the cid reference"
-        );
-
-        match &content {
-            MessageContent::Array(parts) => match &parts[1] {
-                MessageContentPart::ImageUrl { image_url } => {
-                    assert!(image_url.url.starts_with("cid:"));
-                    assert!(!image_url.url.contains(&base64_payload));
-                }
-                other => panic!("expected ImageUrl, got {other:#?}"),
-            },
-            other => panic!("expected Array, got {other:#?}"),
-        }
-
-        let dir = crate::config::attachments::attachments_dir_for(std::path::Path::new(
-            session.path.as_ref().unwrap(),
-        ));
-        assert_eq!(std::fs::read_dir(&dir).unwrap().flatten().count(), 1);
-    }
-
-    #[test]
     fn compress_keeping_recent_preserves_suffix() {
         use harnx_core::message::{Message, MessageContent, MessageRole};
         let mut session = test_session();
@@ -3555,86 +2130,6 @@ content: second
             .all(|message| message.role != MessageRole::System));
         assert_eq!(session.messages[0].content.to_text(), "recent u");
         assert_eq!(session.messages[1].content.to_text(), "recent a");
-    }
-
-    #[test]
-    fn first_turn_persists_user_only_and_no_stored_system_message() {
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-
-        let config = Config::default();
-        let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config));
-        let input = crate::config::input::from_str(&global_config, "hello world", Some(agent));
-
-        super::add_assistant_text(&mut session, &input, "hi there", None).unwrap();
-
-        assert!(
-            session
-                .messages
-                .iter()
-                .all(|message| message.role != MessageRole::System),
-            "session transcript should not store a system message: {:#?}",
-            session.messages
-        );
-        let persisted = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
-        assert!(
-            !persisted.contains("role: system"),
-            "persisted log should not contain a stored system message: {persisted}"
-        );
-    }
-
-    #[test]
-    fn compress_keeping_recent_log_stores_summary_only_and_runtime_tracks_it() {
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-        session.messages = vec![
-            Message::new(
-                MessageRole::System,
-                MessageContent::Text("agent instructions".to_string()),
-            ),
-            Message::new(MessageRole::User, MessageContent::Text("old u".to_string())),
-            Message::new(
-                MessageRole::Assistant,
-                MessageContent::Text("old a".to_string()),
-            ),
-            Message::new(
-                MessageRole::User,
-                MessageContent::Text("recent u".to_string()),
-            ),
-            Message::new(
-                MessageRole::Assistant,
-                MessageContent::Text("recent a".to_string()),
-            ),
-        ];
-        super::save(
-            &mut session,
-            "test",
-            &tmp.path().join("test.yaml"),
-            false,
-            None,
-        )
-        .unwrap();
-
-        super::compress_keeping_recent(&mut session, "LLM summary only".to_string(), 3);
-
-        let persisted = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
-        assert!(persisted.contains("type: compress\nprompt: LLM summary only"));
-        assert!(!persisted.contains("prompt: agent instructions"));
-        assert!(session
-            .messages
-            .iter()
-            .all(|message| message.role != MessageRole::System));
-        assert_eq!(
-            session.compaction_summary.as_deref(),
-            Some("LLM summary only")
-        );
     }
 
     #[test]
@@ -3827,52 +2322,5 @@ content: hello
             "messages: {messages:#?}"
         );
         assert_eq!(messages[1].content.to_text(), "q");
-    }
-
-    /// Regression test: `exit` must NOT deadlock when a lock is passed through.
-    /// Simulates the in-loop exit path where the agent loop holds `_session_lock`
-    /// and calls `exit_agent_with_lock(Some(&lock))`. Uses a timeout to detect hangs.
-    #[test]
-    fn exit_with_lock_held_does_not_deadlock() {
-        use std::path::PathBuf;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let session_path: PathBuf = tmp.path().join("locked-session.yaml");
-
-        // Create a session file with a header so load_from_log works.
-        let header = r#""type: header
-model: test:model
-"#;
-        std::fs::write(&session_path, header).unwrap();
-
-        // Build a session that is dirty (has unsaved changes).
-        let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-        session.path = Some(session_path.display().to_string());
-        session.dirty = true; // Force the exit path to call save().
-
-        // Acquire the session lock BEFORE calling exit.
-        let lock = crate::config::session_lock::SessionLock::acquire(&session_path).unwrap();
-
-        // Call exit with Some(&lock) - simulating the in-loop path.
-        // A deadlock would cause this test to hang/timeout.
-        let result = std::thread::scope(|s| {
-            let handle = s.spawn(|| super::exit(&mut session, tmp.path(), false, Some(&lock)));
-            // Give it 2 seconds; if hung, the join will timeout.
-            handle.join().expect("exit thread should not panic")
-        });
-
-        result.expect("exit with lock held should succeed");
-
-        // Verify the session file was actually written.
-        let written = std::fs::read_to_string(&session_path).unwrap();
-        assert!(
-            written.contains("type: header"),
-            "session file should contain header"
-        );
-        // Verify save() actually ran by checking that dirty flag was consumed
-        // (we can't check file content for messages since session is empty).
-        // The key proof of no-deadlock is that exit() returned Ok(()) above.
     }
 }

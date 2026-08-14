@@ -5,6 +5,7 @@
 pub mod ag_ui;
 pub mod ag_ui_rpc;
 pub mod session_actor;
+mod session_actor_types;
 // Not `#[cfg(test)]`: the `tests/` integration crates link the library built
 // WITHOUT the `test` cfg, so gating this out would break their
 // `harnx_serve::test_support` imports. Kept public for cross-crate test reuse.
@@ -589,19 +590,11 @@ impl Server {
         let (agent, session) =
             parse_session_attachments_path(&path).ok_or_else(|| anyhow!("Not Found"))?;
 
-        // Check Content-Length header first (early rejection for oversized payloads)
-        if let Some(length) = req
-            .headers()
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<usize>().ok())
-        {
-            if length > MAX_UPLOAD_BYTES {
-                return json_response_with_status(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    json!({"error":"payload too large","max_bytes":MAX_UPLOAD_BYTES}),
-                );
-            }
+        if request_is_oversized(req.headers()) {
+            return json_response_with_status(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({"error":"payload too large","max_bytes":MAX_UPLOAD_BYTES}),
+            );
         }
 
         let Some(boundary) = multer::parse_boundary(
@@ -613,9 +606,10 @@ impl Server {
         .ok() else {
             bail!("Bad Request");
         };
-        let scoped = agent_scoped_config(&self.config, &agent)?;
-        let session_path = scoped.session_file(&session);
-        let attachments_dir = session_path.with_extension("attachments");
+        let _scoped = agent_scoped_config(&self.config, &agent)?;
+        let attachments_dir = Config::agent_data_dir(&agent)
+            .join("attachments")
+            .join(&session);
 
         // Stream body with size limit to prevent OOM
         let body = req.into_body();
@@ -1052,10 +1046,35 @@ fn parse_session_attachments_path(path: &str) -> Option<(String, String)> {
         .collect();
     match segments.as_slice() {
         [agent, "sessions", session, "attachments"] => {
-            Some((percent_decode(agent), percent_decode(session)))
+            let agent = percent_decode(agent);
+            let session = percent_decode(session);
+            if !is_safe_agent_path(&agent) || !is_safe_path_segment(&session) {
+                return None;
+            }
+            Some((agent, session))
         }
         _ => None,
     }
+}
+
+fn request_is_oversized(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > MAX_UPLOAD_BYTES)
+}
+
+fn is_safe_path_segment(value: &str) -> bool {
+    !value.is_empty()
+        && std::path::Path::new(value)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && !value.contains(['/', '\\'])
+}
+
+fn is_safe_agent_path(value: &str) -> bool {
+    !value.is_empty() && !value.starts_with('/') && value.split('/').all(is_safe_path_segment)
 }
 
 fn negotiate_agents_route(
@@ -1459,10 +1478,24 @@ mod tests {
             parse_session_attachments_path("/v1/agents/hephaestus/sessions/thread-1/attachments"),
             Some(("hephaestus".to_string(), "thread-1".to_string()))
         );
+        assert_eq!(
+            parse_session_attachments_path(
+                "/v1/agents/coding%2Fcoder/sessions/thread-1/attachments"
+            ),
+            Some(("coding/coder".to_string(), "thread-1".to_string()))
+        );
         assert!(!is_session_attachments_path("/v1/agents/hephaestus/rpc"));
         assert!(!is_session_attachments_path(
             "/v1/agents/hephaestus/sessions/thread-1"
         ));
+        assert!(parse_session_attachments_path(
+            "/v1/agents/hephaestus/sessions/%2E%2E/attachments"
+        )
+        .is_none());
+        assert!(parse_session_attachments_path(
+            "/v1/agents/hephaestus/sessions/%2E%2E%2Foutside/attachments"
+        )
+        .is_none());
     }
 
     #[test]
@@ -2007,12 +2040,10 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert!(refs[0].as_str().unwrap().starts_with("cid:"));
 
-        // Verify file was stored in attachments directory
-        // Note: The handler uses agent_scoped_config which scopes the config for the agent,
-        // so we need to use the scoped config to find the session path
-        let scoped = agent_scoped_config(&config.read(), "plain").expect("scope config");
-        let session_path = scoped.session_file("test-session");
-        let attachments_dir = session_path.with_extension("attachments");
+        // Verify the uploaded blob was stored in the attachment directory.
+        let attachments_dir = Config::agent_data_dir("plain")
+            .join("attachments")
+            .join("test-session");
         assert!(
             attachments_dir.exists(),
             "attachments dir should exist at {:?}",

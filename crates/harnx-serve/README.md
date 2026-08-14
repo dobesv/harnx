@@ -108,7 +108,7 @@ Same canonical session URL, negotiated into programmatic control.
   ```json
   { "jsonrpc": "2.0", "id": 1, "method": "session/get" }
   ```
-  **Result:** `{ "state": { "status": "idle" }, "history_snapshot": [...], "capabilities": { "multiClient": true, "persistence": "filesystem" } }` (a running session reports `"state": { "status": "running", "run_id": "…", "started_at": "…" }`)
+  **Result:** `{ "state": { "status": "idle" }, "history_snapshot": [...], "capabilities": { "multiClient": true, "persistence": "nats" } }` (a running session reports `"state": { "status": "running", "run_id": "…", "started_at": "…" }`)
 - **`session/prompt`**: Sends a new user prompt.
   ```json
   { "jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": { "text": "hello" } }
@@ -145,7 +145,7 @@ This implementation deliberately diverges from generic AG-UI/assistant-ui standa
 
 ### Phase B Scope
 
-Cross-process live synchronization via NATS and distributed persistence (Issue #848) are deferred to Phase B.
+Cross-process live synchronization and durable session persistence use NATS.
 
 
 ### AgentEvent → AG-UI mapping
@@ -172,7 +172,7 @@ Intentionally dropped today:
 - `Notice::Info` / `Notice::Warning` — not currently emitted in server flows worth surfacing; omitted to avoid custom-event spam.
 ## Operational Notes
 
-- **Persistence and `--dry-run`:** Session persistence is skipped in `--dry-run` mode.
+- **Persistence and `--dry-run`:** NATS transcript writes are skipped in `--dry-run` mode. A generated session ID is still reserved in the NATS session index.
 - **Consistency Barrier:** History reflects a turn only AFTER it completes and is persisted.
 
 ## Quickstart
@@ -206,4 +206,4 @@ Intentionally dropped today:
 
 - **Phase 1:** Text streaming, content negotiation, session enumeration, and history. (Done)
 - **Phase 2:** Two-plane model (SSE + JSON-RPC), multi-subscriber broadcast, session cancellation. (Current)
-- **Phase B:** NATS-backed sessions, shared state, and distributed persistence. (Planned)
+- **NATS sessions:** Shared state and durable session persistence are NATS-backed.

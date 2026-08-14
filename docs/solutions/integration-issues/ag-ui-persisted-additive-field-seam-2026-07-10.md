@@ -4,7 +4,7 @@ date: 2026-07-10
 category: "integration-issues"
 problem_type: integration_issue
 component: "harnx-serve, harnx-runtime, harnx-core, web"
-root_cause: "Additive field populated only for live event emission, never written to persisted ToolResult before save_session_tool_results"
+root_cause: "Additive field populated only for live event emission, never written to persisted ToolResult before append_session_tool_results"
 resolution_type: code_fix
 severity: high
 tags:
@@ -21,7 +21,7 @@ plan_ref: "harnx-webui-tui-parity"
 
 ## Problem
 
-Adding a `markdown: Option<String>` field to `ToolResult` and rendering it into emitted AG-UI events is not sufficient. If the persisted object is not populated before `save_session_tool_results`, restored sessions silently lose the field — tool-call summary cards appear blank after page reload.
+Adding a `markdown: Option<String>` field to `ToolResult` and rendering it into emitted AG-UI events is not sufficient. If the persisted object is not populated before `append_session_tool_results`, restored sessions silently lose the field — tool-call summary cards appear blank after page reload.
 
 ## Symptoms
 
@@ -38,7 +38,7 @@ Adding a `markdown: Option<String>` field to `ToolResult` and rendering it into 
 1. Added `markdown: Option<String>` to `harnx_core::ToolResult` with `#[serde(default, skip_serializing_if = "Option::is_none")]`.
 2. Live path: emitted `tool_summary` custom event keyed by `tool_call_id` when `ToolEvent::Started.markdown` present — worked.
 3. Restore path: `history_messages_for_snapshot` preferred `.markdown` over `.output` — also correct.
-4. Review blocker: persisted sessions still had `markdown: null`. The field was never written to `ToolResult` before `save_session_tool_results`.
+4. Review blocker: persisted sessions still had `markdown: null`. The field was never written to `ToolResult` before `append_session_tool_results`.
 5. Traced execution: `harnx-engine::eval_tool_calls` builds `ToolResult::new()` (markdown None); live emit renders template for event but never writes back to the result object.
 6. Mock tests hid the bug — they constructed `ToolResult { markdown: Some("test"), .. }` directly, bypassing the real production flow.
 
@@ -47,7 +47,7 @@ Adding a `markdown: Option<String>` field to `ToolResult` and rendering it into 
 The persistence seam has two independent paths:
 
 1. **Live emit path**: Template markdown rendered directly into `ToolEvent::Completed` for SSE broadcast — does not touch `ToolResult`.
-2. **Persistence path**: `ToolResult` constructed via `ToolResult::new()` with `markdown: None`, then saved via `save_session_tool_results`.
+2. **Persistence path**: `ToolResult` constructed via `ToolResult::new()` with `markdown: None`, then saved via `append_session_tool_results`.
 
 The field was added to the struct and the emit path, but never threaded through the persistence construction sites. Old serialized sessions deserialize with `None` (serde default), but new sessions also had `None` because nothing populated it before save.
 
@@ -61,18 +61,18 @@ The field was added to the struct and the emit path, but never threaded through 
 
 ### 1. Populate before persist (the finalize-before-save seam)
 
-Added `populate_result_markdown(results, eval_ctx)` call immediately before `save_session_tool_results`:
+Added `populate_result_markdown(results, eval_ctx)` call immediately before `append_session_tool_results`:
 
 ```rust
 // crates/harnx-runtime/src/tool.rs:142-152
 let results = populate_result_markdown(results, &eval_ctx);
 if !dry_run {
-    config.write().save_session_tool_results(&results)?;
+    config.write().append_session_tool_results(&results)?;
 }
 
 // Error path also needs it:
 let fallback = populate_result_markdown(fallback, &eval_ctx);
-let _ = config.write().save_session_tool_results(&fallback);
+let _ = config.write().append_session_tool_results(&fallback);
 ```
 
 `populate_result_markdown` iterates results, looks up `ToolDeclaration.result_template` via `eval_ctx.render.decl_map`, renders via `render_tool_result_template`, and sets `.markdown` when present.

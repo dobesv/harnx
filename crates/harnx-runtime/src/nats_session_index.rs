@@ -83,6 +83,27 @@ pub async fn put_record(store: &kv::Store, record: &SessionIndexRecord) -> Resul
         .with_context(|| format!("Failed to put session index record for key '{key}'"))
 }
 
+/// Atomically reserve a session ID in the index.
+///
+/// Returns `false` when another creator already owns the ID. The worker later
+/// replaces this provisional record with metadata reconstructed from the
+/// canonical session header.
+pub async fn try_create_record(store: &kv::Store, record: &SessionIndexRecord) -> Result<bool> {
+    let key = session_index_key(&record.session_id);
+    let payload = serde_json::to_vec(record).with_context(|| {
+        format!(
+            "Failed to serialize session index reservation '{}'",
+            record.session_id
+        )
+    })?;
+    match store.create(&key, payload.into()).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == kv::CreateErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(anyhow::Error::from(error))
+            .with_context(|| format!("Failed to reserve session index key '{key}'")),
+    }
+}
+
 pub async fn get_record(store: &kv::Store, session_id: &str) -> Result<Option<SessionIndexRecord>> {
     Ok(get_record_with_revision(store, session_id)
         .await?
@@ -195,7 +216,7 @@ pub async fn update_session_title(store: &kv::Store, session_id: &str, title: &s
 mod tests {
     use super::{
         get_record, get_record_with_revision, list_records, put_record, session_index_key,
-        update_record_with_revision, SessionIndexRecord, SESSION_INDEX_BUCKET,
+        try_create_record, update_record_with_revision, SessionIndexRecord, SESSION_INDEX_BUCKET,
     };
     use async_nats::jetstream::kv::Store;
 
@@ -301,6 +322,12 @@ mod tests {
         let record = sample_record(&unique);
         let revision = put_record(&store, &record).await.expect("put record");
         assert!(revision > 0);
+        assert!(
+            !try_create_record(&store, &record)
+                .await
+                .expect("reject duplicate reservation"),
+            "an existing session ID must not be reserved twice"
+        );
 
         let loaded = get_record(&store, &unique)
             .await
@@ -329,6 +356,15 @@ mod tests {
             .await
             .expect("get deleted record")
             .is_none());
+        assert!(
+            try_create_record(&store, &record)
+                .await
+                .expect("reserve available session ID"),
+            "a free session ID should be reserved atomically"
+        );
+        super::delete_record(&store, &unique)
+            .await
+            .expect("delete reservation");
     }
 
     /// Integration test for `list_remote_sessions_with_meta` via config.

@@ -201,9 +201,7 @@ impl Tui {
             _ => {
                 self.app.detail_view_text = None;
                 self.app.detail_view_title = None;
-                self.app.detail_view_raw_yaml = self
-                    .selected_seq_range()
-                    .and_then(|(from, to)| self.config.read().get_message_range_yaml(from, to));
+                self.app.detail_view_raw_yaml = None;
             }
         }
         self.app.detail_view_open = true;
@@ -1485,8 +1483,8 @@ impl Tui {
     pub(super) async fn start_prompt(&mut self, msg: crate::types::PendingMessage) -> Result<()> {
         // Drain any prior prompt task BEFORE spawning the new one. Two
         // prompt tasks must never run concurrently against the same
-        // session — they would interleave save_session_tool_calls /
-        // save_session_tool_results writes and corrupt the in-memory
+        // session — they would interleave append_session_tool_calls /
+        // append_session_tool_results writes and corrupt the in-memory
         // pending Tool message (see Bug 2: orphan tool_calls in the
         // session log around line 24785/24794 of the reproducing
         // session).
@@ -2013,9 +2011,8 @@ impl Tui {
                 Vec::new()
             };
 
-            // When completing .session in remote-agent context, use the async
-            // helper that queries the NATS KV index with a short timeout.
-            // Otherwise, fall back to local sessions.
+            // Session completion always queries the NATS KV index. An absent
+            // remote-agent cluster means the shared local NATS cluster.
             if cmd == ".session" && args.len() == 1 {
                 let cluster = self
                     .config
@@ -2046,28 +2043,7 @@ impl Tui {
     }
 
     pub(crate) async fn open_session_picker(&mut self) {
-        let cluster = self
-            .config
-            .read()
-            .remote_agent
-            .as_ref()
-            .map(|(_, cluster)| cluster.clone())
-            .unwrap_or_else(|| harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string());
-        let cfg = self.config.read().clone();
-        let (sessions, fetch_error) = match cfg.list_remote_sessions_with_meta(&cluster).await {
-            Ok(sessions) => (sessions, None),
-            Err(error) => {
-                log::warn!(
-                    "Failed to list NATS sessions for cluster '{}': {:#}",
-                    cluster,
-                    error
-                );
-                (
-                    vec![],
-                    Some(format!("NATS sessions unavailable: {error:#}")),
-                )
-            }
-        };
+        let (sessions, fetch_error) = Self::picker_sessions(&self.config).await;
 
         let ctx = build_picker_context(None);
         let sessions = sort_sessions_for_picker(sessions, &ctx);
@@ -2122,7 +2098,7 @@ impl Tui {
         }
     }
 
-    fn reconcile_transcript_after_command(
+    pub(crate) fn reconcile_transcript_after_command(
         &mut self,
         prev_session: Option<String>,
         prev_agent: Option<String>,
@@ -2160,7 +2136,7 @@ impl Tui {
         self.pin_transcript_to_bottom();
     }
 
-    fn try_handle_info_overlay(&mut self, line_cmd: &str) -> bool {
+    async fn try_handle_info_overlay(&mut self, line_cmd: &str) -> bool {
         let is_info_agent =
             line_cmd.starts_with(".info agent") || line_cmd.starts_with("/info agent");
         let is_info_session =
@@ -2184,10 +2160,18 @@ impl Tui {
                     harnx_runtime::config::render_agent_dump(&cfg, &agent_name)
                 })
         } else {
-            self.resolve_info_session_target(&tokens)
-                .and_then(|(agent_name, session_id)| {
-                    harnx_runtime::config::render_session_dump(agent_name.as_deref(), &session_id)
-                })
+            async {
+                let (_agent_name, session_id) = self.resolve_info_session_target(&tokens)?;
+                let cfg = self.config.read().clone();
+                let cluster = cfg
+                    .remote_agent
+                    .as_ref()
+                    .map(|(_, cluster)| cluster.as_str())
+                    .unwrap_or(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+                    .to_string();
+                harnx_runtime::config::render_session_dump(&cfg, &cluster, &session_id).await
+            }
+            .await
         };
 
         let display_text = result.unwrap_or_else(|err| format!("Error: {}", err));
@@ -2261,7 +2245,7 @@ impl Tui {
     }
 
     pub(super) async fn run_command(&mut self, line: &str) -> Result<()> {
-        if self.try_handle_info_overlay(line.trim_start()) {
+        if self.try_handle_info_overlay(line.trim_start()).await {
             return Ok(());
         }
         let prev_session = self
@@ -2506,8 +2490,6 @@ impl Tui {
                                 .as_ref()
                                 .map(|a| a.name().to_string());
 
-                            // Activate the agent immediately so sessions_dir() is
-                            // already scoped to the correct per-agent directory.
                             if let Err(e) = self.config.write().use_agent_by_name(&agent_name) {
                                 self.app.modal = Some(crate::types::ModalState::AgentPicker {
                                     agents,
@@ -2517,7 +2499,7 @@ impl Tui {
                                 return Err(e);
                             }
 
-                            let sessions = self.config.read().list_sessions_with_meta();
+                            let (sessions, fetch_error) = Self::picker_sessions(&self.config).await;
                             let ctx = build_picker_context(None);
                             let sessions = sort_sessions_for_picker(sessions, &ctx);
                             // Always show SessionPicker so the user can pick "New session"
@@ -2529,7 +2511,7 @@ impl Tui {
                                 selected: 0,
                                 origin_agent: prev_agent,
                                 origin_session: prev_session,
-                                error: None,
+                                error: fetch_error,
                             });
                         }
                     }
@@ -2542,30 +2524,13 @@ impl Tui {
                     }) => {
                         // Index 0 = "New session"; index N (1‥) = sessions[N-1].
                         if selected == 0 {
-                            // Create a new session.
-                            if let Err(e) = self.config.write().use_session(None) {
-                                self.app.modal = Some(crate::types::ModalState::SessionPicker {
-                                    sessions,
-                                    selected,
-                                    origin_agent,
-                                    origin_session,
-                                    error: None,
-                                });
-                                return Err(e);
-                            }
-                            let llm_busy = self.app.llm_busy;
-                            let pending = self.app.pending_message.is_some();
-                            Self::refresh_input_chrome_from_state(
-                                &self.config,
-                                &mut self.app,
-                                llm_busy,
-                                pending,
-                            );
-                            self.reconcile_transcript_after_command(
-                                origin_session,
+                            self.select_new_session(crate::lifecycle::NewSessionSelection {
+                                sessions,
+                                selected,
                                 origin_agent,
-                                ".session",
-                            );
+                                origin_session,
+                            })
+                            .await?;
                         } else if selected > sessions.len() {
                             // Index out of range — keep picker open.
                             self.app.modal = Some(crate::types::ModalState::SessionPicker {

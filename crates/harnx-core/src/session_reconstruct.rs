@@ -1346,7 +1346,6 @@ mod tests {
             temperature: None,
             top_p: None,
             use_tools: None,
-            save_session: None,
             compress_threshold: None,
             agent_name: None,
             session_id: None,

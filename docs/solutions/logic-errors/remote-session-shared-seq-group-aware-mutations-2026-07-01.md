@@ -22,7 +22,7 @@ plan_ref: "p915-remote-tui-wiring"
 
 ## Problem
 
-Remote NATS sessions require edit/delete/rewind/resume operations to work identically to local sessions, but remote sessions use an append-only JetStream log with physical seqs while local sessions use document indices. A subtle trap emerges: worker header migration creates entries that **share a single physical JetStream seq**, and naive per-seq mutations silently corrupt sessions by dropping Headers or mis-targeting operations.
+NATS sessions require edit/delete/rewind/resume operations to preserve logical document grouping over the append-only JetStream log. A subtle trap emerges: worker header migration creates entries that **share a single physical JetStream seq**, and naive per-seq mutations silently corrupt sessions by dropping Headers or mis-targeting operations.
 
 ## Symptoms
 

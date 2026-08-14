@@ -6,37 +6,44 @@ use crate::tool::ToolResult;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Externalize inline image data URIs in a single message's content — both
-/// plain content arrays and tool-result content — into `cid:` references,
-/// writing files to `dir` and recording `cid -> filename` in `map`. On partial
-/// failure, keeps whatever was already externalized (those files are on disk
-/// and their refs are already in `content`).
-pub(crate) fn externalize_message(
+pub(crate) fn attachments_dir(session: &Session) -> Option<std::path::PathBuf> {
+    let agent_name = session.agent_name.as_deref()?;
+    let session_id = session.id();
+    if session_id.is_empty() {
+        return None;
+    }
+    if session_id.contains(['/', '\\']) {
+        return None;
+    }
+    if !Path::new(session_id)
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(
+        super::Config::agent_data_dir(agent_name)
+            .join("attachments")
+            .join(session_id),
+    )
+}
+
+fn externalize_message(
     dir: &Path,
     content: &mut MessageContent,
     map: &mut HashMap<String, String>,
-) {
-    let result = match content {
+) -> anyhow::Result<()> {
+    match content {
         MessageContent::Array(parts) => {
             crate::config::attachments::externalize_parts(dir, parts, map)
         }
         MessageContent::ToolCalls(tool_calls) => {
-            let mut res = Ok(());
-            for tool_result in tool_calls.tool_results.iter_mut() {
-                if let Err(err) = crate::config::attachments::externalize_parts(
-                    dir,
-                    &mut tool_result.content,
-                    map,
-                ) {
-                    res = Err(err);
-                }
+            for result in &mut tool_calls.tool_results {
+                crate::config::attachments::externalize_parts(dir, &mut result.content, map)?;
             }
-            res
+            Ok(())
         }
         MessageContent::Text(_) => Ok(()),
-    };
-    if let Err(err) = result {
-        log::warn!("attachment externalization failed: {err}");
     }
 }
 
@@ -48,11 +55,12 @@ pub(crate) fn externalize_content(
     content: &mut MessageContent,
 ) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    let Some(path) = session.path.as_deref() else {
+    let Some(dir) = attachments_dir(session) else {
         return map;
     };
-    let dir = crate::config::attachments::attachments_dir_for(Path::new(path));
-    externalize_message(&dir, content, &mut map);
+    if let Err(err) = externalize_message(&dir, content, &mut map) {
+        log::warn!("attachment externalization failed: {err}");
+    }
     map
 }
 
@@ -73,22 +81,6 @@ pub(crate) fn externalize_tool_result_content(
             log::warn!("tool-result attachment externalization failed: {err}");
         }
     }
-}
-
-/// Externalize still-inline image content across every stored message
-/// (compressed + active) into the session's attachments dir, merging the new
-/// `cid -> filename` mappings into the session map. Idempotent — used by the
-/// full-rewrite `save()` to migrate first-turn/legacy inline blobs.
-pub(crate) fn externalize_persisted_messages(session: &mut Session, session_path: &Path) {
-    let dir = crate::config::attachments::attachments_dir_for(session_path);
-    let mut map = HashMap::new();
-    for msg in session.compressed_messages.iter_mut() {
-        externalize_message(&dir, &mut msg.content, &mut map);
-    }
-    for msg in session.messages.iter_mut() {
-        externalize_message(&dir, &mut msg.content, &mut map);
-    }
-    session.data_urls.extend(map);
 }
 
 /// Record freshly externalized `cid -> filename` mappings: append a `DataUrls`

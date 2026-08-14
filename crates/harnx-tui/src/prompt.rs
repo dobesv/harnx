@@ -157,7 +157,6 @@ impl Tui {
             nats_hook_provider: None,
             pending_async_context: None,
             working_dir: None,
-            session_lock: None,
         };
 
         harnx_runtime::run_agent_loop_with_local_handoff(&loop_ctx, input).await

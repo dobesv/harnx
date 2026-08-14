@@ -23,7 +23,7 @@ plan_ref: "harnx-issue-1091-agent-handoff"
 
 ## Symptoms
 
-- **NATS handoff fell back to file**: `Config::use_session` unconditionally installed `FileSessionLogSink`. NATS-specific wiring (`FencedSessionLogSink`/`NatsSessionLogBackend`) existed only in pre-loop setup, never re-run after handoff.
+- **NATS handoff lost its persistence sink**: NATS-specific wiring (`FencedSessionLogSink`/`NatsSessionLogBackend`) existed only in pre-loop setup and was not re-run after handoff.
 - **Web UI missed post-handoff events**: Serve outer loop continued delegated turn in-place on the original actor's task. Browser navigated to target session's SSE but target actor was idle — missed live events.
 - **History replay caused ghost navigation**: `session_handoff` event in historical sessions triggered navigation even when no live run was active.
 - **NATS handoff test failed**: Test read JetStream using human `Session.id` ("handoff-remote-session") but backend wrote to generated durable id ("alyQCQ").
@@ -115,7 +115,7 @@ fn run_agent_loop_segment(mut args: AgentLoopSegmentArgs) -> Pin<Box<dyn Future<
             LoopResult::Completed => Ok(()),
             LoopResult::HandoffRequested { agent, session_id, prompt } => {
                 // Exit old session
-                args.config.write().exit_agent_with_lock(args.ctx.session_lock.as_ref())?;
+                args.config.write().exit_agent()?;
                 
                 // Activate new agent/session
                 Config::use_agent(&args.config, &agent, session_id.as_deref(), args.abort_signal.clone()).await?;

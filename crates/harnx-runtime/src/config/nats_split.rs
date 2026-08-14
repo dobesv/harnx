@@ -8,7 +8,11 @@ use harnx_nats_common::connect::{
     HARNX_NATS_TLS_KEY_ENV,
 };
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, path::Path};
+use std::{borrow::Cow, path::Path, sync::OnceLock};
+
+static LOCAL_NATS_SERVER: OnceLock<
+    tokio::sync::Mutex<Option<crate::nats_local_server::SharedNatsServer>>,
+> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteAgentEntry {
@@ -86,7 +90,14 @@ pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
             (url, token, replicas, tls, tls_cert, tls_key, tls_ca)
         }
         (None, None) => {
-            let server = crate::nats_local_server::ensure_shared_server().await?;
+            let manager = LOCAL_NATS_SERVER.get_or_init(|| tokio::sync::Mutex::new(None));
+            let mut managed_server = manager.lock().await;
+            if managed_server.is_none() {
+                *managed_server = Some(crate::nats_local_server::ensure_shared_server().await?);
+            }
+            let server = managed_server
+                .as_ref()
+                .expect("local NATS server initialized above");
             (
                 server.url.clone(),
                 server.token.clone(),

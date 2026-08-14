@@ -1,4 +1,3 @@
 model: mock:mock-llm
 stream: true
-save_session: false
 keybindings: emacs

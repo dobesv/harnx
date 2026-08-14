@@ -16,14 +16,12 @@ pub const JSON_RPC_IDLE_CANCEL_CODE: i64 = -32002;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistenceKind {
-    Filesystem,
     Nats,
 }
 
 impl PersistenceKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Filesystem => "filesystem",
             Self::Nats => "nats",
         }
     }
@@ -654,17 +652,7 @@ mod tests {
         .await;
 
         let base_config = crate::session_actor::load_base_config_for_tests();
-        let mut persisted = base_config.clone();
-        persisted.use_agent_by_name("plain").expect("scope agent");
-        persisted
-            .use_session(Some("rpc-get"))
-            .expect("load filesystem test session");
-        let messages = persisted
-            .session
-            .as_ref()
-            .expect("persisted test session")
-            .messages
-            .clone();
+        let messages = crate::session_actor::load_test_session_messages("plain", "rpc-get");
         if !seed_rpc_session(&base_config, &messages).await {
             return;
         }
@@ -708,7 +696,7 @@ mod tests {
             Bytes::from(json!({"jsonrpc":"2.0","id":"x","method":"session/get"}).to_string()),
             &crate::session_actor::load_base_config_for_tests(),
             &registry,
-            PersistenceKind::Filesystem,
+            PersistenceKind::Nats,
         )
         .await
         .expect("rpc response");
@@ -729,7 +717,7 @@ mod tests {
             session: "never-prompted".into(),
         };
 
-        let response = handle_ag_ui_rpc_bytes(Method::POST, "plain", "never-prompted", Bytes::from(json!({"jsonrpc":"2.0","id":11,"method":"session/prompt","params":{"text":"hello"}}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("rpc response");
+        let response = handle_ag_ui_rpc_bytes(Method::POST, "plain", "never-prompted", Bytes::from(json!({"jsonrpc":"2.0","id":11,"method":"session/prompt","params":{"text":"hello"}}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Nats).await.expect("rpc response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = response_json(response).await;
         assert_eq!(body["error"]["code"], JSON_RPC_UNKNOWN_SESSION_CODE);
@@ -755,7 +743,7 @@ mod tests {
             Bytes::from(json!({"jsonrpc":"2.0","id":12,"method":"session/cancel"}).to_string()),
             &crate::session_actor::load_base_config_for_tests(),
             &registry,
-            PersistenceKind::Filesystem,
+            PersistenceKind::Nats,
         )
         .await
         .expect("rpc response");
@@ -784,18 +772,12 @@ mod tests {
         });
         let registry = registry_with_call_fn(call_fn);
 
-        // Seed session the simple way (not via SSE stream drain)
         let handle = registry.get_or_spawn(SessionKey {
             agent: "plain".into(),
             session: "rpc-prompt".into(),
         });
-        let _ = prompt(&handle, "seed history", SessionPromptOptions::default()).await;
-        wait_for_state(&handle, "idle after seeding history", |state| {
-            *state == SessionState::Idle
-        })
-        .await;
 
-        let response = handle_ag_ui_rpc_bytes(Method::POST, "plain", "rpc-prompt", Bytes::from(json!({"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"text":"run me"}}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("rpc response");
+        let response = handle_ag_ui_rpc_bytes(Method::POST, "plain", "rpc-prompt", Bytes::from(json!({"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"text":"run me"}}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Nats).await.expect("rpc response");
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["result"]["status"], "accepted");
@@ -805,10 +787,7 @@ mod tests {
             *state == SessionState::Idle
         })
         .await;
-        let mut config = crate::session_actor::load_base_config_for_tests();
-        config.use_agent_by_name("plain").expect("set agent");
-        config.use_session(Some("rpc-prompt")).expect("set session");
-        let messages = config.session.expect("session exists").messages;
+        let messages = crate::session_actor::load_test_session_messages("plain", "rpc-prompt");
         assert!(messages
             .iter()
             .any(|msg| msg.role.is_user() && msg.content.to_text() == "run me"));
@@ -865,7 +844,7 @@ mod tests {
             ),
             &crate::session_actor::load_base_config_for_tests(),
             registry,
-            PersistenceKind::Filesystem,
+            PersistenceKind::Nats,
         )
         .await
         .expect("resume response")
@@ -879,7 +858,7 @@ mod tests {
             Bytes::from(json!({"jsonrpc":"2.0","id":20,"method":"session/prompt","params":{"text":"resume me"}}).to_string()),
             &crate::session_actor::load_base_config_for_tests(),
             registry,
-            PersistenceKind::Filesystem,
+            PersistenceKind::Nats,
         )
         .await
         .expect("start response");
@@ -1033,7 +1012,7 @@ mod tests {
             }).to_string()),
             &crate::session_actor::load_base_config_for_tests(),
             &registry,
-            PersistenceKind::Filesystem,
+            PersistenceKind::Nats,
         )
         .await
         .expect("partial response");
@@ -1091,7 +1070,7 @@ mod tests {
             Bytes::from(json!({"jsonrpc":"2.0","id":9,"method":"session/cancel"}).to_string()),
             &crate::session_actor::load_base_config_for_tests(),
             &registry,
-            PersistenceKind::Filesystem,
+            PersistenceKind::Nats,
         )
         .await
         .expect("rpc response");
@@ -1115,7 +1094,7 @@ mod tests {
             Bytes::from(json!({"jsonrpc":"2.0","id":3,"method":"session/nope"}).to_string()),
             &crate::session_actor::load_base_config_for_tests(),
             &registry,
-            PersistenceKind::Filesystem,
+            PersistenceKind::Nats,
         )
         .await
         .expect("rpc response");
@@ -1155,7 +1134,7 @@ mod tests {
             ),
             &crate::session_actor::load_base_config_for_tests(),
             &registry,
-            PersistenceKind::Filesystem,
+            PersistenceKind::Nats,
         )
         .await
         .expect("rpc response");
@@ -1181,7 +1160,7 @@ mod tests {
             Bytes::from("{not json".to_string()),
             &crate::session_actor::load_base_config_for_tests(),
             &registry,
-            PersistenceKind::Filesystem,
+            PersistenceKind::Nats,
         )
         .await
         .expect("parse response");
@@ -1196,7 +1175,7 @@ mod tests {
             Bytes::from(json!({"jsonrpc":"2.0","id":4}).to_string()),
             &crate::session_actor::load_base_config_for_tests(),
             &registry,
-            PersistenceKind::Filesystem,
+            PersistenceKind::Nats,
         )
         .await
         .expect("invalid response");
@@ -1246,7 +1225,7 @@ mod extra_rpc_tests {
             Bytes::from(json!({"jsonrpc":"2.0","id":"idle","method":"session/cancel"}).to_string()),
             &config,
             &registry,
-            PersistenceKind::Filesystem,
+            PersistenceKind::Nats,
         )
         .await
         .expect("idle cancel response");
@@ -1262,7 +1241,7 @@ mod extra_rpc_tests {
             Bytes::from(json!({"jsonrpc":"2.0","id":null,"method":"session/prompt"}).to_string()),
             &config,
             &registry,
-            PersistenceKind::Filesystem,
+            PersistenceKind::Nats,
         )
         .await
         .expect("missing params response");
@@ -1285,7 +1264,7 @@ mod extra_rpc_tests {
             ),
             &config,
             &registry,
-            PersistenceKind::Filesystem,
+            PersistenceKind::Nats,
         )
         .await
         .expect("wrong text response");
@@ -1317,7 +1296,7 @@ mod extra_rpc_tests {
             ),
             &config,
             &registry,
-            PersistenceKind::Filesystem,
+            PersistenceKind::Nats,
         )
         .await
         .expect("batch response");
@@ -1332,7 +1311,7 @@ mod extra_rpc_tests {
             Bytes::from(json!({"jsonrpc":"2.0","method":"session/get"}).to_string()),
             &config,
             &registry,
-            PersistenceKind::Filesystem,
+            PersistenceKind::Nats,
         )
         .await
         .expect("notification response");

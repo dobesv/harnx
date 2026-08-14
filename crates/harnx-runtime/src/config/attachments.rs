@@ -1,12 +1,12 @@
 //! Content-addressed storage for image/binary attachments referenced from
-//! session transcripts. Blobs live in a per-session `{id}.attachments/`
-//! directory and are referenced from message content as `cid:<sha256>`,
-//! keeping multi-megabyte base64 out of the transcript and out of memory at
-//! rest. Runtime owns session-local blob storage and provider-specific wire
+//! NATS session transcripts. Blobs live in a per-session attachment directory
+//! and are referenced from message content as `cid:<sha256>`, keeping
+//! multi-megabyte base64 out of NATS and out of memory at rest. Runtime owns
+//! session-local blob storage and provider-specific wire
 //! encoders; shared expansion/cache scaffolding lives in `harnx-core`.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use harnx_core::attachments::{
@@ -29,17 +29,6 @@ pub fn extension_for_data_url(data_url: &str) -> &'static str {
         "image/gif" => "gif",
         _ => "bin",
     }
-}
-
-/// The attachments directory for a session given its `.yaml` transcript path:
-/// `<dir>/<stem>.attachments/`.
-pub fn attachments_dir_for(session_yaml_path: &Path) -> PathBuf {
-    let parent = session_yaml_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = session_yaml_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("session");
-    parent.join(format!("{stem}.attachments"))
 }
 
 /// Parse an inline data URI into (`mime_type`, `raw_bytes`). Only `;base64,`
@@ -74,6 +63,7 @@ pub fn write_attachment(dir: &Path, data_url: &str) -> Result<String> {
     Ok(cid)
 }
 
+#[allow(dead_code)]
 pub trait AttachmentEncoder {
     /// Expand a transcript-stored image reference into provider wire form.
     fn expand(&self, dir: &Path, reference: &str) -> Result<ExpandedAttachment>;
@@ -124,6 +114,7 @@ pub fn externalize_parts(
 /// Expand persisted `cid:` image refs into provider wire format using
 /// attachment encoder. Missing blobs degrade to text placeholder instead of
 /// failing whole transcript load.
+#[allow(dead_code)]
 pub fn expand_parts(
     encoder: &dyn AttachmentEncoder,
     dir: &Path,
@@ -156,21 +147,6 @@ pub fn expand_parts(
     Ok(())
 }
 
-/// Best-effort cleanup of attachment sidecar dir when session is deleted or
-/// compacted away.
-pub fn remove_attachments_dir(session_yaml_path: &Path) -> Result<()> {
-    let dir = attachments_dir_for(session_yaml_path);
-    match std::fs::remove_dir_all(&dir) {
-        Ok(()) => Ok(()),
-        // No directory means there was nothing to clean up — a success, and
-        // race-free (no exists()-then-remove gap).
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => {
-            Err(err).with_context(|| format!("Failed to remove attachments dir {}", dir.display()))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,15 +159,6 @@ mod tests {
         assert_eq!(
             extension_for_data_url("data:application/x;base64,AA"),
             "bin"
-        );
-    }
-
-    #[test]
-    fn attachments_dir_is_sibling_of_transcript() {
-        let p = std::path::Path::new("/tmp/sessions/agent/abc123.yaml");
-        assert_eq!(
-            attachments_dir_for(p),
-            std::path::PathBuf::from("/tmp/sessions/agent/abc123.attachments")
         );
     }
 
@@ -256,20 +223,6 @@ mod tests {
                 expires_at: None,
             }
         );
-    }
-
-    #[test]
-    fn remove_attachments_dir_is_idempotent() {
-        use tempfile::TempDir;
-        let tmp = TempDir::new().unwrap();
-        let yaml = tmp.path().join("abc.yaml");
-        let dir = attachments_dir_for(&yaml);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("foo.bin"), b"x").unwrap();
-
-        remove_attachments_dir(&yaml).unwrap();
-        assert!(!dir.exists());
-        remove_attachments_dir(&yaml).unwrap();
     }
 
     #[test]

@@ -17,8 +17,6 @@ mod servers_split;
 pub mod session;
 mod session_dump;
 mod session_externalize;
-pub mod session_lock;
-mod session_log_split;
 pub mod session_meta;
 mod session_ops_compaction;
 mod session_ops_core;
@@ -61,27 +59,21 @@ pub const DEFAULT_BUCKET_REPLICAS: usize = 1;
 /// front-end, and for tests that build both into a scratch directory.
 pub const HARNX_WORKER_BIN_ENV: &str = "HARNX_WORKER_BIN";
 pub(crate) use self::persistence_split::collect_tool_calls;
-pub use self::session_dump::render_session_dump;
-pub(crate) use self::session_log_split::{
-    adjust_range_for_tool_pairs, split_session_log_documents, validate_edited_session_documents,
-    validate_tool_pair_integrity,
-};
-pub use self::session_ops_split::reload_session_from_disk;
+pub use self::session_dump::{render_session_dump, render_session_dump_for_agent};
 
 pub use self::agent::TEMP_AGENT_NAME;
 pub use self::agent::{
     apply_package_agent_transforms, complete_agent_variables, list_agents, list_assistant_agents,
     render_agent_dump, Agent, AgentConfig, AgentVariables,
 };
-pub(crate) use self::attachments::attachments_dir_for;
 pub use self::attachments::{write_attachment, Base64Encoder};
 pub use self::input::Input;
 pub(crate) use self::patches_split::server_display_name;
 use self::patches_split::{apply_client_patch, package_dir_name};
 use self::session::Session;
 pub use self::session_meta::{
-    build_picker_context, find_matching_session, parse_session_meta, sort_sessions_for_picker,
-    PickerContext, SessionMeta,
+    build_picker_context, find_matching_session, sort_sessions_for_picker, PickerContext,
+    SessionMeta,
 };
 pub use harnx_core::attachments::{
     expand_passthrough_reference, read_attachment, AttachmentRefCache, CachedRef,
@@ -346,9 +338,6 @@ pub struct Config {
     /// the alternate-screen TUI. `None` keeps the CLI/inquire behavior.
     pub tui_confirm_tool_use: Option<Arc<crate::tool::ConfirmToolUseFn>>,
 
-    /// Override the sessions directory — used in tests to redirect session
-    /// log writes to a temp directory without touching real user data.
-    pub sessions_dir_override: Option<std::path::PathBuf>,
     /// Override the directory used for editor temp files — used in tests so
     /// the after-hook closure can find the file without scanning the global
     /// temp directory. Never set in production.
@@ -413,7 +402,6 @@ impl Clone for Config {
             tui_before_editor: None,
             tui_after_editor: None,
             tui_confirm_tool_use: self.tui_confirm_tool_use.clone(),
-            sessions_dir_override: self.sessions_dir_override.clone(),
             temp_dir_override: self.temp_dir_override.clone(),
         }
     }
@@ -461,7 +449,6 @@ impl Config {
             tui_before_editor: None,
             tui_after_editor: None,
             tui_confirm_tool_use: self.tui_confirm_tool_use.clone(),
-            sessions_dir_override: self.sessions_dir_override.clone(),
             temp_dir_override: self.temp_dir_override.clone(),
         }
     }
@@ -496,7 +483,6 @@ impl Default for Config {
             tui_before_editor: None,
             tui_after_editor: None,
             tui_confirm_tool_use: None,
-            sessions_dir_override: None,
             temp_dir_override: None,
         }
     }
@@ -578,8 +564,8 @@ impl Config {
         // When an explicit agent is active, prefer it over the session-derived
         // agent. The in-memory agent has the full configuration from the agent
         // file (including retry settings, hooks, etc.) that may not be stored
-        // in the session log.  The session-derived agent is used only when
-        // loading a standalone session from disk with no agent in context.
+        // in the session log. The session-derived agent is used when no
+        // explicit agent is active.
         if let Some(agent) = self.agent.as_ref() {
             agent.clone()
         } else if let Some(session) = self.session.as_ref() {
@@ -667,7 +653,6 @@ impl Config {
                     .map(|v| format!("{v} (current model)"))
                     .unwrap_or_else(|| "null".into()),
             ),
-            ("save_session", format_option_value(&self.save_session)),
             ("compress_threshold", self.compress_threshold.to_string()),
             (
                 "rag_reranker_model",
@@ -685,7 +670,6 @@ impl Config {
             ("theme", format_option_value(&self.theme)),
             ("config_file", display_path(&Self::config_file())),
             ("env_file", display_path(&Self::env_file())),
-            ("sessions_dir", display_path(&self.sessions_dir())),
             ("rags_dir", display_path(&Self::rags_dir())),
             ("macros_dir", display_path(&Self::macros_dir())),
             ("messages_file", display_path(&self.messages_file())),
@@ -705,10 +689,9 @@ impl Config {
         Ok(output)
     }
 
-    pub fn delete(config: &GlobalConfig, kind: &str) -> Result<()> {
+    pub fn delete(_config: &GlobalConfig, kind: &str) -> Result<()> {
         let (dir, file_ext) = match kind {
             "agent" => (Self::agents_config_dir(), Some(".md")),
-            "session" => (config.read().sessions_dir(), Some(".yaml")),
             "rag" => (Self::rags_dir(), Some(".yaml")),
             "macro" => (Self::macros_dir(), Some(".yaml")),
             "agent-data" => (Self::agents_data_dir(), None),
@@ -777,11 +760,6 @@ impl Config {
         match file_ext {
             Some(ext) => {
                 let path = dir.join(format!("{name}{ext}"));
-                if kind == "session" {
-                    if let Err(err) = crate::config::attachments::remove_attachments_dir(&path) {
-                        log::warn!("failed to remove attachments for session '{name}': {err}");
-                    }
-                }
                 remove_file(&path).with_context(|| fail(&path))
             }
             None => {
@@ -1097,7 +1075,7 @@ impl Config {
 
     /// Record token usage without saving any new message — the
     /// round's transcript entries are being written separately by the
-    /// split [`save_session_tool_calls`] / [`save_session_tool_results`]
+    /// split [`append_session_tool_calls`] / [`append_session_tool_results`]
     /// pair.  Callers use this to keep `completion_usage` current on
     /// the session while driving the two-phase save directly.
     pub fn record_completion_usage(&mut self, usage: &crate::client::CompletionTokenUsage) {
@@ -1106,15 +1084,13 @@ impl Config {
         }
     }
 
-    /// Finalize the tool round opened by [`save_session_tool_calls`].
+    /// Finalize the tool round opened by [`append_session_tool_calls`].
     /// Writes a `ToolResults` entry to the session log and fills in
     /// the pending outputs on the last in-memory message.
-    pub fn save_session_tool_results(&mut self, results: &[ToolResult]) -> Result<()> {
-        let sessions_dir = self.sessions_dir();
+    pub fn append_session_tool_results(&mut self, results: &[ToolResult]) -> Result<()> {
         let Some(session) = self.session.as_mut() else {
             return Ok(());
         };
-        session.set_sessions_dir(sessions_dir);
         crate::config::session::add_tool_results(session, results)
     }
 
@@ -1129,10 +1105,7 @@ impl Config {
             return None;
         }
 
-        let sessions_dir = self.sessions_dir();
-        let session = self.session.as_mut()?;
-        session.set_sessions_dir(sessions_dir);
-        Some(session)
+        self.session.as_mut()
     }
 
     fn save_message_with_tool_results(
@@ -1463,8 +1436,6 @@ where
 mod compaction_tests;
 #[cfg(test)]
 mod remote_agent_tests;
-#[cfg(test)]
-mod session_edit_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]

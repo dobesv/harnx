@@ -2110,42 +2110,20 @@ fn assert_run_finished(events: Vec<Value>) {
 }
 
 fn load_session_texts(config: &Config, agent: &str, session_id: &str) -> Vec<String> {
-    let prompt_config = harnx_session::fork_prompt_config(config);
-    {
-        let mut cfg = prompt_config.write();
-        cfg.use_agent_by_name(agent).expect("set agent");
-        cfg.use_session(Some(session_id)).expect("load session");
-    }
-    let session_messages = prompt_config
-        .read()
-        .session
-        .as_ref()
-        .expect("session should exist")
-        .messages
+    let _ = config;
+    crate::session_actor::load_test_session_messages(agent, session_id)
         .iter()
         .filter(|msg| msg.role.is_user() || msg.role.is_assistant())
         .map(|msg| msg.content.to_text())
-        .collect();
-    session_messages
+        .collect()
 }
 fn load_session_messages(config: &Config, agent: &str, session_id: &str) -> Vec<HistoryMsg> {
-    let prompt_config = harnx_session::fork_prompt_config(config);
-    {
-        let mut cfg = prompt_config.write();
-        cfg.use_agent_by_name(agent).expect("set agent");
-        cfg.use_session(Some(session_id)).expect("load session");
-    }
-    let messages = prompt_config
-        .read()
-        .session
-        .as_ref()
-        .expect("session should exist")
-        .messages
+    let _ = config;
+    crate::session_actor::load_test_session_messages(agent, session_id)
         .iter()
         .filter(|msg| msg.role.is_user() || msg.role.is_assistant())
         .cloned()
-        .collect();
-    messages
+        .collect()
 }
 
 #[test]

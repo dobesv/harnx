@@ -1594,7 +1594,7 @@ fn write_mock_editor(dir: &Path, replacement: &str) -> Result<PathBuf> {
 fn write_mutation_fixture_files(paths: &TestPaths, editor_path: &Path) -> Result<()> {
     std::fs::create_dir_all(&paths.harnx_config_dir)?;
 
-    // save_session enabled by default — but set editor to our mock script.
+    // Set the editor to our mock script.
     // Also set a fixed session name so session 2 can resume it.
     std::fs::write(
         &paths.config_path,

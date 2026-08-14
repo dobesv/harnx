@@ -161,19 +161,13 @@ pub fn prepare_completion_data(
     model.guard_max_input_tokens(&messages)?;
     let (temperature, top_p) = (input.agent().temperature(), input.agent().top_p());
 
-    // Clients either expand attachments internally (Gemini native) or rely on
-    // the runtime base64 pre-pass (all other providers).
     let attachments_dir = if client.expands_attachments_internally() {
-        // The client will resolve cid: refs via Files API; leave them raw and pass the dir.
         config
             .read()
             .session
             .as_ref()
-            .and_then(|s| s.path.as_ref())
-            .map(|p| crate::config::attachments::attachments_dir_for(std::path::Path::new(p)))
+            .and_then(super::session_externalize::attachments_dir)
     } else {
-        // Runtime base64 pre-pass: expand all cid: refs to data: URLs.
-        // This is the legacy behavior for all providers not yet migrated.
         if let Some(session) = config.read().session.as_ref() {
             crate::config::session::expand_message_attachments(session, &mut messages);
         }
@@ -201,7 +195,7 @@ pub fn build_messages(input: &Input, config: &GlobalConfig) -> Result<Vec<Messag
     };
     drop(guard);
     // Append `input.tool_calls` only when there's no session. With a session,
-    // `save_session_tool_calls` + `save_session_tool_results` already pushed
+    // `append_session_tool_calls` + `append_session_tool_results` already pushed
     // the same `(call, result)` pair into `session.messages`.
     if !with_session {
         if let Some(tool_calls) = &input.tool_calls {
@@ -414,7 +408,7 @@ mod tests {
     /// Regression test for the "continue replayed all Edits" bug.
     ///
     /// The agent loop saves each tool round to `session.messages` via
-    /// `save_session_tool_calls` + `save_session_tool_results`, then
+    /// `append_session_tool_calls` + `append_session_tool_results`, then
     /// calls `Input::merge_tool_results` to accumulate the same
     /// `(call, result)` pair onto `input.tool_calls`. On the next loop
     /// iteration, `build_messages` (this module) was appending
@@ -429,17 +423,16 @@ mod tests {
     /// "continue replayed all Edits in order".
     #[test]
     fn build_messages_does_not_duplicate_tool_calls_when_session_has_them() {
-        let tmp = TempDir::new().unwrap();
+        let _tmp = TempDir::new().unwrap();
         let mut config = Config {
             data: ConfigData {
                 stream: false,
-                save_session: Some(true),
                 ..Default::default()
             },
             ..Default::default()
         };
         let mut sess = session::new(&config, "trace-repro", None).unwrap();
-        sess.set_sessions_dir(tmp.path().to_path_buf());
+        session::attach_memory_log(&mut sess);
         config.session = Some(sess);
         let global_config: GlobalConfig = Arc::new(RwLock::new(config));
 
@@ -457,7 +450,7 @@ mod tests {
         let input = from_str(&global_config, "do the edit", None);
         global_config
             .write()
-            .save_session_tool_calls(
+            .append_session_tool_calls(
                 &input,
                 "thinking out loud",
                 None,
@@ -466,7 +459,7 @@ mod tests {
             .unwrap();
         global_config
             .write()
-            .save_session_tool_results(std::slice::from_ref(&result))
+            .append_session_tool_results(std::slice::from_ref(&result))
             .unwrap();
 
         let merged =
@@ -492,201 +485,6 @@ mod tests {
              duplication makes the wire request re-send the prior tool \
              round and triggers 'continue replayed all Edits' narrations \
              from the model. messages: {messages:#?}",
-        );
-    }
-
-    /// Test: capability-true client skips base64 pre-pass, keeping cid: raw + setting dir.
-    /// Uses a mock client that expands attachments internally to verify the mechanism.
-    #[test]
-    fn gemini_client_capability_skips_base64_prepass() {
-        use crate::test_utils::{MockClient, MockTurnBuilder};
-        use tempfile::TempDir;
-
-        // Setup: create a temp session dir
-        let tmp = TempDir::new().unwrap();
-        let session_path = tmp.path().join("test-session.yaml");
-        let attachments_dir = crate::config::attachments::attachments_dir_for(&session_path);
-        std::fs::create_dir_all(&attachments_dir).unwrap();
-
-        // Build a config with session that has the path set
-        let mut config = Config {
-            data: ConfigData {
-                stream: false,
-                save_session: Some(true),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut sess = session::new(&config, "test-session", None).unwrap();
-        sess.set_sessions_dir(tmp.path().to_path_buf());
-        sess.path = Some(session_path.to_string_lossy().into_owned());
-        config.session = Some(sess);
-
-        // Get agent config before moving config to Arc
-        let agent_config = config.extract_agent().into_config();
-        let global_config: GlobalConfig = Arc::new(RwLock::new(config));
-
-        // Create mock client that expands attachments internally (capability = true)
-        let mock_client = MockClient::builder()
-            .expands_attachments_internally(true)
-            .add_turn(MockTurnBuilder::new().add_text_chunk("OK").build())
-            .build();
-
-        // Build input with session
-        let mut input = Input::new(
-            "test".to_string(),
-            ("test".to_string(), vec![]),
-            agent_config,
-        );
-        input.with_session = true;
-
-        // Call prepare_completion_data
-        let data = prepare_completion_data(
-            &mut input,
-            &global_config,
-            mock_client.model(),
-            false,
-            &mock_client,
-        )
-        .unwrap();
-
-        // ASSERT: attachments_dir is set because capability is true and session has path
-        assert!(
-            data.attachments_dir.is_some(),
-            "attachments_dir should be set for capability-true client with session path"
-        );
-        assert_eq!(
-            data.attachments_dir.as_ref().unwrap(),
-            &attachments_dir,
-            "attachments_dir should match session attachments dir"
-        );
-    }
-
-    /// Test: attachment refs survive build_messages and expand through prepare_completion_data.
-    #[test]
-    fn build_messages_preserves_attachment_refs_for_runtime_expansion() {
-        use crate::config::attachments::write_attachment;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let session_path = tmp.path().join("attach-session.yaml");
-        let attachments_dir = crate::config::attachments::attachments_dir_for(&session_path);
-        std::fs::create_dir_all(&attachments_dir).unwrap();
-        let data_url = "data:image/png;base64,aGVsbG8h";
-        let cid = write_attachment(&attachments_dir, data_url).unwrap();
-
-        let mut config = Config {
-            data: ConfigData {
-                stream: false,
-                save_session: Some(true),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut sess = session::new(&config, "attach-session", None).unwrap();
-        sess.set_sessions_dir(tmp.path().to_path_buf());
-        sess.path = Some(session_path.to_string_lossy().into_owned());
-        config.session = Some(sess);
-
-        let agent_config = config.extract_agent().into_config();
-        let global_config: GlobalConfig = Arc::new(RwLock::new(config));
-        let mut input = Input::new(
-            "look at this".to_string(),
-            ("look at this".to_string(), vec![]),
-            agent_config,
-        );
-        input.with_session = true;
-        input.set_attachment_refs(vec![cid.clone()]);
-
-        let messages = build_messages(&input, &global_config).unwrap();
-        let user = messages.last().unwrap();
-        match &user.content {
-            MessageContent::Array(parts) => {
-                assert!(parts.iter().any(|part| matches!(part, harnx_core::message::MessageContentPart::ImageUrl { image_url } if image_url.url == cid)));
-            }
-            other => panic!("expected multipart user content, got {other:?}"),
-        }
-
-        let mock_client = crate::test_utils::MockClient::builder()
-            .expands_attachments_internally(false)
-            .build();
-        let data = prepare_completion_data(
-            &mut input,
-            &global_config,
-            mock_client.model(),
-            false,
-            &mock_client,
-        )
-        .unwrap();
-        let user = data.messages.last().unwrap();
-        match &user.content {
-            MessageContent::Array(parts) => {
-                assert!(
-                    !parts.is_empty(),
-                    "expanded content should remain multipart"
-                );
-            }
-            other => panic!("expected expanded multipart user content, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn prepare_completion_data_default_client_expands_base64() {
-        use crate::test_utils::{MockClient, MockTurnBuilder};
-        use tempfile::TempDir;
-
-        // Setup: create a temp session dir
-        let tmp = TempDir::new().unwrap();
-        let session_path = tmp.path().join("test-session.yaml");
-        let attachments_dir = crate::config::attachments::attachments_dir_for(&session_path);
-        std::fs::create_dir_all(&attachments_dir).unwrap();
-
-        // Build a config with session that has the path set
-        let mut config = Config {
-            data: ConfigData {
-                stream: false,
-                save_session: Some(true),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut sess = session::new(&config, "test-session", None).unwrap();
-        sess.set_sessions_dir(tmp.path().to_path_buf());
-        sess.path = Some(session_path.to_string_lossy().into_owned());
-        config.session = Some(sess);
-
-        // Get agent config before moving config to Arc
-        let agent_config = config.extract_agent().into_config();
-        let global_config: GlobalConfig = Arc::new(RwLock::new(config));
-
-        // Create mock client with default capability (expands_attachments_internally = false)
-        let mock_client = MockClient::builder()
-            .expands_attachments_internally(false)
-            .add_turn(MockTurnBuilder::new().add_text_chunk("OK").build())
-            .build();
-
-        // Build input with session
-        let mut input = Input::new(
-            "test".to_string(),
-            ("test".to_string(), vec![]),
-            agent_config,
-        );
-        input.with_session = true;
-
-        // Call prepare_completion_data
-        let data = prepare_completion_data(
-            &mut input,
-            &global_config,
-            mock_client.model(),
-            false,
-            &mock_client,
-        )
-        .unwrap();
-
-        // ASSERT: attachments_dir is None because capability is false (runtime handles expansion)
-        assert!(
-            data.attachments_dir.is_none(),
-            "attachments_dir should be None for capability-false client"
         );
     }
 }

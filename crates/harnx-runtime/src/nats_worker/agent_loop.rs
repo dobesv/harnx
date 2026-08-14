@@ -334,7 +334,6 @@ async fn build_agent_loop_context(
         nats_hook_provider,
         pending_async_context: Some(Arc::new(tokio::sync::Mutex::new(None))),
         working_dir: params.working_dir,
-        session_lock: None,
     }
 }
 
@@ -545,9 +544,7 @@ async fn prepare_nats_handoff(
         .lease
         .as_ref()
         .context("NATS handoff requires active session lease")?;
-    args.config
-        .write()
-        .exit_agent_with_lock(args.ctx.session_lock.as_ref())?;
+    args.config.write().exit_agent()?;
     crate::config::Config::use_agent(
         &args.config,
         &agent,

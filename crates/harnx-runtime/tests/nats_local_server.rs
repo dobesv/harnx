@@ -206,6 +206,49 @@ async fn nats_local_server_owner_drop_starts_fresh_owner() {
 }
 
 #[tokio::test]
+async fn nats_local_server_owner_drop_preserves_jetstream_data() {
+    require_nextest();
+    if skip_without_nats_server() {
+        return;
+    }
+    let (_directory, _guard) = isolated_data_dir();
+
+    let first = ensure_shared_server().await.expect("start first owner");
+    let first_client = authenticated_client(&first).await;
+    let first_jetstream = async_nats::jetstream::new(first_client);
+    let index = harnx_runtime::nats_session_index::ensure_index_bucket(&first_jetstream, 1)
+        .await
+        .expect("create session index");
+    let record = harnx_runtime::nats_session_index::SessionIndexRecord {
+        session_id: "saved-session".to_string(),
+        agent_name: "test-agent".to_string(),
+        working_dir: None,
+        git_branch: None,
+        git_remote: None,
+        title: Some("Saved session".to_string()),
+        last_activity: 1,
+    };
+    harnx_runtime::nats_session_index::put_record(&index, &record)
+        .await
+        .expect("write session index record");
+    drop(index);
+    drop(first_jetstream);
+    drop(first);
+
+    let _second = ensure_shared_server()
+        .await
+        .expect("start replacement owner");
+    let config = harnx_runtime::config::Config::default();
+    let restored = config
+        .list_remote_sessions_with_meta(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+        .await
+        .expect("list persisted sessions through the local NATS index");
+
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].id, record.session_id);
+}
+
+#[tokio::test]
 async fn local_cluster_jetstream_connects_to_shared_server_with_token() {
     require_nextest();
     if skip_without_nats_server() {
@@ -219,14 +262,11 @@ async fn local_cluster_jetstream_connects_to_shared_server_with_token() {
         std::env::remove_var(harnx_runtime::config::HARNX_NATS_TOKEN_ENV);
     }
 
-    let server = ensure_shared_server()
-        .await
-        .expect("start shared local NATS");
     let config = harnx_runtime::config::Config::default();
     let jetstream = config
         .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
         .await
-        .expect("connect reserved local cluster with shared token");
+        .expect("start and retain the shared local NATS server");
 
     let stream_name = format!("LOCAL_CLUSTER_{}", uuid::Uuid::new_v4().simple());
     jetstream
@@ -236,7 +276,5 @@ async fn local_cluster_jetstream_connects_to_shared_server_with_token() {
             ..Default::default()
         })
         .await
-        .expect("create stream through reserved local JetStream context");
-
-    assert!(server.is_owner());
+        .expect("local NATS server remains alive after config resolution");
 }

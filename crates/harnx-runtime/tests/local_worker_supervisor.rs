@@ -161,7 +161,6 @@ async fn assert_worker_completes_turn(
         temperature: None,
         top_p: None,
         use_tools: Some(vec![]),
-        save_session: Some(false),
         compress_threshold: None,
         agent_name: Some("trivial".to_string()),
         session_id: Some(session_id.clone()),

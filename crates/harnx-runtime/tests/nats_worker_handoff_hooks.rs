@@ -84,7 +84,6 @@ fn session_header(session_id: &str) -> harnx_core::session::SessionLogEntry {
         temperature: None,
         top_p: None,
         use_tools: None,
-        save_session: Some(true),
         compress_threshold: None,
         agent_name: None,
         session_id: Some(session_id.to_string()),
