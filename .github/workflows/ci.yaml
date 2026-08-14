@@ -62,6 +62,11 @@ jobs:
         set -euo pipefail
         VERSION="v2.11.6"
         ASSET="nats-server-${VERSION}-linux-amd64.tar.gz"
+        # Pinned digest for the pinned VERSION. GitHub releases are mutable, so
+        # the tag alone does not pin the bytes, and the release's own SHA256SUMS
+        # is served from the same place as the tarball — fetching it would prove
+        # nothing an attacker who can replace one can't also replace.
+        SHA256="5e5272dd1bdb8da020aedc8cf883fb26c128441809a992f156e0b1ccb28ac5b7"
         DOWNLOAD_URL="https://github.com/nats-io/nats-server/releases/download/${VERSION}/${ASSET}"
         BINDIR="${HOME}/.local/bin"
         mkdir -p "${BINDIR}"
@@ -72,6 +77,8 @@ jobs:
         # failed download.
         curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 2 \
           --location --silent --show-error --fail --output "${TMPDIR_DL}/${ASSET}" "${DOWNLOAD_URL}"
+        echo "${SHA256}  ${TMPDIR_DL}/${ASSET}" | shasum -a 256 --check --status \
+          || { echo "::error::nats-server checksum mismatch for ${ASSET}"; exit 1; }
         tar -xzf "${TMPDIR_DL}/${ASSET}" -C "${BINDIR}" --strip-components=1 "nats-server-${VERSION}-linux-amd64/nats-server"
         chmod +x "${BINDIR}/nats-server"
         echo "${BINDIR}" >> "${GITHUB_PATH}"
@@ -86,9 +93,16 @@ jobs:
         set -euo pipefail
         VERSION="v2.11.6"
         ARCH="$(uname -m)"
+        # See the Linux step for why the digests are pinned here rather than fetched.
         case "${ARCH}" in
-          arm64) NATS_ARCH="arm64" ;;
-          x86_64) NATS_ARCH="amd64" ;;
+          arm64)
+            NATS_ARCH="arm64"
+            SHA256="1a78170526e18a41ca2a24e6eaa00e95d39c677e1d5bfc56d3f662a114324e17"
+            ;;
+          x86_64)
+            NATS_ARCH="amd64"
+            SHA256="6c8f0cf8bc879db372ce0edca34c0178845e92286fac47db1a6a0f5eff59daef"
+            ;;
           *) echo "unsupported macOS arch: ${ARCH}" >&2; exit 1 ;;
         esac
         ASSET="nats-server-${VERSION}-darwin-${NATS_ARCH}.tar.gz"
@@ -99,6 +113,8 @@ jobs:
         # See the Linux step for why this downloads to a file first.
         curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 2 \
           --location --silent --show-error --fail --output "${TMPDIR_DL}/${ASSET}" "${DOWNLOAD_URL}"
+        echo "${SHA256}  ${TMPDIR_DL}/${ASSET}" | shasum -a 256 --check --status \
+          || { echo "::error::nats-server checksum mismatch for ${ASSET}"; exit 1; }
         tar -xzf "${TMPDIR_DL}/${ASSET}" -C "${BINDIR}" --strip-components=1 "nats-server-${VERSION}-darwin-${NATS_ARCH}/nats-server"
         chmod +x "${BINDIR}/nats-server"
         echo "${BINDIR}" >> "${GITHUB_PATH}"
