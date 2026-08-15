@@ -2,5 +2,5 @@ allowBuilds:
   msw: false
 frozenLockfile: true
 overrides:
-  '@assistant-ui/core': 0.3.12
+  '@assistant-ui/core': 0.3.13
   assistant-stream: 0.3.37
