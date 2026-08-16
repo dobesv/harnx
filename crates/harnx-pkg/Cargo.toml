@@ -28,7 +28,6 @@ semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-simplelog = { workspace = true }
 tar = "0.4"
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs"] }

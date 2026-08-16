@@ -494,7 +494,7 @@ fn child_output_sink(config: &ToolServerStartConfig) -> Stdio {
     if config.inherit_child_output {
         Stdio::inherit()
     } else {
-        crate::local_orchestrator::worker_output_sink()
+        harnx_core::logging::child_output_sink()
     }
 }
 

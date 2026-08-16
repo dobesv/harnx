@@ -297,7 +297,7 @@ pub async fn publish_hook_registration(
 /// Wires SIGTERM/Ctrl+C to a graceful stop so a pod killed by Kubernetes gets
 /// a chance to remove its own registration instead of leaving it for the TTL.
 pub async fn run_hookset_main<H: Hook + 'static>(hook: H) -> Result<()> {
-    harnx_core::server_logging::init_server_logger();
+    let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
     let scope =
         harnx_core::instance::scope_from_env(harnx_core::instance::StandaloneMode::WorkerLaunched)?;
     log::info!("serving under scope '{}'", scope.as_str());

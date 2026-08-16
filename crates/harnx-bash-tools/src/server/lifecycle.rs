@@ -25,6 +25,14 @@ impl BashServer {
         // that are whitelisted from ambient env in sandbox defaults.
         "GOMODCACHE",
         "GOCACHE",
+        // Logging config, so raising the level once raises it for harnx
+        // binaries further down the tree — `harnx-sandbox-run` in particular,
+        // which this env is built for. HARNX_LOG_PATH is deliberately absent:
+        // a sandboxed child usually can't write there, and every binary that
+        // reaches this point logs to stderr anyway.
+        "HARNX_LOG_LEVEL",
+        "HARNX_LOG_FORMAT",
+        "HARNX_LOG_FILTER",
         // Windows-specific names. std::env::var returns Err on Unix where
         // these are unset, so listing them here is a no-op on POSIX builds.
         "SYSTEMROOT",

@@ -11,7 +11,7 @@ use crate::nats_worker::worker_ready_subject;
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
 use harnx_core::abort::AbortSignal;
-use harnx_core::config_paths::{nats_runtime_dir, state_path};
+use harnx_core::config_paths::nats_runtime_dir;
 use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::sink::emit_agent_event;
 use std::fs::{File, OpenOptions};
@@ -325,8 +325,8 @@ pub fn build_local_worker_command(
         .env(HARNX_NATS_URL_ENV, nats_url)
         .env(HARNX_NATS_TOKEN_ENV, nats_token)
         .stdin(Stdio::null())
-        .stdout(worker_output_sink())
-        .stderr(worker_output_sink())
+        .stdout(harnx_core::logging::child_output_sink())
+        .stderr(harnx_core::logging::child_output_sink())
         .kill_on_drop(true);
     configure_worker_process(&mut command);
     command
@@ -366,23 +366,13 @@ impl Drop for LocalWorkerSupervisor {
     }
 }
 
-/// File the local worker's stdout/stderr is appended to.
-///
-/// The worker is a detached subprocess with no terminal, so anything it writes
-/// outside the `log` facade — a panic, a `main` returning `Err`, a child
-/// process's own stderr — is otherwise lost. That made startup failures
-/// undiagnosable: the front-end only saw a readiness timeout.
-pub fn local_worker_output_file() -> PathBuf {
-    state_path("harnx_worker.log")
-}
-
 /// Tell the user the worker is still coming up, on the same channel as other
 /// agent notices so the TUI and the CLI both surface it.
 fn emit_worker_wait_notice(waited: Duration) {
     let message = format!(
         "Still waiting for the local worker to start ({}s). Ctrl-C to cancel; worker output goes to {}.",
         waited.as_secs(),
-        local_worker_output_file().display()
+        harnx_core::logging::child_output_destination(),
     );
     // Warning, not Info: the CLI sink routes Info to stdout, where progress
     // chatter would corrupt piped output from a one-shot invocation.
@@ -390,9 +380,18 @@ fn emit_worker_wait_notice(waited: Duration) {
     log::info!("{message}");
 }
 
-/// Last [`WORKER_OUTPUT_TAIL_BYTES`] of the worker log, for error messages.
+/// Last [`WORKER_OUTPUT_TAIL_BYTES`] of the log the worker writes into, for
+/// error messages.
+///
+/// The worker is a detached subprocess with no terminal, so anything it writes
+/// outside the `log` facade — a panic, a `main` returning `Err`, a child
+/// process's own stderr — is otherwise lost, and the front-end only sees a
+/// readiness timeout. Empty when the worker inherits our streams instead of a
+/// log file: the output is already wherever the operator is looking.
 fn worker_output_tail() -> String {
-    let path = local_worker_output_file();
+    let Some(path) = harnx_core::logging::log_file_path() else {
+        return String::new();
+    };
     let render = |body: String| {
         if body.trim().is_empty() {
             format!("(no output in {})", path.display())
@@ -400,7 +399,7 @@ fn worker_output_tail() -> String {
             format!("--- tail of {} ---\n{}", path.display(), body.trim_end())
         }
     };
-    let Ok(mut file) = File::open(&path) else {
+    let Ok(mut file) = File::open(path) else {
         return render(String::new());
     };
     let Ok(length) = file.metadata().map(|meta| meta.len()) else {
@@ -416,30 +415,6 @@ fn worker_output_tail() -> String {
     let mut body = Vec::new();
     let _ = file.read_to_end(&mut body);
     render(String::from_utf8_lossy(&body).into_owned())
-}
-
-/// Append-mode handle to [`local_worker_output_file`], falling back to a null
-/// sink so a non-writable state dir never blocks worker startup.
-///
-/// Also used for the worker's own children (tool and hook servers) so the whole
-/// worker subtree explains itself in one file. They redirect to this path rather
-/// than inheriting the worker's descriptors: an inherited pipe outlives the
-/// child that holds it, which strands test harness output.
-pub(crate) fn worker_output_sink() -> Stdio {
-    let path = local_worker_output_file();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    match OpenOptions::new().create(true).append(true).open(&path) {
-        Ok(file) => Stdio::from(file),
-        Err(error) => {
-            log::warn!(
-                "local worker output not captured to {}: {error}",
-                path.display()
-            );
-            Stdio::null()
-        }
-    }
 }
 
 fn open_worker_lock() -> Result<File> {

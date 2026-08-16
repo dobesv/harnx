@@ -64,8 +64,42 @@ Harnx can load environment variables from a `.env` file located in the data dire
 
 ## Logging Envs
 
-- **HARNX_LOG_LEVEL**: The log level (e.g., `debug`, `info`).
-- **HARNX_LOG_FILE**: The path to the log file.
+Every binary in this repo reads the same four variables, and every one of them
+is inherited by child processes — so setting `HARNX_LOG_LEVEL=debug` once raises
+the level for the front-end, the worker, and every tool and hook server it
+starts.
+
+- **HARNX_LOG_LEVEL**: `off`, `error`, `warn`, `info`, `debug`, or `trace`.
+  Default `info`. Falls back to a bare level in `RUST_LOG` if unset.
+- **HARNX_LOG_FORMAT**: `text` (default) or `json`. JSON writes one object per
+  line: `{"ts","level","pid","target","message"}`. Parse the log leniently:
+  it also collects raw bytes from subprocesses that know nothing about the
+  format — `nats-server`'s startup banner, a panic message, a wrapped MCP
+  server's stderr.
+- **HARNX_LOG_FILTER**: Only log records whose target starts with this prefix.
+  Default `harnx`, which matches every `harnx_*` crate. Narrow it to one crate
+  with e.g. `HARNX_LOG_FILTER=harnx_mcp_bridge`.
+- **HARNX_LOG_PATH**: Log file for the `harnx` CLI and TUI. Default
+  `<state dir>/harnx.log` — `$HARNX_STATE_DIR`, else `$XDG_STATE_HOME/harnx`,
+  else `~/.local/state/harnx`.
+
+### Where logs go
+
+`harnx` owns the terminal, so it writes to a file; log lines on the terminal
+would overwrite the TUI and corrupt piped output from a one-shot invocation.
+
+Every other binary — `harnx-serve`, `harnx-worker`, the tool and hook servers,
+the MCP bridge — writes to **stderr** and ignores `HARNX_LOG_PATH`. Whoever
+spawned it decides where that goes, and one process per tree owns the file. In
+practice `harnx` points the worker's stdout and stderr at its own log file and
+the worker's children inherit that, so a whole session lands in one
+`harnx.log`. Run a server standalone and redirect it yourself:
+`harnx-worker --cluster … 2>> /var/log/harnx-worker.log`.
+
+The log file is appended, never truncated or rotated. Delete or rotate it
+yourself when it grows; if you use `logrotate`, use `copytruncate` — harnx
+holds the descriptor open for the life of the process.
+
 - **HARNX_LLM_TRACE**: Path to a file that receives one JSON line per LLM
   HTTP request and per response chunk. Independent of `HARNX_LOG_LEVEL`.
   Each line is `{ts, kind, ...}` where `kind` is `request`, `response`, or

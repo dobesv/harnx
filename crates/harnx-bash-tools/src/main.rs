@@ -9,10 +9,11 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
     let sandbox_config = parse_args()?;
     let allowlist = &sandbox_config.allowlist;
 
-    eprintln!(
+    log::info!(
         "harnx-bash-tools v{}: starting ({} read, {} write, {} exec allow paths)",
         env!("CARGO_PKG_VERSION"),
         allowlist.read_paths().len(),
@@ -22,19 +23,19 @@ async fn main() -> anyhow::Result<()> {
 
     #[cfg(unix)]
     if sandbox_config.enabled {
-        eprintln!(
+        log::info!(
             "  sandbox: enabled (helper: {})",
             sandbox_config.sandbox_run_path.display()
         );
     } else {
-        eprintln!("  sandbox: disabled");
+        log::info!("  sandbox: disabled");
     }
 
     let toolset = BashToolset::new(sandbox_config).await;
     let cleanup_toolset = toolset.clone();
     let result = harnx_toolset_server::run_toolset_main(toolset).await;
     if let Err(err) = cleanup_toolset.cleanup_log_dir() {
-        eprintln!("harnx-bash-tools: warning: failed to clean temp log dir: {err}");
+        log::warn!("failed to clean temp log dir: {err}");
     }
     result
 }

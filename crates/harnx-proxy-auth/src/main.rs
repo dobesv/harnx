@@ -12,11 +12,9 @@ use harnx_proxy_auth::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Write tracing output to stderr so it never interleaves with the
-    // readiness lines or JSONL responses on stdout.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .init();
+    // Logs go to stderr so they never interleave with the readiness lines or
+    // JSONL responses on stdout.
+    let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
 
     let args = <cli::Args as Parser>::parse();
     let hook_name = args

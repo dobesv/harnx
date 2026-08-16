@@ -39,7 +39,6 @@ async-trait = { workspace = true }
 textwrap = { workspace = true }
 ansi_colours = { workspace = true }
 reqwest-eventsource = { workspace = true }
-simplelog = { workspace = true }
 log = { workspace = true }
 shell-words = { workspace = true }
 sha2 = { workspace = true }

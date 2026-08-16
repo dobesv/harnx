@@ -3487,7 +3487,6 @@ dependencies = [
  "sha2 0.11.0",
  "shell-words",
  "shellexpand",
- "simplelog",
  "syntect",
  "sys-locale",
  "tempfile",
@@ -3634,7 +3633,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.11.0",
- "simplelog",
  "sys-locale",
  "tempfile",
  "tokio",
@@ -3716,6 +3714,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "fancy-regex 0.19.0",
+ "harnx-core",
  "harnx-toolset",
  "harnx-toolset-server",
  "log",
@@ -3883,6 +3882,8 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "harnx-core",
+ "log",
  "parking_lot",
  "reqwest",
  "rmcp",
@@ -3902,8 +3903,10 @@ dependencies = [
  "axum",
  "chrono",
  "chrono-tz",
+ "harnx-core",
  "iana-time-zone",
  "jiff",
+ "log",
  "rmcp",
  "serde",
  "serde_json",
@@ -3953,7 +3956,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.11.0",
- "simplelog",
  "tar",
  "tempfile",
  "tokio",
@@ -3969,8 +3971,10 @@ dependencies = [
  "axum",
  "chrono",
  "filetime",
+ "harnx-core",
  "harnx-toolset",
  "harnx-toolset-server",
+ "log",
  "rmcp",
  "schemars",
  "serde",
@@ -4007,6 +4011,7 @@ dependencies = [
  "jaq-all",
  "jaq-core",
  "jaq-std",
+ "log",
  "parking_lot",
  "rcgen",
  "reqwest",
@@ -4017,8 +4022,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
- "tracing",
- "tracing-subscriber",
  "uuid",
  "which",
 ]
@@ -4120,7 +4123,6 @@ dependencies = [
  "serde_yaml",
  "shell-words",
  "shellexpand",
- "simplelog",
  "syntect",
  "sys-locale",
  "tempfile",
@@ -4155,7 +4157,6 @@ version = "0.33.4"
 dependencies = [
  "anyhow",
  "clap",
- "env_logger",
  "harnx-core",
  "harnx-hooks",
  "harnx-sandbox-common",
@@ -7863,17 +7864,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "simplelog"
-version = "0.12.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16257adbfaef1ee58b1363bdc0664c9b8e1e30aed86049635fb5f147d065a9c0"
-dependencies = [
- "log",
- "termcolor",
- "time",
-]
-
-[[package]]
 name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8192,15 +8182,6 @@ checksum = "c4790fc369d5a530f4b544b094e31388b9b3a37c0f4652ade4505945f5660d24"
 dependencies = [
  "new_debug_unreachable",
  "utf-8",
-]
-
-[[package]]
-name = "termcolor"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
-dependencies = [
- "winapi-util",
 ]
 
 [[package]]

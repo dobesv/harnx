@@ -16,12 +16,13 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
     let args = parse_args()?;
 
     if args.http {
         run_http(args).await
     } else {
-        eprintln!("harnx-mcp-time v{}: starting", env!("CARGO_PKG_VERSION"));
+        log::info!("harnx-mcp-time v{}: starting", env!("CARGO_PKG_VERSION"));
 
         let server = TimeServer::new();
         let service = server.serve(rmcp::transport::stdio()).await?;

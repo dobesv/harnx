@@ -117,7 +117,7 @@ pub async fn serve_over_nats<T>(
 where
     T: Toolset + 'static,
 {
-    harnx_core::server_logging::init_server_logger();
+    let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
     let endpoint = harnx_nats_common::connect::NatsEndpoint {
         name: "explicit".to_string(),
         url: nats_url.to_string(),
@@ -590,7 +590,7 @@ pub async fn run_toolset_main<T>(toolset: T) -> Result<()>
 where
     T: Toolset + 'static,
 {
-    harnx_core::server_logging::init_server_logger();
+    let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
     let toolset: Arc<dyn Toolset> = Arc::new(toolset);
     if std::env::args_os().any(|arg| arg == "--mcp-stdio") {
         let service = McpToolsetAdapter { toolset }

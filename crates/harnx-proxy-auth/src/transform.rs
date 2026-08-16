@@ -118,7 +118,7 @@ impl TransformPipeline {
                     match crate::filter::apply_filter_with_vars(filter, current.clone(), vars) {
                         Ok(next) => next,
                         Err(err) => {
-                            tracing::warn!(error = %err, "jaq hook stage failed");
+                            log::warn!("jaq hook stage failed: {err}");
                             current
                         }
                     }

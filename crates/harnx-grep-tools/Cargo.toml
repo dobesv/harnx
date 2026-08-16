@@ -11,6 +11,7 @@ description = "Toolset server for GitHub code search through grep.app (also supp
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 fancy-regex = { workspace = true }
+harnx-core = { path = "../harnx-core" }
 harnx-toolset = { path = "../harnx-toolset" }
 harnx-toolset-server = { path = "../harnx-toolset-server" }
 log = { workspace = true }

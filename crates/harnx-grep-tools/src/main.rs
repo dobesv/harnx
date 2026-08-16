@@ -4,12 +4,13 @@ use harnx_grep_tools::GrepToolset;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
     if parse_args()? {
         print_help();
         return Ok(());
     }
 
-    eprintln!("harnx-grep-tools v{}: starting", env!("CARGO_PKG_VERSION"));
+    log::info!("harnx-grep-tools v{}: starting", env!("CARGO_PKG_VERSION"));
 
     harnx_toolset_server::run_toolset_main(GrepToolset::new()).await
 }

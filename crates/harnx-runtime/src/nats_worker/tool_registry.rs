@@ -151,7 +151,7 @@ async fn next_poll_interval(wait: &RegistrationWait<'_>) -> Result<Duration> {
             "has not registered after {}s and is still running, so it may still be \
              starting; its output goes to {}",
             wait.timeout.as_secs_f64(),
-            crate::local_orchestrator::local_worker_output_file().display()
+            harnx_core::logging::child_output_destination()
         );
     }
     Ok(wait

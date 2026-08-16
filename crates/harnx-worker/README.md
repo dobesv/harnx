@@ -35,5 +35,8 @@ find it:
 2. Otherwise a `harnx-worker` next to the running front-end.
 3. Otherwise `harnx-worker` on `PATH`.
 
-Worker stdout/stderr goes to `harnx_worker.log` in the harnx state directory —
-check there when a front-end reports that the worker never became ready.
+The worker logs to stderr, and a front-end that started it points that at its
+own log file — `~/.local/state/harnx/harnx.log` by default. So does everything
+the worker starts in turn. Check there when a front-end reports that the worker
+never became ready. Running the worker by hand, redirect it yourself:
+`harnx-worker --cluster __local__ 2>> worker.log`.

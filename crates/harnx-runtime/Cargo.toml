@@ -56,7 +56,6 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 shell-words = { workspace = true }
 shellexpand = { workspace = true }
-simplelog = { workspace = true }
 time = { workspace = true }
 syntect = { workspace = true }
 sys-locale = { workspace = true }

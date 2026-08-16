@@ -8,6 +8,7 @@
 use anyhow::Result;
 use clap::Parser;
 use harnx_core::agent_config::collect_agent_variables;
+use harnx_core::logging::LogSink;
 use harnx_runtime::bootstrap::setup_logger;
 use harnx_runtime::config::{load_env_file, Config, WorkingMode};
 use parking_lot::RwLock;
@@ -53,7 +54,7 @@ struct Cli {
 async fn main() -> Result<()> {
     load_env_file()?;
     let cli = Cli::parse();
-    setup_logger(false)?;
+    setup_logger(LogSink::Stderr)?;
     harnx_core::alloc_guard::init_from_env();
 
     let config = Arc::new(RwLock::new(Config::init(WorkingMode::Cmd, true).await?));

@@ -21,7 +21,6 @@ indexmap = { workspace = true }
 os_info = { workspace = true }
 path-absolutize = { workspace = true }
 serde = { workspace = true }
-simplelog = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
