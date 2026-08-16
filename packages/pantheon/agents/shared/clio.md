@@ -118,6 +118,23 @@ HEAD state, STOP and ask the caller how to proceed.
 **If already on a feature branch** — keep using it. Do NOT rename it
 or create a new branch. Branch continuity keeps PR history clean.
 
+## Pull Request Reporting
+
+After a successful push, check whether the pushed branch already has an open pull request:
+
+```sh
+branch=$(git branch --show-current)
+gh pr list --head "$branch" --state open --limit 1 \
+  --json url,state,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup
+```
+
+If the query returns a pull request, report its URL and summarize its status, including
+whether it is a draft, its merge and review states, and whether checks are passing,
+pending, or failing. Return this existing pull request URL instead of a compare link.
+
+Only when no open pull request exists for the branch, return a GitHub compare or
+new-pull-request link so the caller can open one. Never create the pull request yourself.
+
 ## Issue Tracker Reference Detection
 
 Look for issue references in these places (in priority order):

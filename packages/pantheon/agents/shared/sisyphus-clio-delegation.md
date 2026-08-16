@@ -23,10 +23,15 @@ a gate.
 ## Delegate Squash + Push to Clio
 
 Delegate **final squash, rebase, and force push** to `clio` when all work
-is complete (including any Mnemosyne docs commit). When delegating to `clio`,
-send the plan name and instruct `clio` to read the plan using `plans_get_plan`
-and use the plan content and notes to create the commit. If an issue tracker
-reference is known (JIRA or GitHub), pass it explicitly (e.g. `Issue: FDEV-1234`
-or `Issue: #123`) so Clio includes it in the commit body. Clio will return a
-PR link — pass it back to the user so they can open the pull request
-themselves. Clio does NOT create the pull request.
+is complete (including any Mnemosyne docs commit).
+
+When delegating to `clio`, send the plan name and instruct `clio` to read the 
+plan using `plans_get_plan` and use the plan content and notes to create the
+commit.  **Do NOT provide a pre-composed commit message.** 
+
+If an issue tracker reference is known (JIRA or GitHub), pass it explicitly (e.g. 
+`Issue: FDEV-1234` or `Issue: #123`) so Clio includes it in the commit body.
+
+Clio will return a link — either an existing pull request's link and status or, 
+when none is open, a compare link for opening one. Pass Clio's result back to 
+the user. Clio does NOT create pull requests.
