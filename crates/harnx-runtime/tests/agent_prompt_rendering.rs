@@ -192,3 +192,31 @@ fn agent_prompt_rendering_renders_all_shipped_agents() {
         "no shipped agent exercised a file-backed variable"
     );
 }
+
+#[test]
+fn clio_prompt_checks_for_an_existing_pull_request_after_push() {
+    harnx_core::require_nextest();
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+    let (_temp, _config_guard) = install_packages(&workspace_root);
+
+    let qualified_name = "pantheon/clio";
+    let agent_path = Config::agent_file(qualified_name);
+    let mut agent = load_with_qualified_name(&agent_path, qualified_name).expect("load Clio");
+    resolve_variables(&mut agent).expect("resolve Clio variables");
+    let prompt = agent.system_text().expect("render Clio prompt");
+
+    assert!(
+        prompt.contains("gh pr list --head \"$branch\" --state open --limit 1"),
+        "Clio must query for an open pull request on the pushed branch"
+    );
+    assert!(
+        prompt.contains("url,state,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup"),
+        "Clio must retrieve the existing pull request's link and status"
+    );
+    assert!(
+        prompt.contains("Only when no open pull request exists for the branch"),
+        "Clio must reserve the compare-link fallback for branches without an open pull request"
+    );
+}

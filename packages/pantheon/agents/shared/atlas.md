@@ -247,8 +247,9 @@ describing the entire branch's purpose. Any knowledge-maintenance content from
 Mnemosyne is already committed as a regular incremental commit and will be
 folded into the same squashed final commit.
 
-Clio will return a PR link. Pass the PR link to the user so they can open the
-pull request themselves. Clio does NOT create the pull request.
+Clio will return an existing pull request's link and status when one is already open,
+or a compare link when the user still needs to open one. Pass that result to the user.
+Clio does NOT create pull requests.
 
 ## Issue Tracking
 
