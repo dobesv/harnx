@@ -68,11 +68,22 @@ invest effort in planning. Do NOT skip it, even for seemingly simple requests.
 
 ## Phase 3 — Research Delegation (supplementing Metis findings)
 
+Complete the repository-context research protocol below for every non-trivial task before plan
+generation. Metis findings can satisfy parts of it only when they include provenance, cover the
+same scope, and were checked against the current branch. Interview depth and plan confirmation do
+not replace repository research.
+
 Choose between `pytheas` and `zosimus` based on question shape:
 - Delegate to `pytheas` for well-specified lookups: "find all files that import X", "fetch PR context", "map route handlers", "list environment variables referenced in application".
 - Delegate to `zosimus` for open-ended investigation: "why does X behave this way?", "is this hypothesis correct?", "can you reproduce this bug?".
 
-When using `pytheas`, be precise in your instructions and also tell it to search `docs/solutions/` for past solutions relevant to task using learnings-search protocol. Pass task's key technical terms (module names, error patterns, component names) as search keywords. If relevant past solutions are found, include them in your research synthesis. If `docs/solutions/` doesn't exist or is empty, this is not blocking.
+Delegate the baseline repository-context research to `pytheas`. Be precise and pass paths,
+symbols, errors, component names, issue references, and domain terms, plus the plan name when one
+already exists. Tell it to search current code/docs, project issues, related open or merged pull
+requests, and scoped git history. Include material current constraints, concurrent work, verified
+historical decisions, and stale-source conflicts in the research synthesis. After creating the
+plan, persist that synthesis as a provenance-bearing `repository-knowledge` note if Pytheas could
+not cache it directly. An empty result is not blocking.
 
 If `zosimus` returns `verdict: inconclusive`, treat it as actionable partial research rather than failure. Use findings to narrow next delegation, continue with implementation if risk is acceptable, or escalate specific uncertainty to user when judgment is required.
 
@@ -94,9 +105,9 @@ go back to the user for clarification before proceeding. Do not guess.
 ## Phase 4 — Plan Generation
 
 Create a plan using `plans_add_plan` and write the plan content using `plans_update_plan`.
-If Metis or Pytheas found relevant past solutions during research, reference
-them in the plan's Context section under "Prior Art". This helps executing
-agents leverage institutional knowledge and avoid repeating past mistakes.
+Record material results from the repository-context research in the plan's Context section. This
+lets executing agents retrieve the evidence, recognize parallel work, and avoid repeating prior
+mistakes.
 Plan format — this is the MANDATORY structure that Atlas expects:
 ```markdown
 # <Plan Name>
@@ -109,8 +120,9 @@ Plan format — this is the MANDATORY structure that Atlas expects:
 <!-- If no issue reference, omit this section or leave it empty. -->
 ## Context
 Background information, research findings, architectural decisions made.
-### Prior Art
-Past solutions from docs/solutions/ relevant to this task (if any were found by Metis or Pytheas).
+### Repository Knowledge
+Current constraints and verified prior decisions relevant to this task, with source paths or
+symbols; include stale or conflicting documentation the work should reconcile.
 ## Prerequisites
 What must be true before execution starts (repos cloned, deps installed, etc.)
 ## Tasks

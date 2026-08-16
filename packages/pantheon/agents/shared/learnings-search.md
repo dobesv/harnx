@@ -1,59 +1,55 @@
-## Searching Past Solutions for Learnings
+## Repository Context Research
 
-Before planning or when investigating a problem, search the `docs/solutions/` directory for past solutions that might be relevant to your current task. This helps you avoid repeating work and leverage institutional knowledge.
+Before planning or acting, build a task-specific context set. For every non-trivial task this is a
+required research phase, whether planning is interactive or immediately followed by execution.
+The goal is not exhaustive archaeology; it is to find current constraints, concurrent work, and
+prior reasoning that could change the approach.
 
-### When to Search
+Delegate repository research to `pytheas` when available so findings can be cached and reused.
+Give it the plan name, task statement, likely work areas, and the protocol below. Existing findings
+may satisfy a step only when they include provenance, cover the same scope, and have been checked
+against the current branch; otherwise refresh them.
 
-- **Before planning**: Extract key technical terms from the task and search for related solutions
-- **When investigating a problem**: Search for error patterns, component names, or similar issues
-- **When uncertain about approach**: Look for precedent in how similar problems were solved
+1. **Extract search cues.** Identify affected paths and symbols, component and domain names, error
+   text, configuration keys, issue references, and proposed techniques.
+2. **Read current repository guidance.** Read the root repository map and the nearest applicable
+   `AGENTS.md`/README files for likely work areas. Follow links to maintained architecture,
+   decision, API, runbook, and troubleshooting docs.
+3. **Inspect current implementation.** Search code, tests, configuration, and docs with several
+   precise cues. Prefer sources closest to the behavior. Record the path and section/symbol for
+   facts that shape the work.
+4. **Search project records.** Identify the project's issue tracker, then search the referenced
+   issue plus related, duplicate, blocking, or recently active issues using the same cues. Search
+   open and recently merged pull requests that touch the component or discuss the issue. Read the
+   relevant review threads and status; distinguish accepted decisions from proposals and abandoned
+   work. If the tracker or PR data is unavailable, record that limitation and continue.
+5. **Search version history.** Use path- and symbol-scoped history to recover rationale and prior
+   regressions: start with `git log --oneline -- <path>`, then use `git log -S'<string>' -- <path>`
+   or `git log -G'<regex>' -- <path>` for important behavior and `git blame` only for specific
+   unexplained lines.
+   Inspect relevant commits rather than relying on their subjects. Include linked issue/PR
+   references when present.
+6. **Check curated historical knowledge.** Search `docs/solutions/` and relevant plan notes for
+   prior attempts, failure modes, and decisions.
+7. **Triangulate.** Issues, PRs, review comments, commits, plan notes, and solution docs are evidence
+   of historical intent—not proof of current behavior. Verify their current-state claims against
+   the sources from steps 2–3. Identify contradictions and surface stale guidance as work rather
+   than silently carrying both versions forward.
 
-### Search Strategy
+Keep searches bounded and relevance-driven. Broaden only when results expose an unresolved
+dependency, contradiction, regression, or likely parallel effort. A trivial edit may need only the
+applicable instructions and current file; do not use triviality to bypass research for behavior or
+architecture changes.
 
-Search the `docs/solutions/` directory efficiently using whatever search tools are available:
+Report only material results under `Repository Knowledge`:
 
-1. **Extract keywords from the current task**
-   - Identify module names, error patterns, component names, and technical terms
-   - Example: "Add authentication to API" → keywords: `auth`, `api`, `authentication`, `jwt`
+- current constraints or patterns, with source paths/symbols
+- relevant issues and pull requests, with identifiers, status, links, and the decision or risk
+- relevant commits, with hashes, affected paths, and verified rationale
+- prior decisions or failed approaches, marked as historical and verified or unverified
+- conflicts, parallel work, or stale sources that should change the plan
+- queries/sources checked and material access limitations
+- `No relevant repository knowledge found` when the search is empty
 
-2. **Search YAML frontmatter first** (efficient pre-filtering)
-   - Search by tags: `rg -l 'tags:.*<keyword>' docs/solutions/`
-   - Search by component: `rg -l 'component:.*<keyword>' docs/solutions/`
-   - Search by problem type: `rg -l 'problem_type:.*<type>' docs/solutions/`
-   - Example: `rg -l 'tags:.*kubernetes' docs/solutions/` finds all solutions tagged with kubernetes
-
-3. **Refine based on result count**
-   - If >10 candidates: narrow with more specific patterns or combine multiple keywords
-   - If 3-10 candidates: proceed to relevance scoring
-   - If <3 results: broaden to full-text content search with `rg '<keyword>' docs/solutions/`
-
-4. **Score relevance efficiently**
-   - Read only the first 30 lines of each candidate (frontmatter + Problem section)
-   - Look for direct relevance to your current task
-   - Skip solutions that don't match your specific context
-
-### Output Format
-
-When relevant past solutions are found, present them as a "Prior Art" section in your response:
-
-```
-## Prior Art (from docs/solutions/)
-- [filename.md] — Brief summary of how it relates to this task
-- [filename.md] — Brief summary of the solution approach
-```
-
-Include the filename and a one-line summary of relevance. This helps the team understand what precedent exists.
-
-### Graceful Fallback
-
-If `docs/solutions/` doesn't exist or is empty, note "No past solutions found" and continue. This is **not** a blocking failure — proceed with your analysis and planning. The directory may not be populated yet, or your search terms may not match existing solutions.
-
-### Example Search Flow
-
-Task: "Fix intermittent database connection timeouts in the API"
-
-1. Keywords: `database`, `timeout`, `connection`, `api`
-2. Search: `rg -l 'tags:.*database' docs/solutions/` → 5 results
-3. Refine: `rg -l 'tags:.*timeout' docs/solutions/` → 2 results
-4. Read first 30 lines of each → 1 is highly relevant
-5. Output: "## Prior Art: [connection-pooling-fix.md] — Addresses similar timeout issues by tuning pool size"
+Cache this synthesis in a `repository-knowledge` plan note when a plan exists. Do not dump search
+results, treat absence as blocking, or present any historical source as proof of current behavior.

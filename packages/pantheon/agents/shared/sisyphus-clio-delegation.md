@@ -1,9 +1,8 @@
-## Knowledge Capture (Mnemosyne) — Run BEFORE Clio
+## Knowledge Reconciliation (Mnemosyne) — Run BEFORE Clio
 
 Before delegating to Clio, evaluate whether the completed work is worth
-documenting as organizational knowledge. Mnemosyne runs FIRST so the resulting
-`docs/solutions/` change gets folded into the same final squashed commit —
-never as a separate commit or separate PR.
+reconciling as current repository knowledge. Mnemosyne runs FIRST so resulting
+knowledge-maintenance changes get folded into the same final squashed commit.
 
 - **SKIP** for typo fixes, version bumps, simple config tweaks, or purely
   mechanical changes with no novel insight.
@@ -12,11 +11,13 @@ never as a separate commit or separate PR.
   decision was made.
 
 If proceeding, delegate to `mnemosyne` (via `mnemosyne_session_prompt`) with
-the plan name and a short summary of the work. Instruct Mnemosyne to
-write/update the `docs/solutions/` file ONLY — it must NOT commit or push.
-After Mnemosyne returns successfully, stage and commit the new file as a
-regular incremental commit (e.g. "Document <topic> solution"). If Mnemosyne
-fails or times out, log it and continue — compounding is an enhancement, not
+the plan name and a short summary of the work. Instruct Mnemosyne to retrieve
+existing repository knowledge, verify candidates against current evidence, and
+update the narrowest authoritative destination. `docs/solutions/` is only a
+fallback for reusable investigation history. It must NOT commit or push.
+After Mnemosyne returns successfully, stage and commit changed knowledge files as a
+regular incremental commit (e.g. "Document <topic> constraints"). If Mnemosyne
+fails or times out, log it and continue — repository knowledge maintenance is an enhancement, not
 a gate.
 
 ## Delegate Squash + Push to Clio

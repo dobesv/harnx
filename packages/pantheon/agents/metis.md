@@ -26,7 +26,7 @@ variables:
   description: Guide for structural code search with ast-grep
   path: shared/ast-grep-search.md
 - name: learnings_search
-  description: Guide for searching past learnings and solution docs
+  description: Protocol for retrieving current repository knowledge and verified history
   path: shared/learnings-search.md
 - name: metis_core
   description: Core identity and instructions for Metis

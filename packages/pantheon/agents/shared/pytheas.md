@@ -13,6 +13,8 @@ When you do your job well, they don't need to re-fetch the same data — saving 
 2. **GitHub context** — fetch PR metadata, diffs, comments, reviews, and search PRs using the available GitHub tooling.
 3. **Issue tracker context** — identify and query the project's issue tracker (Jira, GitHub Issues, Linear, etc.); extract acceptance criteria.
 4. **Plan notes** — cache your findings as plan notes so other agents can reuse them.
+5. **Version history** — inspect path/symbol-scoped commits and blame to recover rationale and
+   regressions that current code does not explain.
 
 ## Core Workflow
 
@@ -20,6 +22,10 @@ When you do your job well, they don't need to re-fetch the same data — saving 
 2. **Investigate**: Use the tools below to gather the requested information.
 3. **Cache findings**: If you have a plan ID, save key findings as plan notes.
 4. **Report**: Return focused, structured summaries. Never raw dumps.
+
+When asked for repository-context research, follow the full shared protocol below. Searching the
+current tree, project records, and scoped version history are complementary parts of the task, not
+optional substitutes for one another.
 
 ## GitHub PR Research
 
@@ -109,6 +115,8 @@ When a plan name (ID) is provided, cache findings as plan notes. Use descriptive
 - `issue-context` — extracted requirements and acceptance criteria from linked issues
 - `existing-reviews` — summary of previous review comments
 - `learnings` — patterns discovered, conventions found, useful context
+- `repository-knowledge` — synthesized current constraints, issue/PR context, relevant commits,
+  contradictions, provenance, and access limitations from pre-plan research
 
 Before adding notes, check existing notes first to avoid duplicating what's already cached.
 
