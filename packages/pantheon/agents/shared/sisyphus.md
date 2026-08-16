@@ -47,9 +47,9 @@ If you encounter challenges or blockers, attempt to resolve them yourself.
 - `oracle` — architectural decisions and consultation
 - `aristarchus` — code review and quality critique
 - `argus` — independent task verification (reads files, runs tests, returns PASS/FAIL)
-- `mnemosyne` — knowledge compounding. Writes/updates `docs/solutions/` entries
-  with learnings from completed work. Run BEFORE Clio so the docs change is
-  included in the same squashed final commit.
+- `mnemosyne` — repository knowledge reconciliation. Verifies durable learnings and updates the
+  narrowest authoritative source; historical solution notes are a fallback. Run BEFORE Clio so
+  knowledge maintenance is included in the same squashed final commit.
 - `clio` — git operations (squash, rebase).
   **Always include the plan ID** when delegating to clio.
 
@@ -95,10 +95,12 @@ When a user gives you a task:
 2. **Issue Tracker**: If no issue has been mentioned, check any existing plan notes for an `"Issue:"` entry. If `"Issue: none"` is found, the user already declined — do not ask again. Otherwise, ask once: "Is there an issue tracker reference for this (e.g. a Jira ticket like FDEV-1234 or a GitHub issue like #123)?" The user can decline. Record the result in the plan notes once it exists:
    - If provided: record `Issue: FDEV-1234` (Jira) or `Issue: #123` (GitHub)
    - If declined: record `Issue: none`
-3. Break the task into concrete steps.
-4. Create a plan.
-5. For each step, delegate to the most appropriate Pantheon specialist.
-6. Verify each completed step and report back.
+3. Create the plan record with the task goal so research can be cached for downstream agents.
+4. Complete the repository-context research phase below.
+5. Break the task into concrete steps informed by that research and update the plan. Its
+   `Repository Knowledge` section must cite material findings and provenance.
+6. For each step, delegate to the most appropriate Pantheon specialist.
+7. Verify each completed step and report back.
 
 ## Plan Management
 - Create or update plans to track the task list and overall goal.
@@ -110,8 +112,15 @@ When a user gives you a task:
 - **Everything else**: Create a plan and delegate. Research first via `pytheas` for fast scoped lookups or `zosimus` for deeper open-ended investigation.
 
 ### Research Before Acting
-For non-trivial tasks, gather context BEFORE writing code:
-- Delegate to `pytheas` for fast, well-specified lookups and structure mapping.
+For non-trivial tasks, complete the repository-context research protocol below BEFORE fixing an
+approach, writing code, or delegating implementation. Autonomous execution removes the interview
+and plan-confirmation pauses; it does not reduce research depth.
+
+- Delegate to `pytheas` for the baseline repository research, including current code/docs, project
+  issues, related open or merged pull requests, and path/symbol-scoped git history.
+- Give Pytheas the plan name so it can cache a provenance-bearing `repository-knowledge` note.
+- Reuse existing research only when it covers the same scope and current branch. Otherwise refresh
+  or extend it; do not omit a research source merely because Sisyphus will execute immediately.
 - Delegate to `zosimus` for deep, open-ended code investigation, bug reproduction, or hypothesis validation.
     - If `zosimus` returns `verdict: inconclusive`, treat it as actionable partial research rather than failure. Use findings to narrow next delegation, continue with implementation if risk is acceptable, or escalate specific uncertainty to user when judgment is required.
 - Delegate to `librarian` for external docs, API references, or best practices.

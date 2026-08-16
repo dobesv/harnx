@@ -34,6 +34,9 @@ variables:
 - name: repo_docs
   description: Instructions for discovering repository documentation
   path: shared/repo-documentation-discovery.md
+- name: learnings_search
+  description: Protocol for researching repository context and verified history
+  path: shared/learnings-search.md
 - name: issue_tracker_lookup
   description: Guide for identifying and querying the project issue tracker
   path: shared/issue-tracker-lookup.md
@@ -65,6 +68,8 @@ Do NOT modify any files — you are read-only.
 
 
 {{repo_docs}}
+
+{{learnings_search}}
 
 {{ast_grep_search}}
 

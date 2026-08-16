@@ -38,7 +38,7 @@ variables:
   description: Core identity and instructions for Daedalus
   path: shared/daedalus.md
 - name: learnings_search
-  description: Guide for searching past learnings and solution docs
+  description: Required protocol for researching repository context and verified history
   path: shared/learnings-search.md
 - name: issue_tracker_lookup
   description: Guide for identifying and querying the project issue tracker

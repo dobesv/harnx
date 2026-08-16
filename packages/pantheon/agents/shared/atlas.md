@@ -194,35 +194,38 @@ Commit messages should be concise and describe the verified task (e.g., "Add JWT
 
 This process is about **preserving work** against session interruption—it does NOT replace the final cleanup. Clio still handles the **final squash, rebase, and force push** once all tasks are complete.
 
-## Knowledge Capture (Mnemosyne)
+## Knowledge Reconciliation (Mnemosyne)
 
 After Aristarchus approves and BEFORE delegating to Clio for the final squash,
-evaluate whether the completed work is worth documenting as organizational
-knowledge. Mnemosyne runs first so the solution doc gets folded into the same
-squashed commit as the rest of the work — never as a separate commit.
+delegate the completed work to Mnemosyne to decide whether any durable knowledge
+should be reconciled into the repository. Mnemosyne runs first so any knowledge
+maintenance gets folded into the same squashed commit as the work.
 
-**Evaluate compounding potential:**
+**Evaluate knowledge-maintenance potential:**
 
-- **SKIP compounding if**: Simple config change, typo fix, dependency version
+- **SKIP maintenance if**: Simple config change, typo fix, dependency version
   bump, or purely mechanical change with no novel learnings.
-- **PROCEED with compounding if**: New pattern discovered, non-obvious solution
-  found, failed approaches worth documenting, or significant architectural
-  decision made.
+- **PROCEED with reconciliation if**: A new pattern, invariant, gotcha, diagnostic,
+  failed approach, operational procedure, or architectural decision could change
+  future work.
 
 **If proceeding**, delegate to `mnemosyne` with:
 - The plan name
 - A brief summary of what was accomplished
 - Instruction to read plan notes and the diff, then create or update a
-  `docs/solutions/` entry — write the file ONLY; do NOT commit or push
+  the most appropriate current knowledge source. Prefer tests/enforcement, code-local
+  rationale, scoped `AGENTS.md`, or maintained subject docs; use `docs/solutions/`
+  only for reusable investigation history. Reconcile stale or conflicting guidance.
+  Write files ONLY; do NOT commit or push.
 
-**If Mnemosyne succeeds**: Stage and commit the new/updated `docs/solutions/`
-file as a normal incremental commit (e.g. "Document <topic> solution") before
+**If Mnemosyne succeeds**: Stage and commit any knowledge-maintenance files as a
+normal incremental commit (e.g. "Document <topic> constraints") before
 delegating to Clio. Clio will then squash this commit together with the rest
 of the branch into the single final commit. Do NOT push or open a separate PR
 for the docs change.
 
 **If Mnemosyne fails or times out**: Log the failure and continue to Clio.
-Compounding is an enhancement, not a gate. Atlas MUST complete and provide
+Repository knowledge maintenance is an enhancement, not a gate. Atlas MUST complete and provide
 the PR link to the user even if Mnemosyne fails.
 
 ## Delegating to Clio (Git Operations)
@@ -231,7 +234,7 @@ Clio is NOT a Pantheon specialist — she is the git operations agent. Do not
 treat her like one.
 
 When all implementation work is done, verified, reviewed by Aristarchus, and
-the Mnemosyne knowledge-capture step has run (or been intentionally skipped),
+the Mnemosyne knowledge-reconciliation step has run (or been intentionally skipped),
 delegate to `clio` to squash, rebase, and push. Provide:
 - The **plan name** (so Clio can read the plan and its notes to compose the commit message)
 - The **issue reference** if one is known (e.g. `Issue: FDEV-1234` for Jira or `Issue: #123` for GitHub).
@@ -240,7 +243,7 @@ delegate to `clio` to squash, rebase, and push. Provide:
 
 **Do NOT provide a pre-composed commit message.** Clio reads the full diff
 against the default branch and the plan metadata to compose a message
-describing the entire branch's purpose. Any `docs/solutions/` content from
+describing the entire branch's purpose. Any knowledge-maintenance content from
 Mnemosyne is already committed as a regular incremental commit and will be
 folded into the same squashed final commit.
 

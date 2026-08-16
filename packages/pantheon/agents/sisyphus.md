@@ -93,6 +93,9 @@ variables:
 - name: issue_tracker_lookup
   description: Guide for identifying and querying the project issue tracker
   path: shared/issue-tracker-lookup.md
+- name: learnings_search
+  description: Required protocol for researching repository context and verified history
+  path: shared/learnings-search.md
 - name: github_gh_lookup
   description: Brief guide for fetching GitHub issue and pull request information with gh
   path: shared/github-gh-lookup.md
@@ -111,6 +114,8 @@ variables:
 {{github_gh_lookup}}
 
 {{repo_docs}}
+
+{{learnings_search}}
 
 {{ast_grep_search}}
 
