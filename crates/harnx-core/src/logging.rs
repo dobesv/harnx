@@ -149,29 +149,49 @@ pub fn init_with(settings: LogSettings) -> Result<LogSettings> {
     Ok(settings)
 }
 
+/// Where a child process's stdout and stderr should go. Split out from
+/// [`child_output_sink`] because `Stdio` can't be compared or inspected, so this
+/// is the only part of the decision a test can assert on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChildOutput {
+    /// Append to our log file.
+    File(PathBuf),
+    /// Let the child have our own streams.
+    Inherit,
+    /// Discard.
+    Null,
+}
+
 /// Stdio for a child process, following the rule in the module docs: hand the
 /// child our log file when we have one, otherwise let it inherit our streams.
 ///
 /// Falls back to [`Stdio::null`] when the file can't be opened. Never `inherit`
 /// in that case — the callers that log to a file are the ones drawing on the
 /// terminal, and child output there corrupts the display.
-///
-/// A process that never called [`init`] gets [`Stdio::null`] too, not `inherit`.
-/// In practice that means a test harness, whose stdout is a pipe: a child
-/// holding an inherited pipe open outlives the test that spawned it and strands
-/// the harness waiting on EOF. A process that configured no logging has said
-/// nothing about wanting its children's output either.
 pub fn child_output_sink() -> Stdio {
-    match current().map(|settings| &settings.dest) {
-        Some(LogDest::File(path)) => match open_append(path) {
+    match child_output(current().map(|settings| &settings.dest)) {
+        ChildOutput::File(path) => match open_append(&path) {
             Ok(file) => Stdio::from(file),
             Err(error) => {
                 log::warn!("child output not captured to {}: {error:#}", path.display());
                 Stdio::null()
             }
         },
-        Some(LogDest::Stderr) => Stdio::inherit(),
-        None => Stdio::null(),
+        ChildOutput::Inherit => Stdio::inherit(),
+        ChildOutput::Null => Stdio::null(),
+    }
+}
+
+/// A process that never called [`init`] gets [`ChildOutput::Null`], not
+/// `Inherit`. In practice that means a test harness, whose stdout is a pipe: a
+/// child holding an inherited pipe open outlives the test that spawned it and
+/// strands the harness waiting on EOF. A process that configured no logging has
+/// said nothing about wanting its children's output either.
+fn child_output(dest: Option<&LogDest>) -> ChildOutput {
+    match dest {
+        Some(LogDest::File(path)) => ChildOutput::File(path.clone()),
+        Some(LogDest::Stderr) => ChildOutput::Inherit,
+        None => ChildOutput::Null,
     }
 }
 
@@ -200,10 +220,18 @@ pub fn log_file_path() -> Option<&'static Path> {
 /// the writers clobber each other and the kernel zero-fills the gaps, which is
 /// where the giant NUL runs in #880 came from. The file is never truncated per
 /// run; rotate or delete it yourself when it grows.
+///
+/// Read access is requested alongside append even though nothing here reads the
+/// file. On Windows, `append` alone produces a `FILE_APPEND_DATA` handle, and a
+/// child process that inherits it as its stdout — an MSYS shell, say — fails
+/// when it probes the handle with calls that need read rights. Asking for read
+/// widens the handle to behave like an ordinary one. No effect on Unix, and
+/// `O_APPEND` semantics are unchanged either way.
 fn open_append(path: &Path) -> Result<std::fs::File> {
     crate::path::ensure_parent_exists(path)?;
     OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)
         .with_context(|| format!("open log file {}", path.display()))
@@ -581,6 +609,24 @@ mod tests {
             dest,
             LogDest::File(PathBuf::from("/tmp/harnx-logging-test/harnx.log"))
         );
+    }
+
+    #[test]
+    fn a_file_logging_process_gives_children_that_file() {
+        let dest = LogDest::File(default_path());
+        assert_eq!(child_output(Some(&dest)), ChildOutput::File(default_path()));
+    }
+
+    #[test]
+    fn a_stderr_logging_process_lets_children_inherit() {
+        assert_eq!(child_output(Some(&LogDest::Stderr)), ChildOutput::Inherit);
+    }
+
+    #[test]
+    fn a_process_with_no_logger_discards_child_output() {
+        // Not `Inherit`: an inherited pipe outlives the child holding it, which
+        // strands a test harness waiting on EOF.
+        assert_eq!(child_output(None), ChildOutput::Null);
     }
 
     #[test]

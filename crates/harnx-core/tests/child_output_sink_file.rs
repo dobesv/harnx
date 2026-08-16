@@ -1,12 +1,35 @@
-//! A process that logs to a file hands its children that same file.
+//! A process that logs to a file really does get its children's bytes into that
+//! file — the end-to-end half of the rule `logging::child_output` decides.
 //!
 //! Lives in its own test binary because `logging::init` publishes to a
-//! process-global `OnceLock`: the stderr half of this rule is asserted by
-//! `child_output_sink_stderr.rs`, which needs a fresh process.
+//! process-global `OnceLock` that this test must be the one to set.
 
 use std::process::Command;
 
 use harnx_core::logging::{self, LogSink};
+
+/// A child that writes `text` to `stream`, via whichever shell the platform is
+/// guaranteed to have. `sh` is not dependable on Windows.
+fn echo_to(stream: &str, text: &str) -> Command {
+    let redirect = if stream == "stderr" { " 1>&2" } else { "" };
+    let script = format!("echo {text}{redirect}");
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", &script]);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]);
+        command
+    };
+    command
+        .stdout(logging::child_output_sink())
+        .stderr(logging::child_output_sink());
+    command
+}
 
 #[test]
 fn a_file_logging_process_hands_children_its_log_file() {
@@ -31,20 +54,23 @@ fn a_file_logging_process_hands_children_its_log_file() {
     // This crate's own target doesn't start with the default `harnx` filter, so
     // it must be dropped.
     log::info!("a line from a foreign target");
-    let status = Command::new("sh")
-        .args([
-            "-c",
-            "echo a line from the child; echo and one on stderr >&2",
-        ])
-        .stdout(logging::child_output_sink())
-        .stderr(logging::child_output_sink())
-        .status()
-        .expect("run child");
-    assert!(status.success());
+
+    for (stream, text) in [
+        ("stdout", "child-stdout-line"),
+        ("stderr", "child-stderr-line"),
+    ] {
+        let status = echo_to(stream, text)
+            .status()
+            .unwrap_or_else(|error| panic!("spawn child writing to {stream}: {error}"));
+        assert!(
+            status.success(),
+            "child writing to {stream} exited {status}"
+        );
+    }
 
     let body = std::fs::read_to_string(&log_path).expect("read log");
     assert!(body.contains("a line from the parent"), "{body}");
     assert!(!body.contains("a foreign target"), "{body}");
-    assert!(body.contains("a line from the child"), "{body}");
-    assert!(body.contains("and one on stderr"), "{body}");
+    assert!(body.contains("child-stdout-line"), "{body}");
+    assert!(body.contains("child-stderr-line"), "{body}");
 }
