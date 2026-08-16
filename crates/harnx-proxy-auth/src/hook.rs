@@ -118,7 +118,7 @@ pub async fn run_jsonl_loop(
                 let request: HookRequest = match serde_json::from_str(&line) {
                     Ok(request) => request,
                     Err(e) => {
-                        tracing::warn!("Malformed JSONL input (skipping): {e}");
+                        log::warn!("Malformed JSONL input (skipping): {e}");
                         continue;
                     }
                 };

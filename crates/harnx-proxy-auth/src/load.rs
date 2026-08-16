@@ -42,13 +42,23 @@ pub fn load_value(spec: &LoadSpec) -> json::Val {
         Ok(value) => match serde_json_to_jaq_value(&value) {
             Ok(value) => value,
             Err(error) => {
-                tracing::warn!(name = %spec.name, path = %spec.path.display(), format = ?spec.format, error = %error, "failed to convert loaded jaq variable; using null");
+                log::warn!(
+                    "failed to convert loaded jaq variable `{}` from {} ({:?}); using null: {error}",
+                    spec.name,
+                    spec.path.display(),
+                    spec.format,
+                );
                 json::Val::Null
             }
         },
         Err(LoadError::MissingOrUnreadable) => json::Val::Null,
         Err(LoadError::Malformed(message)) => {
-            tracing::warn!(name = %spec.name, path = %spec.path.display(), format = ?spec.format, error = %message, "failed to parse loaded jaq variable; using null");
+            log::warn!(
+                "failed to parse loaded jaq variable `{}` from {} ({:?}); using null: {message}",
+                spec.name,
+                spec.path.display(),
+                spec.format,
+            );
             json::Val::Null
         }
     }

@@ -6,11 +6,12 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
     let inputs = parse_args();
     let cwd = std::env::current_dir()?;
     let allowlist = resolve_allowlist(&inputs, &cwd, &AllowEnv::from_current_process());
 
-    eprintln!(
+    log::info!(
         "harnx-fs-tools v{}: starting ({} read, {} write allow path{})",
         env!("CARGO_PKG_VERSION"),
         allowlist.read_paths().len(),

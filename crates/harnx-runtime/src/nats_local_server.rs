@@ -222,8 +222,10 @@ async fn spawn_once(binary: &Path, config_path: &Path, token: &str) -> Result<(C
         .arg("-c")
         .arg(config_path)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        // Where our own logs go. Discarding this left a broker that refuses to
+        // start — a bad config, a port it can't bind — saying nothing at all.
+        .stdout(harnx_core::logging::child_output_sink())
+        .stderr(harnx_core::logging::child_output_sink());
     configure_parent_death(&mut command);
     let mut child = command
         .spawn()

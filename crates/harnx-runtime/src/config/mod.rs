@@ -115,7 +115,6 @@ use indexmap::IndexMap;
 use inquire::{list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text};
 use parking_lot::RwLock;
 use serde_json::json;
-use simplelog::LevelFilter;
 use std::collections::{HashMap, HashSet};
 use std::{
     env,
@@ -541,46 +540,6 @@ impl Config {
         self.serve_addr.clone().unwrap_or_else(|| SERVE_ADDR.into())
     }
 
-    pub fn log_config(is_serve: bool) -> Result<(LevelFilter, Option<PathBuf>)> {
-        let log_level = env::var(get_env_name("log_level"))
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| Self::default_log_level(is_serve));
-        if log_level == LevelFilter::Off {
-            return Ok((log_level, None));
-        }
-        Ok((log_level, Self::resolve_log_path(is_serve)))
-    }
-
-    /// Default log level when `log_level` is unset: `Debug` in debug builds,
-    /// otherwise `Info` for serve mode and `Off` for interactive use.
-    fn default_log_level(is_serve: bool) -> LevelFilter {
-        if cfg!(debug_assertions) {
-            LevelFilter::Debug
-        } else if is_serve {
-            LevelFilter::Info
-        } else {
-            LevelFilter::Off
-        }
-    }
-
-    /// Resolve the log file path: an explicit `log_path` env value wins;
-    /// otherwise default to the state-dir log file (or none in serve mode).
-    fn resolve_log_path(is_serve: bool) -> Option<PathBuf> {
-        if let Ok(v) = env::var(get_env_name("log_path")) {
-            if !v.is_empty() {
-                return Some(PathBuf::from(v));
-            }
-        }
-        if is_serve {
-            return None;
-        }
-        Some(paths::state_path(&format!(
-            "{}.log",
-            env!("CARGO_CRATE_NAME")
-        )))
-    }
-
     pub fn edit_config(&mut self) -> Result<()> {
         let config_path = Self::config_file();
         self.edit_with_tui_hooks(|this| {
@@ -734,8 +693,9 @@ impl Config {
         if let Some(hooks) = &self.hooks {
             items.push(("hooks", hooks.entries.len().to_string()));
         }
-        if let Ok((_, Some(log_path))) = Self::log_config(self.working_mode.is_serve()) {
-            items.push(("log_path", display_path(&log_path)));
+        if let Some(settings) = harnx_core::logging::current() {
+            items.push(("log_level", settings.level.to_string()));
+            items.push(("log_output", settings.dest_display()));
         }
         let output = items
             .iter()

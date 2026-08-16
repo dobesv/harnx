@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
     load_env_file()?;
     let cli = Cli::parse();
     if let Some(command) = &cli.command {
-        setup_logger(false)?;
+        setup_logger(LogSink::File)?;
         harnx_core::alloc_guard::init_from_env();
         return run_command(command).await;
     }
@@ -111,7 +111,7 @@ async fn main() -> Result<()> {
         WorkingMode::Cmd
     };
     let info_flag = legacy_info_flag(&cli);
-    setup_logger(false)?;
+    setup_logger(LogSink::File)?;
     harnx_core::alloc_guard::init_from_env();
     let config = Arc::new(RwLock::new(Config::init(working_mode, info_flag).await?));
     if let Err(err) = run(config, cli, text).await {
@@ -688,6 +688,7 @@ async fn create_input(
     Ok(input)
 }
 
+use harnx_core::logging::LogSink;
 use harnx_runtime::bootstrap::setup_logger;
 
 #[cfg(test)]

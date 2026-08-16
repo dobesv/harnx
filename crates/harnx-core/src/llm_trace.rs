@@ -10,7 +10,7 @@
 //! - `kind: "stream-event"` — one entry per parsed streaming event (one SSE
 //!   message, or one Bedrock event-stream frame).
 //!
-//! This is independent of the standard `simplelog` log filter so the trace
+//! This is independent of the standard log level and filter so the trace
 //! file contains only LLM I/O and nothing else, even with debug logging
 //! disabled. When the env var is unset, every entry point is a cheap
 //! `OnceLock::get().is_none()` check, so call sites can invoke unconditionally.

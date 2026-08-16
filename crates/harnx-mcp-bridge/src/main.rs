@@ -8,7 +8,7 @@ use std::sync::Arc;
 async fn main() -> anyhow::Result<()> {
     // Before spawning the child: its stderr is forwarded to `log::debug!`, which
     // goes nowhere until a logger exists.
-    harnx_core::server_logging::init_server_logger();
+    let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
     let args = Args::parse();
 
     if args.list_tools {

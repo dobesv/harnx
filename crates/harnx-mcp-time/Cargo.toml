@@ -14,6 +14,8 @@ chrono = { workspace = true }
 chrono-tz = { workspace = true }
 iana-time-zone = { workspace = true }
 jiff = { workspace = true }
+harnx-core = { path = "../harnx-core" }
+log = { workspace = true }
 rmcp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

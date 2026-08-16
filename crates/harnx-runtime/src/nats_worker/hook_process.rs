@@ -90,10 +90,10 @@ pub(super) fn spawn_hook_server(
     apply_tls_env(&mut command, config);
     command
         .stdin(Stdio::null())
-        // Send output to the worker log so a hook server that exits before
+        // Send output where our own logs go so a hook server that exits before
         // registering explains itself instead of failing silently.
-        .stdout(crate::local_orchestrator::worker_output_sink())
-        .stderr(crate::local_orchestrator::worker_output_sink())
+        .stdout(harnx_core::logging::child_output_sink())
+        .stderr(harnx_core::logging::child_output_sink())
         .kill_on_drop(true);
     configure_hook_process(&mut command);
     command

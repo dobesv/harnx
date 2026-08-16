@@ -21,8 +21,9 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main() -> anyhow::Result<()> {
+    let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
     let cli = cli::Cli::parse();
-    eprintln!(
+    log::info!(
         "harnx-mcp-remote v{}: starting, proxying to {}",
         env!("CARGO_PKG_VERSION"),
         cli.url

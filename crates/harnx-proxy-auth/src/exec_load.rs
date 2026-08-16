@@ -63,18 +63,24 @@ pub fn map_exec_outcome(spec: &ExecSpec, outcome: ExecOutcome) -> Value {
         ExecOutcome::Success { stdout } => {
             let value = trim_single_trailing_newline(stdout);
             if value.is_empty() {
-                tracing::debug!(name = %spec.name, "--load-exec produced empty output; using null");
+                log::debug!(
+                    "--load-exec `{}` produced empty output; using null",
+                    spec.name
+                );
                 Value::Null
             } else {
                 Value::String(value)
             }
         }
         ExecOutcome::ExitFailure => {
-            tracing::debug!(name = %spec.name, "--load-exec command failed; using null");
+            log::debug!("--load-exec `{}` command failed; using null", spec.name);
             Value::Null
         }
         ExecOutcome::SpawnFailed => {
-            tracing::debug!(name = %spec.name, "--load-exec command could not be spawned; using null");
+            log::debug!(
+                "--load-exec `{}` command could not be spawned; using null",
+                spec.name
+            );
             Value::Null
         }
     }

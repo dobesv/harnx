@@ -74,7 +74,7 @@ impl HttpHandler for AuthHandler {
             _ => None,
         };
         if let Some(reason) = block_reason {
-            tracing::info!(reason = %reason, "request blocked by filter");
+            log::info!("request blocked by filter: {reason}");
             let response = Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .header("content-type", "text/plain")
@@ -125,7 +125,7 @@ async fn append_log(path: &std::path::Path, entry: &Value) {
         anyhow::Ok(())
     };
     if let Err(err) = write.await {
-        tracing::warn!(error = %err, "failed to write auth log line");
+        log::warn!("failed to write auth log line: {err}");
     }
 }
 
@@ -359,7 +359,7 @@ async fn start_proxy_inner(transforms: Arc<TransformPipeline>, config: ProxyConf
             .build()?;
         tokio::spawn(async move {
             if let Err(err) = proxy.start().await {
-                tracing::error!(error = %err, "Proxy error");
+                log::error!("Proxy error: {err}");
             }
         });
     } else {
@@ -371,7 +371,7 @@ async fn start_proxy_inner(transforms: Arc<TransformPipeline>, config: ProxyConf
             .build()?;
         tokio::spawn(async move {
             if let Err(err) = proxy.start().await {
-                tracing::error!(error = %err, "Proxy error");
+                log::error!("Proxy error: {err}");
             }
         });
     }

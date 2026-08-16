@@ -29,6 +29,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
     let Args {
         plans_dir,
         retention_days,
@@ -41,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
         return run_http(plans_dir, retention_days, host, port).await;
     }
 
-    eprintln!(
+    log::info!(
         "harnx-plans-tools v{}: starting (dir: {}, retention: {} days)",
         env!("CARGO_PKG_VERSION"),
         plans_dir.display(),
@@ -49,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let cleanup = if retention_days == 0 {
-        eprintln!("[cleanup] retention disabled");
+        log::info!("[cleanup] retention disabled");
         None
     } else {
         Some(tokio::spawn(supervise_cleanup(
@@ -73,7 +74,7 @@ async fn supervise_cleanup(plans_dir: PathBuf, retention_days: u64) {
     loop {
         match tokio::spawn(server::cleanup_loop(plans_dir.clone(), retention_days)).await {
             Err(error) => {
-                eprintln!("[cleanup] task failed: {error}");
+                log::error!("[cleanup] task failed: {error}");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
@@ -255,7 +256,7 @@ async fn run_http(
 
     spawn_shutdown_handler(ct.clone());
 
-    eprintln!(
+    log::info!(
         "harnx-plans-tools v{}: listening on http://{}:{}/mcp (dir: {}, retention: {} days)",
         env!("CARGO_PKG_VERSION"),
         host,
@@ -273,7 +274,7 @@ async fn run_http(
     tokio::pin!(server_handle);
 
     if retention_days == 0 {
-        eprintln!("[cleanup] retention disabled");
+        log::info!("[cleanup] retention disabled");
         (&mut server_handle).await??;
     } else {
         let cleanup_dir = plans_dir.clone();
@@ -293,7 +294,7 @@ async fn run_http(
                 result = &mut cleanup_handle => {
                     match result {
                         Err(e) => {
-                            eprintln!("[cleanup] task failed: {e}");
+                            log::error!("[cleanup] task failed: {e}");
                             tokio::time::sleep(backoff).await;
                             backoff = (backoff * 2).min(MAX_BACKOFF);
                         }

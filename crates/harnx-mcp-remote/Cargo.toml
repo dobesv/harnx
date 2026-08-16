@@ -8,6 +8,8 @@ repository.workspace = true
 description = "stdio MCP proxy that forwards to remote HTTP MCP servers"
 
 [dependencies]
+harnx-core = { path = "../harnx-core" }
+log = { workspace = true }
 rmcp = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }

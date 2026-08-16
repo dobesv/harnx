@@ -7,6 +7,7 @@ use std::path::PathBuf;
 #[cfg(unix)]
 mod imp {
     use anyhow::{anyhow, bail, Context, Result};
+    use log::{debug, warn};
     use serde::{Deserialize, Serialize};
     use serde_json::{Map, Value};
     use std::collections::HashMap;
@@ -21,7 +22,6 @@ mod imp {
     use tokio::process::{Child, ChildStdin, Command};
     use tokio::sync::{oneshot, Mutex};
     use tokio::task::JoinHandle;
-    use tracing::{debug, warn};
 
     static EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
     const STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -356,7 +356,7 @@ mod imp {
             ExecSource::Path(path) => (path.clone(), None),
         };
 
-        debug!(program = %program.display(), "Spawning resident exec hook process");
+        debug!("Spawning resident exec hook process: {}", program.display());
         let mut child = Command::new(&program)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

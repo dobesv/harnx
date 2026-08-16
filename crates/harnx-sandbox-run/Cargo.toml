@@ -15,7 +15,6 @@ clap = { workspace = true, features = ["derive"] }
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 log = { workspace = true }
-env_logger = "0.11"
 serde_json = { workspace = true }
 uuid = { workspace = true }
 

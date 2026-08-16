@@ -85,7 +85,7 @@ fn parse_cli(args: &[String]) -> cli::Cli {
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
+    let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
 
     // Raw args (skip program name)
     let raw: Vec<String> = std::env::args().skip(1).collect();
