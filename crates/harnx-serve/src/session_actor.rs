@@ -5,8 +5,13 @@ mod test_executor;
 #[path = "session_actor_test_log.rs"]
 mod test_log;
 
+mod registry;
+
 pub use crate::session_actor_types::*;
+pub use registry::SessionRegistry;
 pub use test_log::load_test_session_messages;
+
+use registry::get_or_spawn_in;
 
 use crate::ag_ui::AgUiSink;
 use ag_ui_core::{
@@ -17,7 +22,7 @@ use ag_ui_core::{
     },
 };
 use chrono::Utc;
-use dashmap::{mapref::entry::Entry, DashMap};
+use dashmap::DashMap;
 use harnx_core::{
     abort::{create_abort_signal, AbortSignal},
     message::MessageContent,
@@ -31,24 +36,27 @@ use harnx_runtime::{
     AgentCallFn, AgentLoopContext, OnToolRoundFn, ThinClientConfig, ThinClientSession,
     ToolApprovalDecision, ToolApprovalInterrupt, ToolUseConfirmation,
 };
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::{
     sync::{broadcast, mpsc, oneshot, Mutex},
     task::JoinHandle,
     time::{sleep_until, Instant, Sleep},
 };
 
-const DEFAULT_REAP_TTL: Duration = Duration::from_secs(5);
 const COMMAND_BUFFER: usize = 32;
 const BROADCAST_BUFFER: usize = 64;
 const FAR_FUTURE_SECS: u64 = 365 * 24 * 60 * 60;
 
-#[derive(Clone)]
-pub struct SessionRegistry {
-    map: Arc<DashMap<SessionKey, SessionHandle>>,
-    reap_ttl: Duration,
-    actor_config: SessionActorConfig,
-}
+type SessionMap = Arc<DashMap<SessionKey, SessionHandle>>;
+
+static NEXT_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct SessionActorConfig {
@@ -81,96 +89,10 @@ struct ActorTurnParams {
     session_id: String,
 }
 
-impl SessionRegistry {
-    pub fn new(base_config: Config) -> Self {
-        Self::with_reap_ttl(base_config, DEFAULT_REAP_TTL)
-    }
-
-    pub fn with_reap_ttl(base_config: Config, reap_ttl: Duration) -> Self {
-        Self {
-            map: Arc::new(DashMap::new()),
-            reap_ttl,
-            actor_config: SessionActorConfig {
-                base_config,
-                call_fn: None,
-                local_worker: Arc::new(Mutex::new(None)),
-            },
-        }
-    }
-
-    fn with_options(reap_ttl: Duration, actor_config: SessionActorConfig) -> Self {
-        Self {
-            map: Arc::new(DashMap::new()),
-            reap_ttl,
-            actor_config,
-        }
-    }
-
-    pub fn new_for_tests(
-        base_config: Config,
-        reap_ttl: Duration,
-        call_fn: Option<AgentCallFn>,
-    ) -> Self {
-        Self::with_options(
-            reap_ttl,
-            SessionActorConfig {
-                base_config,
-                call_fn,
-                local_worker: Arc::new(Mutex::new(None)),
-            },
-        )
-    }
-
-    // Only used by the Unix-only NATS serve tests (`nats_tests`).
-    #[cfg(all(test, unix))]
-    fn new_with_local_worker_for_tests(
-        base_config: Config,
-        supervisor: LocalWorkerSupervisor,
-    ) -> Self {
-        Self::with_options(
-            DEFAULT_REAP_TTL,
-            SessionActorConfig {
-                base_config,
-                call_fn: None,
-                local_worker: Arc::new(Mutex::new(Some(supervisor))),
-            },
-        )
-    }
-
-    pub fn has_session(&self, key: &SessionKey) -> bool {
-        self.map.contains_key(key)
-    }
-
-    pub fn get_or_spawn(&self, key: SessionKey) -> SessionHandle {
-        match self.map.entry(key.clone()) {
-            Entry::Occupied(entry) => entry.get().clone(),
-            Entry::Vacant(entry) => {
-                let handle = spawn_session_actor(
-                    key,
-                    Arc::clone(&self.map),
-                    self.reap_ttl,
-                    self.actor_config.clone(),
-                );
-                entry.insert(handle.clone());
-                handle
-            }
-        }
-    }
-
-    pub fn contains(&self, key: &SessionKey) -> bool {
-        self.map.contains_key(key)
-    }
-}
-
-impl Default for SessionRegistry {
-    fn default() -> Self {
-        Self::new(Config::default())
-    }
-}
-
 struct SessionActor {
     key: SessionKey,
-    registry: Arc<DashMap<SessionKey, SessionHandle>>,
+    actor_id: u64,
+    registry: SessionMap,
     rx: mpsc::Receiver<SessionCommand>,
     broadcast_tx: broadcast::Sender<Event>,
     subscribers: usize,
@@ -188,16 +110,21 @@ struct SessionActor {
 
 fn spawn_session_actor(
     key: SessionKey,
-    registry: Arc<DashMap<SessionKey, SessionHandle>>,
+    registry: SessionMap,
     reap_ttl: Duration,
     actor_config: SessionActorConfig,
 ) -> SessionHandle {
     let (tx, rx) = mpsc::channel(COMMAND_BUFFER);
     let (broadcast_tx, _) = broadcast::channel(BROADCAST_BUFFER);
     let (run_done_tx, run_done_rx) = mpsc::channel(COMMAND_BUFFER);
-    let handle = SessionHandle { tx: tx.clone() };
+    let actor_id = NEXT_ACTOR_ID.fetch_add(1, Ordering::Relaxed);
+    let handle = SessionHandle {
+        tx: tx.clone(),
+        actor_id,
+    };
     let actor = SessionActor {
         key,
+        actor_id,
         registry,
         rx,
         broadcast_tx,
@@ -331,22 +258,21 @@ impl SessionActor {
                         if let Some(active_run) = &self.active_run {
                             active_run.abort_signal.set_ctrlc();
                         }
-                        self.registry.remove(&self.key);
+                        self.deregister();
                         break;
                     };
                     self.handle_command(cmd, &mut reap_sleep).await;
                 }
                 maybe_done = self.run_done_rx.recv() => {
                     let Some(done) = maybe_done else {
-                        self.registry.remove(&self.key);
+                        self.deregister();
                         break;
                     };
                     self.handle_run_done(done, &mut reap_sleep).await;
                 }
                 _ = &mut reap_sleep, if self.reap_deadline.is_some() => {
                     if self.subscribers == 0 && !self.is_running() {
-                        if self.should_reap() {
-                            self.registry.remove(&self.key);
+                        if self.reap_now() {
                             break;
                         }
                         self.arm_reap(&mut reap_sleep);
@@ -592,19 +518,12 @@ impl SessionActor {
     }
 
     fn get_or_spawn_target_session_actor(&mut self, target_key: SessionKey) -> SessionHandle {
-        match self.registry.entry(target_key.clone()) {
-            Entry::Occupied(entry) => entry.get().clone(),
-            Entry::Vacant(entry) => {
-                let handle = spawn_session_actor(
-                    target_key,
-                    Arc::clone(&self.registry),
-                    self.reap_ttl,
-                    self.actor_config.clone(),
-                );
-                entry.insert(handle.clone());
-                handle
-            }
-        }
+        get_or_spawn_in(
+            &self.registry,
+            target_key,
+            self.reap_ttl,
+            &self.actor_config,
+        )
     }
 
     async fn start_run(
@@ -765,6 +684,33 @@ impl SessionActor {
             interrupts,
             metadata,
         })
+    }
+
+    /// Drop this actor's registry entry, leaving any replacement under the same key in place.
+    fn deregister(&self) {
+        self.registry
+            .remove_if(&self.key, |_, handle| handle.actor_id == self.actor_id);
+    }
+
+    /// Whether this actor is done: its idle deadline has passed and it managed to deregister,
+    /// which is the point of no return for a reap.
+    fn reap_now(&self) -> bool {
+        self.should_reap() && self.deregister_for_reap()
+    }
+
+    /// Deregister for reaping, but only if nobody outside the registry holds a handle.
+    ///
+    /// `strong_count == 1` means the registry's own sender is the last one, so no caller is
+    /// mid-request. Any other count means a caller already cloned the handle and would hit a
+    /// closed channel the moment this actor stops, which is exactly the spurious 503 the reap
+    /// used to cause. DashMap holds the shard lock across both the check and the removal, and
+    /// handing out a handle needs that same lock, so no caller can slip in between the two.
+    fn deregister_for_reap(&self) -> bool {
+        self.registry
+            .remove_if(&self.key, |_, handle| {
+                handle.actor_id == self.actor_id && handle.tx.strong_count() == 1
+            })
+            .is_some()
     }
 
     fn arm_reap(&mut self, reap_sleep: &mut std::pin::Pin<&mut Sleep>) {
@@ -2821,6 +2767,9 @@ mod tests {
             "target session should be registered in registry after handoff dispatch"
         );
     }
+
+    #[path = "session_actor_registry_tests.rs"]
+    mod registry_tests;
 
     // NATS-backed serve tests spawn a local worker subprocess via
     // `LocalWorkerSupervisor` (Unix process-group management), so they are

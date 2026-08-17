@@ -16,6 +16,7 @@ tags:
   - session-id-mapping
   - web-ui-navigation
 plan_ref: "harnx-issue-1091-agent-handoff"
+last_updated: 2026-08-17
 ---
 
 ## Problem
@@ -165,16 +166,12 @@ Ok(LoopResult::HandoffRequested { agent, session_id, prompt }) => {
         prompt_config.write().new_session_id().expect("session ID allocation failed")
     });
     
-    // Get or spawn target actor
+    // Get or spawn target actor. Since 2026-08 this goes through the same
+    // `get_or_spawn_in` helper as `SessionRegistry::get_or_spawn` (see
+    // docs/solutions/async-patterns/session-actor-concurrency-invariants-2026-07-04.md §2) —
+    // do not hand-roll the `registry.entry()` match here, it misses the closed-entry case.
     let target_key = SessionKey { agent: agent.clone(), session: target_session_id.clone() };
-    let target_handle = match self.registry.entry(target_key.clone()) {
-        Entry::Occupied(e) => e.get().clone(),
-        Entry::Vacant(e) => {
-            let handle = spawn_session_actor(target_key, Arc::clone(&self.registry), self.reap_ttl, self.actor_config.clone());
-            e.insert(handle.clone());
-            handle
-        }
-    };
+    let target_handle = self.get_or_spawn_target_session_actor(target_key.clone());
     
     // Re-dispatch prompt to target actor (original run finishes with RUN_FINISHED)
     let (reply_tx, _) = oneshot::channel();

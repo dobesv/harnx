@@ -121,7 +121,9 @@ Same canonical session URL, negotiated into programmatic control.
   **Result:** `{ "cancelled": true }`
 
 **Error Codes:**
-- `-32001`: Unknown session
+- `-32001`: Unknown session (HTTP 404)
+- `-32002`: Session is not running — `session/cancel` on an idle session (HTTP 400)
+- `-32003`: Session actor unreachable (HTTP 503). Transient: the session's in-process actor could not be reached, so retry the call.
 - `-32601`: Method not found
 - Standard JSON-RPC 2.0 codes (-32700, -32600, -32602)
 
