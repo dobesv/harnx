@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -136,7 +136,7 @@ fn install_web_assets(workspace_root: &Path) -> Result<()> {
     ensure_pnpm_available(&pnpm)?;
 
     println!("==> Installing web-ui dependencies (pnpm install)");
-    let mut install = Command::new(&pnpm);
+    let mut install = pnpm_process(&pnpm);
     install
         .arg("install")
         .arg("--frozen-lockfile")
@@ -144,7 +144,7 @@ fn install_web_assets(workspace_root: &Path) -> Result<()> {
     run_command(&mut install, "pnpm install")?;
 
     println!("==> Building web-ui (pnpm build)");
-    let mut build = Command::new(&pnpm);
+    let mut build = pnpm_process(&pnpm);
     build.arg("build").current_dir(&web_dir);
     run_command(&mut build, "pnpm build")?;
 
@@ -169,10 +169,21 @@ fn pnpm_command() -> OsString {
     env::var_os("PNPM").unwrap_or_else(|| OsString::from("pnpm"))
 }
 
+/// Create a pnpm process that will not wait for Corepack download approval.
+///
+/// Corepack may need to download the version pinned in `package.json`. Setting
+/// this variable keeps unattended installs non-interactive while still
+/// allowing that download to proceed.
+fn pnpm_process(pnpm: &OsStr) -> Command {
+    let mut command = Command::new(pnpm);
+    command.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+    command
+}
+
 /// Verify the pnpm executable can be run before we lean on it, so a missing
 /// pnpm yields an actionable message instead of a raw "No such file" IO error.
 fn ensure_pnpm_available(pnpm: &OsString) -> Result<()> {
-    match Command::new(pnpm).arg("--version").output() {
+    match pnpm_process(pnpm).arg("--version").output() {
         Ok(output) if output.status.success() => Ok(()),
         Ok(output) => Err(command_failure(
             "pnpm --version",
@@ -787,6 +798,17 @@ mod tests {
     fn parse_install_args_default_builds_web() {
         let args = parse_install_args(&[]).unwrap();
         assert!(!args.skip_web);
+    }
+
+    #[test]
+    fn pnpm_process_disables_corepack_download_prompt() {
+        let command = pnpm_process(OsStr::new("pnpm"));
+        let prompt_setting = command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("COREPACK_ENABLE_DOWNLOAD_PROMPT"))
+            .and_then(|(_, value)| value);
+
+        assert_eq!(prompt_setting, Some(OsStr::new("0")));
     }
 
     #[test]
