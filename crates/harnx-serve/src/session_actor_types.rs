@@ -13,6 +13,13 @@ pub struct SessionKey {
 #[derive(Clone)]
 pub struct SessionHandle {
     pub tx: mpsc::Sender<SessionCommand>,
+    /// Identifies which actor incarnation this handle talks to. A registry entry can be
+    /// replaced by a fresh actor for the same key, and the outgoing actor must only remove
+    /// its own entry — never its replacement's.
+    ///
+    /// Holding a clone of a handle also keeps its actor alive: the idle reap only fires while
+    /// the registry's own sender is the last one, so a long-lived clone pins the actor.
+    pub(crate) actor_id: u64,
 }
 
 pub(crate) struct ActiveRun {
