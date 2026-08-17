@@ -140,7 +140,7 @@ async fn rpc_call(
         Bytes::from(request.to_string()),
         config,
         registry,
-        PersistenceKind::Filesystem,
+        PersistenceKind::Nats,
     )
     .await
     .expect("rpc response");
@@ -154,15 +154,8 @@ async fn rpc_call(
 }
 
 fn load_session_messages(config: &Config, agent: &str, session: &str) -> Vec<Message> {
-    let mut scoped = config.clone();
-    scoped.use_agent_by_name(agent).expect("set agent");
-    scoped.use_session(Some(session)).expect("load session");
-    scoped
-        .session
-        .as_ref()
-        .expect("session should exist")
-        .messages
-        .clone()
+    let _ = config;
+    harnx_serve::session_actor::load_test_session_messages(agent, session)
 }
 
 #[allow(dead_code)]
@@ -173,52 +166,6 @@ fn history_snapshot_texts(result: &Value) -> Vec<String> {
         .iter()
         .filter_map(|message| message["content"].as_str().map(str::to_string))
         .collect()
-}
-
-#[allow(dead_code)]
-fn sessions_json(config: &Config, agent: &str) -> Value {
-    let mut scoped = config.clone();
-    scoped.use_agent_by_name(agent).expect("set agent");
-    Value::Array(
-        scoped
-            .list_sessions_with_meta()
-            .into_iter()
-            .filter(|session| session.agent_name.as_deref() == Some(agent))
-            .map(|session| {
-                json!({
-                    "id": session.session_id,
-                    "agent": session.agent_name,
-                })
-            })
-            .collect(),
-    )
-}
-
-#[allow(dead_code)]
-fn history_json(config: &Config, agent: &str, session: &str) -> Value {
-    let mut scoped = config.clone();
-    scoped.use_agent_by_name(agent).expect("set agent");
-    scoped.use_session(Some(session)).expect("load session");
-    scoped
-        .session
-        .as_ref()
-        .expect("session should exist")
-        .messages
-        .iter()
-        .map(|msg| {
-            json!({
-                "id": Uuid::new_v4(),
-                "role": match msg.role {
-                    harnx_core::message::MessageRole::User => "user",
-                    harnx_core::message::MessageRole::Assistant => "assistant",
-                    harnx_core::message::MessageRole::System => "system",
-                    harnx_core::message::MessageRole::Tool => "tool",
-                },
-                "content": msg.content.to_text(),
-            })
-        })
-        .collect::<Vec<_>>()
-        .into()
 }
 
 fn has_real_run_finished(read: &SseRead) -> bool {
@@ -758,8 +705,8 @@ async fn e2e_success_criterion_10_sse_stream_includes_tool_call_events() {
         "expected one executed tool result"
     );
     assert!(
-        seen_tool_results[0].contains("session has not been saved yet"),
-        "tool result should surface built-in tool execution error: {}",
+        seen_tool_results[0].contains("[]"),
+        "new NATS session history should initially be empty: {}",
         seen_tool_results[0]
     );
 
@@ -805,7 +752,7 @@ async fn e2e_success_criterion_10_sse_stream_includes_tool_call_events() {
         result["content"]
             .as_str()
             .unwrap_or_default()
-            .contains("session has not been saved yet"),
+            .contains("[]"),
         "tool result should surface built-in tool execution output: {result}"
     );
 }
@@ -1297,7 +1244,7 @@ async fn route_post_malformed_json_maps_to_sse_400_and_rpc_parse_error() {
         Bytes::from_static(b"{not json"),
         &config,
         &registry,
-        PersistenceKind::Filesystem,
+        PersistenceKind::Nats,
     )
     .await
     .expect("rpc response");

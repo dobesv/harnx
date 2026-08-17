@@ -48,7 +48,9 @@ impl Config {
                     .into_iter()
                     .map(|v| (v.id(), Some(v.description())))
                     .collect(),
-                ".session" => map_completion_values(self.list_sessions()),
+                // Session completion is populated asynchronously from NATS by
+                // `list_sessions_for_completion`.
+                ".session" => vec![],
                 ".rag" => map_completion_values(Self::list_rags()),
                 ".agent" => map_completion_values(precomputed_agents),
                 ".macro" => map_completion_values(Self::list_macros()),
@@ -66,7 +68,6 @@ impl Config {
                         "temperature",
                         "top_p",
                         "use_tools",
-                        "save_session",
                         "compress_threshold",
                         "compaction_agent",
                         "model_fallbacks",
@@ -126,14 +127,6 @@ impl Config {
                         .map(|v| format!("{prefix}{v}"))
                         .collect()
                 }
-                "save_session" => {
-                    let save_session = if let Some(session) = &self.session {
-                        session.save_session()
-                    } else {
-                        self.save_session
-                    };
-                    complete_option_bool(save_session)
-                }
                 "rag_reranker_model" => list_models(&self.clients, ModelType::Reranker)
                     .iter()
                     .map(|v| v.id())
@@ -161,13 +154,6 @@ impl Config {
             let current = agent.use_tools().unwrap_or_default();
             values = current.into_iter().map(|s| (s, None)).collect();
         } else if cmd == ".agent" {
-            if args.len() == 2 {
-                let dir = Self::agent_data_dir(args[0]).join(paths::SESSIONS_DIR_NAME);
-                values = list_file_names(dir, ".yaml")
-                    .into_iter()
-                    .map(|v| (v, None))
-                    .collect();
-            }
             values.extend(complete_agent_variables(args[0]));
         };
         fuzzy_filter(values, |v| v.0.as_str(), filter)
@@ -177,45 +163,30 @@ impl Config {
     ///
     /// This is the async variant that should be used from async contexts (TUI).
     /// When a remote agent is in context, fetches session IDs from the remote
-    /// NATS KV index with a short timeout for snappy completion. Otherwise,
-    /// returns local session IDs.
+    /// NATS KV index with a short timeout for snappy completion.
     ///
     /// # Arguments
-    /// * `cluster` - The cluster name if a remote agent is active, or `None` for local
+    /// * `cluster` - The remote cluster name, or `None` for shared local NATS
     ///
     /// # Returns
     /// Session ID strings suitable for completion. Returns empty vec on timeout/error
     /// (graceful degradation).
     pub async fn list_sessions_for_completion(&self, cluster: Option<&str>) -> Vec<String> {
-        match cluster {
-            Some(cluster) => {
-                // Short timeout to keep completion snappy; on timeout/error,
-                // fall back to empty vec (graceful degradation).
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    self.list_remote_sessions_with_meta(cluster),
-                )
-                .await
-                {
-                    Ok(Ok(sessions)) => sessions.into_iter().map(|s| s.id).collect(),
-                    Ok(Err(e)) => {
-                        log::debug!("Remote session completion failed: {:#}", e);
-                        vec![]
-                    }
-                    Err(_) => {
-                        log::debug!("Remote session completion timed out");
-                        vec![]
-                    }
-                }
+        let cluster = cluster.unwrap_or(super::LOCAL_CLUSTER_KEY);
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            self.list_remote_sessions_with_meta(cluster),
+        )
+        .await
+        {
+            Ok(Ok(sessions)) => sessions.into_iter().map(|s| s.id).collect(),
+            Ok(Err(e)) => {
+                log::debug!("NATS session completion failed: {:#}", e);
+                vec![]
             }
-            None => {
-                let config = self.clone();
-                tokio::task::spawn_blocking(move || config.list_sessions())
-                    .await
-                    .unwrap_or_else(|error| {
-                        log::debug!("Local session completion task failed: {error}");
-                        vec![]
-                    })
+            Err(_) => {
+                log::debug!("NATS session completion timed out");
+                vec![]
             }
         }
     }
@@ -225,57 +196,9 @@ fn complete_bool(value: bool) -> Vec<String> {
     vec![(!value).to_string()]
 }
 
-fn complete_option_bool(value: Option<bool>) -> Vec<String> {
-    match value {
-        Some(true) => vec!["false".to_string(), "null".to_string()],
-        Some(false) => vec!["true".to_string(), "null".to_string()],
-        None => vec!["true".to_string(), "false".to_string()],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-
-    /// Test that list_sessions_for_completion returns local sessions when cluster is None.
-    ///
-    /// Creates a temp sessions dir with known session files, verifies that
-    /// `list_sessions_for_completion(None)` returns those session IDs.
-    #[tokio::test]
-    async fn test_list_sessions_for_completion_local_branch() {
-        // Create a temp directory to act as sessions_dir
-        let temp = tempfile::TempDir::new().expect("temp dir");
-        let sessions_dir = temp.path();
-
-        // Create session files: session-alpha.yaml, session-beta.yaml
-        let session_alpha = sessions_dir.join("session-alpha.yaml");
-        let session_beta = sessions_dir.join("session-beta.yaml");
-        std::fs::File::create(&session_alpha)
-            .expect("create session-alpha")
-            .write_all(b"id: session-alpha\n")
-            .expect("write session-alpha");
-        std::fs::File::create(&session_beta)
-            .expect("create session-beta")
-            .write_all(b"id: session-beta\n")
-            .expect("write session-beta");
-
-        // Build a minimal Config with sessions_dir_override pointing to temp
-        let config = Config {
-            sessions_dir_override: Some(sessions_dir.to_path_buf()),
-            ..Config::default()
-        };
-
-        // WHEN cluster = None, local branch fires
-        let result = config.list_sessions_for_completion(None).await;
-
-        // THEN result contains our session IDs (sorted alphabetically)
-        assert_eq!(
-            result,
-            vec!["session-alpha", "session-beta"],
-            "cluster=None should return local session IDs from list_sessions()"
-        );
-    }
 
     /// Test that remote session completion gracefully degrades on unreachable cluster.
     ///

@@ -951,32 +951,6 @@ async fn info_session_without_session_renders_in_tui_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn info_session_with_session_renders_in_tui_snapshot() {
-    let config = test_config();
-    let mut harness = TuiTestHarness::with_size(60, 18).await;
-    harness.tui().config = config.clone();
-
-    harness
-        .tui()
-        .run_command(".session info-session-with-session-test")
-        .await
-        .unwrap();
-    while let Ok(event) = harness.tui().event_rx.try_recv() {
-        harness.tui().handle_tui_event(event).await.unwrap();
-    }
-
-    harness.tui().run_command(".info session").await.unwrap();
-    while let Ok(event) = harness.tui().event_rx.try_recv() {
-        harness.tui().handle_tui_event(event).await.unwrap();
-    }
-    harness.render();
-
-    let rendered = normalize_screen(&harness.screen_contents());
-    assert!(harness.tui().app.detail_view_open);
-    insta::assert_snapshot!("info_session_with_session_in_tui", rendered);
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn info_agent_overlay_renders_in_tui_snapshot() {
     let mut harness = TuiTestHarness::with_size(72, 20).await;
     {
@@ -1038,47 +1012,6 @@ Overlay {{project_name}} for {{agent.name}}."#,
 
     let rendered = normalize_screen(&harness.screen_contents());
     insta::assert_snapshot!("info_agent_overlay_in_tui", rendered);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn info_session_overlay_renders_in_tui_snapshot() {
-    let config = test_config();
-    let mut harness = TuiTestHarness::with_size(72, 20).await;
-    harness.tui().config = config.clone();
-
-    harness
-        .tui()
-        .run_command(".session overlay-session-test")
-        .await
-        .unwrap();
-    while let Ok(event) = harness.tui().event_rx.try_recv() {
-        harness.tui().handle_tui_event(event).await.unwrap();
-    }
-
-    let initial_transcript_len = harness.tui().app.transcript.len();
-    harness.tui().run_command(".info session").await.unwrap();
-    while let Ok(event) = harness.tui().event_rx.try_recv() {
-        harness.tui().handle_tui_event(event).await.unwrap();
-    }
-    harness.render();
-
-    assert!(harness.tui().app.detail_view_open);
-    assert_eq!(harness.tui().app.transcript.len(), initial_transcript_len);
-
-    let rendered = normalize_snapshot_text(&harness.screen_contents());
-    let rendered = rendered
-        .replace(
-            "working_dir: /mnt/projects/ai-tools/harnx",
-            "working_dir: [WORKING_DIR]",
-        )
-        .replace(
-            &format!(
-                "path: {}/agents/overlay-session-test/sessions/overlay-session-test.yaml",
-                std::env::temp_dir().display()
-            ),
-            "path: [SESSION_PATH]",
-        );
-    insta::assert_snapshot!("info_session_overlay_in_tui", rendered);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -6780,18 +6713,6 @@ fn create_agent_stubs(agents_dir: &std::path::Path, names: &[&str]) {
     }
 }
 
-/// Create a minimal session .yaml stub for the given agent.
-/// The file must begin with a `type: header` YAML document so that
-/// `parse_session_meta` recognises it as a valid session header.
-fn create_session_stub(config_dir: &std::path::Path, agent_name: &str, session_id: &str) {
-    let dir = config_dir.join("agents").join(agent_name).join("sessions");
-    std::fs::create_dir_all(&dir).unwrap();
-    let content = format!(
-        "type: header\nmodel: test-model\nagent_name: {agent_name}\nworking_dir: /tmp\ngit_branch: main\n"
-    );
-    std::fs::write(dir.join(format!("{session_id}.yaml")), content).unwrap();
-}
-
 // --- AgentPicker filtering ---------------------------------------------------
 
 #[tokio::test]
@@ -7007,19 +6928,24 @@ async fn agent_picker_enter_with_no_sessions_starts_new_session() {
     let _lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
 
-    create_agent_stubs(&tmp.path().join("agents"), &["hermes"]);
-    // No session files created → no sessions for this agent.
+    let agent_name = format!("picker-empty-{}", uuid::Uuid::new_v4());
+    create_agent_stubs(&tmp.path().join("agents"), &[&agent_name]);
+    // No NATS sessions exist for this agent.
 
     let config = picker_test_config();
+    let nats_config = config.read().clone();
+    if nats_config
+        .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+        .await
+        .is_err()
     {
-        let mut guard = config.write();
-        guard.sessions_dir_override =
-            Some(tmp.path().join("agents").join("hermes").join("sessions"));
+        eprintln!("skipping: local nats-server is unavailable");
+        return;
     }
     let mut tui = Tui::init(&config).await.unwrap();
 
     tui.app.modal = Some(crate::types::ModalState::AgentPicker {
-        agents: vec!["hermes".into()],
+        agents: vec![agent_name],
         selected: 0,
         query: String::new(),
     });
@@ -7049,21 +6975,13 @@ async fn agent_picker_enter_with_no_sessions_starts_new_session() {
 }
 
 #[tokio::test]
-async fn agent_picker_enter_with_sessions_shows_session_picker() {
+async fn agent_picker_enter_shows_session_picker() {
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
 
     create_agent_stubs(&tmp.path().join("agents"), &["hermes"]);
-    create_session_stub(tmp.path(), "hermes", "session-001");
-
     let config = picker_test_config();
-    {
-        let mut guard = config.write();
-        // Override sessions dir to the hermes-specific path.
-        guard.sessions_dir_override =
-            Some(tmp.path().join("agents").join("hermes").join("sessions"));
-    }
     let mut tui = Tui::init(&config).await.unwrap();
 
     tui.app.modal = Some(crate::types::ModalState::AgentPicker {
@@ -7106,7 +7024,6 @@ async fn session_picker_esc_without_prior_session_goes_back_to_agent_picker() {
     let config = picker_test_config();
     {
         let mut guard = config.write();
-        guard.sessions_dir_override = Some(tmp.path().join("sessions"));
         // Give config a minimal agent so use_session doesn't fail on agent checks.
         let model = MockClient::builder().build().model().clone();
         let mut agent =
@@ -7158,7 +7075,6 @@ async fn session_picker_esc_with_agent_origin_but_no_session_exits() {
     let config = picker_test_config();
     {
         let mut guard = config.write();
-        guard.sessions_dir_override = Some(tmp.path().join("sessions"));
         let model = MockClient::builder().build().model().clone();
         let mut agent =
             harnx_runtime::config::Agent::new(harnx_runtime::config::AgentConfig::from_prompt(""));
@@ -7364,46 +7280,83 @@ async fn agent_picker_esc_dismisses_when_agent_already_active() {
 
 // --- SessionPicker Enter picks session ---------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_picker_enter_loads_selected_session() {
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
-
-    let sessions_dir = tmp.path().join("sessions");
-    std::fs::create_dir_all(&sessions_dir).unwrap();
-    // Use old (non-log) format so session::load takes the "old format" path
-    // and doesn't try to validate the model name against registered clients.
-    // All we need here is for the file to exist so use_session picks it up.
-    std::fs::write(sessions_dir.join("my-session.yaml"), "# old format stub\n").unwrap();
+    let _data_env = EnvGuard::set("HARNX_DATA_DIR", tmp.path().to_str().unwrap());
 
     let config = picker_test_config();
     {
         let mut guard = config.write();
-        guard.sessions_dir_override = Some(sessions_dir.clone());
         let model = MockClient::builder().build().model().clone();
         let mut agent =
             harnx_runtime::config::Agent::new(harnx_runtime::config::AgentConfig::from_prompt(""));
         agent.set_name("hermes");
         agent.set_model(model);
         guard.agent = Some(agent);
+        // Force the production NATS transcript path under cfg(test); ordinary
+        // TUI unit tests intentionally render their injected in-memory session.
+        guard.remote_agent = Some((
+            "hermes".to_string(),
+            harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
+        ));
+    }
+    let nats_config = config.read().clone();
+    let Ok(jetstream) = nats_config
+        .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+        .await
+    else {
+        eprintln!("skipping: local nats-server is unavailable");
+        return;
+    };
+    let index = harnx_runtime::nats_session_index::ensure_index_bucket(&jetstream, 1)
+        .await
+        .expect("create picker session index");
+    harnx_runtime::nats_session_index::put_record(
+        &index,
+        &harnx_runtime::nats_session_index::SessionIndexRecord {
+            session_id: "my-session".to_string(),
+            agent_name: "hermes".to_string(),
+            working_dir: Some("/tmp".to_string()),
+            git_branch: Some("main".to_string()),
+            git_remote: None,
+            title: None,
+            last_activity: 1,
+        },
+    )
+    .await
+    .expect("index picker session fixture");
+    let log =
+        harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, "my-session".to_string());
+    for entry in [
+        harnx_core::session::SessionLogEntry::Message {
+            id: None,
+            timestamp: None,
+            fence_token: None,
+            role: harnx_core::message::MessageRole::User,
+            content: harnx_core::message::MessageContent::Text("prior question".to_string()),
+        },
+        harnx_core::session::SessionLogEntry::Message {
+            id: None,
+            timestamp: None,
+            fence_token: None,
+            role: harnx_core::message::MessageRole::Assistant,
+            content: harnx_core::message::MessageContent::Text("prior answer".to_string()),
+        },
+    ] {
+        log.append_event_async(&entry)
+            .await
+            .expect("append picker transcript fixture");
     }
     let mut tui = Tui::init(&config).await.unwrap();
-
-    let meta = harnx_runtime::config::SessionMeta {
-        id: "my-session".into(),
-        agent_name: Some("hermes".into()),
-        working_dir: Some("/tmp".into()),
-        git_branch: Some("main".into()),
-        git_remote: None,
-        session_id: None,
-        terminal_session_id: None,
-        title: None,
-        modified: None,
-    };
+    let (sessions, error) = Tui::picker_sessions(&config).await;
+    assert!(error.is_none(), "picker enumeration failed: {error:?}");
+    assert_eq!(sessions.len(), 1);
 
     tui.app.modal = Some(crate::types::ModalState::SessionPicker {
-        sessions: vec![meta],
+        sessions,
         selected: 1,
         origin_agent: None,
         origin_session: None,
@@ -7423,6 +7376,19 @@ async fn session_picker_enter_loads_selected_session() {
         session_id.as_deref(),
         Some("my-session"),
         "selected session should be loaded"
+    );
+    assert!(
+        tui.app.transcript.iter().any(
+            |item| matches!(item, TranscriptItem::UserText { text, .. } if text == "prior question")
+        ),
+        "selected session's user history should populate the TUI transcript: {:#?}",
+        tui.app.transcript
+    );
+    assert!(
+        tui.app.transcript.iter().any(
+            |item| matches!(item, TranscriptItem::AssistantText { text, .. } if text == "prior answer")
+        ),
+        "selected session's assistant history should populate the TUI transcript"
     );
 }
 
@@ -7447,15 +7413,9 @@ async fn session_picker_enter_reconciles_from_origin_not_current_agent() {
     let _lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
 
-    // Create a session file for hermes.
-    let sessions_dir = tmp.path().join("sessions");
-    std::fs::create_dir_all(&sessions_dir).unwrap();
-    std::fs::write(sessions_dir.join("sess-1.yaml"), "# old format stub\n").unwrap();
-
     let config = picker_test_config();
     {
         let mut guard = config.write();
-        guard.sessions_dir_override = Some(sessions_dir.clone());
         let model = MockClient::builder().build().model().clone();
         let mut agent =
             harnx_runtime::config::Agent::new(harnx_runtime::config::AgentConfig::from_prompt(""));
@@ -7478,7 +7438,7 @@ async fn session_picker_enter_reconciles_from_origin_not_current_agent() {
     );
 
     let meta = harnx_runtime::config::SessionMeta {
-        id: "sess-1".into(),
+        id: format!("reconcile-{}", uuid::Uuid::new_v4()),
         agent_name: Some("hermes".into()),
         working_dir: Some("/tmp".into()),
         git_branch: Some("main".into()),
@@ -7523,11 +7483,6 @@ async fn session_picker_esc_restores_origin() {
 
     // Setup an agent to restore
     create_agent_stubs(&tmp.path().join("agents"), &["apollo", "hermes"]);
-
-    let sessions_dir = tmp.path().join("agents").join("apollo").join("sessions");
-    std::fs::create_dir_all(&sessions_dir).unwrap();
-    // create a fake session file
-    std::fs::write(sessions_dir.join("old-session.json"), "{}").unwrap();
 
     let config = picker_test_config();
     {
@@ -8747,7 +8702,7 @@ async fn test_start_prompt_does_not_arm_remote_cancel_without_session() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_start_prompt_arms_remote_cancel_with_real_session_id() {
     let config = test_config();
     let session_id = {

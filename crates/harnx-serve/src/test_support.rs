@@ -35,11 +35,7 @@ impl TestConfigSandbox {
         fs::create_dir_all(root.join("agents")).expect("create agents dir");
         fs::create_dir_all(&data_dir).expect("create data dir");
         fs::create_dir_all(&state_dir).expect("create state dir");
-        fs::write(
-            root.join("config.yaml"),
-            "model: openai:gpt-4o\nsave_session: true\n",
-        )
-        .expect("write config");
+        fs::write(root.join("config.yaml"), "model: openai:gpt-4o\n").expect("write config");
         fs::write(
             root.join("clients/openai.yaml"),
             concat!(

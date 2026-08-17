@@ -120,13 +120,32 @@ jobs:
         echo "${BINDIR}" >> "${GITHUB_PATH}"
       shell: bash
 
-    # NOTE: nats-server is intentionally NOT installed on Windows. The
-    # shared-broker + worker-subprocess machinery (and the NATS worker
-    # integration tests) is Unix-first; on Windows those integration tests hang
-    # on the JetStream/worker path. Without the binary they skip cleanly (each
-    # guards on nats-server availability), matching the pre-existing behavior
-    # where Windows CI never exercised the NATS path. Linux + macOS get full
-    # coverage. Revisit if/when the worker path gains first-class Windows support.
+    - name: Install nats-server (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $version = 'v2.11.6'
+        $asset = "nats-server-$version-windows-amd64.zip"
+        $sha256 = '947aea642cc2b7b688a11a71c36c80a030cabb109167246ca1f8fbf30dc1c83b'
+        $downloadUrl = "https://github.com/nats-io/nats-server/releases/download/$version/$asset"
+        $downloadDir = Join-Path $env:RUNNER_TEMP 'nats-server-download'
+        $binDir = Join-Path $env:RUNNER_TEMP 'nats-server-bin'
+        New-Item -ItemType Directory -Force -Path $downloadDir, $binDir | Out-Null
+        $archive = Join-Path $downloadDir $asset
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $archive
+        $actualSha256 = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+        if ($actualSha256 -ne $sha256) {
+          throw "nats-server checksum mismatch for $asset"
+        }
+        Expand-Archive -Path $archive -DestinationPath $downloadDir -Force
+        $source = Join-Path $downloadDir "nats-server-$version-windows-amd64/nats-server.exe"
+        Copy-Item $source (Join-Path $binDir 'nats-server.exe')
+        $binDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        & (Join-Path $binDir 'nats-server.exe') --version
+        if ($LASTEXITCODE -ne 0) {
+          throw "nats-server.exe --version failed with exit code $LASTEXITCODE"
+        }
 
     - name: Test
       # Use the `ci` nextest profile (.config/nextest.toml): retries transient

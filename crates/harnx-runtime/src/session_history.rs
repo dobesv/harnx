@@ -1,7 +1,7 @@
 //! The `harnx_agent_session_history_read` built-in tool: lets an agent search
-//! its own session's on-disk log (including pre-compaction entries) so detail
+//! its own NATS session log (including pre-compaction entries) so detail
 //! dropped by compaction stays recoverable. Pure query core here; the
-//! `ToolProvider` wiring resolves the active session path and reads the file.
+//! `ToolProvider` wiring reads the active session's NATS stream.
 
 use crate::config::GlobalConfig;
 use anyhow::Result;
@@ -223,7 +223,7 @@ fn parse_query(arguments: &Value) -> HistoryQuery {
 }
 
 /// `ToolProvider` for the session-history tool. Resolves the active session's
-/// on-disk log path from the captured config at call time (own session only).
+/// NATS log from the captured config at call time (own session only).
 pub struct SessionHistoryProvider {
     config: GlobalConfig,
 }
@@ -248,24 +248,43 @@ impl ToolProvider for SessionHistoryProvider {
         &self,
         _tool_name: &str,
         arguments: Value,
-        _abort: &AbortSignal,
+        abort: &AbortSignal,
     ) -> Result<Value, ToolError> {
-        let (path, name) = {
+        let (config, name, cluster) = {
             let guard = self.config.read();
             let session = guard
                 .session
                 .as_ref()
                 .ok_or_else(|| ToolError::Recoverable(anyhow::anyhow!("no active session")))?;
-            let path = session.path.clone().ok_or_else(|| {
-                ToolError::Recoverable(anyhow::anyhow!("session has not been saved yet"))
-            })?;
-            (path, session.id().to_string())
+            let cluster = guard
+                .remote_agent
+                .as_ref()
+                .map(|(_, cluster)| cluster.clone())
+                .unwrap_or_else(|| crate::config::LOCAL_CLUSTER_KEY.to_string());
+            (guard.clone(), session.id().to_string(), cluster)
         };
-        let content = std::fs::read_to_string(&path).map_err(|e| {
-            ToolError::Recoverable(anyhow::anyhow!("failed to read session log: {e}"))
-        })?;
+        let operation = async {
+            let jetstream = config.nats_jetstream(&cluster).await?;
+            crate::nats_session_log::NatsSessionLog::new(jetstream, name)
+                .load_events_async()
+                .await
+        };
+        let entries = tokio::select! {
+            _ = harnx_core::abort::wait_abort_signal(abort) => {
+                return Err(ToolError::Recoverable(anyhow::anyhow!("session history request aborted")));
+            }
+            result = tokio::time::timeout(std::time::Duration::from_secs(30), operation) => {
+                result
+                    .map_err(|_| ToolError::Recoverable(anyhow::anyhow!("session history request timed out")))?
+                    .map_err(ToolError::Recoverable)?
+            }
+        };
         let query = parse_query(&arguments);
-        let rows = query_log_content(&content, &name, &query).map_err(ToolError::Recoverable)?;
+        let entries: Vec<_> = entries
+            .into_iter()
+            .map(|(seq, entry)| (seq as usize, entry))
+            .collect();
+        let rows = query_entries_with_jaq(&entries, &query).map_err(ToolError::Recoverable)?;
         Ok(json!({ "content": [{ "type": "text", "text": rows.to_string() }] }))
     }
 }

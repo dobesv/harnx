@@ -12,12 +12,12 @@
 //! front-ends now delegate to.
 
 use crate::{
-    config::{session_lock::SessionLock, Config, GlobalConfig, Input},
+    config::{Config, GlobalConfig, Input},
     nats_hook_provider::{dispatch_hook_event, HookDispatchMeta, HookEventDispatch},
     tool::{execute_tool_round, CompletionText, ToolResult},
     utils::dimmed_text,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use harnx_hooks::{inject_pending_async_context, HookEvent, HookResultControl};
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
@@ -102,10 +102,6 @@ pub struct AgentLoopContext {
     /// Optional per-session working directory. When unset, runtime falls back
     /// to process cwd for CLI compatibility.
     pub working_dir: Option<PathBuf>,
-    /// Optional session lock held across the agent loop (T6).
-    /// When set, passed through to exit paths to avoid re-entrancy deadlock.
-    #[allow(dead_code)]
-    pub session_lock: Option<SessionLock>,
 }
 
 /// Resume a tool round that was interrupted for approval.
@@ -245,57 +241,7 @@ pub enum LoopResult {
 /// Recoverable tool errors are already converted to `{"is_error":true}`
 /// results by `execute_tool_round` and fed back to the LLM.
 pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Result<LoopResult> {
-    let session_path = {
-        let config_read = ctx.config.read();
-        match config_read.session.as_ref() {
-            Some(session) if session.save_session() != Some(false) => {
-                session.path.as_deref().map(PathBuf::from).or_else(|| {
-                    session
-                        .sessions_dir
-                        .as_ref()
-                        .map(|sessions_dir| sessions_dir.join(format!("{}.yaml", session.id)))
-                })
-            }
-            _ => None,
-        }
-    };
-
-    // Acquire session lock if needed, or use the one from ctx
-    let _session_lock: Option<SessionLock> = if let Some(session_path) = session_path {
-        // Use the lock from ctx if available (preferred)
-        if let Some(ref _lock) = ctx.session_lock {
-            // We don't clone SessionLock (File isn't Clone), but we don't need to -
-            // the lock in ctx keeps it held. We just pass a reference through.
-            None
-        } else {
-            // Otherwise acquire it ourselves
-            let lock = match SessionLock::try_acquire(&session_path)? {
-                Some(lock) => lock,
-                None => {
-                    harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Notice(
-                        harnx_core::event::NoticeEvent::Info(
-                            "Waiting for session lock…".to_string(),
-                        ),
-                    ));
-                    let sp = session_path.clone();
-                    tokio::task::spawn_blocking(move || SessionLock::acquire(&sp))
-                        .await
-                        .context("session lock task join failed")??
-                }
-            };
-            crate::config::reload_session_from_disk(&ctx.config)?;
-            Some(lock)
-        }
-    } else {
-        None
-    };
-
-    run_agent_loop_inner(
-        ctx,
-        initial_input,
-        ctx.session_lock.as_ref().or(_session_lock.as_ref()),
-    )
-    .await
+    run_agent_loop_inner(ctx, initial_input).await
 }
 
 /// Runs agent loop, applying file-backed local handoffs until completion.
@@ -328,14 +274,10 @@ async fn apply_local_handoff(
     session_id: Option<&str>,
     _prompt: &str,
 ) -> Result<()> {
-    ctx.config
-        .write()
-        .exit_agent_with_lock(ctx.session_lock.as_ref())?;
+    ctx.config.write().exit_agent()?;
     Config::use_agent(&ctx.config, agent, session_id, ctx.abort_signal.clone()).await?;
     if ctx.config.read().session.is_some() {
-        ctx.config
-            .write()
-            .empty_session_with_lock(ctx.session_lock.as_ref())?;
+        ctx.config.write().empty_session()?;
     }
     Ok(())
 }
@@ -753,11 +695,7 @@ async fn pending_resume_action(
     }
 }
 
-async fn run_agent_loop_inner(
-    ctx: &AgentLoopContext,
-    initial_input: Input,
-    _session_lock: Option<&SessionLock>,
-) -> Result<LoopResult> {
+async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> Result<LoopResult> {
     let config = &ctx.config;
     let abort_signal = &ctx.abort_signal;
     let mut input = initial_input;
@@ -934,10 +872,10 @@ mod tests {
 
     use tempfile::TempDir;
 
-    fn replay_test_config(tmp: &TempDir) -> GlobalConfig {
+    fn replay_test_config(_tmp: &TempDir) -> GlobalConfig {
         let mut config = Config::default();
         let mut session = crate::config::session::new(&config, "replay_test", None).unwrap();
-        session.set_sessions_dir(tmp.path().to_path_buf());
+        crate::config::session::attach_memory_log(&mut session);
         config.session = Some(session);
         Arc::new(RwLock::new(config))
     }
@@ -1051,7 +989,6 @@ mod tests {
             max_resume: Some(0),
             nats_hook_provider: None,
             pending_async_context: None,
-            session_lock: None,
         }
     }
 
@@ -1131,10 +1068,8 @@ user prompt"
 
         let mut config = crate::config::Config {
             model: crate::client::Model::new("test", "test-model"),
-            sessions_dir_override: Some(tmp.path().join("sessions")),
             ..Default::default()
         };
-        std::fs::create_dir_all(config.sessions_dir()).unwrap();
         let session = crate::config::session::new(&config, "handoff-session", None).unwrap();
         config.session = Some(session);
         config.set_use_tools(Some(vec!["delegate-agent_session_handoff".to_string()]));

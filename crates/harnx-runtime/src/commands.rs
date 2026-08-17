@@ -67,7 +67,7 @@ pub static COMMANDS: LazyLock<[Command; 48]> = LazyLock::new(|| {
             "Show active model details (id, client, pricing, vision/tool-use, catalog source)",
         ),
         Command::new(".info theme", "Show active syntax-highlight theme"),
-        Command::new(".edit session", "Modify current session"),
+        Command::new(".edit session", "Unavailable for NATS-backed sessions"),
         Command::with_usage(
             ".edit message",
             "<n>",
@@ -78,7 +78,7 @@ pub static COMMANDS: LazyLock<[Command; 48]> = LazyLock::new(|| {
             "<n>-<m>",
             "Edit a range of log entries by sequence number",
         ),
-        Command::new(".save session", "Save current session to file"),
+        Command::new(".save session", "Sessions persist automatically in NATS"),
         Command::new(".agent", "Use an agent"),
         Command::new(".starter", "Use a conversation starter"),
         Command::new(".info agent", "Show agent info"),
@@ -483,7 +483,8 @@ pub async fn run_command_with_output_and_local_worker(
                     config.write().save_agent(name)?;
                 }
                 Some(("session", name)) => {
-                    config.write().save_session(name)?;
+                    let _ = name;
+                    bail!("Sessions are persisted automatically in NATS")
                 }
                 _ => writeln!(output, r#"Usage: .save <agent|session> [name]"#)?,
             },
@@ -499,7 +500,7 @@ pub async fn run_command_with_output_and_local_worker(
                         config.write().edit_agent_prompt()?;
                     }
                     Some("session") => {
-                        config.write().edit_session()?;
+                        bail!("Raw session-file editing is unavailable for NATS sessions")
                     }
                     Some("rag-docs") => {
                         Config::edit_rag_docs(config, abort_signal.clone()).await?;
@@ -592,13 +593,15 @@ pub async fn run_command_with_output_and_local_worker(
             },
             ".empty" => match args {
                 Some("session") => {
-                    config.write().empty_session()?;
+                    remote_session_ops::clear_remote_session(config, &abort_signal).await?;
+                    config.write().empty_session_after_persisted_clear()?;
                 }
                 _ => writeln!(output, r#"Usage: .empty session"#)?,
             },
             ".reset" => match args {
                 Some("session") | Some("repl") => {
-                    config.write().reset_session()?;
+                    remote_session_ops::clear_remote_session(config, &abort_signal).await?;
+                    config.write().reset_session_after_persisted_clear()?;
                 }
                 _ => {
                     writeln!(output, r#"Usage: .reset session"#)?;

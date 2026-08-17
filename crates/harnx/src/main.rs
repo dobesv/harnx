@@ -20,12 +20,12 @@ pub use harnx_tui as tui;
 use crate::cli::{Cli, Commands, DeleteSessionArgs, InfoSubcommands, SessionSubcommands};
 use crate::client::{list_models, ModelType};
 use crate::config::{
-    list_agents, list_assistant_agents, load_env_file, macro_execute, render_agent_dump,
-    render_session_dump, Config, GlobalConfig, Input, WorkingMode,
+    list_agents, list_assistant_agents, load_env_file, macro_execute, render_agent_dump, Config,
+    GlobalConfig, Input, WorkingMode,
 };
 use crate::tui::{TranscriptItem, Tui};
 use harnx_core::agent_config::collect_agent_variables;
-use harnx_core::event::{AgentEvent, AgentSource, NoticeEvent};
+use harnx_core::event::AgentSource;
 use harnx_render::{render_error, MarkdownRender};
 use harnx_runtime::config::SessionMeta;
 use harnx_runtime::utils::*;
@@ -35,15 +35,13 @@ use clap::Parser;
 use parking_lot::RwLock;
 use std::{sync::Arc, time::Duration};
 
-use harnx_core::sink::emit_agent_event;
 use harnx_runtime::remote_session_cleanup::{run_remote_cleanup, RemoteCleanupStats};
-use harnx_runtime::session_cleanup::{humanize_bytes, run_cleanup, CleanupStats};
 
 /// Routing decision for `--list-sessions` handler.
 /// Extracted as a pure function for testability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListSessionsTarget {
-    /// List sessions from the local session directory.
+    /// List sessions from the shared local NATS cluster.
     Local,
     /// List sessions from a remote NATS cluster.
     Remote { cluster: String },
@@ -134,7 +132,14 @@ async fn run_command(command: &Commands) -> Result<()> {
                 agent_name,
                 session_id,
             } => {
-                let out = render_session_dump(Some(agent_name.as_str()), session_id)?;
+                let config = Config::init(WorkingMode::Cmd, true).await?;
+                let out = harnx_runtime::config::render_session_dump_for_agent(
+                    &config,
+                    harnx_runtime::config::LOCAL_CLUSTER_KEY,
+                    session_id,
+                    Some(agent_name),
+                )
+                .await?;
                 println!("{out}");
                 Ok(())
             }
@@ -183,6 +188,68 @@ fn legacy_info_flag(cli: &Cli) -> bool {
         || cli.list_rags
         || cli.list_macros
         || cli.list_sessions
+}
+
+async fn resolve_session_arg(
+    config: &GlobalConfig,
+    session: Option<&Option<String>>,
+) -> Result<Option<String>> {
+    match session {
+        None => Ok(None),
+        Some(Some(session_id)) => Ok(Some(session_id.clone())),
+        Some(None) => Config::reserve_new_session_id(config).await.map(Some),
+    }
+}
+
+fn command_only_needs_supplied_session(cli: &Cli) -> bool {
+    cli.list_sessions || cli.info
+}
+
+async fn apply_session_arg(config: &GlobalConfig, cli: &Cli) -> Result<()> {
+    let Some(session) = &cli.session else {
+        return Ok(());
+    };
+    if session.is_none() && command_only_needs_supplied_session(cli) {
+        return Ok(());
+    }
+    let session = resolve_session_arg(config, Some(session))
+        .await?
+        .expect("a supplied session argument always resolves");
+    config.write().use_session(Some(&session))
+}
+
+fn spawn_remote_session_cleanup(config: &GlobalConfig) {
+    let Some(days) = config
+        .read()
+        .cleanup_remote_sessions_days
+        .filter(|days| *days > 0)
+    else {
+        return;
+    };
+    let config = Arc::clone(config);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            let mut cluster_names = config
+                .read()
+                .nats_servers
+                .iter()
+                .map(|server| server.name.clone())
+                .collect::<Vec<_>>();
+            if !cluster_names
+                .iter()
+                .any(|name| name == harnx_runtime::config::LOCAL_CLUSTER_KEY)
+            {
+                cluster_names.push(harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string());
+            }
+            for cluster_name in cluster_names {
+                let snapshot = config.read().clone();
+                let stats = run_remote_cleanup(&snapshot, days, &cluster_name).await;
+                emit_remote_cleanup_summary(cluster_name, stats);
+            }
+        }
+    });
 }
 
 async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()> {
@@ -246,29 +313,21 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         //   None          → --session not provided; no session
         //   Some(None)    → bare --session flag; generate a new session ID
         //   Some(Some(s)) → --session <id>; use that ID
-        let generated_session_id;
-        let session = match &cli.session {
-            None => None,
-            Some(None) => {
-                generated_session_id = config.read().new_session_id()?;
-                Some(generated_session_id.as_str())
-            }
-            Some(Some(s)) => Some(s.as_str()),
+        let session = if command_only_needs_supplied_session(&cli) {
+            cli.session.as_ref().and_then(Clone::clone)
+        } else {
+            resolve_session_arg(&config, cli.session.as_ref()).await?
         };
         config.write().agent_variables = collect_agent_variables(&cli.agent_variable)?;
 
-        let ret = Config::use_agent(&config, agent, session, abort_signal.clone()).await;
+        let ret = Config::use_agent(&config, agent, session.as_deref(), abort_signal.clone()).await;
         config.write().agent_variables = None;
         ret?;
     } else {
         if let Some(prompt) = &cli.prompt {
             config.write().use_prompt(prompt)?;
         }
-        if let Some(session) = &cli.session {
-            config
-                .write()
-                .use_session(session.as_ref().map(|v| v.as_str()))?;
-        }
+        apply_session_arg(&config, &cli).await?;
         if let Some(rag) = &cli.rag {
             Config::use_rag(&config, Some(rag), abort_signal.clone()).await?;
         }
@@ -293,8 +352,11 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
                 }
             }
             ListSessionsTarget::Local => {
-                let sessions = config.read().list_sessions().join("\n");
-                println!("{sessions}");
+                let cfg = config.read().clone();
+                let sessions = cfg
+                    .list_remote_sessions_with_meta(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+                    .await?;
+                println!("{}", format_sessions_for_output(&sessions));
             }
         }
         return Ok(());
@@ -322,66 +384,16 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     if cli.empty_session {
         config.write().empty_session()?;
     }
-    if cli.save_session {
-        config.write().set_save_session_this_time()?;
-    }
     if cli.info {
         let info = config.read().info()?;
         println!("{info}");
         return Ok(());
     }
 
-    // Spawn session cleanup background task if enabled.
-    // MUST run before command/TUI branching so cleanup runs in all harnx modes.
-    // The task is best-effort and never panics; deletions are fault-tolerant.
-    let cleanup_days = config.read().cleanup_inactive_sessions_days;
-    if let Some(days) = cleanup_days {
-        if days > 0 {
-            let config_clone = Arc::clone(&config);
-            tokio::spawn(async move {
-                // tokio::time::interval fires its first tick immediately, so cleanup runs
-                // once at startup and then every hour thereafter.
-                let mut interval = tokio::time::interval(Duration::from_secs(3600));
-                loop {
-                    interval.tick().await;
-                    let stats = run_cleanup(&config_clone, days).await;
-                    emit_cleanup_summary(stats);
-                }
-            });
-        }
-    }
-
     // Spawn remote session cleanup background task if enabled.
     // MUST run before command/TUI branching so cleanup runs in all harnx modes.
     // The task is best-effort and never panics; deletions are fault-tolerant.
-    let remote_cleanup_days = config.read().cleanup_remote_sessions_days;
-    if let Some(days) = remote_cleanup_days {
-        if days > 0 {
-            let config_clone = Arc::clone(&config);
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(3600));
-                loop {
-                    interval.tick().await;
-                    // Collect cluster names up front to release config lock before any await.
-                    let cluster_names: Vec<String> = {
-                        config_clone
-                            .read()
-                            .nats_servers
-                            .iter()
-                            .map(|s| s.name.clone())
-                            .collect()
-                    };
-                    for cluster_name in cluster_names {
-                        // Clone config to avoid holding lock across await.
-                        // Config is cheap to clone (Arc-wrapped internally).
-                        let config_snapshot = config_clone.read().clone();
-                        let stats = run_remote_cleanup(&config_snapshot, days, &cluster_name).await;
-                        emit_remote_cleanup_summary(cluster_name, stats);
-                    }
-                }
-            });
-        }
-    }
+    spawn_remote_session_cleanup(&config);
 
     let is_tui = config.read().working_mode.is_tui();
     if cli.rebuild_rag {
@@ -411,23 +423,9 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
                     bail!("No agent selected. Use --agent/-a to specify an agent.");
                 }
             }
-            {
-                let mut cfg = config.write();
-                if cfg.session.is_none() {
-                    use harnx_runtime::config::{build_picker_context, find_matching_session};
-                    let sessions = cfg.list_sessions_with_meta();
-                    let ctx = build_picker_context(None);
-                    let agent_name = cfg
-                        .agent
-                        .as_ref()
-                        .map(|a| a.name().to_string())
-                        .unwrap_or_default();
-                    let matching_id = find_matching_session(&sessions, &ctx, &agent_name);
-                    if let Some(ref id) = matching_id {
-                        eprintln!("{}", dimmed_text(&format!("Resuming session {id}")));
-                    }
-                    cfg.use_session(matching_id.as_deref())?;
-                }
+            if config.read().session.is_none() {
+                let session_id = Config::reserve_new_session_id(&config).await?;
+                config.write().use_session(Some(&session_id))?;
             }
             let input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
             let aborted_check = abort_signal.clone();
@@ -451,12 +449,6 @@ fn session_resume_command(config: &GlobalConfig) -> Option<String> {
     let config_read = config.read();
     let session = config_read.session.as_ref()?;
     if session.is_empty() {
-        return None;
-    }
-
-    let save_session = session.save_session;
-    let save_session_this_time = session.save_session_this_time;
-    if save_session == Some(false) && !save_session_this_time {
         return None;
     }
 
@@ -831,23 +823,6 @@ mod resume_tests {
     }
 
     #[test]
-    fn returns_none_when_save_session_false() {
-        let mut session = session_with_message("test");
-        session.save_session = Some(false);
-        let config = make_config(Some(session));
-        assert!(session_resume_command(&config).is_none());
-    }
-
-    #[test]
-    fn returns_command_when_save_session_false_but_save_this_time() {
-        let mut session = session_with_message("test");
-        session.save_session = Some(false);
-        session.save_session_this_time = true;
-        let config = make_config(Some(session));
-        assert_eq!(session_resume_command(&config).unwrap(), "harnx -s test");
-    }
-
-    #[test]
     fn returns_command_for_plain_named_session() {
         let session = session_with_message("my-session");
         let config = make_config(Some(session));
@@ -1089,29 +1064,6 @@ mod tests_list_sessions_routing {
             }
         }
     }
-}
-
-/// Emit cleanup summary if sessions were removed.
-/// `emit_agent_event` buffers the event until a TUI/CLI sink is installed,
-/// then replays it to transcript.
-///
-/// We also log summary directly so background cleanup remains visible even when
-/// no interactive transcript sink is attached yet.
-fn emit_cleanup_summary(stats: CleanupStats) {
-    if stats.sessions_removed == 0 {
-        return;
-    }
-    let msg = format!(
-        "Note: cleaned up {} old sessions, {} disk freed",
-        stats.sessions_removed,
-        humanize_bytes(stats.bytes_freed)
-    );
-    // Always emit via agent event sink for transcript visibility.
-    // Function returns true if event was delivered or buffered.
-    emit_agent_event(AgentEvent::Notice(NoticeEvent::Info(msg.clone())));
-    // Also log so early/background cleanup work is visible before sink attach.
-    // In interactive use this can duplicate transcript text in logs.
-    log::info!("{msg}");
 }
 
 /// Emit remote cleanup summary if any work was done.

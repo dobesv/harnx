@@ -54,8 +54,6 @@ pub struct ConfigData {
     #[serde(default, deserialize_with = "deserialize_use_tools")]
     pub use_tools: Option<Vec<String>>,
 
-    pub save_session: Option<bool>,
-    pub cleanup_inactive_sessions_days: Option<u64>,
     pub cleanup_remote_sessions_days: Option<u64>,
     pub compress_threshold: usize,
 
@@ -107,8 +105,6 @@ impl Default for ConfigData {
             toolsets: Default::default(),
             use_tools: None,
 
-            save_session: Some(true),
-            cleanup_inactive_sessions_days: None,
             cleanup_remote_sessions_days: None,
             compress_threshold: 180000,
 
@@ -155,7 +151,6 @@ mod tests {
         assert!(d.tool_use);
         assert!(d.highlight);
         assert!(d.save_shell_history);
-        assert_eq!(d.save_session, Some(true));
         assert_eq!(d.compress_threshold, 180_000);
         assert_eq!(d.rag_top_k, 5);
     }
@@ -169,7 +164,6 @@ mod tests {
         assert_eq!(got.keybindings, default.keybindings);
         assert_eq!(got.stream, default.stream);
         assert_eq!(got.tool_use, default.tool_use);
-        assert_eq!(got.save_session, default.save_session);
         assert_eq!(got.compress_threshold, default.compress_threshold);
         assert_eq!(got.rag_top_k, default.rag_top_k);
         assert_eq!(got.highlight, default.highlight);

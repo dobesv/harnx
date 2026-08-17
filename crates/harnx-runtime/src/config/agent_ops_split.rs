@@ -1,6 +1,5 @@
 //! Agent lifecycle methods extracted from config/mod.rs for code health.
 use super::*;
-use crate::config::session_lock::SessionLock;
 
 struct UseRemoteAgentParams<'a> {
     config: &'a GlobalConfig,
@@ -303,11 +302,7 @@ impl Config {
     }
 
     pub fn exit_agent(&mut self) -> Result<()> {
-        self.exit_agent_with_lock(None)
-    }
-
-    pub fn exit_agent_with_lock(&mut self, lock: Option<&SessionLock>) -> Result<()> {
-        self.exit_session_with_lock(lock)?;
+        self.exit_session()?;
         if self.agent.take().is_some() {
             self.rag.take();
             self.discontinuous_last_message();

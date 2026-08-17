@@ -24,7 +24,6 @@ snapshot:
   git_remote: origin
   terminal_session_id: term-1
   agent_name: smith
-  save_session: true
   compress_threshold: 42
   model_fallbacks:
   - openai:fallback

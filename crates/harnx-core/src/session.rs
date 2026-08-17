@@ -1,6 +1,5 @@
 //! `Session` — persistent conversation history + lifecycle metadata.
-//! Pure data + pure methods. File I/O (save, exit, ensure_log_file,
-//! append_event), Config-using operations (new, load, render), and
+//! Pure data + pure methods. NATS persistence, Config-using operations, and
 //! methods with harnx-only dependencies (add_message, compress,
 //! build_messages, echo_messages, etc.) live in
 //! `harnx::config::session` as free functions.
@@ -17,7 +16,6 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 /// A single entry in the append-only session log file.
 ///
@@ -44,8 +42,6 @@ pub enum SessionLogEntry {
         top_p: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         use_tools: Option<Vec<String>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        save_session: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         compress_threshold: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -228,8 +224,6 @@ pub struct Session {
     )]
     pub use_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub save_session: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub compress_threshold: Option<usize>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -271,11 +265,7 @@ pub struct Session {
     #[serde(skip)]
     pub id: String,
     #[serde(skip)]
-    pub path: Option<String>,
-    #[serde(skip)]
     pub dirty: bool,
-    #[serde(skip)]
-    pub save_session_this_time: bool,
     #[serde(skip)]
     pub compressing: bool,
     #[serde(skip)]
@@ -284,8 +274,6 @@ pub struct Session {
     pub titling: bool,
     #[serde(skip)]
     pub title_last_updated_tokens: usize,
-    #[serde(skip)]
-    pub sessions_dir: Option<PathBuf>,
     #[serde(skip)]
     pub log_entry_count: usize,
     #[serde(skip)]
@@ -297,10 +285,6 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn set_sessions_dir(&mut self, dir: PathBuf) {
-        self.sessions_dir = Some(dir);
-    }
-
     pub fn is_log_format(content: &str) -> bool {
         for line in content.lines() {
             let trimmed = line.trim();
@@ -318,7 +302,6 @@ impl Session {
             temperature: self.temperature,
             top_p: self.top_p,
             use_tools: self.use_tools.clone(),
-            save_session: self.save_session,
             compress_threshold: self.compress_threshold,
             agent_name: self.agent_name.clone(),
             session_id: self.session_id.clone(),
@@ -343,10 +326,6 @@ impl Session {
 
     pub fn agent_name(&self) -> Option<&str> {
         self.agent_name.as_deref()
-    }
-
-    pub fn save_session(&self) -> Option<bool> {
-        self.save_session
     }
 
     pub fn tokens(&self) -> usize {
@@ -377,7 +356,6 @@ impl Session {
 
     pub fn export(&self) -> Result<String> {
         let mut data = json!({
-            "path": self.path,
             "model": self.model().id(),
         });
         if let Some(temperature) = self.temperature() {
@@ -402,9 +380,6 @@ impl Session {
                     .map(serde_json::Value::String)
                     .collect(),
             );
-        }
-        if let Some(save_session) = self.save_session() {
-            data["save_session"] = save_session.into();
         }
         let (tokens, percent) = self.tokens_usage();
         data["total_tokens"] = tokens.into();
@@ -474,17 +449,6 @@ impl Session {
 
     pub fn agent_variables(&self) -> &AgentVariables {
         &self.agent_variables
-    }
-
-    pub fn set_save_session(&mut self, value: Option<bool>) {
-        if self.save_session != value {
-            self.save_session = value;
-            self.dirty = true;
-        }
-    }
-
-    pub fn set_save_session_this_time(&mut self) {
-        self.save_session_this_time = true;
     }
 
     /// Test-only helper: directly inject a message into the session without

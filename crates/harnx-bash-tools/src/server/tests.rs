@@ -136,6 +136,8 @@ use crate::test_support::{env_lock, EnvVar};
 fn allowlist_for_paths(paths: Vec<PathBuf>) -> Arc<ResolvedAllowlist> {
     let inputs = harnx_tool_allow::AllowInputs {
         rwx: paths,
+        exec: system_exec_paths(),
+        read: system_read_paths(),
         ..harnx_tool_allow::AllowInputs::default()
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -144,6 +146,21 @@ fn allowlist_for_paths(paths: Vec<PathBuf>) -> Arc<ResolvedAllowlist> {
         &cwd,
         &harnx_tool_allow::AllowEnv::from_current_process(),
     ))
+}
+
+fn system_exec_paths() -> Vec<PathBuf> {
+    harnx_sandbox_common::SYSTEM_EXEC_PATHS
+        .iter()
+        .filter(|path| **path != "/tmp")
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn system_read_paths() -> Vec<PathBuf> {
+    harnx_sandbox_common::SYSTEM_READ_PATHS
+        .iter()
+        .map(PathBuf::from)
+        .collect()
 }
 
 fn server_with_paths(paths: Vec<PathBuf>) -> BashServer {
@@ -234,6 +251,26 @@ fn sandboxed_server(roots: Vec<PathBuf>) -> BashServer {
             sandbox_run_path: sandbox_run_test_path(),
         },
     )
+}
+
+#[cfg(target_os = "linux")]
+fn sandboxed_read_exec_server(root: &Path) -> BashServer {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut inputs = harnx_tool_allow::AllowInputs {
+        read: vec![root.to_path_buf()],
+        exec: vec![root.to_path_buf()],
+        ..harnx_tool_allow::AllowInputs::default()
+    };
+    inputs.exec.extend(system_exec_paths());
+    inputs.read.extend(system_read_paths());
+    BashServer::new_with_sandbox(SandboxConfig {
+        allowlist: Arc::new(harnx_tool_allow::resolve_allowlist(
+            &inputs,
+            &cwd,
+            &harnx_tool_allow::AllowEnv::from_current_process(),
+        )),
+        ..enabled_sandbox_config()
+    })
 }
 
 /// Probe whether the sandbox helper can actually initialize in the current
@@ -687,7 +724,7 @@ async fn test_sandbox_exec_write_denied_outside_root() {
         return;
     }
     let root = TestDir::new();
-    let server = sandboxed_server(vec![root.path().to_path_buf()]);
+    let server = sandboxed_read_exec_server(root.path());
 
     let result = server
         .exec_command_impl(ExecCommandParams {

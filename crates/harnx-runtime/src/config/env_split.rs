@@ -61,12 +61,6 @@ impl Config {
             }
         }
 
-        if let Some(v) = read_env_bool(&get_env_name("save_session")) {
-            self.save_session = v;
-        }
-        if let Some(v) = read_env_value::<u64>(&get_env_name("cleanup_inactive_sessions_days")) {
-            self.cleanup_inactive_sessions_days = v;
-        }
         if let Some(v) = read_env_value::<u64>(&get_env_name("cleanup_remote_sessions_days")) {
             self.cleanup_remote_sessions_days = v;
         }

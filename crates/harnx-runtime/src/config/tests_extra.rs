@@ -4,6 +4,10 @@ use super::*;
 
 #[test]
 fn expand_use_tools_wildcard_returns_concrete_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let _lock = super::test_support::env_lock();
+    let _config_dir = super::test_support::EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+    let _data_dir = super::test_support::EnvGuard::new("HARNX_DATA_DIR", temp.path());
     let config = Config {
         tools: crate::tool::Tools::init_from_mcp(Some(vec![
             make_tool_decl("alpha_tool"),
@@ -105,94 +109,6 @@ fn expand_use_tools_multiple_explicit_selectors_returns_only_those() {
     assert_eq!(expanded.len(), 2);
     assert!(expanded.contains(&"fs_read".to_string()));
     assert!(expanded.contains(&"bash_exec".to_string()));
-}
-
-// ── SessionHistoryProvider::call_tool end-to-end ─────────────────────────
-
-/// Exercises the full `call_tool` path of `SessionHistoryProvider`: build a
-/// real on-disk log, wire it up as the active session's `path`, then call
-/// through the provider and verify the envelope shape.
-#[tokio::test]
-async fn session_history_provider_call_tool_returns_message_entries() {
-    use crate::session_history::SessionHistoryProvider;
-    use harnx_core::abort::create_abort_signal;
-    use harnx_core::tool::ToolProvider as _;
-
-    let tmp = tempfile::TempDir::new().unwrap();
-
-    // Build a minimal config with a session that has a real on-disk log.
-    let mut config = Config {
-        data: ConfigData {
-            stream: false,
-            save_session: Some(true),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut session = self::session::new(&config, "call-tool-test", None).unwrap();
-    session.set_sessions_dir(tmp.path().to_path_buf());
-
-    // Append a message entry so the log file is initialized and contains data.
-    let wrote = self::session::append_event(
-        &mut session,
-        &harnx_core::session::SessionLogEntry::Message {
-            id: None,
-            role: crate::client::MessageRole::User,
-            content: crate::client::MessageContent::Text("what is 2+2?".to_string()),
-            timestamp: None,
-            fence_token: None,
-        },
-    );
-    assert!(wrote, "append_event must write the log file");
-
-    config.session = Some(session);
-    let global_config: GlobalConfig = Arc::new(RwLock::new(config));
-
-    let provider = SessionHistoryProvider::new(global_config.clone());
-    let abort = create_abort_signal();
-
-    // has_tool assertions
-    assert!(
-        provider.has_tool(crate::session_history::TOOL_NAME),
-        "provider must report the session-history tool as owned"
-    );
-    assert!(
-        !provider.has_tool("other_tool"),
-        "provider must not claim unrelated tools"
-    );
-
-    // call_tool with a type filter so only message entries come back.
-    let result = provider
-        .call_tool(
-            crate::session_history::TOOL_NAME,
-            serde_json::json!({"type": "message"}),
-            &abort,
-        )
-        .await
-        .map_err(|e| match e {
-            harnx_core::tool::ToolError::Recoverable(e) => e,
-            harnx_core::tool::ToolError::Fatal(e) => e,
-        })
-        .unwrap();
-
-    // Verify the content envelope: [{type:"text", text:"[...]"}]
-    let text = result["content"][0]["text"]
-        .as_str()
-        .expect("content[0].text must be a string");
-    assert_eq!(
-        result["content"][0]["type"], "text",
-        "content type must be 'text'"
-    );
-
-    // The text must deserialize as a JSON array containing at least one object
-    // with type == "message".
-    let rows: serde_json::Value =
-        serde_json::from_str(text).expect("content text must be valid JSON");
-    let arr = rows.as_array().expect("rows must be a JSON array");
-    assert!(
-        arr.iter().any(|r| r["type"] == "message"),
-        "at least one entry with type 'message' must be present; got: {arr:?}"
-    );
 }
 
 fn make_tool_decl(name: &str) -> crate::tool::ToolDeclaration {

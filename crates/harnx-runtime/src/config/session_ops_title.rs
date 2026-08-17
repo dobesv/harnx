@@ -9,7 +9,6 @@
 //! generation fails or no title agent is configured, the title is left unset.
 
 use super::*;
-use crate::config::session_lock::SessionLock;
 
 use harnx_core::message::MessageRole;
 
@@ -481,113 +480,15 @@ impl Config {
             return Ok(None);
         }
 
-        // Persist to the session log + in-memory session, but only if the active
-        // session is still the one we titled (it may have been swapped).
-        //
-        // CRITICAL: This runs on a background task that may start BEFORE the
-        // agent loop's SessionLock is released. We cannot use a blocking acquire
-        // (would deadlock). Use bounded try_acquire with fallback.
         {
-            // Derive session path WITHOUT holding the write guard.
-            let session_path = {
-                let guard = config.read();
-                let Some(session) = guard.session.as_ref() else {
-                    return Ok(None);
-                };
-                if session.id != session_id {
-                    return Ok(None);
-                }
-                // Skip ephemeral / unsaved sessions or sessions without a path.
-                if session.save_session() == Some(false) {
-                    // Just set in-memory title; no log persistence needed.
-                    let mut guard = config.write();
-                    if let Some(session) = guard.session.as_mut() {
-                        if session.id == session_id {
-                            session.set_title(title.clone());
-                            session.set_title_last_updated_tokens(tokens);
-                        }
-                    }
-                    return Ok(Some(title));
-                }
-                match (&session.path, &session.sessions_dir) {
-                    (Some(path), _) => std::path::PathBuf::from(path),
-                    (None, Some(dir)) => dir.join(format!("{}.yaml", session.id)),
-                    (None, None) => {
-                        // No persistence path - skip log append, set in-memory only.
-                        let mut guard = config.write();
-                        if let Some(session) = guard.session.as_mut() {
-                            if session.id == session_id {
-                                session.set_title(title.clone());
-                                session.set_title_last_updated_tokens(tokens);
-                            }
-                        }
-                        return Ok(Some(title));
-                    }
-                }
+            let mut guard = config.write();
+            let Some(session) = guard.session.as_mut() else {
+                return Ok(None);
             };
-
-            // Try to acquire the session lock with bounded retries.
-            // This avoids deadlocking against the same-process runner lock
-            // (which is released shortly after the turn ends).
-            let lock = {
-                let session_path = session_path.clone();
-                tokio::task::spawn_blocking(move || {
-                    let mut attempts = 0;
-                    let max_attempts = 20; // ~2s total with 100ms sleeps
-                    let sleep_ms = 100;
-                    loop {
-                        match SessionLock::try_acquire(&session_path) {
-                            Ok(Some(lock)) => return Ok(lock),
-                            Ok(None) => {
-                                // Lock held by another process; retry
-                                attempts += 1;
-                                if attempts >= max_attempts {
-                                    return Err(anyhow::anyhow!(
-                                        "title persist: could not acquire session lock after {} attempts",
-                                        attempts
-                                    ));
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                })
-                .await
-                .context("title persist lock task join")?
-            };
-
-            match lock {
-                Ok(_session_lock) => {
-                    // Lock acquired - now take the write guard and persist.
-                    let mut guard = config.write();
-                    let Some(session) = guard.session.as_mut() else {
-                        return Ok(None);
-                    };
-                    if session.id != session_id {
-                        return Ok(None);
-                    }
-                    crate::config::session::record_title(session, title.clone(), false, tokens);
-                    // Lock dropped at end of scope along with guard.
-                }
-                Err(e) => {
-                    // Failed to acquire lock - fall back to in-memory only.
-                    // The title will be persisted on next locked save (dirty flag not set
-                    // since we skip the log append; title will re-derive from log on reload).
-                    log::warn!(
-                        "title persist: could not acquire session lock for {}: {}; setting in-memory only",
-                        session_id,
-                        e
-                    );
-                    let mut guard = config.write();
-                    if let Some(session) = guard.session.as_mut() {
-                        if session.id == session_id {
-                            session.set_title(title.clone());
-                            session.set_title_last_updated_tokens(tokens);
-                        }
-                    }
-                }
+            if session.id != session_id {
+                return Ok(None);
             }
+            crate::config::session::record_title(session, title.clone(), false, tokens);
         }
 
         Ok(Some(title))

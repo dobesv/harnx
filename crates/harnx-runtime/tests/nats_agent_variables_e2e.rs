@@ -42,7 +42,7 @@ const PACKAGE_SHARED_FILES: [(&str, &str); 3] = [
 const VARIABLE_FILE_TEXT: &str = "core instructions loaded from a file";
 /// Generous enough that a slow CI box does not trip it, short enough that a
 /// genuinely stalled turn fails the test rather than hanging the suite.
-const TURN_TIMEOUT: Duration = Duration::from_secs(20);
+const TURN_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct EnvVarGuard {
     key: &'static str,
@@ -54,6 +54,13 @@ impl EnvVarGuard {
         let previous = std::env::var_os(key);
         // SAFETY: nextest gives each test its own process, so nothing else
         // mutates the environment concurrently.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+
+    fn set_os(key: &'static str, value: std::ffi::OsString) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: nextest gives each test its own process.
         unsafe { std::env::set_var(key, value) };
         Self { key, previous }
     }
@@ -101,10 +108,21 @@ impl TestEnv {
             "type: openai\napi_key: sk-test\nmodels:\n  - name: test-model\n    type: chat\n    max_input_tokens: 4096\n",
         )?;
 
+        let current_exe = std::env::current_exe().context("resolve current test executable")?;
+        let binary_dir = current_exe
+            .parent()
+            .and_then(Path::parent)
+            .context("derive Cargo profile directory from test executable")?;
+        let mut paths = vec![binary_dir.to_path_buf()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let test_path = std::env::join_paths(paths)?;
         let guards = vec![
             EnvVarGuard::set_path("HARNX_CONFIG_DIR", &config_dir),
             EnvVarGuard::set_path("HARNX_DATA_DIR", &data_dir),
             EnvVarGuard::set_path("HARNX_STATE_DIR", &state_dir),
+            EnvVarGuard::set_os("PATH", test_path),
         ];
 
         Ok(Self {
@@ -285,12 +303,25 @@ impl TestEnv {
         )
         .await?;
 
-        tokio::time::timeout(
+        match tokio::time::timeout(
             TURN_TIMEOUT,
             thin.run_turn("hello", Arc::new(NullSink), None),
         )
         .await
-        .context("turn stalled: the client never stopped waiting for the worker")?
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let worker_log = std::fs::read_to_string(
+                    self._root.path().join("state").join("harnx_worker.log"),
+                )
+                .unwrap_or_else(|read_error| format!("<failed to read worker log: {read_error}>"));
+                Err(error).with_context(|| {
+                    format!(
+                        "turn stalled: the client never stopped waiting for the worker\nworker log:\n{worker_log}"
+                    )
+                })
+            }
+        }
     }
 }
 

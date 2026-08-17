@@ -42,61 +42,63 @@ impl Config {
         paths::messages_file(self.agent.as_ref().map(|a| a.name()))
     }
 
-    pub fn sessions_dir(&self) -> PathBuf {
-        if let Some(ref override_dir) = self.sessions_dir_override {
-            return override_dir.clone();
-        }
-        paths::sessions_dir(self.agent.as_ref().map(|a| a.name()))
-    }
-
     pub fn rags_dir() -> PathBuf {
         paths::rags_dir()
     }
 
-    pub fn session_file(&self, name: &str) -> PathBuf {
-        match name.split_once('/') {
-            Some((sub, leaf)) => self.sessions_dir().join(sub).join(format!("{leaf}.yaml")),
-            None => self.sessions_dir().join(format!("{name}.yaml")),
-        }
+    /// Atomically reserve a short session ID in NATS without holding the
+    /// configuration lock across network I/O.
+    pub async fn reserve_new_session_id(config: &GlobalConfig) -> Result<String> {
+        const RESERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+        let config = config.read().clone();
+        tokio::time::timeout(RESERVATION_TIMEOUT, config.reserve_new_session_id_inner())
+            .await
+            .context("Timed out reserving a new NATS session ID")?
     }
 
-    /// Returns the `.yaml.lock` sidecar path for a session name.
-    pub fn session_lock_path(&self, name: &str) -> PathBuf {
-        session_lock::SessionLock::lock_path_for(&self.session_file(name))
-    }
+    async fn reserve_new_session_id_inner(&self) -> Result<String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// Atomically claim a short session ID by creating its stub file with
-    /// `create_new(true)`. Returns `Ok(true)` if the claim succeeded, `Ok(false)`
-    /// if another process already claimed the same ID (caller should retry with a
-    /// different ID), or `Err` for unexpected I/O failures.
-    fn claim_session_file(&self, id: &str) -> Result<bool> {
-        let path = self.session_file(id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create sessions dir at {}", parent.display())
-            })?;
-        }
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-            Err(e) => Err(e)
-                .with_context(|| format!("Failed to claim session ID file at {}", path.display())),
-        }
-    }
+        let cluster = self
+            .remote_agent
+            .as_ref()
+            .map(|(_, cluster)| cluster.as_str())
+            .unwrap_or(LOCAL_CLUSTER_KEY);
+        let server = self.resolve_nats_server(cluster).await?;
+        let client = Self::connect_nats_server(&server).await?;
+        let store = crate::nats_session_index::ensure_index_bucket(
+            &async_nats::jetstream::new(client),
+            server.replicas.unwrap_or(1),
+        )
+        .await?;
+        let activity_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut seconds = activity_seconds;
 
-    /// Generate a unique short session ID and atomically claim it on disk.
-    /// Retries with the next second's timestamp if the claim loses a race.
-    pub fn new_session_id(&self) -> Result<String> {
         loop {
-            let candidate =
-                crate::utils::session_name::generate_session_id(|c| self.session_file(c).exists());
-            if self.claim_session_file(&candidate)? {
+            let candidate = crate::utils::session_name::encode_timestamp_session_id(seconds);
+            let record = crate::nats_session_index::SessionIndexRecord {
+                session_id: candidate.clone(),
+                agent_name: self
+                    .agent
+                    .as_ref()
+                    .map(|agent| agent.name().to_string())
+                    .unwrap_or_default(),
+                working_dir: std::env::current_dir()
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                git_branch: Some(crate::utils::session_name::git_branch())
+                    .filter(|branch| !branch.is_empty()),
+                git_remote: crate::utils::session_name::git_remote(),
+                title: None,
+                last_activity: activity_seconds,
+            };
+            if crate::nats_session_index::try_create_record(&store, &record).await? {
                 return Ok(candidate);
             }
+            seconds = seconds.saturating_add(1);
         }
     }
 
@@ -133,34 +135,5 @@ impl Config {
 
     pub fn models_override_file() -> PathBuf {
         paths::models_override_file()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn session_lock_path_returns_yaml_lock_sidecar() {
-        let config = Config::default();
-        let lock_path = config.session_lock_path("foo");
-        assert!(lock_path.ends_with("foo.yaml.lock"));
-        assert_eq!(
-            lock_path,
-            config.session_file("foo").with_extension("yaml.lock")
-        );
-    }
-
-    #[test]
-    fn session_lock_path_handles_subdir_names() {
-        let config = Config::default();
-        let lock_path = config.session_lock_path("subdir/leaf");
-        assert!(lock_path.ends_with("leaf.yaml.lock"));
-        assert_eq!(
-            lock_path,
-            config
-                .session_file("subdir/leaf")
-                .with_extension("yaml.lock")
-        );
     }
 }

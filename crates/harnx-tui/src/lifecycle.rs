@@ -15,10 +15,10 @@ use crossterm::event::{
 use crossterm::terminal::{enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen};
 use crossterm::ExecutableCommand;
 use harnx_core::message::Message;
-use harnx_runtime::config::GlobalConfig;
 use harnx_runtime::config::{
     build_picker_context, list_assistant_agents, sort_sessions_for_picker,
 };
+use harnx_runtime::config::{GlobalConfig, SessionMeta};
 use harnx_runtime::tool::ToolDeclaration;
 use harnx_runtime::utils::create_abort_signal;
 use log::warn;
@@ -28,6 +28,13 @@ use ratatui_textarea::Input as TextInput;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
+
+pub(crate) struct NewSessionSelection {
+    pub sessions: Vec<SessionMeta>,
+    pub selected: usize,
+    pub origin_agent: Option<String>,
+    pub origin_session: Option<String>,
+}
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 
@@ -243,30 +250,7 @@ impl Tui {
             });
         }
         if config.read().session.is_none() {
-            // sessions_dir() is already scoped to the active agent, so no
-            // extra agent_name filter is needed here.
-            let cluster = config
-                .read()
-                .remote_agent
-                .as_ref()
-                .map(|(_, cluster)| cluster.clone())
-                .unwrap_or_else(|| harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string());
-
-            let cfg = config.read().clone();
-            let (sessions, fetch_error) = match cfg.list_remote_sessions_with_meta(&cluster).await {
-                Ok(sessions) => (sessions, None),
-                Err(error) => {
-                    log::warn!(
-                        "Failed to list NATS sessions for cluster '{}': {:#}",
-                        cluster,
-                        error
-                    );
-                    (
-                        vec![],
-                        Some(format!("NATS sessions unavailable: {error:#}")),
-                    )
-                }
-            };
+            let (sessions, fetch_error) = Self::picker_sessions(config).await;
 
             let ctx = build_picker_context(None);
             let sorted = sort_sessions_for_picker(sessions, &ctx);
@@ -283,6 +267,71 @@ impl Tui {
             });
         }
         None
+    }
+
+    pub(crate) async fn picker_sessions(
+        config: &GlobalConfig,
+    ) -> (Vec<harnx_runtime::config::SessionMeta>, Option<String>) {
+        let cfg = config.read().clone();
+        let cluster = cfg
+            .remote_agent
+            .as_ref()
+            .map(|(_, cluster)| cluster.as_str())
+            .unwrap_or(harnx_runtime::config::LOCAL_CLUSTER_KEY);
+
+        match cfg.list_remote_sessions_with_meta(cluster).await {
+            Ok(sessions) => (sessions, None),
+            Err(error) => {
+                log::warn!(
+                    "Failed to list NATS sessions for cluster '{}': {:#}",
+                    cluster,
+                    error
+                );
+                (
+                    vec![],
+                    Some(format!("NATS sessions unavailable: {error:#}")),
+                )
+            }
+        }
+    }
+
+    pub(crate) async fn select_new_session(
+        &mut self,
+        selection: NewSessionSelection,
+    ) -> Result<()> {
+        let NewSessionSelection {
+            sessions,
+            selected,
+            origin_agent,
+            origin_session,
+        } = selection;
+        let restore_picker = |this: &mut Self| {
+            this.app.modal = Some(ModalState::SessionPicker {
+                sessions: sessions.clone(),
+                selected,
+                origin_agent: origin_agent.clone(),
+                origin_session: origin_session.clone(),
+                error: None,
+            });
+        };
+        let new_session_id =
+            match harnx_runtime::config::Config::reserve_new_session_id(&self.config).await {
+                Ok(session_id) => session_id,
+                Err(error) => {
+                    restore_picker(self);
+                    return Err(error);
+                }
+            };
+        let use_result = self.config.write().use_session(Some(&new_session_id));
+        if let Err(error) = use_result {
+            restore_picker(self);
+            return Err(error);
+        }
+        let llm_busy = self.app.llm_busy;
+        let pending = self.app.pending_message.is_some();
+        Self::refresh_input_chrome_from_state(&self.config, &mut self.app, llm_busy, pending);
+        self.reconcile_transcript_after_command(origin_session, origin_agent, ".session");
+        Ok(())
     }
 
     pub(crate) fn build_initial_transcript(config: &GlobalConfig) -> Vec<TranscriptItem> {
@@ -802,9 +851,12 @@ pub(crate) fn build_transcript_with_compaction(
 
 pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<TranscriptItem> {
     let cfg = config.read();
+    // A NATS-backed session is deliberately only an identity in the local
+    // Config; its in-memory message vectors remain empty until a worker runs.
+    // Presence of a session ID is therefore enough to load its transcript.
     let session_id = match cfg.session.as_ref() {
-        Some(s) if !s.is_empty() => s.id().to_string(),
-        _ => return vec![],
+        Some(session) => session.id().to_string(),
+        None => return vec![],
     };
     let thin_agent = cfg.remote_agent.clone().or_else(|| {
         cfg.agent.as_ref().map(|agent| {

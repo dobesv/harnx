@@ -201,7 +201,6 @@ fn session_header(session_id: &str) -> SessionLogEntry {
         temperature: None,
         top_p: None,
         use_tools: None,
-        save_session: Some(true),
         compress_threshold: None,
         agent_name: None,
         session_id: Some(session_id.to_string()),
@@ -1207,10 +1206,7 @@ fn assert_handoff_target_session(config: &Arc<RwLock<Config>>) -> String {
         .expect("expected active handed-off session id")
 }
 
-fn assert_handoff_target_log(
-    entries: &[(u64, SessionLogEntry)],
-    local_session_path: &std::path::Path,
-) {
+fn assert_handoff_target_log(entries: &[(u64, SessionLogEntry)]) {
     assert!(
         !entries.is_empty(),
         "expected handed-off session to persist to JetStream"
@@ -1225,11 +1221,6 @@ fn assert_handoff_target_log(
             } if text.contains("handoff completed")
         )),
         "expected handed-off JetStream log to contain delegated assistant reply"
-    );
-    assert!(
-        !local_session_path.exists(),
-        "handoff should stay NATS-backed; unexpected local session file at {}",
-        local_session_path.display()
     );
 }
 
@@ -1366,8 +1357,7 @@ async fn nats_worker_handoff_persists_to_jetstream_not_file() -> Result<()> {
     let new_log = NatsSessionLog::new(js.clone(), &actual_new_session_id);
     let new_entries = new_log.load_events_async().await?;
 
-    let local_session_path = config.read().session_file(&actual_new_session_id);
-    assert_handoff_target_log(&new_entries, &local_session_path);
+    assert_handoff_target_log(&new_entries);
 
     Ok(())
 }

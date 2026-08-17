@@ -114,7 +114,6 @@ If the response is interrupted or unsatisfactory, you can regenerate it with `.r
 .set save true
 .set function_calling true
 .set use_tools <tab>
-.set save_session true
 .set compress_threshold 1000
 .set rag_reranker_model <tab>
 .set rag_top_k 4

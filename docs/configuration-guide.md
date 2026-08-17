@@ -47,8 +47,6 @@ The `config.yaml` file contains global behavior and appearance settings.
 ### Behavior
 
 - **stream**: Whether to use streaming for responses. (`true`/`false`)
-- **save_session**: Whether to save session history. (`true`/`false`)
-- **cleanup_inactive_sessions_days**: Number of days of inactivity (filesystem mtime) after which a session's transcript (`{id}.yaml`) and its attachments directory (`{id}.attachments/`) are permanently deleted. Deletion is best-effort, permanent, and runs at startup and hourly thereafter in all modes. Set to `0` or leave unset to disable (default). (Example: `14`)
 - **keybindings**: Choose between `emacs` or `vi` style.
 - **editor**: Command used to edit input buffers.
 - **wrap**: Text wrapping behavior (`no`, `auto`, or a number).

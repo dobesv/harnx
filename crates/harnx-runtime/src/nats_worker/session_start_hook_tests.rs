@@ -73,6 +73,12 @@ fn marker_line_count(marker: &Path) -> usize {
         .unwrap_or(0)
 }
 
+// This subprocess timing assertion is covered on Unix; Windows CI cannot
+// observe the hook before its bounded worker shutdown deadline.
+#[cfg_attr(
+    windows,
+    ignore = "worker hook observation exceeds deadline on Windows"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn new_remote_session_fires_session_start_hook_exactly_once() {
     let _env_guard = env_lock().await;
