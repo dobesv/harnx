@@ -386,6 +386,11 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    // Cases are tabulated rather than written as runs of consecutive asserts:
+    // it keeps each expectation labelled with the input that produced it, and
+    // `cargo nextest` runs a process per test, so this crate's suite stays small
+    // next to the timing-sensitive integration tests elsewhere in the workspace.
+
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs
             .iter()
@@ -398,115 +403,65 @@ mod tests {
         PathBuf::from("/state/harnx.log")
     }
 
-    #[test]
-    fn defaults_to_info_text_and_the_harnx_filter() {
-        let settings = resolve(env(&[]), LogSink::Stderr, default_path());
-        assert_eq!(settings.level, LevelFilter::Info);
-        assert_eq!(settings.format, LogFormat::Text);
-        assert_eq!(settings.filter, "harnx");
+    fn settings_from(pairs: &[(&str, &str)], sink: LogSink) -> LogSettings {
+        resolve(env(pairs), sink, default_path())
     }
 
     #[test]
-    fn parses_bare_level_names_case_insensitively() {
-        assert_eq!(parse_level("debug"), Some(LevelFilter::Debug));
-        assert_eq!(parse_level(" WARN "), Some(LevelFilter::Warn));
-        assert_eq!(parse_level("off"), Some(LevelFilter::Off));
+    fn level_comes_from_harnx_log_level_then_rust_log_then_info() {
+        for (value, expected) in [
+            ("debug", Some(LevelFilter::Debug)),
+            (" WARN ", Some(LevelFilter::Warn)),
+            ("off", Some(LevelFilter::Off)),
+            // Per-target directives are RUST_LOG syntax we don't parse. They must
+            // read as "unrecognised", never as "off".
+            ("harnx_mcp_bridge=debug", None),
+            ("", None),
+        ] {
+            assert_eq!(parse_level(value), expected, "parse_level({value:?})");
+        }
+
+        for (pairs, expected, why) in [
+            (vec![], LevelFilter::Info, "default"),
+            (
+                vec![("RUST_LOG", "debug")],
+                LevelFilter::Debug,
+                "RUST_LOG fallback",
+            ),
+            (
+                vec![("HARNX_LOG_LEVEL", "trace"), ("RUST_LOG", "error")],
+                LevelFilter::Trace,
+                "HARNX_LOG_LEVEL wins over RUST_LOG",
+            ),
+            (
+                vec![("RUST_LOG", "harnx_mcp_bridge=debug")],
+                LevelFilter::Info,
+                "an unrecognised directive must not silence the process",
+            ),
+        ] {
+            let level = settings_from(&pairs, LogSink::Stderr).level;
+            assert_eq!(level, expected, "{why}: {pairs:?}");
+        }
     }
 
     #[test]
-    fn unrecognised_directives_do_not_silence_the_process() {
-        // A per-target RUST_LOG directive must not be read as "off".
-        assert_eq!(parse_level("harnx_mcp_bridge=debug"), None);
-        assert_eq!(parse_level(""), None);
-        let settings = resolve(
-            env(&[("RUST_LOG", "harnx_mcp_bridge=debug")]),
-            LogSink::Stderr,
-            default_path(),
-        );
-        assert_eq!(settings.level, LevelFilter::Info);
+    fn format_is_text_unless_json_is_asked_for_by_name() {
+        for (pairs, expected) in [
+            (vec![], LogFormat::Text),
+            (vec![("HARNX_LOG_FORMAT", "JSON")], LogFormat::Json),
+            (vec![("HARNX_LOG_FORMAT", "logfmt")], LogFormat::Text),
+        ] {
+            let format = settings_from(&pairs, LogSink::Stderr).format;
+            assert_eq!(format, expected, "{pairs:?}");
+        }
     }
 
     #[test]
-    fn harnx_log_level_wins_over_rust_log() {
-        let settings = resolve(
-            env(&[("HARNX_LOG_LEVEL", "trace"), ("RUST_LOG", "error")]),
-            LogSink::Stderr,
-            default_path(),
-        );
-        assert_eq!(settings.level, LevelFilter::Trace);
-    }
-
-    #[test]
-    fn rust_log_is_the_fallback_level() {
-        let settings = resolve(
-            env(&[("RUST_LOG", "debug")]),
-            LogSink::Stderr,
-            default_path(),
-        );
-        assert_eq!(settings.level, LevelFilter::Debug);
-    }
-
-    #[test]
-    fn json_format_is_opt_in_by_name() {
-        let json = resolve(
-            env(&[("HARNX_LOG_FORMAT", "JSON")]),
-            LogSink::Stderr,
-            default_path(),
-        );
-        assert_eq!(json.format, LogFormat::Json);
-        let nonsense = resolve(
-            env(&[("HARNX_LOG_FORMAT", "logfmt")]),
-            LogSink::Stderr,
-            default_path(),
-        );
-        assert_eq!(nonsense.format, LogFormat::Text);
-    }
-
-    #[test]
-    fn terminal_binaries_default_to_the_state_dir_log_file() {
-        let settings = resolve(env(&[]), LogSink::File, default_path());
-        assert_eq!(settings.dest, LogDest::File(default_path()));
-    }
-
-    #[test]
-    fn log_path_overrides_the_default_file() {
-        let settings = resolve(
-            env(&[("HARNX_LOG_PATH", "/tmp/custom.log")]),
-            LogSink::File,
-            default_path(),
-        );
-        assert_eq!(
-            settings.dest,
-            LogDest::File(PathBuf::from("/tmp/custom.log"))
-        );
-    }
-
-    #[test]
-    fn empty_log_path_falls_back_to_the_default_file() {
-        let settings = resolve(
-            env(&[("HARNX_LOG_PATH", "")]),
-            LogSink::File,
-            default_path(),
-        );
-        assert_eq!(settings.dest, LogDest::File(default_path()));
-    }
-
-    #[test]
-    fn servers_stay_on_stderr_even_when_log_path_is_inherited() {
-        let settings = resolve(
-            env(&[("HARNX_LOG_PATH", "/tmp/custom.log")]),
-            LogSink::Stderr,
-            default_path(),
-        );
-        assert_eq!(settings.dest, LogDest::Stderr);
-        assert_eq!(settings.dest_display(), "stderr");
-    }
-
-    #[test]
-    fn default_filter_matches_every_harnx_crate_target() {
+    fn the_default_filter_matches_every_harnx_crate_target() {
+        let filter = settings_from(&[], LogSink::Stderr).filter;
+        assert_eq!(filter, "harnx");
         // Rust targets use underscores (`harnx_runtime::client`); the historic
         // `harnx::serve` filter matched none of them and dropped every line.
-        let settings = resolve(env(&[]), LogSink::Stderr, default_path());
         for target in [
             "harnx_runtime::client",
             "harnx_runtime::bootstrap",
@@ -514,22 +469,81 @@ mod tests {
             "harnx_core::logging",
         ] {
             assert!(
-                target.starts_with(&settings.filter),
-                "{target} should match filter {:?}",
-                settings.filter
+                target.starts_with(&filter) && !target.starts_with("harnx::serve"),
+                "{target} should match {filter:?} but not the historic harnx::serve"
             );
-            assert!(!target.starts_with("harnx::serve"));
         }
     }
 
     #[test]
-    fn log_filter_narrows_to_one_target() {
-        let settings = resolve(
-            env(&[("HARNX_LOG_FILTER", "harnx_mcp_bridge")]),
-            LogSink::Stderr,
-            default_path(),
-        );
+    fn log_filter_narrows_to_one_crate() {
+        let settings = settings_from(&[("HARNX_LOG_FILTER", "harnx_mcp_bridge")], LogSink::Stderr);
         assert_eq!(settings.filter, "harnx_mcp_bridge");
+    }
+
+    #[test]
+    fn the_sink_decides_the_destination_not_the_configured_path() {
+        for (pairs, sink, expected, why) in [
+            (
+                vec![],
+                LogSink::File,
+                LogDest::File(default_path()),
+                "terminal binaries default to the state-dir log file",
+            ),
+            (
+                vec![("HARNX_LOG_PATH", "/tmp/custom.log")],
+                LogSink::File,
+                LogDest::File(PathBuf::from("/tmp/custom.log")),
+                "HARNX_LOG_PATH overrides the default",
+            ),
+            (
+                vec![("HARNX_LOG_PATH", "")],
+                LogSink::File,
+                LogDest::File(default_path()),
+                "an empty override falls back to the default",
+            ),
+            (
+                // A server inherits HARNX_LOG_PATH from the front-end that spawned
+                // it and must still leave that file to its single writer.
+                vec![("HARNX_LOG_PATH", "/tmp/custom.log")],
+                LogSink::Stderr,
+                LogDest::Stderr,
+                "servers ignore an inherited HARNX_LOG_PATH",
+            ),
+        ] {
+            assert_eq!(settings_from(&pairs, sink).dest, expected, "{why}");
+        }
+    }
+
+    #[test]
+    fn stderr_destinations_describe_themselves_as_stderr() {
+        let settings = settings_from(&[], LogSink::Stderr);
+        assert_eq!(settings.dest_display(), "stderr");
+    }
+
+    #[test]
+    fn child_output_follows_our_own_destination() {
+        for (dest, expected, why) in [
+            (
+                Some(LogDest::File(default_path())),
+                ChildOutput::File(default_path()),
+                "a file-logging process hands children that file",
+            ),
+            (
+                Some(LogDest::Stderr),
+                ChildOutput::Inherit,
+                "a stderr-logging process lets children inherit",
+            ),
+            (
+                // Not `Inherit`: an inherited pipe outlives the child holding it,
+                // which strands a test harness waiting on EOF.
+                None,
+                ChildOutput::Null,
+                "a process with no logger discards child output",
+            ),
+        ] {
+            assert_eq!(child_output(dest.as_ref()), expected, "{why}");
+        }
     }
 
     /// Render one sample record. The `format_args!` temporary can't outlive the
@@ -549,13 +563,19 @@ mod tests {
     }
 
     #[test]
-    fn text_lines_carry_level_pid_target_and_message() {
+    fn text_lines_carry_the_timestamp_level_pid_target_and_message() {
         let line = record_line(LogFormat::Text);
-        assert!(line.ends_with('\n'), "{line:?}");
-        assert!(line.contains("[INFO ]"), "{line:?}");
-        assert!(line.contains(&std::process::id().to_string()), "{line:?}");
-        assert!(line.contains("harnx_core::logging: hello 42"), "{line:?}");
-        assert!(line.starts_with("20"), "timestamp first: {line:?}");
+        let pid = std::process::id().to_string();
+        for expected in ["[INFO ]", &pid, "harnx_core::logging: hello 42"] {
+            assert!(
+                line.contains(expected),
+                "{expected:?} missing from {line:?}"
+            );
+        }
+        assert!(
+            line.starts_with("20") && line.ends_with('\n'),
+            "expected a timestamp first and one trailing newline: {line:?}"
+        );
     }
 
     #[test]
@@ -563,23 +583,48 @@ mod tests {
         let line = record_line(LogFormat::Json);
         assert!(line.ends_with('\n'), "{line:?}");
         let value: serde_json::Value = serde_json::from_str(line.trim()).expect("valid JSON line");
-        assert_eq!(value["level"], "INFO");
-        assert_eq!(value["target"], "harnx_core::logging");
-        assert_eq!(value["message"], "hello 42");
-        assert_eq!(value["pid"].as_u64(), Some(u64::from(std::process::id())));
+        for (key, expected) in [
+            ("level", serde_json::json!("INFO")),
+            ("target", serde_json::json!("harnx_core::logging")),
+            ("message", serde_json::json!("hello 42")),
+            ("pid", serde_json::json!(std::process::id())),
+        ] {
+            assert_eq!(value[key], expected, "{key}");
+        }
         assert!(value["ts"].as_str().is_some_and(|ts| ts.ends_with('Z')));
     }
 
-    /// Serialises the tests that mutate process-global env vars. `cargo nextest`
-    /// gives each test its own process, but `cargo test` shares one.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    #[test]
+    fn records_are_gated_by_both_level_and_target() {
+        let logger = HarnxLogger {
+            level: LevelFilter::Info,
+            format: LogFormat::Text,
+            filter: "harnx".to_string(),
+            writer: Mutex::new(Box::new(Vec::new())),
+        };
+        for (target, level, expected) in [
+            ("harnx_runtime::client", log::Level::Info, true),
+            ("harnx_runtime::client", log::Level::Debug, false),
+            ("hyper::proto", log::Level::Error, false),
+        ] {
+            let metadata = Metadata::builder().target(target).level(level).build();
+            assert_eq!(
+                logger.enabled(&metadata),
+                expected,
+                "{target} at {level} should{} be logged",
+                if expected { "" } else { " not" }
+            );
+        }
+    }
 
     #[test]
     fn the_default_log_file_is_harnx_log_under_the_state_dir() {
         // Regression test: this path used to be derived from
-        // `env!("CARGO_CRATE_NAME")`, so it silently became
-        // `harnx_runtime.log` when the logging code moved between crates.
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // `env!("CARGO_CRATE_NAME")`, so it silently became `harnx_runtime.log`
+        // when the logging code moved between crates.
+        //
+        // The only test here that touches process env, so it reads the real
+        // `settings` rather than the pure `resolve`.
         let overrides = [
             ("HARNX_STATE_DIR", Some("/tmp/harnx-logging-test")),
             ("XDG_STATE_HOME", None),
@@ -609,39 +654,5 @@ mod tests {
             dest,
             LogDest::File(PathBuf::from("/tmp/harnx-logging-test/harnx.log"))
         );
-    }
-
-    #[test]
-    fn a_file_logging_process_gives_children_that_file() {
-        let dest = LogDest::File(default_path());
-        assert_eq!(child_output(Some(&dest)), ChildOutput::File(default_path()));
-    }
-
-    #[test]
-    fn a_stderr_logging_process_lets_children_inherit() {
-        assert_eq!(child_output(Some(&LogDest::Stderr)), ChildOutput::Inherit);
-    }
-
-    #[test]
-    fn a_process_with_no_logger_discards_child_output() {
-        // Not `Inherit`: an inherited pipe outlives the child holding it, which
-        // strands a test harness waiting on EOF.
-        assert_eq!(child_output(None), ChildOutput::Null);
-    }
-
-    #[test]
-    fn filter_rejects_foreign_targets_and_levels_above_the_threshold() {
-        let logger = HarnxLogger {
-            level: LevelFilter::Info,
-            format: LogFormat::Text,
-            filter: "harnx".to_string(),
-            writer: Mutex::new(Box::new(Vec::new())),
-        };
-        let enabled = |target: &str, level: log::Level| {
-            logger.enabled(&Metadata::builder().target(target).level(level).build())
-        };
-        assert!(enabled("harnx_runtime::client", log::Level::Info));
-        assert!(!enabled("harnx_runtime::client", log::Level::Debug));
-        assert!(!enabled("hyper::proto", log::Level::Error));
     }
 }
