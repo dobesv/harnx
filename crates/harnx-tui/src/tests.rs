@@ -1,5 +1,5 @@
 use crate::markdown_render::MarkdownBlockData;
-use crate::test_utils::TuiTestHarness;
+use crate::test_utils::{TestEnvironment, TuiTestHarness, ENV_LOCK};
 use crate::types::Tui;
 use crate::types::{ToolCallBody, TranscriptItem, TuiEvent};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -6668,37 +6668,6 @@ async fn test_check_agents_available_ok_when_agent_selected_even_without_agents_
 // Picker tests — AgentPicker filtering, SessionPicker ESC, agent activation
 // ---------------------------------------------------------------------------
 
-/// Process-wide async mutex that serialises tests which mutate `HARNX_CONFIG_DIR`.
-/// Env vars are process-global, so concurrent tests that each set their own
-/// temp dir would race.  Using `tokio::sync::Mutex` lets the guard be held
-/// safely across `.await` points (unlike `std::sync::Mutex`).
-static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// RAII guard that sets an env var for the duration of the test and restores
-/// the original value (or removes it) on drop.  Callers must hold `ENV_LOCK`
-/// for the duration the guard is alive.
-struct EnvGuard {
-    key: &'static str,
-    prior: Option<String>,
-}
-
-impl EnvGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let prior = std::env::var(key).ok();
-        std::env::set_var(key, value);
-        Self { key, prior }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.prior {
-            Some(v) => std::env::set_var(self.key, v),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
-
 /// Build a minimal config for picker tests (alias for `test_config`).
 fn picker_test_config() -> GlobalConfig {
     test_config()
@@ -6719,7 +6688,7 @@ fn create_agent_stubs(agents_dir: &std::path::Path, names: &[&str]) {
 async fn agent_picker_typing_filters_list() {
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
     create_agent_stubs(&tmp.path().join("agents"), &["apollo", "argus", "hermes"]);
 
     let config = picker_test_config();
@@ -6793,7 +6762,7 @@ async fn agent_picker_no_match_query_returns_empty() {
 async fn agent_picker_backspace_removes_char_and_resets_selection() {
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     let config = picker_test_config();
     let mut tui = Tui::init(&config).await.unwrap();
@@ -6823,7 +6792,7 @@ async fn agent_picker_backspace_removes_char_and_resets_selection() {
 async fn agent_picker_down_bounded_by_filtered_count() {
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     let config = picker_test_config();
     let mut tui = Tui::init(&config).await.unwrap();
@@ -6861,7 +6830,7 @@ async fn agent_picker_enter_on_empty_filter_does_nothing() {
     // When the filter yields no matches, Enter should be a no-op (modal stays open).
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     let config = picker_test_config();
     let mut tui = Tui::init(&config).await.unwrap();
@@ -6894,7 +6863,7 @@ async fn agent_picker_enter_on_empty_filter_does_nothing() {
 async fn agent_picker_enter_activates_agent_immediately() {
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     // Create a real agent .md file so use_agent_by_name succeeds.
     let agents_dir = tmp.path().join("agents");
@@ -6926,7 +6895,7 @@ async fn agent_picker_enter_activates_agent_immediately() {
 async fn agent_picker_enter_with_no_sessions_starts_new_session() {
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     let agent_name = format!("picker-empty-{}", uuid::Uuid::new_v4());
     create_agent_stubs(&tmp.path().join("agents"), &[&agent_name]);
@@ -6978,7 +6947,7 @@ async fn agent_picker_enter_with_no_sessions_starts_new_session() {
 async fn agent_picker_enter_shows_session_picker() {
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     create_agent_stubs(&tmp.path().join("agents"), &["hermes"]);
     let config = picker_test_config();
@@ -7017,7 +6986,7 @@ async fn session_picker_esc_without_prior_session_goes_back_to_agent_picker() {
     // It must NOT keep the SessionPicker open and must NOT create a session (#467).
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     create_agent_stubs(&tmp.path().join("agents"), &["hermes"]);
 
@@ -7070,7 +7039,7 @@ async fn session_picker_esc_with_agent_origin_but_no_session_exits() {
     // harnx with `-a <agent>` (no session). ESC must exit the process (#467).
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     let config = picker_test_config();
     {
@@ -7108,7 +7077,7 @@ async fn agent_picker_esc_exits_when_no_agent_active() {
     // process (#467). Previously this did nothing (wrong behaviour from #451).
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     let config = picker_test_config();
     let mut tui = Tui::init(&config).await.unwrap();
@@ -7139,7 +7108,7 @@ async fn picker_ctrl_d_exits_from_agent_picker() {
     // Ctrl+D in AgentPicker must exit the process.
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     let config = picker_test_config();
     let mut tui = Tui::init(&config).await.unwrap();
@@ -7166,7 +7135,7 @@ async fn picker_ctrl_c_exits_from_agent_picker() {
     // Ctrl+C in AgentPicker must exit the process (no prompt to abort).
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     let config = picker_test_config();
     let mut tui = Tui::init(&config).await.unwrap();
@@ -7192,7 +7161,7 @@ async fn picker_ctrl_d_exits_from_session_picker() {
     // Ctrl+D in SessionPicker must exit the process.
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     let config = picker_test_config();
     let mut tui = Tui::init(&config).await.unwrap();
@@ -7220,7 +7189,7 @@ async fn picker_ctrl_c_exits_from_session_picker() {
     // Ctrl+C in SessionPicker must exit the process (no prompt to abort).
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     let config = picker_test_config();
     let mut tui = Tui::init(&config).await.unwrap();
@@ -7249,7 +7218,7 @@ async fn agent_picker_esc_dismisses_when_agent_already_active() {
     // AgentPicker cancels the switch and dismisses the picker.
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     let config = picker_test_config();
     {
@@ -7284,8 +7253,7 @@ async fn agent_picker_esc_dismisses_when_agent_already_active() {
 async fn session_picker_enter_loads_selected_session() {
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
-    let _data_env = EnvGuard::set("HARNX_DATA_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     let config = picker_test_config();
     {
@@ -7411,7 +7379,7 @@ async fn session_picker_enter_reconciles_from_origin_not_current_agent() {
 
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     let config = picker_test_config();
     {
@@ -7479,7 +7447,7 @@ async fn session_picker_enter_reconciles_from_origin_not_current_agent() {
 async fn session_picker_esc_restores_origin() {
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
-    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    let _env = TestEnvironment::set(tmp.path());
 
     // Setup an agent to restore
     create_agent_stubs(&tmp.path().join("agents"), &["apollo", "hermes"]);
@@ -7947,6 +7915,9 @@ async fn test_browsing_mode_first_up_scrolls_last_item_into_view() {
 
 #[tokio::test]
 async fn test_agent_command_leaves_tui_without_session_gap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = TestEnvironment::set(tmp.path());
     let mut harness = TuiTestHarness::with_size(60, 20).await;
     let tui = harness.tui();
     let config = tui.config.clone();
