@@ -117,7 +117,12 @@ fn input_schema<T: JsonSchema + 'static>() -> Value {
         .schema_as_json_value()
 }
 
-fn spec<T: JsonSchema + 'static>(name: &str, description: &str, read_only_hint: bool) -> ToolSpec {
+fn spec<T: JsonSchema + 'static>(
+    name: &str,
+    description: &str,
+    read_only_hint: bool,
+    call_template: &str,
+) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
         description: description.to_string(),
@@ -125,9 +130,22 @@ fn spec<T: JsonSchema + 'static>(name: &str, description: &str, read_only_hint: 
         idempotent_hint: false,
         read_only_hint,
         timeout_secs: None,
+        meta: None,
     }
+    .with_call_template(call_template)
 }
 ```
+
+Don't skip the `call_template` argument. `ToolSpec.meta` is the only place a
+client reads `call_template`/`result_template` from, so a spec built with
+`meta: None` renders as a raw YAML dump of the arguments. The original fs, bash,
+plans, and time conversions all left their templates behind on an rmcp
+`ServerHandler` — the crate's own, or for time the predecessor `harnx-mcp-time`
+crate. `run_toolset_main` serves neither; it builds `list_tools` from `ToolSpec`
+through its own adapter. Keep the strings in a `tool_templates` module that both
+the `Toolset` and the `ServerHandler` read. See
+`mcp-tool-template-design-guidelines-2026-05-08.md` for the template notation
+itself.
 
 ### 4. Roots-from-CLI-Only in Native Mode
 
@@ -205,7 +223,7 @@ Run `cargo fmt --all` after rename (string-length changes cause line-wrap violat
 ## Why This Works
 
 1. **Envelope parity**: The bridge already serialized `CallToolResult` to JSON. Native Toolset produces identical wire format.
-2. **Test preservation**: Existing `*_impl` handler tests survive unchanged because the native path wraps, not replaces.
+2. **Test preservation**: Existing `*_impl` handler tests survive unchanged because the native path wraps, not replaces. But surviving is not the same as still covering: anything the `ServerHandler` contributes on its own (`list_tools` output, `Tool.meta`) is no longer on the shipping path, and tests that drive the handler stay green while the native path regresses. Both fs and bash had a `*_advertise_call_template_only` test pass through the entire template regression. Assert against `Toolset::tools()`, or against both and compare.
 3. **Back-compat**: `run_toolset_main` handles `--mcp-stdio` flag, serving MCP over stdio when needed.
 4. **Schema reuse**: `JsonSchema` derives on param structs generate correct schemas for both MCP and Toolset paths.
 5. **Safety preserved**: Roots validation and `$HOME`-ancestor guard work identically in both modes.
@@ -214,6 +232,7 @@ Run `cargo fmt --all` after rename (string-length changes cause line-wrap violat
 
 **Test Cases**:
 - Envelope parity test: `assert_eq!` NATS reply against direct `to_value(CallToolResult)`
+- Template parity test: every `Toolset::tools()` spec carries a `call_template`, and it matches what MCP `list_tools` advertises — see `crates/harnx-bash-tools/tests/tool_templates.rs` and `fs_toolset_call_templates_match_mcp_handler`
 - Roots deny-on-empty: invoke tool with empty roots, assert `Recoverable` error
 - Out-of-root denial: invoke tool with path outside roots, assert denial
 - Write/read round-trip over real NATS
@@ -221,6 +240,8 @@ Run `cargo fmt --all` after rename (string-length changes cause line-wrap violat
 **Code Review Checklist**:
 - [ ] Does `invoke()` map all `ErrorData` → `Recoverable`? (Fatal only for serde failures)
 - [ ] Are all tool names in `tools()` covered by `invoke()` match arms?
+- [ ] Does every `ToolSpec` from `tools()` carry its `call_template`? (`meta: None` = YAML dump in the TUI)
+- [ ] Do the new tests assert against `Toolset::tools()`/`invoke()`, not only the `ServerHandler`?
 - [ ] Is empty-roots path tested (deny-all)?
 - [ ] Does integration test verify envelope parity?
 

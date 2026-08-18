@@ -1,3 +1,6 @@
+mod tool_specs;
+mod tool_templates;
+
 use async_trait::async_trait;
 use chrono::{Datelike, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -147,71 +150,7 @@ impl Toolset for TimeToolset {
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
-        vec![
-            ToolSpec {
-                name: "get_current_time".to_string(),
-                description: "Get current time in a specific timezone".to_string(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": { "timezone": { "type": "string" } }
-                }),
-                idempotent_hint: true,
-                read_only_hint: true,
-                timeout_secs: Some(60),
-                meta: None,
-            },
-            ToolSpec {
-                name: "convert_time".to_string(),
-                description: "Convert timestamps, timezones, and time offsets".to_string(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "isoTimestamp": { "type": "string" },
-                        "unixTimestamp": { "type": "number" },
-                        "epochMillis": { "type": "integer" },
-                        "offsetSeconds": { "type": "integer" },
-                        "offsetMinutes": { "type": "integer" },
-                        "offsetHours": { "type": "integer" },
-                        "offsetDays": { "type": "integer" },
-                        "timezone": { "type": "string" },
-                        "sourceTimezone": { "type": "string" }
-                    }
-                }),
-                idempotent_hint: true,
-                read_only_hint: true,
-                timeout_secs: Some(60),
-                meta: None,
-            },
-            ToolSpec {
-                name: "wait".to_string(),
-                description: "Wait for a specified number of seconds".to_string(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": { "seconds": { "type": "number" } },
-                    "required": ["seconds"]
-                }),
-                idempotent_hint: false,
-                read_only_hint: true,
-                timeout_secs: Some(3_660),
-                meta: None,
-            },
-            ToolSpec {
-                name: "wait_until".to_string(),
-                description: "Wait until a target time, up to 24 hours".to_string(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "time": { "type": "string" },
-                        "timezone": { "type": "string" }
-                    },
-                    "required": ["time"]
-                }),
-                idempotent_hint: false,
-                read_only_hint: true,
-                timeout_secs: Some(86_460),
-                meta: None,
-            },
-        ]
+        tool_specs::all()
     }
 
     async fn invoke(
@@ -385,6 +324,23 @@ fn recoverable(error: impl std::fmt::Display) -> ToolInvokeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_tool_advertises_a_call_template() {
+        for spec in TimeToolset::new().tools() {
+            let call_template = spec
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("call_template"))
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("tool '{}' has no call_template", spec.name));
+            assert!(
+                !call_template.is_empty(),
+                "tool '{}' has an empty call_template",
+                spec.name
+            );
+        }
+    }
 
     #[tokio::test]
     async fn current_time_returns_expected_shape() {

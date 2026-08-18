@@ -39,8 +39,54 @@ pub struct ToolSpec {
     pub timeout_secs: Option<u64>,
     /// Tool `_meta` as in-house JSON, including optional display templates.
     /// Missing values indicate tools without `call_template`, `result_template`, or other metadata.
+    ///
+    /// This is the only place a client looks for display templates.
+    /// `harnx_runtime::nats_tool_provider` reads `call_template` /
+    /// `result_template` out of here to build the `ToolDeclaration`, and
+    /// `harnx_toolset_server::run_toolset_main` rebuilds the MCP `list_tools`
+    /// response from these specs too. A template attached only to a server
+    /// crate's own rmcp `ServerHandler` therefore reaches nobody, and the tool
+    /// call renders as a raw YAML dump of its arguments. Use
+    /// [`ToolSpec::with_call_template`] / [`ToolSpec::with_result_template`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// `_meta` key holding one of the client's display templates.
+enum TemplateKey {
+    Call,
+    Result,
+}
+
+impl TemplateKey {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Call => "call_template",
+            Self::Result => "result_template",
+        }
+    }
+}
+
+impl ToolSpec {
+    /// Attach the template the client uses to render the tool call header.
+    #[must_use]
+    pub fn with_call_template(self, template: &str) -> Self {
+        self.with_template(TemplateKey::Call, template)
+    }
+
+    /// Attach the template the client uses to render the tool result.
+    #[must_use]
+    pub fn with_result_template(self, template: &str) -> Self {
+        self.with_template(TemplateKey::Result, template)
+    }
+
+    fn with_template(mut self, key: TemplateKey, template: &str) -> Self {
+        self.meta.get_or_insert_with(serde_json::Map::new).insert(
+            key.as_str().to_string(),
+            Value::String(template.to_string()),
+        );
+        self
+    }
 }
 
 /// Error returned directly by a [`Toolset`] implementation.
@@ -207,6 +253,35 @@ mod tests {
         let spec: ToolSpec = serde_json::from_value(value).expect("decode legacy tool spec");
         assert_eq!(spec.timeout_secs, None);
         assert_eq!(spec.meta, None);
+    }
+
+    #[test]
+    fn template_builders_create_and_extend_meta() {
+        let spec = tool_spec();
+        assert_eq!(spec.meta, None);
+
+        let spec = spec
+            .with_call_template("🕐 time")
+            .with_result_template("{{ result.content[0].text }}");
+
+        let meta = spec.meta.as_ref().expect("builders create the meta map");
+        assert_eq!(meta["call_template"], json!("🕐 time"));
+        assert_eq!(
+            meta["result_template"],
+            json!("{{ result.content[0].text }}")
+        );
+    }
+
+    #[test]
+    fn template_builders_preserve_unrelated_meta_keys() {
+        let mut spec = tool_spec();
+        spec.meta = json!({ "vendor": "harnx" }).as_object().cloned();
+
+        let spec = spec.with_call_template("call");
+
+        let meta = spec.meta.as_ref().expect("meta map survives");
+        assert_eq!(meta["vendor"], json!("harnx"));
+        assert_eq!(meta["call_template"], json!("call"));
     }
 
     #[test]

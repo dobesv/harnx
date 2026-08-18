@@ -40,6 +40,66 @@ async fn fs_tools_advertise_call_template_only() {
     }
 }
 
+/// The NATS toolset path and the MCP path must render a tool the same way:
+/// both read `tool_templates`, and this catches either side drifting.
+#[tokio::test]
+async fn fs_toolset_call_templates_match_mcp_handler() {
+    let temp_dir = TestDir::new();
+    let TestConnection {
+        _server_service,
+        client_service,
+    } = connect_server(
+        make_server(temp_dir.path()),
+        vec![temp_dir.path().to_path_buf()],
+    )
+    .await;
+    let peer = client_service.peer().clone();
+    let _client_task = tokio::spawn(async move {
+        let _ = client_service.waiting().await;
+    });
+
+    let mcp_templates: HashMap<String, String> = peer
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|tool| {
+            let template = tool.meta.as_ref().and_then(|meta| {
+                meta.0
+                    .get("call_template")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+            (
+                tool.name.to_string(),
+                template.unwrap_or_else(|| panic!("tool '{}' has no call_template", tool.name)),
+            )
+        })
+        .collect();
+
+    let toolset = crate::FsToolset::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
+    let specs = toolset.tools();
+    assert_eq!(specs.len(), mcp_templates.len());
+    for spec in &specs {
+        let meta = spec
+            .meta
+            .as_ref()
+            .unwrap_or_else(|| panic!("tool '{}' spec has no meta", spec.name));
+        assert_eq!(
+            meta.get("call_template").and_then(Value::as_str),
+            mcp_templates.get(&spec.name).map(String::as_str),
+            "call_template mismatch for tool '{}'",
+            spec.name
+        );
+        assert!(
+            !meta.contains_key("result_template"),
+            "tool '{}' must not pin result_template — let the client fall back to its generic audience-aware renderer",
+            spec.name
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_fs_server_list_tools() {
     let temp_dir = TestDir::new();

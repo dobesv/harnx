@@ -1,5 +1,6 @@
 use super::*;
 
+use harnx_toolset::Toolset;
 use harnx_toolset_server::content::audience;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{CallToolRequestParams, ClientCapabilities, InitializeRequestParams};

@@ -174,11 +174,9 @@ Path-dependency audit: Check for `path = "../old-crate-name"` in `Cargo.toml` fi
 
 ### 6. ToolSpec vs MCP Tool.meta Gap
 
-Native `ToolSpec` has: name, description, JSON schema, idempotent/read-only hints, timeout.
+At the time of this conversion, native `ToolSpec` had only: name, description, JSON schema, idempotent/read-only hints, timeout — no counterpart to MCP `Tool.meta` (templates, annotations).
 
-MCP `Tool.meta` has: templates, annotations, etc.
-
-If standalone MCP modes need `Tool.meta` fields that `ToolSpec` lacks, preserve the old `ServerHandler` implementation for those modes. The native toolset path doesn't use those metadata fields.
+`ToolSpec` since gained a `meta` field, and the native toolset path *does* use it: the runtime reads `call_template`/`result_template` out of it to render tool calls. Assuming otherwise is what broke the custom markdown rendering for every first-party server. Keep the templates in shared consts that both the `ServerHandler` and the `Toolset` read, so the two paths can't drift.
 
 ### 7. Lib.rs Sharing Pattern
 

@@ -16,6 +16,14 @@ tags:
 plan_ref: "issue-498-tool-templates-more-info"
 ---
 
+> **Where the template goes.** The `.with_meta(...)` snippets below predate the
+> NATS toolsets. For a first-party server, the template belongs on the
+> `ToolSpec` the `Toolset` advertises — use `ToolSpec::with_call_template` /
+> `with_result_template`. That is what the runtime reads. Attaching it only to
+> the rmcp `ServerHandler` is how the templates silently stopped rendering. Keep
+> the strings in a shared `tool_templates` module so the handler and the toolset
+> can't drift. The notation and filter guidance in this doc still applies.
+
 ## Problem
 
 MCP tool call templates were too terse, showing minimal parameter info with opaque single-character prefixes (`#`, `?`, `~`, `+`). Users couldn't understand what a tool call was doing without expanding to full args. Large text inputs (plan body, note body) were invisible in the transcript.

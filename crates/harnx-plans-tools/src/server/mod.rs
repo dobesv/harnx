@@ -31,6 +31,22 @@ pub(crate) use params::*;
 pub use store::cleanup_loop;
 pub(crate) use store::*;
 
+use crate::tool_templates;
+
+/// Build a `_meta` block from a tool's call template plus the result template
+/// every plans tool shares.
+fn tool_meta(call_template: &str) -> MetaObject {
+    MetaObject(
+        json!({
+            "call_template": call_template,
+            "result_template": tool_templates::RESULT,
+        })
+        .as_object()
+        .expect("object literal")
+        .clone(),
+    )
+}
+
 #[derive(Clone)]
 pub struct PlansServer {
     dir: PathBuf,
