@@ -169,7 +169,7 @@ Verified `configured_worker_services` falls back to `ConfigData.use_tools` when 
 
 2. **rmcp-clean boundary**: `harnx-toolset` remains rmcp-free. Adapters (bridge, toolset-server) translate between rmcp types and in-house wire types. `ToolSpec.meta` is pure JSON, transportable over NATS without rmcp.
 
-3. **Prerequisite sequencing**: The `_meta` propagation fix landed before the direct path was removed. Template support survived the transition.
+3. **Prerequisite sequencing**: The `_meta` propagation fix landed before the direct path was removed. Template support survived the transition **for bridged MCP servers only**. It did not survive for the first-party servers: their native `Toolset` impls hardcoded `ToolSpec.meta: None`, so bash/fs/plans/time/sub-agent tool calls silently fell back to the generic YAML dump until the templates were re-attached. Propagating metadata through the adapters is not enough — the producer has to populate it.
 
 4. **No half-migration**: Kept `harnx-mcp` exports until all callers repointed, `rg`-verified zero references, then deleted atomically. Deletes in a single commit, not scattered across PRs.
 

@@ -23,42 +23,38 @@ impl ServerHandler for FsServer {
                 Tool::new("read", "Read a text file with line numbers, pagination, grep filtering, and smart truncation. Prefer this tool over shell commands like sed, cat, head, tail. Use offset+limit to read specific line ranges instead of sed -n. Also reads local image files (PNG, JPEG, GIF, WebP, up to 5MB) and returns them as viewable images for vision-capable models — use this to view/inspect an image file by its path.", Map::new())
                     .with_input_schema::<ReadFileParams>()
                     .annotate(read_only.clone())
-                    .with_meta(make_tool_meta("📖 {{ args.path }}{% if args.offset %} +{{ args.offset }}{% endif %}{% if args.limit is not none %} [:{{ args.limit }}]{% endif %}{% if args.tail is not none %} [tail:{{ args.tail }}]{% endif %}{% if args.grep %} /{{ args.grep }}/{% endif %}{% if args.head_lines is not none %} [head:{{ args.head_lines }}]{% endif %}{% if args.tail_lines is not none %} [tail_lines:{{ args.tail_lines }}]{% endif %}{% if args.max_output_bytes is not none %} [:{{ args.max_output_bytes }}b]{% endif %}")),
+                    .with_meta(make_tool_meta(tool_templates::READ_CALL)),
                 Tool::new("write", "Write or create a file, replacing its contents.", Map::new())
                     .with_input_schema::<WriteFileParams>()
-                    .with_meta(make_tool_meta("✏️ {{ args.path }} ({{ args.content | length }}ch)")),
+                    .with_meta(make_tool_meta(tool_templates::WRITE_CALL)),
                 Tool::new("edit", "Replace exact text within an existing file.", Map::new())
                     .with_input_schema::<EditFileParams>()
-                    .with_meta(make_tool_meta("🔧 {{ args.path }}{% if args.replace_all %} [all]{% endif %}\n▸ {{ args.old_text | truncate(60) }}\n↳ {{ args.new_text | truncate(60) }}")),
+                    .with_meta(make_tool_meta(tool_templates::EDIT_CALL)),
                 Tool::new("insert",
                     "Insert text into a file at a specific line position.      insert_line: 0 prepends before line 1; insert_line: N inserts after line N; omit insert_line (or set N = total lines) to append to the end of the file. Optional column (1-indexed byte offset within      the line, default 1 = start of line) for mid-line insertion.      For exact-text replacement use edit; for regex replacement use re_replace.",
                     Map::new())
                     .with_input_schema::<InsertParams>()
-                    .with_meta(make_tool_meta(
-                        "➕ {{ args.path }}:{{ args.insert_line | default(value=\"end\") }}{% if args.column %}:{{ args.column }}{% endif %}\n↳ {{ args.insert_text | truncate(60) }}"
-                    )),
+                    .with_meta(make_tool_meta(tool_templates::INSERT_CALL)),
                 Tool::new("re_replace",
                     "Replace text in a file using a regular expression.      Uses fancy_regex syntax (supports lookahead/lookbehind).      Use $0 for the full match, $1/$2 etc. for capture groups in replacement.      Errors if pattern matches nothing. If pattern matches more than once,      set replace_all=true; otherwise only the first match is replaced.      For exact-text replacement use edit instead.",
                     Map::new())
                     .with_input_schema::<ReReplaceParams>()
-                    .with_meta(make_tool_meta(
-                        "🔁 {{ args.path }}{% if args.replace_all %} [all]{% endif %}\n▸ /{{ args.pattern }}/\n↳ {{ args.replacement | truncate(60) }}"
-                    )),
+                    .with_meta(make_tool_meta(tool_templates::RE_REPLACE_CALL)),
                 Tool::new("ls", "List directory contents, optionally recursively. Prefer this tool over running bash ls.", Map::new())
                     .with_input_schema::<ListDirectoryParams>()
                     .annotate(read_only.clone())
-                    .with_meta(make_tool_meta("📂 {{ args.path }}{% if args.recursive %} -r{% endif %}")),
+                    .with_meta(make_tool_meta(tool_templates::LS_CALL)),
                 Tool::new("grep", "Search file contents with regex and optional context lines. Prefer this tool over running bash grep.", Map::new())
                     .with_input_schema::<SearchFilesParams>()
                     .annotate(read_only.clone())
-                    .with_meta(make_tool_meta("🔍 /{{ args.pattern }}/{% if args.ignore_case %}i{% endif %}{% if args.path %} {{ args.path }}{% endif %}{% if args.include %} [{{ args.include }}]{% endif %}{% if args.context_lines %} ±{{ args.context_lines }}{% endif %}{% if args.max_results %} [max:{{ args.max_results }}]{% endif %}")),
+                    .with_meta(make_tool_meta(tool_templates::GREP_CALL)),
                 Tool::new("find", "Find files by glob pattern. Prefer this tool over running bash find.", Map::new())
                     .with_input_schema::<FindFilesParams>()
                     .annotate(read_only.clone())
-                    .with_meta(make_tool_meta("🔎 {{ args.pattern }}{% if args.path %} {{ args.path }}{% endif %}{% if args.max_results %} [max:{{ args.max_results }}]{% endif %}")),
+                    .with_meta(make_tool_meta(tool_templates::FIND_CALL)),
                 Tool::new("rollback_file", "Restore a repository to a prior harnx history snapshot. Pass the commit SHA from the 'commit <sha>' line at the top of a prior tool response's diff as the commit_id parameter.", Map::new())
                     .with_input_schema::<RollbackParams>()
-                    .with_meta(make_tool_meta("⏪ rollback {{ args.commit_id | truncate(8, end='') }}{% if args.repo_path %} @ {{ args.repo_path }}{% endif %}")),
+                    .with_meta(make_tool_meta(tool_templates::ROLLBACK_FILE_CALL)),
             ];
 
         Ok(ListToolsResult::with_all_items(tools))

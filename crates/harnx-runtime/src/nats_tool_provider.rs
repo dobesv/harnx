@@ -661,6 +661,36 @@ mod tests {
         assert_eq!(tools["fs_read"].raw_name, "read");
     }
 
+    /// Native toolsets ship their display templates in `ToolSpec.meta`; if that
+    /// stops reaching `ToolDeclaration` the TUI falls back to a YAML dump.
+    #[test]
+    fn carries_native_toolset_templates_into_tool_declarations() {
+        harnx_core::require_nextest();
+        use harnx_toolset::Toolset;
+
+        let specs = harnx_time_server::TimeToolset::new().tools();
+        assert!(!specs.is_empty());
+        let registration = Registration {
+            package: None,
+            config: String::new(),
+            server: "time".to_string(),
+            tools: specs.clone(),
+            schema_version: 1,
+            proto_version: 1,
+        };
+
+        let (_, declarations) = build_registered_tools(None, vec![registration]);
+
+        assert_eq!(declarations.len(), specs.len());
+        for declaration in &declarations {
+            let template = declaration
+                .call_template
+                .as_deref()
+                .unwrap_or_else(|| panic!("tool '{}' lost its call_template", declaration.name));
+            assert!(!template.is_empty());
+        }
+    }
+
     #[test]
     fn builds_tool_declaration_templates_from_tool_spec_meta() {
         harnx_core::require_nextest();

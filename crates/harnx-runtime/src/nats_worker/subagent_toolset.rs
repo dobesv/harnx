@@ -437,80 +437,110 @@ impl Toolset for SubagentToolset {
 fn tool_specs(agent: &str, server_name: &str, timeouts: SubagentTimeouts) -> Vec<ToolSpec> {
     let request_timeout = timeouts.operation.as_secs().saturating_add(5);
     vec![
-        ToolSpec {
-                name: format!("{server_name}_session_new"),
-                description: format!("Create a new session on the '{}' agent", agent),
-                input_schema: json!({ "type": "object", "properties": {} }),
-                idempotent_hint: false,
-                read_only_hint: false,
-                timeout_secs: Some(request_timeout),
-                meta: None,
+        session_new_spec(agent, server_name, request_timeout),
+        session_prompt_spec(agent, server_name, request_timeout),
+        session_id_tool_spec(agent, server_name, SessionIdTool::Load),
+        session_id_tool_spec(agent, server_name, SessionIdTool::Cancel),
+    ]
+}
+
+/// A truncated session ID, so the call header stays one short line.
+const SHORT_SESSION_ID: &str = "{{ args.session_id | truncate(8, end='') }}";
+
+fn session_new_spec(agent: &str, server_name: &str, request_timeout: u64) -> ToolSpec {
+    ToolSpec {
+        name: format!("{server_name}_session_new"),
+        description: format!("Create a new session on the '{agent}' agent"),
+        input_schema: json!({ "type": "object", "properties": {} }),
+        idempotent_hint: false,
+        read_only_hint: false,
+        timeout_secs: Some(request_timeout),
+        meta: None,
+    }
+    .with_call_template(&format!("@ {server_name} new session"))
+}
+
+fn session_prompt_spec(agent: &str, server_name: &str, request_timeout: u64) -> ToolSpec {
+    ToolSpec {
+        name: format!("{server_name}_session_prompt"),
+        description: format!(
+            "Send a prompt to the '{agent}' agent. To continue a conversation, pass only the exact session_id returned by session_prompt or session_new. To start a new conversation, omit session_id; empty or whitespace-only values also start a new session. Do not invent a session ID."
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The prompt message to send to the agent"
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "To continue a conversation, use the exact session ID returned by session_prompt or session_new"
+                }
             },
-            ToolSpec {
-                name: format!("{server_name}_session_prompt"),
-                description: format!(
-                    "Send a prompt to the '{}' agent. To continue a conversation, pass only the exact session_id returned by session_prompt or session_new. To start a new conversation, omit session_id; empty or whitespace-only values also start a new session. Do not invent a session ID.",
-                    agent
-                ),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "message": {
-                            "type": "string",
-                            "description": "The prompt message to send to the agent"
-                        },
-                        "session_id": {
-                            "type": "string",
-                            "description": "To continue a conversation, use the exact session ID returned by session_prompt or session_new"
-                        }
-                    },
-                    "required": ["message"]
-                }),
-                idempotent_hint: false,
-                read_only_hint: false,
-                timeout_secs: Some(request_timeout),
-                meta: None,
+            "required": ["message"]
+        }),
+        idempotent_hint: false,
+        read_only_hint: false,
+        timeout_secs: Some(request_timeout),
+        meta: None,
+    }
+    .with_call_template(&format!(
+        "@ {server_name}{{% if args.session_id %}} [{SHORT_SESSION_ID}]{{% endif %}}\n{{{{ args.message }}}}"
+    ))
+}
+
+/// The two tools that take nothing but a session ID.
+enum SessionIdTool {
+    Load,
+    Cancel,
+}
+
+impl SessionIdTool {
+    fn verb(&self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::Cancel => "cancel",
+        }
+    }
+
+    fn describe(&self, agent: &str) -> String {
+        match self {
+            Self::Load => format!(
+                "Load an existing session on the '{agent}' agent and resume its prior context"
+            ),
+            Self::Cancel => format!("Cancel a running prompt on the '{agent}' agent"),
+        }
+    }
+
+    /// Loading resumes context without touching the session; cancelling stops
+    /// whatever it was doing.
+    fn read_only(&self) -> bool {
+        matches!(self, Self::Load)
+    }
+}
+
+fn session_id_tool_spec(agent: &str, server_name: &str, tool: SessionIdTool) -> ToolSpec {
+    let verb = tool.verb();
+    ToolSpec {
+        name: format!("{server_name}_session_{verb}"),
+        description: tool.describe(agent),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": format!("The session ID to {verb}")
+                }
             },
-            ToolSpec {
-                name: format!("{server_name}_session_load"),
-                description: format!(
-                    "Load an existing session on the '{}' agent and resume its prior context",
-                    agent
-                ),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "session_id": {
-                            "type": "string",
-                            "description": "The session ID to load"
-                        }
-                    },
-                    "required": ["session_id"]
-                }),
-                idempotent_hint: true,
-                read_only_hint: true,
-                timeout_secs: Some(60),
-                meta: None,
-            },
-            ToolSpec {
-                name: format!("{server_name}_session_cancel"),
-                description: format!("Cancel a running prompt on the '{}' agent", agent),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "session_id": {
-                            "type": "string",
-                            "description": "The session ID to cancel"
-                        }
-                    },
-                    "required": ["session_id"]
-                }),
-                idempotent_hint: true,
-                read_only_hint: false,
-                timeout_secs: Some(60),
-                meta: None,
-            },
-        ]
+            "required": ["session_id"]
+        }),
+        idempotent_hint: true,
+        read_only_hint: tool.read_only(),
+        timeout_secs: Some(60),
+        meta: None,
+    }
+    .with_call_template(&format!("@ {server_name} {verb} {SHORT_SESSION_ID}"))
 }
 
 #[cfg(test)]
@@ -545,5 +575,37 @@ mod tests {
         assert_eq!(tools[3].input_schema["required"], json!(["session_id"]));
         assert_eq!(tools[0].timeout_secs, Some(12));
         assert_eq!(tools[1].timeout_secs, Some(12));
+    }
+
+    /// Without a `call_template` the client renders a YAML dump of the
+    /// arguments, which for `session_prompt` means the whole prompt body.
+    #[test]
+    fn every_session_tool_advertises_a_call_template() {
+        let tools = tool_specs(
+            "pkg/helper",
+            "pkg__helper",
+            SubagentTimeouts::new(Duration::from_secs(3), Duration::from_secs(7)),
+        );
+
+        let templates = tools
+            .iter()
+            .map(|tool| {
+                tool.meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("call_template"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("tool '{}' has no call_template", tool.name))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            templates,
+            vec![
+                "@ pkg__helper new session",
+                "@ pkg__helper{% if args.session_id %} [{{ args.session_id | truncate(8, end='') }}]{% endif %}\n{{ args.message }}",
+                "@ pkg__helper load {{ args.session_id | truncate(8, end='') }}",
+                "@ pkg__helper cancel {{ args.session_id | truncate(8, end='') }}",
+            ]
+        );
     }
 }

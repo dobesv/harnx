@@ -43,6 +43,8 @@ mod walk;
 pub use params::*;
 pub(crate) use walk::*;
 
+use crate::tool_templates;
+
 #[derive(Clone)]
 pub struct FsServer {
     allowlist: Arc<ResolvedAllowlist>,

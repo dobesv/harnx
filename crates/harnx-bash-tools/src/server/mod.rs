@@ -56,6 +56,20 @@ pub(crate) use handlers::*;
 pub(crate) use params::*;
 pub(crate) use render::*;
 
+use crate::tool_templates;
+
+/// Build a `_meta` block carrying only the call template. Bash tools omit
+/// `result_template` so the client keeps its audience-aware renderer, which is
+/// what surfaces the history diff blocks mutating tools append to their output.
+fn call_template_meta(call_template: &str) -> MetaObject {
+    MetaObject(
+        json!({ "call_template": call_template })
+            .as_object()
+            .expect("object literal")
+            .clone(),
+    )
+}
+
 // Spawned process tracking
 pub(crate) struct SpawnedProcess {
     child: Box<dyn ChildWrapper>,

@@ -1,4 +1,5 @@
 use crate::server::*;
+use crate::tool_templates;
 use async_trait::async_trait;
 use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
 use rmcp::model::{CallToolResult, ErrorCode, ErrorData, Tool};
@@ -51,7 +52,13 @@ fn input_schema<T: JsonSchema + 'static>() -> Value {
         .schema_as_json_value()
 }
 
-fn spec<T: JsonSchema + 'static>(name: &str, description: &str, read_only_hint: bool) -> ToolSpec {
+/// Build a spec with the tool's call template plus the shared result template.
+fn spec<T: JsonSchema + 'static>(
+    name: &str,
+    description: &str,
+    read_only_hint: bool,
+    call_template: &str,
+) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
         description: description.to_string(),
@@ -61,6 +68,8 @@ fn spec<T: JsonSchema + 'static>(name: &str, description: &str, read_only_hint: 
         timeout_secs: None,
         meta: None,
     }
+    .with_call_template(call_template)
+    .with_result_template(tool_templates::RESULT)
 }
 
 fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T, ToolInvokeError> {
@@ -86,6 +95,19 @@ fn unknown_tool(tool: &str) -> Result<Value, ToolInvokeError> {
     )))
 }
 
+/// Declares the tool table: params type, tool name, read-only hint, call
+/// template, description. A macro because `spec` is generic over the params
+/// type, so the rows cannot live in a plain array.
+macro_rules! plan_tool_specs {
+    (
+        $( $params:ty : $name:literal, $read_only:literal, $template:ident, $description:literal; )+
+    ) => {
+        vec![
+            $( spec::<$params>($name, $description, $read_only, tool_templates::$template), )+
+        ]
+    };
+}
+
 #[async_trait]
 impl Toolset for PlansToolset {
     fn name(&self) -> &str {
@@ -93,62 +115,37 @@ impl Toolset for PlansToolset {
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
-        vec![
-            spec::<ListPlansParams>(
-                "list_plans",
-                "List all plans with metadata and task/note counts.",
-                true,
-            ),
-            spec::<AddPlanParams>(
-                "add_plan",
-                "Create a new plan with optional metadata. Set body with content (or body for compatibility). Keep body content under 1000 words per call; use update_plan with replace_in_content for targeted edits.",
-                false,
-            ),
-            spec::<GetPlanParams>(
-                "get_plan",
-                "Read plan metadata, body, and list task/note IDs.",
-                true,
-            ),
-            spec::<UpdatePlanParams>(
-                "update_plan",
-                "Update plan body and metadata. Creates plan if it doesn't exist. Use content or replace_content to rewrite body, append_content to extend it, or replace_in_content for surgical edits. Provide at most one body-edit parameter. Optionally batch-create tasks. Keep each write under 1000 words.",
-                false,
-            ),
-            spec::<DeletePlanParams>(
-                "delete_plan",
-                "Delete an entire plan and all its tasks and notes.",
-                false,
-            ),
-            spec::<ListTasksParams>(
-                "list_tasks",
-                "List tasks in a plan with optional filters.",
-                true,
-            ),
-            spec::<AddTaskParams>(
-                "add_task",
-                "Create a task in a plan. Keep body under 1000 words; use update_task with replace_in_body for targeted edits.",
-                false,
-            ),
-            spec::<GetTaskParams>("get_task", "Read a task by ID within a plan.", true),
-            spec::<UpdateTaskParams>(
-                "update_task",
-                "Update a task within its plan. Use replace_body to rewrite body, append_body to extend it, or replace_in_body for surgical edits. Keep each write under 1000 words.",
-                false,
-            ),
-            spec::<DeleteTaskParams>("delete_task", "Delete a task by ID.", false),
-            spec::<ListNotesParams>("list_notes", "List notes for a plan.", true),
-            spec::<AddNoteParams>(
-                "add_note",
-                "Add a note to a plan. Keep body under 1000 words; use update_note with replace_in_body for targeted edits.",
-                false,
-            ),
-            spec::<GetNoteParams>("get_note", "Read a note from a plan.", true),
-            spec::<UpdateNoteParams>(
-                "update_note",
-                "Update a note within its plan. Use replace_body, append_body, or replace_in_body for body edits. Keep each write under 1000 words.",
-                false,
-            ),
-            spec::<DeleteNoteParams>("delete_note", "Delete a note from a plan.", false),
+        plan_tool_specs![
+            ListPlansParams: "list_plans", true, LIST_PLANS_CALL,
+                "List all plans with metadata and task/note counts.";
+            AddPlanParams: "add_plan", false, ADD_PLAN_CALL,
+                "Create a new plan with optional metadata. Set body with content (or body for compatibility). Keep body content under 1000 words per call; use update_plan with replace_in_content for targeted edits.";
+            GetPlanParams: "get_plan", true, GET_PLAN_CALL,
+                "Read plan metadata, body, and list task/note IDs.";
+            UpdatePlanParams: "update_plan", false, UPDATE_PLAN_CALL,
+                "Update plan body and metadata. Creates plan if it doesn't exist. Use content or replace_content to rewrite body, append_content to extend it, or replace_in_content for surgical edits. Provide at most one body-edit parameter. Optionally batch-create tasks. Keep each write under 1000 words.";
+            DeletePlanParams: "delete_plan", false, DELETE_PLAN_CALL,
+                "Delete an entire plan and all its tasks and notes.";
+            ListTasksParams: "list_tasks", true, LIST_TASKS_CALL,
+                "List tasks in a plan with optional filters.";
+            AddTaskParams: "add_task", false, ADD_TASK_CALL,
+                "Create a task in a plan. Keep body under 1000 words; use update_task with replace_in_body for targeted edits.";
+            GetTaskParams: "get_task", true, GET_TASK_CALL,
+                "Read a task by ID within a plan.";
+            UpdateTaskParams: "update_task", false, UPDATE_TASK_CALL,
+                "Update a task within its plan. Use replace_body to rewrite body, append_body to extend it, or replace_in_body for surgical edits. Keep each write under 1000 words.";
+            DeleteTaskParams: "delete_task", false, DELETE_TASK_CALL,
+                "Delete a task by ID.";
+            ListNotesParams: "list_notes", true, LIST_NOTES_CALL,
+                "List notes for a plan.";
+            AddNoteParams: "add_note", false, ADD_NOTE_CALL,
+                "Add a note to a plan. Keep body under 1000 words; use update_note with replace_in_body for targeted edits.";
+            GetNoteParams: "get_note", true, GET_NOTE_CALL,
+                "Read a note from a plan.";
+            UpdateNoteParams: "update_note", false, UPDATE_NOTE_CALL,
+                "Update a note within its plan. Use replace_body, append_body, or replace_in_body for body edits. Keep each write under 1000 words.";
+            DeleteNoteParams: "delete_note", false, DELETE_NOTE_CALL,
+                "Delete a note from a plan.";
         ]
     }
 
