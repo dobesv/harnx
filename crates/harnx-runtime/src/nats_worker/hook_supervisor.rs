@@ -4,6 +4,7 @@ use super::hook_registration::{
     ensure_bucket_for, prepare_hook_registrations, remove_registration_and_expectation,
     wait_for_registration, PreparedHook,
 };
+use super::process_manager::ChildProcessManager;
 use anyhow::{bail, Context, Result};
 use async_nats::jetstream::kv;
 use harnx_core::hooks::{HookConfig, HooksConfig};
@@ -37,6 +38,7 @@ pub struct HookServerStartConfig {
     pub(super) tls_cert: Option<String>,
     pub(super) tls_key: Option<String>,
     pub(super) tls_ca: Option<String>,
+    pub(super) process_manager: ChildProcessManager,
 }
 
 impl HookServerStartConfig {
@@ -56,12 +58,18 @@ impl HookServerStartConfig {
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
+            process_manager: ChildProcessManager::new(),
         }
     }
 
     /// Set the JetStream replica count from the cluster this config connects to.
     pub fn with_replicas(mut self, replicas: Option<usize>) -> Self {
         self.replicas = replicas;
+        self
+    }
+
+    pub(super) fn with_process_manager(mut self, manager: ChildProcessManager) -> Self {
+        self.process_manager = manager;
         self
     }
 
@@ -86,6 +94,7 @@ impl HookServerStartConfig {
 
 /// Owns one child process per configured hook and removes registrations on exit.
 pub struct HookServerSupervisor {
+    _process_manager: ChildProcessManager,
     processes: Arc<Mutex<HashMap<u32, String>>>,
     tasks: Vec<JoinHandle<()>>,
     client: async_nats::Client,
@@ -111,6 +120,7 @@ impl HookServerSupervisor {
         let run_id = Uuid::new_v4().simple().to_string()[..8].to_string();
         let processes = Arc::new(Mutex::new(HashMap::new()));
         let mut supervisor = Self {
+            _process_manager: config.process_manager.clone(),
             processes: Arc::clone(&processes),
             tasks: Vec::new(),
             client: config.client.clone(),
@@ -190,7 +200,7 @@ async fn spawn_enabled_hooks(
     let expectations = ensure_bucket_for(config, HOOK_EXPECTATIONS_BUCKET).await?;
     let mut startups = Vec::new();
     for prepared in prepared {
-        let mut child = match spawn_hook_server(config, &prepared.hook, &prepared.name) {
+        let mut child = match spawn_hook_server(config, &prepared.hook, &prepared.name).await {
             Ok(child) => child,
             Err(error) => {
                 publish_startup_rejector(

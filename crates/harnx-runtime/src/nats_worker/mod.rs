@@ -34,6 +34,7 @@ mod hook_crash;
 mod hook_process;
 mod hook_registration;
 mod hook_supervisor;
+mod process_manager;
 pub mod server_reconciler;
 mod subagent_toolset;
 mod tool_registry;

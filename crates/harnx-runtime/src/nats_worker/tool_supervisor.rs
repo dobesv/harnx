@@ -1,4 +1,5 @@
 use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
+use super::process_manager::ChildProcessManager;
 use super::tool_registry::{
     ensure_registry_bucket, log_registry_contents, remove_registrations_for_config,
     wait_for_registration, RegistrationWait, SupervisedProcesses, SupervisedServer,
@@ -52,6 +53,7 @@ pub struct ToolServerStartConfig {
     /// the worker log. Set by foreground diagnostics, where routing a server's
     /// explanation of its own failure into a file is the opposite of useful.
     inherit_child_output: bool,
+    process_manager: ChildProcessManager,
 }
 
 impl ToolServerStartConfig {
@@ -72,6 +74,7 @@ impl ToolServerStartConfig {
             tls_key: None,
             tls_ca: None,
             inherit_child_output: false,
+            process_manager: ChildProcessManager::new(),
         }
     }
 
@@ -118,6 +121,7 @@ impl ToolServerStartConfig {
             self.nats_url.clone(),
             self.token.clone(),
         )
+        .with_process_manager(self.process_manager.clone())
         .with_replicas(self.replicas)
         .with_tls(&self.tls_endpoint())
     }
@@ -125,6 +129,7 @@ impl ToolServerStartConfig {
 
 /// Owns local tool-server children for one worker process.
 pub struct ToolServerSupervisor {
+    _process_manager: ChildProcessManager,
     processes: SupervisedProcesses,
     tasks: Vec<JoinHandle<()>>,
     hook_supervisors: Vec<HookServerSupervisor>,
@@ -161,6 +166,7 @@ impl ToolServerSupervisor {
     ) -> Result<Self> {
         let processes = Arc::new(Mutex::new(HashMap::new()));
         let mut supervisor = Self {
+            _process_manager: config.process_manager.clone(),
             processes: Arc::clone(&processes),
             tasks: Vec::new(),
             hook_supervisors: Vec::new(),
@@ -387,7 +393,7 @@ async fn spawn_enabled_tool_servers(
         )) {
             continue;
         }
-        match spawn_tool_server(config, server) {
+        match spawn_tool_server(config, server).await {
             Ok(child) => {
                 let Some(pid) = child.id() else {
                     warn_server_failure(&server.name, "spawned child has no process ID");
@@ -517,7 +523,10 @@ fn apply_tls_env(command: &mut Command, config: &ToolServerStartConfig) {
     }
 }
 
-fn spawn_tool_server(config: &ToolServerStartConfig, server: &ToolServerConfig) -> Result<Child> {
+async fn spawn_tool_server(
+    config: &ToolServerStartConfig,
+    server: &ToolServerConfig,
+) -> Result<Child> {
     let binary = resolve_tool_binary(server)?;
     let mut command = Command::new(&binary);
     command
@@ -545,14 +554,17 @@ fn spawn_tool_server(config: &ToolServerStartConfig, server: &ToolServerConfig) 
         .stdout(child_output_sink(config))
         .stderr(child_output_sink(config))
         .kill_on_drop(true);
-    configure_tool_process(&mut command);
-    command.spawn().with_context(|| {
-        format!(
-            "spawn tool server '{}' from {}",
-            server.name,
-            binary.display()
-        )
-    })
+    config
+        .process_manager
+        .spawn(command)
+        .await
+        .with_context(|| {
+            format!(
+                "spawn tool server '{}' from {}",
+                server.name,
+                binary.display()
+            )
+        })
 }
 
 /// Report a tool-server problem. Deliberately not phrased as "failed to start":
@@ -675,33 +687,6 @@ async fn wait_for_child(child: &mut Child) -> std::io::Result<std::process::Exit
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
-
-#[cfg(unix)]
-fn configure_tool_process(command: &mut Command) {
-    #[cfg(target_os = "linux")]
-    let parent_pid = std::process::id() as libc::pid_t;
-    // SAFETY: pre_exec invokes only async-signal-safe libc calls.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            #[cfg(target_os = "linux")]
-            {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::getppid() != parent_pid {
-                    libc::raise(libc::SIGTERM);
-                }
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(unix))]
-fn configure_tool_process(_command: &mut Command) {}
 
 #[cfg(test)]
 mod tests {
