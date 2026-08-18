@@ -2,6 +2,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 
+/// Environment variable describing the stdio protocol expected from a hook.
+pub const HARNX_HOOK_PROTOCOL_ENV: &str = "HARNX_HOOK_PROTOCOL";
+
+/// Value of [`HARNX_HOOK_PROTOCOL_ENV`] for persistent JSON Lines hooks.
+pub const HARNX_HOOK_PROTOCOL_JSONL: &str = "jsonl";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookPayload {
     pub session_id: String,

@@ -89,7 +89,6 @@ If omitted, the AWS SDK default credential chain applies:
 
 - The HTTP server binds to **loopback only** (`127.0.0.1`), never to `0.0.0.0`
 - The bearer token is a **random UUID generated per session** — it changes every time `harnx-aws-creds` starts
-- The token is printed to stderr so operators can see it: `harnx-aws-creds: authorization token: <uuid>`
 - Credentials are fetched on-demand from the provider, so short-lived credentials (STS, SSO) are refreshed automatically
 - `~/.aws` is never mounted into the sandbox — the credential files remain inaccessible to the sandboxed process
 

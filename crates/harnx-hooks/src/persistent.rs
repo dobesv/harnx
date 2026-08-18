@@ -1,6 +1,6 @@
 use crate::{
-    executor::control_from_result, HookCommand, HookOutcome, HookPayload, HookResult,
-    HookResultControl,
+    executor::{control_from_result, persistent_hook_command},
+    HookCommand, HookOutcome, HookPayload, HookResult, HookResultControl,
 };
 
 use anyhow::{bail, Result};
@@ -171,7 +171,7 @@ impl Default for PersistentHookManager {
 
 impl PersistentHookProcess {
     fn spawn(hook: &HookCommand) -> Result<Self> {
-        let mut child = super::executor::base_hook_command(&hook.argv, hook.package_dir.as_deref())
+        let mut child = persistent_hook_command(&hook.argv, hook.package_dir.as_deref())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -250,7 +250,7 @@ impl PersistentHookProcess {
                     Ok(Some(line)) => {
                         let line = line.trim();
                         if !line.is_empty() {
-                            warn!("Persistent hook stderr: {line}");
+                            debug!("Persistent hook stderr: {line}");
                             if let Ok(mut buf) = stderr_lines_task.lock() {
                                 if buf.len() == HOOK_STDERR_TAIL_LINES {
                                     buf.pop_front();

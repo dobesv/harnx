@@ -51,6 +51,16 @@ pub(crate) fn base_hook_command(argv: &[String], package_dir: Option<&Path>) -> 
     cmd
 }
 
+/// Build a hook command whose child must speak the persistent JSONL protocol.
+pub(crate) fn persistent_hook_command(argv: &[String], package_dir: Option<&Path>) -> Command {
+    let mut cmd = base_hook_command(argv, package_dir);
+    cmd.env(
+        harnx_core::hooks::HARNX_HOOK_PROTOCOL_ENV,
+        harnx_core::hooks::HARNX_HOOK_PROTOCOL_JSONL,
+    );
+    cmd
+}
+
 pub async fn execute_command_hook(payload: &HookPayload, hook: &HookCommand) -> HookOutcome {
     let command = hook.display();
     let timeout_secs = hook.timeout;
