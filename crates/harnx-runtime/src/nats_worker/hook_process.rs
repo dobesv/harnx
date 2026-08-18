@@ -54,7 +54,7 @@ pub(super) fn apply_tls_env(command: &mut Command, config: &HookServerStartConfi
     }
 }
 
-pub(super) fn spawn_hook_server(
+pub(super) async fn spawn_hook_server(
     config: &HookServerStartConfig,
     hook: &HookConfig,
     name: &str,
@@ -95,9 +95,10 @@ pub(super) fn spawn_hook_server(
         .stdout(harnx_core::logging::child_output_sink())
         .stderr(harnx_core::logging::child_output_sink())
         .kill_on_drop(true);
-    configure_hook_process(&mut command);
-    command
-        .spawn()
+    config
+        .process_manager
+        .spawn(command)
+        .await
         .with_context(|| format!("spawn hook server '{name}'"))
 }
 
@@ -159,30 +160,3 @@ fn log_child_exit(server: &str, status: std::io::Result<std::process::ExitStatus
         Err(error) => log::warn!("hook server '{server}' wait failed: {error}"),
     }
 }
-
-#[cfg(unix)]
-fn configure_hook_process(command: &mut Command) {
-    #[cfg(target_os = "linux")]
-    let parent_pid = std::process::id() as libc::pid_t;
-    // SAFETY: pre_exec invokes only async-signal-safe libc calls.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            #[cfg(target_os = "linux")]
-            {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::getppid() != parent_pid {
-                    libc::raise(libc::SIGTERM);
-                }
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(unix))]
-fn configure_hook_process(_command: &mut Command) {}
