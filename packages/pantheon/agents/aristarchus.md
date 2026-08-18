@@ -1,4 +1,5 @@
 ---
+role: assistant
 model: claude:claude-sonnet-5
 compaction_agent: compact-reviewer
 use_tools:
