@@ -17,7 +17,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
@@ -75,6 +75,53 @@ async fn test_header_injection_through_proxy() {
 
         shutdown_proxy(&mut proxy).await;
         test_result.expect("integration flow")
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn persistent_jsonl_mode_has_no_readiness_preamble() {
+    timeout(Duration::from_secs(15), async {
+        let mut proxy = Command::new(proxy_binary_path())
+            .env(
+                harnx_core::hooks::HARNX_HOOK_PROTOCOL_ENV,
+                harnx_core::hooks::HARNX_HOOK_PROTOCOL_JSONL,
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn proxy");
+
+        let request = br#"{"id":"probe","tool_input":{"env":{}}}
+"#;
+        proxy
+            .stdin
+            .as_mut()
+            .expect("proxy stdin")
+            .write_all(request)
+            .await
+            .expect("write hook request");
+
+        let stdout = proxy.stdout.take().expect("proxy stdout");
+        let line = BufReader::new(stdout)
+            .lines()
+            .next_line()
+            .await
+            .expect("read first stdout line")
+            .expect("proxy response line");
+        let response: Value = serde_json::from_str(&line)
+            .unwrap_or_else(|error| panic!("first stdout line was not JSON: {line:?}: {error}"));
+
+        assert_eq!(response["id"], "probe");
+        assert!(
+            response["hookSpecificOutput"]["toolInput"]["env"]["HTTP_PROXY"]
+                .as_str()
+                .is_some()
+        );
+
+        shutdown_proxy(&mut proxy).await;
     })
     .await
     .expect("test timed out");

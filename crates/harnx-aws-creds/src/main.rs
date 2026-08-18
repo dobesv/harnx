@@ -224,12 +224,6 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = start_server(Arc::clone(&state), listener).await?;
 
-    eprintln!("harnx-aws-creds: listening on http://127.0.0.1:{port}/creds");
-    eprintln!(
-        "harnx-aws-creds: authorization token: {}",
-        state.bearer_token
-    );
-
     run_hook_loop(&state, port).await
 }
 

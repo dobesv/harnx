@@ -78,16 +78,20 @@ async fn main() -> Result<()> {
         extra_env.insert(key, value);
     }
 
-    write_readiness(port, &ca_cert_path, &ca_cert_pem)?;
+    let nats_mode = nats_mode_enabled();
+    write_readiness_for_mode(nats_mode, port, &ca_cert_path, &ca_cert_pem)?;
 
-    run_dispatch_mode(DispatchRuntime {
-        name: hook_name,
-        port,
-        ca_cert_path,
-        extra_env,
-        notice_rx,
-        fs_temp_dir,
-    })
+    run_dispatch_mode(
+        DispatchRuntime {
+            name: hook_name,
+            port,
+            ca_cert_path,
+            extra_env,
+            notice_rx,
+            fs_temp_dir,
+        },
+        nats_mode,
+    )
     .await
 }
 
@@ -124,6 +128,19 @@ fn write_readiness(port: u16, ca_cert_path: &std::path::Path, ca_cert_pem: &str)
     Ok(())
 }
 
+fn write_readiness_for_mode(
+    nats_mode: bool,
+    port: u16,
+    ca_cert_path: &std::path::Path,
+    ca_cert_pem: &str,
+) -> Result<()> {
+    let hook_protocol = std::env::var(harnx_core::hooks::HARNX_HOOK_PROTOCOL_ENV).ok();
+    if should_write_readiness(nats_mode, hook_protocol.as_deref()) {
+        write_readiness(port, ca_cert_path, ca_cert_pem)?;
+    }
+    Ok(())
+}
+
 struct DispatchRuntime {
     name: String,
     port: u16,
@@ -133,7 +150,7 @@ struct DispatchRuntime {
     fs_temp_dir: Option<tempfile::TempDir>,
 }
 
-async fn run_dispatch_mode(runtime: DispatchRuntime) -> Result<()> {
+async fn run_dispatch_mode(runtime: DispatchRuntime, nats_mode: bool) -> Result<()> {
     let DispatchRuntime {
         name,
         port,
@@ -142,7 +159,7 @@ async fn run_dispatch_mode(runtime: DispatchRuntime) -> Result<()> {
         notice_rx,
         fs_temp_dir,
     } = runtime;
-    if nats_mode_enabled() {
+    if nats_mode {
         // Keep generated credentials and notice channel alive for hook-server lifetime.
         let _temp_dir_guard = fs_temp_dir;
         let _notice_rx_guard = notice_rx;
@@ -164,6 +181,10 @@ async fn run_dispatch_mode(runtime: DispatchRuntime) -> Result<()> {
         };
     }
     hook::run_jsonl_loop(port, ca_cert_path, extra_env, notice_rx).await
+}
+
+fn should_write_readiness(nats_mode: bool, hook_protocol: Option<&str>) -> bool {
+    !nats_mode && hook_protocol != Some(harnx_core::hooks::HARNX_HOOK_PROTOCOL_JSONL)
 }
 
 fn nats_mode_enabled() -> bool {

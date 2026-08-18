@@ -234,6 +234,10 @@ Persistent hooks use a JSONL-based protocol to avoid the overhead of spawning a 
 
 The hook process must read one line from `stdin`, process it, and write exactly one line to `stdout`. The `id` must match the request.
 
+Harnx sets `HARNX_HOOK_PROTOCOL=jsonl` on persistent hook processes. Hooks that
+also support a direct startup/readiness protocol can use this value to keep
+their persistent-hook stdout strictly JSONL.
+
 
 ### Startup Message for Proxy-style Persistent Hooks
 
