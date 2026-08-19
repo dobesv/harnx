@@ -193,6 +193,7 @@ async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandl
         jetstream,
         replicas,
     } = start;
+    let package = harnx_core::package_namespace::pkg_from_qualified(&agent).map(str::to_string);
     let registration_context = jetstream.clone();
     let toolset = Arc::new(SubagentToolset::new(
         agent,
@@ -201,13 +202,14 @@ async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandl
         jetstream,
     ));
     let server_name = harnx_toolset::Toolset::name(toolset.as_ref()).to_string();
-    let identity_token = harnx_toolset::server_identity_token(None, "", &server_name);
+    let identity_token = harnx_toolset::server_identity_token(package.as_deref(), "", &server_name);
     let registration_key = harnx_toolset_server::registration_key(&instance_id, &identity_token);
     let connection = harnx_nats_common::connect::NatsConnection { client, replicas };
-    let server = tokio::spawn(harnx_toolset_server::serve_with_client(
+    let server = tokio::spawn(harnx_toolset_server::serve_with_client_and_identity(
         toolset,
         instance_id,
         connection,
+        harnx_toolset_server::RegistrationIdentity::new(package, ""),
     ));
 
     let registration = tokio::time::timeout(Duration::from_secs(5), async {
@@ -310,12 +312,11 @@ pub(super) async fn launch_worker_services(
     super::daemon::spawn_readiness_publisher(startup.client.clone(), daemon);
 
     let background = Arc::new(Mutex::new(None));
-    // There is no longer a global tool-server registration round for a
-    // session to wait on: `handle_activation` waits on the servers it just
-    // asked the reconciler to start instead. Start this already-settled so
-    // `await_initial_tool_registration` is a no-op, kept for the hooks/
-    // sub-agent-toolset background task shape rather than removed outright.
-    let (_tools_attempted_tx, tools_attempted) = tokio::sync::watch::channel(true);
+    // Session-specific tool servers are awaited during activation, but the
+    // worker-wide sub-agent toolsets still start in the background. Keep the
+    // first activation behind this barrier so its registry snapshot cannot
+    // race those registrations and cache an incomplete tool list.
+    let (tools_attempted_tx, tools_attempted) = tokio::sync::watch::channel(false);
 
     let all_tool_servers = all_enabled_tool_servers(config);
     let server_reconciler = build_server_reconciler(
@@ -334,6 +335,7 @@ pub(super) async fn launch_worker_services(
         instance_id: instance_id.clone(),
         slot: Arc::clone(&background),
         replicas: startup.replicas,
+        tools_attempted: tools_attempted_tx,
     });
 
     let session_index =
@@ -346,13 +348,9 @@ pub(super) async fn launch_worker_services(
     })
 }
 
-/// Historically blocked until the first tool-server registration round had
-/// finished, so a session's registry snapshot included whatever managed to
-/// come up. Tool servers now start per session (`handle_activation` awaits
-/// `ServerReconciler::session_started` directly), so `tools_attempted` is
-/// already settled by the time this runs and it returns immediately. Kept
-/// rather than removed so a future global round has somewhere to plug back
-/// in without re-threading `handle_activation`.
+/// Block until the worker's first sub-agent registration round has finished,
+/// so the session's registry snapshot includes every available delegation
+/// toolset. Session-specific tool servers have their own activation barrier.
 pub(super) async fn await_initial_tool_registration(
     tools_attempted: &tokio::sync::watch::Receiver<bool>,
 ) {
@@ -360,7 +358,7 @@ pub(super) async fn await_initial_tool_registration(
         return;
     }
     let mut attempted = tools_attempted.clone();
-    log::debug!("waiting for the first tool-server registration round");
+    log::debug!("waiting for the first sub-agent tool registration round");
     // The only sender lives in the background task; if it is gone the round can
     // never complete and there is nothing left to wait for. Cap the wait so a
     // wedged round costs the session its tools rather than the whole turn — the
@@ -374,7 +372,7 @@ pub(super) async fn await_initial_tool_registration(
     .is_err()
     {
         log::warn!(
-            "tool servers did not finish their first registration round within {}s; \
+            "sub-agent tools did not finish their first registration round within {}s; \
              starting this session with the tools registered so far",
             INITIAL_TOOL_REGISTRATION_WAIT.as_secs()
         );
@@ -390,6 +388,7 @@ struct BackgroundServicesCtx {
     instance_id: harnx_core::instance::ServerScope,
     slot: Arc<Mutex<Option<BackgroundServices>>>,
     replicas: usize,
+    tools_attempted: tokio::sync::watch::Sender<bool>,
 }
 
 fn spawn_background_services(ctx: BackgroundServicesCtx) {
@@ -402,13 +401,11 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
             instance_id,
             slot,
             replicas,
+            tools_attempted,
         } = ctx;
         // Tool servers aren't started here anymore — each session's own
         // servers start on demand through `WorkerRuntime::server_reconciler`.
         let (_worker_tool_servers, global_hooks) = configured_worker_services(&config);
-        let global_hook_supervisor =
-            start_global_hooks(&daemon, client.clone(), &instance_id, &global_hooks).await;
-
         let mut subagent_tool_servers = Vec::new();
         for agent in list_agents() {
             match start_subagent_toolset(SubagentToolsetStart {
@@ -428,6 +425,13 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
                 }
             }
         }
+        // Release waiting activations once every sub-agent registration has
+        // either succeeded or failed. Global hooks are independent and must
+        // not delay delegation-tool discovery.
+        let _ = tools_attempted.send(true);
+
+        let global_hook_supervisor =
+            start_global_hooks(&daemon, client.clone(), &instance_id, &global_hooks).await;
 
         *slot.lock().await = Some(BackgroundServices {
             _global_hook_supervisor: global_hook_supervisor,

@@ -32,7 +32,10 @@ use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
+mod subagent_discovery_tests;
 mod transcript_render_tests;
+
+use subagent_discovery_tests::{call_registered_agent, registered_agent_provider};
 
 /// Spawn a local JetStream-enabled nats-server on a free port with an isolated
 /// temp store dir, returning the connect URL, the child process, and the temp
@@ -1532,127 +1535,6 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
     let _ = child.wait();
 }
 
-async fn registered_agent_provider(
-    jetstream: &async_nats::jetstream::Context,
-    config: &Config,
-    agents: &[&str],
-) -> (
-    String,
-    Arc<crate::nats_tool_provider::NatsToolProvider>,
-    Vec<(String, harnx_toolset::Registration)>,
-) {
-    let (instance_id, registrations) = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Ok(registry) = jetstream
-                .get_key_value(harnx_toolset_server::TOOL_REGISTRY_BUCKET)
-                .await
-            {
-                let mut keys = registry.keys().await.expect("list registry keys");
-                let mut registrations = Vec::new();
-                while let Some(key) = keys.next().await {
-                    let key = key.expect("read registry key");
-                    let Some(value) = registry.get(&key).await.expect("read registration") else {
-                        continue;
-                    };
-                    let registration: harnx_toolset::Registration =
-                        serde_json::from_slice(&value).expect("decode registration");
-                    registrations.push((key, registration));
-                }
-                if agents.iter().all(|agent| {
-                    registrations
-                        .iter()
-                        .any(|(_, registration)| registration.server == *agent)
-                }) {
-                    let agent = agents.first().expect("at least one requested agent");
-                    let key = registrations
-                        .iter()
-                        .find(|(_, registration)| registration.server == *agent)
-                        .map(|(key, _)| key)
-                        .expect("requested agent registration exists");
-                    let instance_id = key
-                        .strip_suffix(&format!(".____{agent}"))
-                        .expect("registry key uses {instance}.{identity_token}")
-                        .to_string();
-                    break (instance_id, registrations);
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("worker did not register configured agents");
-    let provider = crate::nats_tool_provider::NatsToolProvider::discover(
-        config,
-        harnx_core::instance::ServerScope::from_string(instance_id.clone()),
-        crate::nats_tool_provider::NatsInFlightCalls::default(),
-        None,
-    )
-    .await
-    .expect("parent discovers configured sub-agent toolsets");
-    (instance_id, Arc::new(provider), registrations)
-}
-
-async fn call_registered_agent(
-    provider: Arc<crate::nats_tool_provider::NatsToolProvider>,
-    tool: String,
-    message: String,
-    early_event: Option<(&mut async_nats::Subscriber, &str)>,
-) -> (serde_json::Value, Option<String>) {
-    let prompt_call = tokio::spawn(async move {
-        provider
-            .call_tool(
-                &tool,
-                json!({ "message": message }),
-                &harnx_core::abort::create_abort_signal(),
-            )
-            .await
-    });
-    let child_session_id = if let Some((parent_events, expected_agent)) = early_event {
-        let (agent, session_id) = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let message = parent_events
-                    .next()
-                    .await
-                    .expect("parent event stream closed");
-                let envelope =
-                    crate::nats_event_sink::AdvisoryEnvelope::from_bytes(&message.payload)
-                        .expect("decode parent advisory");
-                if let AgentEvent::SubAgent { source, event } = envelope.event {
-                    if let AgentEvent::Turn(harnx_core::event::TurnEvent::SubAgentStarted {
-                        agent,
-                        session_id,
-                    }) = *event
-                    {
-                        assert_eq!(source.agent, agent);
-                        assert_eq!(source.session_id.as_deref(), Some(session_id.as_str()));
-                        break (agent, session_id);
-                    }
-                }
-            }
-        })
-        .await
-        .expect("parent did not receive early SubAgentStarted");
-        assert_eq!(agent, expected_agent);
-        assert!(
-            !prompt_call.is_finished(),
-            "SubAgentStarted must arrive before final tool result"
-        );
-        Some(session_id)
-    } else {
-        None
-    };
-    let result = prompt_call
-        .await
-        .expect("join prompt tool call")
-        .unwrap_or_else(|error| match error {
-            harnx_core::tool::ToolError::Recoverable(error)
-            | harnx_core::tool::ToolError::Fatal(error) => {
-                panic!("registered agent prompt failed: {error:#}")
-            }
-        });
-    (result, child_session_id)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_registers_and_delegates_to_every_configured_agent() {
     let _env_guard = env_lock().await;
@@ -1681,6 +1563,7 @@ async fn worker_registers_and_delegates_to_every_configured_agent() {
         &jetstream,
         &seeded.parent_config,
         &["alpha", "beta", "metis"],
+        None,
     )
     .await;
 
@@ -1695,17 +1578,17 @@ async fn worker_registers_and_delegates_to_every_configured_agent() {
         assert!(registration
             .tools
             .iter()
-            .all(|tool| tool.name.starts_with(&format!("{agent}_session_"))));
+            .all(|tool| tool.name.starts_with("session_")));
     }
 
     let declarations = provider.declarations_for_use_tools(Some("*"));
     for agent in ["alpha", "beta"] {
         assert!(declarations
             .iter()
-            .any(|tool| tool.name == format!("{agent}_{agent}_session_prompt")));
+            .any(|tool| tool.name == format!("{agent}_session_prompt")));
         let (result, _) = call_registered_agent(
             Arc::clone(&provider),
-            format!("{agent}_{agent}_session_prompt"),
+            format!("{agent}_session_prompt"),
             format!("delegate to {agent}"),
             None,
         )
@@ -1741,7 +1624,7 @@ async fn subagent_new_and_prompt_results_include_agent_source_marker() {
     .await;
 
     let created = toolset
-        .invoke("metis_session_new", json!({}), CancellationToken::new())
+        .invoke("session_new", json!({}), CancellationToken::new())
         .await
         .expect("create marked child session");
     let session_id = created["session_id"]
@@ -1754,7 +1637,7 @@ async fn subagent_new_and_prompt_results_include_agent_source_marker() {
 
     let prompted = toolset
         .invoke(
-            "metis_session_prompt",
+            "session_prompt",
             json!({ "message": "continue marked session", "session_id": session_id }),
             CancellationToken::new(),
         )
@@ -1808,7 +1691,7 @@ async fn subagent_started_reaches_parent_stream_before_prompt_result() {
         .expect("flush parent event subscription");
     let jetstream = async_nats::jetstream::new(client);
     let (_, provider, _) =
-        registered_agent_provider(&jetstream, &seeded.parent_config, &["metis"]).await;
+        registered_agent_provider(&jetstream, &seeded.parent_config, &["metis"], None).await;
     let (result, child_session_id) = call_registered_agent(
         provider,
         "metis_session_prompt".to_string(),
@@ -1847,7 +1730,7 @@ async fn subagent_new_prompt_reuse_and_load_share_one_session_log() {
     .await;
 
     let created = toolset
-        .invoke("metis_session_new", json!({}), CancellationToken::new())
+        .invoke("session_new", json!({}), CancellationToken::new())
         .await
         .expect("create and initialize child session");
     let session_id = created["session_id"]
@@ -1880,7 +1763,7 @@ async fn subagent_new_prompt_reuse_and_load_share_one_session_log() {
     ] {
         let result = toolset
             .invoke(
-                "metis_session_prompt",
+                "session_prompt",
                 json!({ "message": message, "session_id": session_id }),
                 CancellationToken::new(),
             )
@@ -1892,7 +1775,7 @@ async fn subagent_new_prompt_reuse_and_load_share_one_session_log() {
 
     let loaded = toolset
         .invoke(
-            "metis_session_load",
+            "session_load",
             json!({ "session_id": session_id }),
             CancellationToken::new(),
         )
@@ -1967,7 +1850,7 @@ async fn run_subagent_cancel_case(parent_abort: bool) {
         async move {
             toolset
                 .invoke(
-                    "metis_session_prompt",
+                    "session_prompt",
                     json!({ "message": "block until cancelled", "session_id": session_id }),
                     parent_cancel,
                 )
@@ -1983,7 +1866,7 @@ async fn run_subagent_cancel_case(parent_abort: bool) {
     } else {
         toolset
             .invoke(
-                "metis_session_cancel",
+                "session_cancel",
                 json!({ "session_id": session_id }),
                 CancellationToken::new(),
             )
@@ -2049,7 +1932,7 @@ async fn subagent_operation_timeout_returns_error_and_cancels_child() {
     let session_id = crate::nats_worker::new_remote_session_id();
     let error = toolset
         .invoke(
-            "metis_session_prompt",
+            "session_prompt",
             json!({ "message": "time out", "session_id": session_id }),
             CancellationToken::new(),
         )
@@ -2141,7 +2024,7 @@ async fn subagent_idle_timeout_resets_on_child_activity() {
     });
     let result = toolset
         .invoke(
-            "metis_session_prompt",
+            "session_prompt",
             json!({ "message": "stay active", "session_id": session_id }),
             CancellationToken::new(),
         )

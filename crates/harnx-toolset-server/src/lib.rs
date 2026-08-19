@@ -2,7 +2,10 @@
 
 pub mod content;
 mod drain;
+mod registration_identity;
 pub mod schema;
+
+pub use registration_identity::RegistrationIdentity;
 
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv};
@@ -12,8 +15,7 @@ use harnx_core::instance::ServerScope;
 use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{
     server_identity_token, ControlKind, ControlMessage, Registration, ToolErrorPayload,
-    ToolInvokeError, ToolReply, ToolRequest, Toolset, HARNX_SERVER_CONFIG, HARNX_SERVER_PACKAGE,
-    HDR_CALL_ID, HDR_IDEMPOTENCY_KEY,
+    ToolInvokeError, ToolReply, ToolRequest, Toolset, HDR_CALL_ID, HDR_IDEMPOTENCY_KEY,
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
@@ -72,6 +74,13 @@ struct ValidatedToolRequest {
     reply_subject: async_nats::Subject,
     request: ToolRequest,
     idempotency_key: String,
+}
+
+struct ServeSettings {
+    instance_id: ServerScope,
+    connection: NatsConnection,
+    shutdown: CancellationToken,
+    identity: RegistrationIdentity,
 }
 
 /// Everything `serve_requests` needs to keep the KV registration alive, bundled
@@ -145,9 +154,34 @@ pub async fn serve_with_client(
     instance_id: ServerScope,
     connection: NatsConnection,
 ) -> Result<()> {
+    serve_with_client_and_identity(
+        toolset,
+        instance_id,
+        connection,
+        RegistrationIdentity::from_env(),
+    )
+    .await
+}
+
+/// Serve an in-process toolset with an explicit package/config identity.
+pub async fn serve_with_client_and_identity(
+    toolset: Arc<dyn Toolset>,
+    instance_id: ServerScope,
+    connection: NatsConnection,
+    identity: RegistrationIdentity,
+) -> Result<()> {
     // Never cancelled: this entry point has no shutdown signal of its own, so
     // it only ever exits through `serve_requests`' bail! conditions.
-    serve_with_shutdown(toolset, instance_id, connection, CancellationToken::new()).await
+    serve_configured(
+        toolset,
+        ServeSettings {
+            instance_id,
+            connection,
+            shutdown: CancellationToken::new(),
+            identity,
+        },
+    )
+    .await
 }
 
 /// Serve a toolset using an existing NATS connection, exiting cleanly (and
@@ -159,12 +193,28 @@ pub async fn serve_with_shutdown(
     connection: NatsConnection,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    serve_configured(
+        toolset,
+        ServeSettings {
+            instance_id,
+            connection,
+            shutdown,
+            identity: RegistrationIdentity::from_env(),
+        },
+    )
+    .await
+}
+
+async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) -> Result<()> {
+    let ServeSettings {
+        instance_id,
+        connection,
+        shutdown,
+        identity,
+    } = settings;
     let NatsConnection { client, replicas } = connection;
     let server_name = toolset.name().to_owned();
-    let package = std::env::var(HARNX_SERVER_PACKAGE)
-        .ok()
-        .filter(|package| !package.is_empty());
-    let config = std::env::var(HARNX_SERVER_CONFIG).unwrap_or_default();
+    let RegistrationIdentity { package, config } = identity;
     let identity_token = server_identity_token(package.as_deref(), &config, &server_name);
     let tool_subject = instance_id.tool_subject(&identity_token, ">");
     let control_subject = instance_id.control_subject();
@@ -341,7 +391,7 @@ async fn process_tool_request(
         .await
         .insert(request.call_id.clone(), cancel.clone());
     let mut args = request.args;
-    if request.tool.ends_with("_session_prompt") || request.tool.ends_with("_session_new") {
+    if accepts_parent_session_id(&request.tool) {
         if let (Some(parent_session_id), Some(args)) =
             (request.parent_session_id, args.as_object_mut())
         {
@@ -366,6 +416,11 @@ async fn process_tool_request(
     )
     .await;
     publish_reply(&context.client, reply_subject, &reply).await
+}
+
+fn accepts_parent_session_id(tool: &str) -> bool {
+    // Sub-agent toolsets reserve these raw names for calls that start a child turn.
+    matches!(tool, "session_prompt" | "session_new")
 }
 
 async fn validate_tool_request(
@@ -715,5 +770,18 @@ mod tests {
             CacheReservation::Full
         ));
         assert_eq!(cache.lock().await.len(), IDEMPOTENCY_CACHE_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn parent_session_id_supports_raw_session_start_tools() {
+        for tool in ["session_prompt", "session_new"] {
+            assert!(
+                accepts_parent_session_id(tool),
+                "expected support for {tool}"
+            );
+        }
+        assert!(!accepts_parent_session_id("session_load"));
+        assert!(!accepts_parent_session_id("prompt"));
+        assert!(!accepts_parent_session_id("agent_session_prompt"));
     }
 }
