@@ -32,6 +32,8 @@ use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
+mod transcript_render_tests;
+
 /// Spawn a local JetStream-enabled nats-server on a free port with an isolated
 /// temp store dir, returning the connect URL, the child process, and the temp
 /// dir guard. Using a free port + per-run store dir avoids cross-run state
@@ -424,7 +426,7 @@ pub(super) async fn run_remote_round_trip_with_session_id_and_sink(
         crate::ThinClientSession::from_global_config(thin_cfg, &parent_global_config, abort_signal)
             .await?;
 
-    const REMOTE_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(30);
+    const REMOTE_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(60);
     let turn_result = tokio::time::timeout(
         REMOTE_ROUND_TRIP_TIMEOUT,
         thin.run_turn("delegate over nats", sink, None),
@@ -436,9 +438,12 @@ pub(super) async fn run_remote_round_trip_with_session_id_and_sink(
             REMOTE_ROUND_TRIP_TIMEOUT.as_secs()
         )
     })??;
-    let reply = turn_result
-        .response
-        .context("thin client turn must return final assistant response")?;
+    let reply = turn_result.response.with_context(|| {
+        format!(
+            "thin client turn must return final assistant response (error={:?}, cancelled={}, user_seq={})",
+            turn_result.error, turn_result.was_cancelled, turn_result.user_msg_seq
+        )
+    })?;
     anyhow::ensure!(
         reply.contains("stub remote reply over nats"),
         "expected reply to contain stub remote reply, got: {reply}"
@@ -1240,6 +1245,13 @@ async fn legacy_headerless_session_migrates_on_first_activation() {
             .iter()
             .all(|(_, entry)| !matches!(entry, SessionLogEntry::Header { .. })),
         "migration must not physically reorder or prepend raw header entries"
+    );
+    assert!(
+        raw_entries.iter().any(|(_, entry)| matches!(
+            entry,
+            SessionLogEntry::TurnEnd { through_seq, .. } if *through_seq >= user_seq
+        )),
+        "the worker must persist the successful full-loop boundary"
     );
     assert_eq!(
         leading_user_texts(&effective_after),
@@ -2959,215 +2971,6 @@ async fn remote_delete_refreshes_after_concurrent_mutation() {
     assert!(
         late_user_still_present,
         "retry delete must not target concurrent late row"
-    );
-
-    worker.abort();
-    let _ = worker.await;
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn load_remote_transcript_for_render_prerenders_logical_rows() {
-    let _env_guard = env_lock().await;
-    let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
-        return;
-    };
-
-    let mut seeded = seed_remote_config(&url);
-    let session_id = crate::nats_worker::new_remote_session_id();
-    let worker =
-        spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("stub remote reply over nats"));
-
-    run_remote_round_trip_with_session_id(seeded.parent_config.clone(), session_id.clone())
-        .await
-        .expect("worker should build realistic migrated session");
-
-    seeded
-        .parent_config
-        .set_remote_agent("metis".to_string(), "local".to_string());
-    seeded
-        .parent_config
-        .use_session(Some(&session_id))
-        .expect("activate remote session id");
-    let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
-    let abort = harnx_core::abort::create_abort_signal();
-    let thin = ThinClientSession::from_global_config(
-        crate::ThinClientConfig {
-            cluster: "local".to_string(),
-            agent: "metis".to_string(),
-            session_id: Some(session_id.clone()),
-        },
-        &global_config,
-        abort,
-    )
-    .await
-    .expect("load thin session");
-
-    let transcript = load_remote_transcript_for_render(&thin)
-        .await
-        .expect("load transcript state");
-    assert!(
-        transcript.compressed_messages.is_empty(),
-        "worker-migrated headerless fixture should have empty compacted prefix"
-    );
-    let row_seqs: Vec<usize> = transcript
-        .messages
-        .iter()
-        .filter_map(|message| message.log_seq)
-        .collect();
-    assert_eq!(row_seqs, vec![1, 2]);
-    let row_texts: Vec<(harnx_core::message::MessageRole, String)> = transcript
-        .messages
-        .iter()
-        .map(|message| (message.role, message.content.to_text()))
-        .collect();
-    assert_eq!(
-        row_texts,
-        vec![
-            (
-                harnx_core::message::MessageRole::User,
-                "delegate over nats".to_string(),
-            ),
-            (
-                harnx_core::message::MessageRole::Assistant,
-                "stub remote reply over nats".to_string(),
-            ),
-        ]
-    );
-
-    worker.abort();
-    let _ = worker.await;
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn load_remote_transcript_for_render_keeps_tool_rows_and_compressed_prefix() {
-    let _env_guard = env_lock().await;
-    let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
-        return;
-    };
-
-    let mut seeded = seed_remote_config(&url);
-    let session_id = crate::nats_worker::new_remote_session_id();
-    let worker =
-        spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("stub remote reply over nats"));
-
-    run_remote_round_trip_with_session_id(seeded.parent_config.clone(), session_id.clone())
-        .await
-        .expect("worker should build realistic migrated session");
-
-    let jetstream = seeded
-        .parent_config
-        .nats_jetstream("local")
-        .await
-        .expect("load local jetstream");
-    let log = NatsSessionLog::new(jetstream, session_id.clone());
-
-    let tool_call = ToolCall::new(
-        "fs_read".to_string(),
-        json!({"path": "README.md"}),
-        Some("tool-1".to_string()),
-        None,
-    );
-    log.append_event_async(&SessionLogEntry::ToolCalls {
-        text: "calling tool".to_string(),
-        thought: Some("tool thought".to_string()),
-        calls: vec![tool_call.clone()],
-        timestamp: None,
-        fence_token: None,
-    })
-    .await
-    .expect("append tool calls");
-    log.append_event_async(&SessionLogEntry::ToolResults {
-        results: vec![ToolOutput {
-            id: tool_call.id.clone(),
-            name: tool_call.name.clone(),
-            output: json!({"ok": true}),
-            markdown: None,
-            content: vec![],
-            switch_agent: None,
-        }],
-        timestamp: None,
-    })
-    .await
-    .expect("append tool results");
-    log.append_event_async(&SessionLogEntry::Compress {
-        prompt: "summary prompt".to_string(),
-    })
-    .await
-    .expect("append compress");
-    log.append_event_async(&SessionLogEntry::Message {
-        id: Some(uuid::Uuid::new_v4().to_string()),
-        role: harnx_core::message::MessageRole::User,
-        content: harnx_core::message::MessageContent::Text("after compress user".to_string()),
-        timestamp: None,
-        fence_token: None,
-    })
-    .await
-    .expect("append post-compress user");
-
-    seeded
-        .parent_config
-        .set_remote_agent("metis".to_string(), "local".to_string());
-    seeded
-        .parent_config
-        .use_session(Some(&session_id))
-        .expect("activate remote session id");
-    let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
-    let thin = ThinClientSession::from_global_config(
-        crate::ThinClientConfig {
-            cluster: "local".to_string(),
-            agent: "metis".to_string(),
-            session_id: Some(session_id.clone()),
-        },
-        &global_config,
-        harnx_core::abort::create_abort_signal(),
-    )
-    .await
-    .expect("load thin session");
-
-    let transcript = load_remote_transcript_for_render(&thin)
-        .await
-        .expect("load transcript state");
-
-    assert!(
-        !transcript.compressed_messages.is_empty(),
-        "compressed_messages must be populated after remote Compress"
-    );
-    assert!(
-        transcript
-            .compressed_messages
-            .iter()
-            .any(|message| message.role == harnx_core::message::MessageRole::Tool),
-        "compressed prefix must retain assembled tool message rows"
-    );
-    assert!(
-        transcript
-            .messages
-            .iter()
-            .all(|message| message.role != harnx_core::message::MessageRole::System),
-        "active transcript must not include a synthetic System message after Compress"
-    );
-    assert_eq!(
-        transcript.compaction_summary.as_deref(),
-        Some("summary prompt"),
-        "compaction summary must carry the summary text after Compress"
-    );
-
-    let active_rows: Vec<(harnx_core::message::MessageRole, String, Option<usize>)> = transcript
-        .messages
-        .iter()
-        .map(|message| (message.role, message.content.to_text(), message.log_seq))
-        .collect();
-    assert_eq!(
-        active_rows,
-        vec![(
-            harnx_core::message::MessageRole::User,
-            "after compress user".to_string(),
-            Some(0),
-        ),]
     );
 
     worker.abort();

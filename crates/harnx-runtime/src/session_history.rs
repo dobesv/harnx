@@ -40,6 +40,7 @@ pub fn entry_type(entry: &SessionLogEntry) -> &'static str {
         SessionLogEntry::Clear => "clear",
         SessionLogEntry::Cancel { .. } => "cancel",
         SessionLogEntry::Error { .. } => "error",
+        SessionLogEntry::TurnEnd { .. } => "turn_end",
         SessionLogEntry::EditEntries { .. } => "edit_entries",
         SessionLogEntry::Rewind { .. } => "rewind",
         SessionLogEntry::Title { .. } => "title",

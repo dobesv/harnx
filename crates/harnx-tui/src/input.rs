@@ -805,6 +805,17 @@ impl Tui {
             TuiEvent::Agent(event) => {
                 self.render_agent_event(event).await;
             }
+            TuiEvent::PromptTaskFinished { task, error } => {
+                self.finish_prompt_task(task, error).await;
+            }
+            TuiEvent::SessionActivity {
+                session_id,
+                cluster,
+                active,
+            } => {
+                self.handle_session_activity(session_id, cluster, active)
+                    .await;
+            }
             TuiEvent::ToolRoundComplete => {
                 // Intermediate tool round — prompt loop continues, don't clear llm_busy.
                 // Flush any pending thought so follow-up thought after tool results
@@ -871,14 +882,14 @@ impl Tui {
     }
 
     #[cfg(not(test))]
-    async fn submit_pending_message(
+    pub(super) async fn submit_pending_message(
         &mut self,
         pending: crate::types::PendingMessage,
     ) -> Result<()> {
         self.submit_pending_message_inner(pending).await
     }
 
-    async fn submit_pending_message_inner(
+    pub(super) async fn submit_pending_message_inner(
         &mut self,
         pending: crate::types::PendingMessage,
     ) -> Result<()> {
@@ -936,7 +947,7 @@ impl Tui {
         }
     }
 
-    fn flush_pending_thought(&mut self) {
+    pub(super) fn flush_pending_thought(&mut self) {
         if self.app.pending_thought_text.is_empty() {
             return;
         }
@@ -972,14 +983,15 @@ impl Tui {
     }
 
     async fn render_agent_event(&mut self, event: AgentEvent) {
-        use harnx_core::event::{
-            ModelEvent, NoticeEvent, SessionEvent, ToolEvent, TurnEvent, UserEvent,
-        };
+        use harnx_core::event::{ModelEvent, NoticeEvent, SessionEvent, ToolEvent, UserEvent};
 
         let (source, event, is_sub_agent) = match event {
             AgentEvent::SubAgent { source, event } => (Some(source), *event, true),
             event => (None, event, false),
         };
+        if self.handle_turn_activity(&event, is_sub_agent).await {
+            return;
+        }
         let is_thought = matches!(&event, AgentEvent::Model(ModelEvent::ThoughtChunk { .. }));
         let is_usage = matches!(&event, AgentEvent::Model(ModelEvent::Usage { .. }));
         // No streaming-run bookkeeping is needed here: any event that renders a
@@ -1038,20 +1050,7 @@ impl Tui {
             return;
         }
 
-        if let AgentEvent::Turn(TurnEvent::ModelFallback { ref to, .. }) = event {
-            let new_source = self.app.last_ui_output_source.clone().map(|mut s| {
-                s.model = Some(to.clone());
-                s
-            });
-            self.render_ui_output_heading(new_source.as_ref(), false);
-            return;
-        }
-        if let AgentEvent::Session(SessionEvent::ModelChanged { ref to, .. }) = event {
-            let new_source = self.app.last_ui_output_source.clone().map(|mut s| {
-                s.model = Some(to.clone());
-                s
-            });
-            self.render_ui_output_heading(new_source.as_ref(), false);
+        if self.render_model_source_change(&event) {
             return;
         }
         if !is_thought {
@@ -1103,15 +1102,8 @@ impl Tui {
                 output, markdown, ..
             }) => tool_completed_to_transcript_items(&output, markdown.as_deref()),
             AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
-                let text = concat_text_blocks(&blocks);
-                if text.is_empty() {
-                    vec![]
-                } else {
-                    self.app.streamed_text_this_turn = true;
-                    self.append_streaming_assistant_chunk(&text);
-                    self.pin_transcript_to_bottom();
-                    vec![]
-                }
+                self.append_streaming_assistant_chunk(&concat_text_blocks(&blocks), is_sub_agent);
+                vec![]
             }
             AgentEvent::SubAgent { .. } => unreachable!("sub-agent event flattened above"),
             AgentEvent::Model(ModelEvent::Final { output, usage }) => {
@@ -1236,10 +1228,9 @@ impl Tui {
                 self.app.streaming_open = false;
                 // A compaction can land mid-turn after some assistant text has
                 // already streamed. The rebuild drops that streamed row, so the
-                // per-turn flag must also reset — otherwise the next
-                // ModelEvent::Final sees streamed_text_this_turn == true and
-                // skips rendering the final assistant row.
-                self.app.streamed_text_this_turn = false;
+                // The rebuild drops the parent streamed row, so its replacement
+                // index must also be cleared before the eventual Final event.
+                self.app.main_streamed_text_idx = None;
                 // The rebuild drops all SourceHeading entries, so the next
                 // output must re-emit its heading even if it shares the prior
                 // source. Without this, the first post-compaction message would
@@ -1292,39 +1283,23 @@ impl Tui {
         usage: &harnx_core::api_types::CompletionTokenUsage,
     ) {
         self.flush_pending_thought();
-        self.app.llm_busy = false;
-        self.active_remote_session = None;
-        // Final means this task is exiting. Keep its completed JoinHandle for
-        // the next start_prompt drain, but drop the obsolete abort signal.
-        self.current_prompt_abort = None;
-        // Prevent a text-only response from leaking a queued message into the
-        // next prompt task as a duplicate user message.
-        *self.shared_pending_message.lock().await = None;
-        self.app.last_ui_output_source = None;
         let usage_str = format_usage(usage);
         if !output.is_empty() {
-            if self.app.streamed_text_this_turn {
-                // Replace the trailing streamed run with canonical final output.
-                let tail_start = self
-                    .app
-                    .transcript
-                    .iter()
-                    .rposition(|item| !matches!(item, TranscriptItem::AssistantText { .. }))
-                    .map_or(0, |idx| idx + 1);
-
-                if tail_start < self.app.transcript.len() {
-                    let mut tail = self.app.transcript.split_off(tail_start);
-                    if let Some(TranscriptItem::AssistantText {
-                        text,
-                        rendered_cache,
-                        ..
-                    }) = tail.first_mut()
-                    {
-                        *text = output;
-                        *rendered_cache = None;
-                    }
-                    tail.truncate(1);
-                    self.app.transcript.extend(tail);
+            if let Some(streamed_idx) = self.app.main_streamed_text_idx {
+                // Replace the latest parent-agent streamed run with canonical
+                // final output. A sub-agent may have emitted a newer assistant
+                // row while the parent tool call was in flight.
+                // Status/usage events may be emitted after the last text chunk
+                // but before the full-loop Final, so the assistant row is not
+                // necessarily the transcript tail.
+                if let Some(TranscriptItem::AssistantText {
+                    text,
+                    rendered_cache,
+                    ..
+                }) = self.app.transcript.get_mut(streamed_idx)
+                {
+                    *text = output;
+                    *rendered_cache = None;
                 } else {
                     self.app.transcript.push(TranscriptItem::AssistantText {
                         text: output,
@@ -1344,7 +1319,7 @@ impl Tui {
             self.pin_transcript_to_bottom();
         }
         self.app.streaming_open = false;
-        self.app.streamed_text_this_turn = false;
+        self.app.main_streamed_text_idx = None;
         if !usage_str.is_empty() {
             self.app
                 .transcript
@@ -1352,27 +1327,27 @@ impl Tui {
             self.pin_transcript_to_bottom();
         }
         self.refresh_input_chrome();
-
-        if let Some(pending) = self.app.pending_message.take() {
-            if let Err(err) = self.submit_pending_message(pending).await {
-                self.app
-                    .transcript
-                    .push(TranscriptItem::ErrorText(pretty_error_string(&err)));
-                self.pin_transcript_to_bottom();
-            }
-        }
     }
 
-    async fn finish_main_prompt_error(&mut self, err: String) {
+    pub(super) async fn finish_main_prompt_error(&mut self, err: String) {
         self.flush_pending_thought();
-        self.app.llm_busy = false;
-        self.active_remote_session = None;
-        self.current_prompt_abort = None;
-        *self.shared_pending_message.lock().await = None;
         self.app.streaming_open = false;
-        self.app.streamed_text_this_turn = false;
+        self.app.main_streamed_text_idx = None;
         self.app.last_ui_output_source = None;
         self.app.transcript.push(TranscriptItem::ErrorText(err));
+        if self
+            .current_prompt_abort
+            .as_ref()
+            .is_some_and(|abort| abort.aborted())
+        {
+            // The user may type a new message while the cancelled task winds
+            // down. Keep that newer message queued; Turn::Ended (or the task
+            // fallback) will submit it after the old task actually exits.
+            self.pin_transcript_to_bottom();
+            self.refresh_input_chrome();
+            return;
+        }
+        *self.shared_pending_message.lock().await = None;
 
         // Do not replay input that failed. Restore it as editable draft so user
         // can change it before resubmitting, avoiding persistent retry loops.
@@ -1427,7 +1402,11 @@ impl Tui {
         self.pin_transcript_to_bottom();
     }
 
-    fn render_ui_output_heading(&mut self, source: Option<&AgentSource>, is_usage: bool) {
+    pub(super) fn render_ui_output_heading(
+        &mut self,
+        source: Option<&AgentSource>,
+        is_usage: bool,
+    ) {
         let source = source.cloned();
         if source != self.app.last_ui_output_source {
             if let Some(source) = &source {
@@ -1499,8 +1478,7 @@ impl Tui {
 
         self.app.llm_busy = true;
         self.app.streaming_open = false;
-
-        self.app.streamed_text_this_turn = false;
+        self.app.main_streamed_text_idx = None;
 
         let (agent, cluster, session_id) = {
             let guard = self.config.read();
@@ -1526,7 +1504,7 @@ impl Tui {
 
         let ctx = crate::prompt::PromptTaskContext {
             config: self.config.clone(),
-            abort_signal: new_abort,
+            abort_signal: new_abort.clone(),
             #[cfg(test)]
             shared_pending_message: self.shared_pending_message.clone(),
             local_worker: self.local_worker.clone(),
@@ -1544,12 +1522,15 @@ impl Tui {
             let result: Result<()> =
                 Self::run_thin_client_prompt_task(msg, ctx, agent, cluster).await;
 
-            if let Err(err) = result {
-                use harnx_core::event::{AgentEvent, ModelEvent};
-                let _ = event_tx.send(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Error(
-                    pretty_error_string(&err),
-                ))));
-            }
+            let error = match result {
+                Err(_) if new_abort.aborted() => None,
+                Err(err) => Some(pretty_error_string(&err)),
+                Ok(()) => None,
+            };
+            let _ = event_tx.send(TuiEvent::PromptTaskFinished {
+                task: new_abort,
+                error,
+            });
         });
         self.current_prompt_handle = Some(handle);
 
@@ -2128,7 +2109,7 @@ impl Tui {
 
         self.app.transcript.clear();
         self.app.streaming_open = false;
-        self.app.streamed_text_this_turn = false;
+        self.app.main_streamed_text_idx = None;
         // Reset scroll state so the widget doesn't subtract-overflow when
         // the rebuilt transcript is shorter than the previous one.
         self.app.scroll_state = ratatui_widget_scrolling::ScrollState::new();

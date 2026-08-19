@@ -18,6 +18,8 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 mod command_completion;
+mod delegation_tests;
+mod turn_activity_tests;
 
 fn yaml_to_json(yaml: &str) -> serde_json::Value {
     serde_yaml::from_str::<serde_json::Value>(yaml)
@@ -242,6 +244,13 @@ async fn pending_message_is_auto_sent_after_finish() {
     })))
     .await
     .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+        harnx_core::event::TurnEvent::Ended {
+            outcome: Default::default(),
+        },
+    )))
+    .await
+    .unwrap();
 
     assert!(tui.app.llm_busy);
     assert!(tui.app.pending_message.is_none());
@@ -250,98 +259,6 @@ async fn pending_message_is_auto_sent_after_finish() {
             |entry| matches!(entry, TranscriptItem::UserText { text, .. } if text == "follow up"),
         );
     assert!(has_user_entry);
-}
-
-fn sub_agent_source() -> AgentSource {
-    AgentSource {
-        agent: "aristarchus".to_string(),
-        session_id: Some("sub-session-1".to_string()),
-        model: None,
-    }
-}
-
-/// A nested sub-agent's error (e.g. a transient LLM failure inside a
-/// delegated agent session) arrives as a `SubAgent`-wrapped `ModelEvent::Error`.
-/// It must NOT be mistaken for the end of the main prompt task: the
-/// delegating tool call is still in flight, so busy state and the queued
-/// pending message must survive. Otherwise the TUI shows idle (no spinner)
-/// while the agent loop is still running and output keeps streaming.
-#[tokio::test]
-async fn sub_agent_error_does_not_clear_llm_busy() {
-    let config = test_config();
-    let mut tui = Tui::init(&config).await.unwrap();
-    tui.app.llm_busy = true;
-    tui.queue_pending_message("follow up".to_string()).await;
-
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
-        sub_agent_source(),
-        AgentEvent::Model(ModelEvent::Error("sub-agent exploded".to_string())),
-    )))
-    .await
-    .unwrap();
-
-    assert!(
-        tui.app.llm_busy,
-        "sub-agent error must not clear the main busy flag"
-    );
-    // The queued message still belongs to the (still running) main task.
-    assert!(tui.app.pending_message.is_some());
-    assert!(tui.shared_pending_message.lock().await.is_some());
-    // The error itself is still surfaced in the transcript.
-    assert!(tui.app.transcript.iter().any(
-        |entry| matches!(entry, TranscriptItem::ErrorText(text) if text == "sub-agent exploded")
-    ));
-}
-
-/// Same as above for `ModelEvent::Final`: only a bare main-task Final may
-/// flip the TUI back to idle.
-#[tokio::test]
-async fn sub_agent_final_does_not_clear_llm_busy() {
-    let config = test_config();
-    let mut tui = Tui::init(&config).await.unwrap();
-    tui.app.llm_busy = true;
-    tui.queue_pending_message("follow up".to_string()).await;
-
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
-        sub_agent_source(),
-        AgentEvent::Model(ModelEvent::Final {
-            output: "sub-agent final text".to_string(),
-            usage: Default::default(),
-        }),
-    )))
-    .await
-    .unwrap();
-
-    assert!(
-        tui.app.llm_busy,
-        "sub-agent Final must not clear the main busy flag"
-    );
-    // The pending message must not be auto-submitted by a sub-agent Final.
-    assert!(tui.app.pending_message.is_some());
-    assert!(tui.shared_pending_message.lock().await.is_some());
-    // The sub-agent's final text is still rendered.
-    assert!(tui.app.transcript.iter().any(
-        |entry| matches!(entry, TranscriptItem::AssistantText { text, .. } if text == "sub-agent final text")
-    ));
-}
-
-#[tokio::test]
-async fn bare_final_clears_llm_busy() {
-    let config = test_config();
-    let mut tui = Tui::init(&config).await.unwrap();
-    tui.app.llm_busy = true;
-
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
-        output: "main final text".to_string(),
-        usage: Default::default(),
-    })))
-    .await
-    .unwrap();
-
-    assert!(
-        !tui.app.llm_busy,
-        "bare Final must clear the main busy flag"
-    );
 }
 
 #[tokio::test]
@@ -373,6 +290,13 @@ async fn pending_dot_command_restores_attachments_before_running() {
         output: "done".to_string(),
         usage: Default::default(),
     })))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+        harnx_core::event::TurnEvent::Ended {
+            outcome: Default::default(),
+        },
+    )))
     .await
     .unwrap();
 
@@ -570,7 +494,6 @@ async fn final_coalesces_streamed_multiline_assistant_text() {
     let mut tui = Tui::init(&config).await.unwrap();
 
     tui.app.llm_busy = true;
-    tui.app.streamed_text_this_turn = false;
 
     for chunk in ["Hello\n", "world\n", "Again"] {
         tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
@@ -599,7 +522,52 @@ async fn final_coalesces_streamed_multiline_assistant_text() {
         })
         .collect();
     assert_eq!(assistant_entries, vec!["Hello\nworld\nAgain"]);
-    assert!(!tui.app.streamed_text_this_turn);
+    assert!(tui.app.main_streamed_text_idx.is_none());
+}
+
+#[tokio::test]
+async fn parent_final_does_not_replace_newer_sub_agent_text() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.clear_transcript();
+
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+        ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("parent streaming".to_string())],
+        },
+    )))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        AgentSource {
+            agent: "delegate".to_string(),
+            session_id: Some("delegate-session".to_string()),
+            model: None,
+        },
+        AgentEvent::Model(ModelEvent::Final {
+            output: "sub-agent result".to_string(),
+            usage: Default::default(),
+        }),
+    )))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+        output: "parent final".to_string(),
+        usage: Default::default(),
+    })))
+    .await
+    .unwrap();
+
+    let assistant_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptItem::AssistantText { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(assistant_entries, vec!["parent final", "sub-agent result"]);
 }
 
 #[tokio::test]
@@ -704,6 +672,48 @@ async fn final_only_coalesces_trailing_streamed_run_after_interruption() {
     assert!(transcript
         .iter()
         .any(|entry| matches!(entry, TranscriptItem::SystemText(text) if text == "tool output")));
+}
+
+#[tokio::test]
+async fn final_coalesces_streamed_text_before_trailing_status() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+
+    tui.app.llm_busy = true;
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+        ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("fallback response".to_string())],
+        },
+    )))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Notice(NoticeEvent::Info(
+        "turn status".to_string(),
+    ))))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+        output: "fallback response".to_string(),
+        usage: Default::default(),
+    })))
+    .await
+    .unwrap();
+
+    let assistant_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptItem::AssistantText { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(assistant_entries, vec!["fallback response"]);
+    assert!(tui
+        .app
+        .transcript
+        .iter()
+        .any(|entry| matches!(entry, TranscriptItem::SystemText(text) if text == "turn status")));
 }
 
 #[tokio::test]
@@ -2238,98 +2248,6 @@ async fn test_streaming_with_tool_calls() {
     harness.drain_and_settle().await.unwrap();
 }
 
-/// Test the specialist_session_handoff tool flow for sub-agent delegation.
-/// This test verifies that when the LLM returns a specialist_session_handoff tool call,
-/// the tool result includes the switch_agent data for the prompt loop to process.
-/// The actual agent switching is complex (requires agent files), so this test
-/// focuses on verifying the tool call appears in the TUI transcript.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_sub_agent_delegation_tool_appears() {
-    let config = test_config_with_mock_client_and_agent("coordinator", Some("delegation-test"));
-
-    // The mock returns specialist_session_handoff tool call, which gets processed
-    // The tool result will have switch_agent data, but we're just verifying
-    // the tool call appears in the transcript
-    let mock_client = Arc::new(
-        MockClient::builder()
-            .global_config(config.clone())
-            .add_turn(
-                MockTurnBuilder::new()
-                    .add_text_chunk("I'll delegate this task.")
-                    .add_tool_call(
-                        "specialist_session_handoff",
-                        serde_json::json!({
-                            "session_id": "handoff-session-1",
-                            "prompt": "Please help with this task"
-                        }),
-                    )
-                    .build(),
-            )
-            .build(),
-    );
-
-    let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
-
-    let mut harness = TuiTestHarness::with_config(config.clone()).await;
-    harness.tui().clear_transcript();
-    harness.tui().app.transcript.push(TranscriptItem::UserText {
-        timestamp: None,
-        text: "Help me".to_string(),
-        seq: None,
-    });
-    harness
-        .tui()
-        .start_prompt(crate::types::PendingMessage {
-            text: "Help me".to_string(),
-            attachments: vec![],
-            attachment_dir: None,
-            paste_count: 0,
-        })
-        .await
-        .unwrap();
-
-    harness
-        .sync()
-        .wait_until_mock_exhausted(mock_client.as_ref(), Duration::from_secs(5))
-        .await
-        .unwrap();
-
-    // Process all pending events
-    loop {
-        match harness.tui().event_rx.try_recv() {
-            Ok(event) => {
-                harness.tui().handle_tui_event(event).await.unwrap();
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-            Err(e) => panic!("Unexpected error receiving event: {e}"),
-        }
-    }
-    harness.render();
-
-    // Wait for the specialist_session_handoff tool call to appear on screen
-    harness
-        .wait_until_screen_contains("specialist_session_handoff", Duration::from_secs(3))
-        .await
-        .unwrap();
-
-    let screen = harness.screen_contents();
-
-    // Verify tool call appears with its arguments
-    assert!(
-        screen.contains("specialist_session_handoff"),
-        "Screen should show specialist_session_handoff tool call, got: {screen}"
-    );
-    assert!(
-        screen.contains("handoff-session-1"),
-        "Screen should show the target session id in tool call, got: {screen}"
-    );
-
-    // Don't use snapshot testing - the order of tool call display and tool result
-    // is non-deterministic due to async event processing. The assertions above
-    // verify the key content is present.
-
-    harness.drain_and_settle().await.unwrap();
-}
 #[tokio::test(flavor = "multi_thread")]
 async fn test_screen_overflow_and_word_wrap() {
     let config =
@@ -2934,6 +2852,15 @@ async fn test_pending_message_not_replayed_on_error() {
         .send(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Error(
             "boom".to_string(),
         ))))
+        .unwrap();
+    harness
+        .tui()
+        .event_tx
+        .send(TuiEvent::Agent(AgentEvent::Turn(
+            harnx_core::event::TurnEvent::Ended {
+                outcome: Default::default(),
+            },
+        )))
         .unwrap();
     harness.drain_and_settle().await.unwrap();
 
@@ -7363,7 +7290,7 @@ async fn session_picker_enter_loads_selected_session() {
 // --- Reconciliation: origin_* baseline is used, not post-activation state ---
 
 #[tokio::test]
-async fn session_picker_enter_reconciles_from_origin_not_current_agent() {
+async fn transcript_reconciliation_uses_origin_not_current_agent() {
     // This test verifies the transcript reconciliation fix: when the user goes
     // through AgentPicker → SessionPicker, the reconciliation must compare
     // against the state *before* agent activation (origin_*), not against the
@@ -7405,34 +7332,11 @@ async fn session_picker_enter_reconciles_from_origin_not_current_agent() {
         "sentinel should be present before picker action"
     );
 
-    let meta = harnx_runtime::config::SessionMeta {
-        id: format!("reconcile-{}", uuid::Uuid::new_v4()),
-        agent_name: Some("hermes".into()),
-        working_dir: Some("/tmp".into()),
-        git_branch: Some("main".into()),
-        git_remote: None,
-        session_id: None,
-        terminal_session_id: None,
-        title: None,
-        modified: None,
-    };
-
     // origin_agent = Some("apollo") simulates "user was on apollo before entering picker".
     // Current config has "hermes" active (post-activation).
     // Reconciliation should detect origin("apollo") != current("hermes") → clear transcript.
-    tui.app.modal = Some(crate::types::ModalState::SessionPicker {
-        sessions: vec![meta],
-        selected: 0,
-        origin_agent: Some("apollo".to_string()),
-        origin_session: None,
-        error: None,
-    });
+    tui.reconcile_transcript_after_command(None, Some("apollo".to_string()), ".session");
 
-    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        .await
-        .unwrap();
-
-    assert!(tui.app.modal.is_none(), "modal should be dismissed");
     // Transcript should have been cleared by reconciliation (sentinel gone).
     assert!(
         !tui.app

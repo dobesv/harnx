@@ -7,22 +7,22 @@ retry-agent
 🤖 retry-agent ▸ mock-llm:primary ▸ [SID]
 > hello
 
-error: Failed to call chat-completions api (client: mock-llm, model: mock-llm:primary)
-
-Caused by:
-    Primary down (type: server_error) (status: 500)
-
 ⚠ Retryable error (status 500, Primary down (type: server_error)), attempt 1/2. Retrying in 10ms...
-error: Failed to call chat-completions api (client: mock-llm, model: mock-llm:primary)
-
-Caused by:
-    Primary still down (type: server_error) (status: 500)
-
 ⚠ Model 'mock-llm:primary' exhausted retries (error: Failed to call chat-completions api (client: mock-llm, model:
 mock-llm:primary)), cooldown 60s. Trying next fallback.
 FALLBACK_SUCCESS: The fallback model handled it!
 
 🤖 retry-agent ▸   💬 [N]
+
+
+
+
+
+
+
+
+
+
 
 
 

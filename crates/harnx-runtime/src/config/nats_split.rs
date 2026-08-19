@@ -92,21 +92,23 @@ pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
         (None, None) => {
             let manager = LOCAL_NATS_SERVER.get_or_init(|| tokio::sync::Mutex::new(None));
             let mut managed_server = manager.lock().await;
-            if managed_server.is_none() {
+            let needs_refresh = match managed_server.as_mut() {
+                Some(server) => !server.is_current().await,
+                None => true,
+            };
+            if needs_refresh {
+                // A joiner does not control the broker lifetime. Refresh a
+                // cached discovery result after its owner exits, but retain a
+                // live joiner so frequent config lookups do not each perform a
+                // separate NATS connection and flush.
+                managed_server.take();
                 *managed_server = Some(crate::nats_local_server::ensure_shared_server().await?);
             }
             let server = managed_server
                 .as_ref()
                 .expect("local NATS server initialized above");
-            (
-                server.url.clone(),
-                server.token.clone(),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            let (url, token) = (server.url.clone(), server.token.clone());
+            (url, token, None, None, None, None, None)
         }
         _ => bail!("{HARNX_NATS_URL_ENV} and {HARNX_NATS_TOKEN_ENV} must be set together"),
     };

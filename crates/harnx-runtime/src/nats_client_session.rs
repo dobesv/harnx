@@ -21,22 +21,26 @@
 //!    |                                            |-- run_agent_loop
 //!    |<----------- advisory events ---------------|
 //!    |                                            |-- append final state
-//!    |--4. Detect turn complete from durable -----|
+//!    |--4. Observe durable TurnEnd ---------------|
 //!    |                                            |
 //!    |--5. Return final response                  |
 //! ```
 //!
 //! ## Turn completion detection
 //!
-//! A turn is complete when the durable log contains a final AssistantMessage
-//! with no pending ToolCalls, or when `reconstruct_state` yields `TurnStatus::Idle`
-//! or `TurnStatus::InFlightCancelled`. The client polls the durable log after
-//! each advisory batch to check for completion.
+//! New workers append a durable `TurnEnd` after the complete model/tool/hook
+//! loop, including the highest user-message sequence it consumed. That marker
+//! is the authoritative success boundary. For compatibility with older
+//! workers, an assistant row plus either a parent `Turn::Ended` advisory or a
+//! confirmed worker-lease release is accepted as a fallback. Durable errors
+//! and cancellation remain terminal barriers.
 
 use anyhow::{Context, Result};
 use async_nats::jetstream;
 use harnx_core::abort::wait_abort_signal;
-use harnx_core::event::{AgentEvent, AgentEventSink, SessionEvent, UserEvent};
+use harnx_core::event::{
+    AgentEvent, AgentEventSink, ModelEvent, SessionEvent, TurnEvent, UserEvent,
+};
 use harnx_core::message::{MessageContent, MessageRole};
 use harnx_core::session::SessionLogEntry;
 use harnx_core::session_reconstruct::{
@@ -335,6 +339,8 @@ impl ThinClientSession {
         let mut pending_cancel_rx = pending_cancel;
         let mut was_cancelled = false;
         let mut orphan_watchdog = OrphanWatchdog::new();
+        let mut saw_terminal_model_error = false;
+        let mut saw_turn_ended = false;
 
         // Main event loop with abort signal handling
         let abort_signal_clone = self.abort_signal.clone();
@@ -378,9 +384,9 @@ impl ThinClientSession {
                     break;
                 }
 
-                // Poll durable completion independently so non-streaming workers
-                // that persist a final assistant message without an advisory still
-                // complete the turn promptly.
+                // Poll durable completion independently so a client that misses
+                // the live Turn::Ended advisory still observes the authoritative
+                // TurnEnd marker promptly.
                 _ = completion_interval.tick() => {
                     if let Ok(entries) = self.load_durable_entries().await {
                         // Refresh cached effective log for live LogSeqAssigned.
@@ -399,16 +405,30 @@ impl ThinClientSession {
                                 AdvisoryFlush::Live,
                             );
                         }
-                        if self.is_turn_complete(&entries, user_msg_seq) {
+                        if Self::is_turn_completion_visible(
+                            &entries,
+                            user_msg_seq,
+                            saw_turn_ended,
+                        ) {
                             (final_response, turn_error) =
                                 Self::extract_turn_outcome(&entries, user_msg_seq);
                             turn_complete = true;
                             break;
                         }
-                        if let Some(reason) =
-                            orphan_watchdog.check(&self.jetstream, &self.session_id).await
+                        if let Some(reason) = orphan_watchdog
+                            .check(&self.jetstream, &self.session_id)
+                            .await
                         {
-                            turn_error = Some(reason);
+                            // Workers predating durable TurnEnd release their
+                            // lease after persisting the assistant row. Treat
+                            // that confirmed release as their durable-compatible
+                            // boundary; a missing worker with no answer remains
+                            // an orphaned-turn failure.
+                            (final_response, turn_error) =
+                                Self::extract_turn_outcome(&entries, user_msg_seq);
+                            if final_response.is_none() {
+                                turn_error = Some(reason);
+                            }
                             turn_complete = true;
                             break;
                         }
@@ -421,6 +441,19 @@ impl ThinClientSession {
                         Some(envelope) => {
                             // Check if this advisory should be rendered (dedup rule)
                             if event_stream.should_render(&envelope) {
+                                // Only parent-scope terminal events complete this
+                                // thin-client turn. Sub-agent events remain wrapped
+                                // in AgentEvent::SubAgent and therefore do not set
+                                // either compatibility flag.
+                                saw_terminal_model_error |= matches!(
+                                    envelope.event,
+                                    AgentEvent::Model(ModelEvent::Error(_))
+                                );
+                                let turn_ended = matches!(
+                                    envelope.event,
+                                    AgentEvent::Turn(TurnEvent::Ended { .. })
+                                );
+                                saw_turn_ended |= turn_ended;
                                 pending_advisories.push_back(envelope.clone());
                                 flush_pending_advisories(
                                     &mut pending_advisories,
@@ -452,7 +485,11 @@ impl ThinClientSession {
                                             AdvisoryFlush::Live,
                                         );
                                     }
-                                    if self.is_turn_complete(&entries, user_msg_seq) {
+                                    if Self::is_turn_completion_visible(
+                                        &entries,
+                                        user_msg_seq,
+                                        saw_turn_ended,
+                                    ) {
                                         // Extract final response before we finish
                                         (final_response, turn_error) =
                                             Self::extract_turn_outcome(&entries, user_msg_seq);
@@ -534,8 +571,10 @@ impl ThinClientSession {
             return Err(error);
         }
 
-        if let Some(error) = &turn_error {
-            render_error_entry(error, &event_sink);
+        if !saw_terminal_model_error {
+            if let Some(error) = &turn_error {
+                render_error_entry(error, &event_sink);
+            }
         }
 
         Ok(ThinClientTurnResult {
@@ -616,22 +655,47 @@ impl ThinClientSession {
             .context("failed to load durable session log")
     }
 
-    /// Check if the turn is complete based on durable entries.
-    fn is_turn_complete(&self, entries: &[(u64, SessionLogEntry)], user_msg_seq: u64) -> bool {
-        let has_barrier_after_user = entries.iter().any(|(seq, entry)| {
-            *seq > user_msg_seq
-                && match entry {
-                    SessionLogEntry::Message { role, .. } => role.is_assistant(),
-                    SessionLogEntry::Error { .. } => true,
-                    _ => false,
-                }
+    /// Check for durable failure/cancellation barriers.
+    ///
+    /// An assistant row is deliberately not terminal here. It is persisted
+    /// before stop hooks and pending-context checks, either of which may resume
+    /// the same model/tool loop.
+    fn has_durable_terminal_failure(entries: &[(u64, SessionLogEntry)], user_msg_seq: u64) -> bool {
+        let has_error_after_user = entries.iter().any(|(seq, entry)| {
+            *seq > user_msg_seq && matches!(entry, SessionLogEntry::Error { .. })
         });
 
-        has_barrier_after_user
+        has_error_after_user
             || matches!(
                 reconstruct_state_from_nats(entries).turn_status,
                 TurnStatus::InFlightCancelled
             )
+    }
+
+    fn has_durable_assistant_response(
+        entries: &[(u64, SessionLogEntry)],
+        user_msg_seq: u64,
+    ) -> bool {
+        Self::extract_final_response(entries, user_msg_seq).is_some()
+    }
+
+    fn has_durable_turn_end(entries: &[(u64, SessionLogEntry)], user_msg_seq: u64) -> bool {
+        entries.iter().any(|(_, entry)| {
+            matches!(
+                entry,
+                SessionLogEntry::TurnEnd { through_seq, .. } if *through_seq >= user_msg_seq
+            )
+        })
+    }
+
+    fn is_turn_completion_visible(
+        entries: &[(u64, SessionLogEntry)],
+        user_msg_seq: u64,
+        saw_turn_ended: bool,
+    ) -> bool {
+        Self::has_durable_terminal_failure(entries, user_msg_seq)
+            || Self::has_durable_turn_end(entries, user_msg_seq)
+            || (saw_turn_ended && Self::has_durable_assistant_response(entries, user_msg_seq))
     }
 
     /// Final assistant text and worker-reported failure for the current turn.
@@ -763,6 +827,7 @@ fn render_log_entry_to_sink(
         | SessionLogEntry::DataUrls { .. }
         | SessionLogEntry::Compress { .. }
         | SessionLogEntry::Title { .. }
+        | SessionLogEntry::TurnEnd { .. }
         | SessionLogEntry::Clear
         | SessionLogEntry::EditEntries { .. }
         | SessionLogEntry::Rewind { .. }
@@ -1080,6 +1145,95 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn assistant_message_is_not_a_durable_turn_end() {
+        let entries = test_entries(&[
+            (1, MessageRole::User, "question"),
+            (2, MessageRole::Assistant, "intermediate stop-hook response"),
+        ]);
+
+        assert!(
+            !ThinClientSession::is_turn_completion_visible(&entries, 1, false),
+            "an assistant row may still be followed by stop-hook or pending-context work"
+        );
+        assert!(
+            ThinClientSession::is_turn_completion_visible(&entries, 1, true),
+            "older workers use the parent turn advisory as a compatibility fallback"
+        );
+
+        let mut durably_ended = entries;
+        durably_ended.push((
+            3,
+            SessionLogEntry::TurnEnd {
+                through_seq: 1,
+                fence_token: 7,
+                timestamp: None,
+            },
+        ));
+        assert!(ThinClientSession::is_turn_completion_visible(
+            &durably_ended,
+            1,
+            false
+        ));
+    }
+
+    #[test]
+    fn turn_end_does_not_complete_a_later_queued_user() {
+        let entries = vec![
+            (
+                1,
+                SessionLogEntry::Message {
+                    id: None,
+                    role: MessageRole::User,
+                    content: MessageContent::Text("first".to_string()),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                2,
+                SessionLogEntry::Message {
+                    id: None,
+                    role: MessageRole::User,
+                    content: MessageContent::Text("queued".to_string()),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                3,
+                SessionLogEntry::TurnEnd {
+                    through_seq: 1,
+                    fence_token: 7,
+                    timestamp: None,
+                },
+            ),
+        ];
+        assert!(!ThinClientSession::is_turn_completion_visible(
+            &entries, 2, false
+        ));
+    }
+
+    #[test]
+    fn durable_error_and_cancel_are_terminal_without_an_advisory() {
+        let mut failed = test_entries(&[(1, MessageRole::User, "question")]);
+        failed.push((
+            2,
+            SessionLogEntry::Error {
+                message: "worker failed".to_string(),
+                fence_token: 7,
+                timestamp: None,
+            },
+        ));
+        assert!(ThinClientSession::has_durable_terminal_failure(&failed, 1));
+
+        let mut cancelled = test_entries(&[(1, MessageRole::User, "question")]);
+        cancelled.push((2, SessionLogEntry::Cancel { fence_token: 7 }));
+        assert!(ThinClientSession::has_durable_terminal_failure(
+            &cancelled, 1
+        ));
     }
 
     #[test]

@@ -129,16 +129,14 @@ fn ag_ui_sink_unwraps_sub_agent_message_chunk() {
 }
 
 #[test]
-fn ag_ui_sink_unwraps_sub_agent_error() {
-    // SubAgent wrapper around Model::Error should produce the same RunError
-    // event as the bare error path after unwrapping at the top of emit.
+fn ag_ui_sink_does_not_promote_sub_agent_error_to_run_error() {
+    // A nested agent failure belongs to that sub-agent step. It must not end
+    // the parent AG-UI run.
     use harnx_core::event::AgentSource;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let message_id =
         MessageId::from(uuid::Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap());
-    // Use `new` (not with_snapshot) for error path — finish_turn is not called
-    // unless a message was already started, so we expect RunError directly.
     let sink = super::AgUiSink::new(tx, message_id.clone());
 
     let source = AgentSource {
@@ -151,22 +149,8 @@ fn ag_ui_sink_unwraps_sub_agent_error() {
         AgentEvent::Model(ModelEvent::Error("boom".into())),
     ));
 
-    // RunError with the wrapped message
-    match rx.try_recv().expect("run error") {
-        Event::RunError(RunErrorEvent {
-            base,
-            message,
-            code,
-        }) => {
-            assert_eq!(base.timestamp, None);
-            assert_eq!(base.raw_event, None);
-            assert_eq!(message, "boom");
-            assert!(code.is_none());
-        }
-        other => panic!("expected RunError event, got: {other:?}"),
-    }
-
-    assert!(rx.try_recv().is_err(), "no additional events expected");
+    assert!(rx.try_recv().is_err(), "no AG-UI run error expected");
+    assert!(sink.take_run_error().is_none());
 }
 
 #[test]
@@ -190,27 +174,16 @@ fn ag_ui_sink_skips_empty_chunk() {
 }
 
 #[test]
-fn ag_ui_sink_emits_run_error_for_model_error() {
+fn ag_ui_sink_defers_model_error_to_run_owner() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let message_id = MessageId::from(uuid::Uuid::new_v4());
     let sink = super::AgUiSink::new(tx, message_id);
 
     sink.emit(AgentEvent::Model(ModelEvent::Error("boom".to_string())));
 
-    let event = rx.try_recv().expect("should receive event");
-    match event {
-        Event::RunError(RunErrorEvent {
-            base,
-            message,
-            code,
-        }) => {
-            assert_eq!(base.timestamp, None);
-            assert_eq!(base.raw_event, None);
-            assert_eq!(message, "boom");
-            assert!(code.is_none());
-        }
-        _ => panic!("expected RunError event, got: {:?}", event),
-    }
+    assert!(rx.try_recv().is_err());
+    assert_eq!(sink.take_run_error().as_deref(), Some("boom"));
+    assert!(sink.take_run_error().is_none());
 }
 
 #[test]
@@ -234,22 +207,24 @@ fn ag_ui_sink_emits_custom_for_title_generation_failed() {
 }
 
 #[test]
-fn ag_ui_sink_emits_run_error_for_notice_error() {
+fn ag_ui_sink_emits_advisory_notices_without_failing_run() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let message_id = MessageId::from(uuid::Uuid::new_v4());
     let sink = super::AgUiSink::new(tx, message_id);
 
-    sink.emit(AgentEvent::Notice(NoticeEvent::Error(
-        "fatal error".to_string(),
+    sink.emit(AgentEvent::Notice(NoticeEvent::Warning(
+        "partial stream failed".to_string(),
     )));
 
-    let event = rx.try_recv().expect("should receive event");
-    match event {
-        Event::RunError(RunErrorEvent { message, .. }) => {
-            assert_eq!(message, "fatal error");
-        }
-        _ => panic!("expected RunError event, got: {:?}", event),
-    }
+    let Event::Custom(CustomEvent { name, value, .. }) =
+        rx.try_recv().expect("notice should be forwarded")
+    else {
+        panic!("expected custom notice event");
+    };
+    assert_eq!(name, "notice");
+    assert_eq!(value["level"], json!("warning"));
+    assert_eq!(value["message"], json!("partial stream failed"));
+    assert!(sink.take_run_error().is_none());
 }
 
 #[test]
@@ -321,6 +296,33 @@ fn ag_ui_sink_skips_final_when_empty() {
     }));
 
     assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn ag_ui_sink_does_not_repeat_streamed_text_on_final() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let message_id = MessageId::from(uuid::Uuid::new_v4());
+    let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), true, None);
+
+    sink.emit(AgentEvent::Model(ModelEvent::MessageChunk {
+        blocks: vec![ContentBlock::Text("answer".to_string())],
+    }));
+    sink.emit(AgentEvent::Model(ModelEvent::Final {
+        output: "answer".to_string(),
+        usage: CompletionTokenUsage::default(),
+    }));
+
+    match rx.try_recv().expect("streamed text") {
+        Event::TextMessageContent(event) => {
+            assert_eq!(event.message_id, message_id);
+            assert_eq!(event.delta, "answer");
+        }
+        other => panic!("expected TextMessageContent, got: {other:?}"),
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "Final must not repeat streamed text"
+    );
 }
 
 #[test]
@@ -478,10 +480,6 @@ fn ag_ui_sink_keeps_thinking_open_across_background_session_event() {
     assert!(matches!(
         rx.try_recv().expect("thinking end"),
         Event::ThinkingEnd(_)
-    ));
-    assert!(matches!(
-        rx.try_recv().expect("step finished"),
-        Event::StepFinished(_)
     ));
     assert!(rx.try_recv().is_err());
 }
@@ -864,7 +862,7 @@ fn parse_run_input_accepts_valid_body() {
 }
 
 #[test]
-fn ag_ui_sink_maps_turn_started_and_ended_to_step_events() {
+fn ag_ui_sink_maps_only_sub_agent_turns_to_step_events() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let sink = super::AgUiSink::with_snapshot(tx, MessageId::random(), true, None);
 
@@ -872,6 +870,27 @@ fn ag_ui_sink_maps_turn_started_and_ended_to_step_events() {
     sink.emit(AgentEvent::Turn(TurnEvent::Ended {
         outcome: harnx_core::event::TurnOutcome::default(),
     }));
+
+    assert!(
+        rx.try_recv().is_err(),
+        "the parent turn is already represented by the AG-UI run"
+    );
+
+    let source = harnx_core::event::AgentSource {
+        agent: "sub".into(),
+        session_id: None,
+        model: None,
+    };
+    sink.emit(AgentEvent::sub_agent(
+        source.clone(),
+        AgentEvent::Turn(TurnEvent::Started),
+    ));
+    sink.emit(AgentEvent::sub_agent(
+        source,
+        AgentEvent::Turn(TurnEvent::Ended {
+            outcome: harnx_core::event::TurnOutcome::default(),
+        }),
+    ));
 
     match rx.try_recv().expect("step started") {
         Event::StepStarted(event) => assert_eq!(event.step_name, "turn-1"),
@@ -949,7 +968,8 @@ fn ag_ui_sink_emits_session_handoff_custom_event_on_handoff_requested() {
         session_id: Some("target-session-123".to_string()),
     }));
 
-    // Emit a step finished event (simulating turn end after handoff)
+    // The parent turn ending is represented by RUN_FINISHED in the session
+    // actor, not by a redundant step boundary in this adapter.
     sink.emit(AgentEvent::Turn(TurnEvent::Ended {
         outcome: harnx_core::event::TurnOutcome::default(),
     }));
@@ -960,13 +980,11 @@ fn ag_ui_sink_emits_session_handoff_custom_event_on_handoff_requested() {
         events.push(event);
     }
 
-    // Extract event types for ordering assertions
+    // Extract custom event types for ordering assertions.
     let event_types: Vec<&str> = events
         .iter()
         .map(|e| match e {
             Event::Custom(ce) => ce.name.as_str(),
-            Event::StepFinished(_) => "STEP_FINISHED",
-            Event::StepStarted(_) => "STEP_STARTED",
             _ => "OTHER",
         })
         .collect();
@@ -976,7 +994,6 @@ fn ag_ui_sink_emits_session_handoff_custom_event_on_handoff_requested() {
     let turn_handoff_idx = event_types
         .iter()
         .position(|&t| t == "turn_handoff_requested");
-    let step_finished_idx = event_types.iter().position(|&t| t == "STEP_FINISHED");
 
     // Both custom events must be present
     assert!(
@@ -987,16 +1004,10 @@ fn ag_ui_sink_emits_session_handoff_custom_event_on_handoff_requested() {
         turn_handoff_idx.is_some(),
         "turn_handoff_requested event should be emitted"
     );
-    assert!(
-        step_finished_idx.is_some(),
-        "STEP_FINISHED event should be emitted"
-    );
-
-    // session_handoff must come BEFORE STEP_FINISHED (the terminal event for this test)
-    assert!(
-        session_handoff_idx.unwrap() < step_finished_idx.unwrap(),
-        "session_handoff must appear before STEP_FINISHED; got order: {:?}",
-        event_types
+    assert_eq!(
+        event_types,
+        ["turn_handoff_requested", "session_handoff"],
+        "parent turn end must not add a redundant AG-UI step"
     );
 
     assert_handoff_payload(find_custom_event(&events, "session_handoff"));
@@ -1832,10 +1843,12 @@ async fn ag_ui_run_uses_only_last_message_user_prompt() {
         vec![
             "RUN_STARTED",
             "TEXT_MESSAGE_START",
+            "TEXT_MESSAGE_CONTENT",
             "TEXT_MESSAGE_END",
             "RUN_FINISHED",
         ]
     );
+    assert_eq!(events[2]["delta"].as_str(), Some("assistant2"));
 }
 
 #[tokio::test]

@@ -4,6 +4,7 @@ use crate::types::{
     App, ModalState, ToolCallBody, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT,
     SPINNER_FRAMES,
 };
+use harnx_core::event::{AgentEvent, SessionEvent, TurnEvent};
 use harnx_runtime::config::GlobalConfig;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -23,6 +24,20 @@ struct ListModalOpts<'a> {
 }
 
 impl Tui {
+    pub(super) fn render_model_source_change(&mut self, event: &AgentEvent) -> bool {
+        let model = match event {
+            AgentEvent::Turn(TurnEvent::ModelFallback { to, .. })
+            | AgentEvent::Session(SessionEvent::ModelChanged { to, .. }) => to,
+            _ => return false,
+        };
+        let source = self.app.last_ui_output_source.clone().map(|mut source| {
+            source.model = Some(model.clone());
+            source
+        });
+        self.render_ui_output_heading(source.as_ref(), false);
+        true
+    }
+
     fn render_text_entry(
         prefix: &str,
         text: &str,
@@ -649,7 +664,10 @@ impl Tui {
     /// item — a fresh `AssistantText` is started. An interleaving item thus
     /// breaks the surrounding text into separate blocks for free, with no
     /// per-event bookkeeping.
-    pub(super) fn append_streaming_assistant_chunk(&mut self, chunk: &str) {
+    pub(super) fn append_streaming_assistant_chunk(&mut self, chunk: &str, is_sub_agent: bool) {
+        if chunk.is_empty() {
+            return;
+        }
         let open = self.app.streaming_open
             && matches!(
                 self.app.transcript.last(),
@@ -674,6 +692,10 @@ impl Tui {
             // Invalidate the cached render so the appended text repaints.
             *rendered_cache = None;
         }
+        if !is_sub_agent {
+            self.app.main_streamed_text_idx = Some(self.app.transcript.len() - 1);
+        }
+        self.pin_transcript_to_bottom();
     }
 
     pub(super) fn pin_transcript_to_bottom(&mut self) {
@@ -685,7 +707,7 @@ impl Tui {
         self.app.transcript.clear();
         self.app.scroll_state = ratatui_widget_scrolling::ScrollState::new();
         self.app.streaming_open = false;
-        self.app.streamed_text_this_turn = false;
+        self.app.main_streamed_text_idx = None;
     }
 
     pub(super) fn build_input_title(&self) -> Line<'static> {

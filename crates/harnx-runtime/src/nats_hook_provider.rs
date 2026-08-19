@@ -17,6 +17,8 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
+const DISCOVERY_ATTEMPTS: usize = 4;
+const DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// Session data needed to serialize a hook event for a remote hook server.
 #[derive(Clone, Debug)]
@@ -141,7 +143,9 @@ pub struct NatsHookProvider {
 impl NatsHookProvider {
     pub async fn discover(config: &Config, instance_id: ServerScope) -> Result<Self> {
         let client = config.nats_client(LOCAL_CLUSTER_KEY).await?;
-        let hooks = hooks_or_fail_closed_guard(registration_snapshot(&client, &instance_id).await);
+        let hooks = hooks_or_fail_closed_guard(
+            registration_snapshot_with_retry(&client, &instance_id).await,
+        );
         Ok(Self::from_hooks(client, instance_id, hooks))
     }
 
@@ -151,7 +155,9 @@ impl NatsHookProvider {
         client: async_nats::Client,
         instance_id: ServerScope,
     ) -> Result<Self> {
-        let hooks = hooks_or_fail_closed_guard(registration_snapshot(&client, &instance_id).await);
+        let hooks = hooks_or_fail_closed_guard(
+            registration_snapshot_with_retry(&client, &instance_id).await,
+        );
         Ok(Self::from_hooks(client, instance_id, hooks))
     }
 
@@ -706,6 +712,31 @@ async fn registration_snapshot(
             .filter(|hook| !active_servers.contains(&hook.server)),
     );
     Ok(hooks)
+}
+
+async fn registration_snapshot_with_retry(
+    client: &async_nats::Client,
+    instance_id: &ServerScope,
+) -> Result<Vec<DiscoveredHook>> {
+    let mut last_error = None;
+    for attempt in 1..=DISCOVERY_ATTEMPTS {
+        match registration_snapshot(client, instance_id).await {
+            Ok(hooks) => return Ok(hooks),
+            Err(error) => {
+                if attempt < DISCOVERY_ATTEMPTS {
+                    log::warn!(
+                        "retrying NATS hook discovery: scope={} attempt={}/{} error={error:#}",
+                        instance_id.as_str(),
+                        attempt,
+                        DISCOVERY_ATTEMPTS,
+                    );
+                    tokio::time::sleep(DISCOVERY_RETRY_DELAY).await;
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.expect("at least one hook discovery attempt must record an error"))
 }
 
 async fn optional_bucket_snapshot(

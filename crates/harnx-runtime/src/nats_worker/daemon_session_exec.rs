@@ -146,6 +146,8 @@ impl WorkerRuntime {
                     );
                 }
 
+                Self::record_session_turn_end(&backend, &lease, turn_cursor_val).await?;
+
                 log::info!(
                     "execute_session turn complete: session_id={} turn_cursor={} activation_high_water={:?}",
                     activation.session_id,
@@ -161,7 +163,7 @@ impl WorkerRuntime {
                 // Re-run another turn ONLY if there's a user message with seq > activation_high_water.
                 // This prevents re-running when we've already consumed everything.
                 // Use the fresh leader-authoritative load so this re-read reflects
-                // both the worker's own just-persisted turn barrier and any client
+                // both the worker's own just-persisted completion boundary and any client
                 // edit/retract committed just before the read (otherwise it would
                 // re-fold already-answered or retracted messages).
                 let tail = backend.load_events_latest_async().await?;
@@ -200,7 +202,7 @@ impl WorkerRuntime {
         .await;
 
         // Record the failure durably BEFORE releasing the lease: attached
-        // clients treat an `Error` entry as the turn barrier, and a client that
+        // clients treat an `Error` entry as a terminal boundary, and a client that
         // reconnects later still sees why the turn produced nothing.
         if let Err(error) = &result {
             Self::record_session_error(&backend, &lease, error).await;
@@ -248,6 +250,27 @@ impl WorkerRuntime {
                 backend.session_id(),
             );
         }
+    }
+
+    /// Persist the successful full-loop boundary before checking for another
+    /// queued turn. Unlike the live Turn::Ended advisory, this cannot be lost
+    /// when the client is briefly disconnected or under load.
+    async fn record_session_turn_end(
+        backend: &NatsSessionLogBackend,
+        lease: &NatsSessionLease,
+        through_seq: u64,
+    ) -> Result<()> {
+        if !should_append_control_log_entry(lease) {
+            return Ok(());
+        }
+        backend
+            .append_event(&harnx_core::session::SessionLogEntry::TurnEnd {
+                through_seq,
+                fence_token: lease.fence_token(),
+                timestamp: Some(chrono::Utc::now()),
+            })
+            .await?;
+        Ok(())
     }
 
     /// Spawn a task that watches for lease loss and aborts on loss.

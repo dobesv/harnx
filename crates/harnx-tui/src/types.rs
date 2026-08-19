@@ -48,6 +48,11 @@ pub struct Tui {
     /// The (session_id, cluster) of the remote agent currently running, if any.
     /// Set in `start_prompt` and cleared when the turn completes.
     pub(super) active_remote_session: Option<(String, String)>,
+    /// Session whose shared NATS turn activity is currently being observed.
+    pub(super) session_activity_target: Option<(String, String)>,
+    /// Background subscription that lets this TUI react to turns submitted by
+    /// another client attached to the same session.
+    pub(super) session_activity_handle: Option<JoinHandle<()>>,
     #[allow(private_interfaces)]
     pub(crate) app: App,
     pub(crate) event_tx: mpsc::UnboundedSender<TuiEvent>,
@@ -82,7 +87,10 @@ pub(super) struct App {
     /// Interleaving items (tool calls, notices, headings, …) end a run
     /// implicitly by becoming the trailing item themselves.
     pub(super) streaming_open: bool,
-    pub(super) streamed_text_this_turn: bool,
+    /// Transcript row containing the latest streamed parent-agent text for
+    /// this turn. Sub-agent rows must never become the replacement target for
+    /// the parent agent's canonical `ModelEvent::Final` output.
+    pub(super) main_streamed_text_idx: Option<usize>,
     pub(super) cache_valid_width: Option<u16>,
     pub(super) last_ui_output_source: Option<AgentSource>,
     pub(super) last_usage_source: Option<AgentSource>,
@@ -331,6 +339,18 @@ impl App {
 
 pub(crate) enum TuiEvent {
     Agent(harnx_core::event::AgentEvent),
+    /// The locally-owned prompt task has exited. `Turn::Ended` normally closes
+    /// busy state; this is the fallback for a lossy advisory or setup failure.
+    PromptTaskFinished {
+        task: AbortSignal,
+        error: Option<String>,
+    },
+    /// Shared activity observed directly from the session fan-out stream.
+    SessionActivity {
+        session_id: String,
+        cluster: String,
+        active: bool,
+    },
     /// Intermediate tool round completed; retained for queued-message tests.
     #[allow(dead_code)]
     ToolRoundComplete,

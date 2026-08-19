@@ -4305,6 +4305,7 @@ name = "harnx-tui"
 version = "0.33.4"
 dependencies = [
  "anyhow",
+ "async-nats",
  "async-trait",
  "bincode 2.0.1",
  "chrono",
