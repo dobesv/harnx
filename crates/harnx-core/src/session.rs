@@ -150,15 +150,29 @@ pub enum SessionLogEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timestamp: Option<DateTime<Utc>>,
     },
+    /// Durable boundary written only after the worker has finished the full
+    /// model/tool/stop-hook loop. Live `Turn::Ended` events are advisory and
+    /// may be lost, so thin clients use this entry as the authoritative
+    /// successful completion signal.
+    #[serde(rename = "turn_end")]
+    TurnEnd {
+        /// Highest physical user-message sequence consumed by this turn. A
+        /// later queued user row may precede this marker physically without
+        /// having been incorporated into the completed turn.
+        through_seq: u64,
+        fence_token: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<DateTime<Utc>>,
+    },
     #[serde(other)]
     Unknown,
 }
 
 impl SessionLogEntry {
     /// Stamp the fence token on worker-originated entries that carry one
-    /// (`Message`, `ToolCalls`). Other variants are left unchanged: `Cancel`
-    /// carries its fence at construction (control plane), and client-originated
-    /// entries (`UserMessage`) are intentionally unfenced.
+    /// (`Message`, `ToolCalls`). Other variants are left unchanged: `Cancel`,
+    /// `Error`, and `TurnEnd` carry their fence at construction, while
+    /// client-originated entries (`UserMessage`) are intentionally unfenced.
     pub fn set_fence_token(&mut self, fence: u64) {
         match self {
             SessionLogEntry::Message { fence_token, .. }
@@ -170,14 +184,15 @@ impl SessionLogEntry {
     }
 
     /// Fence token carried by this entry, if any. `Message`/`ToolCalls` carry an
-    /// optional fence; `Cancel` and `Error` always carry one. All other variants
-    /// are unfenced and return `None`.
+    /// optional fence; `Cancel`, `Error`, and `TurnEnd` always carry one. All
+    /// other variants are unfenced and return `None`.
     pub fn fence_token(&self) -> Option<u64> {
         match self {
             SessionLogEntry::Message { fence_token, .. }
             | SessionLogEntry::ToolCalls { fence_token, .. } => *fence_token,
             SessionLogEntry::Cancel { fence_token }
-            | SessionLogEntry::Error { fence_token, .. } => Some(*fence_token),
+            | SessionLogEntry::Error { fence_token, .. }
+            | SessionLogEntry::TurnEnd { fence_token, .. } => Some(*fence_token),
             _ => None,
         }
     }

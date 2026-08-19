@@ -241,7 +241,42 @@ pub enum LoopResult {
 /// Recoverable tool errors are already converted to `{"is_error":true}`
 /// results by `execute_tool_round` and fed back to the LLM.
 pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Result<LoopResult> {
-    run_agent_loop_inner(ctx, initial_input).await
+    if initial_input.is_empty() {
+        return run_agent_loop_inner(ctx, initial_input).await;
+    }
+
+    with_turn_lifecycle(ctx, run_agent_loop_inner(ctx, initial_input)).await
+}
+
+async fn with_turn_lifecycle<T>(
+    ctx: &AgentLoopContext,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    emit_turn_started();
+    let result = future.await;
+    emit_turn_ended(ctx, &result);
+    result
+}
+
+fn emit_turn_started() {
+    use harnx_core::event::{AgentEvent, TurnEvent};
+
+    harnx_core::sink::emit_agent_event(AgentEvent::Turn(TurnEvent::Started));
+}
+
+fn emit_turn_ended<T>(ctx: &AgentLoopContext, result: &Result<T>) {
+    use harnx_core::event::{AgentEvent, ModelEvent, TurnEvent, TurnOutcome};
+
+    if let Err(error) = result {
+        if !ctx.abort_signal.aborted() {
+            harnx_core::sink::emit_agent_event(AgentEvent::Model(ModelEvent::Error(
+                harnx_render::pretty_error_string(error),
+            )));
+        }
+    }
+    harnx_core::sink::emit_agent_event(AgentEvent::Turn(TurnEvent::Ended {
+        outcome: TurnOutcome::default(),
+    }));
 }
 
 /// Runs agent loop, applying file-backed local handoffs until completion.
@@ -253,19 +288,26 @@ pub async fn run_agent_loop_with_local_handoff(
     ctx: &AgentLoopContext,
     mut input: Input,
 ) -> Result<()> {
-    loop {
-        match run_agent_loop(ctx, input).await? {
-            LoopResult::Completed => return Ok(()),
-            LoopResult::HandoffRequested {
-                agent,
-                session_id,
-                prompt,
-            } => {
-                apply_local_handoff(ctx, &agent, session_id.as_deref(), &prompt).await?;
-                input = crate::config::input::from_str(&ctx.config, &prompt, None);
+    if input.is_empty() {
+        return run_agent_loop_inner(ctx, input).await.map(|_| ());
+    }
+
+    with_turn_lifecycle(ctx, async move {
+        loop {
+            match run_agent_loop_inner(ctx, input).await? {
+                LoopResult::Completed => return Ok(()),
+                LoopResult::HandoffRequested {
+                    agent,
+                    session_id,
+                    prompt,
+                } => {
+                    apply_local_handoff(ctx, &agent, session_id.as_deref(), &prompt).await?;
+                    input = crate::config::input::from_str(&ctx.config, &prompt, None);
+                }
             }
         }
-    }
+    })
+    .await
 }
 
 async fn apply_local_handoff(
@@ -487,6 +529,20 @@ async fn complete_model_turn(
         completion.tool_calls,
     )
     .await
+}
+
+async fn emit_final_text_response(
+    ctx: &AgentLoopContext,
+    output: String,
+    usage: CompletionTokenUsage,
+) {
+    if let Some(callback) = &ctx.on_text_response {
+        callback(output, usage).await;
+    } else {
+        harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Model(
+            harnx_core::event::ModelEvent::Final { output, usage },
+        ));
+    }
 }
 
 fn emit_text_turn_status(
@@ -786,10 +842,6 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
             continue;
         }
 
-        // Text-only turn — invoke on_text_response callback (TUI emits Final).
-        if let Some(ref cb) = ctx.on_text_response {
-            cb(output.clone(), usage.clone()).await;
-        }
         emitted_text_turns += 1;
 
         match stop_resume_action(ctx, &turn, resume_count, stop_outcome) {
@@ -813,6 +865,8 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
             ResumeAction::Abort => break,
             ResumeAction::None => {}
         }
+
+        emit_final_text_response(ctx, output, usage).await;
 
         // Done.
         break;
@@ -852,6 +906,32 @@ mod tests {
         }
     }
 
+    fn assert_single_completed_turn(sink: &CollectingSink) {
+        let events = sink.events.lock().unwrap();
+        assert!(matches!(
+            events.first(),
+            Some((AgentEvent::Turn(TurnEvent::Started), None))
+        ));
+        assert!(matches!(
+            events.last(),
+            Some((AgentEvent::Turn(TurnEvent::Ended { .. }), None))
+        ));
+        let final_outputs: Vec<&str> = events
+            .iter()
+            .filter_map(|(event, source)| match (event, source) {
+                (AgentEvent::Model(harnx_core::event::ModelEvent::Final { output, .. }), None) => {
+                    Some(output.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            final_outputs,
+            ["all done"],
+            "only the text that ends the full tool loop is final"
+        );
+    }
+
     #[tokio::test]
     async fn user_prompt_block_reason_is_emitted_as_error_notice() {
         let _guard = SINK_LOCK.lock().await;
@@ -888,6 +968,7 @@ mod tests {
     /// duplicate copies. The fix clears the field after each round.
     #[tokio::test(flavor = "multi_thread")]
     async fn injected_user_text_is_not_replayed_across_rounds() {
+        let _sink_guard = SINK_LOCK.lock().await;
         let _guard = crate::client::TestStateGuard::new(None).await;
         let tmp = TempDir::new().unwrap();
         let global_config = replay_test_config(&tmp);
@@ -941,7 +1022,13 @@ mod tests {
         let ctx = make_test_context(global_config.clone(), call_fn, on_tool_round);
 
         let input = crate::config::input::from_str(&global_config, "do work", None);
-        run_agent_loop(&ctx, input).await.unwrap();
+        let sink = Arc::new(CollectingSink::default());
+        harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+            run_agent_loop(&ctx, input).await
+        })
+        .await
+        .unwrap();
+        assert_single_completed_turn(&sink);
 
         // The injection happened once; the bug would have made it appear in
         // round 2 and round 3). With the fix it appears exactly once.
@@ -993,6 +1080,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_turn_ends_without_emitting_model_error() {
+        let _guard = SINK_LOCK.lock().await;
+        let config = Arc::new(RwLock::new(crate::config::Config::default()));
+        let call_fn: AgentCallFn = Arc::new(|_, _, _| unreachable!("model is not called"));
+        let ctx = make_test_context(config, call_fn, handoff_on_tool_round());
+        ctx.abort_signal.set_ctrlc();
+        let sink = Arc::new(CollectingSink::default());
+
+        let result: Result<()> = harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+            with_turn_lifecycle(&ctx, async { Err(anyhow::anyhow!("interrupted by user")) }).await
+        })
+        .await;
+        assert!(result.is_err());
+
+        let events = sink.events.lock().unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                (AgentEvent::Turn(TurnEvent::Started), None),
+                (AgentEvent::Turn(TurnEvent::Ended { .. }), None)
+            ]
+        ));
+    }
+
+    #[tokio::test]
     async fn shared_pending_context_is_taken_and_injected_into_next_input() {
         let config = Arc::new(RwLock::new(crate::config::Config::default()));
         let mut input = crate::config::input::from_str(&config, "user prompt", None);
@@ -1024,9 +1136,7 @@ user prompt"
     }
 
     /// Test that the dispatch path for _session_handoff tools returns a
-    /// ToolResult.switch_agent that the loop detects. We inject a mock
-    /// ToolProvider that returns the switch_agent JSON; the engine's
-    /// detect_switch_agent picks it up.
+    /// ToolResult.switch_agent that the loop detects.
     #[tokio::test(flavor = "multi_thread")]
     async fn handoff_returns_handoff_requested_and_emits_event() {
         let _guard = SINK_LOCK.lock().await;

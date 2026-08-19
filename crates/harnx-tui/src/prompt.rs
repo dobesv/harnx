@@ -1,11 +1,10 @@
 use crate::types::Tui;
-use crate::types::{PendingMessage, TuiEvent};
+use crate::types::{PendingMessage, TranscriptItem, TuiEvent};
 use anyhow::{Context, Result};
 #[cfg(test)]
 use harnx_core::event::{AgentEvent, ModelEvent};
 #[cfg(test)]
 use harnx_core::sink::emit_agent_event;
-#[cfg(test)]
 use harnx_render::pretty_error_string;
 #[cfg(test)]
 use harnx_runtime::client::CompletionTokenUsage;
@@ -30,6 +29,44 @@ pub(super) struct PromptTaskContext {
 }
 
 impl Tui {
+    pub(super) async fn finish_prompt_task(&mut self, task: AbortSignal, error: Option<String>) {
+        let is_current = self
+            .current_prompt_abort
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &task));
+        if !is_current {
+            return;
+        }
+
+        self.current_prompt_abort = None;
+        if let Some(error) = error {
+            self.finish_main_prompt_error(error).await;
+        }
+        // Turn lifecycle advisories are lossy by design. Normally Turn::Ended
+        // already completed the UI state; task exit is the local owner's
+        // authoritative fallback when that advisory was missed or setup failed
+        // before a worker could start the turn.
+        self.complete_main_prompt().await;
+    }
+
+    pub(super) async fn complete_main_prompt(&mut self) {
+        self.current_prompt_abort = None;
+        self.app.llm_busy = false;
+        self.active_remote_session = None;
+        *self.shared_pending_message.lock().await = None;
+        self.app.last_ui_output_source = None;
+        self.refresh_input_chrome();
+
+        if let Some(pending) = self.app.pending_message.take() {
+            if let Err(err) = self.submit_pending_message(pending).await {
+                self.app
+                    .transcript
+                    .push(TranscriptItem::ErrorText(pretty_error_string(&err)));
+                self.pin_transcript_to_bottom();
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(super) async fn run_test_prompt_task(
         msg: PendingMessage,
@@ -217,16 +254,6 @@ impl Tui {
             input,
             &result,
         );
-        if result.was_cancelled || result.response.is_none() {
-            let _ = ctx
-                .event_tx
-                .send(TuiEvent::Agent(harnx_core::event::AgentEvent::Model(
-                    harnx_core::event::ModelEvent::Final {
-                        output: String::new(),
-                        usage: Default::default(),
-                    },
-                )));
-        }
         log::info!(
             "thin-client prompt completed: cluster={} session_id={} cancelled={}",
             cluster,

@@ -51,6 +51,46 @@ impl SharedNatsServer {
     pub fn server_process_id(&self) -> Option<u32> {
         self.owner.as_ref().map(|owner| owner.child.id())
     }
+
+    /// Whether this handle still identifies the active shared broker.
+    ///
+    /// Joiners cannot keep the owner process alive, so their cached discovery
+    /// result is valid only while the same nonce is published and another
+    /// process still holds the lifetime lock. Checking those local files avoids
+    /// a new NATS connection for every config lookup while still detecting an
+    /// owner that exited and left stale metadata behind.
+    pub async fn is_current(&mut self) -> bool {
+        if let Some(owner) = self.owner.as_mut() {
+            return matches!(owner.child.try_wait(), Ok(None));
+        }
+
+        let cached_identity = (self.url.clone(), self.token.clone(), self.nonce.clone());
+        tokio::task::spawn_blocking(move || joiner_is_current(cached_identity))
+            .await
+            .unwrap_or(false)
+    }
+}
+
+fn joiner_is_current(cached_identity: (String, String, String)) -> bool {
+    let Ok(metadata) = read_metadata() else {
+        return false;
+    };
+    let discovered_identity = (metadata.url(), metadata.token, metadata.nonce);
+    if discovered_identity != cached_identity {
+        return false;
+    }
+
+    let Ok(lock_file) = open_lock_file() else {
+        return false;
+    };
+    match crate::file_lock::try_lock_exclusive(&lock_file) {
+        Ok(true) => {
+            let _ = lock_file.unlock();
+            false
+        }
+        Ok(false) => true,
+        Err(_) => false,
+    }
 }
 
 impl std::fmt::Debug for SharedNatsServer {
@@ -355,7 +395,13 @@ async fn try_join_server() -> Option<SharedNatsServer> {
     .await
     .ok()?
     .ok()?;
-    if client.flush().await.is_err() {
+    // The owner can exit after the TCP/auth handshake but before this flush.
+    // async-nats then waits for a reconnect to the now-dead ephemeral port, so
+    // bound the validation just like the connect itself.
+    if !matches!(
+        tokio::time::timeout(CONNECT_TIMEOUT, client.flush()).await,
+        Ok(Ok(()))
+    ) {
         return None;
     }
 
@@ -395,10 +441,9 @@ async fn wait_for_nats_ready(url: &str, token: &str, child: &mut Child) -> Resul
         .await;
         match result {
             Ok(Ok(client)) => {
-                client
-                    .flush()
+                tokio::time::timeout(CONNECT_TIMEOUT, client.flush())
                     .await
-                    .context("failed to flush shared local NATS readiness connection")?;
+                    .context("timed out flushing shared local NATS readiness connection")??;
                 return Ok(());
             }
             Ok(Err(error)) if Instant::now() >= deadline => {

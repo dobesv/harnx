@@ -10,7 +10,7 @@ use harnx_client::{
     SseHandler,
 };
 use harnx_core::abort::wait_abort_signal;
-use harnx_core::event::{AgentEvent, ModelEvent};
+use harnx_core::event::{AgentEvent, ModelEvent, NoticeEvent};
 use harnx_core::sink::emit_agent_event;
 use harnx_core::text::{extract_code_block, strip_think_tag};
 use harnx_core::tool::ToolCall;
@@ -57,17 +57,15 @@ pub async fn chat_completions_streaming_with_data(
 /// tool_calls, usage). Tool-call evaluation stays on the caller side so the
 /// caller can control whether a spinner covers that work.
 ///
-/// `suppress_final_output`: when true, `ModelEvent::Final` fires with an
-/// empty `output` string (signalling that the caller will display the text
-/// via another path, e.g. `print_markdown`). When false, `Final` carries the
-/// full text so any `AgentEventSink` consumer that renders Final sees the
-/// output.
+/// Terminal model events are deliberately not emitted here. One transport
+/// invocation can be followed by tool execution, stop-hook continuation, or
+/// another pending message; the agent loop owns the actual `ModelEvent::Final`
+/// / `ModelEvent::Error` boundary.
 pub async fn run_chat_completion(
     client: &dyn Client,
     data: ChatCompletionsData,
     ctx: &ClientCallContext<'_>,
     extract_code: bool,
-    suppress_final_output: bool,
     _abort_signal: harnx_core::abort::AbortSignal,
 ) -> Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)> {
     let ret = chat_completions_with_data(client, data, ctx).await;
@@ -89,15 +87,6 @@ pub async fn run_chat_completion(
                 text = extract_code_block(&strip_think_tag(&text)).to_string();
             }
 
-            let final_output = if suppress_final_output {
-                String::new()
-            } else {
-                text.clone()
-            };
-            emit_agent_event(AgentEvent::Model(ModelEvent::Final {
-                output: final_output,
-                usage: usage.clone(),
-            }));
             if !usage.is_empty() {
                 emit_agent_event(AgentEvent::Model(ModelEvent::Usage {
                     input: usage.input_tokens,
@@ -109,19 +98,15 @@ pub async fn run_chat_completion(
 
             Ok((text, thought, tool_calls, usage))
         }
-        Err(err) => {
-            emit_agent_event(AgentEvent::Model(ModelEvent::Error(pretty_error_string(
-                &err,
-            ))));
-            Err(err)
-        }
+        Err(err) => Err(err),
     }
 }
 
 /// Orchestrate one streaming LLM call. Runs `chat_completions_streaming_with_data`
 /// (which consumes the caller-supplied `SseHandler`), then after completion
-/// extracts the response tuple from the handler and emits `AgentEvent::Model`
-/// events via `harnx_core::sink`.
+/// extracts the response tuple from the handler and emits usage events via
+/// `harnx_core::sink`. Terminal model events belong to the agent loop rather
+/// than an individual transport invocation.
 ///
 /// Returns `(text, thought, tool_calls, usage, aborted)`. Caller is responsible
 /// for: tool_call evaluation, stdout newline cleanup, and final Ok/Err shaping.
@@ -148,16 +133,11 @@ pub async fn run_chat_completion_streaming(
     let (text, thought, tool_calls, usage) = handler.take();
 
     if aborted {
-        emit_agent_event(AgentEvent::Model(ModelEvent::Error("aborted".to_string())));
         return Ok((text, thought, vec![], usage, true));
     }
 
     match send_ret {
         Ok(_) => {
-            emit_agent_event(AgentEvent::Model(ModelEvent::Final {
-                output: String::new(),
-                usage: usage.clone(),
-            }));
             if !usage.is_empty() {
                 emit_agent_event(AgentEvent::Model(ModelEvent::Usage {
                     input: usage.input_tokens,
@@ -169,12 +149,12 @@ pub async fn run_chat_completion_streaming(
             Ok((text, thought, tool_calls, usage, false))
         }
         Err(err) => {
-            emit_agent_event(AgentEvent::Model(ModelEvent::Error(pretty_error_string(
-                &err,
-            ))));
             if text.trim().is_empty() {
                 Err(err)
             } else {
+                emit_agent_event(AgentEvent::Notice(NoticeEvent::Warning(
+                    pretty_error_string(&err),
+                )));
                 Ok((text, thought, vec![], usage, false))
             }
         }
@@ -209,7 +189,7 @@ mod tests {
     use super::run_chat_completion_streaming;
     use harnx_client::{ChatCompletionsData, ClientCallContext, CompletionTokenUsage, SseHandler};
     use harnx_core::abort::create_abort_signal;
-    use harnx_core::event::{AgentEvent, AgentEventSink, ModelEvent};
+    use harnx_core::event::{AgentEvent, AgentEventSink, ModelEvent, NoticeEvent};
     use harnx_core::sink::{clear_agent_event_sink, install_agent_event_sink};
     use harnx_runtime::test_utils::{MockClient, MockTurnBuilder};
     use parking_lot::Mutex;
@@ -245,7 +225,8 @@ mod tests {
                 .lock()
                 .iter()
                 .filter_map(|event| match event {
-                    AgentEvent::Model(ModelEvent::Error(message)) => Some(message.clone()),
+                    AgentEvent::Model(ModelEvent::Error(message))
+                    | AgentEvent::Notice(NoticeEvent::Warning(message)) => Some(message.clone()),
                     _ => None,
                 })
                 .collect()
@@ -295,8 +276,8 @@ mod tests {
 
     /// Run `run_chat_completion_streaming` against a mock turn that streams
     /// `text_chunk` (when `Some`) followed by a mid-stream error. Returns the
-    /// call result plus the error messages emitted to the agent-event sink so
-    /// each test can assert its own expectations.
+    /// call result plus terminal/warning messages emitted to the agent-event
+    /// sink so each test can assert its own expectations.
     async fn run_streaming_error_case(text_chunk: Option<&str>) -> (StreamingResult, Vec<String>) {
         let sink = install_collecting_sink();
         let mut turn = MockTurnBuilder::new();
@@ -341,18 +322,18 @@ mod tests {
     fn streaming_error_with_empty_text_returns_err() {
         let (result, messages) = run_streaming_error_case_serial(None);
         assert!(result.is_err());
-        assert_eq!(messages.len(), 1);
+        assert!(messages.is_empty());
     }
 
     #[test]
     fn streaming_error_with_whitespace_only_text_returns_err() {
         let (result, messages) = run_streaming_error_case_serial(Some("\n"));
         assert!(result.is_err());
-        assert_eq!(messages.len(), 1);
+        assert!(messages.is_empty());
     }
 
     #[test]
-    fn streaming_error_with_partial_text_returns_ok_and_emits_error() {
+    fn streaming_error_with_partial_text_returns_ok_and_emits_warning() {
         let (result, messages) = run_streaming_error_case_serial(Some("partial"));
         let output = result.expect("partial text should be returned");
         assert_eq!(output.0, "partial");

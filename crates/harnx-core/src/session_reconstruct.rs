@@ -134,7 +134,10 @@ pub fn apply_log_mutations_with_name(
 
                 effective_entries.splice(start_idx..=end_idx, parsed_replacements);
             }
-            SessionLogEntry::Unknown => {}
+            // TurnEnd is durable control metadata, not a logical transcript
+            // row. Drop it from effective history so it cannot shift the
+            // user-visible logical sequence numbers.
+            SessionLogEntry::TurnEnd { .. } | SessionLogEntry::Unknown => {}
             _ => effective_entries.push((*seq, entry.clone())),
         }
     }

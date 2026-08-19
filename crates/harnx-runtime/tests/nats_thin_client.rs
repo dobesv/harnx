@@ -3,15 +3,17 @@ mod common;
 use anyhow::Result;
 use common::spawn_nats_server;
 use harnx_core::{
-    event::{AgentEvent, AgentEventSink},
+    event::{AgentEvent, AgentEventSink, TurnEvent, TurnOutcome},
     message::{MessageContent, MessageRole},
     require_nextest,
     session::SessionLogEntry,
     session_reconstruct::{reconstruct_state_from_nats, TurnStatus},
 };
 use harnx_runtime::{
-    nats_session_log::NatsSessionLog, nats_worker::ControlCommand, send_control_command,
-    ThinClientConfig, ThinClientSession,
+    nats_event_sink::{events_subject, AdvisoryEnvelope},
+    nats_session_log::NatsSessionLog,
+    nats_worker::ControlCommand,
+    send_control_command, ThinClientConfig, ThinClientSession,
 };
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
@@ -53,6 +55,8 @@ fn resumed_session_config(session_id: String) -> ThinClientConfig {
 
 async fn append_new_reply_after_current_turn_user(
     log: NatsSessionLog,
+    client: async_nats::Client,
+    session_id: String,
     prior_assistant_seq: u64,
 ) -> Result<u64> {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -79,14 +83,34 @@ async fn append_new_reply_after_current_turn_user(
     .map_err(|_| {
         anyhow::anyhow!("timed out waiting for current-turn user entry before appending new reply")
     })??;
-    log.append_event_async(&SessionLogEntry::Message {
-        id: Some("new-assistant".to_string()),
-        role: MessageRole::Assistant,
-        content: MessageContent::Text("new reply".to_string()),
-        timestamp: None,
-        fence_token: None,
-    })
-    .await
+    let seq = log
+        .append_event_async(&SessionLogEntry::Message {
+            id: Some("new-assistant".to_string()),
+            role: MessageRole::Assistant,
+            content: MessageContent::Text("new reply".to_string()),
+            timestamp: None,
+            fence_token: None,
+        })
+        .await?;
+    let ended = AdvisoryEnvelope::new(
+        seq,
+        AgentEvent::Turn(TurnEvent::Ended {
+            outcome: TurnOutcome::default(),
+        }),
+    );
+    let subject = events_subject(&session_id);
+    let payload = ended.to_bytes()?;
+    // Legacy workers had no durable TurnEnd marker. Repeat their lossy
+    // advisory in this compatibility test so it cannot race the client's
+    // subscribe-after-append setup.
+    for _ in 0..4 {
+        client
+            .publish(subject.clone(), payload.clone().into())
+            .await?;
+        client.flush().await?;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Ok(seq)
 }
 
 struct NoopEventSink;
@@ -489,8 +513,16 @@ async fn resumed_session_run_turn_ignores_stale_prior_reply_and_returns_new_repl
     .await?;
 
     let log_for_reply = log.clone();
+    let client_for_reply = client.clone();
+    let session_id_for_reply = session_id.clone();
     let reply_task = tokio::spawn(async move {
-        append_new_reply_after_current_turn_user(log_for_reply, prior_assistant_seq).await
+        append_new_reply_after_current_turn_user(
+            log_for_reply,
+            client_for_reply,
+            session_id_for_reply,
+            prior_assistant_seq,
+        )
+        .await
     });
 
     let result = tokio::time::timeout(

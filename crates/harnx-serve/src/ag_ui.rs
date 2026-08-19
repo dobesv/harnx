@@ -15,11 +15,11 @@ use crate::session_actor::{
 use ag_ui_core::event::RunStartedEvent;
 use ag_ui_core::{
     event::{
-        BaseEvent, CustomEvent, Event, MessagesSnapshotEvent, RunErrorEvent, StepFinishedEvent,
-        StepStartedEvent, TextMessageContentEvent, TextMessageEndEvent, TextMessageStartEvent,
-        ThinkingEndEvent, ThinkingStartEvent, ThinkingTextMessageContentEvent,
-        ThinkingTextMessageEndEvent, ThinkingTextMessageStartEvent, ToolCallArgsEvent,
-        ToolCallEndEvent, ToolCallResultEvent, ToolCallStartEvent,
+        BaseEvent, CustomEvent, Event, MessagesSnapshotEvent, StepFinishedEvent, StepStartedEvent,
+        TextMessageContentEvent, TextMessageEndEvent, TextMessageStartEvent, ThinkingEndEvent,
+        ThinkingStartEvent, ThinkingTextMessageContentEvent, ThinkingTextMessageEndEvent,
+        ThinkingTextMessageStartEvent, ToolCallArgsEvent, ToolCallEndEvent, ToolCallResultEvent,
+        ToolCallStartEvent,
     },
     types::{
         context::Context,
@@ -35,6 +35,7 @@ use harnx_core::{
     agent_config::AgentConfig,
     event::{
         AgentEvent, ContentBlock, ModelEvent, NoticeEvent, SessionEvent, ToolEvent, TurnEvent,
+        TurnOutcome,
     },
     message::{Message as HistoryMsg, MessageContent, MessageRole},
 };
@@ -170,8 +171,9 @@ impl std::error::Error for AgUiError {}
 
 /// Sink that maps harnx `AgentEvent`s to ag-ui-core `Event`s.
 ///
-/// Phase-1 mapping: text message content and errors only.
-/// Lifecycle events (RUN_STARTED, TEXT_MESSAGE_START, etc.) are handled by caller.
+/// Run lifecycle events are owned by the session actor. This adapter maps
+/// streamed content and nested-agent steps, and records terminal errors for the
+/// actor to publish after it closes any open content segments.
 enum AgUiEventTx {
     Unbounded(UnboundedSender<Event>),
     Broadcast(broadcast::Sender<Event>),
@@ -205,6 +207,7 @@ impl From<broadcast::Sender<Event>> for AgUiEventTx {
 #[derive(Debug, Clone)]
 struct TextSegmentState {
     open_message_id: Option<MessageId>,
+    content_emitted: bool,
 }
 
 pub struct AgUiSink {
@@ -213,6 +216,7 @@ pub struct AgUiSink {
     text_segment_state: Mutex<TextSegmentState>,
     history_snapshot: Option<Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>>,
     session_context: Option<Arc<dyn Fn() -> Option<UsageContextSnapshot> + Send + Sync>>,
+    pending_run_error: Mutex<Option<String>>,
     in_thinking_segment: std::sync::atomic::AtomicBool,
     turn_counter: std::sync::atomic::AtomicUsize,
 }
@@ -282,9 +286,13 @@ impl AgUiSink {
         Self {
             tx: tx.into(),
             message_id,
-            text_segment_state: Mutex::new(TextSegmentState { open_message_id }),
+            text_segment_state: Mutex::new(TextSegmentState {
+                open_message_id,
+                content_emitted: false,
+            }),
             history_snapshot,
             session_context,
+            pending_run_error: Mutex::new(None),
             in_thinking_segment: std::sync::atomic::AtomicBool::new(false),
             turn_counter: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -325,6 +333,7 @@ impl AgUiSink {
     pub(crate) fn close_text_segment(&self) -> Option<MessageId> {
         let message_id = {
             let mut state = self.text_segment_state.lock().expect("text segment state");
+            state.content_emitted = false;
             state.open_message_id.take()
         }?;
 
@@ -363,6 +372,10 @@ impl AgUiSink {
         }
         self.close_thinking_segment();
         let message_id = self.ensure_text_message_started();
+        self.text_segment_state
+            .lock()
+            .expect("text segment state")
+            .content_emitted = true;
         self.send(Event::TextMessageContent(TextMessageContentEvent {
             base: Self::base_event(),
             message_id,
@@ -398,6 +411,24 @@ impl AgUiSink {
 
     fn finish_turn(&self) {
         self.close_thinking_segment();
+    }
+
+    fn text_content_emitted(&self) -> bool {
+        self.text_segment_state
+            .lock()
+            .expect("text segment state")
+            .content_emitted
+    }
+
+    fn record_run_error(&self, message: String) {
+        *self.pending_run_error.lock().expect("pending run error") = Some(message);
+    }
+
+    pub(crate) fn take_run_error(&self) -> Option<String> {
+        self.pending_run_error
+            .lock()
+            .expect("pending run error")
+            .take()
     }
 
     fn emit_custom(&self, name: impl Into<String>, value: serde_json::Value) {
@@ -527,64 +558,63 @@ impl AgUiSink {
             ToolEvent::Progress { .. } | ToolEvent::Update { .. } => {}
         }
     }
-}
 
-impl harnx_core::event::AgentEventSink for AgUiSink {
-    fn emit(&self, event: AgentEvent) {
-        let event = match event {
-            AgentEvent::SubAgent { event, .. } => *event,
-            event => event,
-        };
+    fn content_text(blocks: &[ContentBlock]) -> String {
+        blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn emit_model_event(&self, event: ModelEvent, is_sub_agent: bool) {
         match event {
-            AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
-                let delta: String = blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text(t) => Some(t.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                if !delta.is_empty() {
-                    self.close_thinking_segment();
-                }
-                self.emit_text_delta(delta);
+            ModelEvent::MessageChunk { blocks } => {
+                self.emit_text_delta(Self::content_text(&blocks));
             }
-            AgentEvent::Model(ModelEvent::Final { output, .. }) => {
-                self.emit_text_delta(output);
+            ModelEvent::ThoughtChunk { blocks } => {
+                self.emit_thinking_delta(Self::content_text(&blocks));
+            }
+            ModelEvent::Final { output, .. } => {
+                if !self.text_content_emitted() {
+                    self.emit_text_delta(output);
+                }
                 self.finish_turn();
             }
-            AgentEvent::Model(ModelEvent::Usage {
+            ModelEvent::Usage {
                 input,
                 output,
                 cached,
                 session_label,
-            }) => {
-                self.emit_custom(
-                    "usage",
-                    self.build_usage_payload(input, output, cached, session_label),
-                );
-            }
-            AgentEvent::Model(ModelEvent::Error(message))
-            | AgentEvent::Notice(NoticeEvent::Error(message)) => {
-                self.finish_turn();
-                self.send(Event::RunError(RunErrorEvent {
-                    base: Self::base_event(),
-                    message,
-                    code: None,
-                }));
-            }
-            AgentEvent::Tool(tool_event) => self.emit_tool_event(tool_event),
-            AgentEvent::Model(ModelEvent::ThoughtChunk { blocks }) => {
-                let delta: String = blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text(t) => Some(t.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                self.emit_thinking_delta(delta);
-            }
-            AgentEvent::Turn(TurnEvent::Started) => {
+            } => self.emit_custom(
+                "usage",
+                self.build_usage_payload(input, output, cached, session_label),
+            ),
+            ModelEvent::Error(message) => self.record_model_error(message, is_sub_agent),
+        }
+    }
+
+    fn record_model_error(&self, message: String, is_sub_agent: bool) {
+        self.finish_turn();
+        if !is_sub_agent {
+            self.record_run_error(message);
+        }
+    }
+
+    fn emit_notice(&self, notice: NoticeEvent) {
+        let (level, message) = match notice {
+            NoticeEvent::Info(_) => return,
+            NoticeEvent::Warning(message) => ("warning", message),
+            NoticeEvent::Error(message) => ("error", message),
+        };
+        self.emit_custom("notice", json!({ "level": level, "message": message }));
+    }
+
+    fn emit_turn_event(&self, event: TurnEvent, is_sub_agent: bool) {
+        match event {
+            TurnEvent::Started if is_sub_agent => {
                 let turn = self
                     .turn_counter
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -594,71 +624,106 @@ impl harnx_core::event::AgentEventSink for AgUiSink {
                     step_name: format!("turn-{turn}"),
                 }));
             }
-            AgentEvent::Turn(TurnEvent::Ended { outcome }) => {
+            TurnEvent::Ended { outcome } => {
                 self.finish_turn();
-                self.send(Event::StepFinished(StepFinishedEvent {
-                    base: Self::base_event(),
-                    step_name: self.step_name_for_turn(),
-                }));
-                if !outcome.output.is_empty()
-                    || outcome.thought.is_some()
-                    || outcome.handoff.is_some()
-                    || outcome.usage.input_tokens > 0
-                    || outcome.usage.output_tokens > 0
-                    || outcome.usage.cached_tokens > 0
-                {
-                    self.emit_custom(
-                        "turn_outcome",
-                        serde_json::to_value(outcome).expect("turn outcome should serialize"),
-                    );
+                if is_sub_agent {
+                    self.send(Event::StepFinished(StepFinishedEvent {
+                        base: Self::base_event(),
+                        step_name: self.step_name_for_turn(),
+                    }));
                 }
+                self.emit_turn_outcome(outcome);
             }
-            AgentEvent::Turn(TurnEvent::RetryAttempt { attempt, reason }) => {
-                self.emit_custom(
-                    "turn_retry_attempt",
-                    json!({ "attempt": attempt, "reason": reason }),
-                );
-            }
-            AgentEvent::Turn(TurnEvent::ModelFallback { from, to }) => {
+            TurnEvent::RetryAttempt { attempt, reason } => self.emit_custom(
+                "turn_retry_attempt",
+                json!({ "attempt": attempt, "reason": reason }),
+            ),
+            TurnEvent::ModelFallback { from, to } => {
                 self.emit_custom("turn_model_fallback", json!({ "from": from, "to": to }));
             }
-            AgentEvent::Turn(TurnEvent::HandoffRequested { agent, session_id }) => {
+            TurnEvent::HandoffRequested { agent, session_id } => {
                 self.emit_handoff(agent, session_id);
             }
-            AgentEvent::Turn(TurnEvent::SubAgentStarted { agent, session_id }) => {
-                self.emit_custom(
-                    "sub_agent_started",
-                    json!({ "agent": agent, "session_id": session_id }),
-                );
-            }
-            AgentEvent::Session(SessionEvent::CompactingStarted) => {
+            TurnEvent::SubAgentStarted { agent, session_id } => self.emit_custom(
+                "sub_agent_started",
+                json!({ "agent": agent, "session_id": session_id }),
+            ),
+            TurnEvent::Started => {}
+        }
+    }
+
+    fn emit_turn_outcome(&self, outcome: TurnOutcome) {
+        let outcome_is_empty = [
+            outcome.output.is_empty(),
+            outcome.thought.is_none(),
+            outcome.handoff.is_none(),
+            outcome.usage.input_tokens == 0,
+            outcome.usage.output_tokens == 0,
+            outcome.usage.cached_tokens == 0,
+        ]
+        .into_iter()
+        .all(std::convert::identity);
+        if outcome_is_empty {
+            return;
+        }
+        self.emit_custom(
+            "turn_outcome",
+            serde_json::to_value(outcome).expect("turn outcome should serialize"),
+        );
+    }
+
+    fn emit_session_event(&self, event: SessionEvent) {
+        match event {
+            SessionEvent::CompactingStarted => {
                 self.emit_custom("session_compacting_started", json!({}));
             }
-            AgentEvent::Session(SessionEvent::CompactingCompleted) => {
+            SessionEvent::CompactingCompleted => {
                 self.emit_custom("session_compacting_completed", json!({}));
                 self.emit_history_snapshot();
             }
-            AgentEvent::Session(SessionEvent::CompactingFailed(error)) => {
+            SessionEvent::CompactingFailed(error) => {
                 self.emit_custom("session_compacting_failed", json!({ "error": error }));
             }
-            AgentEvent::Session(SessionEvent::TitleGenerationFailed(error)) => {
+            SessionEvent::TitleGenerationFailed(error) => {
                 self.emit_custom("session_title_generation_failed", json!({ "error": error }));
             }
-            AgentEvent::Session(SessionEvent::Saved { path }) => {
+            SessionEvent::Saved { path } => {
                 self.emit_custom("session_saved", json!({ "path": path }));
             }
-            AgentEvent::Session(SessionEvent::AgentInitializing { agent }) => {
+            SessionEvent::AgentInitializing { agent } => {
                 self.emit_custom("session_agent_initializing", json!({ "agent": agent }));
             }
-            AgentEvent::Session(SessionEvent::ModelChanged { from, to }) => {
+            SessionEvent::ModelChanged { from, to } => {
                 self.emit_custom("session_model_changed", json!({ "from": from, "to": to }));
             }
-            AgentEvent::Session(SessionEvent::RagIndexing { url, index, total }) => {
-                self.emit_custom(
-                    "session_rag_indexing",
-                    json!({ "url": url, "index": index, "total": total }),
-                );
+            SessionEvent::RagIndexing { url, index, total } => self.emit_custom(
+                "session_rag_indexing",
+                json!({ "url": url, "index": index, "total": total }),
+            ),
+            SessionEvent::TitleUpdated(title) => {
+                self.emit_custom("session_title_updated", json!({ "title": title }));
             }
+            SessionEvent::Generic { text } => {
+                self.finish_turn();
+                self.emit_custom("session_generic", json!({ "text": text }));
+            }
+            SessionEvent::LogSeqAssigned { .. } => self.finish_turn(),
+        }
+    }
+}
+
+impl harnx_core::event::AgentEventSink for AgUiSink {
+    fn emit(&self, event: AgentEvent) {
+        let (event, is_sub_agent) = match event {
+            AgentEvent::SubAgent { event, .. } => (*event, true),
+            event => (event, false),
+        };
+        match event {
+            AgentEvent::Model(event) => self.emit_model_event(event, is_sub_agent),
+            AgentEvent::Tool(tool_event) => self.emit_tool_event(tool_event),
+            AgentEvent::Turn(event) => self.emit_turn_event(event, is_sub_agent),
+            AgentEvent::Session(event) => self.emit_session_event(event),
+            AgentEvent::Notice(notice) => self.emit_notice(notice),
             AgentEvent::Plan { entries } => {
                 self.emit_custom(
                     "plan",
@@ -667,16 +732,6 @@ impl harnx_core::event::AgentEventSink for AgUiSink {
             }
             AgentEvent::Status(status) => {
                 self.emit_custom("status", json!({ "text": status.text }));
-            }
-            AgentEvent::Session(SessionEvent::TitleUpdated(title)) => {
-                self.emit_custom("session_title_updated", json!({ "title": title }))
-            }
-            AgentEvent::Session(SessionEvent::Generic { text }) => {
-                self.finish_turn();
-                self.emit_custom("session_generic", json!({ "text": text }));
-            }
-            AgentEvent::Session(SessionEvent::LogSeqAssigned { .. }) => {
-                self.finish_turn();
             }
             _ => {}
         }

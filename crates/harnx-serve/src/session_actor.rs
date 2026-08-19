@@ -433,14 +433,26 @@ impl SessionActor {
     }
 
     fn finish_completed_run(&mut self, done: &RunFinished) {
-        done.sink.sink.close_text_segment();
-        let _ = self.broadcast_tx.send(Event::RunFinished(RunFinishedEvent {
-            base: base_event(),
-            thread_id: done.thread_id.clone(),
-            run_id: done.run_id.clone(),
-            result: None,
-        }));
+        self.finish_run(done, None);
         self.state = SessionState::Idle;
+    }
+
+    fn finish_run(&self, done: &RunFinished, result: Option<serde_json::Value>) {
+        done.sink.sink.close_text_segment();
+        if let Some(message) = done.sink.sink.take_run_error() {
+            let _ = self.broadcast_tx.send(Event::RunError(RunErrorEvent {
+                base: base_event(),
+                message,
+                code: None,
+            }));
+        } else {
+            let _ = self.broadcast_tx.send(Event::RunFinished(RunFinishedEvent {
+                base: base_event(),
+                thread_id: done.thread_id.clone(),
+                run_id: done.run_id.clone(),
+                result,
+            }));
+        }
     }
 
     async fn replay_pending_or_arm_reap(&mut self, reap_sleep: &mut std::pin::Pin<&mut Sleep>) {
@@ -482,13 +494,7 @@ impl SessionActor {
             .await
             .ok();
 
-        done.sink.sink.close_text_segment();
-        let _ = self.broadcast_tx.send(Event::RunFinished(RunFinishedEvent {
-            base: base_event(),
-            thread_id: done.thread_id.clone(),
-            run_id: done.run_id.clone(),
-            result: None,
-        }));
+        self.finish_run(done, None);
         self.state = SessionState::Idle;
     }
 

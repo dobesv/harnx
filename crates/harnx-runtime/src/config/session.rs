@@ -12,6 +12,14 @@ use std::sync::Arc;
 pub trait SessionAppendSink: Send + Sync + Any {
     /// Append an entry and return its one-based durable sequence number.
     fn append(&self, entry: &SessionLogEntry) -> Result<u64>;
+
+    /// Whether an append failure makes the active turn invalid. File-backed
+    /// sessions can mark themselves dirty and rewrite later; a NATS worker log
+    /// is authoritative and must never publish a successful turn boundary
+    /// after losing an assistant/tool entry.
+    fn failure_is_fatal(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -268,6 +276,7 @@ pub fn replay_log_entries_for_external(
             // A failed turn is a transcript annotation, not conversation
             // history — replaying it would feed the error back to the model.
             SessionLogEntry::Error { .. } => {}
+            SessionLogEntry::TurnEnd { .. } => {}
             SessionLogEntry::Cancel { .. } => {}
             SessionLogEntry::EditEntries { .. }
             | SessionLogEntry::Rewind { .. }
@@ -414,6 +423,25 @@ pub fn append_event(session: &mut Session, entry: &SessionLogEntry) -> bool {
         crate::session_history::entry_type(entry)
     );
     false
+}
+
+fn require_authoritative_appends(
+    session: &Session,
+    all_appended: bool,
+    operation: &str,
+) -> Result<()> {
+    if all_appended {
+        return Ok(());
+    }
+    let fatal = session
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.downcast_ref::<Arc<dyn SessionAppendSink>>())
+        .is_some_and(|sink| sink.failure_is_fatal());
+    if fatal {
+        anyhow::bail!("failed to durably persist {operation}");
+    }
+    Ok(())
 }
 
 /// Append a `Title` log entry and update the in-memory session title state.
@@ -662,6 +690,7 @@ pub fn add_assistant_text(
         session.messages.push(assistant_msg);
         emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }));
         session.dirty = !all_appended;
+        require_authoritative_appends(session, all_appended, "assistant response")?;
     }
     session.update_tokens();
     Ok(())
@@ -730,6 +759,7 @@ pub fn add_tool_calls(
             .with_log_seq(tool_calls_seq),
     );
     session.dirty = !all_appended;
+    require_authoritative_appends(session, all_appended, "tool calls")?;
     session.update_tokens();
     Ok(())
 }
@@ -808,12 +838,9 @@ pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResul
             timestamp: Some(Utc::now()),
         },
     );
-    if !appended {
-        session.dirty = true;
-    }
-    if !record_externalized(session, cid_urls) {
-        session.dirty = true;
-    }
+    let all_appended = appended & record_externalized(session, cid_urls);
+    session.dirty |= !all_appended;
+    require_authoritative_appends(session, all_appended, "tool results")?;
     session.update_tokens();
     Ok(())
 }
@@ -1080,6 +1107,18 @@ fn build_messages_inner(session: &Session, input: &Input) -> Result<Vec<Message>
 mod tests {
     use super::*;
 
+    struct FailingAuthoritativeSink;
+
+    impl SessionAppendSink for FailingAuthoritativeSink {
+        fn append(&self, _entry: &SessionLogEntry) -> Result<u64> {
+            anyhow::bail!("simulated durable append failure")
+        }
+
+        fn failure_is_fatal(&self) -> bool {
+            true
+        }
+    }
+
     fn test_session() -> Session {
         let mut session = new(&Config::default(), "test", None).unwrap();
         attach_memory_log(&mut session);
@@ -1091,6 +1130,29 @@ mod tests {
             .iter()
             .map(|m| (m.role, m.content.to_text()))
             .collect()
+    }
+
+    #[test]
+    fn authoritative_assistant_append_failure_fails_the_turn() {
+        let config = Config::default();
+        let global_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let input = crate::config::input::from_str(
+            &global_config,
+            "question",
+            Some(config.extract_agent()),
+        );
+        let mut session = new(&config, "authoritative-failure", None).unwrap();
+        session.runtime = Some(Arc::new(
+            Arc::new(FailingAuthoritativeSink) as Arc<dyn SessionAppendSink>
+        ));
+
+        let error = add_assistant_text(&mut session, &input, "answer", None)
+            .expect_err("authoritative persistence failure must fail the turn");
+
+        assert!(error
+            .to_string()
+            .contains("failed to durably persist assistant response"));
+        assert!(session.dirty);
     }
 
     #[test]

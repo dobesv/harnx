@@ -153,7 +153,6 @@ pub async fn call_chat_completions(
             data,
             &ctx,
             extract_code,
-            print, // suppress_final_output = print (we'll display via print_markdown)
             abort_signal.clone(),
         ),
         &spinner_message,
@@ -219,11 +218,6 @@ pub async fn call_chat_completions_streaming(
         }));
     }
 
-    // Turn::Started belongs to the direct agent handling this request.
-    harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Turn(
-        harnx_core::event::TurnEvent::Started,
-    ));
-
     // Drain the SseHandler's channel — chunk display is now driven by
     // AgentEvent::Model::MessageChunk/ThoughtChunk emitted by SseHandler,
     // which the installed sink renders. The channel itself just needs
@@ -243,15 +237,6 @@ pub async fn call_chat_completions_streaming(
     .await;
 
     let _ = drainer.await;
-
-    // Emit Turn::Ended so the sink stops the spinner, exits raw mode,
-    // and emits a trailing newline if needed.
-    {
-        use harnx_core::event::{AgentEvent, TurnEvent, TurnOutcome};
-        harnx_core::sink::emit_agent_event(AgentEvent::Turn(TurnEvent::Ended {
-            outcome: TurnOutcome::default(),
-        }));
-    }
 
     let (text, thought, tool_calls, usage, _aborted) = engine_ret?;
     let _ = abort_signal;

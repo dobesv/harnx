@@ -4,6 +4,8 @@ use crate::nats_admin::kv_bucket_missing;
 use crate::nats_session_index::{self, SessionIndexRecord};
 use std::time::{Duration, UNIX_EPOCH};
 
+const REMOTE_SESSION_LIST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Convert a `SessionIndexRecord` to `SessionMeta`.
 ///
 /// This mapping is used by `list_remote_sessions_with_meta` to translate
@@ -156,6 +158,23 @@ impl Config {
     /// This distinction allows callers to differentiate "no remote sessions" from
     /// "could not reach the cluster" — important for CLI error reporting and TUI visibility.
     pub async fn list_remote_sessions_with_meta(&self, cluster: &str) -> Result<Vec<SessionMeta>> {
+        tokio::time::timeout(
+            REMOTE_SESSION_LIST_TIMEOUT,
+            self.list_remote_sessions_with_meta_inner(cluster),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "Timed out listing sessions from NATS cluster '{cluster}' after {}s",
+                REMOTE_SESSION_LIST_TIMEOUT.as_secs()
+            )
+        })?
+    }
+
+    async fn list_remote_sessions_with_meta_inner(
+        &self,
+        cluster: &str,
+    ) -> Result<Vec<SessionMeta>> {
         let jetstream = match self.nats_jetstream(cluster).await {
             Ok(js) => js,
             Err(e) => {

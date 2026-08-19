@@ -57,15 +57,49 @@ impl Config {
     }
 
     async fn reserve_new_session_id_inner(&self) -> Result<String> {
-        use std::time::{SystemTime, UNIX_EPOCH};
+        const LOCAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
         let cluster = self
             .remote_agent
             .as_ref()
             .map(|(_, cluster)| cluster.as_str())
             .unwrap_or(LOCAL_CLUSTER_KEY);
+        if cluster != LOCAL_CLUSTER_KEY {
+            return self.reserve_new_session_id_once(cluster).await;
+        }
+
+        // The embedded broker is owned by one of the connected processes. It
+        // can legitimately disappear between discovery and the KV operation
+        // when that process exits, so rediscover and retry during that narrow
+        // handoff rather than surfacing a transient no-responders error.
+        loop {
+            match self.reserve_new_session_id_once(cluster).await {
+                Ok(session_id) => return Ok(session_id),
+                Err(_) => tokio::time::sleep(LOCAL_RETRY_DELAY).await,
+            }
+        }
+    }
+
+    async fn reserve_new_session_id_once(&self, cluster: &str) -> Result<String> {
+        const LOCAL_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
         let server = self.resolve_nats_server(cluster).await?;
-        let client = Self::connect_nats_server(&server).await?;
+        if cluster == LOCAL_CLUSTER_KEY {
+            tokio::time::timeout(
+                LOCAL_OPERATION_TIMEOUT,
+                self.reserve_new_session_id_on_server(&server),
+            )
+            .await
+            .context("Timed out reserving an ID on the shared local NATS server")?
+        } else {
+            self.reserve_new_session_id_on_server(&server).await
+        }
+    }
+
+    async fn reserve_new_session_id_on_server(&self, server: &NatsServerConfig) -> Result<String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let client = Self::connect_nats_server(server).await?;
         let store = crate::nats_session_index::ensure_index_bucket(
             &async_nats::jetstream::new(client),
             server.replicas.unwrap_or(1),

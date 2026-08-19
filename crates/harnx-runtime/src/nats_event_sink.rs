@@ -7,9 +7,9 @@
 //!
 //! ## Durable vs advisory contract
 //!
-//! - DURABLE (JetStream session log, authoritative): UserMessage, AssistantMessage(final),
-//!   ToolCalls, ToolResults, Cancel. Reconstructable via NatsSessionLog
-//!   + reconstruct_state.
+//! - DURABLE (JetStream session log, authoritative): UserMessage, AssistantMessage,
+//!   ToolCalls, ToolResults, TurnEnd, Error, Cancel. Reconstructable via
+//!   NatsSessionLog + reconstruct_state.
 //! - ADVISORY (fan-out `sessions.{id}.events` only, non-durable, lossy-OK): streaming token
 //!   deltas (ModelEvent::MessageChunk/ThoughtChunk), thinking/status indicators,
 //!   tool-progress chunks. NEVER authoritative; safe to miss.

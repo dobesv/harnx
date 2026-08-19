@@ -110,7 +110,7 @@ fn build_initial_app(
         llm_busy: false,
         scroll_state: ratatui_widget_scrolling::ScrollState::new(),
         streaming_open: false,
-        streamed_text_this_turn: false,
+        main_streamed_text_idx: None,
         cache_valid_width: None,
         last_ui_output_source: None,
         last_usage_source: None,
@@ -230,6 +230,8 @@ impl Tui {
             current_prompt_abort: None,
             current_prompt_handle: None,
             active_remote_session: None,
+            session_activity_target: None,
+            session_activity_handle: None,
             needs_full_redraw: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             app,
             event_tx,
@@ -439,7 +441,7 @@ impl Tui {
             {
                 let _ = terminal.clear();
             }
-            terminal.draw(|frame| self.draw(frame))?;
+            self.draw_with_session_activity(terminal)?;
 
             if self.app.should_quit || self.abort_signal.aborted_ctrld() {
                 break;

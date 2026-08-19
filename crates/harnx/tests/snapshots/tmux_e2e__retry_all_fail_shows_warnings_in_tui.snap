@@ -7,46 +7,46 @@ retry-agent
 🤖 retry-agent ▸ mock-llm:primary ▸ [SID]
 > hello
 
-error: Failed to call chat-completions api (client: mock-llm, model: mock-llm:primary)
-
-Caused by:
-    Internal Server Error (type: server_error) (status: 500)
-
 ⚠ Retryable error (status 500, Internal Server Error (type: server_error)), attempt 1/3. Retrying in 10ms...
-error: Failed to call chat-completions api (client: mock-llm, model: mock-llm:primary)
-
-Caused by:
-    Internal Server Error (type: server_error) (status: 500)
-
 ⚠ Retryable error (status 500, Internal Server Error (type: server_error)), attempt 2/3. Retrying in 20ms...
-error: Failed to call chat-completions api (client: mock-llm, model: mock-llm:primary)
-
-Caused by:
-    Internal Server Error (type: server_error) (status: 500)
-
 ⚠ Model 'mock-llm:primary' exhausted retries (error: Failed to call chat-completions api (client: mock-llm, model:
 mock-llm:primary)), cooldown 60s. Trying next fallback.
-error: Failed to call chat-completions api (client: mock-llm, model: mock-llm:fallback)
-
-Caused by:
-    Internal Server Error (type: server_error) (status: 500)
-
 ⚠ Retryable error (status 500, Internal Server Error (type: server_error)), attempt 1/3. Retrying in 10ms...
-error: Failed to call chat-completions api (client: mock-llm, model: mock-llm:fallback)
-
-Caused by:
-    Internal Server Error (type: server_error) (status: 500)
-
 ⚠ Retryable error (status 500, Internal Server Error (type: server_error)), attempt 2/3. Retrying in 20ms...
-error: Failed to call chat-completions api (client: mock-llm, model: mock-llm:fallback)
-
-Caused by:
-    Internal Server Error (type: server_error) (status: 500)
-
 ⚠ Model 'mock-llm:fallback' exhausted retries (error: Failed to call chat-completions api (client: mock-llm, model:
 mock-llm:fallback)), cooldown 60s. Trying next fallback.
-error: Failed to call chat-completions api (client: mock-llm, model: mock-llm:fallback): Internal Server Error (type:
-server_error) (status: 500)
+error: Failed to call chat-completions api (client: mock-llm, model: mock-llm:fallback)
+
+Caused by:
+    Internal Server Error (type: server_error) (status: 500)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 * 🤖 retry-agent ▸ mock-llm:primary ▸ [SID]

@@ -6,6 +6,9 @@ use anyhow::Result;
 use async_nats::jetstream;
 use std::sync::Arc;
 
+const APPEND_ATTEMPTS: usize = 3;
+const APPEND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// NATS session log backend for the async worker.
 ///
 /// Wraps `NatsSessionLog` and provides blocking entrypoints for the sync
@@ -24,6 +27,10 @@ pub struct NatsSessionLogBackend {
 impl crate::config::session::SessionAppendSink for NatsSessionLogBackend {
     fn append(&self, entry: &harnx_core::session::SessionLogEntry) -> Result<u64> {
         self.append_event_blocking(entry)
+    }
+
+    fn failure_is_fatal(&self) -> bool {
+        true
     }
 }
 
@@ -49,20 +56,14 @@ impl FencedSessionLogSink {
 
 impl crate::config::session::SessionAppendSink for FencedSessionLogSink {
     fn append(&self, entry: &harnx_core::session::SessionLogEntry) -> Result<u64> {
-        if !self.lease.is_held() {
-            nats_metrics::fenced_write_rejected();
-            warn!(
-                "fenced write rejected: session_id={} worker_id={} revision={} entry_type={}",
-                self.backend.session_id(),
-                self.lease.worker_id(),
-                self.lease.fence_token(),
-                crate::session_history::entry_type(entry)
-            );
-            anyhow::bail!("refusing worker-originated append: session lease not held (fenced out)");
-        }
         let mut fenced = entry.clone();
         fenced.set_fence_token(self.lease.fence_token());
-        self.backend.append_event_blocking(&fenced)
+        self.backend
+            .append_event_blocking_with_lease(&fenced, Some(&self.lease))
+    }
+
+    fn failure_is_fatal(&self) -> bool {
+        true
     }
 }
 
@@ -96,11 +97,64 @@ impl NatsSessionLogBackend {
     /// Prefer this over [`Self::append_event_blocking`] wherever the caller is
     /// already async.
     pub async fn append_event(&self, entry: &harnx_core::session::SessionLogEntry) -> Result<u64> {
+        self.append_event_with_lease(entry, None).await
+    }
+
+    async fn append_event_with_lease(
+        &self,
+        entry: &harnx_core::session::SessionLogEntry,
+        lease: Option<&NatsSessionLease>,
+    ) -> Result<u64> {
         let log = crate::nats_session_log::NatsSessionLog::new(
             self.jetstream.clone(),
             self.session_id.clone(),
         );
-        let seq = log.append_event_async(entry).await?;
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let mut last_error = None;
+        let mut appended_seq = None;
+        for attempt in 1..=APPEND_ATTEMPTS {
+            if let Some(lease) = lease.filter(|lease| !lease.is_held()) {
+                nats_metrics::fenced_write_rejected();
+                warn!(
+                    "fenced write rejected: session_id={} worker_id={} revision={} entry_type={}",
+                    self.session_id(),
+                    lease.worker_id(),
+                    lease.fence_token(),
+                    crate::session_history::entry_type(entry)
+                );
+                anyhow::bail!(
+                    "refusing worker-originated append: session lease not held (fenced out)"
+                );
+            }
+
+            match log
+                .append_event_with_message_id_async(entry, message_id.clone())
+                .await
+            {
+                Ok(seq) => {
+                    appended_seq = Some(seq);
+                    break;
+                }
+                Err(error) => {
+                    if attempt < APPEND_ATTEMPTS {
+                        warn!(
+                            "retrying session append: session_id={} entry_type={} attempt={}/{} error={error:#}",
+                            self.session_id(),
+                            crate::session_history::entry_type(entry),
+                            attempt,
+                            APPEND_ATTEMPTS,
+                        );
+                    }
+                    last_error = Some(error);
+                    if attempt < APPEND_ATTEMPTS {
+                        tokio::time::sleep(APPEND_RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
+        let seq = appended_seq.ok_or_else(|| {
+            last_error.expect("at least one NATS append attempt must record an error")
+        })?;
         self.observe_append(seq);
         Ok(seq)
     }
@@ -113,14 +167,17 @@ impl NatsSessionLogBackend {
         &self,
         entry: &harnx_core::session::SessionLogEntry,
     ) -> Result<u64> {
-        let log = crate::nats_session_log::NatsSessionLog::new(
-            self.jetstream.clone(),
-            self.session_id.clone(),
-        );
+        self.append_event_blocking_with_lease(entry, None)
+    }
+
+    fn append_event_blocking_with_lease(
+        &self,
+        entry: &harnx_core::session::SessionLogEntry,
+        lease: Option<&NatsSessionLease>,
+    ) -> Result<u64> {
         let seq = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(log.append_event_async(entry))
+            tokio::runtime::Handle::current().block_on(self.append_event_with_lease(entry, lease))
         })?;
-        self.observe_append(seq);
         Ok(seq)
     }
 
@@ -147,8 +204,8 @@ impl NatsSessionLogBackend {
     /// the stream reflects at least the worker's latest durable append before
     /// reading. Uses the shared `after_seq_observer` high-water mark when set;
     /// falls back to a plain load otherwise. Used by the end-of-turn drain
-    /// re-read so the worker sees its own just-written turn barrier and does not
-    /// re-fold already-answered messages.
+    /// re-read so the worker sees its own just-written completion boundary and
+    /// does not re-fold already-answered messages.
     pub async fn load_events_consistent_async(
         &self,
     ) -> Result<Vec<(u64, harnx_core::session::SessionLogEntry)>> {
