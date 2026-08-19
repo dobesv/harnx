@@ -2,7 +2,7 @@ use super::session_externalize::{
     externalize_content, externalize_tool_result_content, record_externalized,
 };
 use super::*;
-use crate::nats_client_session::new_client_message_id;
+use crate::nats_session::new_client_message_id;
 
 pub use harnx_core::session::{Session, SessionLogEntry};
 

@@ -1,5 +1,5 @@
 use super::*;
-use crate::nats_client_session::{new_client_message_id, ThinClientConfig, ThinClientSession};
+use crate::nats_session::{new_client_message_id, NatsSession, NatsSessionConfig};
 use crate::nats_session_log::NatsSessionLog;
 use crate::utils::{edit_file, temp_file, AbortSignal};
 use anyhow::{anyhow, bail, Context, Result};
@@ -9,8 +9,11 @@ pub(crate) async fn clear_remote_session(
     config: &GlobalConfig,
     abort_signal: &AbortSignal,
 ) -> Result<()> {
-    let thin = remote_thin_session(config, abort_signal).await?;
-    let log = NatsSessionLog::new(thin.jetstream().clone(), thin.session_id().to_string());
+    let session = remote_nats_session(config, abort_signal).await?;
+    let log = NatsSessionLog::new(
+        session.jetstream().clone(),
+        session.session_id().to_string(),
+    );
     log.append_event_async(&SessionLogEntry::Clear)
         .await
         .context("Failed to persist session clear in NATS")?;
@@ -51,9 +54,9 @@ pub(crate) async fn edit_remote_message_range(
     to: usize,
     abort_signal: &AbortSignal,
 ) -> Result<()> {
-    let thin = remote_thin_session(config, abort_signal).await?;
+    let session = remote_nats_session(config, abort_signal).await?;
 
-    let selected_messages = remote_user_messages_for_range(from, to, &thin).await?;
+    let selected_messages = remote_user_messages_for_range(from, to, &session).await?;
     if selected_messages.len() > 1 {
         bail!("Remote edit supports a single user message at a time");
     }
@@ -67,7 +70,7 @@ pub(crate) async fn edit_remote_message_range(
         cfg.edit_message_text_with_tui_hooks(&target.text)?
     };
 
-    append_session_mutation_batch_cas(&thin, |state| {
+    append_session_mutation_batch_cas(&session, |state| {
         let target_logical_index = find_target_logical_index(state, target.js_seq)?;
         let group = load_seq_group(state, target.js_seq)?;
         let replacements = build_edit_replacements(group, target_logical_index, &new_text)?;
@@ -163,8 +166,8 @@ pub(crate) async fn delete_remote_message_range(
     to: usize,
     abort_signal: &AbortSignal,
 ) -> Result<()> {
-    let thin = remote_thin_session(config, abort_signal).await?;
-    append_session_mutation_batch_cas(&thin, |state| {
+    let session = remote_nats_session(config, abort_signal).await?;
+    append_session_mutation_batch_cas(&session, |state| {
         let (from, to) = self::session_ops_core::compute_delete_range(
             from,
             to,
@@ -287,8 +290,8 @@ pub(crate) async fn rewind_remote_session(
     after_seq: usize,
     abort_signal: &AbortSignal,
 ) -> Result<()> {
-    let thin = remote_thin_session(config, abort_signal).await?;
-    append_session_mutation_batch_cas(&thin, |state| {
+    let session = remote_nats_session(config, abort_signal).await?;
+    append_session_mutation_batch_cas(&session, |state| {
         let len = state.logical_entries.len();
         let after_seq =
             self::session_ops_core::compute_rewind_point(after_seq, len, &state.logical_entries)?;
@@ -303,10 +306,10 @@ pub(crate) async fn rewind_remote_session(
     Ok(())
 }
 
-async fn remote_thin_session(
+async fn remote_nats_session(
     config: &GlobalConfig,
     abort_signal: &AbortSignal,
-) -> Result<ThinClientSession> {
+) -> Result<NatsSession> {
     let (agent, cluster, session_id) = {
         let cfg = config.read();
         let (agent, cluster) = cfg.remote_agent.clone().unwrap_or_else(|| {
@@ -326,8 +329,8 @@ async fn remote_thin_session(
         (agent, cluster, session_id)
     };
 
-    ThinClientSession::from_global_config(
-        ThinClientConfig {
+    NatsSession::from_global_config(
+        NatsSessionConfig {
             cluster,
             agent,
             session_id: Some(session_id),
@@ -429,11 +432,14 @@ fn consume_window_member(
 }
 
 pub async fn load_remote_transcript_for_render(
-    thin: &ThinClientSession,
+    session: &NatsSession,
 ) -> Result<RemoteTranscriptState> {
-    let log = NatsSessionLog::new(thin.jetstream().clone(), thin.session_id().to_string());
+    let log = NatsSessionLog::new(
+        session.jetstream().clone(),
+        session.session_id().to_string(),
+    );
     let entries = log.load_events_async().await?;
-    transcript_state_from_entries(&entries, thin.session_id())
+    transcript_state_from_entries(&entries, session.session_id())
 }
 
 fn transcript_state_from_entries(
@@ -477,9 +483,9 @@ struct RemoteUserMessageSelection {
 async fn remote_user_messages_for_range(
     from: usize,
     to: usize,
-    thin: &ThinClientSession,
+    session: &NatsSession,
 ) -> Result<Vec<RemoteUserMessageSelection>> {
-    let state = load_remote_session_for_render(thin).await?;
+    let state = load_remote_session_for_render(session).await?;
     let mut user_messages = Vec::new();
     for logical_index in from..=to {
         let target = state.logical_target(logical_index)?;
@@ -504,17 +510,17 @@ async fn remote_user_messages_for_range(
     Ok(user_messages)
 }
 
-async fn append_session_mutation_batch_cas<F>(
-    thin: &ThinClientSession,
-    build_entries: F,
-) -> Result<()>
+async fn append_session_mutation_batch_cas<F>(session: &NatsSession, build_entries: F) -> Result<()>
 where
     F: Fn(&RemoteRenderState) -> Result<Vec<SessionLogEntry>>,
 {
     const MAX_CAS_ATTEMPTS: usize = 10;
-    let log = NatsSessionLog::new(thin.jetstream().clone(), thin.session_id().to_string());
+    let log = NatsSessionLog::new(
+        session.jetstream().clone(),
+        session.session_id().to_string(),
+    );
     for attempt in 1..=MAX_CAS_ATTEMPTS {
-        let state = load_remote_session_for_render(thin).await?;
+        let state = load_remote_session_for_render(session).await?;
         let entries = build_entries(&state)?;
         if entries.is_empty() {
             return Ok(());
@@ -596,9 +602,12 @@ struct RemoteLogicalTarget {
 }
 
 pub(crate) async fn load_remote_session_for_render(
-    thin: &ThinClientSession,
+    session: &NatsSession,
 ) -> Result<RemoteRenderState> {
-    let log = NatsSessionLog::new(thin.jetstream().clone(), thin.session_id().to_string());
+    let log = NatsSessionLog::new(
+        session.jetstream().clone(),
+        session.session_id().to_string(),
+    );
     let entries = log.load_events_async().await?;
     let rendered = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)
         .context("failed to reconstruct remote session log before edit/delete")?;

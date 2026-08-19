@@ -117,10 +117,10 @@ fn assert_compressed_tool_transcript(
     );
 }
 
-async fn activate_thin_session(
+async fn activate_nats_session(
     seeded: &mut SeededRemoteParentConfig,
     session_id: String,
-) -> ThinClientSession {
+) -> NatsSession {
     seeded
         .parent_config
         .set_remote_agent("metis".to_string(), "local".to_string());
@@ -131,8 +131,8 @@ async fn activate_thin_session(
     let global_config = Arc::new(parking_lot::RwLock::new(std::mem::take(
         &mut seeded.parent_config,
     )));
-    ThinClientSession::from_global_config(
-        crate::ThinClientConfig {
+    NatsSession::from_global_config(
+        crate::NatsSessionConfig {
             cluster: "local".to_string(),
             agent: "metis".to_string(),
             session_id: Some(session_id),
@@ -141,7 +141,7 @@ async fn activate_thin_session(
         harnx_core::abort::create_abort_signal(),
     )
     .await
-    .expect("load thin session")
+    .expect("load session")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -155,9 +155,9 @@ async fn load_remote_transcript_for_render_prerenders_logical_rows() {
     let session_id = crate::nats_worker::new_remote_session_id();
     append_completed_transcript_fixture(&seeded.parent_config, &session_id).await;
 
-    let thin = activate_thin_session(&mut seeded, session_id).await;
+    let session = activate_nats_session(&mut seeded, session_id).await;
 
-    let transcript = load_remote_transcript_for_render(&thin)
+    let transcript = load_remote_transcript_for_render(&session)
         .await
         .expect("load transcript state");
     assert!(transcript.compressed_messages.is_empty());
@@ -209,9 +209,9 @@ async fn load_remote_transcript_for_render_keeps_tool_rows_and_compressed_prefix
     let log = NatsSessionLog::new(jetstream, session_id.clone());
     append_compressed_tool_fixture(&log).await;
 
-    let thin = activate_thin_session(&mut seeded, session_id).await;
+    let session = activate_nats_session(&mut seeded, session_id).await;
 
-    let transcript = load_remote_transcript_for_render(&thin)
+    let transcript = load_remote_transcript_for_render(&session)
         .await
         .expect("load transcript state");
     assert_compressed_tool_transcript(&transcript);

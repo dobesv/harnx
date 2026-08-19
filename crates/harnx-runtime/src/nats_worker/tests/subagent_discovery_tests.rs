@@ -153,8 +153,8 @@ async fn first_package_agent_turn_waits_for_delegation_registrations() {
         .expect("worker readiness timed out")
         .expect("worker readiness subscription closed");
 
-    let thin = ThinClientSession::new(
-        crate::ThinClientConfig {
+    let session = NatsSession::new(
+        crate::NatsSessionConfig {
             cluster: "local".to_string(),
             agent: "pantheon/aristarchus".to_string(),
             session_id: None,
@@ -169,7 +169,7 @@ async fn first_package_agent_turn_waits_for_delegation_registrations() {
     // a regression fails promptly instead of consuming the full 30 seconds.
     let result = tokio::time::timeout(
         Duration::from_secs(15),
-        thin.run_turn("review this change", Arc::new(NoopEventSink), None),
+        session.run_turn("review this change", Arc::new(NoopEventSink), None),
     )
     .await
     .expect("first package turn timed out")

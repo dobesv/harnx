@@ -20,7 +20,8 @@ pub(super) struct LocalTestTurnParams {
 }
 
 /// Legacy in-process executor used only when tests inject a model call function.
-/// Production serve routing is thin-client-only because it never supplies one.
+/// Production serve routing always goes through NATS because it never
+/// supplies one.
 pub(super) async fn run_local_test_turn(
     params: LocalTestTurnParams,
 ) -> anyhow::Result<harnx_runtime::LoopResult> {

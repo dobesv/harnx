@@ -1,10 +1,8 @@
-//! Thin-client driver for remote NATS agents (agent@cluster).
+//! Session driver for NATS agents (agent@cluster).
 //!
-//! P4.2 implementation: when an agent ref contains `@` (parsed as
-//! `AgentRef::Remote { agent, cluster }`), the client runs in THIN mode:
-//! it posts the user message + control commands to NATS and renders events
-//! from the fan-out — it does NOT run `run_agent_loop` locally. A separate
-//! `harnx-worker --cluster <key>` daemon executes the turn.
+//! The client posts the user message + control commands to NATS and renders
+//! events from the fan-out — it does not run `run_agent_loop` itself. A
+//! separate `harnx-worker --cluster <key>` daemon executes the turn.
 //!
 //! ## Architecture
 //!
@@ -126,7 +124,7 @@ impl OrphanWatchdog {
             Ok(holder) => holder,
             Err(error) => {
                 // An unreadable lease says nothing about the worker.
-                log::debug!("thin client: lease liveness check failed: {error:#}");
+                log::debug!("nats session: lease liveness check failed: {error:#}");
                 self.missing_checks = 0;
                 return None;
             }
@@ -147,19 +145,16 @@ impl OrphanWatchdog {
             );
         };
 
-        log::trace!(
-            "thin client: session {session_id} held by {}",
-            holder.worker_id
-        );
+        log::trace!("nats session: {session_id} held by {}", holder.worker_id);
         self.saw_lease = true;
         self.missing_checks = 0;
         None
     }
 }
 
-/// Configuration for a thin-client session.
+/// Configuration for a NATS session.
 #[derive(Clone)]
-pub struct ThinClientConfig {
+pub struct NatsSessionConfig {
     /// Cluster key (from AgentRef::Remote { cluster, ... }).
     pub cluster: String,
     /// Agent name (from AgentRef::Remote { agent, ... }).
@@ -168,27 +163,27 @@ pub struct ThinClientConfig {
     pub session_id: Option<String>,
 }
 
-/// Thin-client session driver.
+/// Session driver.
 ///
-/// Orchestrates the remote-agent workflow: append user message, activate,
-/// stream events, detect completion.
-pub struct ThinClientSession {
-    config: ThinClientConfig,
+/// Orchestrates the workflow: append user message, activate, stream events,
+/// detect completion.
+pub struct NatsSession {
+    config: NatsSessionConfig,
     session_id: String,
     jetstream: jetstream::Context,
     client: async_nats::Client,
     abort_signal: AbortSignal,
 }
 
-impl ThinClientSession {
-    /// Create a new thin-client session.
+impl NatsSession {
+    /// Create a new NATS session.
     ///
     /// Connects to the NATS cluster and generates/reuses a session ID.
     ///
     /// This function takes the NATS connection components directly to avoid
     /// Send issues with GlobalConfig's parking_lot lock guard across await points.
     pub async fn new(
-        config: ThinClientConfig,
+        config: NatsSessionConfig,
         client: async_nats::Client,
         jetstream: jetstream::Context,
         abort_signal: AbortSignal,
@@ -210,7 +205,7 @@ impl ThinClientSession {
 
     /// Convenience constructor that builds NATS connections from GlobalConfig.
     pub async fn from_global_config(
-        config: ThinClientConfig,
+        config: NatsSessionConfig,
         global_config: &crate::config::GlobalConfig,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
@@ -219,7 +214,7 @@ impl ThinClientSession {
         let client = config_snapshot
             .nats_client(&cluster)
             .await
-            .context("failed to connect to NATS cluster for thin client")?;
+            .context("failed to connect to NATS cluster")?;
         let jetstream = async_nats::jetstream::new(client.clone());
 
         Self::new(config, client, jetstream, abort_signal).await
@@ -251,7 +246,7 @@ impl ThinClientSession {
         user_message: &str,
         event_sink: Arc<dyn AgentEventSink>,
         pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
-    ) -> Result<ThinClientTurnResult> {
+    ) -> Result<NatsTurnResult> {
         // Step 1: Append user message to durable log BEFORE activating.
         // The worker derives input from the last user message.
         // Generate a client-side ID for retract/edit reference.
@@ -270,7 +265,7 @@ impl ThinClientSession {
             .context("failed to append user message to session log")?;
 
         log::info!(
-            "thin client: appended user message session_id={} len={}",
+            "nats session: appended user message session_id={} len={}",
             self.session_id,
             user_message.len()
         );
@@ -292,13 +287,13 @@ impl ThinClientSession {
                 Ok(history) => history,
                 Err(err) => {
                     log::warn!(
-                    "failed to apply NATS log mutations while rendering thin-client history: {err}"
-                );
+                        "failed to apply NATS log mutations while rendering session history: {err}"
+                    );
                     history.to_vec()
                 }
             };
         // Front-ends render resumed history through their explicit transcript
-        // loading path. Replaying it on every newly-created per-turn thin client
+        // loading path. Replaying it on every newly-created per-turn session
         // duplicates all prior messages in interactive and continued sessions.
 
         // Step 3: Publish activation to wake a worker.
@@ -308,7 +303,7 @@ impl ThinClientSession {
             .context("failed to publish session activation")?;
 
         log::info!(
-            "thin client: published activation session_id={} agent={} cluster={}",
+            "nats session: published activation session_id={} agent={} cluster={}",
             self.session_id,
             self.config.agent,
             self.config.cluster
@@ -349,7 +344,7 @@ impl ThinClientSession {
                 // Check for cancellation via wait_abort_signal
                 _ = wait_abort_signal(&abort_signal_clone) => {
                     was_cancelled = true;
-                    log::info!("thin client: abort signal received, publishing cancel");
+                    log::info!("nats session: abort signal received, publishing cancel");
                     if let Err(error) = publish_control_command(
                         &self.client,
                         &self.session_id,
@@ -357,7 +352,7 @@ impl ThinClientSession {
                     )
                     .await
                     {
-                        log::warn!("thin client: failed to publish abort control command: {error:#}");
+                        log::warn!("nats session: failed to publish abort control command: {error:#}");
                     }
                     break;
                 }
@@ -371,7 +366,7 @@ impl ThinClientSession {
                     }
                 } => {
                     was_cancelled = true;
-                    log::info!("thin client: pending cancel received, publishing cancel");
+                    log::info!("nats session: pending cancel received, publishing cancel");
                     if let Err(error) = publish_control_command(
                         &self.client,
                         &self.session_id,
@@ -379,7 +374,7 @@ impl ThinClientSession {
                     )
                     .await
                     {
-                        log::warn!("thin client: failed to publish pending cancel control command: {error:#}");
+                        log::warn!("nats session: failed to publish pending cancel control command: {error:#}");
                     }
                     break;
                 }
@@ -442,7 +437,7 @@ impl ThinClientSession {
                             // Check if this advisory should be rendered (dedup rule)
                             if event_stream.should_render(&envelope) {
                                 // Only parent-scope terminal events complete this
-                                // thin-client turn. Sub-agent events remain wrapped
+                                // turn. Sub-agent events remain wrapped
                                 // in AgentEvent::SubAgent and therefore do not set
                                 // either compatibility flag.
                                 saw_terminal_model_error |= matches!(
@@ -501,7 +496,7 @@ impl ThinClientSession {
                         }
                         None => {
                             // Subscription closed, check final state
-                            log::info!("thin client: event stream closed");
+                            log::info!("nats session: event stream closed");
                             break;
                         }
                     }
@@ -577,7 +572,7 @@ impl ThinClientSession {
             }
         }
 
-        Ok(ThinClientTurnResult {
+        Ok(NatsTurnResult {
             response: final_response,
             session_id: self.session_id.clone(),
             was_cancelled: was_cancelled || self.abort_signal.aborted(),
@@ -755,9 +750,9 @@ impl ThinClientSession {
     }
 }
 
-/// Result of a thin-client turn.
+/// Result of a NATS session turn.
 #[derive(Debug, Clone)]
-pub struct ThinClientTurnResult {
+pub struct NatsTurnResult {
     /// Final assistant response text (if any).
     pub response: Option<String>,
     /// Session ID (for resume/attach).
@@ -1059,7 +1054,7 @@ fn render_error_entry(message: &str, sink: &Arc<dyn AgentEventSink>) {
 
 /// Send a control command to a remote session.
 ///
-/// Helper for frontends to send cancel/set-pending without full ThinClientSession.
+/// Helper for frontends to send cancel/set-pending without full NatsSession.
 pub async fn send_control_command(
     client: &async_nats::Client,
     session_id: &str,
@@ -1155,11 +1150,11 @@ mod tests {
         ]);
 
         assert!(
-            !ThinClientSession::is_turn_completion_visible(&entries, 1, false),
+            !NatsSession::is_turn_completion_visible(&entries, 1, false),
             "an assistant row may still be followed by stop-hook or pending-context work"
         );
         assert!(
-            ThinClientSession::is_turn_completion_visible(&entries, 1, true),
+            NatsSession::is_turn_completion_visible(&entries, 1, true),
             "older workers use the parent turn advisory as a compatibility fallback"
         );
 
@@ -1172,7 +1167,7 @@ mod tests {
                 timestamp: None,
             },
         ));
-        assert!(ThinClientSession::is_turn_completion_visible(
+        assert!(NatsSession::is_turn_completion_visible(
             &durably_ended,
             1,
             false
@@ -1211,9 +1206,7 @@ mod tests {
                 },
             ),
         ];
-        assert!(!ThinClientSession::is_turn_completion_visible(
-            &entries, 2, false
-        ));
+        assert!(!NatsSession::is_turn_completion_visible(&entries, 2, false));
     }
 
     #[test]
@@ -1227,13 +1220,11 @@ mod tests {
                 timestamp: None,
             },
         ));
-        assert!(ThinClientSession::has_durable_terminal_failure(&failed, 1));
+        assert!(NatsSession::has_durable_terminal_failure(&failed, 1));
 
         let mut cancelled = test_entries(&[(1, MessageRole::User, "question")]);
         cancelled.push((2, SessionLogEntry::Cancel { fence_token: 7 }));
-        assert!(ThinClientSession::has_durable_terminal_failure(
-            &cancelled, 1
-        ));
+        assert!(NatsSession::has_durable_terminal_failure(&cancelled, 1));
     }
 
     #[test]
@@ -1571,7 +1562,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            ThinClientSession::extract_final_response(&entries, 3),
+            NatsSession::extract_final_response(&entries, 3),
             Some("new".to_string())
         );
     }
@@ -1584,6 +1575,6 @@ mod tests {
             (3, MessageRole::User, "new prompt"),
         ]);
 
-        assert_eq!(ThinClientSession::extract_final_response(&entries, 3), None);
+        assert_eq!(NatsSession::extract_final_response(&entries, 3), None);
     }
 }

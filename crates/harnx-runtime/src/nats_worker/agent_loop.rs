@@ -752,8 +752,8 @@ async fn load_or_repair_session(
     let mut entries_vec = entries;
     let mut effective_entries =
         harnx_core::session_reconstruct::apply_log_mutations_nats(&entries_vec)?;
-    // The thin client appends its user message before it activates a session, so
-    // a brand-new session reaches this path with a headerless log rather than an
+    // The client appends its user message before it activates a session, so a
+    // brand-new session reaches this path with a headerless log rather than an
     // empty one. Writing the header here is what creates the session.
     let header_written = maybe_insert_remote_header(MaybeInsertRemoteHeaderArgs {
         backend,

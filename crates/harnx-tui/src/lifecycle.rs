@@ -860,7 +860,7 @@ pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<Tra
         Some(session) => session.id().to_string(),
         None => return vec![],
     };
-    let thin_agent = cfg.remote_agent.clone().or_else(|| {
+    let session_agent = cfg.remote_agent.clone().or_else(|| {
         cfg.agent.as_ref().map(|agent| {
             (
                 agent.name().to_string(),
@@ -889,7 +889,7 @@ pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<Tra
         );
     }
 
-    if let Some((agent, cluster)) = thin_agent {
+    if let Some((agent, cluster)) = session_agent {
         drop(cfg);
         let Some(state) = crate::session_history_loader::load_remote_session_history(
             config, agent, cluster, session_id,

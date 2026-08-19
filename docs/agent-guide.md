@@ -313,7 +313,7 @@ Harnx supports agent delegation, allowing a parent agent to run nested sub-agent
 
 ### NATS-Based Session Model
 
-Sub-agents in Harnx execute as standard NATS agent sessions (`ThinClientSession`). ACP (Agent Client Protocol) and its stdio child process architecture have been removed.
+Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP (Agent Client Protocol) and its stdio child process architecture have been removed.
 
 - **Markdown-only agent definitions**: Agents are defined solely by Markdown files with YAML front-matter in `<config-dir>/agents/*.md` (or package agents). ACP server configuration (`acp_servers/*.yaml`) and ACP stdio child processes no longer exist.
 - **Auto-registered toolsets**: For every configured agent, the worker daemon registers a NATS-backed 4-tool toolset. Each registration advertises the raw names `session_new`, `session_prompt`, `session_load`, and `session_cancel`; the provider exposes them to agents with an agent-relative prefix:

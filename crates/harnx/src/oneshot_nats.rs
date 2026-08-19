@@ -1,5 +1,5 @@
 use harnx_core::event::{AgentEvent, AgentEventSink, ContentBlock, ModelEvent};
-use harnx_runtime::ThinClientTurnResult;
+use harnx_runtime::NatsTurnResult;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -18,7 +18,7 @@ impl AssistantTextTrackingSink {
         }
     }
 
-    pub(crate) fn emit_durable_response_if_needed(&self, result: ThinClientTurnResult) {
+    pub(crate) fn emit_durable_response_if_needed(&self, result: NatsTurnResult) {
         if result.was_cancelled || self.rendered_assistant_text.load(Ordering::Acquire) {
             return;
         }

@@ -12,7 +12,7 @@ use harnx_runtime::config::GlobalConfig;
 #[cfg(test)]
 use harnx_runtime::config::Input;
 use harnx_runtime::utils::AbortSignal;
-use harnx_runtime::{ThinClientConfig, ThinClientSession};
+use harnx_runtime::{NatsSession, NatsSessionConfig};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -200,7 +200,7 @@ impl Tui {
     }
 
     /// Drive either a local or configured remote agent through NATS.
-    pub(super) async fn run_thin_client_prompt_task(
+    pub(super) async fn run_nats_prompt_task(
         msg: PendingMessage,
         ctx: PromptTaskContext,
         agent: String,
@@ -213,9 +213,7 @@ impl Tui {
             .await;
         }
         if !msg.attachments.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Attachments are not yet supported in thin-client mode"
-            ));
+            return Err(anyhow::anyhow!("Attachments are not yet supported"));
         }
 
         if cluster == harnx_runtime::config::LOCAL_CLUSTER_KEY {
@@ -235,8 +233,8 @@ impl Tui {
             .session
             .as_ref()
             .map(|session| session.id().to_string());
-        let session = ThinClientSession::from_global_config(
-            ThinClientConfig {
+        let session = NatsSession::from_global_config(
+            NatsSessionConfig {
                 cluster: cluster.clone(),
                 agent,
                 session_id,
@@ -245,17 +243,13 @@ impl Tui {
             ctx.abort_signal.clone(),
         )
         .await
-        .context("failed to create thin-client session")?;
+        .context("failed to create NATS session")?;
 
         let input = harnx_runtime::config::input::from_str(&ctx.config, &msg.text, None);
         let result = session.run_turn(&msg.text, sink, None).await?;
-        harnx_runtime::commands::update_last_message_after_thin_client_turn(
-            &ctx.config,
-            input,
-            &result,
-        );
+        harnx_runtime::commands::update_last_message_after_nats_turn(&ctx.config, input, &result);
         log::info!(
-            "thin-client prompt completed: cluster={} session_id={} cancelled={}",
+            "prompt completed: cluster={} session_id={} cancelled={}",
             cluster,
             result.session_id,
             result.was_cancelled

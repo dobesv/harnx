@@ -152,7 +152,7 @@ pub enum SessionLogEntry {
     },
     /// Durable boundary written only after the worker has finished the full
     /// model/tool/stop-hook loop. Live `Turn::Ended` events are advisory and
-    /// may be lost, so thin clients use this entry as the authoritative
+    /// may be lost, so clients use this entry as the authoritative
     /// successful completion signal.
     #[serde(rename = "turn_end")]
     TurnEnd {

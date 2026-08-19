@@ -33,7 +33,7 @@ use harnx_runtime::{
     config::{self, Config, GlobalConfig, LOCAL_CLUSTER_KEY},
     continue_agent_loop_from_tool_round,
     local_orchestrator::{ensure_local_worker, LocalWorkerSupervisor},
-    AgentCallFn, AgentLoopContext, OnToolRoundFn, ThinClientConfig, ThinClientSession,
+    AgentCallFn, AgentLoopContext, NatsSession, NatsSessionConfig, OnToolRoundFn,
     ToolApprovalDecision, ToolApprovalInterrupt, ToolUseConfirmation,
 };
 use std::{
@@ -166,8 +166,8 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
         let mut supervisor = params.local_worker.lock().await;
         ensure_local_worker(&mut supervisor, params.abort_signal.clone()).await?;
     }
-    let session = ThinClientSession::from_global_config(
-        ThinClientConfig {
+    let session = NatsSession::from_global_config(
+        NatsSessionConfig {
             cluster: LOCAL_CLUSTER_KEY.to_string(),
             agent: params.agent,
             session_id: Some(params.session_id),
@@ -349,8 +349,8 @@ impl SessionActor {
             };
         };
 
-        // Test executors support same-turn injection. Production thin-client
-        // turns queue the complete prompt for a fresh turn after completion.
+        // Test executors support same-turn injection. Real turns queue the
+        // complete prompt for a fresh turn after completion.
         let run_id = active_run.run_id.clone();
         let injected = active_run
             .inject_tx

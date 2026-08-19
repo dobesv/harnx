@@ -919,8 +919,8 @@ async fn ask(
             .context("failed to ensure local NATS worker")?;
     }
 
-    let session = crate::ThinClientSession::from_global_config(
-        crate::ThinClientConfig {
+    let session = crate::NatsSession::from_global_config(
+        crate::NatsSessionConfig {
             cluster,
             agent,
             session_id,
@@ -929,19 +929,19 @@ async fn ask(
         abort_signal,
     )
     .await
-    .context("failed to create thin-client session for command")?;
+    .context("failed to create NATS session for command")?;
     let sink = harnx_core::sink::current_agent_event_sink()
         .unwrap_or_else(|| Arc::new(harnx_core::event::NullSink));
     let result = session.run_turn(&input.text(), sink, None).await?;
-    update_last_message_after_thin_client_turn(config, input, &result);
+    update_last_message_after_nats_turn(config, input, &result);
     Ok(())
 }
 
-/// Update front-end continuation state after a completed thin-client turn.
-pub fn update_last_message_after_thin_client_turn(
+/// Update front-end continuation state after a completed NATS session turn.
+pub fn update_last_message_after_nats_turn(
     config: &GlobalConfig,
     input: Input,
-    result: &crate::ThinClientTurnResult,
+    result: &crate::NatsTurnResult,
 ) {
     if result.was_cancelled {
         return;
@@ -1199,10 +1199,10 @@ mod tests {
     }
 
     #[test]
-    fn thin_client_result_updates_last_message_only_after_completed_turn() {
+    fn nats_turn_result_updates_last_message_only_after_completed_turn() {
         let config = Arc::new(RwLock::new(Config::default()));
         let input = crate::config::input::from_str(&config, "hello", None);
-        let completed = crate::ThinClientTurnResult {
+        let completed = crate::NatsTurnResult {
             response: Some("world".to_string()),
             session_id: "session".to_string(),
             was_cancelled: false,
@@ -1211,7 +1211,7 @@ mod tests {
             user_msg_id: "message".to_string(),
         };
 
-        update_last_message_after_thin_client_turn(&config, input.clone(), &completed);
+        update_last_message_after_nats_turn(&config, input.clone(), &completed);
         let last = config
             .read()
             .last_message
@@ -1221,12 +1221,12 @@ mod tests {
         assert_eq!(last.output, "world");
         assert!(last.continuous);
 
-        let cancelled = crate::ThinClientTurnResult {
+        let cancelled = crate::NatsTurnResult {
             response: Some("partial".to_string()),
             was_cancelled: true,
             ..completed
         };
-        update_last_message_after_thin_client_turn(&config, input, &cancelled);
+        update_last_message_after_nats_turn(&config, input, &cancelled);
         assert_eq!(
             config
                 .read()
