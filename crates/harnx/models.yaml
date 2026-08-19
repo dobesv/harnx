@@ -539,6 +539,8 @@
       output_price: 30
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p)
       endpoint: responses
     - name: gpt-5.6-sol:high
       real_name: gpt-5.6-sol
@@ -550,6 +552,17 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"high"}
+      endpoint: responses
+    - name: gpt-5.6-sol:max
+      real_name: gpt-5.6-sol
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 30
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"max"}
       endpoint: responses
     - name: gpt-5.6-terra
       max_input_tokens: 1050000

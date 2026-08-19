@@ -217,12 +217,14 @@ pub(super) struct WorkerStartup {
     /// every bucket this worker creates (leases, session index, tool/hook
     /// registries) agrees on it instead of drifting to a per-site default.
     pub(super) replicas: usize,
+    pub(super) identity: crate::worker_identity::WorkerIdentity,
 }
 
 async fn prepare_worker_startup(
     config: &GlobalConfig,
     daemon: &WorkerDaemonConfig,
 ) -> Result<WorkerStartup> {
+    let identity = crate::worker_identity::WorkerIdentity::current(&daemon.worker_id).await?;
     let (jetstream, client, replicas) = {
         let cfg = config.read().clone();
         let jetstream = cfg.nats_jetstream(&daemon.cluster).await?;
@@ -253,16 +255,21 @@ async fn prepare_worker_startup(
         client,
         consumer,
         replicas,
+        identity,
     })
 }
 
-pub(super) fn spawn_readiness_publisher(client: async_nats::Client, daemon: &WorkerDaemonConfig) {
+pub(super) fn spawn_readiness_publisher(
+    client: async_nats::Client,
+    daemon: &WorkerDaemonConfig,
+    identity: &crate::worker_identity::WorkerIdentity,
+) -> Result<()> {
     let subject = worker_ready_subject(&daemon.cluster);
-    let worker_id = daemon.worker_id.clone();
+    let payload = identity.payload()?;
     tokio::spawn(async move {
         loop {
             if let Err(error) = client
-                .publish(subject.clone(), worker_id.clone().into())
+                .publish(subject.clone(), payload.clone().into())
                 .await
             {
                 log::warn!("failed to publish worker readiness marker: {error}");
@@ -275,6 +282,7 @@ pub(super) fn spawn_readiness_publisher(client: async_nats::Client, daemon: &Wor
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     });
+    Ok(())
 }
 
 pub(super) async fn optional_session_index(
@@ -340,8 +348,16 @@ pub async fn run_worker_daemon(
     call_fn: Option<crate::agent_loop::AgentCallFn>,
 ) -> Result<()> {
     let instance_id = resolve_worker_scope(daemon.manage_servers)?;
-    log::info!("serving under scope '{}'", instance_id.as_str());
     let startup = prepare_worker_startup(&config, &daemon).await?;
+    log::info!(
+        "serving under scope '{}' worker_id={} pid={} build={} executable={} config={}",
+        instance_id.as_str(),
+        startup.identity.worker_id,
+        startup.identity.pid,
+        startup.identity.build,
+        crate::worker_identity::short_fingerprint(&startup.identity.executable_fingerprint),
+        crate::worker_identity::short_fingerprint(&startup.identity.config_fingerprint),
+    );
     // `WorkerDaemonConfig::new` has no cluster to resolve against yet, so its
     // lease config carries the bare default; now that `daemon.cluster` is
     // resolved, the lease bucket agrees with everything else this worker
@@ -357,6 +373,7 @@ pub async fn run_worker_daemon(
         cluster: daemon.cluster.clone(),
         manage_servers: daemon.manage_servers,
         worker_id: daemon.worker_id.clone(),
+        identity: startup.identity.clone(),
         lease: daemon.lease,
         jetstream: startup.jetstream,
         session_index: services.session_index,

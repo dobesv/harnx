@@ -1,8 +1,8 @@
 //! Tests for the config module (extracted from mod.rs for code health).
 #![cfg(test)]
 
-#[cfg(unix)]
 use super::test_support::env_lock;
+use super::test_support::env_lock_async;
 use super::test_support::EnvGuard;
 use super::*;
 use harnx_core::message::MessageRole;
@@ -271,6 +271,7 @@ async fn test_use_agent_by_name_resolves_file_backed_variable_defaults() {
     // Hold the global test lock so concurrent tests can't race on the
     // shared HARNX_CONFIG_DIR env var.
     let _guard = TestStateGuard::new(None).await;
+    let _env_lock = env_lock_async().await;
     let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
 
     // Drive use_session in non-interactive mode so the inquire prompt
@@ -574,22 +575,10 @@ fn session_history_tool_declaration_is_gated_by_use_tools() {
 
 #[test]
 fn dynamic_provider_model_init_sets_client_name_from_provider() {
-    struct ProviderGuard(Option<std::ffi::OsString>);
-    impl Drop for ProviderGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(value) => unsafe { std::env::set_var("HARNX_PROVIDER", value) },
-                None => unsafe { std::env::remove_var("HARNX_PROVIDER") },
-            }
-        }
-    }
-
-    #[cfg(unix)]
     let _lock = env_lock();
     let tmp = tempfile::tempdir().unwrap();
     let _config_dir = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
-    let _provider_guard = ProviderGuard(std::env::var_os("HARNX_PROVIDER"));
-    unsafe { std::env::set_var("HARNX_PROVIDER", "claude:some-model") };
+    let _provider = EnvGuard::new("HARNX_PROVIDER", "claude:some-model");
 
     let config = tokio_test::block_on(Config::init(WorkingMode::Cmd, false))
         .expect("dynamic config should load");
@@ -603,12 +592,11 @@ async fn use_agent_routes_remote_refs_to_nats_cluster_validation() {
     use harnx_core::{abort::create_abort_signal, working_mode::WorkingMode};
 
     let _guard = TestStateGuard::new(None).await;
+    let _env_lock = env_lock_async().await;
 
     let temp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
-    let provider_prev = std::env::var_os("HARNX_PROVIDER");
-    // SAFETY: test-only; shared test lock held for duration.
-    unsafe { std::env::set_var("HARNX_PROVIDER", "claude:some-model") };
+    let _provider = EnvGuard::new("HARNX_PROVIDER", "claude:some-model");
 
     let config = Config::init(WorkingMode::Cmd, false)
         .await
@@ -618,14 +606,6 @@ async fn use_agent_routes_remote_refs_to_nats_cluster_validation() {
     let err = Config::use_agent(&config, "atlas@prod", None, create_abort_signal())
         .await
         .expect_err("remote ref with an unknown cluster must fail cluster validation");
-
-    // SAFETY: test-only; restore provider env.
-    unsafe {
-        match &provider_prev {
-            Some(v) => std::env::set_var("HARNX_PROVIDER", v),
-            None => std::env::remove_var("HARNX_PROVIDER"),
-        }
-    }
 
     // Remote refs are no longer stubbed out — they route into NATS thin-client
     // mode, which first validates the cluster. With no nats_servers/prod.yaml

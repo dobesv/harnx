@@ -211,7 +211,7 @@ impl Server {
         let mut models = list_all_models(&config.clients);
         let mut default_model = config.model.clone();
         default_model.data_mut().name = DEFAULT_MODEL_NAME.into();
-        models.insert(0, &default_model);
+        models.insert(0, default_model);
         let models: Vec<Value> = models
             .into_iter()
             .enumerate()

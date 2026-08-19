@@ -310,7 +310,7 @@ pub(super) async fn launch_worker_services(
     // intentionally non-fatal degradation into an unusable CLI. Tool servers
     // no longer start here at all: each session's own servers start (and are
     // waited on) in `handle_activation` when that session activates.
-    super::daemon::spawn_readiness_publisher(startup.client.clone(), daemon);
+    super::daemon::spawn_readiness_publisher(startup.client.clone(), daemon, &startup.identity)?;
 
     let background = Arc::new(Mutex::new(None));
     // Session-specific tool servers are awaited during activation, but the

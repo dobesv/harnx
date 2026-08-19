@@ -1,0 +1,3 @@
+type: gemini
+# api_key: AIza...   # or set GEMINI_API_KEY env var
+# api_base: https://generativelanguage.googleapis.com/v1beta   # optional override

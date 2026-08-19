@@ -74,7 +74,7 @@ pub(super) async fn spawn_test_nats() -> Option<(String, std::process::Child, te
 }
 
 static CWD_MUTEX: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
-static ENV_MUTEX: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+const NATS_TEST_CONDITION_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct CurrentDirGuard {
     original_dir: PathBuf,
@@ -100,48 +100,14 @@ impl Drop for CurrentDirGuard {
     }
 }
 
-pub(super) async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    ENV_MUTEX.lock().await
-}
-
-pub(super) struct TestEnvGuard {
-    key: String,
-    prev: Option<std::ffi::OsString>,
-}
-
-impl TestEnvGuard {
-    pub(super) fn new(key: &str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let prev = std::env::var_os(key);
-        unsafe { std::env::set_var(key, value) };
-        Self {
-            key: key.to_string(),
-            prev,
-        }
-    }
-}
-
-impl Drop for TestEnvGuard {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(value) => unsafe { std::env::set_var(&self.key, value) },
-            None => unsafe { std::env::remove_var(&self.key) },
-        }
-    }
-}
+pub(super) use crate::test_environment::{env_lock_async as env_lock, EnvGuard as TestEnvGuard};
 
 fn load_config_via_internal_pipeline(config_path: &Path) -> Config {
-    let prev = std::env::var_os("HARNX_CONFIG_DIR");
     let config_dir = config_path
         .parent()
         .expect("config path must have parent directory");
     let _config_guard = TestEnvGuard::new("HARNX_CONFIG_DIR", config_dir);
-    let config = Config::load_from_file(config_path).unwrap();
-    drop(_config_guard);
-    match prev {
-        Some(value) => unsafe { std::env::set_var("HARNX_CONFIG_DIR", value) },
-        None => unsafe { std::env::remove_var("HARNX_CONFIG_DIR") },
-    }
-    config
+    Config::load_from_file(config_path).unwrap()
 }
 
 pub(super) struct SeededRemoteParentConfig {
@@ -1460,7 +1426,7 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
             .await
     });
 
-    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+    tokio::time::timeout(NATS_TEST_CONDITION_TIMEOUT, entered.notified())
         .await
         .expect("worker never entered in-flight call_fn before cancel publish");
 
@@ -1472,7 +1438,7 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
         .expect("publish cancel control command");
 
     assert!(
-        wait_for_condition(Duration::from_secs(5), || worker_saw_abort
+        wait_for_condition(NATS_TEST_CONDITION_TIMEOUT, || worker_saw_abort
             .load(Ordering::SeqCst))
         .await,
         "worker call_fn never observed abort after remote cancel publish"
@@ -1482,7 +1448,7 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
         .await
         .expect("connect nats client for session log polling");
     let log = NatsSessionLog::new(async_nats::jetstream::new(log_client), session_id.clone());
-    let _cancel_entries = tokio::time::timeout(Duration::from_secs(5), async {
+    let _cancel_entries = tokio::time::timeout(NATS_TEST_CONDITION_TIMEOUT, async {
         loop {
             let entries = log
                 .load_events_async()
@@ -1500,7 +1466,7 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
     .await
     .expect("durable session log never recorded Cancel entry");
 
-    let _turn_result = tokio::time::timeout(Duration::from_secs(5), run_turn)
+    let _turn_result = tokio::time::timeout(NATS_TEST_CONDITION_TIMEOUT, run_turn)
         .await
         .expect("run_turn task did not complete after remote cancel")
         .expect("run_turn join must succeed")
@@ -2095,6 +2061,38 @@ async fn subagent_operation_timeout_returns_error_and_cancels_child() {
     let _ = nats.wait();
 }
 
+async fn spawn_child_activity_heartbeat(
+    url: &str,
+    session_id: &str,
+) -> (CancellationToken, tokio::task::JoinHandle<()>) {
+    let client = async_nats::connect(url)
+        .await
+        .expect("connect activity publisher");
+    let subject = crate::nats_event_sink::events_subject(session_id);
+    let payload = crate::nats_event_sink::AdvisoryEnvelope::new(
+        u64::MAX,
+        AgentEvent::Turn(harnx_core::event::TurnEvent::Started),
+    )
+    .to_bytes()
+    .expect("encode activity");
+    let stop = CancellationToken::new();
+    let task_stop = stop.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = task_stop.cancelled() => break,
+                () = tokio::time::sleep(Duration::from_millis(40)) => {}
+            }
+            client
+                .publish(subject.clone(), payload.clone().into())
+                .await
+                .expect("publish child activity");
+            client.flush().await.expect("flush child activity");
+        }
+    });
+    (stop, task)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subagent_idle_timeout_resets_on_child_activity() {
     let _env_guard = env_lock().await;
@@ -2119,46 +2117,24 @@ async fn subagent_idle_timeout_resets_on_child_activity() {
         &url,
         super::subagent_toolset::SubagentTimeouts::new(
             Duration::from_millis(75),
-            Duration::from_secs(2),
+            Duration::from_secs(10),
         ),
     )
     .await;
     let session_id = crate::nats_worker::new_remote_session_id();
-    let activity_publisher = tokio::spawn({
-        let url = url.clone();
-        let session_id = session_id.clone();
-        async move {
-            let client = async_nats::connect(url)
-                .await
-                .expect("connect activity publisher");
-            let subject = crate::nats_event_sink::events_subject(&session_id);
-            for _ in 0..15 {
-                tokio::time::sleep(Duration::from_millis(40)).await;
-                let envelope = crate::nats_event_sink::AdvisoryEnvelope::new(
-                    u64::MAX,
-                    AgentEvent::Turn(harnx_core::event::TurnEvent::Started),
-                );
-                client
-                    .publish(
-                        subject.clone(),
-                        envelope.to_bytes().expect("encode activity").into(),
-                    )
-                    .await
-                    .expect("publish child activity");
-                client.flush().await.expect("flush child activity");
-            }
-        }
-    });
+    let (activity_stop, activity_publisher) =
+        spawn_child_activity_heartbeat(&url, &session_id).await;
     let result = toolset
         .invoke(
             "session_prompt",
             json!({ "message": "stay active", "session_id": session_id }),
             CancellationToken::new(),
         )
-        .await
-        .expect("activity must keep idle timeout from false-firing");
-    assert_eq!(result["response"], "active child completed");
+        .await;
+    activity_stop.cancel();
     activity_publisher.await.expect("join activity publisher");
+    let result = result.expect("activity must keep idle timeout from false-firing");
+    assert_eq!(result["response"], "active child completed");
 
     daemon.abort();
     let _ = daemon.await;

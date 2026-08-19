@@ -9,6 +9,7 @@
 
 use std::{ffi::OsStr, fs, path::Path, path::PathBuf};
 
+use harnx_runtime::client::{retrieve_model, ModelType};
 use harnx_runtime::config::agent::{load_with_qualified_name, resolve_variables};
 use harnx_runtime::config::Config;
 
@@ -190,6 +191,72 @@ fn agent_prompt_rendering_renders_all_shipped_agents() {
     assert!(
         file_backed_variables > 0,
         "no shipped agent exercised a file-backed variable"
+    );
+}
+
+fn check_agent_models(config: &Config, qualified_name: &str) -> (usize, Vec<String>) {
+    let agent_path = Config::agent_file(qualified_name);
+    let agent = match load_with_qualified_name(&agent_path, qualified_name) {
+        Ok(agent) => agent,
+        Err(error) => return (0, vec![format!("{qualified_name}: {error:#}")]),
+    };
+    let model_ids = agent
+        .model_id()
+        .into_iter()
+        .chain(agent.model_fallbacks().iter().map(String::as_str));
+    let mut checked = 0;
+    let mut failures = Vec::new();
+    for model_id in model_ids {
+        checked += 1;
+        if let Err(error) = check_model_metadata(config, model_id) {
+            failures.push(format!("{qualified_name}: {error}"));
+        }
+    }
+    (checked, failures)
+}
+
+fn check_model_metadata(config: &Config, model_id: &str) -> Result<(), String> {
+    let model = retrieve_model(&config.clients, model_id, ModelType::Chat)
+        .map_err(|error| format!("model {model_id} does not resolve: {error:#}"))?;
+    if model.real_name() != "gpt-5.6-sol" {
+        return Ok(());
+    }
+    if model.endpoint() != Some("responses") {
+        return Err(format!("{model_id} lost its Responses endpoint metadata"));
+    }
+    Ok(())
+}
+
+#[test]
+fn shipped_agent_models_resolve_with_required_endpoint_metadata() {
+    harnx_core::require_nextest();
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+    let (temp, _config_guard) = install_packages(&workspace_root);
+    let config = Config::load_from_file(&temp.path().join("config.yaml"))
+        .expect("load package client configs");
+    let mut failures = Vec::new();
+    let mut checked = 0usize;
+
+    for package in PACKAGES {
+        let agents_dir = workspace_root.join("packages").join(package).join("agents");
+        for stem in agent_stems(&agents_dir, &mut failures) {
+            let qualified_name = format!("{package}/{stem}");
+            let (agent_checked, agent_failures) = check_agent_models(&config, &qualified_name);
+            checked += agent_checked;
+            failures.extend(agent_failures);
+        }
+    }
+
+    assert!(
+        checked > 0,
+        "no shipped agent model references were checked"
+    );
+    assert!(
+        failures.is_empty(),
+        "invalid shipped agent model references:\n{}",
+        failures.join("\n")
     );
 }
 

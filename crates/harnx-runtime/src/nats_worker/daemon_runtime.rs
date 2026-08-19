@@ -61,6 +61,7 @@ pub(super) struct WorkerRuntime {
     pub(super) cluster: String,
     pub(super) manage_servers: bool,
     pub(super) worker_id: String,
+    pub(super) identity: crate::worker_identity::WorkerIdentity,
     pub(super) lease: NatsLeaseConfig,
     pub(super) jetstream: jetstream::Context,
     pub(super) session_index: Option<async_nats::jetstream::kv::Store>,
@@ -238,9 +239,13 @@ impl WorkerRuntime {
         // registration round a chance to finish before that snapshot is taken.
         super::daemon_background::await_initial_tool_registration(&self.tools_attempted).await;
         log::info!(
-            "session activate claimed: session_id={} worker_id={} revision={} epoch={}",
+            "session activate claimed: session_id={} worker_id={} worker_pid={} build={} executable={} config={} revision={} epoch={}",
             activation.session_id,
             lease.worker_id(),
+            self.identity.pid,
+            self.identity.build,
+            crate::worker_identity::short_fingerprint(&self.identity.executable_fingerprint),
+            crate::worker_identity::short_fingerprint(&self.identity.config_fingerprint),
             lease.fence_token(),
             activation.epoch
         );

@@ -3,17 +3,15 @@
 
 use super::*;
 use crate::client::MessageRole;
+use crate::config::test_support::{env_lock, EnvGuard};
 use crate::config::GlobalConfig;
 use crate::utils::create_abort_signal;
 use std::{
     fs,
     path::Path,
     path::PathBuf,
-    sync::{LazyLock, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
-
-static TEST_CONFIG_DIR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn unique_test_config_dir() -> PathBuf {
     let timestamp = SystemTime::now()
@@ -27,7 +25,7 @@ fn unique_test_config_dir() -> PathBuf {
 }
 
 fn with_test_config_dir<T>(f: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
-    let _guard = TEST_CONFIG_DIR_LOCK.lock().unwrap();
+    let _guard = env_lock();
     let config_dir = unique_test_config_dir();
     let data_dir = config_dir.with_file_name(format!(
         "{}-data",
@@ -42,17 +40,12 @@ fn with_test_config_dir<T>(f: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
     fs::create_dir_all(&data_dir)?;
     fs::create_dir_all(&state_dir)?;
 
-    unsafe {
-        std::env::set_var("HARNX_CONFIG_DIR", &config_dir);
-        std::env::set_var("HARNX_DATA_DIR", &data_dir);
-        std::env::set_var("HARNX_STATE_DIR", &state_dir);
-    }
-    let result = f(&config_dir);
-    unsafe {
-        std::env::remove_var("HARNX_CONFIG_DIR");
-        std::env::remove_var("HARNX_DATA_DIR");
-        std::env::remove_var("HARNX_STATE_DIR");
-    }
+    let result = {
+        let _config = EnvGuard::new("HARNX_CONFIG_DIR", &config_dir);
+        let _data = EnvGuard::new("HARNX_DATA_DIR", &data_dir);
+        let _state = EnvGuard::new("HARNX_STATE_DIR", &state_dir);
+        f(&config_dir)
+    };
 
     let _ = fs::remove_dir_all(&data_dir);
     let _ = fs::remove_dir_all(&state_dir);
