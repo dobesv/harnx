@@ -34,12 +34,14 @@ pub fn install_cli_agent_event_sink(
     highlight: bool,
     render_options: RenderOptions,
     abort_signal: AbortSignal,
+    final_only: bool,
 ) {
-    install_agent_event_sink(Arc::new(CliAgentEventSink::new(
-        highlight,
-        render_options,
-        abort_signal,
-    )));
+    let sink = if final_only {
+        CliAgentEventSink::new_with_final_only(highlight, render_options, abort_signal)
+    } else {
+        CliAgentEventSink::new(highlight, render_options, abort_signal)
+    };
+    install_agent_event_sink(Arc::new(sink));
     debug_assert!(
         has_agent_event_sink(),
         "CLI AgentEventSink must be installed after startup call"

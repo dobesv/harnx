@@ -155,7 +155,7 @@ model: openai:gpt-4o
 You are a helpful assistant that explains things clearly and concisely.
 ```
 
-Running `harnx -a my-agent "What is Rust?"` produces these messages:
+Running `harnx prompt -a my-agent "What is Rust?"` produces these messages:
 
 ```json
 [
@@ -280,14 +280,14 @@ Agent hooks extend global hooks (defined in the main config). The merge rules ar
 
 ```sh
 harnx --agent <name>                    # Start an agent
-harnx --agent <name> "your question"    # Start with input
+harnx prompt --agent <name> "your question" # Run a non-interactive prompt
 harnx --list-agents                     # List available agents
 ```
 
 You can also pass variable values directly:
 
 ```sh
-harnx --agent coder --agent-variable language=rust "write a web server"
+harnx prompt --agent coder --agent-variable language rust "write a web server"
 ```
 
 ### From the TUI
@@ -304,7 +304,7 @@ harnx --agent coder --agent-variable language=rust "write a web server"
 Use `--prompt` to create a temporary agent without a file:
 
 ```sh
-harnx --prompt "You are a helpful translator" "translate hello to French"
+harnx prompt --prompt "You are a helpful translator" "translate hello to French"
 ```
 
 ## Sub-Agents & Agent Delegation

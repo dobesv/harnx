@@ -13,10 +13,13 @@ use std::time::Duration;
 
 use harnx::test_utils::interrupt::{
     script_call_trivial_tool, script_call_wait_tool, script_stall_streaming, send_sigint,
-    spawn_oneshot, spawn_oneshot_in_tmux, spawn_tui, wait_for_cmd_exit, wait_for_exit,
-    wait_for_prompt_return, write_minimal_config, write_with_blocking_hook, write_with_wait_tool,
+    spawn_oneshot, spawn_oneshot_final_only, spawn_oneshot_in_tmux, spawn_tui, wait_for_cmd_exit,
+    wait_for_exit, wait_for_prompt_return, write_minimal_config, write_with_blocking_hook,
+    write_with_wait_tool,
 };
-use harnx::test_utils::mock_openai_server::{MockOpenAiScript, MockOpenAiServer, MockOpenAiTurn};
+use harnx::test_utils::mock_openai_server::{
+    MockOpenAiError, MockOpenAiScript, MockOpenAiServer, MockOpenAiTurn,
+};
 use harnx::test_utils::tmux_harness::TmuxHarness;
 
 fn wait_for_mock_request(mock: &MockOpenAiServer) -> Result<()> {
@@ -59,11 +62,118 @@ fn one_shot_local_turn_runs_over_nats() -> Result<()> {
         use std::io::Read;
         pipe.read_to_string(&mut stdout)?;
     }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read;
+        pipe.read_to_string(&mut stderr)?;
+    }
     assert!(status.success(), "one-shot exited with {status}");
     assert_eq!(
         stdout.matches("NATS one-shot smoke").count(),
         1,
         "response should be rendered exactly once: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("Resume this session by running:")
+            && stderr.contains("harnx -a default -s "),
+        "one-shot should report its resumable session: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn final_only_prints_only_the_durable_response() -> Result<()> {
+    harnx_core::require_nextest();
+    if std::process::Command::new("nats-server")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("nats-server unavailable; skipping final_only_prints_only_the_durable_response");
+        return Ok(());
+    }
+
+    let mock = MockOpenAiServer::start(MockOpenAiScript {
+        turns: vec![MockOpenAiTurn {
+            text_chunks: vec!["Only the final answer.".to_string()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    })?;
+    let tmp = tempfile::tempdir()?;
+    let paths = write_minimal_config(tmp.path(), &format!("http://127.0.0.1:{}/v1", mock.port()))?;
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let mut child = spawn_oneshot_final_only(&paths, &harnx_bin, "answer quietly")?;
+    let status = wait_for_exit(&mut child, Duration::from_secs(30))?;
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        use std::io::Read;
+        pipe.read_to_string(&mut stdout)?;
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read;
+        pipe.read_to_string(&mut stderr)?;
+    }
+
+    assert!(status.success(), "final-only one-shot exited with {status}");
+    assert_eq!(stdout, "Only the final answer.\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn final_only_reports_terminal_failures_on_stderr() -> Result<()> {
+    harnx_core::require_nextest();
+    if std::process::Command::new("nats-server")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!(
+            "nats-server unavailable; skipping final_only_reports_terminal_failures_on_stderr"
+        );
+        return Ok(());
+    }
+
+    let mock = MockOpenAiServer::start(MockOpenAiScript {
+        turns: vec![MockOpenAiTurn {
+            error: Some(MockOpenAiError {
+                status: 400,
+                message: "final-only terminal failure".to_string(),
+                error_type: "invalid_request_error".to_string(),
+                headers: Vec::new(),
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    })?;
+    let tmp = tempfile::tempdir()?;
+    let paths = write_minimal_config(tmp.path(), &format!("http://127.0.0.1:{}/v1", mock.port()))?;
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let mut child = spawn_oneshot_final_only(&paths, &harnx_bin, "fail quietly")?;
+    let status = wait_for_exit(&mut child, Duration::from_secs(30))?;
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        use std::io::Read;
+        pipe.read_to_string(&mut stdout)?;
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read;
+        pipe.read_to_string(&mut stderr)?;
+    }
+
+    assert!(
+        !status.success(),
+        "final-only failure unexpectedly succeeded"
+    );
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("final-only terminal failure"),
+        "terminal failure should remain diagnosable: {stderr:?}"
     );
     Ok(())
 }

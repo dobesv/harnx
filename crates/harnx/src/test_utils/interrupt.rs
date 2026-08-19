@@ -286,7 +286,8 @@ fn shell_escape(s: &str) -> String {
 }
 
 /// Starts tmux + bash, exports `HARNX_CONFIG_DIR`, and launches harnx in
-/// one-shot (Cmd) mode with `prompt` as the argument.  Returns the harness
+/// one-shot (Cmd) mode with `prompt` as the prompt-subcommand input. Returns
+/// the harness
 /// immediately; the harnx process runs inside the pane and the exit code will
 /// appear as `HARNX_EXIT:<code>` when it finishes.
 ///
@@ -312,7 +313,7 @@ pub fn spawn_oneshot_in_tmux(
     // non-zero (interrupted), making exit detection possible from pane capture.
     // --agent default is required since chat activity needs an active agent.
     tmux.send_text(&format!(
-        "{} --agent default {} || echo HARNX_EXIT:$?\n",
+        "{} prompt --agent default {} || echo HARNX_EXIT:$?\n",
         shell_escape(&harnx_bin.to_string_lossy()),
         shell_escape(prompt),
     ))?;
@@ -368,19 +369,41 @@ pub fn wait_for_prompt_return(tmux: &TmuxHarness, budget: Duration) -> Result<()
     }
 }
 
-/// Spawns `harnx "<prompt>"` non-interactively. Returns the `Child` —
+/// Spawns `harnx prompt "<prompt>"` non-interactively. Returns the `Child` —
 /// caller is responsible for `wait_for_exit` or kill.
 pub fn spawn_oneshot(
     paths: &ConfigPaths,
     harnx_bin: &Path,
     prompt: &str,
 ) -> Result<std::process::Child> {
+    spawn_oneshot_with_args(paths, harnx_bin, prompt, &[])
+}
+
+/// Spawns a final-response-only one-shot command.
+pub fn spawn_oneshot_final_only(
+    paths: &ConfigPaths,
+    harnx_bin: &Path,
+    prompt: &str,
+) -> Result<std::process::Child> {
+    spawn_oneshot_with_args(paths, harnx_bin, prompt, &["--final-only"])
+}
+
+fn spawn_oneshot_with_args(
+    paths: &ConfigPaths,
+    harnx_bin: &Path,
+    prompt: &str,
+    extra_args: &[&str],
+) -> Result<std::process::Child> {
     harnx_core::require_nextest();
     use std::process::{Command, Stdio};
     // --agent default is required since chat activity needs an active agent.
     // The "default" agent is written by write_minimal_config.
-    Command::new(harnx_bin)
-        .args(["--agent", "default", prompt])
+    let mut command = Command::new(harnx_bin);
+    command
+        .args(["prompt", "--agent", "default"])
+        .args(extra_args)
+        .arg("--")
+        .arg(prompt)
         .env("HARNX_CONFIG_DIR", &paths.harnx_config_dir)
         .env("HARNX_DATA_DIR", &paths.harnx_data_dir)
         .env("HARNX_STATE_DIR", &paths.harnx_state_dir)

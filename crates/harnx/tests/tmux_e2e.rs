@@ -47,7 +47,7 @@ fn proxy_auth_hook_injects_env_vars_into_bash_exec() -> Result<()> {
     prime_proxy_test_shell(&tmux, &paths, &repo_root, &harnx_bin)?;
 
     tmux.send_text(&format!(
-        "{} -a proxy-test -s proxy-auth-e2e {}",
+        "{} prompt -a proxy-test -s proxy-auth-e2e -- {}",
         shell_escape(harnx_bin.to_string_lossy().as_ref()),
         shell_escape("Run a bash command")
     ))?;

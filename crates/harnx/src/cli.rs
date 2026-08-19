@@ -8,92 +8,109 @@ use std::io::{stdin, Read};
     author,
     version,
     about,
-    long_about = None,
-    args_conflicts_with_subcommands = true
+    long_about = None
 )]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
     /// Select a LLM model
-    #[clap(short, long, hide = true)]
+    #[clap(short, long, global = true, hide = true)]
     pub model: Option<String>,
     /// Use the system prompt
-    #[clap(long, hide = true)]
+    #[clap(long, global = true, hide = true)]
     pub prompt: Option<String>,
     /// Start or join a session
-    #[clap(short = 's', long, hide = true)]
+    #[clap(short = 's', long, global = true, hide = true)]
     pub session: Option<Option<String>>,
     /// Ensure the session is empty
-    #[clap(long, hide = true)]
+    #[clap(long, global = true, hide = true)]
     pub empty_session: bool,
     /// Start a agent
-    #[clap(short = 'a', long, hide = true)]
+    #[clap(short = 'a', long, global = true, hide = true)]
     pub agent: Option<String>,
     /// Set agent variable pairs (format: --agent-variable key value or -x key value); can be repeated
-    #[clap(short = 'x', long, value_names = ["KEY", "VALUE"], num_args = 2, action = clap::ArgAction::Append, hide = true)]
+    #[clap(short = 'x', long, value_names = ["KEY", "VALUE"], num_args = 2, action = clap::ArgAction::Append, global = true, hide = true)]
     pub agent_variable: Vec<String>,
     /// Use the RAG
-    #[clap(short = 'r', long, hide = true)]
+    #[clap(short = 'r', long, global = true, hide = true)]
     pub rag: Option<String>,
     /// Rebuild the RAG to sync document changes
-    #[clap(long, hide = true)]
+    #[clap(long, global = true, hide = true)]
     pub rebuild_rag: bool,
     /// File to include with the message
-    #[clap(short, long, value_name = "FILE", hide = true)]
+    #[clap(short, long, value_name = "FILE", global = true, hide = true)]
     pub file: Vec<String>,
     /// Highlight code with provided theme
-    #[clap(long, hide = true)]
+    #[clap(long, global = true, hide = true)]
     pub code_theme: Option<String>,
     /// Light theme for markdown rendering
-    #[clap(long, hide = true)]
+    #[clap(long, global = true, hide = true)]
     pub light_theme: bool,
     /// Execute macro command(s) from config by name
-    #[clap(long = "macro", value_name = "NAME", hide = true)]
+    #[clap(long = "macro", value_name = "NAME", global = true, hide = true)]
     pub macro_name: Option<String>,
     /// Disable streaming output
-    #[clap(long, hide = true)]
+    #[clap(long, global = true, hide = true)]
     pub no_stream: bool,
+    /// Print only the final response in non-interactive mode
+    #[clap(long, global = true, hide = true)]
+    pub final_only: bool,
     /// Display the message without sending it
-    #[clap(long, hide = true)]
+    #[clap(long, global = true, hide = true)]
     pub dry_run: bool,
     /// Display internal info
-    #[clap(long, hide = true)]
+    #[clap(long, global = true, hide = true)]
     pub info: bool,
     /// Sync models updates
-    #[clap(long, hide = true)]
+    #[clap(long, global = true, hide = true)]
     pub sync_models: bool,
     /// List all available chat models
-    #[clap(long, hide = true)]
+    #[clap(long, global = true, hide = true)]
     pub list_models: bool,
     /// List all sessions
-    #[clap(long, hide = true)]
+    #[clap(long, global = true, hide = true)]
     pub list_sessions: bool,
     /// List all agents
-    #[clap(long, hide = true)]
+    #[clap(long, global = true, hide = true)]
     pub list_agents: bool,
     /// List agents available for direct interaction (excludes subagent and compaction roles)
-    #[clap(long, hide = true)]
+    #[clap(long, global = true, hide = true)]
     pub list_assistant_agents: bool,
     /// List all RAGs
-    #[clap(long, hide = true)]
+    #[clap(long, global = true, hide = true)]
     pub list_rags: bool,
     /// List all macros
-    #[clap(long, hide = true)]
+    #[clap(long, global = true, hide = true)]
     pub list_macros: bool,
     /// Enable tools or toolsets for this session (can be repeated, also accepts toolset names)
-    #[clap(short = 't', long = "tool", value_name = "TOOL", hide = true)]
+    #[clap(
+        short = 't',
+        long = "tool",
+        value_name = "TOOL",
+        global = true,
+        hide = true
+    )]
     pub tool: Vec<String>,
-    /// Input text
-    #[clap(trailing_var_arg = true, hide = true)]
+    /// Input text after an explicit `--` separator
+    #[clap(last = true, hide = true)]
     text: Vec<String>,
 }
 
 #[derive(Subcommand, Debug, PartialEq, Eq)]
 pub enum Commands {
+    /// Run a non-interactive prompt
+    Prompt(PromptArgs),
     /// Inspect harnx state
     Info(InfoArgs),
     /// Session management commands
     Session(SessionArgs),
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct PromptArgs {
+    /// Input text
+    #[arg(trailing_var_arg = true)]
+    text: Vec<String>,
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -141,35 +158,33 @@ impl Cli {
                 .read_to_string(&mut stdin_text)
                 .context("Invalid stdin pipe")?;
         };
-        match self.text.is_empty() {
-            true => {
-                if stdin_text.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(stdin_text))
-                }
+        let text_args = match &self.command {
+            Some(Commands::Prompt(args)) => &args.text,
+            _ => &self.text,
+        };
+        if text_args.is_empty() {
+            if stdin_text.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(stdin_text))
             }
-            false => {
-                if self.macro_name.is_some() {
-                    let text = self
-                        .text
-                        .iter()
-                        .map(|v| shell_words::quote(v))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if stdin_text.is_empty() {
-                        Ok(Some(text))
-                    } else {
-                        Ok(Some(format!("{text} -- {stdin_text}")))
-                    }
-                } else {
-                    let text = self.text.join(" ");
-                    if stdin_text.is_empty() {
-                        Ok(Some(text))
-                    } else {
-                        Ok(Some(format!("{text}\n{stdin_text}")))
-                    }
-                }
+        } else if self.macro_name.is_some() {
+            let text = text_args
+                .iter()
+                .map(|v| shell_words::quote(v))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if stdin_text.is_empty() {
+                Ok(Some(text))
+            } else {
+                Ok(Some(format!("{text} -- {stdin_text}")))
+            }
+        } else {
+            let text = text_args.join(" ");
+            if stdin_text.is_empty() {
+                Ok(Some(text))
+            } else {
+                Ok(Some(format!("{text}\n{stdin_text}")))
             }
         }
     }
@@ -216,14 +231,47 @@ mod tests {
         }
     }
 
-    /// The worker moved to the `harnx-worker` binary. `harnx worker` is no
-    /// longer a subcommand, so it falls through to the trailing prompt text
-    /// like any other unrecognized words.
     #[test]
-    fn worker_is_no_longer_a_subcommand() {
-        let cli = Cli::try_parse_from(["harnx", "worker", "--cluster", "prod"]).unwrap();
+    fn unrecognized_words_are_not_implicit_prompt_text() {
+        assert!(Cli::try_parse_from(["harnx", "worker", "--cluster", "prod"]).is_err());
+        assert!(Cli::try_parse_from(["harnx", "hello"]).is_err());
+    }
+
+    #[test]
+    fn parses_prompt_subcommand_with_options_before_or_after_it() {
+        let before = Cli::try_parse_from(["harnx", "--agent", "foo", "prompt", "hello"]).unwrap();
+        let after = Cli::try_parse_from(["harnx", "prompt", "--agent", "foo", "hello"]).unwrap();
+
+        for cli in [before, after] {
+            assert_eq!(cli.agent.as_deref(), Some("foo"));
+            assert_eq!(
+                cli.command,
+                Some(Commands::Prompt(super::PromptArgs {
+                    text: vec!["hello".to_string()],
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn parses_explicit_separator_prompt() {
+        let cli = Cli::try_parse_from(["harnx", "--agent", "foo", "--", "info"]).unwrap();
+
         assert!(cli.command.is_none());
-        assert_eq!(cli.text, vec!["worker", "--cluster", "prod"]);
+        assert_eq!(cli.agent.as_deref(), Some("foo"));
+        assert_eq!(cli.text, vec!["info"]);
+    }
+
+    #[test]
+    fn prompt_subcommand_accepts_option_like_text_after_separator() {
+        let cli = Cli::try_parse_from(["harnx", "prompt", "--", "review", "--staged"]).unwrap();
+
+        assert_eq!(
+            cli.command,
+            Some(Commands::Prompt(super::PromptArgs {
+                text: vec!["review".to_string(), "--staged".to_string()],
+            }))
+        );
     }
 }
 

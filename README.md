@@ -113,16 +113,16 @@ Explore powerful command-line functionalities with Harnx's CMD mode.
 
 Accept diverse input forms such as stdin, local files and directories, and remote URLs, allowing flexibility in data handling.
 
-| Input             | CMD                                  | TUI                              |
-| ----------------- | ------------------------------------ | -------------------------------- |
-| CMD               | `harnx hello`                       |                                  |
-| STDIN             | `cat data.txt \| harnx`             |                                  |
-| Last Reply        |                                      | `.file %%`                       |
-| Local files       | `harnx -f image.png -f data.txt`    | `.file image.png data.txt`       |
-| Local directories | `harnx -f dir/`                     | `.file dir/`                     |
-| Remote URLs       | `harnx -f https://example.com`      | `.file https://example.com`      |
-| External commands | ```harnx -f '`git diff`'```         | ```.file `git diff` ```          |
-| Combine Inputs    | `harnx -f dir/ -f data.txt explain` | `.file dir/ data.txt -- explain` |
+| Input             | CMD                                          | TUI                              |
+| ----------------- | -------------------------------------------- | -------------------------------- |
+| CMD               | `harnx prompt hello`                         |                                  |
+| STDIN             | `cat data.txt \| harnx prompt`              |                                  |
+| Last Reply        |                                              | `.file %%`                       |
+| Local files       | `harnx prompt -f image.png -f data.txt`     | `.file image.png data.txt`       |
+| Local directories | `harnx prompt -f dir/`                      | `.file dir/`                     |
+| Remote URLs       | `harnx prompt -f https://example.com`       | `.file https://example.com`      |
+| External commands | ```harnx prompt -f '`git diff`'```          | ```.file `git diff` ```          |
+| Combine Inputs    | `harnx prompt -f dir/ -f data.txt explain` | `.file dir/ data.txt -- explain` |
 
 ### Agents
 
@@ -301,4 +301,3 @@ See the LICENSE-APACHE and LICENSE-MIT files for license details.
 ## Lineage
 
 Harnx began as an independently continued derivative of [aichat](https://github.com/sigoden/aichat).
-

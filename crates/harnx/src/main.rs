@@ -96,21 +96,21 @@ pub fn remote_list_outcome(result: Result<Vec<SessionMeta>, anyhow::Error>) -> L
 async fn main() -> Result<()> {
     load_env_file()?;
     let cli = Cli::parse();
-    if let Some(command) = &cli.command {
-        setup_logger(LogSink::File)?;
-        harnx_core::alloc_guard::init_from_env();
-        return run_command(command).await;
+    setup_logger(LogSink::File)?;
+    harnx_core::alloc_guard::init_from_env();
+    match &cli.command {
+        Some(command @ (Commands::Info(_) | Commands::Session(_))) => {
+            return run_command(command).await;
+        }
+        Some(Commands::Prompt(_)) | None => {}
     }
 
     let text = cli.text()?;
-    let working_mode = if text.is_none() && cli.file.is_empty() {
-        WorkingMode::Tui
-    } else {
-        WorkingMode::Cmd
+    let working_mode = match (&cli.command, &text, cli.file.is_empty()) {
+        (Some(Commands::Prompt(_)), _, _) | (_, Some(_), _) | (_, _, false) => WorkingMode::Cmd,
+        _ => WorkingMode::Tui,
     };
     let info_flag = legacy_info_flag(&cli);
-    setup_logger(LogSink::File)?;
-    harnx_core::alloc_guard::init_from_env();
     let config = Arc::new(RwLock::new(Config::init(working_mode, info_flag).await?));
     if let Err(err) = run(config, cli, text).await {
         render_error(err);
@@ -121,6 +121,7 @@ async fn main() -> Result<()> {
 
 async fn run_command(command: &Commands) -> Result<()> {
     match command {
+        Commands::Prompt(_) => bail!("prompt commands use the one-shot execution path"),
         Commands::Info(info_args) => match &info_args.command {
             InfoSubcommands::Agent { name } => {
                 let config = Config::init(WorkingMode::Cmd, true).await?;
@@ -407,35 +408,7 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         return Ok(());
     }
     match is_tui {
-        false => {
-            let (highlight, render_options) = {
-                let cfg = config.read();
-                (cfg.highlight, cfg.render_options().unwrap_or_default())
-            };
-            agent_event_sink::install_cli_agent_event_sink(
-                highlight,
-                render_options,
-                abort_signal.clone(),
-            );
-            {
-                let cfg = config.read();
-                if cfg.agent.is_none() {
-                    bail!("No agent selected. Use --agent/-a to specify an agent.");
-                }
-            }
-            if config.read().session.is_none() {
-                let session_id = Config::reserve_new_session_id(&config).await?;
-                config.write().use_session(Some(&session_id))?;
-            }
-            let input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
-            let aborted_check = abort_signal.clone();
-            let result = start_directive(&config, input, abort_signal).await;
-            exit_session(&config)?;
-            if aborted_check.aborted() {
-                bail!("interrupted by user");
-            }
-            result
-        }
+        false => run_one_shot(&config, &cli, text, abort_signal).await,
         true => {
             if !*IS_STDOUT_TERMINAL {
                 bail!("No TTY for TUI")
@@ -445,13 +418,42 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     }
 }
 
+async fn run_one_shot(
+    config: &GlobalConfig,
+    cli: &Cli,
+    text: Option<String>,
+    abort_signal: AbortSignal,
+) -> Result<()> {
+    let (highlight, render_options) = {
+        let cfg = config.read();
+        (cfg.highlight, cfg.render_options().unwrap_or_default())
+    };
+    agent_event_sink::install_cli_agent_event_sink(
+        highlight,
+        render_options,
+        abort_signal.clone(),
+        cli.final_only,
+    );
+    if config.read().agent.is_none() {
+        bail!("No agent selected. Use --agent/-a to specify an agent.");
+    }
+    if config.read().session.is_none() {
+        let session_id = Config::reserve_new_session_id(config).await?;
+        config.write().use_session(Some(&session_id))?;
+    }
+    let input = create_input(config, text, &cli.file, abort_signal.clone()).await?;
+    let aborted_check = abort_signal.clone();
+    let result = start_directive(config, input, abort_signal, cli.final_only).await;
+    exit_session(config, !cli.final_only)?;
+    if aborted_check.aborted() {
+        bail!("interrupted by user");
+    }
+    result
+}
+
 fn session_resume_command(config: &GlobalConfig) -> Option<String> {
     let config_read = config.read();
     let session = config_read.session.as_ref()?;
-    if session.is_empty() {
-        return None;
-    }
-
     let session_name = session.id();
 
     let agent_name = config_read.agent.as_ref().map(|a| a.name());
@@ -551,8 +553,10 @@ fn print_session_breakdown(
     }
 }
 
-fn exit_session(config: &GlobalConfig) -> Result<()> {
-    let resume_cmd = session_resume_command(config);
+fn exit_session(config: &GlobalConfig, show_resume_hint: bool) -> Result<()> {
+    let resume_cmd = show_resume_hint
+        .then(|| session_resume_command(config))
+        .flatten();
     config.write().exit_session()?;
 
     if let Some(cmd) = resume_cmd {
@@ -566,26 +570,13 @@ fn exit_session(config: &GlobalConfig) -> Result<()> {
     Ok(())
 }
 
-#[async_recursion::async_recursion]
 async fn start_directive(
-    config: &GlobalConfig,
-    input: Input,
-    abort_signal: AbortSignal,
-) -> Result<()> {
-    start_directive_inner(config, input, abort_signal, 0, true).await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn start_directive_inner(
     config: &GlobalConfig,
     mut input: Input,
     abort_signal: AbortSignal,
-    _resume_count: u32,
-    with_embeddings: bool,
+    final_only: bool,
 ) -> Result<()> {
-    if with_embeddings {
-        crate::config::input::use_embeddings(&mut input, config, abort_signal.clone()).await?;
-    }
+    crate::config::input::use_embeddings(&mut input, config, abort_signal.clone()).await?;
 
     let (agent, cluster, session_id) = {
         let cfg = config.read();
@@ -631,12 +622,37 @@ async fn start_directive_inner(
         .await?;
 
     let worker_error = result.error.clone();
-    tracking_sink.emit_durable_response_if_needed(result);
+    finish_one_shot_output(final_only, &tracking_sink, result);
     // A worker-side failure must not exit 0 — scripts driving one-shot mode
     // rely on the exit code to tell an answer from a dead turn.
     match worker_error {
         Some(error) => Err(anyhow::anyhow!(error)),
         None => Ok(()),
+    }
+}
+
+fn finish_one_shot_output(
+    final_only: bool,
+    tracking_sink: &oneshot_nats::AssistantTextTrackingSink,
+    result: harnx_runtime::ThinClientTurnResult,
+) {
+    if final_only {
+        print_final_response(&result);
+    } else {
+        tracking_sink.emit_durable_response_if_needed(result);
+    }
+}
+
+fn print_final_response(result: &harnx_runtime::ThinClientTurnResult) {
+    if result.was_cancelled || result.error.is_some() {
+        return;
+    }
+    let Some(response) = result.response.as_deref().filter(|text| !text.is_empty()) else {
+        return;
+    };
+    print!("{response}");
+    if !response.ends_with('\n') {
+        println!();
     }
 }
 
@@ -652,7 +668,7 @@ async fn start_interactive(config: &GlobalConfig) -> Result<()> {
         }
     };
     print_session_breakdown(tui.transcript(), &source, config);
-    exit_session(config)?;
+    exit_session(config, true)?;
     result
 }
 
@@ -814,12 +830,12 @@ mod resume_tests {
     }
 
     #[test]
-    fn returns_none_for_empty_session() {
+    fn returns_command_for_empty_reserved_session() {
         let config = make_config(Some(Session {
             id: "test".to_string(),
             ..Default::default()
         }));
-        assert!(session_resume_command(&config).is_none());
+        assert_eq!(session_resume_command(&config).unwrap(), "harnx -s test");
     }
 
     #[test]
