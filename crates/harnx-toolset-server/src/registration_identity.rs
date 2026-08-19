@@ -83,6 +83,7 @@ mod tests {
 
     #[test]
     fn environment_identity_handles_set_empty_and_unset_package() {
+        harnx_core::require_nextest();
         let _lock = ENV_LOCK.lock().expect("lock registration environment");
         let _restore = EnvRestore::capture();
 

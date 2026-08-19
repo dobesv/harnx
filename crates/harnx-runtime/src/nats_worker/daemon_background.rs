@@ -19,6 +19,7 @@ use crate::config::{
 };
 use anyhow::{Context, Result};
 use async_nats::jetstream;
+use futures_util::future::join_all;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -406,18 +407,20 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
         // Tool servers aren't started here anymore — each session's own
         // servers start on demand through `WorkerRuntime::server_reconciler`.
         let (_worker_tool_servers, global_hooks) = configured_worker_services(&config);
-        let mut subagent_tool_servers = Vec::new();
-        for agent in list_agents() {
-            match start_subagent_toolset(SubagentToolsetStart {
+        let registrations = list_agents().into_iter().map(|agent| {
+            let start = SubagentToolsetStart {
                 agent: agent.clone(),
                 cluster: daemon.cluster.clone(),
                 instance_id: instance_id.clone(),
                 client: client.clone(),
                 jetstream: jetstream.clone(),
                 replicas,
-            })
-            .await
-            {
+            };
+            async move { (agent, start_subagent_toolset(start).await) }
+        });
+        let mut subagent_tool_servers = Vec::new();
+        for (agent, result) in join_all(registrations).await {
+            match result {
                 Ok(handle) => subagent_tool_servers.push(handle),
                 // One unusable sub-agent must not cost the others their toolset.
                 Err(error) => {

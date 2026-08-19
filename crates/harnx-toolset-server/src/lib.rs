@@ -16,6 +16,7 @@ use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{
     server_identity_token, ControlKind, ControlMessage, Registration, ToolErrorPayload,
     ToolInvokeError, ToolReply, ToolRequest, Toolset, HDR_CALL_ID, HDR_IDEMPOTENCY_KEY,
+    SUBAGENT_SESSION_NEW_TOOL, SUBAGENT_SESSION_PROMPT_TOOL,
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
@@ -420,7 +421,10 @@ async fn process_tool_request(
 
 fn accepts_parent_session_id(tool: &str) -> bool {
     // Sub-agent toolsets reserve these raw names for calls that start a child turn.
-    matches!(tool, "session_prompt" | "session_new")
+    matches!(
+        tool,
+        SUBAGENT_SESSION_PROMPT_TOOL | SUBAGENT_SESSION_NEW_TOOL
+    )
 }
 
 async fn validate_tool_request(
