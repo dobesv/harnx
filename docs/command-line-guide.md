@@ -3,10 +3,12 @@
 ## Usage
 
 ```
-Usage: harnx [OPTIONS] [TEXT]...
+Usage: harnx [OPTIONS] [COMMAND]
 
-Arguments:
-  [TEXT]...  Input text
+Commands:
+  prompt  Run a non-interactive prompt
+  info    Inspect harnx state
+  session Manage sessions
 
 Options:
   -m, --model <MODEL>                  Select a LLM model
@@ -22,6 +24,7 @@ Options:
   -t, --tool <TOOL>                    Use specific tools
   -f, --file <FILE>                    Include files, directories, or URLs
   -S, --no-stream                      Turn off stream mode
+      --final-only                     Print only the final response
       --dry-run                        Display the message without sending it
       --info                           Display information
       --sync-models                    Sync models updates
@@ -38,7 +41,8 @@ Options:
 
 ```
 harnx                                          # Enter the interactive TUI
-harnx Tell a joke                              # Generate response
+harnx prompt Tell a joke                       # Generate response
+harnx -- Tell a joke                           # Same, using an explicit separator
 
 harnx-serve                                    # Run server (standalone binary)
 harnx-serve --addr 0.0.0.0:8080                # Run server with addr
@@ -56,12 +60,19 @@ harnx --info                                   # View system info
 harnx --rag rag1 --info                        # View RAG info
 
 harnx --macro macro1                           # Execute macro 'macro1'
-harnx --macro macro2 arg1 arg2                 # Execute macro 'macro2' with args
+harnx --macro macro2 -- arg1 arg2              # Execute macro 'macro2' with args
 
-output=$(harnx -S $input)                      # Run in the script
+output=$(harnx prompt --final-only -- "$input") # Return only the final response
+cat prompt.txt | harnx prompt                    # Read the prompt from stdin
 
-harnx -f a.png -f b.png diff images            # Use files
+harnx prompt -f a.png -f b.png diff images     # Use files
 ```
+
+Free-form command-line text must be introduced by the `prompt` subcommand or
+an explicit `--` separator. This keeps prompts such as `info` and `session`
+distinct from CLI subcommands. Use `prompt` as the canonical syntax for piped
+stdin and file-only input as well. Bare stdin and file-only forms remain
+supported for compatibility.
 
 ## Shell Integration
 
@@ -81,15 +92,15 @@ The `-f/--file` flag can be used to send files to LLMs.
 
 ```
 # Use local file
-harnx -f data.txt
+harnx prompt -f data.txt
 # Use image file
-harnx -f image.png ocr
+harnx prompt -f image.png ocr
 # Use multiple files
-harnx -f file1 -f file2 explain
+harnx prompt -f file1 -f file2 explain
 # Use local dirs
-harnx -f dir/ summarize
+harnx prompt -f dir/ summarize
 # Use remote URLs
-harnx -f https://example.com/page summarize
+harnx prompt -f https://example.com/page summarize
 ```
 
 ## Run Server

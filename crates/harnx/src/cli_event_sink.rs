@@ -15,11 +15,11 @@ use harnx_core::event::{
 };
 
 use harnx_render::{MarkdownRender, RenderOptions};
-use harnx_runtime::utils::{dimmed_text, spawn_spinner, warning_text, Spinner, IS_STDOUT_TERMINAL};
+use harnx_runtime::utils::{dimmed_text, warning_text, IS_STDOUT_TERMINAL};
 
 /// Stderr-bound sink for the non-interactive CLI. Thread-safe — interior
 /// state is held behind an `Arc<Mutex<CliSinkState>>` so multiple clones
-/// of the sink share the same spinner/render buffer.
+/// of the sink share the same render buffer.
 #[derive(Clone)]
 pub struct CliAgentEventSink {
     state: Arc<Mutex<CliSinkState>>,
@@ -43,28 +43,45 @@ fn source_heading(source: &AgentSource) -> String {
 }
 
 struct CliSinkState {
-    spinner: Option<Spinner>,
     render: Option<MarkdownRender>,
     buffer: String,
     last_ui_output_source: Option<AgentSource>,
     highlight: bool,
     render_options: RenderOptions,
+    final_only: bool,
 }
 
 impl CliAgentEventSink {
     pub fn new(
         highlight: bool,
         render_options: RenderOptions,
+        abort_signal: harnx_core::abort::AbortSignal,
+    ) -> Self {
+        Self::new_with_options(highlight, render_options, abort_signal, false)
+    }
+
+    pub fn new_with_final_only(
+        highlight: bool,
+        render_options: RenderOptions,
+        abort_signal: harnx_core::abort::AbortSignal,
+    ) -> Self {
+        Self::new_with_options(highlight, render_options, abort_signal, true)
+    }
+
+    fn new_with_options(
+        highlight: bool,
+        render_options: RenderOptions,
         _abort_signal: harnx_core::abort::AbortSignal,
+        final_only: bool,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(CliSinkState {
-                spinner: None,
                 render: None,
                 buffer: String::new(),
                 last_ui_output_source: None,
                 highlight,
                 render_options,
+                final_only,
             })),
         }
     }
@@ -94,12 +111,7 @@ impl CliSinkState {
 
     /// Dispatch a chunk of text to either the markdown or raw rendering
     /// path based on the highlight flag snapshot + stdout terminal-ness.
-    /// Stops the spinner on first chunk.
     fn handle_chunk_text(&mut self, text: &str) -> anyhow::Result<()> {
-        if let Some(spinner) = self.spinner.take() {
-            spinner.stop();
-        }
-
         if self.highlight && *IS_STDOUT_TERMINAL {
             self.handle_markdown_chunk(text)
         } else {
@@ -163,12 +175,9 @@ impl CliSinkState {
         Ok(())
     }
 
-    /// End-of-turn cleanup: stop spinner, flush any buffered partial line,
-    /// and reset state so the next turn starts fresh.
+    /// End-of-turn cleanup: flush any buffered partial line and reset state so
+    /// the next turn starts fresh.
     fn cleanup(&mut self) -> anyhow::Result<()> {
-        if let Some(spinner) = self.spinner.take() {
-            spinner.stop();
-        }
         // The partial line in self.buffer has already been printed raw
         // (handle_markdown_chunk prints each chunk immediately).  We just
         // need a trailing newline to close the line on the terminal.
@@ -274,23 +283,14 @@ impl AgentEventSink for CliAgentEventSink {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
+        if state.final_only {
+            return;
+        }
         if is_model_output_event(&event) {
             state.maybe_emit_source_heading(source.as_ref());
         }
         match event {
-            AgentEvent::Status(line) => match &state.spinner {
-                Some(spinner) => {
-                    let _ = spinner.set_message(line.text);
-                }
-                None => {
-                    state.spinner = Some(spawn_spinner(&line.text));
-                }
-            },
-            AgentEvent::Turn(TurnEvent::Started) => {
-                if state.spinner.is_none() {
-                    state.spinner = Some(spawn_spinner("Generating"));
-                }
-            }
+            AgentEvent::Status(_) | AgentEvent::Turn(TurnEvent::Started) => {}
             AgentEvent::Turn(TurnEvent::Ended { .. }) => {
                 if let Err(err) = state.cleanup() {
                     eprintln!(
@@ -414,11 +414,9 @@ impl AgentEventSink for CliAgentEventSink {
             // Silent for Progress / Update — they are streamed mid-call
             // updates that would clutter stderr.
             AgentEvent::Tool(_) => {}
-            // Compaction lifecycle: start spinner, stop it, or report failure.
+            // Compaction lifecycle uses stable log lines in one-shot mode.
             AgentEvent::Session(SessionEvent::CompactingStarted) => {
-                if state.spinner.is_none() {
-                    state.spinner = Some(spawn_spinner("Compacting"));
-                }
+                eprintln!("{}", dimmed_text("Compacting the session..."));
             }
             AgentEvent::Session(SessionEvent::CompactingCompleted) => {
                 if let Err(err) = state.cleanup() {
@@ -466,16 +464,16 @@ fn split_line_tail_local(text: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harnx_core::event::{ContentBlock, StatusLine};
+    use harnx_core::event::ContentBlock;
 
     fn make_state(highlight: bool) -> CliSinkState {
         CliSinkState {
-            spinner: None,
             render: None,
             buffer: String::new(),
             last_ui_output_source: None,
             highlight,
             render_options: RenderOptions::default(),
+            final_only: false,
         }
     }
 
@@ -536,59 +534,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn user_message_cleans_up_spinner_without_panic() {
-        let sink = CliAgentEventSink::new(
+    async fn final_only_ignores_intermediate_events() {
+        let sink = CliAgentEventSink::new_with_final_only(
             false,
             RenderOptions::default(),
             harnx_core::abort::create_abort_signal(),
         );
         sink.emit(AgentEvent::Turn(TurnEvent::Started));
-        {
-            let state = sink.state.lock().unwrap();
-            assert!(state.spinner.is_some(), "spinner should be started");
-        }
         sink.emit(AgentEvent::User(UserEvent::Message {
             content: "hello user".into(),
         }));
-        {
-            let state = sink.state.lock().unwrap();
-            assert!(
-                state.spinner.is_none(),
-                "spinner should be cleared before printing user text"
-            );
-        }
-    }
+        sink.emit(AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("hidden".into())],
+        }));
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn status_event_starts_spinner_without_panic() {
-        let sink = CliAgentEventSink::new(
-            false,
-            RenderOptions::default(),
-            harnx_core::abort::create_abort_signal(),
-        );
-        sink.emit(AgentEvent::Status(StatusLine {
-            text: "[test-model] generating".into(),
-        }));
-        sink.emit(AgentEvent::Turn(TurnEvent::Started));
-        sink.emit(AgentEvent::Turn(TurnEvent::Ended {
-            outcome: Default::default(),
-        }));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn status_event_updates_existing_spinner() {
-        let sink = CliAgentEventSink::new(
-            false,
-            RenderOptions::default(),
-            harnx_core::abort::create_abort_signal(),
-        );
-        sink.emit(AgentEvent::Turn(TurnEvent::Started));
-        sink.emit(AgentEvent::Status(StatusLine {
-            text: "[rich-label] generating".into(),
-        }));
-        sink.emit(AgentEvent::Turn(TurnEvent::Ended {
-            outcome: Default::default(),
-        }));
+        let state = sink.state.lock().unwrap();
+        assert!(state.buffer.is_empty());
+        assert!(state.last_ui_output_source.is_none());
     }
 
     // ----------------------------------------------------------------
@@ -1011,70 +973,16 @@ mod tests {
     // ----------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn compacting_started_starts_spinner_without_panic() {
+    async fn compaction_events_are_handled_without_panic() {
         let sink = CliAgentEventSink::new(
             false,
             RenderOptions::default(),
             harnx_core::abort::create_abort_signal(),
         );
         sink.emit(AgentEvent::Session(SessionEvent::CompactingStarted));
-        // cleanup to close spinner
         sink.emit(AgentEvent::Session(SessionEvent::CompactingCompleted));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn compacting_completed_clears_spinner() {
-        let sink = CliAgentEventSink::new(
-            false,
-            RenderOptions::default(),
-            harnx_core::abort::create_abort_signal(),
-        );
-        // Start spinner first
-        sink.emit(AgentEvent::Turn(TurnEvent::Started));
-        {
-            let state = sink.state.lock().unwrap();
-            assert!(state.spinner.is_some(), "spinner should be started");
-        }
-        // CompactingStarted should NOT replace an existing spinner
-        sink.emit(AgentEvent::Session(SessionEvent::CompactingStarted));
-        {
-            let state = sink.state.lock().unwrap();
-            assert!(state.spinner.is_some(), "spinner should still exist");
-        }
-        // CompactingCompleted clears spinner
-        sink.emit(AgentEvent::Session(SessionEvent::CompactingCompleted));
-        {
-            let state = sink.state.lock().unwrap();
-            assert!(
-                state.spinner.is_none(),
-                "spinner should be cleared by Completed"
-            );
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn compacting_failed_clears_spinner_and_reports_warning() {
-        let sink = CliAgentEventSink::new(
-            false,
-            RenderOptions::default(),
-            harnx_core::abort::create_abort_signal(),
-        );
-        // Start spinner
-        sink.emit(AgentEvent::Session(SessionEvent::CompactingStarted));
-        {
-            let state = sink.state.lock().unwrap();
-            assert!(state.spinner.is_some(), "spinner should be started");
-        }
-        // Failed clears spinner
         sink.emit(AgentEvent::Session(SessionEvent::CompactingFailed(
             "something went wrong".to_string(),
         )));
-        {
-            let state = sink.state.lock().unwrap();
-            assert!(
-                state.spinner.is_none(),
-                "spinner should be cleared by Failed"
-            );
-        }
     }
 }
