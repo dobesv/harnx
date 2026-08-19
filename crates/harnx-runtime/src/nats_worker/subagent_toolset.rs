@@ -8,7 +8,10 @@ use async_trait::async_trait;
 use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, TurnEvent};
 use harnx_core::package_namespace::sanitize_for_tool_name;
 use harnx_core::session::SessionLogEntry;
-use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
+use harnx_toolset::{
+    ToolInvokeError, ToolSpec, Toolset, SUBAGENT_SESSION_CANCEL_TOOL, SUBAGENT_SESSION_LOAD_TOOL,
+    SUBAGENT_SESSION_NEW_TOOL, SUBAGENT_SESSION_PROMPT_TOOL,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -265,7 +268,7 @@ impl SubagentToolset {
         args: Value,
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
-        let args: NewSessionArgs = parse_args("session_new", args)?;
+        let args: NewSessionArgs = parse_args(SUBAGENT_SESSION_NEW_TOOL, args)?;
         let result = self
             .run_prompt(
                 SESSION_NEW_INITIAL_PROMPT,
@@ -282,7 +285,7 @@ impl SubagentToolset {
         args: Value,
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
-        let args: PromptArgs = parse_args("session_prompt", args)?;
+        let args: PromptArgs = parse_args(SUBAGENT_SESSION_PROMPT_TOOL, args)?;
         if args.message.trim().is_empty() {
             return Err(ToolInvokeError::Recoverable(
                 "message must not be empty".to_string(),
@@ -314,7 +317,7 @@ impl SubagentToolset {
     }
 
     async fn session_load(&self, args: Value) -> Result<Value, ToolInvokeError> {
-        let args: SessionArgs = parse_args("session_load", args)?;
+        let args: SessionArgs = parse_args(SUBAGENT_SESSION_LOAD_TOOL, args)?;
         let session_id = required_session_id(args.session_id)?;
         let events = NatsSessionLog::new(self.jetstream.clone(), session_id.clone())
             .load_events_async()
@@ -328,7 +331,7 @@ impl SubagentToolset {
     }
 
     async fn session_cancel(&self, args: Value) -> Result<Value, ToolInvokeError> {
-        let args: SessionArgs = parse_args("session_cancel", args)?;
+        let args: SessionArgs = parse_args(SUBAGENT_SESSION_CANCEL_TOOL, args)?;
         let session_id = required_session_id(args.session_id)?;
         publish_control_command(&self.client, &session_id, &ControlCommand::Cancel)
             .await
@@ -417,13 +420,13 @@ impl Toolset for SubagentToolset {
         args: Value,
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
-        if tool == "session_new" {
+        if tool == SUBAGENT_SESSION_NEW_TOOL {
             self.session_new(args, cancel).await
-        } else if tool == "session_prompt" {
+        } else if tool == SUBAGENT_SESSION_PROMPT_TOOL {
             self.session_prompt(args, cancel).await
-        } else if tool == "session_load" {
+        } else if tool == SUBAGENT_SESSION_LOAD_TOOL {
             self.session_load(args).await
-        } else if tool == "session_cancel" {
+        } else if tool == SUBAGENT_SESSION_CANCEL_TOOL {
             self.session_cancel(args).await
         } else {
             Err(ToolInvokeError::Recoverable(format!(
@@ -449,7 +452,7 @@ const SHORT_SESSION_ID: &str = "{{ args.session_id | truncate(8, end='') }}";
 
 fn session_new_spec(agent: &str, display_name: &str, request_timeout: u64) -> ToolSpec {
     ToolSpec {
-        name: "session_new".to_string(),
+        name: SUBAGENT_SESSION_NEW_TOOL.to_string(),
         description: format!("Create a new session on the '{agent}' agent"),
         input_schema: json!({ "type": "object", "properties": {} }),
         idempotent_hint: false,
@@ -462,7 +465,7 @@ fn session_new_spec(agent: &str, display_name: &str, request_timeout: u64) -> To
 
 fn session_prompt_spec(agent: &str, display_name: &str, request_timeout: u64) -> ToolSpec {
     ToolSpec {
-        name: "session_prompt".to_string(),
+        name: SUBAGENT_SESSION_PROMPT_TOOL.to_string(),
         description: format!(
             "Send a prompt to the '{agent}' agent. To continue a conversation, pass only the exact session_id returned by session_prompt or session_new. To start a new conversation, omit session_id; empty or whitespace-only values also start a new session. Do not invent a session ID."
         ),
@@ -497,6 +500,13 @@ enum SessionIdTool {
 }
 
 impl SessionIdTool {
+    fn tool_name(&self) -> &'static str {
+        match self {
+            Self::Load => SUBAGENT_SESSION_LOAD_TOOL,
+            Self::Cancel => SUBAGENT_SESSION_CANCEL_TOOL,
+        }
+    }
+
     fn verb(&self) -> &'static str {
         match self {
             Self::Load => "load",
@@ -523,7 +533,7 @@ impl SessionIdTool {
 fn session_id_tool_spec(agent: &str, display_name: &str, tool: SessionIdTool) -> ToolSpec {
     let verb = tool.verb();
     ToolSpec {
-        name: format!("session_{verb}"),
+        name: tool.tool_name().to_string(),
         description: tool.describe(agent),
         input_schema: json!({
             "type": "object",

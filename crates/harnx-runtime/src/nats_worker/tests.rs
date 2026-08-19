@@ -35,8 +35,6 @@ use tokio_util::sync::CancellationToken;
 mod subagent_discovery_tests;
 mod transcript_render_tests;
 
-use subagent_discovery_tests::{call_registered_agent, registered_agent_provider};
-
 /// Spawn a local JetStream-enabled nats-server on a free port with an isolated
 /// temp store dir, returning the connect URL, the child process, and the temp
 /// dir guard. Using a free port + per-run store dir avoids cross-run state
@@ -1533,6 +1531,135 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
     let _ = daemon.await;
     let _ = child.kill();
     let _ = child.wait();
+}
+
+async fn registered_agent_provider(
+    jetstream: &async_nats::jetstream::Context,
+    config: &Config,
+    agents: &[&str],
+    active_package: Option<&str>,
+) -> (
+    String,
+    Arc<crate::nats_tool_provider::NatsToolProvider>,
+    Vec<(String, harnx_toolset::Registration)>,
+) {
+    let (instance_id, registrations) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(registry) = jetstream
+                .get_key_value(harnx_toolset_server::TOOL_REGISTRY_BUCKET)
+                .await
+            {
+                let mut keys = registry.keys().await.expect("list registry keys");
+                let mut registrations = Vec::new();
+                while let Some(key) = keys.next().await {
+                    let key = key.expect("read registry key");
+                    let Some(value) = registry.get(&key).await.expect("read registration") else {
+                        continue;
+                    };
+                    let registration: harnx_toolset::Registration =
+                        serde_json::from_slice(&value).expect("decode registration");
+                    registrations.push((key, registration));
+                }
+                let registration_agent = |registration: &harnx_toolset::Registration| {
+                    registration.package.as_ref().map_or_else(
+                        || registration.server.clone(),
+                        |package| format!("{package}/{}", registration.server),
+                    )
+                };
+                if agents.iter().all(|agent| {
+                    registrations
+                        .iter()
+                        .any(|(_, registration)| registration_agent(registration) == *agent)
+                }) {
+                    let agent = agents.first().expect("at least one requested agent");
+                    let (key, registration) = registrations
+                        .iter()
+                        .find(|(_, registration)| registration_agent(registration) == *agent)
+                        .expect("requested agent registration exists");
+                    let identity =
+                        crate::server_identity::ServerIdentity::identity_token(registration);
+                    let instance_id = key
+                        .strip_suffix(&format!(".{identity}"))
+                        .expect("registry key uses {instance}.{identity_token}")
+                        .to_string();
+                    break (instance_id, registrations);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("worker did not register configured agents");
+    let provider = crate::nats_tool_provider::NatsToolProvider::discover(
+        config,
+        harnx_core::instance::ServerScope::from_string(instance_id.clone()),
+        crate::nats_tool_provider::NatsInFlightCalls::default(),
+        active_package,
+    )
+    .await
+    .expect("parent discovers configured sub-agent toolsets");
+    (instance_id, Arc::new(provider), registrations)
+}
+
+async fn call_registered_agent(
+    provider: Arc<crate::nats_tool_provider::NatsToolProvider>,
+    tool: String,
+    message: String,
+    early_event: Option<(&mut async_nats::Subscriber, &str)>,
+) -> (serde_json::Value, Option<String>) {
+    let prompt_call = tokio::spawn(async move {
+        provider
+            .call_tool(
+                &tool,
+                json!({ "message": message }),
+                &harnx_core::abort::create_abort_signal(),
+            )
+            .await
+    });
+    let child_session_id = if let Some((parent_events, expected_agent)) = early_event {
+        let (agent, session_id) = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = parent_events
+                    .next()
+                    .await
+                    .expect("parent event stream closed");
+                let envelope =
+                    crate::nats_event_sink::AdvisoryEnvelope::from_bytes(&message.payload)
+                        .expect("decode parent advisory");
+                if let AgentEvent::SubAgent { source, event } = envelope.event {
+                    if let AgentEvent::Turn(harnx_core::event::TurnEvent::SubAgentStarted {
+                        agent,
+                        session_id,
+                    }) = *event
+                    {
+                        assert_eq!(source.agent, agent);
+                        assert_eq!(source.session_id.as_deref(), Some(session_id.as_str()));
+                        break (agent, session_id);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("parent did not receive early SubAgentStarted");
+        assert_eq!(agent, expected_agent);
+        assert!(
+            !prompt_call.is_finished(),
+            "SubAgentStarted must arrive before final tool result"
+        );
+        Some(session_id)
+    } else {
+        None
+    };
+    let result = prompt_call
+        .await
+        .expect("join prompt tool call")
+        .unwrap_or_else(|error| match error {
+            harnx_core::tool::ToolError::Recoverable(error)
+            | harnx_core::tool::ToolError::Fatal(error) => {
+                panic!("registered agent prompt failed: {error:#}")
+            }
+        });
+    (result, child_session_id)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -129,6 +129,15 @@ pub struct ToolRequest {
     pub parent_session_id: Option<String>,
 }
 
+/// Raw tool name for creating a sub-agent session.
+pub const SUBAGENT_SESSION_NEW_TOOL: &str = "session_new";
+/// Raw tool name for prompting a sub-agent session.
+pub const SUBAGENT_SESSION_PROMPT_TOOL: &str = "session_prompt";
+/// Raw tool name for loading a sub-agent session.
+pub const SUBAGENT_SESSION_LOAD_TOOL: &str = "session_load";
+/// Raw tool name for cancelling a sub-agent session.
+pub const SUBAGENT_SESSION_CANCEL_TOOL: &str = "session_cancel";
+
 /// Serializable error returned in a [`ToolReply`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
@@ -383,5 +392,13 @@ mod tests {
         assert_eq!(HDR_CALL_ID, "X-Harnx-Call-Id");
         assert_eq!(HDR_INSTANCE_ID, "X-Harnx-Instance-Id");
         assert_eq!(HDR_CONTENT_TYPE, "Content-Type");
+    }
+
+    #[test]
+    fn subagent_session_tool_names_are_stable() {
+        assert_eq!(SUBAGENT_SESSION_NEW_TOOL, "session_new");
+        assert_eq!(SUBAGENT_SESSION_PROMPT_TOOL, "session_prompt");
+        assert_eq!(SUBAGENT_SESSION_LOAD_TOOL, "session_load");
+        assert_eq!(SUBAGENT_SESSION_CANCEL_TOOL, "session_cancel");
     }
 }
