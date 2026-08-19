@@ -224,7 +224,7 @@ async fn seed_session_and_attach_runtime(
     backend.append_event_blocking(&session_header(session_id))?;
 
     let log = NatsSessionLog::new(jetstream, session_id);
-    let entries = log.load_events_async().await?;
+    let entries = log.load_events_at_least_async(1).await?;
     let mut session =
         harnx_runtime::nats_session_log::load_session_from_entries(&entries, session_id)?;
     let runtime = std::sync::Arc::new(backend.clone())
@@ -838,8 +838,10 @@ async fn nats_worker_persists_full_turn_end_to_end() -> Result<()> {
     })
     .await?;
 
-    // Verify: load entries from NATS
-    let entries = log.load_events_async().await?;
+    // A publish ack can precede JetStream's stream metadata reflecting the
+    // same sequence under load. Read the leader-authoritative tail before
+    // asserting on the immediately reloaded log.
+    let entries = log.load_events_latest_async().await?;
     let entries_only: Vec<SessionLogEntry> = entries.iter().map(|(_, e)| e.clone()).collect();
 
     // Should have: Header, User message, ToolCalls, ToolResults, final assistant Message
@@ -909,7 +911,7 @@ async fn nats_worker_honors_configured_token_auth() -> Result<()> {
     })
     .await?;
 
-    let entries = log.load_events_async().await?;
+    let entries = log.load_events_latest_async().await?;
     assert!(
         entries.len() >= 4,
         "expected the authenticated worker to persist a full turn, got {} entries",
@@ -964,7 +966,7 @@ async fn wait_until(timeout: std::time::Duration, mut cond: impl FnMut() -> bool
 /// Generous enough to avoid flakes under CI load (contended runners, slow
 /// subprocess startup). The poll loop returns immediately when the condition
 /// is met, so this only matters when the system is slow.
-const CI_SAFE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const CI_SAFE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dispatch_runs_exactly_one_worker_per_activation_and_reactivation_is_noop() -> Result<()> {

@@ -86,6 +86,31 @@ fn effort_aliases_set_effort_in_the_request_body() {
     );
 }
 
+#[test]
+fn gpt_5_6_sol_variants_use_responses_without_sampling_parameters() {
+    let openai = ALL_PROVIDER_MODELS
+        .iter()
+        .find(|provider| provider.provider == "openai")
+        .expect("OpenAI provider catalog");
+    for name in ["gpt-5.6-sol", "gpt-5.6-sol:high", "gpt-5.6-sol:max"] {
+        let model = Model::from_config("openai", &openai.models)
+            .into_iter()
+            .find(|model| model.name() == name)
+            .unwrap_or_else(|| panic!("missing OpenAI model alias {name}"));
+        assert_eq!(model.endpoint(), Some("responses"), "{name}");
+        let patched = harnx_core::jaq::eval_filters_strict(
+            model.patches().expect("GPT-5.6 Sol patch"),
+            request_envelope(&model),
+        )
+        .unwrap_or_else(|error| panic!("patches for {name} failed: {error:#}"));
+        assert!(patched["body"].get("temperature").is_none(), "{name}");
+        assert!(patched["body"].get("top_p").is_none(), "{name}");
+        if let Some((_, effort)) = name.rsplit_once(':') {
+            assert_eq!(patched["body"]["reasoning"]["effort"], effort, "{name}");
+        }
+    }
+}
+
 /// Returns the container key (`output_config` or `reasoning`) when the patch
 /// sets an effort level under it.
 fn effort_path(patch: &str) -> Option<&'static str> {

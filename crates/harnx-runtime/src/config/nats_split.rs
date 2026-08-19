@@ -276,7 +276,7 @@ fn expand_env_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::test_support::{env_lock, EnvGuard};
+    use crate::config::test_support::{env_lock, env_lock_async, EnvGuard};
 
     /// Assert a resolved server matches the expected dynamic-local identity
     /// (reserved name, url, token) and routes through the authenticated path.
@@ -303,10 +303,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn local_cluster_env_handoff_builds_authenticated_dynamic_config() {
         harnx_core::require_nextest();
-        let _lock = env_lock();
+        let _lock = env_lock_async().await;
         let _url = EnvGuard::new(
             HARNX_NATS_URL_ENV,
             std::path::Path::new("nats://127.0.0.1:4555"),
@@ -321,10 +320,9 @@ mod tests {
     /// An operator's typo in `HARNX_NATS_REPLICAS` (e.g. "3x") must fail
     /// startup loudly, not silently resolve to a single-replica bucket.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn local_cluster_env_handoff_rejects_an_unparseable_replicas_value() {
         harnx_core::require_nextest();
-        let _lock = env_lock();
+        let _lock = env_lock_async().await;
         let _url = EnvGuard::new(
             HARNX_NATS_URL_ENV,
             std::path::Path::new("nats://127.0.0.1:4555"),
@@ -346,10 +344,9 @@ mod tests {
     /// `HARNX_NATS_TLS*` variables `NatsEndpoint::from_env` does, or that
     /// discovery silently stays plaintext regardless of cluster config.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn local_cluster_env_handoff_carries_tls_settings() {
         harnx_core::require_nextest();
-        let _lock = env_lock();
+        let _lock = env_lock_async().await;
         let _url = EnvGuard::new(
             HARNX_NATS_URL_ENV,
             std::path::Path::new("tls://127.0.0.1:4555"),
@@ -386,10 +383,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn local_cluster_dynamic_resolution_wins_over_reserved_yaml_entry() {
         harnx_core::require_nextest();
-        let _lock = env_lock();
+        let _lock = env_lock_async().await;
         let _url = EnvGuard::new(
             HARNX_NATS_URL_ENV,
             std::path::Path::new("nats://127.0.0.1:4666"),

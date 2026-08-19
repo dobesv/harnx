@@ -2,16 +2,14 @@
 #![cfg(test)]
 
 use super::*;
+use crate::config::test_support::{env_lock, EnvGuard};
 use harnx_core::config_paths::config_dir;
 use std::{
     fs,
     path::Path,
     path::PathBuf,
-    sync::{LazyLock, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
-
-static TEST_CONFIG_DIR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn write_agent_dump_test_config() {
     let config_dir = config_dir();
@@ -40,7 +38,7 @@ fn unique_test_config_dir() -> PathBuf {
 }
 
 fn with_test_config_dir<T>(f: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
-    let _guard = TEST_CONFIG_DIR_LOCK.lock().unwrap();
+    let _guard = env_lock();
     let config_dir = unique_test_config_dir();
     let data_dir = config_dir.with_file_name(format!(
         "{}-data",
@@ -55,17 +53,12 @@ fn with_test_config_dir<T>(f: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
     fs::create_dir_all(&data_dir)?;
     fs::create_dir_all(&state_dir)?;
 
-    unsafe {
-        std::env::set_var("HARNX_CONFIG_DIR", &config_dir);
-        std::env::set_var("HARNX_DATA_DIR", &data_dir);
-        std::env::set_var("HARNX_STATE_DIR", &state_dir);
-    }
-    let result = f(&config_dir);
-    unsafe {
-        std::env::remove_var("HARNX_CONFIG_DIR");
-        std::env::remove_var("HARNX_DATA_DIR");
-        std::env::remove_var("HARNX_STATE_DIR");
-    }
+    let result = {
+        let _config = EnvGuard::new("HARNX_CONFIG_DIR", &config_dir);
+        let _data = EnvGuard::new("HARNX_DATA_DIR", &data_dir);
+        let _state = EnvGuard::new("HARNX_STATE_DIR", &state_dir);
+        f(&config_dir)
+    };
 
     let _ = fs::remove_dir_all(&data_dir);
     let _ = fs::remove_dir_all(&state_dir);
@@ -204,49 +197,18 @@ fn render_agent_dump_errors_cleanly_for_unknown_agent() {
 
 #[test]
 fn render_agent_dump_handles_package_qualified_agent() {
-    let _guard = TEST_CONFIG_DIR_LOCK.lock().unwrap();
-    let config_dir = unique_test_config_dir();
-    let data_dir = config_dir.with_file_name(format!(
-        "{}-data",
-        config_dir.file_name().unwrap().to_string_lossy()
-    ));
-    let state_dir = config_dir.with_file_name(format!(
-        "{}-state",
-        config_dir.file_name().unwrap().to_string_lossy()
-    ));
-    let packages_dir = config_dir.join("packages");
-    let pkg_dir = packages_dir.join("mypkg");
-    let agents_dir = pkg_dir.join("agents");
-    fs::create_dir_all(&agents_dir).unwrap();
-    fs::create_dir_all(&data_dir).unwrap();
-    fs::create_dir_all(&state_dir).unwrap();
-
-    unsafe {
-        std::env::set_var("HARNX_CONFIG_DIR", &config_dir);
-        std::env::set_var("HARNX_DATA_DIR", &data_dir);
-        std::env::set_var("HARNX_STATE_DIR", &state_dir);
-    }
-
-    let agent_content = r#"---
+    let rendered = with_test_config_dir(|config_dir| {
+        let agents_dir = config_dir.join("packages/mypkg/agents");
+        fs::create_dir_all(&agents_dir)?;
+        let agent_content = r#"---
 model: openai:gpt-4o
 ---
 You are a package agent.
 "#;
-    fs::write(agents_dir.join("pkg-agent.md"), agent_content).unwrap();
-
-    let config = Config::default();
-    let result = render_agent_dump(&config, "mypkg/pkg-agent");
-
-    unsafe {
-        std::env::remove_var("HARNX_CONFIG_DIR");
-        std::env::remove_var("HARNX_DATA_DIR");
-        std::env::remove_var("HARNX_STATE_DIR");
-    }
-    let _ = fs::remove_dir_all(&config_dir);
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&state_dir);
-
-    let rendered = result.expect("should succeed for package-qualified agent");
+        fs::write(agents_dir.join("pkg-agent.md"), agent_content)?;
+        render_agent_dump(&Config::default(), "mypkg/pkg-agent")
+    })
+    .expect("should succeed for package-qualified agent");
     assert!(
         rendered.contains("You are a package agent"),
         "should have agent body"

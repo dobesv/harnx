@@ -32,10 +32,13 @@ pub mod nats_worker;
 pub mod remote_session_cleanup;
 pub mod server_identity;
 pub mod session_history;
+#[cfg(test)]
+mod test_environment;
 pub mod test_utils;
 pub mod tool;
 pub mod tool_context;
 pub mod utils;
+mod worker_identity;
 
 // Re-export thin-client types for frontends
 pub use nats_client_session::{

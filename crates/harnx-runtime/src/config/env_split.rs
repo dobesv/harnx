@@ -171,62 +171,42 @@ pub fn load_env_file() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::test_support::{env_lock, EnvGuard};
 
-    /// RAII guard that removes an env var on drop.
     #[test]
     fn load_envs_reads_cleanup_remote_sessions_days() {
-        let _lock = crate::config::test_support::env_lock();
-        let prev = std::env::var_os("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS");
-        // SAFETY: test-only; global test lock held.
-        unsafe { std::env::set_var("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS", "7") };
+        let _lock = env_lock();
+        let _cleanup_days = EnvGuard::new("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS", "7");
 
         let mut config = Config::default();
         config.load_envs();
 
         assert_eq!(config.cleanup_remote_sessions_days, Some(7));
-
-        // Restore prior state
-        match prev {
-            Some(v) => unsafe { std::env::set_var("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS", v) },
-            None => unsafe { std::env::remove_var("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS") },
-        }
     }
 
     #[test]
     fn load_envs_unset_cleanup_remote_sessions_days_is_none() {
-        let _lock = crate::config::test_support::env_lock();
-        let prev = std::env::var_os("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS");
-        // SAFETY: test-only; global test lock held.
-        unsafe { std::env::remove_var("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS") };
+        let _lock = env_lock();
+        let _cleanup_days = EnvGuard::remove("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS");
 
         let mut config = Config::default();
         config.load_envs();
 
         assert_eq!(config.cleanup_remote_sessions_days, None);
-
-        // Restore prior state
-        if let Some(v) = prev {
-            unsafe { std::env::set_var("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS", v) }
-        }
     }
 
     #[test]
     fn load_env_file_ambient_env_always_wins() {
         use std::io::Write;
 
-        let _lock = crate::config::test_support::env_lock();
-        let prev_log_level = std::env::var_os("HARNX_LOG_LEVEL");
-        let prev_inherited = std::env::var_os("SOME_INHERITED_VAR");
-        let prev_unset_var = std::env::var_os("ENV_ONLY_VAR");
-        let prev_harnx_env_file = std::env::var_os("HARNX_ENV_FILE");
+        let _lock = env_lock();
 
         // Set inherited vars: one logging var, one arbitrary non-log var. Both
         // are already present in the ambient environment.
-        // SAFETY: test-only; global test lock held.
-        unsafe { std::env::set_var("HARNX_LOG_LEVEL", "debug") };
-        unsafe { std::env::set_var("SOME_INHERITED_VAR", "from-ambient") };
+        let _log_level = EnvGuard::new("HARNX_LOG_LEVEL", "debug");
+        let _inherited = EnvGuard::new("SOME_INHERITED_VAR", "from-ambient");
         // Ensure the .env-only var is NOT set ambiently.
-        unsafe { std::env::remove_var("ENV_ONLY_VAR") };
+        let _env_only = EnvGuard::remove("ENV_ONLY_VAR");
 
         // .env tries to override both inherited vars AND sets a fresh var.
         let tmpdir = tempfile::tempdir().expect("tempdir");
@@ -238,7 +218,7 @@ mod tests {
         .expect("write .env");
         f.sync_all().expect("sync .env");
 
-        unsafe { std::env::set_var("HARNX_ENV_FILE", env_file.display().to_string()) };
+        let _env_file = EnvGuard::new("HARNX_ENV_FILE", &env_file);
 
         load_env_file().expect("load_env_file");
 
@@ -261,23 +241,5 @@ mod tests {
             Some("from-dotenv".to_string()),
             "unset var should be filled in from .env"
         );
-
-        // Restore prior state
-        unsafe { std::env::remove_var("HARNX_ENV_FILE") };
-        unsafe { std::env::remove_var("ENV_ONLY_VAR") };
-        match prev_log_level {
-            Some(v) => unsafe { std::env::set_var("HARNX_LOG_LEVEL", v) },
-            None => unsafe { std::env::remove_var("HARNX_LOG_LEVEL") },
-        }
-        match prev_inherited {
-            Some(v) => unsafe { std::env::set_var("SOME_INHERITED_VAR", v) },
-            None => unsafe { std::env::remove_var("SOME_INHERITED_VAR") },
-        }
-        if let Some(v) = prev_unset_var {
-            unsafe { std::env::set_var("ENV_ONLY_VAR", v) }
-        }
-        if let Some(v) = prev_harnx_env_file {
-            unsafe { std::env::set_var("HARNX_ENV_FILE", v) }
-        }
     }
 }

@@ -1,7 +1,7 @@
 //! compact_session / compaction-agent tests for the config module.
 #![cfg(test)]
 
-use super::test_support::EnvGuard;
+use super::test_support::{env_lock_async, EnvGuard};
 use super::*;
 use crate::client::TestStateGuard;
 use crate::test_utils::{MockClient, MockTurnBuilder};
@@ -142,6 +142,7 @@ async fn test_compact_session_with_compaction_agent_sends_rendered_transcript() 
         )],
     );
     let (mock, _guard) = install_summarizer_mock().await;
+    let _env_lock = env_lock_async().await;
     let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
 
     Config::compact_session(&config).await.unwrap();
@@ -225,6 +226,7 @@ async fn test_compact_session_package_bare_compaction_agent_resolves_within_pack
         )],
     );
     let (mock, _guard) = install_summarizer_mock().await;
+    let _env_lock = env_lock_async().await;
     let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
 
     Config::compact_session(&config).await.unwrap();
@@ -272,6 +274,7 @@ async fn test_compact_session_honors_compaction_keep_recent_turns() {
     }
     let config = with_session(config, turns);
     let (mock, _guard) = install_summarizer_mock().await;
+    let _env_lock = env_lock_async().await;
     let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
 
     Config::compact_session(&config).await.unwrap();

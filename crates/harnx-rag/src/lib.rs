@@ -976,7 +976,7 @@ impl DocumentId {
     }
 }
 
-fn select_embedding_model(models: &[&Model]) -> Result<String> {
+fn select_embedding_model(models: &[Model]) -> Result<String> {
     let models: Vec<_> = models
         .iter()
         .map(|v| SelectOption::new(v.id(), v.description()))

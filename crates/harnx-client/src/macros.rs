@@ -55,28 +55,12 @@ macro_rules! register_client {
 
                 pub fn list_models(local_config: &$config) -> Vec<Model> {
                     let client_name = Self::name(local_config);
-                    let mut models = if local_config.models.is_empty() {
-                        if let Some(v) = $crate::ALL_PROVIDER_MODELS.iter().find(|v| {
-                            v.provider == $name ||
-                                ($name == OpenAICompatibleClient::NAME
-                                    && local_config.name.starts_with(&v.provider))
-                        }) {
-                            Model::from_config(client_name, &v.models)
-                        } else {
-                            vec![]
-                        }
-                    } else {
-                        Model::from_config(client_name, &local_config.models)
-                    };
-                    // Propagate client-level system_prompt_prefix to models
-                    if let Some(ref prefix) = local_config.system_prompt_prefix {
-                        for model in &mut models {
-                            if model.data().system_prompt_prefix.is_none() {
-                                model.data_mut().system_prompt_prefix = Some(prefix.clone());
-                            }
-                        }
-                    }
-                    models
+                    $crate::models_for_client_config(
+                        $name,
+                        client_name,
+                        &local_config.models,
+                        local_config.system_prompt_prefix.as_deref(),
+                    )
                 }
 
                 pub fn name(local_config: &$config) -> &str {
@@ -103,37 +87,36 @@ macro_rules! register_client {
             client_types
         }
 
-        static ALL_CLIENT_NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-
-        pub fn list_client_names(clients: &[ClientConfig]) -> Vec<&'static String> {
-            let names = ALL_CLIENT_NAMES.get_or_init(|| {
-                clients
-                    .iter()
-                    .flat_map(|v| match v {
-                        $(ClientConfig::$config(c) => vec![$client::name(c).to_string()],)+
-                        ClientConfig::Unknown => vec![],
-                    })
-                    .collect()
-            });
-            names.iter().collect()
+        /// Return the effective names from the current client configuration.
+        ///
+        /// The names are recomputed and returned as owned values so configuration
+        /// reloads are reflected immediately.
+        pub fn list_client_names(clients: &[ClientConfig]) -> Vec<String> {
+            clients
+                .iter()
+                .flat_map(|v| match v {
+                    $(ClientConfig::$config(c) => vec![$client::name(c).to_string()],)+
+                    ClientConfig::Unknown => vec![],
+                })
+                .collect()
         }
 
-        static ALL_MODELS: std::sync::OnceLock<Vec<$crate::Model>> = std::sync::OnceLock::new();
-
-        pub fn list_all_models(clients: &[ClientConfig]) -> Vec<&'static $crate::Model> {
-            let models = ALL_MODELS.get_or_init(|| {
-                clients
-                    .iter()
-                    .flat_map(|v| match v {
-                        $(ClientConfig::$config(c) => $client::list_models(c),)+
-                        ClientConfig::Unknown => vec![],
-                    })
-                    .collect()
-            });
-            models.iter().collect()
+        /// Return every model from the current client configuration.
+        ///
+        /// The models are recomputed and returned as owned values so configuration
+        /// reloads are reflected immediately.
+        pub fn list_all_models(clients: &[ClientConfig]) -> Vec<$crate::Model> {
+            clients
+                .iter()
+                .flat_map(|v| match v {
+                    $(ClientConfig::$config(c) => $client::list_models(c),)+
+                    ClientConfig::Unknown => vec![],
+                })
+                .collect()
         }
 
-        pub fn list_models(clients: &[ClientConfig], model_type: $crate::ModelType) -> Vec<&'static $crate::Model> {
+        /// Return owned models of `model_type` from the current client configuration.
+        pub fn list_models(clients: &[ClientConfig], model_type: $crate::ModelType) -> Vec<$crate::Model> {
             list_all_models(clients).into_iter().filter(|v| v.model_type() == model_type).collect()
         }
 

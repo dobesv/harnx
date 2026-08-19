@@ -98,8 +98,22 @@ pub struct LocalWorkerSupervisor {
     owns_lock: bool,
     child: Option<Child>,
     last_confirmed_ready: Option<Instant>,
+    confirmed_config_fingerprint: Option<String>,
+    confirmed_executable_fingerprint: Option<String>,
+    spawned_config_fingerprint: Option<String>,
+    spawned_executable_fingerprint: Option<String>,
     /// Owned workers that exited during the current readiness wait.
     crashes: u32,
+}
+
+struct ExpectedWorkerIdentity {
+    config_fingerprint: String,
+    executable_fingerprint: String,
+}
+
+enum ReadinessStatus {
+    Ready,
+    Pending,
 }
 
 /// Lazily starts or re-checks a front-end's process-lifetime local worker.
@@ -148,6 +162,10 @@ impl LocalWorkerSupervisor {
             owns_lock,
             child: None,
             last_confirmed_ready: None,
+            confirmed_config_fingerprint: None,
+            confirmed_executable_fingerprint: None,
+            spawned_config_fingerprint: None,
+            spawned_executable_fingerprint: None,
             crashes: 0,
         };
         supervisor.ensure(abort_signal).await?;
@@ -158,21 +176,38 @@ impl LocalWorkerSupervisor {
     /// after another front-end releases `worker.lock`. Returns only after a
     /// post-consumer readiness marker is observed.
     pub async fn ensure(&mut self, abort_signal: AbortSignal) -> Result<()> {
+        let expected = self.current_expected_identity().await?;
         if self.owned_child_is_running()? {
-            return Ok(());
+            if self.spawned_config_fingerprint.as_deref() == Some(&expected.config_fingerprint)
+                && self.spawned_executable_fingerprint.as_deref()
+                    == Some(&expected.executable_fingerprint)
+            {
+                return Ok(());
+            }
+            log::info!(
+                "local worker inputs changed: config={} -> {} executable={} -> {}; restarting owned worker",
+                self.spawned_config_fingerprint
+                    .as_deref()
+                    .map(crate::worker_identity::short_fingerprint)
+                    .unwrap_or("unknown"),
+                crate::worker_identity::short_fingerprint(&expected.config_fingerprint),
+                self.spawned_executable_fingerprint
+                    .as_deref()
+                    .map(crate::worker_identity::short_fingerprint)
+                    .unwrap_or("unknown"),
+                crate::worker_identity::short_fingerprint(&expected.executable_fingerprint),
+            );
+            self.stop_owned_worker().await?;
         }
-        if !self.owns_lock
-            && self
-                .last_confirmed_ready
-                .is_some_and(|ready| ready.elapsed() < JOINER_READY_TTL)
-        {
+        if self.recently_confirmed(&expected) {
             return Ok(());
         }
 
         let readiness = self.subscribe_to_readiness().await?;
         self.crashes = 0;
-        self.ensure_worker_ownership()?;
-        self.wait_for_readiness(readiness, abort_signal).await
+        self.ensure_worker_ownership(&expected)?;
+        self.wait_for_readiness(readiness, abort_signal, &expected)
+            .await
     }
 
     async fn subscribe_to_readiness(&self) -> Result<async_nats::Subscriber> {
@@ -192,10 +227,10 @@ impl LocalWorkerSupervisor {
         Ok(readiness)
     }
 
-    fn ensure_worker_ownership(&mut self) -> Result<()> {
+    fn ensure_worker_ownership(&mut self, expected: &ExpectedWorkerIdentity) -> Result<()> {
         if self.owns_lock {
             if !self.owned_child_is_running()? {
-                self.spawn_worker()?;
+                self.spawn_worker(expected)?;
             }
             return Ok(());
         }
@@ -207,7 +242,7 @@ impl LocalWorkerSupervisor {
         .context("retry local worker lock")?;
         if acquired {
             self.owns_lock = true;
-            self.spawn_worker()?;
+            self.spawn_worker(expected)?;
         }
         Ok(())
     }
@@ -224,6 +259,7 @@ impl LocalWorkerSupervisor {
         &mut self,
         mut readiness: async_nats::Subscriber,
         abort_signal: AbortSignal,
+        expected: &ExpectedWorkerIdentity,
     ) -> Result<()> {
         let started = Instant::now();
         let mut poll = READINESS_POLL_INITIAL;
@@ -232,13 +268,9 @@ impl LocalWorkerSupervisor {
             if abort_signal.aborted() {
                 bail!("cancelled while waiting for the local worker to start");
             }
-            match tokio::time::timeout(poll, readiness.next()).await {
-                Ok(Some(_)) => {
-                    self.last_confirmed_ready = Some(Instant::now());
-                    return Ok(());
-                }
-                Ok(None) => bail!("local worker readiness subscription closed"),
-                Err(_) => self.ensure_worker_ownership()?,
+            match self.poll_readiness(&mut readiness, poll, expected).await? {
+                ReadinessStatus::Ready => return Ok(()),
+                ReadinessStatus::Pending => {}
             }
 
             if self.crashes >= MAX_WORKER_CRASHES {
@@ -256,6 +288,93 @@ impl LocalWorkerSupervisor {
             }
             poll = (poll * 2).min(READINESS_POLL_MAX);
         }
+    }
+
+    async fn poll_readiness(
+        &mut self,
+        readiness: &mut async_nats::Subscriber,
+        poll: Duration,
+        expected: &ExpectedWorkerIdentity,
+    ) -> Result<ReadinessStatus> {
+        match tokio::time::timeout(poll, readiness.next()).await {
+            Ok(Some(message)) => self.readiness_status(&message.payload, expected),
+            Ok(None) => bail!("local worker readiness subscription closed"),
+            Err(_) => {
+                self.ensure_worker_ownership(expected)?;
+                Ok(ReadinessStatus::Pending)
+            }
+        }
+    }
+
+    fn readiness_status(
+        &mut self,
+        payload: &[u8],
+        expected: &ExpectedWorkerIdentity,
+    ) -> Result<ReadinessStatus> {
+        match self.accept_readiness(payload, expected) {
+            Ok(()) => Ok(ReadinessStatus::Ready),
+            Err(error) if self.owns_lock => {
+                log::warn!(
+                    "ignoring stale local worker readiness while waiting for the owned worker: {error:#}"
+                );
+                self.ensure_worker_ownership(expected)?;
+                Ok(ReadinessStatus::Pending)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn recently_confirmed(&self, expected: &ExpectedWorkerIdentity) -> bool {
+        if self.owns_lock {
+            return false;
+        }
+        let fresh = self
+            .last_confirmed_ready
+            .is_some_and(|ready| ready.elapsed() < JOINER_READY_TTL);
+        fresh
+            && self.confirmed_config_fingerprint.as_deref() == Some(&expected.config_fingerprint)
+            && self.confirmed_executable_fingerprint.as_deref()
+                == Some(&expected.executable_fingerprint)
+    }
+
+    fn accept_readiness(
+        &mut self,
+        payload: &[u8],
+        expected: &ExpectedWorkerIdentity,
+    ) -> Result<()> {
+        let identity =
+            crate::worker_identity::WorkerIdentity::from_payload(payload).with_context(|| {
+                "active local worker is too old to verify; restart the frontend that owns it"
+            })?;
+        self.validate_worker_identity(&identity, expected)?;
+        log::info!(
+            "local worker ready: worker_id={} pid={} build={} executable={} config={}",
+            identity.worker_id,
+            identity.pid,
+            identity.build,
+            crate::worker_identity::short_fingerprint(&identity.executable_fingerprint),
+            crate::worker_identity::short_fingerprint(&identity.config_fingerprint),
+        );
+        self.last_confirmed_ready = Some(Instant::now());
+        self.confirmed_config_fingerprint = Some(identity.config_fingerprint);
+        self.confirmed_executable_fingerprint = Some(identity.executable_fingerprint);
+        Ok(())
+    }
+
+    fn validate_worker_identity(
+        &self,
+        identity: &crate::worker_identity::WorkerIdentity,
+        expected: &ExpectedWorkerIdentity,
+    ) -> Result<()> {
+        if identity.build != crate::worker_identity::current_build() {
+            return Err(stale_worker_error(identity, expected));
+        }
+        if identity.config_fingerprint != expected.config_fingerprint
+            || identity.executable_fingerprint != expected.executable_fingerprint
+        {
+            return Err(stale_worker_error(identity, expected));
+        }
+        Ok(())
     }
 
     /// Whether this front-end owns `worker.lock` and therefore the subprocess.
@@ -282,13 +401,15 @@ impl LocalWorkerSupervisor {
             Some(status) => {
                 log::warn!("local worker exited with {status}; respawning");
                 self.child = None;
+                self.spawned_config_fingerprint = None;
+                self.spawned_executable_fingerprint = None;
                 self.crashes = self.crashes.saturating_add(1);
                 Ok(false)
             }
         }
     }
 
-    fn spawn_worker(&mut self) -> Result<()> {
+    fn spawn_worker(&mut self, expected: &ExpectedWorkerIdentity) -> Result<()> {
         if self.child.is_some() {
             return Ok(());
         }
@@ -297,6 +418,36 @@ impl LocalWorkerSupervisor {
         self.child = Some(command.spawn().with_context(|| {
             format!("spawn local worker from {}", self.worker_binary.display())
         })?);
+        self.spawned_config_fingerprint = Some(expected.config_fingerprint.clone());
+        self.spawned_executable_fingerprint = Some(expected.executable_fingerprint.clone());
+        Ok(())
+    }
+
+    async fn current_expected_identity(&self) -> Result<ExpectedWorkerIdentity> {
+        let worker_binary = self.worker_binary.clone();
+        tokio::task::spawn_blocking(move || {
+            Ok(ExpectedWorkerIdentity {
+                config_fingerprint: crate::worker_identity::config_fingerprint()?,
+                executable_fingerprint: crate::worker_identity::executable_fingerprint(
+                    &worker_binary,
+                )?,
+            })
+        })
+        .await
+        .context("join expected local worker identity fingerprint task")?
+    }
+
+    async fn stop_owned_worker(&mut self) -> Result<()> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        signal_worker_tree(&mut child);
+        child.wait().await.context("wait for stale local worker")?;
+        self.last_confirmed_ready = None;
+        self.confirmed_config_fingerprint = None;
+        self.confirmed_executable_fingerprint = None;
+        self.spawned_config_fingerprint = None;
+        self.spawned_executable_fingerprint = None;
         Ok(())
     }
 }
@@ -337,15 +488,7 @@ impl Drop for LocalWorkerSupervisor {
         let Some(mut child) = self.child.take() else {
             return;
         };
-        #[cfg(unix)]
-        if let Some(pid) = child.id() {
-            // Negative PID addresses the worker's dedicated process group.
-            // SAFETY: kill is async-signal-safe and the PID came from Child.
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
-            }
-        }
-        let _ = child.start_kill();
+        signal_worker_tree(&mut child);
 
         // Keep the lock descriptor alive until the child is reaped. This prevents
         // another front-end from spawning a replacement while shutdown is still
@@ -364,6 +507,34 @@ impl Drop for LocalWorkerSupervisor {
                 }
             });
     }
+}
+
+fn signal_worker_tree(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // Negative PID addresses the worker's dedicated process group.
+        // SAFETY: kill is async-signal-safe and the PID came from Child.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
+        }
+    }
+    let _ = child.start_kill();
+}
+
+fn stale_worker_error(
+    identity: &crate::worker_identity::WorkerIdentity,
+    expected: &ExpectedWorkerIdentity,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "active local worker is stale: pid={} build={} executable={} config={}; current frontend expects build={} executable={} config={}. Restart the frontend that owns the local worker and retry",
+        identity.pid,
+        identity.build,
+        crate::worker_identity::short_fingerprint(&identity.executable_fingerprint),
+        crate::worker_identity::short_fingerprint(&identity.config_fingerprint),
+        crate::worker_identity::current_build(),
+        crate::worker_identity::short_fingerprint(&expected.executable_fingerprint),
+        crate::worker_identity::short_fingerprint(&expected.config_fingerprint),
+    )
 }
 
 /// Tell the user the worker is still coming up, on the same channel as other

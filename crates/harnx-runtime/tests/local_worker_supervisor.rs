@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 struct EnvGuard {
     key: &'static str,
@@ -230,14 +231,111 @@ async fn wait_for_process_exit(pid: u32) {
     );
 }
 
+async fn assert_stale_joiner_is_rejected(binary: &Path) {
+    let stale_error = match tokio::time::timeout(
+        Duration::from_secs(10),
+        LocalWorkerSupervisor::start_with_worker_binary(binary, create_abort_signal()),
+    )
+    .await
+    .expect("stale joiner readiness timeout")
+    {
+        Ok(_) => panic!("a joiner must reject a worker with stale config"),
+        Err(error) => error,
+    };
+    assert!(
+        stale_error
+            .to_string()
+            .contains("active local worker is stale"),
+        "unexpected stale-worker error: {stale_error:#}"
+    );
+}
+
+async fn update_config_and_restart_owner(
+    root: &Path,
+    binary: &Path,
+    owner: &mut LocalWorkerSupervisor,
+    old_pid: u32,
+) -> u32 {
+    std::fs::write(
+        root.join("config/config.yaml"),
+        "save: false\nstream: false\nclient: mock\nmodel: mock:test\n# changed\n",
+    )
+    .expect("update local config");
+    assert_stale_joiner_is_rejected(binary).await;
+    let (stale_stop, stale_publisher) = spawn_stale_readiness_heartbeat(owner).await;
+    let restart_result =
+        tokio::time::timeout(Duration::from_secs(15), owner.ensure(create_abort_signal())).await;
+    stale_stop.cancel();
+    stale_publisher
+        .await
+        .expect("join stale readiness publisher");
+    restart_result
+        .expect("owner restart timeout while stale readiness is published")
+        .expect("restart worker after config change");
+    let reloaded_pid = owner.worker_pid().expect("reloaded worker PID");
+    assert_ne!(reloaded_pid, old_pid);
+    assert!(process_exists(reloaded_pid));
+    reloaded_pid
+}
+
+async fn spawn_stale_readiness_heartbeat(
+    owner: &LocalWorkerSupervisor,
+) -> (CancellationToken, tokio::task::JoinHandle<()>) {
+    let client = async_nats::ConnectOptions::new()
+        .token(owner.server().token.clone())
+        .connect(&owner.server().url)
+        .await
+        .expect("connect stale readiness publisher");
+    let subject = worker_ready_subject(LOCAL_CLUSTER_KEY);
+    let stop = CancellationToken::new();
+    let task_stop = stop.clone();
+    let task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(50));
+        loop {
+            tokio::select! {
+                () = task_stop.cancelled() => break,
+                _ = interval.tick() => {
+                    client
+                        .publish(subject.clone(), "stale readiness".into())
+                        .await
+                        .expect("publish stale readiness marker");
+                    client.flush().await.expect("flush stale readiness marker");
+                }
+            }
+        }
+    });
+    (stop, task)
+}
+
+async fn update_executable_and_restart_owner(
+    binary: &Path,
+    owner: &mut LocalWorkerSupervisor,
+    old_pid: u32,
+) -> u32 {
+    let rebuilt = binary.with_extension("rebuilt");
+    std::fs::copy(binary, &rebuilt).expect("copy rebuilt worker fixture");
+    std::fs::rename(rebuilt, binary).expect("atomically replace worker binary fixture");
+    assert_stale_joiner_is_rejected(binary).await;
+    owner
+        .ensure(create_abort_signal())
+        .await
+        .expect("restart worker after executable change");
+    let reloaded_pid = owner.worker_pid().expect("rebuilt worker PID");
+    assert_ne!(reloaded_pid, old_pid);
+    assert!(process_exists(reloaded_pid));
+    reloaded_pid
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_worker_supervisor_deduplicates_respawns_and_tears_down() {
     require_nextest();
-    let Some(binary) = skip_without_binaries() else {
+    let Some(installed_binary) = skip_without_binaries() else {
         return;
     };
     let root = tempfile::tempdir().expect("create isolated supervisor environment");
+    let binary = root.path().join("harnx-worker");
+    std::fs::copy(installed_binary, &binary).expect("copy worker binary fixture");
     let _environment = isolated_environment(root.path());
     let (api_base, mock_task) = start_mock_openai().await;
     write_trivial_agent_config(root.path(), &api_base);
@@ -267,7 +365,13 @@ async fn local_worker_supervisor_deduplicates_respawns_and_tears_down() {
 
     assert_worker_completes_turn(&owner, mock_task).await;
 
-    kill_process(first_pid);
+    let executable_reloaded_pid =
+        update_executable_and_restart_owner(&binary, &mut owner, first_pid).await;
+    let config_reloaded_pid =
+        update_config_and_restart_owner(root.path(), &binary, &mut owner, executable_reloaded_pid)
+            .await;
+
+    kill_process(config_reloaded_pid);
     let deadline = Instant::now() + Duration::from_secs(5);
     let replacement_pid = loop {
         owner
@@ -275,7 +379,7 @@ async fn local_worker_supervisor_deduplicates_respawns_and_tears_down() {
             .await
             .expect("respawn killed local worker");
         let pid = owner.worker_pid().expect("replacement worker PID");
-        if pid != first_pid {
+        if pid != config_reloaded_pid {
             break pid;
         }
         assert!(Instant::now() < deadline, "worker was not respawned");

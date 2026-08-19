@@ -15,6 +15,10 @@
 [test-groups]
 # Terminal-driving e2e tests contend for the same CPU/process-spawn resources.
 heavy-e2e = { max-threads = 1 }
+# Broker-backed tests each launch a NATS process and several async runtimes.
+# Bound their aggregate process/thread load so one test's broker is not starved
+# or killed when the workspace suite fans out on high-core-count runners.
+broker-e2e = { max-threads = 8 }
 
 [profile.default]
 retries = 0
@@ -22,6 +26,10 @@ retries = 0
 [[profile.default.overrides]]
 filter = 'binary(tmux_e2e) | binary(interrupt_e2e)'
 test-group = 'heavy-e2e'
+
+[[profile.default.overrides]]
+filter = 'binary(/nats/) | binary(local_worker_supervisor) | test(/nats/)'
+test-group = 'broker-e2e'
 
 [profile.ci]
 # Retry transient (timing/load-induced) flakes. A real failure fails all attempts.
@@ -37,3 +45,7 @@ final-status-level = "flaky"
 [[profile.ci.overrides]]
 filter = 'binary(tmux_e2e) | binary(interrupt_e2e)'
 test-group = 'heavy-e2e'
+
+[[profile.ci.overrides]]
+filter = 'binary(/nats/) | binary(local_worker_supervisor) | test(/nats/)'
+test-group = 'broker-e2e'
