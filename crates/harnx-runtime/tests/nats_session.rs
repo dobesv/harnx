@@ -13,7 +13,7 @@ use harnx_runtime::{
     nats_event_sink::{events_subject, AdvisoryEnvelope},
     nats_session_log::NatsSessionLog,
     nats_worker::ControlCommand,
-    send_control_command, ThinClientConfig, ThinClientSession,
+    send_control_command, NatsSession, NatsSessionConfig,
 };
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
@@ -45,8 +45,8 @@ async fn seed_prior_completed_turn(log: &NatsSessionLog) -> Result<u64> {
     Ok(prior_assistant_seq)
 }
 
-fn resumed_session_config(session_id: String) -> ThinClientConfig {
-    ThinClientConfig {
+fn resumed_session_config(session_id: String) -> NatsSessionConfig {
+    NatsSessionConfig {
         cluster: "test".to_string(),
         agent: "test-agent".to_string(),
         session_id: Some(session_id),
@@ -121,7 +121,7 @@ impl AgentEventSink for NoopEventSink {
 
 /// Test that control commands are sent correctly
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn thin_client_sends_control_commands() -> Result<()> {
+async fn nats_session_sends_control_commands() -> Result<()> {
     require_nextest();
     let Some(server) = spawn_nats_server().await? else {
         eprintln!("skipping: nats-server not available");
@@ -153,7 +153,7 @@ async fn thin_client_sends_control_commands() -> Result<()> {
 
 /// Test that user messages are stamped with a client-generated ID.
 ///
-/// This test directly appends a user message (mimicking ThinClientSession's append path)
+/// This test directly appends a user message (mimicking NatsSession's append path)
 /// and verifies the ID field is set to a valid UUID. Does NOT call run_turn because
 /// there's no worker to pick up the activation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -190,17 +190,17 @@ async fn user_message_has_client_id() -> Result<()> {
     };
     log.append_event_async(&header).await?;
 
-    // Create a thin client session (mirrors retract test pattern)
-    let config = ThinClientConfig {
+    // Create a NATS session (mirrors retract test pattern)
+    let config = NatsSessionConfig {
         cluster: "test".to_string(),
         agent: "test-agent".to_string(),
         session_id: Some(session_id.clone()),
     };
     let abort_signal = harnx_runtime::utils::create_abort_signal();
 
-    let _session = ThinClientSession::new(config, client, jetstream, abort_signal).await?;
+    let _session = NatsSession::new(config, client, jetstream, abort_signal).await?;
 
-    // Append a user message directly (same pattern as in ThinClientSession::run_turn)
+    // Append a user message directly (same pattern as in NatsSession::run_turn)
     let user_msg_id = uuid::Uuid::new_v4().to_string();
     let user_entry = SessionLogEntry::Message {
         id: Some(user_msg_id.clone()),
@@ -274,7 +274,7 @@ async fn retract_queued_user_message() -> Result<()> {
     };
     let _header_seq = log.append_event_async(&header).await?;
 
-    // Append a user message directly (simulating what ThinClientSession does)
+    // Append a user message directly (simulating what NatsSession does)
     let user_msg_id = uuid::Uuid::new_v4().to_string();
     let user_entry = SessionLogEntry::Message {
         id: Some(user_msg_id.clone()),
@@ -293,15 +293,15 @@ async fn retract_queued_user_message() -> Result<()> {
         "User message should exist before retract"
     );
 
-    // Create ThinClientSession and retract the message
-    let config = ThinClientConfig {
+    // Create NatsSession and retract the message
+    let config = NatsSessionConfig {
         cluster: "test".to_string(),
         agent: "test-agent".to_string(),
         session_id: Some(session_id.clone()),
     };
     let abort_signal = harnx_runtime::utils::create_abort_signal();
 
-    let session = ThinClientSession::new(config, client, jetstream.clone(), abort_signal).await?;
+    let session = NatsSession::new(config, client, jetstream.clone(), abort_signal).await?;
 
     // Retract the message
     let edit_seq = session.retract_user_message(user_msg_seq).await?;
@@ -413,13 +413,13 @@ async fn edit_queued_user_message_replaces_text_in_reconstructed_state() -> Resu
     };
     let user_msg_seq = log.append_event_async(&original_entry).await?;
 
-    let config = ThinClientConfig {
+    let config = NatsSessionConfig {
         cluster: "test".to_string(),
         agent: "test-agent".to_string(),
         session_id: Some(session_id.clone()),
     };
     let abort_signal = harnx_runtime::utils::create_abort_signal();
-    let session = ThinClientSession::new(config, client, jetstream.clone(), abort_signal).await?;
+    let session = NatsSession::new(config, client, jetstream.clone(), abort_signal).await?;
 
     let edit_seq = session
         .edit_user_message(user_msg_seq, "edited text".to_string())
@@ -504,7 +504,7 @@ async fn resumed_session_run_turn_ignores_stale_prior_reply_and_returns_new_repl
     let prior_assistant_seq = seed_prior_completed_turn(&log).await?;
 
     let abort_signal = harnx_runtime::utils::create_abort_signal();
-    let session = ThinClientSession::new(
+    let session = NatsSession::new(
         resumed_session_config(session_id.clone()),
         client.clone(),
         jetstream.clone(),

@@ -24,7 +24,7 @@ use harnx_runtime::{
         NatsSessionLogBackend, RunAgentLoopArgs, SessionActivate, WorkerDaemonConfig,
     },
     utils::create_abort_signal,
-    ControlCommand, ThinClientConfig, ThinClientSession,
+    ControlCommand, NatsSession, NatsSessionConfig,
 };
 use std::sync::LazyLock;
 
@@ -1875,7 +1875,7 @@ async fn load_events_latest_async_empty_stream_returns_empty() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn thin_client_abort_signal_cancels_blocked_worker_and_persists_tombstone() -> Result<()> {
+async fn abort_signal_cancels_blocked_worker_and_persists_tombstone() -> Result<()> {
     let Some(server) = require_nats_server().await? else {
         return Ok(());
     };
@@ -1885,17 +1885,17 @@ async fn thin_client_abort_signal_cancels_blocked_worker_and_persists_tombstone(
     let config = local_nats_runtime_config(server.url());
     let daemon = spawn_worker_daemon_with_call_fn(
         config,
-        "worker-thin-client-cancel",
+        "worker-abort-cancel",
         abort_blocked_call_fn(Arc::clone(&entered), Arc::clone(&saw_abort)),
     )
     .await;
 
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client.clone());
-    let session_id = "thin-client-abort-cancel";
+    let session_id = "abort-cancel";
     let abort = create_abort_signal();
-    let thin = ThinClientSession::new(
-        ThinClientConfig {
+    let session = NatsSession::new(
+        NatsSessionConfig {
             cluster: "local".to_string(),
             agent: "ignored-agent".to_string(),
             session_id: Some(session_id.to_string()),
@@ -1907,7 +1907,8 @@ async fn thin_client_abort_signal_cancels_blocked_worker_and_persists_tombstone(
     .await?;
 
     let run_turn = tokio::spawn(async move {
-        thin.run_turn("block until cancelled", Arc::new(NullSink), None)
+        session
+            .run_turn("block until cancelled", Arc::new(NullSink), None)
             .await
     });
     tokio::time::timeout(CI_SAFE_TIMEOUT, entered.notified()).await?;
@@ -1916,7 +1917,7 @@ async fn thin_client_abort_signal_cancels_blocked_worker_and_persists_tombstone(
     let result = tokio::time::timeout(CI_SAFE_TIMEOUT, run_turn).await???;
     assert!(
         result.was_cancelled,
-        "thin-client turn should report cancellation"
+        "NATS session turn should report cancellation"
     );
 
     let log = NatsSessionLog::new(jetstream, session_id);

@@ -13,7 +13,7 @@ use harnx_runtime::local_orchestrator::{local_worker_lock_file, LocalWorkerSuper
 use harnx_runtime::nats_session_log::NatsSessionLog;
 use harnx_runtime::nats_worker::worker_ready_subject;
 use harnx_runtime::utils::create_abort_signal;
-use harnx_runtime::{ThinClientConfig, ThinClientSession};
+use harnx_runtime::{NatsSession, NatsSessionConfig};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -153,7 +153,7 @@ async fn assert_worker_completes_turn(
         .token(supervisor.server().token.clone())
         .connect(&supervisor.server().url)
         .await
-        .expect("connect thin client");
+        .expect("connect to NATS");
     let jetstream = async_nats::jetstream::new(client.clone());
     let session_id = format!("local-supervisor-{}", uuid::Uuid::new_v4());
     let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
@@ -177,8 +177,8 @@ async fn assert_worker_completes_turn(
     .await
     .expect("seed local session header");
 
-    let session = ThinClientSession::new(
-        ThinClientConfig {
+    let session = NatsSession::new(
+        NatsSessionConfig {
             cluster: LOCAL_CLUSTER_KEY.to_string(),
             agent: "trivial".to_string(),
             session_id: Some(session_id),
@@ -188,7 +188,7 @@ async fn assert_worker_completes_turn(
         harnx_runtime::utils::create_abort_signal(),
     )
     .await
-    .expect("create local thin client");
+    .expect("create local NATS session");
     let result = tokio::time::timeout(
         Duration::from_secs(15),
         session.run_turn("hello", Arc::new(NullSink), None),

@@ -607,9 +607,9 @@ async fn use_agent_routes_remote_refs_to_nats_cluster_validation() {
         .await
         .expect_err("remote ref with an unknown cluster must fail cluster validation");
 
-    // Remote refs are no longer stubbed out — they route into NATS thin-client
-    // mode, which first validates the cluster. With no nats_servers/prod.yaml
-    // the activation fails on cluster lookup, proving the remote path is wired.
+    // Remote refs are no longer stubbed out — activation validates the cluster
+    // first. With no nats_servers/prod.yaml the activation fails on cluster
+    // lookup, proving the path is wired.
     let msg = err.to_string();
     assert!(
         msg.contains("prod") && msg.contains("nats_servers/prod.yaml"),

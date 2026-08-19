@@ -603,8 +603,8 @@ async fn start_directive(
         .context("failed to ensure local NATS worker")?;
     }
 
-    let session = harnx_runtime::ThinClientSession::from_global_config(
-        harnx_runtime::ThinClientConfig {
+    let session = harnx_runtime::NatsSession::from_global_config(
+        harnx_runtime::NatsSessionConfig {
             cluster,
             agent,
             session_id,
@@ -613,7 +613,7 @@ async fn start_directive(
         abort_signal,
     )
     .await
-    .context("failed to create thin-client session")?;
+    .context("failed to create NATS session")?;
     let sink = harnx_core::sink::current_agent_event_sink()
         .context("CLI agent event sink is not installed")?;
     let tracking_sink = Arc::new(oneshot_nats::AssistantTextTrackingSink::new(sink));
@@ -634,7 +634,7 @@ async fn start_directive(
 fn finish_one_shot_output(
     final_only: bool,
     tracking_sink: &oneshot_nats::AssistantTextTrackingSink,
-    result: harnx_runtime::ThinClientTurnResult,
+    result: harnx_runtime::NatsTurnResult,
 ) {
     if final_only {
         print_final_response(&result);
@@ -643,7 +643,7 @@ fn finish_one_shot_output(
     }
 }
 
-fn print_final_response(result: &harnx_runtime::ThinClientTurnResult) {
+fn print_final_response(result: &harnx_runtime::NatsTurnResult) {
     if result.was_cancelled || result.error.is_some() {
         return;
     }

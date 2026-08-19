@@ -1516,11 +1516,10 @@ impl Tui {
             let result: Result<()> = if cluster == harnx_runtime::config::LOCAL_CLUSTER_KEY {
                 Self::run_test_prompt_task(msg, ctx).await
             } else {
-                Self::run_thin_client_prompt_task(msg, ctx, agent, cluster).await
+                Self::run_nats_prompt_task(msg, ctx, agent, cluster).await
             };
             #[cfg(not(test))]
-            let result: Result<()> =
-                Self::run_thin_client_prompt_task(msg, ctx, agent, cluster).await;
+            let result: Result<()> = Self::run_nats_prompt_task(msg, ctx, agent, cluster).await;
 
             let error = match result {
                 Err(_) if new_abort.aborted() => None,

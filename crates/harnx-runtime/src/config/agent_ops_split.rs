@@ -222,7 +222,7 @@ impl Config {
         }
     }
 
-    /// Activate a remote agent for the frontend's next NATS thin-client turn.
+    /// Activate an agent for the frontend's next turn.
     async fn use_remote_agent(params: UseRemoteAgentParams<'_>) -> Result<()> {
         let UseRemoteAgentParams {
             config,
@@ -241,7 +241,7 @@ impl Config {
         }
 
         // Store remote agent metadata in config for use during prompt processing
-        // The actual ThinClientSession is created when the user sends a prompt
+        // The actual NatsSession is created when the user sends a prompt
         config
             .write()
             .set_remote_agent(agent.to_string(), cluster.to_string());

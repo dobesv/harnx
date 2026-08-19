@@ -106,7 +106,7 @@ async fn start_serve_smoke_openai() -> ServeSmokeOpenAi {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn serve_thin_client_replays_prompt_queued_during_active_run() {
+async fn serve_replays_prompt_queued_during_active_run() {
     harnx_core::require_nextest();
     let Some(binary) = live_worker_binary() else {
         return;
@@ -150,7 +150,7 @@ async fn serve_thin_client_replays_prompt_queued_during_active_run() {
     let _ = mock.release_first.send(());
     let second_request = tokio::time::timeout(Duration::from_secs(15), mock.second_request)
         .await
-        .expect("queued thin-client turn did not reach worker")
+        .expect("queued NATS session turn did not reach worker")
         .expect("second mock request notifier dropped");
     assert!(
         String::from_utf8_lossy(&second_request).contains("queued follow-up"),

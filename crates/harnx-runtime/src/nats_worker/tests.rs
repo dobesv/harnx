@@ -11,7 +11,7 @@ use crate::nats_session_index::{
 use crate::nats_session_log::NatsSessionLog;
 use crate::nats_worker::agent_loop::{tool_can_rerun, write_header_and_load_session};
 use crate::nats_worker::run_worker_daemon;
-use crate::ThinClientSession;
+use crate::NatsSession;
 use anyhow::{bail, Context};
 use futures_util::StreamExt;
 use harnx_core::agent_config::AgentConfig;
@@ -384,30 +384,30 @@ pub(super) async fn run_remote_round_trip_with_session_id_and_sink(
     parent_config.session = Some(parent_session);
     let parent_global_config = Arc::new(parking_lot::RwLock::new(parent_config));
     let abort_signal = harnx_core::abort::create_abort_signal();
-    let thin_cfg = crate::ThinClientConfig {
+    let session_cfg = crate::NatsSessionConfig {
         cluster: cluster.to_string(),
         agent: "metis".to_string(),
         session_id: Some(session_id),
     };
-    let thin =
-        crate::ThinClientSession::from_global_config(thin_cfg, &parent_global_config, abort_signal)
+    let session =
+        crate::NatsSession::from_global_config(session_cfg, &parent_global_config, abort_signal)
             .await?;
 
     const REMOTE_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(60);
     let turn_result = tokio::time::timeout(
         REMOTE_ROUND_TRIP_TIMEOUT,
-        thin.run_turn("delegate over nats", sink, None),
+        session.run_turn("delegate over nats", sink, None),
     )
     .await
     .with_context(|| {
         format!(
-            "thin client run_turn timed out after {}s in remote NATS round-trip test",
+            "run_turn timed out after {}s in remote NATS round-trip test",
             REMOTE_ROUND_TRIP_TIMEOUT.as_secs()
         )
     })??;
     let reply = turn_result.response.with_context(|| {
         format!(
-            "thin client turn must return final assistant response (error={:?}, cancelled={}, user_seq={})",
+            "NATS session turn must return final assistant response (error={:?}, cancelled={}, user_seq={})",
             turn_result.error, turn_result.was_cancelled, turn_result.user_msg_seq
         )
     })?;
@@ -865,24 +865,24 @@ async fn run_remote_turn_returning_reply(
     parent_config.session = Some(parent_session);
     let parent_global_config = Arc::new(parking_lot::RwLock::new(parent_config));
     let abort_signal = harnx_core::abort::create_abort_signal();
-    let thin_cfg = crate::ThinClientConfig {
+    let session_cfg = crate::NatsSessionConfig {
         cluster: "local".to_string(),
         agent: "metis".to_string(),
         session_id: Some(session_id),
     };
-    let thin =
-        crate::ThinClientSession::from_global_config(thin_cfg, &parent_global_config, abort_signal)
+    let session =
+        crate::NatsSession::from_global_config(session_cfg, &parent_global_config, abort_signal)
             .await?;
 
     let turn_result = tokio::time::timeout(
         Duration::from_secs(10),
-        thin.run_turn(prompt, Arc::new(NoopEventSink), None),
+        session.run_turn(prompt, Arc::new(NoopEventSink), None),
     )
     .await
-    .context("thin client run_turn timed out after 10s in remote NATS round-trip test")??;
+    .context("run_turn timed out after 10s in remote NATS round-trip test")??;
     turn_result
         .response
-        .context("thin client turn must return final assistant response")
+        .context("NATS session turn must return final assistant response")
 }
 
 fn leading_user_texts(entries: &[(u64, SessionLogEntry)]) -> Vec<String> {
@@ -998,7 +998,7 @@ async fn remote_headerless_session_inserts_header_on_first_activation() {
     let session_id = crate::nats_worker::new_remote_session_id();
     run_remote_round_trip_with_session_id(seeded.parent_config, session_id.clone())
         .await
-        .expect("run realistic headerless thin-client session");
+        .expect("run realistic headerless NATS session");
 
     let log_client = async_nats::connect(&url)
         .await
@@ -1036,7 +1036,7 @@ async fn remote_multi_turn_after_header_insert_preserves_input_derivation() {
             prompt,
         )
         .await
-        .expect("run remote thin-client turn");
+        .expect("run remote NATS session turn");
         assert_eq!(
             reply,
             format!("stub remote reply over nats: {prompt}"),
@@ -1340,13 +1340,13 @@ async fn remote_replay_and_live_rows_emit_logical_seq_assignments() {
     // emits no LogSeqAssigned (exactly like a LOCAL session, whose header is
     // document 0 and whose first USER message is log_seq 1). The numberable
     // rows therefore carry logical seqs [1, 2, 3]: replayed migrated legacy
-    // user, live thin-client user, then live worker assistant. This is the
+    // user, live client user, then live worker assistant. This is the
     // local==remote numbering parity that makes resumed/live remote rows
     // targetable for edit/delete/rewind.
     assert_eq!(
         replayed_seqs,
         vec![1, 2, 3],
-        "sink should number the migrated legacy user, live thin-client user, and live worker assistant rows (Header at logical 0 renders no row, matching local numbering)"
+        "sink should number the migrated legacy user, live client user, and live worker assistant rows (Header at logical 0 renders no row, matching local numbering)"
     );
     assert_eq!(
         replayed_seqs
@@ -1411,18 +1411,19 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
     parent_config.session = Some(parent_session);
     let parent_global_config = Arc::new(parking_lot::RwLock::new(parent_config));
     let abort_signal = harnx_core::abort::create_abort_signal();
-    let thin_cfg = crate::ThinClientConfig {
+    let session_cfg = crate::NatsSessionConfig {
         cluster: "local".to_string(),
         agent: "metis".to_string(),
         session_id: Some(session_id.clone()),
     };
-    let thin =
-        crate::ThinClientSession::from_global_config(thin_cfg, &parent_global_config, abort_signal)
+    let session =
+        crate::NatsSession::from_global_config(session_cfg, &parent_global_config, abort_signal)
             .await
-            .expect("build thin client session");
+            .expect("build NATS session");
 
     let run_turn = tokio::spawn(async move {
-        thin.run_turn("delegate over nats", Arc::new(NoopEventSink), None)
+        session
+            .run_turn("delegate over nats", Arc::new(NoopEventSink), None)
             .await
     });
 
@@ -2207,8 +2208,8 @@ async fn nested_subagent_prompt_returns_final_message_over_nats() {
         .await
         .expect("subscribe to session events");
     client.flush().await.expect("flush event subscription");
-    let thin = ThinClientSession::new(
-        crate::ThinClientConfig {
+    let session = NatsSession::new(
+        crate::NatsSessionConfig {
             cluster: "local".to_string(),
             agent: "metis".to_string(),
             session_id: Some(parent_session_id.clone()),
@@ -2218,10 +2219,10 @@ async fn nested_subagent_prompt_returns_final_message_over_nats() {
         harnx_core::abort::create_abort_signal(),
     )
     .await
-    .expect("create parent thin-client session");
+    .expect("create parent NATS session");
     let parent_result = tokio::time::timeout(
         Duration::from_secs(15),
-        thin.run_turn(
+        session.run_turn(
             "delegate this request through the nested tool",
             Arc::new(NoopEventSink),
             None,
@@ -2321,7 +2322,7 @@ async fn remote_agent_tool_family_and_nats_call_and_return_round_trip() {
 async fn remote_session_activation_writes_session_index_record() {
     let _env_guard = env_lock().await;
     // Use an ISOLATED, self-provisioned NATS server (not the shared
-    // HARNX_NATS_TEST_URL) so the thin-client `run_turn` isn't slowed by
+    // HARNX_NATS_TEST_URL) so `run_turn` isn't slowed by
     // accumulated JetStream state on a shared server — that staleness made this
     // test hit its 10s turn timeout intermittently.
     let Some((server_url, mut child, _store_dir)) = spawn_test_nats().await else {
@@ -2345,7 +2346,7 @@ async fn remote_session_activation_writes_session_index_record() {
         .expect("ensure session index bucket");
 
     let daemon = spawn_metis_worker(&server_url);
-    // Use the expected_session_id in the thin client config
+    // Use the expected_session_id in the NATS session config
     let round_trip =
         run_remote_round_trip_with_session_id(seeded.parent_config, expected_session_id.clone())
             .await;
@@ -2904,8 +2905,8 @@ async fn remote_delete_refreshes_after_concurrent_mutation() {
     let abort = harnx_core::abort::create_abort_signal();
 
     let stale_state = load_remote_session_for_render(
-        &ThinClientSession::from_global_config(
-            crate::ThinClientConfig {
+        &NatsSession::from_global_config(
+            crate::NatsSessionConfig {
                 cluster: "local".to_string(),
                 agent: "metis".to_string(),
                 session_id: Some(session_id.clone()),
@@ -2914,7 +2915,7 @@ async fn remote_delete_refreshes_after_concurrent_mutation() {
             abort.clone(),
         )
         .await
-        .expect("load thin session"),
+        .expect("load session"),
     )
     .await
     .expect("capture stale state");
@@ -3003,8 +3004,8 @@ async fn remote_edit_preserves_header_in_migrated_session() {
         .await
         .expect("edit older user message");
 
-    let thin = ThinClientSession::from_global_config(
-        crate::ThinClientConfig {
+    let session = NatsSession::from_global_config(
+        crate::NatsSessionConfig {
             cluster: "local".to_string(),
             agent: "metis".to_string(),
             session_id: Some(session_id.clone()),
@@ -3013,8 +3014,8 @@ async fn remote_edit_preserves_header_in_migrated_session() {
         abort,
     )
     .await
-    .expect("load thin session");
-    let state = load_remote_session_for_render(&thin)
+    .expect("load session");
+    let state = load_remote_session_for_render(&session)
         .await
         .expect("load remote render state");
 
@@ -3090,8 +3091,8 @@ async fn remote_delete_after_older_edit_deletes_exact_late_range() {
         .await
         .expect("delete later logical range");
 
-    let thin = ThinClientSession::from_global_config(
-        crate::ThinClientConfig {
+    let session = NatsSession::from_global_config(
+        crate::NatsSessionConfig {
             cluster: "local".to_string(),
             agent: "metis".to_string(),
             session_id: Some(session_id.clone()),
@@ -3100,8 +3101,8 @@ async fn remote_delete_after_older_edit_deletes_exact_late_range() {
         abort,
     )
     .await
-    .expect("load thin session");
-    let state = load_remote_session_for_render(&thin)
+    .expect("load session");
+    let state = load_remote_session_for_render(&session)
         .await
         .expect("load remote render state");
     // Assert header survives the edit (key coverage for shared-seq bug fix)
@@ -3176,8 +3177,8 @@ async fn remote_rewind_after_older_edit_preserves_correct_logical_prefix() {
         .await
         .expect("rewind logical suffix");
 
-    let thin = ThinClientSession::from_global_config(
-        crate::ThinClientConfig {
+    let session = NatsSession::from_global_config(
+        crate::NatsSessionConfig {
             cluster: "local".to_string(),
             agent: "metis".to_string(),
             session_id: Some(session_id.clone()),
@@ -3186,8 +3187,8 @@ async fn remote_rewind_after_older_edit_preserves_correct_logical_prefix() {
         abort,
     )
     .await
-    .expect("load thin session");
-    let state = load_remote_session_for_render(&thin)
+    .expect("load session");
+    let state = load_remote_session_for_render(&session)
         .await
         .expect("load remote render state");
     // Assert header survives the edit (key coverage for shared-seq bug fix)
@@ -3262,8 +3263,8 @@ async fn remote_delete_command_routes_to_exact_set_mutations() {
         .await
         .expect("remote delete command succeeds");
 
-    let thin = ThinClientSession::from_global_config(
-        crate::ThinClientConfig {
+    let session = NatsSession::from_global_config(
+        crate::NatsSessionConfig {
             cluster: "local".to_string(),
             agent: "metis".to_string(),
             session_id: Some(session_id.clone()),
@@ -3272,8 +3273,8 @@ async fn remote_delete_command_routes_to_exact_set_mutations() {
         abort.clone(),
     )
     .await
-    .expect("load thin session");
-    let state = load_remote_session_for_render(&thin)
+    .expect("load session");
+    let state = load_remote_session_for_render(&session)
         .await
         .expect("load remote render state");
     // Assert header survives the edit (key coverage for shared-seq bug fix)
@@ -3388,8 +3389,8 @@ async fn remote_rewind_command_routes_to_exact_suffix_deletions() {
         .await
         .expect("remote rewind command succeeds");
 
-    let thin = ThinClientSession::from_global_config(
-        crate::ThinClientConfig {
+    let session = NatsSession::from_global_config(
+        crate::NatsSessionConfig {
             cluster: "local".to_string(),
             agent: "metis".to_string(),
             session_id: Some(session_id.clone()),
@@ -3398,8 +3399,8 @@ async fn remote_rewind_command_routes_to_exact_suffix_deletions() {
         abort.clone(),
     )
     .await
-    .expect("load thin session");
-    let state = load_remote_session_for_render(&thin)
+    .expect("load session");
+    let state = load_remote_session_for_render(&session)
         .await
         .expect("load remote render state");
     // Assert header survives the edit (key coverage for shared-seq bug fix)
@@ -3500,7 +3501,7 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
     let session_id = crate::nats_worker::new_remote_session_id();
 
     // Seed two leading user messages directly to the durable log BEFORE the
-    // worker activates, mirroring a thin client that appended several prompts
+    // worker activates, mirroring a client that appended several prompts
     // before the first worker turn.
     let jetstream = seeded
         .parent_config
@@ -3536,8 +3537,8 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
         .expect("activate remote session id");
     let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
-    let thin = ThinClientSession::from_global_config(
-        crate::ThinClientConfig {
+    let session = NatsSession::from_global_config(
+        crate::NatsSessionConfig {
             cluster: "local".to_string(),
             agent: "metis".to_string(),
             session_id: Some(session_id.clone()),
@@ -3546,9 +3547,9 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
         abort,
     )
     .await
-    .expect("load thin session");
+    .expect("load session");
 
-    let transcript = load_remote_transcript_for_render(&thin)
+    let transcript = load_remote_transcript_for_render(&session)
         .await
         .expect("load transcript state");
 

@@ -1,7 +1,7 @@
 //! NATS toolset for nested sub-agent sessions.
 
 use super::{publish_control_command, ControlCommand};
-use crate::nats_client_session::{ThinClientConfig, ThinClientSession, ThinClientTurnResult};
+use crate::nats_session::{NatsSession, NatsSessionConfig, NatsTurnResult};
 use crate::nats_session_log::NatsSessionLog;
 use async_nats::jetstream;
 use async_trait::async_trait;
@@ -113,9 +113,9 @@ impl SubagentToolset {
     async fn create_session(
         &self,
         session_id: Option<String>,
-    ) -> Result<ThinClientSession, ToolInvokeError> {
-        ThinClientSession::new(
-            ThinClientConfig {
+    ) -> Result<NatsSession, ToolInvokeError> {
+        NatsSession::new(
+            NatsSessionConfig {
                 cluster: self.cluster.clone(),
                 agent: self.agent.clone(),
                 session_id,
@@ -136,7 +136,7 @@ impl SubagentToolset {
         session_id: Option<String>,
         parent_session_id: Option<String>,
         cancel: CancellationToken,
-    ) -> Result<ThinClientTurnResult, ToolInvokeError> {
+    ) -> Result<NatsTurnResult, ToolInvokeError> {
         let session = self.create_session(session_id).await?;
         let child_session_id = session.session_id().to_string();
         if let Some(parent_session_id) = parent_session_id {
@@ -244,7 +244,7 @@ impl SubagentToolset {
         })
     }
 
-    async fn turn_has_cancel(&self, result: &ThinClientTurnResult) -> bool {
+    async fn turn_has_cancel(&self, result: &NatsTurnResult) -> bool {
         NatsSessionLog::new(self.jetstream.clone(), result.session_id.clone())
             .load_events_async()
             .await
@@ -302,7 +302,7 @@ impl SubagentToolset {
         self.turn_result_value(&result)
     }
 
-    fn turn_result_value(&self, result: &ThinClientTurnResult) -> Result<Value, ToolInvokeError> {
+    fn turn_result_value(&self, result: &NatsTurnResult) -> Result<Value, ToolInvokeError> {
         let response = require_response(result)?;
         let source = AgentSource {
             agent: self.agent.clone(),
@@ -344,7 +344,7 @@ impl SubagentToolset {
     }
 }
 
-fn require_response(result: &ThinClientTurnResult) -> Result<&str, ToolInvokeError> {
+fn require_response(result: &NatsTurnResult) -> Result<&str, ToolInvokeError> {
     if let Some(error) = &result.error {
         return Err(ToolInvokeError::Recoverable(format!(
             "sub-agent turn failed: {error}"

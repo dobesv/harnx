@@ -1,12 +1,12 @@
 # High-Availability Deployment (NATS Mode)
 
-Harnx supports a distributed, high-availability (HA) mode backed by [NATS JetStream](https://nats.io/). In this mode, the agent tool loop runs in a dedicated **worker** process, while thin **clients** (TUI or CLI) connect to the worker via a NATS cluster.
+Harnx supports a distributed, high-availability (HA) mode backed by [NATS JetStream](https://nats.io/). In this mode, the agent tool loop runs in a dedicated **worker** process, while **clients** (TUI or CLI) connect to the worker via a NATS cluster.
 
 ## Architecture Overview
 
 Harnx NATS mode decouples the execution of an agent from the user interface:
 
-- **Clients**: Thin processes (TUI and CLI) that post user messages and render events. They do not execute tools.
+- **Clients**: The TUI and CLI processes that post user messages and render events. They do not execute tools.
 - **NATS Cluster**: The central nervous system. Uses JetStream for a durable session log and Key-Value (KV) for leader election (leases).
 - **Workers**: One or more daemon processes that execute the agent loop. Multiple workers provide redundancy; only one worker holds the active lease for a given session at a time.
 

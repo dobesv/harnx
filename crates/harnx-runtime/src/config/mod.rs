@@ -325,9 +325,8 @@ pub struct Config {
     pub session: Option<Session>,
     pub rag: Option<Arc<Rag>>,
     pub agent: Option<Agent>,
-    /// Remote agent metadata for NATS thin-client mode.
-    /// When set, the agent runs on a remote worker and this client
-    /// drives the turn via `ThinClientSession`.
+    /// Agent and cluster when the active agent ref names one
+    /// (`agent@cluster`). When unset, turns run against the local cluster.
     pub remote_agent: Option<(String, String)>, // (agent_name, cluster)
     pub tui_before_editor: Option<Box<dyn FnMut() + Send + Sync>>,
     pub tui_after_editor: Option<Box<dyn FnMut() + Send + Sync>>,
@@ -491,12 +490,12 @@ impl Default for Config {
 pub type GlobalConfig = Arc<RwLock<Config>>;
 
 impl Config {
-    /// Set remote agent metadata for NATS thin-client mode.
+    /// Set the agent and cluster for the active session.
     pub fn set_remote_agent(&mut self, agent: String, cluster: String) {
         self.remote_agent = Some((agent, cluster));
     }
 
-    /// Check if this config is running in remote-agent mode.
+    /// Check whether the active agent ref names a cluster.
     pub fn is_remote_agent(&self) -> bool {
         self.remote_agent.is_some()
     }

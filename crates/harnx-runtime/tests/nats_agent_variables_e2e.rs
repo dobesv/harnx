@@ -20,7 +20,7 @@ use harnx_runtime::{
     nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease},
     nats_session_log::NatsSessionLog,
     nats_worker::{run_worker_daemon, WorkerDaemonConfig},
-    ThinClientConfig, ThinClientSession, ThinClientTurnResult,
+    NatsSession, NatsSessionConfig, NatsTurnResult,
 };
 use parking_lot::RwLock;
 use std::path::Path;
@@ -288,11 +288,11 @@ impl TestEnv {
         Ok(async_nats::jetstream::new(client))
     }
 
-    async fn run_turn(&self, agent: &str, session_id: &str) -> Result<ThinClientTurnResult> {
+    async fn run_turn(&self, agent: &str, session_id: &str) -> Result<NatsTurnResult> {
         let client = async_nats::connect(self.server.url()).await?;
         let jetstream = async_nats::jetstream::new(client.clone());
-        let thin = ThinClientSession::new(
-            ThinClientConfig {
+        let session = NatsSession::new(
+            NatsSessionConfig {
                 cluster: "local".to_string(),
                 agent: agent.to_string(),
                 session_id: Some(session_id.to_string()),
@@ -305,7 +305,7 @@ impl TestEnv {
 
         match tokio::time::timeout(
             TURN_TIMEOUT,
-            thin.run_turn("hello", Arc::new(NullSink), None),
+            session.run_turn("hello", Arc::new(NullSink), None),
         )
         .await
         {
@@ -725,8 +725,8 @@ async fn client_ends_turn_when_worker_vanishes_without_writing() -> Result<()> {
         async move {
             let client = async_nats::connect(&server_url).await?;
             let jetstream = async_nats::jetstream::new(client.clone());
-            let thin = ThinClientSession::new(
-                ThinClientConfig {
+            let session = NatsSession::new(
+                NatsSessionConfig {
                     cluster: "local".to_string(),
                     agent: FILE_VARIABLE_AGENT.to_string(),
                     session_id: Some(session_id),
@@ -736,7 +736,7 @@ async fn client_ends_turn_when_worker_vanishes_without_writing() -> Result<()> {
                 create_abort_signal(),
             )
             .await?;
-            thin.run_turn("hello", Arc::new(NullSink), None).await
+            session.run_turn("hello", Arc::new(NullSink), None).await
         }
     });
 

@@ -2,7 +2,7 @@ use harnx_runtime::config::{
     remote_session_ops::{load_remote_transcript_for_render, RemoteTranscriptState},
     GlobalConfig,
 };
-use harnx_runtime::{ThinClientConfig, ThinClientSession};
+use harnx_runtime::{NatsSession, NatsSessionConfig};
 use log::warn;
 
 pub(crate) fn load_remote_session_history(
@@ -12,8 +12,8 @@ pub(crate) fn load_remote_session_history(
     session_id: String,
 ) -> Option<RemoteTranscriptState> {
     let remote_load = || async {
-        let thin = ThinClientSession::from_global_config(
-            ThinClientConfig {
+        let session = NatsSession::from_global_config(
+            NatsSessionConfig {
                 cluster,
                 agent,
                 session_id: Some(session_id),
@@ -22,7 +22,7 @@ pub(crate) fn load_remote_session_history(
             harnx_runtime::utils::create_abort_signal(),
         )
         .await?;
-        load_remote_transcript_for_render(&thin).await
+        load_remote_transcript_for_render(&session).await
     };
     let result = match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| handle.block_on(remote_load())),
