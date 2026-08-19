@@ -94,18 +94,17 @@ impl SubagentToolset {
         timeouts: SubagentTimeouts,
     ) -> Self {
         let agent = agent.into();
+        let server_name = agent
+            .rsplit_once('/')
+            .map_or(agent.as_str(), |(_, stem)| stem);
         Self {
-            server_name: sanitize_for_tool_name(&agent),
+            server_name: sanitize_for_tool_name(server_name),
             agent,
             cluster: cluster.into(),
             client,
             jetstream,
             timeouts,
         }
-    }
-
-    fn tool_name(&self, method: &str) -> String {
-        format!("{}_session_{method}", self.server_name)
     }
 
     async fn create_session(
@@ -266,7 +265,7 @@ impl SubagentToolset {
         args: Value,
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
-        let args: NewSessionArgs = parse_args(&self.tool_name("new"), args)?;
+        let args: NewSessionArgs = parse_args("session_new", args)?;
         let result = self
             .run_prompt(
                 SESSION_NEW_INITIAL_PROMPT,
@@ -283,7 +282,7 @@ impl SubagentToolset {
         args: Value,
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
-        let args: PromptArgs = parse_args(&self.tool_name("prompt"), args)?;
+        let args: PromptArgs = parse_args("session_prompt", args)?;
         if args.message.trim().is_empty() {
             return Err(ToolInvokeError::Recoverable(
                 "message must not be empty".to_string(),
@@ -315,7 +314,7 @@ impl SubagentToolset {
     }
 
     async fn session_load(&self, args: Value) -> Result<Value, ToolInvokeError> {
-        let args: SessionArgs = parse_args(&self.tool_name("load"), args)?;
+        let args: SessionArgs = parse_args("session_load", args)?;
         let session_id = required_session_id(args.session_id)?;
         let events = NatsSessionLog::new(self.jetstream.clone(), session_id.clone())
             .load_events_async()
@@ -329,7 +328,7 @@ impl SubagentToolset {
     }
 
     async fn session_cancel(&self, args: Value) -> Result<Value, ToolInvokeError> {
-        let args: SessionArgs = parse_args(&self.tool_name("cancel"), args)?;
+        let args: SessionArgs = parse_args("session_cancel", args)?;
         let session_id = required_session_id(args.session_id)?;
         publish_control_command(&self.client, &session_id, &ControlCommand::Cancel)
             .await
@@ -409,7 +408,7 @@ impl Toolset for SubagentToolset {
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
-        tool_specs(&self.agent, &self.server_name, self.timeouts)
+        tool_specs(&self.agent, self.timeouts)
     }
 
     async fn invoke(
@@ -418,13 +417,13 @@ impl Toolset for SubagentToolset {
         args: Value,
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
-        if tool == self.tool_name("new") {
+        if tool == "session_new" {
             self.session_new(args, cancel).await
-        } else if tool == self.tool_name("prompt") {
+        } else if tool == "session_prompt" {
             self.session_prompt(args, cancel).await
-        } else if tool == self.tool_name("load") {
+        } else if tool == "session_load" {
             self.session_load(args).await
-        } else if tool == self.tool_name("cancel") {
+        } else if tool == "session_cancel" {
             self.session_cancel(args).await
         } else {
             Err(ToolInvokeError::Recoverable(format!(
@@ -434,22 +433,23 @@ impl Toolset for SubagentToolset {
     }
 }
 
-fn tool_specs(agent: &str, server_name: &str, timeouts: SubagentTimeouts) -> Vec<ToolSpec> {
+fn tool_specs(agent: &str, timeouts: SubagentTimeouts) -> Vec<ToolSpec> {
     let request_timeout = timeouts.operation.as_secs().saturating_add(5);
+    let display_name = sanitize_for_tool_name(agent);
     vec![
-        session_new_spec(agent, server_name, request_timeout),
-        session_prompt_spec(agent, server_name, request_timeout),
-        session_id_tool_spec(agent, server_name, SessionIdTool::Load),
-        session_id_tool_spec(agent, server_name, SessionIdTool::Cancel),
+        session_new_spec(agent, &display_name, request_timeout),
+        session_prompt_spec(agent, &display_name, request_timeout),
+        session_id_tool_spec(agent, &display_name, SessionIdTool::Load),
+        session_id_tool_spec(agent, &display_name, SessionIdTool::Cancel),
     ]
 }
 
 /// A truncated session ID, so the call header stays one short line.
 const SHORT_SESSION_ID: &str = "{{ args.session_id | truncate(8, end='') }}";
 
-fn session_new_spec(agent: &str, server_name: &str, request_timeout: u64) -> ToolSpec {
+fn session_new_spec(agent: &str, display_name: &str, request_timeout: u64) -> ToolSpec {
     ToolSpec {
-        name: format!("{server_name}_session_new"),
+        name: "session_new".to_string(),
         description: format!("Create a new session on the '{agent}' agent"),
         input_schema: json!({ "type": "object", "properties": {} }),
         idempotent_hint: false,
@@ -457,12 +457,12 @@ fn session_new_spec(agent: &str, server_name: &str, request_timeout: u64) -> Too
         timeout_secs: Some(request_timeout),
         meta: None,
     }
-    .with_call_template(&format!("@ {server_name} new session"))
+    .with_call_template(&format!("@ {display_name} new session"))
 }
 
-fn session_prompt_spec(agent: &str, server_name: &str, request_timeout: u64) -> ToolSpec {
+fn session_prompt_spec(agent: &str, display_name: &str, request_timeout: u64) -> ToolSpec {
     ToolSpec {
-        name: format!("{server_name}_session_prompt"),
+        name: "session_prompt".to_string(),
         description: format!(
             "Send a prompt to the '{agent}' agent. To continue a conversation, pass only the exact session_id returned by session_prompt or session_new. To start a new conversation, omit session_id; empty or whitespace-only values also start a new session. Do not invent a session ID."
         ),
@@ -486,7 +486,7 @@ fn session_prompt_spec(agent: &str, server_name: &str, request_timeout: u64) -> 
         meta: None,
     }
     .with_call_template(&format!(
-        "@ {server_name}{{% if args.session_id %}} [{SHORT_SESSION_ID}]{{% endif %}}\n{{{{ args.message }}}}"
+        "@ {display_name}{{% if args.session_id %}} [{SHORT_SESSION_ID}]{{% endif %}}\n{{{{ args.message }}}}"
     ))
 }
 
@@ -520,10 +520,10 @@ impl SessionIdTool {
     }
 }
 
-fn session_id_tool_spec(agent: &str, server_name: &str, tool: SessionIdTool) -> ToolSpec {
+fn session_id_tool_spec(agent: &str, display_name: &str, tool: SessionIdTool) -> ToolSpec {
     let verb = tool.verb();
     ToolSpec {
-        name: format!("{server_name}_session_{verb}"),
+        name: format!("session_{verb}"),
         description: tool.describe(agent),
         input_schema: json!({
             "type": "object",
@@ -540,7 +540,7 @@ fn session_id_tool_spec(agent: &str, server_name: &str, tool: SessionIdTool) -> 
         timeout_secs: Some(60),
         meta: None,
     }
-    .with_call_template(&format!("@ {server_name} {verb} {SHORT_SESSION_ID}"))
+    .with_call_template(&format!("@ {display_name} {verb} {SHORT_SESSION_ID}"))
 }
 
 #[cfg(test)]
@@ -551,7 +551,6 @@ mod tests {
     fn generates_four_agent_session_tools_with_stable_schemas() {
         let tools = tool_specs(
             "pkg/helper",
-            "pkg__helper",
             SubagentTimeouts::new(Duration::from_secs(3), Duration::from_secs(7)),
         );
         assert_eq!(
@@ -560,10 +559,10 @@ mod tests {
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "pkg__helper_session_new",
-                "pkg__helper_session_prompt",
-                "pkg__helper_session_load",
-                "pkg__helper_session_cancel",
+                "session_new",
+                "session_prompt",
+                "session_load",
+                "session_cancel",
             ]
         );
         assert_eq!(
@@ -583,7 +582,6 @@ mod tests {
     fn every_session_tool_advertises_a_call_template() {
         let tools = tool_specs(
             "pkg/helper",
-            "pkg__helper",
             SubagentTimeouts::new(Duration::from_secs(3), Duration::from_secs(7)),
         );
 

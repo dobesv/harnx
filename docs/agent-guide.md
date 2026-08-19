@@ -316,9 +316,9 @@ Harnx supports agent delegation, allowing a parent agent to run nested sub-agent
 Sub-agents in Harnx execute as standard NATS agent sessions (`ThinClientSession`). ACP (Agent Client Protocol) and its stdio child process architecture have been removed.
 
 - **Markdown-only agent definitions**: Agents are defined solely by Markdown files with YAML front-matter in `<config-dir>/agents/*.md` (or package agents). ACP server configuration (`acp_servers/*.yaml`) and ACP stdio child processes no longer exist.
-- **Auto-registered toolsets**: For every configured agent, the worker daemon registers a NATS-backed 4-tool toolset:
+- **Auto-registered toolsets**: For every configured agent, the worker daemon registers a NATS-backed 4-tool toolset. Each registration advertises the raw names `session_new`, `session_prompt`, `session_load`, and `session_cancel`; the provider exposes them to agents with an agent-relative prefix:
   - `{agent}_session_new`: Creates a new sub-agent session and returns its initial response along with session metadata.
-  - `{agent}_session_prompt`: Sends a prompt message (`message`, optional `session_id`, optional `parent_session_id`) to a sub-agent session, returning the sub-agent's final text response.
+  - `{agent}_session_prompt`: Sends a prompt message (`message`, optional `session_id`) to a sub-agent session, returning the sub-agent's final text response. The parent session ID is propagated internally.
   - `{agent}_session_load`: Reads prior event history for an existing sub-agent session log.
   - `{agent}_session_cancel`: Cancels an in-flight prompt on a sub-agent session.
 - **Worker-agnostic execution**: Sub-agent turns route via standard NATS JetStream WorkQueue subjects (`WORK_NOTIFY_<cluster>`) and acquire distributed KV locks (`harnx_leases`). Execution can run on any available worker in a cluster.
@@ -448,4 +448,3 @@ Agent prompts are rendered using [MiniJinja](https://github.com/mitsuhiko/miniji
 - `{{ agent.model }}`: The active model ID (e.g., `openai:gpt-4o`). This updates automatically if the agent falls back to a different model.
 - `{{ tools }}`: A list of available tools. You can iterate over them: `{% for t in tools %}- {{ t.name }}: {{ t.description }}{% endfor %}`.
 - `{{ __os__ }}`, `{{ __arch__ }}`, `{{ __shell__ }}`, `{{ __cwd__ }}`, `{{ __now__ }}`, `{{ __locale__ }}`: Environment and system information.
-
