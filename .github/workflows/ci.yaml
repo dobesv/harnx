@@ -161,10 +161,15 @@ jobs:
           exit 1
         fi
 
+    # Lints are platform-agnostic, so one runner is enough. The per-OS `Build
+    # workspace` step still compiles with `--deny warnings`, which catches rustc
+    # warnings in platform-gated code that Linux clippy never sees.
     - name: Clippy
+      if: runner.os == 'Linux'
       run: cargo clippy --all --all-targets -- -D warnings
 
     - name: Format
+      if: runner.os == 'Linux'
       run: cargo fmt --all --check
 
   docker-lint:
