@@ -20,7 +20,7 @@ tags:
   - reap-race
   - dashmap
 plan_ref: ag-ui-serve-control-plane
-last_updated: 2026-08-17
+last_updated: 2026-08-20
 ---
 
 ## Problem
@@ -222,6 +222,7 @@ Thread the server's real `Config` through `SessionRegistry::new(config)` (now in
 - [ ] Is `notify_one()` used instead of `notify_waiters()` for single-waiter signaling?
 - [ ] Are test-only helpers excluded from production paths (grep for `load_base_config_for_tests`, `set_current_dir`, env `.expect`)?
 - [ ] Does `SessionRegistry`/actor hold the server's real `Config`, not reload from env?
+- [ ] Are actor-owned child tasks held in `AbortOnDropHandle`, not bare `JoinHandle`? A dropped `JoinHandle` does not abort its task, orphaning it on actor stop (panic or exit). See `run_done_task` in `session_actor.rs` and issue #1468.
 
 ### Testing Mechanics
 
@@ -234,3 +235,4 @@ Thread the server's real `Config` through `SessionRegistry::new(config)` (now in
 
 - **GitHub:** [issue #959](https://github.com/dobesv/harnx/issues/959) — AG-UI Phase 2: per-session actor control plane
 - **GitHub:** [issue #1465](https://github.com/dobesv/harnx/issues/1465) — `get_or_spawn` handed out reaped actors' handles; the source of the ~1-in-10 503 flake in `rpc_session_prompt_returns_ack_and_persists_effect`
+- **GitHub:** [issue #1468](https://github.com/dobesv/harnx/issues/1468) — orphan turn task after actor panic; double-writer window narrowed by `AbortOnDropHandle`

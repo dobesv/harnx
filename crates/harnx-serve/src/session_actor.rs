@@ -46,9 +46,9 @@ use std::{
 };
 use tokio::{
     sync::{broadcast, mpsc, oneshot, Mutex},
-    task::JoinHandle,
     time::{sleep_until, Instant, Sleep},
 };
+use tokio_util::task::AbortOnDropHandle;
 
 const COMMAND_BUFFER: usize = 32;
 const BROADCAST_BUFFER: usize = 64;
@@ -101,7 +101,13 @@ struct SessionActor {
     active_run: Option<ActiveRun>,
     run_done_tx: mpsc::Sender<RunFinished>,
     run_done_rx: mpsc::Receiver<RunFinished>,
-    run_done_task: Option<JoinHandle<()>>,
+    /// In-flight turn task, aborted on drop so a panicking or stopping actor doesn't leak it.
+    /// Dropping the actor requests cancellation via `JoinHandle::abort`: the task is dropped at
+    /// its next await, so a pending write may be dropped rather than completed, and a replacement
+    /// actor can overlap until this task actually terminates. That bounds the double-writer window
+    /// (issue #1468) but isn't a strict single-writer guarantee. That would need a registry-side
+    /// join or actor-mediated writes.
+    run_done_task: Option<AbortOnDropHandle<()>>,
     reap_ttl: Duration,
     reap_deadline: Option<Instant>,
     history_snapshot: Vec<AgUiMessage>,
@@ -328,6 +334,8 @@ impl SessionActor {
             SessionCommand::EmitTestEvent { event } => {
                 let _ = self.broadcast_tx.send(event);
             }
+            #[cfg(test)]
+            SessionCommand::Panic => panic!("test-triggered session actor panic"),
         }
     }
 
@@ -577,7 +585,7 @@ impl SessionActor {
             agent: self.key.agent.clone(),
             session_id: self.key.session.clone(),
         };
-        let task = tokio::spawn(async move {
+        let task = AbortOnDropHandle::new(tokio::spawn(async move {
             let loop_result = run_actor_turn(turn).await;
             let _ = done_tx
                 .send(RunFinished {
@@ -588,7 +596,7 @@ impl SessionActor {
                     attachment_refs,
                 })
                 .await;
-        });
+        }));
 
         self.run_done_task = Some(task);
         self.active_run = Some(ActiveRun {
@@ -888,7 +896,7 @@ impl SessionActor {
         ));
         let sink_for_task = sink.clone();
         let abort_signal_for_task = abort_signal.clone();
-        let task = tokio::spawn(async move {
+        let task = AbortOnDropHandle::new(tokio::spawn(async move {
             let loop_result = with_agent_event_sink(sink_for_task.clone(), async {
                 let mut input = input;
                 loop {
@@ -947,7 +955,7 @@ impl SessionActor {
                     attachment_refs: options.attachment_refs.clone(),
                 })
                 .await;
-        });
+        }));
 
         self.run_done_task = Some(task);
         self.active_run = Some(ActiveRun {
@@ -2773,6 +2781,9 @@ mod tests {
             "target session should be registered in registry after handoff dispatch"
         );
     }
+
+    #[path = "session_actor_panic_abort_tests.rs"]
+    mod panic_abort_tests;
 
     #[path = "session_actor_registry_tests.rs"]
     mod registry_tests;
