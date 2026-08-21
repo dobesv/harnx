@@ -2,5 +2,6 @@ allowBuilds:
   msw: false
 frozenLockfile: true
 overrides:
+  '@ag-ui/client': 0.0.58
   '@assistant-ui/core': 0.3.13
   assistant-stream: 0.3.37
