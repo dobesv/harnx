@@ -81,6 +81,8 @@ pub enum SessionCommand {
     EmitTestEvent {
         event: Event,
     },
+    #[cfg(test)]
+    Panic,
 }
 
 pub struct SubscribeResult {
