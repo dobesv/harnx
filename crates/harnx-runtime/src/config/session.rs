@@ -1103,9 +1103,10 @@ fn inject_fresh_system_prompt(messages: &mut Vec<Message>, input: &Input) -> Res
     Ok(())
 }
 
-/// Extend a single-message history with the tail of the compressed transcript
-/// from its last user message on, so a compacted session keeps recent context.
-fn extend_with_compressed_tail(session: &Session, messages: &mut Vec<Message>) {
+/// Prepend the tail of the compressed transcript to a single-message history
+/// from its last user message on, so a compacted session keeps recent context
+/// in chronological order.
+fn prepend_compressed_tail(session: &Session, messages: &mut Vec<Message>) {
     if messages.len() != 1 || session.compressed_messages.len() < 2 {
         return;
     }
@@ -1114,7 +1115,7 @@ fn extend_with_compressed_tail(session: &Session, messages: &mut Vec<Message>) {
         .iter()
         .rposition(|v| v.role == MessageRole::User)
     {
-        messages.extend(session.compressed_messages[index..].to_vec());
+        messages.splice(0..0, session.compressed_messages[index..].iter().cloned());
     }
 }
 
@@ -1131,7 +1132,7 @@ fn build_messages_inner(session: &Session, input: &Input) -> Result<Vec<Message>
         messages = input.agent().build_messages(input)?;
         false
     } else {
-        extend_with_compressed_tail(session, &mut messages);
+        prepend_compressed_tail(session, &mut messages);
         !history_already_has_input_text(input, &messages)
     };
     inject_fresh_system_prompt(&mut messages, input)?;
@@ -2230,6 +2231,42 @@ replacements:
             .all(|message| message.role != MessageRole::System));
         assert_eq!(session.messages[0].content.to_text(), "recent u");
         assert_eq!(session.messages[1].content.to_text(), "recent a");
+    }
+
+    #[test]
+    fn build_messages_prepends_compressed_tail_before_single_live_message() {
+        let mut session = test_session();
+        session.compressed_messages = vec![
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text("archived question".to_string()),
+            ),
+            Message::new(
+                MessageRole::Assistant,
+                MessageContent::Text("archived answer".to_string()),
+            ),
+        ];
+        session.messages = vec![Message::new(
+            MessageRole::User,
+            MessageContent::Text("live question".to_string()),
+        )];
+
+        let input = Input::new(
+            "next question".to_string(),
+            ("next question".to_string(), vec![]),
+            harnx_core::agent_config::AgentConfig::from_prompt(""),
+        );
+        let messages = super::build_messages(&session, &input).unwrap();
+
+        assert_eq!(
+            message_view(&messages),
+            vec![
+                (MessageRole::User, "archived question".to_string()),
+                (MessageRole::Assistant, "archived answer".to_string()),
+                (MessageRole::User, "live question".to_string()),
+                (MessageRole::User, "next question".to_string()),
+            ]
+        );
     }
 
     #[test]
