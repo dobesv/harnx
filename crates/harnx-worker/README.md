@@ -1,42 +1,67 @@
 # harnx-worker
 
-The worker daemon that executes harnx agent turns. Front-ends (`harnx`,
-`harnx-serve`) don't run the agent loop themselves — they append the user
-message to a NATS session log, and a worker leases the session and runs the
-loop, including tool calls and hooks.
+The worker daemon executes Harnx agent turns. Frontends append user messages
+to a NATS session log and publish activations; a worker acquires the session
+lease and runs the model, tool, and hook loop.
 
-## Usage
+## Persistent clusters
+
+Run a cloud or otherwise persistent worker against a configured cluster:
 
 ```sh
-harnx-worker --cluster local --worker-id worker-1
+harnx-worker --cluster prod --worker-id worker-1
 ```
 
-- `--cluster` — key from `nats_servers/<name>.yaml`, or `__local__` to use the
-  shared local broker handed off via `HARNX_NATS_URL` / `HARNX_NATS_TOKEN`.
-- `--worker-id` — stable identity for leases and the durable consumer name.
-  Defaults to a generated id. Recommended in production so a restart rejoins
-  its own consumer.
-- `-x KEY VALUE` / `--agent-variable KEY VALUE` — agent variables, repeatable.
-- `--diagnose` — start this configuration's tool servers, report which ones
-  registered and how many tools each advertises, then exit without serving
-  sessions.
+- `--cluster` selects `nats_servers/<name>.yaml`. The reserved name
+  `__local__` is rejected because local workers are owned and addressed by a
+  frontend, not shared through cluster dispatch.
+- `--worker-id` is the deployment identity used for leases and the durable
+  cluster consumer. It defaults to a generated ID; a stable value is
+  recommended in production.
+- `--manage-servers` launches this worker's tool and hook servers. Without it,
+  the worker discovers independently deployed servers under
+  `HARNX_SERVER_SCOPE`.
+- `-x KEY VALUE` / `--agent-variable KEY VALUE` sets an agent variable and may
+  be repeated.
 
-Run several workers against one cluster for redundancy. Only one holds the
-active lease for a given session; if it dies, another picks the session up.
+Multiple persistent workers compete through the same cluster-wide activation
+stream. This cloud topology is unchanged.
 
-## Local use
+## Frontend-managed local workers
 
-You normally don't launch this by hand. For the default `__local__` cluster,
-`harnx` and `harnx-serve` start a worker themselves and supervise it for the
-front-end's lifetime, so `harnx-worker` needs to be installed where they can
-find it:
+`harnx` and `harnx-serve` each supervise one worker for their own process
+lifetime. They use the `--session-scope __local__` execution mode with an
+explicit generated worker ID, `--manage-servers`, and a broker credential
+handoff in `HARNX_NATS_URL` and `HARNX_NATS_TOKEN`. This is an internal
+frontend topology, not a manually operated local daemon mode.
 
-1. `HARNX_WORKER_BIN`, if set, must point at the binary.
-2. Otherwise a `harnx-worker` next to the running front-end.
-3. Otherwise `harnx-worker` on `PATH`.
+Local frontends still share the broker, durable session logs, advisory events,
+session listing, and session leases. Only execution is frontend-affine: an
+idle prompt targets the submitting frontend's child. If another child already
+holds the session lease, that holder consumes newly appended messages from the
+shared log. Nested sub-agent turns target the same child as their parent.
 
-The worker logs to stderr, and a front-end that started it points that at its
-own log file — `~/.local/state/harnx/harnx.log` by default. So does everything
-the worker starts in turn. Check there when a front-end reports that the worker
-never became ready. Running the worker by hand, redirect it yourself:
-`harnx-worker --cluster __local__ 2>> worker.log`.
+Each child inherits its frontend's environment and current directory. Restart
+the frontend to pick up intentional configuration, environment, working
+directory, installation, or binary changes; a normal worker health check does
+not hot-reload them. A crashed child is respawned on the same activation route.
+
+Frontend and worker binaries may be compiled separately. Readiness accepts a
+different build SHA when their readiness protocol is compatible. After an
+upgrade that changes the local protocol, restart all local frontend and worker
+processes; durable session history is preserved.
+
+The frontend finds `harnx-worker` in this order:
+
+1. The path in `HARNX_WORKER_BIN`.
+2. A sibling of the running frontend binary.
+3. `harnx-worker` on `PATH`.
+
+Worker, tool-server, and hook-server output goes to the frontend's log file,
+`~/.local/state/harnx/harnx.log` by default.
+
+Local tool-server diagnostics remain available with:
+
+```sh
+harnx-worker --session-scope __local__ --diagnose
+```

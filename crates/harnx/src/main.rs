@@ -593,21 +593,20 @@ async fn start_directive(
         (agent, cluster, session_id)
     };
 
-    let mut local_worker = None;
-    if cluster == harnx_runtime::config::LOCAL_CLUSTER_KEY {
-        harnx_runtime::local_orchestrator::ensure_local_worker(
-            &mut local_worker,
-            abort_signal.clone(),
-        )
-        .await
-        .context("failed to ensure local NATS worker")?;
-    }
+    let local_worker = tokio::sync::Mutex::new(None);
+    let activation_route = harnx_runtime::local_orchestrator::activation_route_for_cluster(
+        &cluster,
+        &local_worker,
+        abort_signal.clone(),
+    )
+    .await?;
 
     let session = harnx_runtime::NatsSession::from_global_config(
         harnx_runtime::NatsSessionConfig {
             cluster,
             agent,
             session_id,
+            activation_route,
         },
         config,
         abort_signal,

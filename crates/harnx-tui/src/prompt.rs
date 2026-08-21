@@ -216,15 +216,12 @@ impl Tui {
             return Err(anyhow::anyhow!("Attachments are not yet supported"));
         }
 
-        if cluster == harnx_runtime::config::LOCAL_CLUSTER_KEY {
-            let mut supervisor = ctx.local_worker.lock().await;
-            harnx_runtime::local_orchestrator::ensure_local_worker(
-                &mut supervisor,
-                ctx.abort_signal.clone(),
-            )
-            .await
-            .context("failed to ensure local NATS worker")?;
-        }
+        let activation_route = harnx_runtime::local_orchestrator::activation_route_for_cluster(
+            &cluster,
+            &ctx.local_worker,
+            ctx.abort_signal.clone(),
+        )
+        .await?;
 
         let sink = Arc::new(TuiAgentEventSink::new(ctx.event_tx.clone()));
         let session_id = ctx
@@ -238,6 +235,7 @@ impl Tui {
                 cluster: cluster.clone(),
                 agent,
                 session_id,
+                activation_route,
             },
             &ctx.config,
             ctx.abort_signal.clone(),

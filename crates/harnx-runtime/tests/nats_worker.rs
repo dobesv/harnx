@@ -398,10 +398,8 @@ async fn spawn_worker_daemon_with_call_fn(
     call_fn: harnx_runtime::agent_loop::AgentCallFn,
 ) -> tokio::task::JoinHandle<Result<()>> {
     let worker_config = WorkerDaemonConfig::managing("local", worker_id);
-    let daemon = tokio::spawn({
-        let cfg = config.clone();
-        async move { run_worker_daemon(cfg, worker_config, Some(call_fn)).await }
-    });
+    let daemon =
+        tokio::spawn(async move { run_worker_daemon(config, worker_config, Some(call_fn)).await });
     tokio::time::sleep(Duration::from_millis(500)).await;
     daemon
 }
@@ -2193,6 +2191,7 @@ async fn abort_signal_cancels_blocked_worker_and_persists_tombstone() -> Result<
             cluster: "local".to_string(),
             agent: "ignored-agent".to_string(),
             session_id: Some(session_id.to_string()),
+            activation_route: harnx_runtime::SessionActivationRoute::ClusterShared,
         },
         client,
         jetstream.clone(),

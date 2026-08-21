@@ -136,6 +136,7 @@ async fn activate_nats_session(
             cluster: "local".to_string(),
             agent: "metis".to_string(),
             session_id: Some(session_id),
+            activation_route: crate::SessionActivationRoute::ClusterShared,
         },
         &global_config,
         harnx_core::abort::create_abort_signal(),

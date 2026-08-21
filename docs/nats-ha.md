@@ -8,7 +8,10 @@ Harnx NATS mode decouples the execution of an agent from the user interface:
 
 - **Clients**: The TUI and CLI processes that post user messages and render events. They do not execute tools.
 - **NATS Cluster**: The central nervous system. Uses JetStream for a durable session log and Key-Value (KV) for leader election (leases).
-- **Workers**: One or more daemon processes that execute the agent loop. Multiple workers provide redundancy; only one worker holds the active lease for a given session at a time.
+- **Workers**: Daemon processes that execute the agent loop. Persistent-cluster
+  workers compete for activations. Local workers are frontend-owned and receive
+  targeted activations. In both cases, only one worker holds a session lease at
+  a time.
 
 ## Prerequisites
 
@@ -42,6 +45,11 @@ Harnx automatically manages the following JetStream resources:
   opened by the standalone `harnx-hookset-server` binary carry a TTL; the
   worker daemon's own copy of the same buckets does not set one.
 - **Streams**: `SESSION_<id>` (Subject: `sessions.{id}.log`) stores the durable append-only session history.
+- **Persistent activation streams**: `WORK_NOTIFY_<cluster>` captures
+  `cluster.<cluster>.sessions.notify` with cluster-shared work-queue dispatch.
+- **Local activation stream**: `LOCAL_WORK_NOTIFY_V2` captures
+  `session_scope.__local__.workers.*.sessions.notify` with interest retention
+  and one exact durable consumer per frontend worker ID.
 
 All of the KV buckets above are created with the `replicas` count from the
 cluster's config (`None` means 1, no HA). Set it to 3 to match a 3-node
@@ -111,7 +119,39 @@ They look for it at `HARNX_WORKER_BIN` first, then next to the running
 front-end, then on `PATH` — so normally the worker just has to be installed
 alongside the front-end.
 
-You can run multiple workers for redundancy. If the active worker for a session dies, another worker will acquire the lease and resume execution.
+`--cluster __local__` is rejected. The reserved name identifies shared local
+session state on the frontend side, but local worker execution uses a separate
+frontend-managed `--session-scope __local__` mode and an exact worker target.
+Persistent workers continue to use `--cluster`; their topology and
+cluster-shared dispatch are unchanged.
+
+### Shared local state, frontend-owned execution
+
+Every local frontend owns one worker child with a generated `local-<uuid>` ID.
+Two frontends therefore share the same local broker, session logs, advisory
+events, session list, and lease bucket while retaining different execution
+environments. An idle prompt wakes only the submitting frontend's child. If
+another child already holds that session's lease, the holder consumes the new
+durable messages at a tool boundary or final drain; the targeted wakeup remains
+available in case the holder releases before seeing them.
+
+The worker inherits its owning frontend's environment and current directory.
+Restart the frontend after intentional configuration, environment, working
+directory, installation, or binary changes. Health checks do not proactively
+restart a running child for those changes. Crash recovery retains the same
+worker ID and consumer route but starts a new PID.
+
+Frontend and worker executables may be built separately as long as their local
+readiness protocol is compatible. Build SHA is diagnostic and does not decide
+admission or affinity. A local protocol upgrade is a hard cutover: restart all
+local frontend and worker processes. Durable session history remains intact;
+legacy local activation streams, consumers, and `worker.lock` files are simply
+left inert.
+
+On a persistent cluster, you can run multiple workers for redundancy. If the
+active worker for a session dies, another persistent worker will acquire the
+lease and resume execution. Local redundancy instead comes from the owning
+frontend respawning its worker on the same targeted route.
 
 ### Independently Deployed Tool and Hook Servers
 

@@ -912,18 +912,19 @@ async fn ask(
         (agent, cluster, session_id)
     };
 
-    if cluster == crate::config::LOCAL_CLUSTER_KEY {
-        let mut supervisor = local_worker.lock().await;
-        crate::local_orchestrator::ensure_local_worker(&mut supervisor, abort_signal.clone())
-            .await
-            .context("failed to ensure local NATS worker")?;
-    }
+    let activation_route = crate::local_orchestrator::activation_route_for_cluster(
+        &cluster,
+        local_worker,
+        abort_signal.clone(),
+    )
+    .await?;
 
     let session = crate::NatsSession::from_global_config(
         crate::NatsSessionConfig {
             cluster,
             agent,
             session_id,
+            activation_route,
         },
         config,
         abort_signal,

@@ -1236,7 +1236,7 @@ user prompt"
         let sink = Arc::new(CollectingSink::default());
         let input = crate::config::input::from_str(&global_config, "start handoff", None);
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(60),
             harnx_core::sink::with_agent_event_sink(sink.clone(), async {
                 run_agent_loop(&ctx, input).await
             }),

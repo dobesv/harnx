@@ -42,7 +42,7 @@ mod worker_identity;
 
 // Re-export session types for frontends
 pub use nats_session::{send_control_command, NatsSession, NatsSessionConfig, NatsTurnResult};
-pub use nats_worker::ControlCommand;
+pub use nats_worker::{ControlCommand, SessionActivationRoute};
 
 pub use agent_loop::{
     continue_agent_loop_from_tool_round, run_agent_loop, run_agent_loop_with_local_handoff,

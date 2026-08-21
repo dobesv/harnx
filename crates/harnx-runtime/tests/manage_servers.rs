@@ -201,6 +201,7 @@ fn local_orchestrator_spawns_the_worker_with_manage_servers() {
     harnx_core::require_nextest();
     let command = harnx_runtime::local_orchestrator::build_local_worker_command(
         Path::new("harnx-worker"),
+        "local-test",
         "nats://127.0.0.1:4222",
         "test-token",
     );
@@ -213,4 +214,10 @@ fn local_orchestrator_spawns_the_worker_with_manage_servers() {
         args.iter().any(|arg| arg == "--manage-servers"),
         "local worker spawn must pass --manage-servers, got argv: {args:?}"
     );
+    assert!(args
+        .windows(2)
+        .any(|args| args == ["--session-scope", "__local__"]));
+    assert!(args
+        .windows(2)
+        .any(|args| args == ["--worker-id", "local-test"]));
 }

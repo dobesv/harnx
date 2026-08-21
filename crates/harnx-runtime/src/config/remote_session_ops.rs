@@ -334,6 +334,7 @@ async fn remote_nats_session(
             cluster,
             agent,
             session_id: Some(session_id),
+            activation_route: crate::SessionActivationRoute::ClusterShared,
         },
         config,
         abort_signal.clone(),

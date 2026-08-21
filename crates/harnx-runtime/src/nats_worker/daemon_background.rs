@@ -11,7 +11,7 @@ use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use super::server_reconciler::{
     all_enabled_tool_servers, build_server_reconciler, ServerReconciler,
 };
-use super::subagent_toolset::SubagentToolset;
+use super::subagent_toolset::{SubagentSessionRoute, SubagentToolset};
 use super::tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
 use crate::config::{
     list_agents, resolve_local_nats_server_config, server_display_name, GlobalConfig,
@@ -178,7 +178,7 @@ fn optional_tool_server<T>(result: Result<T>) -> Option<T> {
 /// didn't push it to a 6th bare argument.
 struct SubagentToolsetStart {
     agent: String,
-    cluster: String,
+    route: SubagentSessionRoute,
     instance_id: harnx_core::instance::ServerScope,
     client: async_nats::Client,
     jetstream: jetstream::Context,
@@ -188,7 +188,7 @@ struct SubagentToolsetStart {
 async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandle<Result<()>>> {
     let SubagentToolsetStart {
         agent,
-        cluster,
+        route,
         instance_id,
         client,
         jetstream,
@@ -198,7 +198,7 @@ async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandl
     let registration_context = jetstream.clone();
     let toolset = Arc::new(SubagentToolset::new(
         agent,
-        cluster,
+        route,
         client.clone(),
         jetstream,
     ));
@@ -410,7 +410,10 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
         let registrations = list_agents().into_iter().map(|agent| {
             let start = SubagentToolsetStart {
                 agent: agent.clone(),
-                cluster: daemon.cluster.clone(),
+                route: SubagentSessionRoute::new(
+                    daemon.connection_key(),
+                    daemon.activation_route(),
+                ),
                 instance_id: instance_id.clone(),
                 client: client.clone(),
                 jetstream: jetstream.clone(),

@@ -1,7 +1,4 @@
-// The local worker supervisor spawns worker subprocesses and manages them via
-// Unix process groups / signals (see `local_orchestrator`), so these
-// integration tests are Unix-only. On non-Unix targets the file compiles to
-// nothing, avoiding unused-import/dead-code errors under `-D warnings`.
+// The supervisor uses Unix process groups/signals.
 #![cfg(unix)]
 
 #[allow(dead_code)]
@@ -9,17 +6,18 @@ mod common;
 
 use harnx_core::{event::NullSink, require_nextest, session::SessionLogEntry};
 use harnx_runtime::config::LOCAL_CLUSTER_KEY;
-use harnx_runtime::local_orchestrator::{local_worker_lock_file, LocalWorkerSupervisor};
+use harnx_runtime::local_orchestrator::LocalWorkerSupervisor;
 use harnx_runtime::nats_session_log::NatsSessionLog;
-use harnx_runtime::nats_worker::worker_ready_subject;
+use harnx_runtime::nats_worker::{
+    targeted_consumer_name, targeted_worker_ready_subject, LocalWorkerTarget,
+};
 use harnx_runtime::utils::create_abort_signal;
 use harnx_runtime::{NatsSession, NatsSessionConfig};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_util::sync::CancellationToken;
 
 struct EnvGuard {
     key: &'static str,
@@ -29,7 +27,6 @@ struct EnvGuard {
 impl EnvGuard {
     fn set(key: &'static str, value: &Path) -> Self {
         let previous = std::env::var_os(key);
-        // Nextest runs this test in its own process.
         unsafe { std::env::set_var(key, value) };
         Self { key, previous }
     }
@@ -147,6 +144,7 @@ fn write_trivial_agent_config(root: &Path, api_base: &str) {
 
 async fn assert_worker_completes_turn(
     supervisor: &LocalWorkerSupervisor,
+    non_target: &LocalWorkerSupervisor,
     mock_task: tokio::task::JoinHandle<()>,
 ) {
     let client = async_nats::ConnectOptions::new()
@@ -182,10 +180,11 @@ async fn assert_worker_completes_turn(
             cluster: LOCAL_CLUSTER_KEY.to_string(),
             agent: "trivial".to_string(),
             session_id: Some(session_id),
+            activation_route: supervisor.route().activation_route(),
         },
         client,
-        jetstream,
-        harnx_runtime::utils::create_abort_signal(),
+        jetstream.clone(),
+        create_abort_signal(),
     )
     .await
     .expect("create local NATS session");
@@ -197,12 +196,28 @@ async fn assert_worker_completes_turn(
     .expect("local worker turn timeout")
     .expect("local worker turn");
     assert_eq!(result.response.as_deref(), Some("worker completed"));
+    let stream = jetstream
+        .get_stream("LOCAL_WORK_NOTIFY_V2")
+        .await
+        .expect("get local-v2 activation stream");
+    let non_target_consumer: async_nats::jetstream::consumer::PullConsumer = stream
+        .get_consumer(&targeted_consumer_name(non_target.route().worker_id()).unwrap())
+        .await
+        .unwrap_or_else(|error| panic!("get non-target consumer: {error}"));
+    assert_eq!(
+        non_target_consumer
+            .get_info()
+            .await
+            .expect("read non-target consumer info")
+            .delivered
+            .consumer_sequence,
+        0,
+        "frontend B's worker consumed frontend A's targeted turn"
+    );
     mock_task.await.expect("mock OpenAI task");
 }
 
-#[cfg(unix)]
 fn kill_process(pid: u32) {
-    // SAFETY: PID belongs to worker child created by this test.
     let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
     assert_eq!(
         result,
@@ -212,14 +227,11 @@ fn kill_process(pid: u32) {
     );
 }
 
-#[cfg(unix)]
 fn process_exists(pid: u32) -> bool {
-    // SAFETY: signal 0 only checks process existence/permission.
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(unix)]
 async fn wait_for_process_exit(pid: u32) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while process_exists(pid) && Instant::now() < deadline {
@@ -231,104 +243,81 @@ async fn wait_for_process_exit(pid: u32) {
     );
 }
 
-async fn assert_stale_joiner_is_rejected(binary: &Path) {
-    let stale_error = match tokio::time::timeout(
-        Duration::from_secs(10),
-        LocalWorkerSupervisor::start_with_worker_binary(binary, create_abort_signal()),
-    )
-    .await
-    .expect("stale joiner readiness timeout")
-    {
-        Ok(_) => panic!("a joiner must reject a worker with stale config"),
-        Err(error) => error,
-    };
-    assert!(
-        stale_error
-            .to_string()
-            .contains("active local worker is stale"),
-        "unexpected stale-worker error: {stale_error:#}"
+fn assert_distinct_frontend_workers(
+    frontend_a: &LocalWorkerSupervisor,
+    frontend_b: &LocalWorkerSupervisor,
+) {
+    assert_ne!(frontend_a.worker_pid(), frontend_b.worker_pid());
+    assert_ne!(frontend_a.route(), frontend_b.route());
+    assert_eq!(frontend_a.server().url, frontend_b.server().url);
+    assert_eq!(
+        targeted_worker_ready_subject(
+            LocalWorkerTarget::new(
+                frontend_a.route().session_scope(),
+                frontend_a.route().worker_id()
+            )
+            .unwrap()
+        ),
+        format!(
+            "session_scope.__local__.workers.{}.worker.ready",
+            frontend_a.route().worker_id()
+        )
+    );
+    assert_ne!(
+        targeted_consumer_name(frontend_a.route().worker_id()).unwrap(),
+        targeted_consumer_name(frontend_b.route().worker_id()).unwrap()
     );
 }
 
-async fn update_config_and_restart_owner(
+async fn replace_inputs_and_start_fresh_frontend(
     root: &Path,
     binary: &Path,
-    owner: &mut LocalWorkerSupervisor,
-    old_pid: u32,
-) -> u32 {
+    frontend_a: &mut LocalWorkerSupervisor,
+    first_a_pid: u32,
+) -> LocalWorkerSupervisor {
     std::fs::write(
         root.join("config/config.yaml"),
         "save: false\nstream: false\nclient: mock\nmodel: mock:test\n# changed\n",
     )
-    .expect("update local config");
-    assert_stale_joiner_is_rejected(binary).await;
-    let (stale_stop, stale_publisher) = spawn_stale_readiness_heartbeat(owner).await;
-    let restart_result =
-        tokio::time::timeout(Duration::from_secs(15), owner.ensure(create_abort_signal())).await;
-    stale_stop.cancel();
-    stale_publisher
-        .await
-        .expect("join stale readiness publisher");
-    restart_result
-        .expect("owner restart timeout while stale readiness is published")
-        .expect("restart worker after config change");
-    let reloaded_pid = owner.worker_pid().expect("reloaded worker PID");
-    assert_ne!(reloaded_pid, old_pid);
-    assert!(process_exists(reloaded_pid));
-    reloaded_pid
-}
-
-async fn spawn_stale_readiness_heartbeat(
-    owner: &LocalWorkerSupervisor,
-) -> (CancellationToken, tokio::task::JoinHandle<()>) {
-    let client = async_nats::ConnectOptions::new()
-        .token(owner.server().token.clone())
-        .connect(&owner.server().url)
-        .await
-        .expect("connect stale readiness publisher");
-    let subject = worker_ready_subject(LOCAL_CLUSTER_KEY);
-    let stop = CancellationToken::new();
-    let task_stop = stop.clone();
-    let task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(50));
-        loop {
-            tokio::select! {
-                () = task_stop.cancelled() => break,
-                _ = interval.tick() => {
-                    client
-                        .publish(subject.clone(), "stale readiness".into())
-                        .await
-                        .expect("publish stale readiness marker");
-                    client.flush().await.expect("flush stale readiness marker");
-                }
-            }
-        }
-    });
-    (stop, task)
-}
-
-async fn update_executable_and_restart_owner(
-    binary: &Path,
-    owner: &mut LocalWorkerSupervisor,
-    old_pid: u32,
-) -> u32 {
+    .expect("update config");
     let rebuilt = binary.with_extension("rebuilt");
-    std::fs::copy(binary, &rebuilt).expect("copy rebuilt worker fixture");
-    std::fs::rename(rebuilt, binary).expect("atomically replace worker binary fixture");
-    assert_stale_joiner_is_rejected(binary).await;
-    owner
+    std::fs::copy(binary, &rebuilt).expect("copy rebuilt fixture");
+    std::fs::rename(rebuilt, binary).expect("replace worker fixture");
+    let route_before = frontend_a.route().clone();
+    let route_after = frontend_a
         .ensure(create_abort_signal())
         .await
-        .expect("restart worker after executable change");
-    let reloaded_pid = owner.worker_pid().expect("rebuilt worker PID");
-    assert_ne!(reloaded_pid, old_pid);
-    assert!(process_exists(reloaded_pid));
-    reloaded_pid
+        .expect("keep live worker");
+    assert_eq!(route_before, route_after);
+    assert_eq!(frontend_a.worker_pid(), Some(first_a_pid));
+
+    let frontend_c = LocalWorkerSupervisor::start_with_worker_binary(binary, create_abort_signal())
+        .await
+        .expect("fresh frontend starts from replacement inputs");
+    assert_ne!(frontend_c.worker_pid(), Some(first_a_pid));
+    assert_ne!(frontend_c.route(), frontend_a.route());
+    frontend_c
 }
 
-#[cfg(unix)]
+async fn crash_and_respawn(frontend: &mut LocalWorkerSupervisor, old_pid: u32) -> u32 {
+    kill_process(old_pid);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        frontend
+            .ensure(create_abort_signal())
+            .await
+            .expect("respawn frontend worker");
+        let pid = frontend.worker_pid().expect("replacement worker PID");
+        if pid != old_pid {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "worker was not respawned");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn local_worker_supervisor_deduplicates_respawns_and_tears_down() {
+async fn local_supervisors_own_distinct_workers_routes_and_process_trees() {
     require_nextest();
     let Some(installed_binary) = skip_without_binaries() else {
         return;
@@ -340,54 +329,40 @@ async fn local_worker_supervisor_deduplicates_respawns_and_tears_down() {
     let (api_base, mock_task) = start_mock_openai().await;
     write_trivial_agent_config(root.path(), &api_base);
 
-    let mut owner = LocalWorkerSupervisor::start_with_worker_binary(&binary, create_abort_signal())
-        .await
-        .expect("start local worker owner");
-    assert!(owner.is_worker_owner());
-    assert_eq!(
-        worker_ready_subject(LOCAL_CLUSTER_KEY),
-        "cluster.__local__.worker.ready"
-    );
-    assert_eq!(
-        local_worker_lock_file().file_name(),
-        Some(OsStr::new("worker.lock"))
-    );
-    let first_pid = owner.worker_pid().expect("owned worker PID");
-
-    let joiner = LocalWorkerSupervisor::start_with_worker_binary(&binary, create_abort_signal())
-        .await
-        .expect("join existing local worker");
-    assert!(
-        !joiner.is_worker_owner(),
-        "second front-end spawned a worker"
-    );
-    assert_eq!(joiner.worker_pid(), None);
-
-    assert_worker_completes_turn(&owner, mock_task).await;
-
-    let executable_reloaded_pid =
-        update_executable_and_restart_owner(&binary, &mut owner, first_pid).await;
-    let config_reloaded_pid =
-        update_config_and_restart_owner(root.path(), &binary, &mut owner, executable_reloaded_pid)
-            .await;
-
-    kill_process(config_reloaded_pid);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let replacement_pid = loop {
-        owner
-            .ensure(create_abort_signal())
+    let mut frontend_a =
+        LocalWorkerSupervisor::start_with_worker_binary(&binary, create_abort_signal())
             .await
-            .expect("respawn killed local worker");
-        let pid = owner.worker_pid().expect("replacement worker PID");
-        if pid != config_reloaded_pid {
-            break pid;
-        }
-        assert!(Instant::now() < deadline, "worker was not respawned");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    assert!(process_exists(replacement_pid));
+            .expect("start frontend A worker");
+    let frontend_b =
+        LocalWorkerSupervisor::start_with_worker_binary(&binary, create_abort_signal())
+            .await
+            .expect("start frontend B worker");
+    let first_a_pid = frontend_a.worker_pid().expect("frontend A worker PID");
+    let b_pid = frontend_b.worker_pid().expect("frontend B worker PID");
+    assert_distinct_frontend_workers(&frontend_a, &frontend_b);
 
-    drop(owner);
-    wait_for_process_exit(replacement_pid).await;
-    drop(joiner);
+    assert_worker_completes_turn(&frontend_a, &frontend_b, mock_task).await;
+    let route_before = frontend_a.route().clone();
+    let frontend_c =
+        replace_inputs_and_start_fresh_frontend(root.path(), &binary, &mut frontend_a, first_a_pid)
+            .await;
+    let c_pid = frontend_c.worker_pid().expect("frontend C worker PID");
+    let replacement_a_pid = crash_and_respawn(&mut frontend_a, first_a_pid).await;
+    assert_eq!(frontend_a.route(), &route_before);
+
+    // Dropping A reaps only A's process group; B remains alive.
+    drop(frontend_a);
+    wait_for_process_exit(replacement_a_pid).await;
+    assert!(
+        process_exists(b_pid),
+        "dropping frontend A terminated frontend B's worker"
+    );
+    assert!(
+        process_exists(c_pid),
+        "dropping frontend A terminated frontend C's worker"
+    );
+    drop(frontend_b);
+    wait_for_process_exit(b_pid).await;
+    drop(frontend_c);
+    wait_for_process_exit(c_pid).await;
 }

@@ -42,7 +42,7 @@ use harnx_core::event::{
 use harnx_core::message::{MessageContent, MessageRole};
 use harnx_core::session::SessionLogEntry;
 use harnx_core::session_reconstruct::{
-    active_context_window, reconstruct_state_from_nats, ActiveContextWindow, TurnStatus,
+    active_context_window, reconstruct_state_from_nats, ActiveContextWindow,
 };
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -50,8 +50,9 @@ use std::sync::Arc;
 use crate::nats_event_sink::SessionEventStream;
 use crate::nats_session_log::NatsSessionLog;
 use crate::nats_worker::{
-    new_remote_session_id, publish_control_command, publish_session_activate, ControlCommand,
-    SessionActivate,
+    new_remote_session_id, publish_control_command, publish_session_activate,
+    publish_targeted_session_activate, ControlCommand, LocalWorkerTarget, SessionActivate,
+    SessionActivationRoute,
 };
 use crate::utils::AbortSignal;
 
@@ -161,6 +162,64 @@ pub struct NatsSessionConfig {
     pub agent: String,
     /// Existing session ID to resume/attach (None = new session).
     pub session_id: Option<String>,
+    /// Where turn activations are dispatched. History access remains tied only
+    /// to `cluster` and `session_id`.
+    pub activation_route: SessionActivationRoute,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestedSeqStatus {
+    Pending,
+    Covered,
+}
+
+/// Determine whether a durable request still needs worker execution.
+///
+/// This is shared by the client completion loop and targeted workers so turn
+/// completion, failure, cancellation, and retraction semantics cannot drift.
+pub(crate) fn requested_seq_status(
+    entries: &[(u64, SessionLogEntry)],
+    requested_seq: u64,
+) -> Result<RequestedSeqStatus> {
+    let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(entries)?;
+    Ok(requested_seq_status_with_effective(
+        entries,
+        &effective,
+        requested_seq,
+    ))
+}
+
+fn requested_seq_status_with_effective(
+    entries: &[(u64, SessionLogEntry)],
+    effective: &[(u64, SessionLogEntry)],
+    requested_seq: u64,
+) -> RequestedSeqStatus {
+    if entries.iter().any(|(_, entry)| {
+        matches!(
+            entry,
+            SessionLogEntry::TurnEnd { through_seq, .. } if *through_seq >= requested_seq
+        )
+    }) || entries.iter().any(|(seq, entry)| {
+        *seq > requested_seq
+            && matches!(
+                entry,
+                SessionLogEntry::Error { .. } | SessionLogEntry::Cancel { .. }
+            )
+    }) {
+        return RequestedSeqStatus::Covered;
+    }
+
+    let requested_still_exists = effective.iter().any(|(seq, _)| *seq == requested_seq);
+    if requested_still_exists {
+        return RequestedSeqStatus::Pending;
+    }
+
+    let reconstructed = reconstruct_state_from_nats(entries);
+    if reconstructed.next_turn_messages.is_empty() && reconstructed.resumable_ctx.is_none() {
+        RequestedSeqStatus::Covered
+    } else {
+        RequestedSeqStatus::Pending
+    }
 }
 
 /// Session driver.
@@ -297,10 +356,32 @@ impl NatsSession {
         // duplicates all prior messages in interactive and continued sessions.
 
         // Step 3: Publish activation to wake a worker.
-        let activation = SessionActivate::new(&self.session_id, &self.config.agent);
-        publish_session_activate(&self.jetstream, &self.config.cluster, &activation)
-            .await
-            .context("failed to publish session activation")?;
+        match &self.config.activation_route {
+            SessionActivationRoute::ClusterShared => {
+                let activation = SessionActivate::new(&self.session_id, &self.config.agent);
+                publish_session_activate(&self.jetstream, &self.config.cluster, &activation)
+                    .await
+                    .context("failed to publish session activation")?;
+            }
+            SessionActivationRoute::WorkerTargeted {
+                session_scope,
+                worker_id,
+            } => {
+                let activation = SessionActivate::targeted(
+                    &self.session_id,
+                    &self.config.agent,
+                    user_msg_seq,
+                    worker_id,
+                );
+                publish_targeted_session_activate(
+                    &self.jetstream,
+                    LocalWorkerTarget::new(session_scope, worker_id)?,
+                    &activation,
+                )
+                .await
+                .context("failed to publish targeted session activation")?;
+            }
+        }
 
         log::info!(
             "nats session: published activation session_id={} agent={} cluster={}",
@@ -385,7 +466,14 @@ impl NatsSession {
                 _ = completion_interval.tick() => {
                     if let Ok(entries) = self.load_durable_entries().await {
                         // Refresh cached effective log for live LogSeqAssigned.
-                        if let Ok(effective) = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries) {
+                        let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries).ok();
+                        let completion_visible = Self::is_turn_completion_visible(
+                            &entries,
+                            effective.as_deref(),
+                            user_msg_seq,
+                            saw_turn_ended,
+                        );
+                        if let Some(effective) = effective {
                             cached_effective = Some(effective);
                             emit_all_logical_seqs_for_window(
                                 cached_effective.as_deref(),
@@ -400,11 +488,7 @@ impl NatsSession {
                                 AdvisoryFlush::Live,
                             );
                         }
-                        if Self::is_turn_completion_visible(
-                            &entries,
-                            user_msg_seq,
-                            saw_turn_ended,
-                        ) {
+                        if completion_visible {
                             (final_response, turn_error) =
                                 Self::extract_turn_outcome(&entries, user_msg_seq);
                             turn_complete = true;
@@ -465,7 +549,14 @@ impl NatsSession {
                             if last_completion_check.elapsed() >= COMPLETION_CHECK_INTERVAL {
                                 last_completion_check = std::time::Instant::now();
                                 if let Ok(entries) = self.load_durable_entries().await {
-                                    if let Ok(effective) = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries) {
+                                    let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries).ok();
+                                    let completion_visible = Self::is_turn_completion_visible(
+                                        &entries,
+                                        effective.as_deref(),
+                                        user_msg_seq,
+                                        saw_turn_ended,
+                                    );
+                                    if let Some(effective) = effective {
                                         cached_effective = Some(effective);
                                         emit_all_logical_seqs_for_window(
                                 cached_effective.as_deref(),
@@ -480,11 +571,7 @@ impl NatsSession {
                                             AdvisoryFlush::Live,
                                         );
                                     }
-                                    if Self::is_turn_completion_visible(
-                                        &entries,
-                                        user_msg_seq,
-                                        saw_turn_ended,
-                                    ) {
+                                    if completion_visible {
                                         // Extract final response before we finish
                                         (final_response, turn_error) =
                                             Self::extract_turn_outcome(&entries, user_msg_seq);
@@ -650,23 +737,6 @@ impl NatsSession {
             .context("failed to load durable session log")
     }
 
-    /// Check for durable failure/cancellation barriers.
-    ///
-    /// An assistant row is deliberately not terminal here. It is persisted
-    /// before stop hooks and pending-context checks, either of which may resume
-    /// the same model/tool loop.
-    fn has_durable_terminal_failure(entries: &[(u64, SessionLogEntry)], user_msg_seq: u64) -> bool {
-        let has_error_after_user = entries.iter().any(|(seq, entry)| {
-            *seq > user_msg_seq && matches!(entry, SessionLogEntry::Error { .. })
-        });
-
-        has_error_after_user
-            || matches!(
-                reconstruct_state_from_nats(entries).turn_status,
-                TurnStatus::InFlightCancelled
-            )
-    }
-
     fn has_durable_assistant_response(
         entries: &[(u64, SessionLogEntry)],
         user_msg_seq: u64,
@@ -674,22 +744,23 @@ impl NatsSession {
         Self::extract_final_response(entries, user_msg_seq).is_some()
     }
 
-    fn has_durable_turn_end(entries: &[(u64, SessionLogEntry)], user_msg_seq: u64) -> bool {
-        entries.iter().any(|(_, entry)| {
-            matches!(
-                entry,
-                SessionLogEntry::TurnEnd { through_seq, .. } if *through_seq >= user_msg_seq
-            )
-        })
-    }
-
     fn is_turn_completion_visible(
         entries: &[(u64, SessionLogEntry)],
+        effective: Option<&[(u64, SessionLogEntry)]>,
         user_msg_seq: u64,
         saw_turn_ended: bool,
     ) -> bool {
-        Self::has_durable_terminal_failure(entries, user_msg_seq)
-            || Self::has_durable_turn_end(entries, user_msg_seq)
+        let status = effective.map_or_else(
+            || requested_seq_status(entries, user_msg_seq).ok(),
+            |effective| {
+                Some(requested_seq_status_with_effective(
+                    entries,
+                    effective,
+                    user_msg_seq,
+                ))
+            },
+        );
+        status == Some(RequestedSeqStatus::Covered)
             || (saw_turn_ended && Self::has_durable_assistant_response(entries, user_msg_seq))
     }
 
@@ -1150,11 +1221,11 @@ mod tests {
         ]);
 
         assert!(
-            !NatsSession::is_turn_completion_visible(&entries, 1, false),
+            !NatsSession::is_turn_completion_visible(&entries, None, 1, false),
             "an assistant row may still be followed by stop-hook or pending-context work"
         );
         assert!(
-            NatsSession::is_turn_completion_visible(&entries, 1, true),
+            NatsSession::is_turn_completion_visible(&entries, None, 1, true),
             "older workers use the parent turn advisory as a compatibility fallback"
         );
 
@@ -1169,6 +1240,7 @@ mod tests {
         ));
         assert!(NatsSession::is_turn_completion_visible(
             &durably_ended,
+            None,
             1,
             false
         ));
@@ -1206,7 +1278,9 @@ mod tests {
                 },
             ),
         ];
-        assert!(!NatsSession::is_turn_completion_visible(&entries, 2, false));
+        assert!(!NatsSession::is_turn_completion_visible(
+            &entries, None, 2, false
+        ));
     }
 
     #[test]
@@ -1220,11 +1294,56 @@ mod tests {
                 timestamp: None,
             },
         ));
-        assert!(NatsSession::has_durable_terminal_failure(&failed, 1));
+        assert_eq!(
+            requested_seq_status(&failed, 1).unwrap(),
+            RequestedSeqStatus::Covered
+        );
 
         let mut cancelled = test_entries(&[(1, MessageRole::User, "question")]);
         cancelled.push((2, SessionLogEntry::Cancel { fence_token: 7 }));
-        assert!(NatsSession::has_durable_terminal_failure(&cancelled, 1));
+        assert_eq!(
+            requested_seq_status(&cancelled, 1).unwrap(),
+            RequestedSeqStatus::Covered
+        );
+    }
+
+    #[test]
+    fn retracted_request_is_covered_only_when_no_replacement_or_pending_work_remains() {
+        let mut retracted = test_entries(&[(1, MessageRole::User, "withdrawn")]);
+        retracted.push((
+            2,
+            SessionLogEntry::EditEntries {
+                from: 1,
+                to: 1,
+                replacements: vec![],
+            },
+        ));
+        assert_eq!(
+            requested_seq_status(&retracted, 1).unwrap(),
+            RequestedSeqStatus::Covered
+        );
+
+        let replacement = serde_yaml::to_string(&SessionLogEntry::Message {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text("replacement".to_string()),
+            timestamp: None,
+            fence_token: None,
+        })
+        .unwrap();
+        let mut replaced = test_entries(&[(1, MessageRole::User, "original")]);
+        replaced.push((
+            2,
+            SessionLogEntry::EditEntries {
+                from: 1,
+                to: 1,
+                replacements: vec![replacement],
+            },
+        ));
+        assert_eq!(
+            requested_seq_status(&replaced, 1).unwrap(),
+            RequestedSeqStatus::Pending
+        );
     }
 
     #[test]

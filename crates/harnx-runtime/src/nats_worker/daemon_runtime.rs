@@ -4,7 +4,9 @@
 
 use super::backend::NatsSessionLogBackend;
 use super::control::{control_subject, ControlCommand};
-use super::daemon::{should_append_control_log_entry, SessionActivate};
+use super::daemon::{
+    should_append_control_log_entry, SessionActivate, SessionActivationRoute, WorkerActivationMode,
+};
 use super::daemon_background::BackgroundServices;
 use super::server_reconciler::{tool_servers_for_activation, ServerReconciler};
 use crate::config::GlobalConfig;
@@ -12,6 +14,7 @@ use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLeas
 use crate::nats_metrics;
 use anyhow::{Context, Result};
 use async_nats::jetstream;
+use async_nats::jetstream::AckKind;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -49,6 +52,13 @@ struct ActivationAckCtx<'a> {
     abort_signal: &'a crate::utils::AbortSignal,
 }
 
+struct PreparedActivation {
+    activation: SessionActivate,
+    lease: Arc<NatsSessionLease>,
+    abort_signal: crate::utils::AbortSignal,
+    control_task: JoinHandle<()>,
+}
+
 pub(super) struct WorkerRuntime {
     pub(super) config: GlobalConfig,
     pub(super) instance_id: harnx_core::instance::ServerScope,
@@ -59,9 +69,11 @@ pub(super) struct WorkerRuntime {
     pub(super) server_reconciler: Option<Arc<ServerReconciler>>,
     #[allow(dead_code)]
     pub(super) cluster: String,
+    pub(super) activation_route: SessionActivationRoute,
+    pub(super) activation_mode: WorkerActivationMode,
     pub(super) manage_servers: bool,
     pub(super) worker_id: String,
-    pub(super) identity: crate::worker_identity::WorkerIdentity,
+    pub(super) identity: crate::worker_identity::WorkerReadiness,
     pub(super) lease: NatsLeaseConfig,
     pub(super) jetstream: jetstream::Context,
     pub(super) session_index: Option<async_nats::jetstream::kv::Store>,
@@ -74,6 +86,10 @@ pub(super) struct WorkerRuntime {
 }
 
 impl WorkerRuntime {
+    fn uses_targeted_activation(&self) -> bool {
+        self.activation_mode == WorkerActivationMode::WorkerTargeted
+    }
+
     pub(super) async fn already_running(&self, session_id: &str) -> bool {
         let mut active = self.active.lock().await;
         active.retain(|_, handle| !handle.is_finished());
@@ -157,6 +173,132 @@ impl WorkerRuntime {
         Ok(lease.map(Arc::new))
     }
 
+    async fn delayed_nak(message: &async_nats::jetstream::Message) -> Result<()> {
+        let delivered = message.info().map(|info| info.delivered).unwrap_or(1);
+        let exponent = u32::try_from(delivered.saturating_sub(1))
+            .unwrap_or(u32::MAX)
+            .min(5);
+        let millis = 100_u64.saturating_mul(1_u64 << exponent).min(2_000);
+        message
+            .ack_with(AckKind::Nak(Some(Duration::from_millis(millis))))
+            .await
+            .map_err(|error| anyhow::anyhow!("delayed-NAK targeted SessionActivate: {error}"))
+    }
+
+    async fn targeted_activation_is_covered(&self, activation: &SessionActivate) -> Result<bool> {
+        let requested_seq = activation
+            .requested_seq
+            .context("targeted activation is missing requested_seq")?;
+        let backend = NatsSessionLogBackend::new(self.jetstream.clone(), &activation.session_id);
+        let entries = backend.load_events_latest_async().await?;
+        Ok(
+            crate::nats_session::requested_seq_status(&entries, requested_seq)?
+                == crate::nats_session::RequestedSeqStatus::Covered,
+        )
+    }
+
+    fn validate_targeted_activation(&self, activation: &SessionActivate) -> Result<()> {
+        anyhow::ensure!(
+            activation.target_worker_id.as_deref() == Some(self.worker_id.as_str()),
+            "targeted activation for session '{}' names worker {:?}, but consumer belongs to '{}'",
+            activation.session_id,
+            activation.target_worker_id,
+            self.worker_id
+        );
+        anyhow::ensure!(
+            activation.requested_seq.is_some(),
+            "targeted activation for session '{}' is missing requested_seq",
+            activation.session_id
+        );
+        Ok(())
+    }
+
+    async fn terminate_activation(
+        message: &async_nats::jetstream::Message,
+        reason: &str,
+    ) -> Result<()> {
+        message
+            .ack_with(AckKind::Term)
+            .await
+            .map_err(|error| anyhow::anyhow!("terminate {reason} SessionActivate: {error}"))
+    }
+
+    async fn decode_activation(
+        &self,
+        message: &async_nats::jetstream::Message,
+    ) -> Result<Option<SessionActivate>> {
+        match serde_json::from_slice(&message.payload) {
+            Ok(activation) => Ok(Some(activation)),
+            Err(error) if self.uses_targeted_activation() => {
+                log::warn!("terminating malformed targeted SessionActivate: {error}");
+                Self::terminate_activation(message, "malformed targeted").await?;
+                Ok(None)
+            }
+            Err(error) => Err(error).context("decode SessionActivate"),
+        }
+    }
+
+    async fn targeted_status_preflight_finished(
+        &self,
+        message: &async_nats::jetstream::Message,
+        activation: &SessionActivate,
+    ) -> Result<bool> {
+        match self.targeted_activation_is_covered(activation).await {
+            Ok(true) => {
+                message
+                    .ack()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("ack covered targeted activation: {error}"))?;
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(error) => {
+                log::warn!(
+                    "targeted activation status read failed for session '{}': {error:#}",
+                    activation.session_id
+                );
+                Self::delayed_nak(message).await?;
+                Ok(true)
+            }
+        }
+    }
+
+    async fn settle_running_activation(
+        &self,
+        message: &async_nats::jetstream::Message,
+    ) -> Result<()> {
+        if self.uses_targeted_activation() {
+            Self::delayed_nak(message).await
+        } else {
+            let _ = message.ack().await;
+            Ok(())
+        }
+    }
+
+    async fn acquire_or_defer_activation(
+        &self,
+        message: &async_nats::jetstream::Message,
+        activation: &SessionActivate,
+    ) -> Result<Option<Arc<NatsSessionLease>>> {
+        match self.acquire_activation_lease(activation).await {
+            Ok(Some(lease)) => Ok(Some(lease)),
+            Ok(None) if self.uses_targeted_activation() => {
+                Self::delayed_nak(message).await?;
+                Ok(None)
+            }
+            Ok(None) => Ok(None),
+            Err(error) if self.uses_targeted_activation() => {
+                log::warn!(
+                    "targeted activation lease attempt failed for session '{}': {error:#}",
+                    activation.session_id
+                );
+                Self::delayed_nak(message).await?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn prepare_activation_control(
         &self,
         activation: &SessionActivate,
@@ -213,55 +355,49 @@ impl WorkerRuntime {
         Ok(control_task)
     }
 
-    pub(super) async fn handle_activation(
-        self: &Arc<Self>,
-        message: async_nats::jetstream::Message,
-    ) -> Result<()> {
-        let activation: SessionActivate =
-            serde_json::from_slice(&message.payload).context("decode SessionActivate")?;
-
-        // Re-activation of an already-running session is a no-op.
-        if self.already_running(&activation.session_id).await {
-            let _ = message.ack().await;
-            return Ok(());
-        }
-
-        // A lease loser leaves the message unacked for its current holder.
-        let Some(lease) = self.acquire_activation_lease(&activation).await? else {
-            return Ok(());
-        };
-
-        // Start (or reuse) this session's own agent's tool servers before the
-        // registry snapshot below is taken, so it sees them.
+    async fn prepare_claimed_activation(
+        &self,
+        activation: SessionActivate,
+        message: &async_nats::jetstream::Message,
+        lease: Arc<NatsSessionLease>,
+    ) -> Result<PreparedActivation> {
         self.start_session_tool_servers(&activation).await;
-
-        // The session snapshots the tool registry below, so give the first
-        // registration round a chance to finish before that snapshot is taken.
         super::daemon_background::await_initial_tool_registration(&self.tools_attempted).await;
         log::info!(
-            "session activate claimed: session_id={} worker_id={} worker_pid={} build={} executable={} config={} revision={} epoch={}",
+            "session activate claimed: session_id={} worker_id={} worker_pid={} build={} activation_route={:?} revision={} epoch={}",
             activation.session_id,
             lease.worker_id(),
             self.identity.pid,
             self.identity.build,
-            crate::worker_identity::short_fingerprint(&self.identity.executable_fingerprint),
-            crate::worker_identity::short_fingerprint(&self.identity.config_fingerprint),
+            self.activation_route,
             lease.fence_token(),
             activation.epoch
         );
 
         let abort_signal = crate::utils::create_abort_signal();
-        // Core-NATS control must be subscribed before activation is
-        // acknowledged; either failing releases the lease and this session's
-        // tool-server refcount (see `prepare_and_ack_activation`).
         let control_task = self
             .prepare_and_ack_activation(ActivationAckCtx {
                 activation: &activation,
-                message: &message,
+                message,
                 lease: &lease,
                 abort_signal: &abort_signal,
             })
             .await?;
+        Ok(PreparedActivation {
+            activation,
+            lease,
+            abort_signal,
+            control_task,
+        })
+    }
+
+    async fn spawn_session_task(self: &Arc<Self>, prepared: PreparedActivation) {
+        let PreparedActivation {
+            activation,
+            lease,
+            abort_signal,
+            control_task,
+        } = prepared;
         let worker = Arc::clone(self);
         let session_id = activation.session_id.clone();
         let task_session_id = session_id.clone();
@@ -278,10 +414,6 @@ impl WorkerRuntime {
             let result = worker
                 .execute_session(activation, Arc::clone(&lease), abort_signal, control_task)
                 .await;
-            // `active` is only pruned lazily (see `already_running`'s
-            // `retain`), so this is the one place a finished session's tool
-            // servers can be released — do it before the metrics/log lines
-            // below, which already mark the session as done.
             worker.end_session_tool_servers(&task_session_id).await;
             nats_metrics::active_session_finished();
             let snapshot = nats_metrics::snapshot();
@@ -297,6 +429,53 @@ impl WorkerRuntime {
             }
         });
         self.active.lock().await.insert(session_id, handle);
+    }
+
+    pub(super) async fn handle_activation(
+        self: &Arc<Self>,
+        message: async_nats::jetstream::Message,
+    ) -> Result<()> {
+        let Some(activation) = self.decode_activation(&message).await? else {
+            return Ok(());
+        };
+        if self.uses_targeted_activation() {
+            if let Err(error) = self.validate_targeted_activation(&activation) {
+                log::warn!("terminating misrouted targeted SessionActivate: {error:#}");
+                Self::terminate_activation(&message, "misrouted targeted").await?;
+                return Ok(());
+            }
+        }
+
+        // A targeted re-activation stays durable until the active loop's tool
+        // boundary or final drain has covered the requested sequence.
+        if self.already_running(&activation.session_id).await {
+            self.settle_running_activation(&message).await?;
+            return Ok(());
+        }
+
+        if self.uses_targeted_activation()
+            && self
+                .targeted_status_preflight_finished(&message, &activation)
+                .await?
+        {
+            return Ok(());
+        }
+
+        // A targeted lease loser uses a short delayed NAK so handling returns
+        // immediately while preserving the final-drain race closure.
+        let Some(lease) = self
+            .acquire_or_defer_activation(&message, &activation)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        // Core-NATS control is subscribed before this acknowledges the
+        // activation. The spawned task owns cleanup of the session's servers.
+        let prepared = self
+            .prepare_claimed_activation(activation, &message, lease)
+            .await?;
+        self.spawn_session_task(prepared).await;
         Ok(())
     }
 

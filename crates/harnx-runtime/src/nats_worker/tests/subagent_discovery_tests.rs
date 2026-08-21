@@ -158,6 +158,7 @@ async fn first_package_agent_turn_waits_for_delegation_registrations() {
             cluster: "local".to_string(),
             agent: "pantheon/aristarchus".to_string(),
             session_id: None,
+            activation_route: crate::SessionActivationRoute::ClusterShared,
         },
         client.clone(),
         async_nats::jetstream::new(client),

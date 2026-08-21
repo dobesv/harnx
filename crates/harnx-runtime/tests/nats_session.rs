@@ -50,6 +50,7 @@ fn resumed_session_config(session_id: String) -> NatsSessionConfig {
         cluster: "test".to_string(),
         agent: "test-agent".to_string(),
         session_id: Some(session_id),
+        activation_route: harnx_runtime::SessionActivationRoute::ClusterShared,
     }
 }
 
@@ -191,11 +192,7 @@ async fn user_message_has_client_id() -> Result<()> {
     log.append_event_async(&header).await?;
 
     // Create a NATS session (mirrors retract test pattern)
-    let config = NatsSessionConfig {
-        cluster: "test".to_string(),
-        agent: "test-agent".to_string(),
-        session_id: Some(session_id.clone()),
-    };
+    let config = resumed_session_config(session_id.clone());
     let abort_signal = harnx_runtime::utils::create_abort_signal();
 
     let _session = NatsSession::new(config, client, jetstream, abort_signal).await?;
@@ -294,11 +291,7 @@ async fn retract_queued_user_message() -> Result<()> {
     );
 
     // Create NatsSession and retract the message
-    let config = NatsSessionConfig {
-        cluster: "test".to_string(),
-        agent: "test-agent".to_string(),
-        session_id: Some(session_id.clone()),
-    };
+    let config = resumed_session_config(session_id.clone());
     let abort_signal = harnx_runtime::utils::create_abort_signal();
 
     let session = NatsSession::new(config, client, jetstream.clone(), abort_signal).await?;
@@ -413,11 +406,7 @@ async fn edit_queued_user_message_replaces_text_in_reconstructed_state() -> Resu
     };
     let user_msg_seq = log.append_event_async(&original_entry).await?;
 
-    let config = NatsSessionConfig {
-        cluster: "test".to_string(),
-        agent: "test-agent".to_string(),
-        session_id: Some(session_id.clone()),
-    };
+    let config = resumed_session_config(session_id.clone());
     let abort_signal = harnx_runtime::utils::create_abort_signal();
     let session = NatsSession::new(config, client, jetstream.clone(), abort_signal).await?;
 

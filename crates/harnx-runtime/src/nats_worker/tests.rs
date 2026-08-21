@@ -370,6 +370,18 @@ async fn run_remote_round_trip_with_session_id(
     .await
 }
 
+fn cluster_shared_session_config(
+    cluster: impl Into<String>,
+    session_id: impl Into<String>,
+) -> crate::NatsSessionConfig {
+    crate::NatsSessionConfig {
+        cluster: cluster.into(),
+        agent: "metis".to_string(),
+        session_id: Some(session_id.into()),
+        activation_route: crate::SessionActivationRoute::ClusterShared,
+    }
+}
+
 pub(super) async fn run_remote_round_trip_with_session_id_and_sink(
     parent_config: Config,
     session_id: String,
@@ -384,11 +396,7 @@ pub(super) async fn run_remote_round_trip_with_session_id_and_sink(
     parent_config.session = Some(parent_session);
     let parent_global_config = Arc::new(parking_lot::RwLock::new(parent_config));
     let abort_signal = harnx_core::abort::create_abort_signal();
-    let session_cfg = crate::NatsSessionConfig {
-        cluster: cluster.to_string(),
-        agent: "metis".to_string(),
-        session_id: Some(session_id),
-    };
+    let session_cfg = cluster_shared_session_config(cluster, session_id);
     let session =
         crate::NatsSession::from_global_config(session_cfg, &parent_global_config, abort_signal)
             .await?;
@@ -834,7 +842,10 @@ async fn test_subagent_toolset(
         .expect("connect sub-agent toolset to test nats");
     Arc::new(super::subagent_toolset::SubagentToolset::with_timeouts(
         "metis",
-        "local",
+        super::subagent_toolset::SubagentSessionRoute::new(
+            "local",
+            crate::SessionActivationRoute::ClusterShared,
+        ),
         client.clone(),
         async_nats::jetstream::new(client),
         timeouts,
@@ -865,11 +876,7 @@ async fn run_remote_turn_returning_reply(
     parent_config.session = Some(parent_session);
     let parent_global_config = Arc::new(parking_lot::RwLock::new(parent_config));
     let abort_signal = harnx_core::abort::create_abort_signal();
-    let session_cfg = crate::NatsSessionConfig {
-        cluster: "local".to_string(),
-        agent: "metis".to_string(),
-        session_id: Some(session_id),
-    };
+    let session_cfg = cluster_shared_session_config("local", session_id);
     let session =
         crate::NatsSession::from_global_config(session_cfg, &parent_global_config, abort_signal)
             .await?;
@@ -1411,11 +1418,7 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
     parent_config.session = Some(parent_session);
     let parent_global_config = Arc::new(parking_lot::RwLock::new(parent_config));
     let abort_signal = harnx_core::abort::create_abort_signal();
-    let session_cfg = crate::NatsSessionConfig {
-        cluster: "local".to_string(),
-        agent: "metis".to_string(),
-        session_id: Some(session_id.clone()),
-    };
+    let session_cfg = cluster_shared_session_config("local", session_id.clone());
     let session =
         crate::NatsSession::from_global_config(session_cfg, &parent_global_config, abort_signal)
             .await
@@ -2209,11 +2212,7 @@ async fn nested_subagent_prompt_returns_final_message_over_nats() {
         .expect("subscribe to session events");
     client.flush().await.expect("flush event subscription");
     let session = NatsSession::new(
-        crate::NatsSessionConfig {
-            cluster: "local".to_string(),
-            agent: "metis".to_string(),
-            session_id: Some(parent_session_id.clone()),
-        },
+        cluster_shared_session_config("local", parent_session_id.clone()),
         client.clone(),
         async_nats::jetstream::new(client.clone()),
         harnx_core::abort::create_abort_signal(),
@@ -2906,11 +2905,7 @@ async fn remote_delete_refreshes_after_concurrent_mutation() {
 
     let stale_state = load_remote_session_for_render(
         &NatsSession::from_global_config(
-            crate::NatsSessionConfig {
-                cluster: "local".to_string(),
-                agent: "metis".to_string(),
-                session_id: Some(session_id.clone()),
-            },
+            cluster_shared_session_config("local", session_id.clone()),
             &global_config,
             abort.clone(),
         )
@@ -3005,11 +3000,7 @@ async fn remote_edit_preserves_header_in_migrated_session() {
         .expect("edit older user message");
 
     let session = NatsSession::from_global_config(
-        crate::NatsSessionConfig {
-            cluster: "local".to_string(),
-            agent: "metis".to_string(),
-            session_id: Some(session_id.clone()),
-        },
+        cluster_shared_session_config("local", session_id.clone()),
         &global_config,
         abort,
     )
@@ -3092,11 +3083,7 @@ async fn remote_delete_after_older_edit_deletes_exact_late_range() {
         .expect("delete later logical range");
 
     let session = NatsSession::from_global_config(
-        crate::NatsSessionConfig {
-            cluster: "local".to_string(),
-            agent: "metis".to_string(),
-            session_id: Some(session_id.clone()),
-        },
+        cluster_shared_session_config("local", session_id.clone()),
         &global_config,
         abort,
     )
@@ -3178,11 +3165,7 @@ async fn remote_rewind_after_older_edit_preserves_correct_logical_prefix() {
         .expect("rewind logical suffix");
 
     let session = NatsSession::from_global_config(
-        crate::NatsSessionConfig {
-            cluster: "local".to_string(),
-            agent: "metis".to_string(),
-            session_id: Some(session_id.clone()),
-        },
+        cluster_shared_session_config("local", session_id.clone()),
         &global_config,
         abort,
     )
@@ -3264,11 +3247,7 @@ async fn remote_delete_command_routes_to_exact_set_mutations() {
         .expect("remote delete command succeeds");
 
     let session = NatsSession::from_global_config(
-        crate::NatsSessionConfig {
-            cluster: "local".to_string(),
-            agent: "metis".to_string(),
-            session_id: Some(session_id.clone()),
-        },
+        cluster_shared_session_config("local", session_id.clone()),
         &global_config,
         abort.clone(),
     )
@@ -3390,11 +3369,7 @@ async fn remote_rewind_command_routes_to_exact_suffix_deletions() {
         .expect("remote rewind command succeeds");
 
     let session = NatsSession::from_global_config(
-        crate::NatsSessionConfig {
-            cluster: "local".to_string(),
-            agent: "metis".to_string(),
-            session_id: Some(session_id.clone()),
-        },
+        cluster_shared_session_config("local", session_id.clone()),
         &global_config,
         abort.clone(),
     )
@@ -3538,11 +3513,7 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
     let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
     let session = NatsSession::from_global_config(
-        crate::NatsSessionConfig {
-            cluster: "local".to_string(),
-            agent: "metis".to_string(),
-            session_id: Some(session_id.clone()),
-        },
+        cluster_shared_session_config("local", session_id.clone()),
         &global_config,
         abort,
     )
