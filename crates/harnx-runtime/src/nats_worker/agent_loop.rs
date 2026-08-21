@@ -39,9 +39,11 @@ pub struct RunAgentLoopArgs<'a> {
     /// Optional observer of the JetStream seq of the header-insert migration
     /// EditEntries (S2), when the worker migrates a headerless remote session on
     /// this activation. The migration re-maps the leading-user block onto this
-    /// seq, so the daemon must advance its activation high-water cursor to cover
-    /// it — otherwise the end-of-turn drain re-folds the now-remapped (and
-    /// already-answered) leading user messages and re-runs the turn (S3).
+    /// seq, so every cursor tracking "user messages already fed into this turn"
+    /// must advance to cover it. Otherwise the re-mapped (already-answered)
+    /// leading users read as unanswered: the mid-round injection callback
+    /// re-injects the prompt the turn is answering, and the end-of-turn drain
+    /// re-runs the turn (S3).
     pub header_insert_observer: Option<Arc<AtomicU64>>,
     /// Optional NATS KV store for the session index. When set, the worker
     /// upserts a `SessionIndexRecord` after the effective log has a `Header`
@@ -1347,13 +1349,14 @@ async fn maybe_insert_remote_header(args: MaybeInsertRemoteHeaderArgs<'_>) -> Re
             .append_event_with_message_id_async(&edit_entry, message_id)
             .await?;
     debug!("inserted header via EditEntries js{insert_seq}");
-    // Publish the migration seq so the daemon advances its activation high-water
-    // cursor past the re-mapped leading-user block. The migration re-maps those
-    // users onto `insert_seq`; the turn that runs this activation answers them,
-    // so without this the drain would re-fold them (seq > pre-migration cursor)
-    // and re-run the turn (S3).
+    // Publish the migration seq so the worker's turn cursor advances past the
+    // re-mapped leading-user block. The migration re-maps those users onto
+    // `insert_seq`; the turn that runs this activation answers them, so without
+    // this they read as unanswered (seq > pre-migration cursor) and get folded
+    // back in — mid-round as a spurious injection, and again by the drain as a
+    // spurious continuation turn (S3).
     if let Some(observer) = header_insert_observer {
-        observer.fetch_max(insert_seq, std::sync::atomic::Ordering::Relaxed);
+        observer.fetch_max(insert_seq, std::sync::atomic::Ordering::SeqCst);
     }
     *entries_vec = backend.load_events_blocking()?;
     *effective_entries = harnx_core::session_reconstruct::apply_log_mutations_nats(entries_vec)?;
