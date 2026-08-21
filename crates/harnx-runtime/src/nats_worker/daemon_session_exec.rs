@@ -96,14 +96,6 @@ impl WorkerRuntime {
                 let on_tool_round =
                     build_mid_turn_injection_callback(backend.clone(), Arc::clone(&turn_cursor));
 
-                // Per-turn observer for the S2 header-insert migration seq. Only
-                // the first activation of a headerless session migrates; the
-                // migration re-maps the leading-user block onto this seq, which
-                // the turn answers. We must advance the activation high-water
-                // past it so the end-of-turn drain does not re-fold the remapped
-                // (already-answered) users and spuriously re-run the turn (S3).
-                let header_insert_seq = Arc::new(AtomicU64::new(0));
-
                 run_agent_loop_with_nats_inner(
                     RunAgentLoopArgs {
                         cluster_key: &self.cluster,
@@ -124,26 +116,24 @@ impl WorkerRuntime {
                     }
                     .with_lease(Arc::clone(&lease))
                     .with_after_seq_observer(Arc::clone(&after_seq_observer))
-                    .with_header_insert_observer(Arc::clone(&header_insert_seq)),
+                    // The S2 header-insert migration re-maps this turn's
+                    // leading-user block onto the migration seq, which is ABOVE
+                    // the seed cursor. Point the observer at `turn_cursor` so
+                    // BOTH consumers skip the re-mapped block: the mid-round
+                    // injection callback (or round 2 re-injects the prompt this
+                    // turn is already answering) and, via `turn_cursor` below,
+                    // the end-of-turn drain (or it re-runs the answered turn).
+                    .with_header_insert_observer(Arc::clone(&turn_cursor)),
                 )
                 .await?;
 
                 // After turn completes, update activation high-water from turn_cursor.
-                // turn_cursor was updated by mid-round injection callback for any messages
-                // injected during multi-round tool execution.
+                // turn_cursor covers everything this turn consumed: the seed
+                // messages, the header-insert re-map, and any mid-round
+                // injection during multi-round tool execution.
                 let turn_cursor_val = turn_cursor.load(Ordering::SeqCst);
                 if turn_cursor_val > 0 {
                     activation_high_water = Some(activation_high_water.map_or(turn_cursor_val, |h| h.max(turn_cursor_val)));
-                }
-
-                // Advance past the header-insert migration seq (if any). The
-                // migration remaps this turn's leading-user block onto this seq,
-                // so treat it as consumed by this turn's answer.
-                let header_insert_val = header_insert_seq.load(Ordering::SeqCst);
-                if header_insert_val > 0 {
-                    activation_high_water = Some(
-                        activation_high_water.map_or(header_insert_val, |h| h.max(header_insert_val)),
-                    );
                 }
 
                 Self::record_session_turn_end(&backend, &lease, turn_cursor_val).await?;

@@ -938,6 +938,21 @@ fn append_injected_user_text(session: &mut Session, input: &Input) -> bool {
         return true;
     };
 
+    // `skip_user_log_append` marks an input whose user text was folded out of
+    // the durable log, so the log already holds this message and re-appending
+    // it is not just a duplicate row: the worker's mid-round fold would read
+    // the fresh copy as another unanswered message and inject it again, once
+    // more per remaining tool round. The in-memory push still has to happen —
+    // `session.messages` is loaded once per turn and is what carries the
+    // injected message into the following rounds' wire requests.
+    if input.skip_user_log_append {
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text(injected.to_string()),
+        ));
+        return true;
+    }
+
     let seq = session.next_seq();
     let injected_msg = Message::new(
         MessageRole::User,
@@ -1042,61 +1057,84 @@ pub(crate) fn expand_message_attachments(session: &Session, messages: &mut [Mess
     }
 }
 
+/// Drop the trailing assistant/tool messages so a regenerate re-answers from
+/// the last user message.
+fn trim_trailing_non_user(messages: &mut Vec<Message>) {
+    while messages.last().is_some_and(|last| !last.role.is_user()) {
+        messages.pop();
+    }
+}
+
+/// Whether the trailing `input.message_content()` user message must be
+/// suppressed because the history already carries that text.
+fn history_already_has_input_text(input: &Input, messages: &[Message]) -> bool {
+    // Mid-tool-round: the pending call/result pair is already in the history.
+    is_tool_continuation(input, messages)
+        // The NATS worker folds its user text out of the durable log, so the
+        // session loaded for this turn already ends with those messages.
+        // Pushing them again would send the prompt to the model twice — once
+        // per turn, since every worker turn derives its input the same way.
+        || input.skip_user_log_append
+}
+
+/// Replace any persisted leading system message with a freshly rendered one, so
+/// each turn sees current agent variables, resolved tools, and the active model
+/// selection (including fallbacks). Agent swaps after construction (e.g.
+/// compaction) also flow through here.
+fn inject_fresh_system_prompt(messages: &mut Vec<Message>, input: &Input) -> Result<()> {
+    if !input.inject_system_prompt() {
+        return Ok(());
+    }
+    let system_text = input
+        .agent()
+        .system_text_with_tools(input.resolved_tools.as_deref().unwrap_or_default())?;
+    // Drop leading system message(s) so only the freshly rendered prompt
+    // survives — including when a legacy transcript stored one but the current
+    // render is empty.
+    while matches!(messages.first().map(|m| m.role), Some(MessageRole::System)) {
+        messages.remove(0);
+    }
+    if !system_text.is_empty() {
+        messages.insert(
+            0,
+            Message::new(MessageRole::System, MessageContent::Text(system_text)),
+        );
+    }
+    Ok(())
+}
+
+/// Extend a single-message history with the tail of the compressed transcript
+/// from its last user message on, so a compacted session keeps recent context.
+fn extend_with_compressed_tail(session: &Session, messages: &mut Vec<Message>) {
+    if messages.len() != 1 || session.compressed_messages.len() < 2 {
+        return;
+    }
+    if let Some(index) = session
+        .compressed_messages
+        .iter()
+        .rposition(|v| v.role == MessageRole::User)
+    {
+        messages.extend(session.compressed_messages[index..].to_vec());
+    }
+}
+
 fn build_messages_inner(session: &Session, input: &Input) -> Result<Vec<Message>> {
     let mut messages = session.messages.clone();
     if input.continue_output().is_some() {
         return Ok(messages);
-    } else if input.regenerate() {
-        while let Some(last) = messages.last() {
-            if !last.role.is_user() {
-                messages.pop();
-            } else {
-                break;
-            }
-        }
+    }
+    if input.regenerate() {
+        trim_trailing_non_user(&mut messages);
         return Ok(messages);
     }
-    let mut need_add_msg = true;
-    let len = messages.len();
-    if len == 0 {
+    let need_add_msg = if messages.is_empty() {
         messages = input.agent().build_messages(input)?;
-        need_add_msg = false;
-    } else if len == 1 && session.compressed_messages.len() >= 2 {
-        if let Some(index) = session
-            .compressed_messages
-            .iter()
-            .rposition(|v| v.role == MessageRole::User)
-        {
-            messages.extend(session.compressed_messages[index..].to_vec());
-        }
-    }
-    // Continuation: suppress the duplicate user message only when the
-    // input is genuinely mid-tool-round — see `is_tool_continuation`.
-    if need_add_msg && is_tool_continuation(input, &messages) {
-        need_add_msg = false;
-    }
-    // System prompt is no longer persisted in session transcript.
-    // Inject it fresh here so each turn sees current agent variables,
-    // resolved tools, and active model selection (including fallbacks).
-    // Agent swaps after construction (e.g. compaction) also flow through
-    // this path via inject_system_prompt.
-    if input.inject_system_prompt() {
-        let system_text = input
-            .agent()
-            .system_text_with_tools(input.resolved_tools.as_deref().unwrap_or_default())?;
-        // Drop any leading system message(s) so only the freshly rendered
-        // prompt survives — including the case where a legacy transcript
-        // stored one but the current render is empty.
-        while matches!(messages.first().map(|m| m.role), Some(MessageRole::System)) {
-            messages.remove(0);
-        }
-        if !system_text.is_empty() {
-            messages.insert(
-                0,
-                Message::new(MessageRole::System, MessageContent::Text(system_text)),
-            );
-        }
-    }
+        false
+    } else {
+        extend_with_compressed_tail(session, &mut messages);
+        !history_already_has_input_text(input, &messages)
+    };
+    inject_fresh_system_prompt(&mut messages, input)?;
     if need_add_msg {
         messages.push(Message::new(MessageRole::User, input.message_content()));
     }
