@@ -3,6 +3,7 @@
 use super::{publish_control_command, ControlCommand};
 use crate::nats_session::{NatsSession, NatsSessionConfig, NatsTurnResult};
 use crate::nats_session_log::NatsSessionLog;
+use crate::nats_worker::SessionActivationRoute;
 use async_nats::jetstream;
 use async_trait::async_trait;
 use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, TurnEvent};
@@ -26,6 +27,30 @@ const OPERATION_TIMEOUT_ENV: &str = "HARNX_SUBAGENT_OPERATION_TIMEOUT_SECS";
 // `_session_new` has no arguments, so a fixed bootstrap message creates the
 // durable session and preserves blocking call-and-return semantics.
 const SESSION_NEW_INITIAL_PROMPT: &str = "Start a new session.";
+
+#[derive(Clone)]
+pub(crate) struct SubagentSessionRoute {
+    cluster: String,
+    activation: SessionActivationRoute,
+}
+
+impl SubagentSessionRoute {
+    pub(crate) fn new(cluster: impl Into<String>, activation: SessionActivationRoute) -> Self {
+        Self {
+            cluster: cluster.into(),
+            activation,
+        }
+    }
+
+    fn session_config(&self, agent: &str, session_id: Option<String>) -> NatsSessionConfig {
+        NatsSessionConfig {
+            cluster: self.cluster.clone(),
+            agent: agent.to_string(),
+            session_id,
+            activation_route: self.activation.clone(),
+        }
+    }
+}
 
 /// Timeout policy for blocking sub-agent turns.
 #[derive(Clone, Copy, Debug)]
@@ -66,7 +91,7 @@ fn timeout_from_env(name: &str, default_secs: u64) -> Duration {
 /// Four-tool NATS adapter for one configured agent.
 pub(crate) struct SubagentToolset {
     agent: String,
-    cluster: String,
+    route: SubagentSessionRoute,
     server_name: String,
     client: async_nats::Client,
     jetstream: jetstream::Context,
@@ -76,22 +101,16 @@ pub(crate) struct SubagentToolset {
 impl SubagentToolset {
     pub(crate) fn new(
         agent: impl Into<String>,
-        cluster: impl Into<String>,
+        route: SubagentSessionRoute,
         client: async_nats::Client,
         jetstream: jetstream::Context,
     ) -> Self {
-        Self::with_timeouts(
-            agent,
-            cluster,
-            client,
-            jetstream,
-            SubagentTimeouts::default(),
-        )
+        Self::with_timeouts(agent, route, client, jetstream, SubagentTimeouts::default())
     }
 
     pub(crate) fn with_timeouts(
         agent: impl Into<String>,
-        cluster: impl Into<String>,
+        route: SubagentSessionRoute,
         client: async_nats::Client,
         jetstream: jetstream::Context,
         timeouts: SubagentTimeouts,
@@ -103,7 +122,7 @@ impl SubagentToolset {
         Self {
             server_name: sanitize_for_tool_name(server_name),
             agent,
-            cluster: cluster.into(),
+            route,
             client,
             jetstream,
             timeouts,
@@ -115,11 +134,7 @@ impl SubagentToolset {
         session_id: Option<String>,
     ) -> Result<NatsSession, ToolInvokeError> {
         NatsSession::new(
-            NatsSessionConfig {
-                cluster: self.cluster.clone(),
-                agent: self.agent.clone(),
-                session_id,
-            },
+            self.route.session_config(&self.agent, session_id),
             self.client.clone(),
             self.jetstream.clone(),
             harnx_core::abort::create_abort_signal(),
@@ -614,6 +629,35 @@ mod tests {
                 "@ pkg__helper load {{ args.session_id | truncate(8, end='') }}",
                 "@ pkg__helper cancel {{ args.session_id | truncate(8, end='') }}",
             ]
+        );
+    }
+
+    #[test]
+    fn local_subagent_sessions_reuse_the_parent_workers_target_route() {
+        let activation = SessionActivationRoute::WorkerTargeted {
+            session_scope: "__local__".to_string(),
+            worker_id: "local-parent".to_string(),
+        };
+        let route = SubagentSessionRoute::new("__local__", activation.clone());
+
+        let config = route.session_config("helper", Some("child".to_string()));
+
+        assert_eq!(config.cluster, "__local__");
+        assert_eq!(config.agent, "helper");
+        assert_eq!(config.session_id.as_deref(), Some("child"));
+        assert_eq!(config.activation_route, activation);
+    }
+
+    #[test]
+    fn cloud_subagent_sessions_keep_cluster_shared_activation() {
+        let route = SubagentSessionRoute::new("prod", SessionActivationRoute::ClusterShared);
+
+        let config = route.session_config("helper", Some("child".to_string()));
+
+        assert_eq!(config.cluster, "prod");
+        assert_eq!(
+            config.activation_route,
+            SessionActivationRoute::ClusterShared
         );
     }
 }

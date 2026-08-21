@@ -17,6 +17,7 @@ pub(crate) fn load_remote_session_history(
                 cluster,
                 agent,
                 session_id: Some(session_id),
+                activation_route: harnx_runtime::SessionActivationRoute::ClusterShared,
             },
             config,
             harnx_runtime::utils::create_abort_signal(),

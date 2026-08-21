@@ -321,7 +321,11 @@ Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP
   - `{agent}_session_prompt`: Sends a prompt message (`message`, optional `session_id`) to a sub-agent session, returning the sub-agent's final text response. The parent session ID is propagated internally.
   - `{agent}_session_load`: Reads prior event history for an existing sub-agent session log.
   - `{agent}_session_cancel`: Cancels an in-flight prompt on a sub-agent session.
-- **Worker-agnostic execution**: Sub-agent turns route via standard NATS JetStream WorkQueue subjects (`WORK_NOTIFY_<cluster>`) and acquire distributed KV locks (`harnx_leases`). Execution can run on any available worker in a cluster.
+- **Route-aware execution**: On persistent clusters, sub-agent turns use the
+  cluster-shared JetStream work queue (`WORK_NOTIFY_<cluster>`) and may run on
+  any available worker. A frontend-owned local worker targets nested
+  activations back to its own worker ID. Distributed `harnx_leases` still
+  ensure exactly one active holder per session in either topology.
 - **Timeout protection**: Sub-agent tool calls run synchronously from the parent agent's perspective. Turn execution is bounded by idle and operation timeouts (`HARNX_SUBAGENT_IDLE_TIMEOUT_SECS` defaulting to 300s, `HARNX_SUBAGENT_OPERATION_TIMEOUT_SECS` defaulting to 3600s).
 
 ### Sub-Agent Tool Result Marker

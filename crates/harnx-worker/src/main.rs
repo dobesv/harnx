@@ -5,8 +5,8 @@
 //! worker as its own binary keeps it out of the front-end's dep graph and lets
 //! deployments run workers without the TUI.
 
-use anyhow::Result;
-use clap::Parser;
+use anyhow::{bail, Result};
+use clap::{ArgGroup, Parser};
 use harnx_core::agent_config::collect_agent_variables;
 use harnx_core::logging::LogSink;
 use harnx_runtime::bootstrap::setup_logger;
@@ -24,16 +24,19 @@ static GLOBAL_ALLOC: harnx_core::alloc_guard::HeapGuard = harnx_core::alloc_guar
 #[command(
     author,
     version,
-    about = "Run a worker daemon for a configured or shared-local NATS cluster",
-    long_about = None
+    about = "Run a persistent-cluster or frontend-managed local worker daemon",
+    long_about = None,
+    group(ArgGroup::new("connection_mode").required(true).args(["cluster", "session_scope"]))
 )]
 struct Cli {
-    /// Cluster key from nats_servers/<name>.yaml, or __local__ with
-    /// HARNX_NATS_URL and HARNX_NATS_TOKEN handoff
-    #[arg(long)]
-    cluster: String,
-    /// Stable worker identity for leases and the durable consumer name.
-    /// Defaults to a generated id if omitted.
+    /// Persistent cluster key from nats_servers/<name>.yaml.
+    #[arg(long, conflicts_with = "session_scope")]
+    cluster: Option<String>,
+    /// Frontend-managed local session scope using the NATS environment handoff.
+    #[arg(long, conflicts_with = "cluster")]
+    session_scope: Option<String>,
+    /// Worker identity for leases and dispatch. Required for local serving;
+    /// generated when omitted for a persistent cluster.
     #[arg(long)]
     worker_id: Option<String>,
     /// Set agent variable pairs (format: --agent-variable key value or -x key value); can be repeated
@@ -50,10 +53,80 @@ struct Cli {
     manage_servers: bool,
 }
 
+impl Cli {
+    fn validate(&self) -> Result<()> {
+        if self.cluster.as_deref() == Some(harnx_runtime::config::LOCAL_CLUSTER_KEY) {
+            bail!(
+                "--cluster {} is reserved for frontend-managed workers; use --session-scope {}",
+                harnx_runtime::config::LOCAL_CLUSTER_KEY,
+                harnx_runtime::config::LOCAL_CLUSTER_KEY
+            );
+        }
+        if let Some(scope) = &self.session_scope {
+            self.validate_local_scope(scope)?;
+        }
+        if self.diagnose && self.session_scope.is_none() {
+            bail!(
+                "--diagnose is available through --session-scope {}",
+                harnx_runtime::config::LOCAL_CLUSTER_KEY
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_local_scope(&self, scope: &str) -> Result<()> {
+        if scope != harnx_runtime::config::LOCAL_CLUSTER_KEY {
+            bail!(
+                "--session-scope currently accepts only {}",
+                harnx_runtime::config::LOCAL_CLUSTER_KEY
+            );
+        }
+        if !self.diagnose {
+            self.validate_local_serving()?;
+        }
+        Ok(())
+    }
+
+    fn validate_local_serving(&self) -> Result<()> {
+        if self.worker_id.is_none() {
+            bail!("local serving requires --worker-id");
+        }
+        if !self.manage_servers {
+            bail!("local serving requires --manage-servers");
+        }
+        Ok(())
+    }
+
+    fn daemon_config(&self) -> Result<harnx_runtime::nats_worker::WorkerDaemonConfig> {
+        self.validate()?;
+        if self.session_scope.is_some() {
+            return harnx_runtime::nats_worker::WorkerDaemonConfig::local(
+                self.worker_id
+                    .clone()
+                    .expect("validated local serving worker id"),
+            );
+        }
+        let cluster = self
+            .cluster
+            .clone()
+            .expect("clap requires a connection mode");
+        let worker_id = self
+            .worker_id
+            .clone()
+            .unwrap_or_else(harnx_runtime::nats_worker::new_worker_id);
+        Ok(if self.manage_servers {
+            harnx_runtime::nats_worker::WorkerDaemonConfig::managing(cluster, worker_id)
+        } else {
+            harnx_runtime::nats_worker::WorkerDaemonConfig::new(cluster, worker_id)
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     load_env_file()?;
     let cli = Cli::parse();
+    cli.validate()?;
     setup_logger(LogSink::Stderr)?;
     harnx_core::alloc_guard::init_from_env();
 
@@ -67,14 +140,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let worker_id = cli
-        .worker_id
-        .unwrap_or_else(harnx_runtime::nats_worker::new_remote_session_id);
-    let daemon = if cli.manage_servers {
-        harnx_runtime::nats_worker::WorkerDaemonConfig::managing(cli.cluster, worker_id)
-    } else {
-        harnx_runtime::nats_worker::WorkerDaemonConfig::new(cli.cluster, worker_id)
-    };
+    let daemon = cli.daemon_config()?;
     // `None` selects the agent loop's default call path
     // (`call_with_retry_and_fallback`), which is what the worker wants.
     harnx_runtime::nats_worker::run_worker_daemon(config, daemon, None).await
@@ -99,7 +165,7 @@ mod tests {
             "false",
         ])
         .unwrap();
-        assert_eq!(cli.cluster, "prod");
+        assert_eq!(cli.cluster.as_deref(), Some("prod"));
         assert_eq!(cli.worker_id, None);
         assert_eq!(
             cli.agent_variable,
@@ -114,10 +180,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_worker_id_and_diagnose() {
+    fn parses_local_diagnose() {
         let cli = Cli::try_parse_from([
             "harnx-worker",
-            "--cluster",
+            "--session-scope",
             "__local__",
             "--worker-id",
             "local",
@@ -126,6 +192,7 @@ mod tests {
         .unwrap();
         assert_eq!(cli.worker_id.as_deref(), Some("local"));
         assert!(cli.diagnose);
+        cli.validate().expect("local diagnose is supported");
     }
 
     #[test]
@@ -136,5 +203,66 @@ mod tests {
         let cli =
             Cli::try_parse_from(["harnx-worker", "--cluster", "prod", "--manage-servers"]).unwrap();
         assert!(cli.manage_servers);
+    }
+
+    #[test]
+    fn connection_modes_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from([
+            "harnx-worker",
+            "--cluster",
+            "prod",
+            "--session-scope",
+            "__local__"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_reserved_local_cluster() {
+        let cli = Cli::try_parse_from(["harnx-worker", "--cluster", "__local__"]).unwrap();
+        let error = cli.validate().expect_err("reserved cluster must fail");
+        assert!(error.to_string().contains("--session-scope __local__"));
+    }
+
+    #[test]
+    fn local_serving_requires_worker_id_and_manage_servers() {
+        let missing_both =
+            Cli::try_parse_from(["harnx-worker", "--session-scope", "__local__"]).unwrap();
+        assert!(missing_both
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("--worker-id"));
+
+        let missing_manage = Cli::try_parse_from([
+            "harnx-worker",
+            "--session-scope",
+            "__local__",
+            "--worker-id",
+            "local-test",
+        ])
+        .unwrap();
+        assert!(missing_manage
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("--manage-servers"));
+    }
+
+    #[test]
+    fn local_scope_rejects_other_values() {
+        let cli =
+            Cli::try_parse_from(["harnx-worker", "--session-scope", "prod", "--diagnose"]).unwrap();
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn diagnose_uses_the_local_session_scope_mode() {
+        let cli = Cli::try_parse_from(["harnx-worker", "--cluster", "prod", "--diagnose"]).unwrap();
+        assert!(cli
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("--session-scope __local__"));
     }
 }

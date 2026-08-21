@@ -54,7 +54,6 @@ reqwest-eventsource = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-sha2 = { workspace = true }
 shell-words = { workspace = true }
 shellexpand = { workspace = true }
 time = { workspace = true }
@@ -80,7 +79,6 @@ arboard = { workspace = true, features = ["wayland-data-control"] }
 arboard = { workspace = true }
 
 [dev-dependencies]
-filetime = "0.2"
 insta = { version = "1", features = ["yaml"] }
 pretty_assertions = "1.4.0"
 tempfile = "3"

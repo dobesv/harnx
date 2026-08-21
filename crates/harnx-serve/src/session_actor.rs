@@ -32,7 +32,7 @@ use harnx_core::{
 use harnx_runtime::{
     config::{self, Config, GlobalConfig, LOCAL_CLUSTER_KEY},
     continue_agent_loop_from_tool_round,
-    local_orchestrator::{ensure_local_worker, LocalWorkerSupervisor},
+    local_orchestrator::{activation_route_for_cluster, LocalWorkerSupervisor},
     AgentCallFn, AgentLoopContext, NatsSession, NatsSessionConfig, OnToolRoundFn,
     ToolApprovalDecision, ToolApprovalInterrupt, ToolUseConfirmation,
 };
@@ -168,15 +168,18 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
         .await;
     }
 
-    {
-        let mut supervisor = params.local_worker.lock().await;
-        ensure_local_worker(&mut supervisor, params.abort_signal.clone()).await?;
-    }
+    let activation_route = activation_route_for_cluster(
+        LOCAL_CLUSTER_KEY,
+        &params.local_worker,
+        params.abort_signal.clone(),
+    )
+    .await?;
     let session = NatsSession::from_global_config(
         NatsSessionConfig {
             cluster: LOCAL_CLUSTER_KEY.to_string(),
             agent: params.agent,
             session_id: Some(params.session_id),
+            activation_route,
         },
         &params.prompt_config,
         params.abort_signal,

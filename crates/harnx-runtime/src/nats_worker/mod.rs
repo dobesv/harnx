@@ -21,11 +21,14 @@
 //! - Adds minimal changes to the loop (just the backend enum check in Config)
 //! - Supports future HA/lease wraps around the same `session_log_backend` seam
 
+mod activation;
+mod activation_transport;
 mod agent_loop;
 mod backend;
 mod control;
 mod daemon;
 mod daemon_background;
+mod daemon_config;
 mod daemon_runtime;
 mod daemon_session_exec;
 mod daemon_turn_input;
@@ -53,8 +56,11 @@ pub use agent_loop::{
 pub use backend::{FencedSessionLogSink, NatsSessionLogBackend};
 pub use control::{control_subject, publish_control_command, ControlCommand};
 pub use daemon::{
-    new_remote_session_id, notify_subject, publish_session_activate, resolve_worker_scope,
-    run_worker_daemon, worker_ready_subject, SessionActivate, WorkerDaemonConfig,
+    new_remote_session_id, new_worker_id, notify_subject, publish_session_activate,
+    publish_targeted_session_activate, resolve_worker_scope, run_worker_daemon,
+    targeted_consumer_name, targeted_notify_subject, targeted_worker_ready_subject,
+    validate_worker_id, worker_ready_subject, LocalWorkerTarget, NatsConnectionSource,
+    SessionActivate, SessionActivationRoute, WorkerActivationMode, WorkerDaemonConfig,
 };
 #[doc(hidden)]
 pub use daemon_background::start_local_tool_servers_for_test;

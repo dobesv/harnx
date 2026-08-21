@@ -1,20 +1,21 @@
-//! Shared-local worker subprocess supervision.
+//! Frontend-owned local worker subprocess supervision.
 //!
-//! One front-end owns the worker through `worker.lock`; other front-ends join
-//! the same broker and wait for that worker's readiness heartbeat.
+//! Frontends share the local NATS broker and durable session state, but each
+//! supervisor owns exactly one targeted worker for its process lifetime.
 
 use crate::config::{
     HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV, HARNX_WORKER_BIN_ENV, LOCAL_CLUSTER_KEY,
 };
 use crate::nats_local_server::{ensure_shared_server, SharedNatsServer};
-use crate::nats_worker::worker_ready_subject;
+use crate::nats_worker::{
+    targeted_worker_ready_subject, validate_worker_id, LocalWorkerTarget, SessionActivationRoute,
+};
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
 use harnx_core::abort::AbortSignal;
-use harnx_core::config_paths::nats_runtime_dir;
 use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::sink::emit_agent_event;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -23,34 +24,49 @@ use tokio::process::{Child, Command};
 
 const READINESS_POLL_INITIAL: Duration = Duration::from_millis(50);
 const READINESS_POLL_MAX: Duration = Duration::from_millis(500);
-const JOINER_READY_TTL: Duration = Duration::from_secs(3);
-const LOCAL_WORKER_ID: &str = "local";
-/// How long the worker may take before the user is told it is still starting.
 const WORKER_SLOW_NOTICE_AFTER: Duration = Duration::from_secs(5);
-/// Spacing of the reminders that follow the first one.
 const WORKER_SLOW_NOTICE_INTERVAL: Duration = Duration::from_secs(10);
-/// Consecutive worker exits tolerated before the wait is declared hopeless.
 const MAX_WORKER_CRASHES: u32 = 3;
-/// Bytes of worker output shown when startup gives up.
 const WORKER_OUTPUT_TAIL_BYTES: u64 = 4096;
 
-/// Name of the worker executable front-ends spawn.
 const WORKER_BINARY: &str = if cfg!(windows) {
     "harnx-worker.exe"
 } else {
     "harnx-worker"
 };
 
-/// Path used to elect one local worker owner per user/broker.
-pub fn local_worker_lock_file() -> PathBuf {
-    nats_runtime_dir().join("worker.lock")
+/// The stable activation target owned by one frontend supervisor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalWorkerRoute {
+    session_scope: String,
+    worker_id: String,
 }
 
-/// Locate the `harnx-worker` binary a front-end should spawn.
-///
-/// `HARNX_WORKER_BIN` wins, then a sibling of the running front-end, then
-/// `PATH`. The sibling case is what makes an ordinary install work: front-end
-/// and worker land in the same `bin` directory, so neither has to be on `PATH`.
+impl LocalWorkerRoute {
+    fn new() -> Self {
+        Self {
+            session_scope: LOCAL_CLUSTER_KEY.to_string(),
+            worker_id: format!("local-{}", uuid::Uuid::new_v4()),
+        }
+    }
+
+    pub fn session_scope(&self) -> &str {
+        &self.session_scope
+    }
+
+    pub fn worker_id(&self) -> &str {
+        &self.worker_id
+    }
+
+    pub fn activation_route(&self) -> SessionActivationRoute {
+        SessionActivationRoute::WorkerTargeted {
+            session_scope: self.session_scope.clone(),
+            worker_id: self.worker_id.clone(),
+        }
+    }
+}
+
+/// Locate the `harnx-worker` binary a frontend should spawn.
 pub fn resolve_worker_binary() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os(HARNX_WORKER_BIN_ENV) {
         let path = PathBuf::from(path);
@@ -67,7 +83,6 @@ pub fn resolve_worker_binary() -> Result<PathBuf> {
     let directory = current
         .parent()
         .context("current frontend executable has no parent directory")?;
-    // Integration tests run from `target/debug/deps`; the worker sits one level up.
     let directory = if directory.file_name().is_some_and(|name| name == "deps") {
         directory
             .parent()
@@ -89,60 +104,54 @@ pub fn resolve_worker_binary() -> Result<PathBuf> {
     })
 }
 
-/// Keeps the shared broker alive and owns a worker subprocess when this
-/// front-end wins `worker.lock`.
+/// Keeps the shared broker alive and owns one frontend-affine worker process.
 pub struct LocalWorkerSupervisor {
     server: SharedNatsServer,
     worker_binary: PathBuf,
-    lock_file: Option<File>,
-    owns_lock: bool,
+    route: LocalWorkerRoute,
     child: Option<Child>,
-    last_confirmed_ready: Option<Instant>,
-    confirmed_config_fingerprint: Option<String>,
-    confirmed_executable_fingerprint: Option<String>,
-    spawned_config_fingerprint: Option<String>,
-    spawned_executable_fingerprint: Option<String>,
-    /// Owned workers that exited during the current readiness wait.
     crashes: u32,
 }
 
-struct ExpectedWorkerIdentity {
-    config_fingerprint: String,
-    executable_fingerprint: String,
-}
-
-enum ReadinessStatus {
-    Ready,
-    Pending,
-}
-
-/// Lazily starts or re-checks a front-end's process-lifetime local worker.
-///
-/// Front-ends keep the `Option` alive for their own lifetime. Repeated calls are
-/// cheap and respawn an owned worker when it has exited.
+/// Lazily start or re-check a frontend's process-lifetime local worker and
+/// return its stable activation route.
 pub async fn ensure_local_worker(
     supervisor: &mut Option<LocalWorkerSupervisor>,
     abort_signal: AbortSignal,
-) -> Result<()> {
+) -> Result<LocalWorkerRoute> {
     match supervisor {
         Some(supervisor) => supervisor.ensure(abort_signal).await,
         slot @ None => {
-            *slot = Some(LocalWorkerSupervisor::start(abort_signal).await?);
-            Ok(())
+            let started = LocalWorkerSupervisor::start(abort_signal).await?;
+            let route = started.route().clone();
+            *slot = Some(started);
+            Ok(route)
         }
     }
 }
 
+/// Resolve how a frontend should activate sessions on `cluster`, starting its
+/// frontend-owned worker only for the reserved local scope.
+pub async fn activation_route_for_cluster(
+    cluster: &str,
+    supervisor: &tokio::sync::Mutex<Option<LocalWorkerSupervisor>>,
+    abort_signal: AbortSignal,
+) -> Result<SessionActivationRoute> {
+    if cluster != LOCAL_CLUSTER_KEY {
+        return Ok(SessionActivationRoute::ClusterShared);
+    }
+    let mut supervisor = supervisor.lock().await;
+    ensure_local_worker(&mut supervisor, abort_signal)
+        .await
+        .context("failed to ensure local NATS worker")
+        .map(|route| route.activation_route())
+}
+
 impl LocalWorkerSupervisor {
-    /// Ensure the shared broker and local worker using the `harnx-worker`
-    /// executable found next to the running front-end.
     pub async fn start(abort_signal: AbortSignal) -> Result<Self> {
         Self::start_with_worker_binary(resolve_worker_binary()?, abort_signal).await
     }
 
-    /// Ensure the shared broker and local worker using an explicit
-    /// `harnx-worker` binary. Integration tests use this when the worker they
-    /// want is not the one discovery would pick.
     pub async fn start_with_worker_binary(
         binary: impl AsRef<Path>,
         abort_signal: AbortSignal,
@@ -152,115 +161,41 @@ impl LocalWorkerSupervisor {
             .as_ref()
             .canonicalize()
             .with_context(|| format!("resolve worker binary {}", binary.as_ref().display()))?;
-        let lock_file = open_worker_lock()?;
-        let owns_lock = crate::file_lock::try_lock_exclusive(&lock_file)
-            .context("acquire local worker lock")?;
+        let route = LocalWorkerRoute::new();
+        validate_worker_id(route.worker_id())?;
         let mut supervisor = Self {
             server,
             worker_binary,
-            lock_file: Some(lock_file),
-            owns_lock,
+            route,
             child: None,
-            last_confirmed_ready: None,
-            confirmed_config_fingerprint: None,
-            confirmed_executable_fingerprint: None,
-            spawned_config_fingerprint: None,
-            spawned_executable_fingerprint: None,
             crashes: 0,
         };
         supervisor.ensure(abort_signal).await?;
         Ok(supervisor)
     }
 
-    /// Check worker health, respawn an exited owned worker, or take ownership
-    /// after another front-end releases `worker.lock`. Returns only after a
-    /// post-consumer readiness marker is observed.
-    pub async fn ensure(&mut self, abort_signal: AbortSignal) -> Result<()> {
-        let expected = self.current_expected_identity().await?;
-        if self.owned_child_is_running()? {
-            if self.spawned_config_fingerprint.as_deref() == Some(&expected.config_fingerprint)
-                && self.spawned_executable_fingerprint.as_deref()
-                    == Some(&expected.executable_fingerprint)
-            {
-                return Ok(());
-            }
-            log::info!(
-                "local worker inputs changed: config={} -> {} executable={} -> {}; restarting owned worker",
-                self.spawned_config_fingerprint
-                    .as_deref()
-                    .map(crate::worker_identity::short_fingerprint)
-                    .unwrap_or("unknown"),
-                crate::worker_identity::short_fingerprint(&expected.config_fingerprint),
-                self.spawned_executable_fingerprint
-                    .as_deref()
-                    .map(crate::worker_identity::short_fingerprint)
-                    .unwrap_or("unknown"),
-                crate::worker_identity::short_fingerprint(&expected.executable_fingerprint),
-            );
-            self.stop_owned_worker().await?;
-        }
-        if self.recently_confirmed(&expected) {
-            return Ok(());
+    /// Check health and respawn this supervisor's worker after a crash.
+    /// Running workers are never restarted for binary or configuration changes.
+    pub async fn ensure(&mut self, abort_signal: AbortSignal) -> Result<LocalWorkerRoute> {
+        if self.child_is_running()? {
+            return Ok(self.route.clone());
         }
 
-        let readiness = self.subscribe_to_readiness().await?;
+        // Subscribe before spawning so a fast worker cannot publish its first
+        // readiness marker between spawn and subscription setup.
+        let mut readiness = self.subscribe_to_readiness().await?;
         self.crashes = 0;
-        self.ensure_worker_ownership(&expected)?;
-        self.wait_for_readiness(readiness, abort_signal, &expected)
+        let expected_pid = self.spawn_worker()?;
+        self.wait_for_readiness(&mut readiness, expected_pid, abort_signal)
             .await
     }
 
-    async fn subscribe_to_readiness(&self) -> Result<async_nats::Subscriber> {
-        let client = async_nats::ConnectOptions::new()
-            .token(self.server.token.clone())
-            .connect(&self.server.url)
-            .await
-            .context("connect local worker readiness client")?;
-        let readiness = client
-            .subscribe(worker_ready_subject(LOCAL_CLUSTER_KEY))
-            .await
-            .context("subscribe to local worker readiness")?;
-        client
-            .flush()
-            .await
-            .context("flush local worker readiness subscription")?;
-        Ok(readiness)
-    }
-
-    fn ensure_worker_ownership(&mut self, expected: &ExpectedWorkerIdentity) -> Result<()> {
-        if self.owns_lock {
-            if !self.owned_child_is_running()? {
-                self.spawn_worker(expected)?;
-            }
-            return Ok(());
-        }
-        let acquired = crate::file_lock::try_lock_exclusive(
-            self.lock_file
-                .as_ref()
-                .expect("worker lock file must exist while supervisor is alive"),
-        )
-        .context("retry local worker lock")?;
-        if acquired {
-            self.owns_lock = true;
-            self.spawn_worker(expected)?;
-        }
-        Ok(())
-    }
-
-    /// Wait for the worker's readiness heartbeat, retrying until it arrives or
-    /// the user aborts.
-    ///
-    /// A worker that is merely slow gets unlimited time — startup cost scales
-    /// with the user's agent and tool-server count, so any fixed deadline is
-    /// wrong for someone. A worker that keeps *exiting* is a different failure:
-    /// retrying cannot help, so give up after [`MAX_WORKER_CRASHES`] and show
-    /// what it printed.
     async fn wait_for_readiness(
         &mut self,
-        mut readiness: async_nats::Subscriber,
+        readiness: &mut async_nats::Subscriber,
+        mut expected_pid: u32,
         abort_signal: AbortSignal,
-        expected: &ExpectedWorkerIdentity,
-    ) -> Result<()> {
+    ) -> Result<LocalWorkerRoute> {
         let started = Instant::now();
         let mut poll = READINESS_POLL_INITIAL;
         let mut next_notice = WORKER_SLOW_NOTICE_AFTER;
@@ -268,17 +203,12 @@ impl LocalWorkerSupervisor {
             if abort_signal.aborted() {
                 bail!("cancelled while waiting for the local worker to start");
             }
-            match self.poll_readiness(&mut readiness, poll, expected).await? {
-                ReadinessStatus::Ready => return Ok(()),
-                ReadinessStatus::Pending => {}
-            }
 
-            if self.crashes >= MAX_WORKER_CRASHES {
-                bail!(
-                    "local worker exited {} times without becoming ready:\n{}",
-                    self.crashes,
-                    worker_output_tail()
-                );
+            if let Some(route) = self
+                .poll_readiness(readiness, poll, &mut expected_pid)
+                .await?
+            {
+                return Ok(route);
             }
 
             let waited = started.elapsed();
@@ -294,184 +224,151 @@ impl LocalWorkerSupervisor {
         &mut self,
         readiness: &mut async_nats::Subscriber,
         poll: Duration,
-        expected: &ExpectedWorkerIdentity,
-    ) -> Result<ReadinessStatus> {
+        expected_pid: &mut u32,
+    ) -> Result<Option<LocalWorkerRoute>> {
         match tokio::time::timeout(poll, readiness.next()).await {
-            Ok(Some(message)) => self.readiness_status(&message.payload, expected),
+            Ok(Some(message)) => self.accept_readiness(&message.payload, *expected_pid),
             Ok(None) => bail!("local worker readiness subscription closed"),
             Err(_) => {
-                self.ensure_worker_ownership(expected)?;
-                Ok(ReadinessStatus::Pending)
+                self.respawn_if_needed(expected_pid)?;
+                Ok(None)
             }
         }
-    }
-
-    fn readiness_status(
-        &mut self,
-        payload: &[u8],
-        expected: &ExpectedWorkerIdentity,
-    ) -> Result<ReadinessStatus> {
-        match self.accept_readiness(payload, expected) {
-            Ok(()) => Ok(ReadinessStatus::Ready),
-            Err(error) if self.owns_lock => {
-                log::warn!(
-                    "ignoring stale local worker readiness while waiting for the owned worker: {error:#}"
-                );
-                self.ensure_worker_ownership(expected)?;
-                Ok(ReadinessStatus::Pending)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn recently_confirmed(&self, expected: &ExpectedWorkerIdentity) -> bool {
-        if self.owns_lock {
-            return false;
-        }
-        let fresh = self
-            .last_confirmed_ready
-            .is_some_and(|ready| ready.elapsed() < JOINER_READY_TTL);
-        fresh
-            && self.confirmed_config_fingerprint.as_deref() == Some(&expected.config_fingerprint)
-            && self.confirmed_executable_fingerprint.as_deref()
-                == Some(&expected.executable_fingerprint)
     }
 
     fn accept_readiness(
-        &mut self,
-        payload: &[u8],
-        expected: &ExpectedWorkerIdentity,
-    ) -> Result<()> {
-        let identity =
-            crate::worker_identity::WorkerIdentity::from_payload(payload).with_context(|| {
-                "active local worker is too old to verify; restart the frontend that owns it"
-            })?;
-        self.validate_worker_identity(&identity, expected)?;
-        log::info!(
-            "local worker ready: worker_id={} pid={} build={} executable={} config={}",
-            identity.worker_id,
-            identity.pid,
-            identity.build,
-            crate::worker_identity::short_fingerprint(&identity.executable_fingerprint),
-            crate::worker_identity::short_fingerprint(&identity.config_fingerprint),
-        );
-        self.last_confirmed_ready = Some(Instant::now());
-        self.confirmed_config_fingerprint = Some(identity.config_fingerprint);
-        self.confirmed_executable_fingerprint = Some(identity.executable_fingerprint);
-        Ok(())
-    }
-
-    fn validate_worker_identity(
         &self,
-        identity: &crate::worker_identity::WorkerIdentity,
-        expected: &ExpectedWorkerIdentity,
-    ) -> Result<()> {
-        if identity.build != crate::worker_identity::current_build() {
-            return Err(stale_worker_error(identity, expected));
+        payload: &[u8],
+        expected_pid: u32,
+    ) -> Result<Option<LocalWorkerRoute>> {
+        let record = crate::worker_identity::WorkerReadiness::from_payload(payload)
+            .and_then(|record| {
+                record
+                    .validate_route(self.route.session_scope(), self.route.worker_id())
+                    .map(|()| record)
+            })
+            .with_context(|| {
+                format!(
+                    "reject readiness from local worker {}",
+                    self.route.worker_id()
+                )
+            })?;
+        if !record.has_pid(expected_pid) {
+            log::debug!(
+                "ignoring stale local worker readiness: worker_id={} expected_pid={} marker_pid={}",
+                self.route.worker_id(),
+                expected_pid,
+                record.pid,
+            );
+            return Ok(None);
         }
-        if identity.config_fingerprint != expected.config_fingerprint
-            || identity.executable_fingerprint != expected.executable_fingerprint
-        {
-            return Err(stale_worker_error(identity, expected));
+        log::info!(
+            "local worker ready: session_scope={} worker_id={} pid={} build={}",
+            record.session_scope,
+            record.worker_id,
+            record.pid,
+            record.build,
+        );
+        Ok(Some(self.route.clone()))
+    }
+
+    fn respawn_if_needed(&mut self, expected_pid: &mut u32) -> Result<()> {
+        if self.child_is_running()? {
+            return Ok(());
         }
+        if self.crashes >= MAX_WORKER_CRASHES {
+            bail!(
+                "local worker exited {} times without becoming ready:\n{}",
+                self.crashes,
+                worker_output_tail()
+            );
+        }
+        *expected_pid = self.spawn_worker()?;
         Ok(())
     }
 
-    /// Whether this front-end owns `worker.lock` and therefore the subprocess.
-    pub fn is_worker_owner(&self) -> bool {
-        self.owns_lock
+    async fn subscribe_to_readiness(&self) -> Result<async_nats::Subscriber> {
+        let client = async_nats::ConnectOptions::new()
+            .token(self.server.token.clone())
+            .connect(&self.server.url)
+            .await
+            .context("connect local worker readiness client")?;
+        let subject = targeted_worker_ready_subject(LocalWorkerTarget::new(
+            self.route.session_scope(),
+            self.route.worker_id(),
+        )?);
+        let readiness = client
+            .subscribe(subject)
+            .await
+            .context("subscribe to targeted local worker readiness")?;
+        client
+            .flush()
+            .await
+            .context("flush local worker readiness subscription")?;
+        Ok(readiness)
     }
 
-    /// PID of this supervisor's worker, if it owns one.
-    pub fn worker_pid(&self) -> Option<u32> {
-        self.child.as_ref().and_then(Child::id)
-    }
-
-    /// Shared broker connection details retained for supervisor lifetime.
-    pub fn server(&self) -> &SharedNatsServer {
-        &self.server
-    }
-
-    fn owned_child_is_running(&mut self) -> Result<bool> {
+    fn child_is_running(&mut self) -> Result<bool> {
         let Some(child) = self.child.as_mut() else {
             return Ok(false);
         };
         match child.try_wait().context("check local worker status")? {
             None => Ok(true),
             Some(status) => {
-                log::warn!("local worker exited with {status}; respawning");
+                log::warn!(
+                    "local worker {} exited with {status}; respawning",
+                    self.route.worker_id()
+                );
                 self.child = None;
-                self.spawned_config_fingerprint = None;
-                self.spawned_executable_fingerprint = None;
                 self.crashes = self.crashes.saturating_add(1);
                 Ok(false)
             }
         }
     }
 
-    fn spawn_worker(&mut self, expected: &ExpectedWorkerIdentity) -> Result<()> {
-        if self.child.is_some() {
-            return Ok(());
-        }
-        let mut command =
-            build_local_worker_command(&self.worker_binary, &self.server.url, &self.server.token);
-        self.child = Some(command.spawn().with_context(|| {
-            format!("spawn local worker from {}", self.worker_binary.display())
-        })?);
-        self.spawned_config_fingerprint = Some(expected.config_fingerprint.clone());
-        self.spawned_executable_fingerprint = Some(expected.executable_fingerprint.clone());
-        Ok(())
+    fn spawn_worker(&mut self) -> Result<u32> {
+        debug_assert!(self.child.is_none());
+        let mut command = build_local_worker_command(
+            &self.worker_binary,
+            self.route.worker_id(),
+            &self.server.url,
+            &self.server.token,
+        );
+        let child = command
+            .spawn()
+            .with_context(|| format!("spawn local worker from {}", self.worker_binary.display()))?;
+        let pid = child.id().context("spawned local worker has no PID")?;
+        self.child = Some(child);
+        Ok(pid)
     }
 
-    async fn current_expected_identity(&self) -> Result<ExpectedWorkerIdentity> {
-        let worker_binary = self.worker_binary.clone();
-        tokio::task::spawn_blocking(move || {
-            Ok(ExpectedWorkerIdentity {
-                config_fingerprint: crate::worker_identity::config_fingerprint()?,
-                executable_fingerprint: crate::worker_identity::executable_fingerprint(
-                    &worker_binary,
-                )?,
-            })
-        })
-        .await
-        .context("join expected local worker identity fingerprint task")?
+    pub fn worker_pid(&self) -> Option<u32> {
+        self.child.as_ref().and_then(Child::id)
     }
 
-    async fn stop_owned_worker(&mut self) -> Result<()> {
-        let Some(mut child) = self.child.take() else {
-            return Ok(());
-        };
-        signal_worker_tree(&mut child);
-        child.wait().await.context("wait for stale local worker")?;
-        self.last_confirmed_ready = None;
-        self.confirmed_config_fingerprint = None;
-        self.confirmed_executable_fingerprint = None;
-        self.spawned_config_fingerprint = None;
-        self.spawned_executable_fingerprint = None;
-        Ok(())
+    pub fn route(&self) -> &LocalWorkerRoute {
+        &self.route
+    }
+
+    pub fn server(&self) -> &SharedNatsServer {
+        &self.server
     }
 }
 
-/// Build the local worker subprocess command.
-///
-/// `--manage-servers` is what keeps local behavior unchanged now that the
-/// worker no longer infers "launch my own tool/hook servers" from the cluster
-/// key: the front-end owns the local worker's whole lifecycle, so it always
-/// wants the all-in-one shape. Split out (rather than inlined in
-/// `spawn_worker`) so a test can assert on the constructed argv without
-/// spawning a real process or a live broker.
+/// Build the frontend-managed local worker subprocess command.
 #[doc(hidden)]
 pub fn build_local_worker_command(
     worker_binary: &Path,
+    worker_id: &str,
     nats_url: &str,
     nats_token: &str,
 ) -> Command {
     let mut command = Command::new(worker_binary);
     command
-        .arg("--cluster")
+        .arg("--session-scope")
         .arg(LOCAL_CLUSTER_KEY)
         .arg("--worker-id")
-        .arg(LOCAL_WORKER_ID)
+        .arg(worker_id)
         .arg("--manage-servers")
         .env(HARNX_NATS_URL_ENV, nats_url)
         .env(HARNX_NATS_TOKEN_ENV, nats_token)
@@ -489,19 +386,9 @@ impl Drop for LocalWorkerSupervisor {
             return;
         };
         signal_worker_tree(&mut child);
-
-        // Keep the lock descriptor alive until the child is reaped. This prevents
-        // another front-end from spawning a replacement while shutdown is still
-        // in progress, without blocking the caller's async runtime thread.
-        let lock_file = self.owns_lock.then(|| {
-            self.lock_file
-                .take()
-                .expect("worker owner must retain its lock file")
-        });
         let _ = std::thread::Builder::new()
             .name("harnx-worker-reaper".to_string())
             .spawn(move || {
-                let _lock_file = lock_file;
                 while matches!(child.try_wait(), Ok(None)) {
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -512,7 +399,6 @@ impl Drop for LocalWorkerSupervisor {
 fn signal_worker_tree(child: &mut Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
-        // Negative PID addresses the worker's dedicated process group.
         // SAFETY: kill is async-signal-safe and the PID came from Child.
         unsafe {
             libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
@@ -521,32 +407,12 @@ fn signal_worker_tree(child: &mut Child) {
     let _ = child.start_kill();
 }
 
-fn stale_worker_error(
-    identity: &crate::worker_identity::WorkerIdentity,
-    expected: &ExpectedWorkerIdentity,
-) -> anyhow::Error {
-    anyhow::anyhow!(
-        "active local worker is stale: pid={} build={} executable={} config={}; current frontend expects build={} executable={} config={}. Restart the frontend that owns the local worker and retry",
-        identity.pid,
-        identity.build,
-        crate::worker_identity::short_fingerprint(&identity.executable_fingerprint),
-        crate::worker_identity::short_fingerprint(&identity.config_fingerprint),
-        crate::worker_identity::current_build(),
-        crate::worker_identity::short_fingerprint(&expected.executable_fingerprint),
-        crate::worker_identity::short_fingerprint(&expected.config_fingerprint),
-    )
-}
-
-/// Tell the user the worker is still coming up, on the same channel as other
-/// agent notices so the TUI and the CLI both surface it.
 fn emit_worker_wait_notice(waited: Duration) {
     let message = format!(
         "Still waiting for the local worker to start ({}s). Ctrl-C to cancel; worker output goes to {}.",
         waited.as_secs(),
         harnx_core::logging::child_output_destination(),
     );
-    // Warning, not Info: the CLI sink routes Info to stdout, where progress
-    // chatter would corrupt piped output from a one-shot invocation.
     emit_agent_event(AgentEvent::Notice(NoticeEvent::Warning(message.clone())));
     log::info!("{message}");
 }
@@ -580,26 +446,9 @@ fn worker_output_tail() -> String {
     if file.seek(SeekFrom::Start(start)).is_err() {
         return render(String::new());
     }
-    // Decode leniently: an arbitrary byte offset can land mid-sequence, and
-    // `read_to_string` would reject the whole read for one split character —
-    // discarding exactly the output this message exists to show.
     let mut body = Vec::new();
     let _ = file.read_to_end(&mut body);
     render(String::from_utf8_lossy(&body).into_owned())
-}
-
-fn open_worker_lock() -> Result<File> {
-    let path = local_worker_lock_file();
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options
-        .open(&path)
-        .with_context(|| format!("open local worker lock {}", path.display()))
 }
 
 #[cfg(unix)]
@@ -633,8 +482,6 @@ fn configure_worker_process(_command: &mut Command) {}
 mod tests {
     use super::*;
 
-    /// `HARNX_WORKER_BIN` wins over sibling/PATH discovery. Nextest gives each
-    /// test its own process, so setting the variable here is contained.
     #[test]
     fn worker_bin_override_wins() {
         harnx_core::require_nextest();
@@ -643,8 +490,6 @@ mod tests {
         assert_eq!(resolve_worker_binary().unwrap(), file.path());
     }
 
-    /// A stale override must fail loudly instead of silently falling back to a
-    /// different worker than the operator asked for.
     #[test]
     fn worker_bin_override_rejects_missing_file() {
         harnx_core::require_nextest();
@@ -654,5 +499,29 @@ mod tests {
             error.to_string().contains("/nonexistent/harnx-worker"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn local_routes_are_nats_safe_and_unique() {
+        let first = LocalWorkerRoute::new();
+        let second = LocalWorkerRoute::new();
+        validate_worker_id(first.worker_id()).expect("first worker id");
+        validate_worker_id(second.worker_id()).expect("second worker id");
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn remote_clusters_use_shared_activation_without_starting_a_worker() {
+        let supervisor = tokio::sync::Mutex::new(None);
+        let route = activation_route_for_cluster(
+            "prod",
+            &supervisor,
+            harnx_core::abort::create_abort_signal(),
+        )
+        .await
+        .expect("resolve remote activation route");
+
+        assert_eq!(route, SessionActivationRoute::ClusterShared);
+        assert!(supervisor.lock().await.is_none());
     }
 }
