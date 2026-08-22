@@ -12,6 +12,24 @@ fn normalize_description(description: Option<String>) -> Option<String> {
 
 impl Config {
     pub async fn init(working_mode: WorkingMode, info_flag: bool) -> Result<Self> {
+        Self::init_inner(working_mode, info_flag, true).await
+    }
+
+    /// Initialize configuration without querying or changing a controlling
+    /// terminal.
+    ///
+    /// Server and worker processes can inherit terminal streams while running
+    /// in a background process group. A terminal theme query enables raw mode,
+    /// which stops such a process group with `SIGTTOU` on Unix.
+    pub async fn init_headless(working_mode: WorkingMode, info_flag: bool) -> Result<Self> {
+        Self::init_inner(working_mode, info_flag, false).await
+    }
+
+    async fn init_inner(
+        working_mode: WorkingMode,
+        info_flag: bool,
+        allow_terminal_interaction: bool,
+    ) -> Result<Self> {
         // Install any user-supplied models-override list before the
         // harnx-client `ALL_PROVIDER_MODELS` lazy-lock is first accessed.
         crate::client::install_models_override();
@@ -24,7 +42,7 @@ impl Config {
             {
                 Some(v) => Self::load_dynamic(&v)?,
                 None => {
-                    if *IS_STDOUT_TERMINAL {
+                    if allow_terminal_interaction && *IS_STDOUT_TERMINAL {
                         create_config_file(&config_path).await?;
                     }
                     Self::load_from_file(&config_path)?
@@ -38,7 +56,7 @@ impl Config {
         config.info_flag = info_flag;
 
         let setup = |config: &mut Self| -> Result<()> {
-            config.load_envs();
+            config.load_envs(allow_terminal_interaction);
 
             if let Some(wrap) = config.wrap.clone() {
                 config.set_wrap(&wrap)?;

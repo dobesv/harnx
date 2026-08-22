@@ -2,8 +2,20 @@
 use super::*;
 use std::env;
 
+fn theme_from_terminal(enabled: bool) -> Option<String> {
+    if !enabled || !*IS_STDOUT_TERMINAL {
+        return None;
+    }
+    theme_mode(QueryOptions::default())
+        .ok()
+        .map(|mode| match mode {
+            ThemeMode::Dark => "dark".into(),
+            ThemeMode::Light => "light".into(),
+        })
+}
+
 impl Config {
-    pub(super) fn load_envs(&mut self) {
+    pub(super) fn load_envs(&mut self, detect_terminal_theme: bool) {
         if let Ok(v) = env::var(get_env_name("model")) {
             self.model_id = v;
         }
@@ -102,14 +114,8 @@ impl Config {
         if self.highlight && self.theme.is_none() {
             if let Some(v) = read_env_value::<String>(&get_env_name("theme")) {
                 self.theme = v;
-            } else if *IS_STDOUT_TERMINAL {
-                if let Ok(mode) = theme_mode(QueryOptions::default()) {
-                    let theme = match mode {
-                        ThemeMode::Dark => "dark",
-                        ThemeMode::Light => "light",
-                    };
-                    self.theme = Some(theme.into());
-                }
+            } else if let Some(theme) = theme_from_terminal(detect_terminal_theme) {
+                self.theme = Some(theme);
             }
         }
         if let Some(v) = read_env_value::<String>(&get_env_name("serve_addr")) {
@@ -179,7 +185,7 @@ mod tests {
         let _cleanup_days = EnvGuard::new("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS", "7");
 
         let mut config = Config::default();
-        config.load_envs();
+        config.load_envs(true);
 
         assert_eq!(config.cleanup_remote_sessions_days, Some(7));
     }
@@ -190,7 +196,7 @@ mod tests {
         let _cleanup_days = EnvGuard::remove("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS");
 
         let mut config = Config::default();
-        config.load_envs();
+        config.load_envs(true);
 
         assert_eq!(config.cleanup_remote_sessions_days, None);
     }

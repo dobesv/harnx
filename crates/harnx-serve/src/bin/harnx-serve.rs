@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
     setup_logger(LogSink::Stderr)?;
 
     let config = Arc::new(RwLock::new(
-        Config::init(WorkingMode::Serve, false)
+        Config::init_headless(WorkingMode::Serve, false)
             .await
             .context("Failed to init Config")?,
     ));
