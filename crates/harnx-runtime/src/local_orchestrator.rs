@@ -213,7 +213,7 @@ impl LocalWorkerSupervisor {
 
             let waited = started.elapsed();
             if waited >= next_notice {
-                emit_worker_wait_notice(waited);
+                emit_worker_wait_notice(waited, expected_pid);
                 next_notice = waited + WORKER_SLOW_NOTICE_INTERVAL;
             }
             poll = (poll * 2).min(READINESS_POLL_MAX);
@@ -407,24 +407,28 @@ fn signal_worker_tree(child: &mut Child) {
     let _ = child.start_kill();
 }
 
-fn emit_worker_wait_notice(waited: Duration) {
-    let message = format!(
-        "Still waiting for the local worker to start ({}s). Ctrl-C to cancel; worker output goes to {}.",
-        waited.as_secs(),
-        harnx_core::logging::child_output_destination(),
-    );
+fn emit_worker_wait_notice(waited: Duration, worker_pid: u32) {
+    let message = worker_wait_notice(waited, worker_pid);
     emit_agent_event(AgentEvent::Notice(NoticeEvent::Warning(message.clone())));
     log::info!("{message}");
+}
+
+fn worker_wait_notice(waited: Duration, worker_pid: u32) -> String {
+    format!(
+        "Still waiting for local worker pid {worker_pid} to start ({}s). Ctrl-C to cancel; worker output goes to {}.",
+        waited.as_secs(),
+        harnx_core::logging::child_output_destination(),
+    )
 }
 
 /// Last [`WORKER_OUTPUT_TAIL_BYTES`] of the log the worker writes into, for
 /// error messages.
 ///
-/// The worker is a detached subprocess with no terminal, so anything it writes
-/// outside the `log` facade — a panic, a `main` returning `Err`, a child
-/// process's own stderr — is otherwise lost, and the front-end only sees a
-/// readiness timeout. Empty when the worker inherits our streams instead of a
-/// log file: the output is already wherever the operator is looking.
+/// When the frontend logs to a file, anything the worker writes outside the
+/// `log` facade — a panic, a `main` returning `Err`, a child process's own
+/// stderr — is otherwise easy to miss while the frontend waits for readiness.
+/// Empty when the worker inherits our streams instead: the output is already
+/// wherever the operator is looking.
 fn worker_output_tail() -> String {
     let Some(path) = harnx_core::logging::log_file_path() else {
         return String::new();
@@ -508,6 +512,16 @@ mod tests {
         validate_worker_id(first.worker_id()).expect("first worker id");
         validate_worker_id(second.worker_id()).expect("second worker id");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn slow_start_notice_identifies_worker_pid() {
+        let notice = worker_wait_notice(Duration::from_secs(15), 42);
+        assert!(
+            notice.contains("worker pid 42"),
+            "unexpected notice: {notice}"
+        );
+        assert!(notice.contains("(15s)"), "unexpected notice: {notice}");
     }
 
     #[tokio::test]

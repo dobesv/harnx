@@ -130,7 +130,9 @@ async fn main() -> Result<()> {
     setup_logger(LogSink::Stderr)?;
     harnx_core::alloc_guard::init_from_env();
 
-    let config = Arc::new(RwLock::new(Config::init(WorkingMode::Cmd, true).await?));
+    let config = Arc::new(RwLock::new(
+        Config::init_headless(WorkingMode::Cmd, true).await?,
+    ));
     config.write().agent_variables = collect_agent_variables(&cli.agent_variable)?;
     if cli.diagnose {
         print!(
