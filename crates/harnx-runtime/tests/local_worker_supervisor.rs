@@ -317,6 +317,67 @@ async fn crash_and_respawn(frontend: &mut LocalWorkerSupervisor, old_pid: u32) -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn joined_supervisor_recovers_after_broker_owner_exits() {
+    require_nextest();
+    let Some(installed_binary) = skip_without_binaries() else {
+        return;
+    };
+    let root = tempfile::tempdir().expect("create isolated supervisor environment");
+    let binary = root.path().join("harnx-worker");
+    std::fs::copy(installed_binary, &binary).expect("copy worker binary fixture");
+    let _environment = isolated_environment(root.path());
+    write_trivial_agent_config(root.path(), "http://127.0.0.1:1/v1");
+
+    let owner = LocalWorkerSupervisor::start_with_worker_binary(&binary, create_abort_signal())
+        .await
+        .expect("start broker-owning frontend worker");
+    let owner_worker_pid = owner.worker_pid().expect("owner worker PID");
+    assert!(owner.server().is_owner());
+
+    let mut joiner =
+        LocalWorkerSupervisor::start_with_worker_binary(&binary, create_abort_signal())
+            .await
+            .expect("start broker-joining frontend worker");
+    let joined_worker_pid = joiner.worker_pid().expect("joined worker PID");
+    let joined_route = joiner.route().clone();
+    let old_broker_nonce = joiner.server().nonce.clone();
+    assert!(!joiner.server().is_owner());
+
+    drop(owner);
+    wait_for_process_exit(owner_worker_pid).await;
+    assert!(
+        process_exists(joined_worker_pid),
+        "joined worker exited before broker recovery"
+    );
+
+    let recovered_route = joiner
+        .ensure(create_abort_signal())
+        .await
+        .expect("recover joined worker after broker owner exits");
+    let replacement_worker_pid = joiner.worker_pid().expect("replacement worker PID");
+    assert_ne!(replacement_worker_pid, joined_worker_pid);
+    wait_for_process_exit(joined_worker_pid).await;
+    assert_eq!(recovered_route, joined_route);
+    assert_eq!(joiner.route(), &joined_route);
+    assert_ne!(joiner.server().nonce, old_broker_nonce);
+    assert!(
+        joiner.server().is_owner(),
+        "surviving frontend must take ownership of the replacement broker"
+    );
+    async_nats::ConnectOptions::new()
+        .token(joiner.server().token.clone())
+        .connect(&joiner.server().url)
+        .await
+        .expect("connect to replacement broker")
+        .flush()
+        .await
+        .expect("flush replacement broker connection");
+
+    drop(joiner);
+    wait_for_process_exit(replacement_worker_pid).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_supervisors_own_distinct_workers_routes_and_process_trees() {
     require_nextest();
     let Some(installed_binary) = skip_without_binaries() else {
