@@ -4,7 +4,6 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import json
-import re
 import sys
 from collections import OrderedDict, defaultdict
 from pathlib import Path
@@ -12,6 +11,26 @@ from typing import Any
 
 import requests
 import yaml
+
+from model_variants import (
+    ADAPTIVE_EFFORT_VARIANTS,
+    BASE_EFFORT,
+    BEDROCK_THINKING_PATCH,
+    OPENAI_NO_SAMPLING_PATCH,
+    apply_base_model_rules,
+    apply_base_thinking,
+    apply_openai_base_patches,
+    claude_adaptive_patch,
+    claude_requires_max_tokens,
+    is_adaptive_only_opus,
+    is_generated_variant_name,
+    is_variant_name,
+    model_variants,
+    openai_effort_variants,
+    opus_minor_version,
+    provider_sort_key,
+    thinking_variants,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODELS_YAML_PATH = REPO_ROOT / "crates" / "harnx" / "models.yaml"
@@ -273,69 +292,6 @@ PROVIDER_COMMENTS = {
     ],
 }
 
-CLAUDE_THINKING_PATCH = (
-    'del(.body.temperature) | del(.body.top_p) | '
-    '.body.thinking = {"type":"enabled","budget_tokens":16000}'
-)
-BEDROCK_THINKING_PATCH = (
-    '.body.inferenceConfig = {"temperature":null,"topP":null} | '
-    '.body.additionalModelRequestFields = '
-    '{"thinking":{"type":"enabled","budget_tokens":16000}}'
-)
-
-# Opus models from this minor version onward dropped manual extended thinking
-# (`thinking: {type: "enabled", budget_tokens: N}` returns a 400). They only
-# accept adaptive thinking plus the `effort` parameter. For these we enable
-# adaptive thinking at the default `high` effort on the base model and expose
-# higher effort levels as `:suffix` variants instead of a `:thinking` variant.
-ADAPTIVE_ONLY_OPUS_MIN_MINOR = 7
-
-# Effort level baked into the base (suffix-less) model, and the higher levels
-# exposed as `model:<effort>` variants. See
-# https://platform.claude.com/docs/en/build-with-claude/effort
-BASE_EFFORT = "high"
-ADAPTIVE_EFFORT_VARIANTS = ("xhigh", "max")
-
-# Suffixes of models derived from a base model (regenerated, never preserved).
-VARIANT_SUFFIXES = ("thinking", *ADAPTIVE_EFFORT_VARIANTS)
-
-
-def opus_minor_version(name: str) -> int | None:
-    """Minor version of an Opus model name, e.g. `claude-opus-4-8` → 8. Returns
-    None for non-Opus names or the older `claude-4-opus-*` ordering."""
-    match = re.search(r"opus-4-(\d+)", name)
-    return int(match.group(1)) if match else None
-
-
-def is_adaptive_only_opus(name: str) -> bool:
-    minor = opus_minor_version(name)
-    return minor is not None and minor >= ADAPTIVE_ONLY_OPUS_MIN_MINOR
-
-
-def claude_requires_max_tokens(name: str) -> bool:
-    """True for Claude models that reject requests without an explicit
-    `max_tokens` (the Messages API returns `max_tokens: Field required`).
-
-    Covers the modern Sonnet/Haiku families from the 4-5 generation onward and
-    any bare major >= 5 name (e.g. `claude-sonnet-5`), matched by name so new
-    releases are handled automatically without a per-model list. Opus models
-    are handled separately by `is_adaptive_only_opus` (see apply_base_thinking),
-    so they are intentionally excluded here to avoid changing their existing
-    behaviour.
-    """
-    match = re.search(r"claude-(sonnet|haiku)-(\d+)(?:-(\d+))?", name)
-    if not match:
-        return False
-    major = int(match.group(2))
-    minor = int(match.group(3)) if match.group(3) is not None else 0
-    # Major version >= 5 (e.g. claude-sonnet-5), or the 4-5+ point releases.
-    return major >= 5 or (major == 4 and minor >= 5)
-
-
-def is_variant_name(name: str) -> bool:
-    return ":" in name and name.rsplit(":", 1)[1] in VARIANT_SUFFIXES
-
-
 def apply_openai_endpoint_default(
     model: dict[str, Any], provider: str, payload: dict[str, Any]
 ) -> None:
@@ -363,22 +319,6 @@ def apply_openai_endpoint_default(
     supported = payload.get("supported_endpoints")
     if isinstance(supported, list) and "/v1/responses" in supported:
         model["endpoint"] = "responses"
-
-
-def claude_adaptive_patch(effort: str) -> str:
-    """Request-body patch enabling adaptive thinking at a given effort level for
-    the Claude/Vertex AI body shape. Sampling params are stripped because they
-    also 400 on adaptive-only Opus models.
-
-    `output_config` is assigned as a whole object rather than via
-    `.body.output_config.effort`: jaq, unlike jq, does not create the missing
-    intermediate object, so the nested form errors at request time and takes
-    the rest of the pipeline down with it."""
-    return (
-        "del(.body.temperature) | del(.body.top_p) | "
-        '.body.thinking = {"type":"adaptive"} | '
-        f'.body.output_config = {{"effort":"{effort}"}}'
-    )
 
 
 def ordered_model(model: dict[str, Any]) -> OrderedDict[str, Any]:
@@ -582,99 +522,6 @@ def merge_old_fields(new_model: dict[str, Any], old_model: dict[str, Any] | None
     return merged
 
 
-def _variant_from_base(
-    base_model: dict[str, Any], suffix: str, patch: str, *, max_output_tokens: int | None
-) -> dict[str, Any]:
-    name = base_model["name"]
-    variant: dict[str, Any] = {
-        "name": f"{name}:{suffix}",
-        # Use the base model's real_name if it has one (aliased model), otherwise
-        # the name. This routes the variant to the correct provider-side model ID.
-        "real_name": base_model.get("real_name", name),
-        # Both thinking and effort variants reject requests without max_tokens.
-        "max_output_tokens": max_output_tokens,
-        "require_max_tokens": True,
-        "patches": [patch],
-    }
-    for field in (
-        "max_input_tokens",
-        "input_price",
-        "output_price",
-        "supports_vision",
-        "supports_tool_use",
-    ):
-        if field in base_model:
-            variant[field] = base_model[field]
-    return variant
-
-
-def apply_base_thinking(model: dict[str, Any], provider: str) -> None:
-    """Enable adaptive thinking at the default effort on the base (suffix-less)
-    model for adaptive-only Opus models. These reject manual thinking and
-    sampling params, so the base model must send the adaptive shape itself."""
-    name = model["name"]
-    if is_variant_name(name) or provider not in ("claude", "vertexai"):
-        return
-    if name.startswith("claude-") and is_adaptive_only_opus(name):
-        model["patches"] = [claude_adaptive_patch(BASE_EFFORT)]
-        # Adaptive-only Opus rejects requests without an explicit max_tokens.
-        model["require_max_tokens"] = True
-    # Modern Claude models reject requests without an explicit max_tokens,
-    # regardless of the adaptive-thinking patch above.
-    if claude_requires_max_tokens(name):
-        model["require_max_tokens"] = True
-
-
-def thinking_variants(base_model: dict[str, Any], provider: str) -> list[dict[str, Any]]:
-    """Variant models derived from a base model: higher effort levels for
-    adaptive-only Opus, or a manual `:thinking` variant for everything else."""
-    name = base_model["name"]
-    if is_variant_name(name):
-        return []
-
-    if provider in ("claude", "vertexai"):
-        if not name.startswith("claude-"):
-            return []
-        if is_adaptive_only_opus(name):
-            return [
-                _variant_from_base(
-                    base_model,
-                    effort,
-                    claude_adaptive_patch(effort),
-                    max_output_tokens=base_model.get("max_output_tokens"),
-                )
-                for effort in ADAPTIVE_EFFORT_VARIANTS
-            ]
-        patch = CLAUDE_THINKING_PATCH
-    elif provider == "bedrock":
-        if not name.startswith("us.anthropic.claude-"):
-            return []
-        # Manual thinking 400s on adaptive-only Opus, and the adaptive+effort
-        # shape on Bedrock is unconfirmed — emit no variant rather than a broken
-        # one.
-        if is_adaptive_only_opus(name):
-            return []
-        patch = BEDROCK_THINKING_PATCH
-    else:
-        return []
-
-    return [
-        _variant_from_base(
-            base_model,
-            "thinking",
-            patch,
-            max_output_tokens=24000,
-        )
-    ]
-
-
-def provider_sort_key(name: str) -> tuple[str, str]:
-    if is_variant_name(name):
-        base = name.rsplit(":", 1)[0]
-        return (base, f"1:{name}")
-    return (name, f"0:{name}")
-
-
 def render_provider_block(provider: str, models: list[dict[str, Any]]) -> str:
     lines = []
     lines.extend(PROVIDER_COMMENTS[provider])
@@ -816,6 +663,68 @@ def build_diff_summary(
     return "\n".join(lines).rstrip()
 
 
+def regenerate_provider_models(
+    provider: str,
+    old_models: dict[str, dict[str, Any]],
+    fetched_models: dict[str, dict[str, Any]] | None,
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    """Merge one provider and regenerate only the variants owned by it."""
+    if not fetched_models:
+        return [copy.deepcopy(old_models[name]) for name in sorted(old_models, key=provider_sort_key)]
+
+    merged, extra_names = _merge_provider_models(provider, old_models, fetched_models)
+    _warn_preserved_models(provider, extra_names, warnings)
+    return _regenerate_model_variants(provider, merged)
+
+
+def _merge_provider_models(
+    provider: str,
+    old_models: dict[str, dict[str, Any]],
+    fetched_models: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    merged = {
+        name: copy.deepcopy(model)
+        for name, model in fetched_models.items()
+        if not is_generated_variant_name(provider, name)
+    }
+    # Generated variants are rebuilt from their refreshed base models. Other
+    # aliases are curated entries, even when they share a suffix such as
+    # `:thinking` or `:max`, and must remain in the catalog.
+    extra_names = sorted(
+        (
+            name
+            for name in set(old_models) - set(fetched_models)
+            if not is_generated_variant_name(provider, name)
+        ),
+        key=provider_sort_key,
+    )
+    for name in extra_names:
+        merged[name] = copy.deepcopy(old_models[name])
+    return merged, extra_names
+
+
+def _warn_preserved_models(provider: str, extra_names: list[str], warnings: list[str]) -> None:
+    if extra_names:
+        warnings.append(
+            f"provider {provider}: preserving models not present in LiteLLM: {', '.join(extra_names)}"
+        )
+
+
+def _regenerate_model_variants(
+    provider: str, models: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    with_variants: dict[str, dict[str, Any]] = {}
+    for name in sorted(models, key=provider_sort_key):
+        model = models[name]
+        apply_base_model_rules(model, provider)
+        with_variants[name] = model
+        for variant in model_variants(model, provider):
+            with_variants[variant["name"]] = variant
+
+    return [with_variants[name] for name in sorted(with_variants, key=provider_sort_key)]
+
+
 def main() -> int:
     _old_raw, old_by_provider = load_existing_data()
     litellm = fetch_litellm_data()
@@ -855,41 +764,9 @@ def main() -> int:
     for provider in provider_order:
         old_models = old_by_provider.get(provider, {})
         fetched_models = new_provider_models.get(provider)
-        if not fetched_models:
-            if provider in old_by_provider:
-                final_models = [copy.deepcopy(old_models[name]) for name in sorted(old_models, key=provider_sort_key)]
-                final_provider_models[provider] = final_models
-            continue
-
-        merged = {name: copy.deepcopy(model) for name, model in fetched_models.items()}
-        # Derived variants (`:thinking`, `:xhigh`, `:max`) are regenerated from
-        # the base models below, so don't preserve stale ones from the YAML.
-        extra_names = sorted(
-            (
-                name
-                for name in set(old_models) - set(fetched_models)
-                if not is_variant_name(name)
-            ),
-            key=provider_sort_key,
+        final_provider_models[provider] = regenerate_provider_models(
+            provider, old_models, fetched_models, warnings
         )
-        if extra_names:
-            warnings.append(
-                f"provider {provider}: preserving models not present in LiteLLM: {', '.join(extra_names)}"
-            )
-            for name in extra_names:
-                merged[name] = copy.deepcopy(old_models[name])
-
-        with_variants: dict[str, dict[str, Any]] = {}
-        for name in sorted(merged, key=provider_sort_key):
-            model = merged[name]
-            apply_base_thinking(model, provider)
-            with_variants[name] = model
-            for variant in thinking_variants(model, provider):
-                with_variants[variant["name"]] = variant
-
-        final_provider_models[provider] = [
-            with_variants[name] for name in sorted(with_variants, key=provider_sort_key)
-        ]
 
     MODELS_YAML_PATH.write_text(render_models_yaml(final_provider_models))
 

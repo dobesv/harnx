@@ -14,6 +14,10 @@ from collections import OrderedDict
 # Import the module under test
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
 import update_models as um
+from update_models_variant_tests import (
+    TestOpenAIEffortVariants,
+    TestProviderModelRegeneration,
+)
 
 
 class TestScalePricing(unittest.TestCase):
@@ -82,10 +86,22 @@ class TestOpusVersionDetection(unittest.TestCase):
 
     def test_is_variant_name(self) -> None:
         self.assertTrue(um.is_variant_name("claude-opus-4-6:thinking"))
+        self.assertTrue(um.is_variant_name("gpt-5.6-sol:high"))
         self.assertTrue(um.is_variant_name("claude-opus-4-8:xhigh"))
         self.assertTrue(um.is_variant_name("claude-opus-4-8@default:max"))
         self.assertFalse(um.is_variant_name("claude-opus-4-8"))
         self.assertFalse(um.is_variant_name("claude-opus-4-8@default"))
+
+    def test_generated_variant_ownership_is_provider_specific(self) -> None:
+        self.assertTrue(um.is_generated_variant_name("openai", "gpt-5.6-sol:max"))
+        self.assertTrue(um.is_generated_variant_name("claude", "claude-opus-4-8:max"))
+        self.assertTrue(
+            um.is_generated_variant_name(
+                "bedrock", "us.anthropic.claude-opus-4-6-v1:thinking"
+            )
+        )
+        self.assertFalse(um.is_generated_variant_name("openai", "custom:max"))
+        self.assertFalse(um.is_generated_variant_name("qianwen", "qwen3-max:thinking"))
 
 
 class TestThinkingVariant(unittest.TestCase):
