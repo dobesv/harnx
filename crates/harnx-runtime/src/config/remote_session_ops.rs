@@ -346,6 +346,7 @@ pub struct RemoteTranscriptState {
     pub compressed_messages: Vec<harnx_core::message::Message>,
     pub messages: Vec<harnx_core::message::Message>,
     pub compaction_summary: Option<String>,
+    pub replay_warnings: Vec<String>,
 }
 
 fn renumber_remote_messages_for_window(
@@ -473,6 +474,7 @@ fn transcript_state_from_entries(
         compressed_messages: session.compressed_messages,
         messages: session.messages,
         compaction_summary: session.compaction_summary,
+        replay_warnings: session.replay_warnings,
     })
 }
 

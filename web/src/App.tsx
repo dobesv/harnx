@@ -89,8 +89,9 @@ const MyMessage = () => {
     );
   }
 
+  const roleClass = role === 'user' ? 'aui-user-message' : 'aui-assistant-message';
   return (
-    <MessagePrimitive.Root className="aui-message">
+    <MessagePrimitive.Root className={`aui-message ${roleClass}`}>
       <div className="aui-message-content">
         <MessageContent />
       </div>
@@ -420,6 +421,8 @@ const SessionPicker = ({
   agentName,
   sessions,
   sessionsError,
+  sessionsLoading,
+  onRetry,
   onSelect,
   onNewChat,
   onBack
@@ -427,6 +430,8 @@ const SessionPicker = ({
   agentName: string;
   sessions: SessionRef[];
   sessionsError: string | null;
+  sessionsLoading: boolean;
+  onRetry: () => void;
   onSelect: (id: string) => void;
   onNewChat: () => void;
   onBack: () => void;
@@ -437,8 +442,13 @@ const SessionPicker = ({
     <div className="actions-bar">
       <button className="new-chat-button" onClick={onNewChat}>New Chat</button>
     </div>
-    {sessionsError ? (
-      <div role="alert" className="aui-error" data-testid="sessions-error">{sessionsError}</div>
+    {sessionsLoading ? (
+      <p className="sessions-loading" role="status">Loading sessions…</p>
+    ) : sessionsError ? (
+      <div role="alert" className="aui-error" data-testid="sessions-error">
+        <span>{sessionsError}</span>
+        <button type="button" onClick={onRetry}>Retry</button>
+      </div>
     ) : (
       <div className="grid-list sessions-grid">
         {sessions.length === 0 ? (
@@ -505,6 +515,7 @@ export default function App() {
     agentsError,
     sessions,
     sessionsError,
+    sessionsLoading,
     selectedAgent,
     selectedSessionId,
     refreshSessions,
@@ -534,6 +545,8 @@ export default function App() {
           agentName={selectedAgent}
           sessions={sessions}
           sessionsError={sessionsError}
+          sessionsLoading={sessionsLoading}
+          onRetry={refreshSessions}
           onSelect={selectSession}
           onNewChat={newChat}
           onBack={clearAgent}

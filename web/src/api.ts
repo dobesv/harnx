@@ -11,9 +11,26 @@ export async function listAgents(): Promise<Agent[]> {
 
 export async function listSessions(agent: string): Promise<SessionRef[]> {
   const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions`);
-  if (!res.ok) throw new Error(`Failed to list sessions for ${agent}: ${res.statusText}`);
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const body = await res.json() as { error?: { message?: string } | string };
+      detail = typeof body.error === 'string' ? body.error : body.error?.message || detail;
+    } catch {
+      // Keep the HTTP status text when the response is not JSON.
+    }
+    throw new Error(`Failed to list sessions for ${agent}: ${detail}`);
+  }
   const json = await res.json() as SessionRef[];
   return json;
+}
+
+export async function createSession(agent: string): Promise<SessionRef> {
+  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error(`Failed to create session for ${agent}: ${res.statusText}`);
+  return await res.json() as SessionRef;
 }
 
 export async function getAgent(agent: string): Promise<AgentDetail> {
@@ -77,8 +94,4 @@ export async function uploadAttachment(agent: string, session: string, file: Fil
   }
   const json = await res.json();
   return json.attachment_refs || [];
-}
-
-export function newSessionId(): string {
-  return crypto.randomUUID();
 }

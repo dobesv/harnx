@@ -207,6 +207,7 @@ async fn handle_get(
             "result": {
                 "state": session_state_json(&info.state),
                 "history_snapshot": info.history_snapshot,
+                "history_warnings": info.history_warnings,
                 "capabilities": {
                     "multiClient": true,
                     "persistence": persistence.as_str(),
@@ -488,9 +489,20 @@ async fn handle_cancel(
 }
 
 async fn session_exists(config: &harnx_runtime::config::Config, key: &SessionKey) -> bool {
-    load_nats_session(config, &key.session)
-        .await
-        .is_ok_and(|session| session.agent_name.as_deref() == Some(key.agent.as_str()))
+    match load_nats_session(config, &key.session).await {
+        Ok(session) => return session.agent_name.as_deref() == Some(key.agent.as_str()),
+        Err(error) if error.to_string() == "Not Found" => {}
+        Err(_) => return false,
+    }
+    crate::session_routes::indexed_agent_session_exists(
+        config,
+        crate::session_routes::AgentSessionRef {
+            agent: &key.agent,
+            session: &key.session,
+        },
+    )
+    .await
+    .unwrap_or(false)
 }
 
 fn session_state_json(state: &SessionState) -> Value {
@@ -675,6 +687,7 @@ mod tests {
         assert_eq!(body["result"]["capabilities"]["multiClient"], true);
         assert_eq!(body["result"]["capabilities"]["persistence"], "nats");
         assert_eq!(body["result"]["state"]["status"], "idle");
+        assert_eq!(body["result"]["history_warnings"], json!([]));
         assert!(body["result"]["history_snapshot"]
             .as_array()
             .expect("history array")

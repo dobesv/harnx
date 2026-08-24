@@ -1,4 +1,5 @@
 use super::*;
+use futures_util::StreamExt;
 
 fn live_worker_binary() -> Option<std::path::PathBuf> {
     if std::process::Command::new(
@@ -26,6 +27,17 @@ fn live_worker_binary() -> Option<std::path::PathBuf> {
         "harnx-worker"
     });
     binary.is_file().then_some(binary)
+}
+
+async fn reserve_session(config: &Config, agent: &str) -> String {
+    let scoped = Arc::new(parking_lot::RwLock::new(config.clone()));
+    scoped
+        .write()
+        .use_agent_by_name(agent)
+        .expect("scope agent");
+    Config::reserve_new_session_id(&scoped)
+        .await
+        .expect("reserve session")
 }
 
 async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
@@ -157,6 +169,79 @@ async fn serve_replays_prompt_queued_during_active_run() {
         "second model request did not contain queued prompt"
     );
     cancel(&handle).await;
+    mock.task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reserved_session_accepts_events_and_rpc_prompt_before_header_exists() {
+    harnx_core::require_nextest();
+    let Some(binary) = live_worker_binary() else {
+        return;
+    };
+    let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
+    let sandbox = TestConfigSandbox::new();
+    let mock = start_serve_smoke_openai().await;
+    sandbox.write_mock_openai_client(&mock.api_base);
+    sandbox.write_agent_with_front_matter(
+        "plain",
+        "model: mock:test\nstream: true",
+        "Complete the turn.",
+    );
+    let config = sandbox.config();
+    let session_id = reserve_session(&config, "plain").await;
+
+    let target = crate::session_routes::AgentSessionRef {
+        agent: "plain",
+        session: &session_id,
+    };
+    let event_stream = crate::session_routes::attach_agent_session(&config, target)
+        .await
+        .expect("reserved session event route");
+    assert!(event_stream.history().is_empty());
+    let mut updates = Box::pin(crate::session_routes::session_updates(event_stream));
+
+    let supervisor = LocalWorkerSupervisor::start_with_worker_binary(binary, create_abort_signal())
+        .await
+        .expect("start local worker");
+    let registry = SessionRegistry::new_with_local_worker_for_tests(config.clone(), supervisor);
+    let response = crate::ag_ui_rpc::handle_ag_ui_rpc_bytes(
+        http::Method::POST,
+        "plain",
+        &session_id,
+        bytes::Bytes::from(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/prompt",
+                "params": { "text": "reserved prompt" }
+            })
+            .to_string(),
+        ),
+        &config,
+        &registry,
+        crate::ag_ui_rpc::PersistenceKind::Nats,
+    )
+    .await
+    .expect("reserved session prompt response");
+    assert_eq!(response.status(), http::StatusCode::OK);
+
+    let update = tokio::time::timeout(Duration::from_secs(15), updates.next())
+        .await
+        .expect("session update timeout")
+        .expect("session update stream ended");
+    assert!(
+        String::from_utf8_lossy(&update).starts_with("event: session-updated\n"),
+        "unexpected session update: {}",
+        String::from_utf8_lossy(&update)
+    );
+
+    mock.first_request
+        .await
+        .expect("first mock request notifier dropped");
+    let handle = registry.get_or_spawn(key("plain", &session_id));
+    let mut events = subscribe(&handle).await.events;
+    let _ = mock.release_first.send(());
+    assert_first_turn_streamed_and_finished(&mut events).await;
     mock.task.abort();
 }
 

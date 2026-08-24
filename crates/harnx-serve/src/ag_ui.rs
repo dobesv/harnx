@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
+use crate::ag_ui_sync::{history_warning_event, pending_user_prompt, wire_message_id};
 use crate::session_actor::{
     PromptResult, SessionCommand, SessionHandle, SessionInfo, SessionRegistry, SubscribeResult,
 };
@@ -95,8 +96,15 @@ enum RelaxedAgUiMessage {
 impl From<RelaxedAgUiMessage> for AgUiMessage {
     fn from(value: RelaxedAgUiMessage) -> Self {
         match value {
-            RelaxedAgUiMessage::User { id: _, content } => AgUiMessage::User {
-                id: MessageId::random(),
+            RelaxedAgUiMessage::User { id, content } => AgUiMessage::User {
+                // Preserve UUIDs and translate arbitrary assistant-ui IDs to a
+                // deterministic UUID at the AG-UI wire boundary. Stable IDs let
+                // promptless hydration distinguish an authoritative user message
+                // from a newly composed one without constraining Harnx session IDs.
+                id: id
+                    .as_deref()
+                    .map(wire_message_id)
+                    .unwrap_or_else(MessageId::random),
                 content,
                 name: None,
             },
@@ -1129,15 +1137,6 @@ fn snapshot_event(messages: Vec<AgUiMessage>) -> Event {
     })
 }
 
-fn last_user_prompt(run_input: &RunAgentInput<JsonValue, JsonValue>) -> Option<String> {
-    match run_input.messages.last() {
-        Some(AgUiMessage::User { content, .. }) if !content.trim().is_empty() => {
-            Some(content.clone())
-        }
-        _ => None,
-    }
-}
-
 async fn subscribe(handle: &SessionHandle) -> SubscribeResult {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     handle
@@ -1315,18 +1314,28 @@ fn build_ag_ui_event_stream(
     handle: &SessionHandle,
     run_id: &str,
     thread_id_text: &str,
-    snapshot: Vec<AgUiMessage>,
-    events: broadcast::Receiver<Event>,
+    subscription: SubscribeResult,
     has_prompt: Option<&str>,
     is_active: bool,
 ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Bytes> + Send + Sync + 'static>> {
-    let snapshot_frame = match frame_event(&snapshot_event(snapshot)) {
-        Ok(frame) => Some(Bytes::from(frame)),
-        Err(err) => {
-            log::warn!("failed to serialize AG-UI snapshot frame: {err}");
-            None
-        }
-    };
+    let SubscribeResult {
+        snapshot,
+        history_warnings,
+        events,
+    } = subscription;
+    let initial_events = has_prompt
+        .is_none()
+        .then(|| snapshot_event(snapshot))
+        .into_iter()
+        .chain(history_warnings.into_iter().map(history_warning_event));
+    let initial_frames = initial_events
+        .filter_map(|event| {
+            frame_event(&event)
+                .map_err(|err| log::warn!("failed to serialize initial AG-UI frame: {err}"))
+                .ok()
+        })
+        .collect::<String>();
+    let initial_frame = (!initial_frames.is_empty()).then(|| Bytes::from(initial_frames));
     let handle_for_lag = handle.clone();
     let live_stream = tokio_stream::StreamExt::then(BroadcastStream::new(events), move |item| {
         let handle = handle_for_lag.clone();
@@ -1349,11 +1358,11 @@ fn build_ag_ui_event_stream(
         // (assistant-ui's applyExternalMessages is a full replace) would wipe the
         // optimistically-appended user message and the streaming reply. Clients
         // hydrate via their own promptless subscribe stream instead (multiplayer-safe).
-        Some(_) => build_prompted_event_stream(run_id, thread_id_text, None, live_stream),
+        Some(_) => build_prompted_event_stream(run_id, thread_id_text, initial_frame, live_stream),
         None => build_promptless_event_stream(
             run_id,
             thread_id_text,
-            snapshot_frame,
+            initial_frame,
             live_stream,
             is_active,
         ),
@@ -1380,10 +1389,10 @@ pub async fn ag_ui_run_with_call_fn(
         session: session.to_string(),
     };
     let handle = registry.get_or_spawn(key);
-    let SubscribeResult { snapshot, events } = subscribe(&handle).await;
+    let subscription = subscribe(&handle).await;
     let session_info = get_info(&handle).await;
     let is_active = session_state_is_active(&session_info.state);
-    let has_prompt = last_user_prompt(&run_input);
+    let has_prompt = pending_user_prompt(&run_input, &subscription.snapshot);
     let thread_id = derive_thread_id(session);
     let thread_id_text = thread_id.to_string();
 
@@ -1395,8 +1404,7 @@ pub async fn ag_ui_run_with_call_fn(
         &handle,
         &run_id,
         &thread_id_text,
-        snapshot,
-        events,
+        subscription,
         has_prompt.as_deref(),
         is_active,
     );
@@ -1553,8 +1561,8 @@ pub(crate) fn history_messages_for_snapshot(history: &[HistoryMsg]) -> Vec<AgUiM
         let visible = history_content_text(&message.content);
         let id = message
             .id
-            .as_ref()
-            .and_then(|value| serde_json::from_value(serde_json::Value::String(value.clone())).ok())
+            .as_deref()
+            .map(wire_message_id)
             .unwrap_or_else(MessageId::random);
         // Stable base for synthesizing tool-call ids — never the random `id` above.
         let stable_base = history_stable_base(message, ordinal);
@@ -1600,6 +1608,17 @@ pub(crate) fn history_messages_for_snapshot(history: &[HistoryMsg]) -> Vec<AgUiM
                         error: None,
                     });
                 }
+            }
+            // ag-ui-core's generic constructor intentionally creates assistant
+            // messages with `content: None`; construct this variant explicitly
+            // so persisted assistant text survives snapshot hydration.
+            MessageContent::Text(_) if role == Role::Assistant => {
+                messages.push(AgUiMessage::Assistant {
+                    id,
+                    content: Some(visible),
+                    name: None,
+                    tool_calls: None,
+                });
             }
             _ => messages.push(AgUiMessage::new(role, id, visible)),
         }

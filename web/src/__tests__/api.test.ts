@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { listAgents, listSessions, getAgent, cancel, uploadAttachment, newSessionId } from '../api';
+import { listAgents, listSessions, createSession, getAgent, cancel, uploadAttachment } from '../api';
 
 const fetchMock = vi.fn();
 globalThis.fetch = fetchMock as any;
@@ -38,6 +38,40 @@ describe('api.ts', () => {
         statusText: 'Not Found',
       });
       await expect(listSessions('agent/A')).rejects.toThrow('Failed to list sessions for agent/A: Not Found');
+    });
+
+    it('surfaces the server explanation when session discovery is unavailable', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: false,
+        statusText: 'Bad Request',
+        json: async () => ({
+          error: { message: 'Session discovery is not available yet; try again shortly' },
+        }),
+      });
+
+      await expect(listSessions('agent/A')).rejects.toThrow(
+        'Failed to list sessions for agent/A: Session discovery is not available yet; try again shortly',
+      );
+    });
+  });
+
+  describe('createSession', () => {
+    it('returns the canonical session reserved by the backend', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ session_id: 'aok2Gw' }),
+      });
+      await expect(createSession('agent/A')).resolves.toEqual({ session_id: 'aok2Gw' });
+      expect(fetchMock).toHaveBeenCalledWith('/v1/agents/agent%2FA/sessions', {
+        method: 'POST',
+      });
+    });
+
+    it('throws if the reservation fails', async () => {
+      fetchMock.mockResolvedValueOnce({ ok: false, statusText: 'Unavailable' });
+      await expect(createSession('agent/A')).rejects.toThrow(
+        'Failed to create session for agent/A: Unavailable',
+      );
     });
   });
 
@@ -132,9 +166,4 @@ describe('api.ts', () => {
     });
   });
 
-  describe('newSessionId', () => {
-    it('returns a uuid', () => {
-      expect(newSessionId()).toMatch(/^[0-9a-f]{8}-/);
-    });
-  });
 });

@@ -13,7 +13,7 @@ pub use test_log::load_test_session_messages;
 
 use registry::get_or_spawn_in;
 
-use crate::ag_ui::AgUiSink;
+use crate::ag_ui::{derive_thread_id, AgUiSink};
 use ag_ui_core::{
     event::{BaseEvent, Event, RunErrorEvent, RunFinishedEvent, RunStartedEvent},
     types::{
@@ -111,6 +111,7 @@ struct SessionActor {
     reap_ttl: Duration,
     reap_deadline: Option<Instant>,
     history_snapshot: Vec<AgUiMessage>,
+    history_warnings: Vec<String>,
     actor_config: SessionActorConfig,
 }
 
@@ -144,6 +145,7 @@ fn spawn_session_actor(
         reap_ttl,
         reap_deadline: None,
         history_snapshot: Vec::new(),
+        history_warnings: Vec::new(),
         actor_config,
     };
     tokio::spawn(actor.run());
@@ -305,6 +307,7 @@ impl SessionActor {
                 self.refresh_history_snapshot().await;
                 let _ = reply.send(SubscribeResult {
                     snapshot: self.history_snapshot.clone(),
+                    history_warnings: self.history_warnings.clone(),
                     events: self.broadcast_tx.subscribe(),
                 });
             }
@@ -619,6 +622,7 @@ impl SessionActor {
         SessionInfo {
             state: self.state.clone(),
             history_snapshot: self.history_snapshot.clone(),
+            history_warnings: self.history_warnings.clone(),
             capabilities: SessionCapabilities {
                 can_prompt: true,
                 can_cancel: true,
@@ -751,7 +755,7 @@ impl SessionActor {
     }
 
     async fn refresh_history_snapshot(&mut self) {
-        self.history_snapshot = if self.actor_config.call_fn.is_some() {
+        let (snapshot, warnings) = if self.actor_config.call_fn.is_some() {
             let prompt_config = prompt_config_for_agent_session_from_global(
                 &self.actor_config.base_config,
                 &self.key,
@@ -763,16 +767,35 @@ impl SessionActor {
                 .as_ref()
                 .map(|session| crate::ag_ui::history_messages_for_snapshot(&session.messages))
                 .unwrap_or_default();
-            snapshot
+            (snapshot, Vec::new())
         } else {
             match crate::load_nats_session(&self.actor_config.base_config, &self.key.session).await
             {
                 Ok(session) if session.agent_name.as_deref() == Some(self.key.agent.as_str()) => {
-                    crate::ag_ui::history_messages_for_snapshot(&session.messages)
+                    (
+                        crate::ag_ui::history_messages_for_snapshot(&session.messages),
+                        session.replay_warnings,
+                    )
                 }
-                _ => Vec::new(),
+                Ok(session) => (
+                    Vec::new(),
+                    vec![format!(
+                        "Failed to load session history: session belongs to agent '{}' rather than '{}'",
+                        session.agent_name.as_deref().unwrap_or("unknown"),
+                        self.key.agent
+                    )],
+                ),
+                Err(error) if error.to_string().contains("Not Found") => {
+                    (Vec::new(), Vec::new())
+                }
+                Err(error) => (
+                    Vec::new(),
+                    vec![format!("Failed to load session history: {error:#}")],
+                ),
             }
         };
+        self.history_snapshot = snapshot;
+        self.history_warnings = warnings;
     }
 }
 
@@ -1158,11 +1181,6 @@ fn usage_context_snapshot(
         max_context_tokens,
         context_percent: max_context_tokens.map(|_| percent),
     })
-}
-
-fn derive_thread_id(session: &str) -> ThreadId {
-    use uuid::Uuid;
-    ThreadId::from(Uuid::new_v5(&Uuid::NAMESPACE_URL, session.as_bytes()))
 }
 
 fn base_event() -> BaseEvent {

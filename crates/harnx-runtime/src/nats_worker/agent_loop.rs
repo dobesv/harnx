@@ -1200,6 +1200,11 @@ fn build_remote_session_header(
     working_dir: Option<&std::path::Path>,
 ) -> Result<harnx_core::session::SessionLogEntry> {
     let mut header_session = crate::config::session::new(&config.read(), session_id, working_dir)?;
+    // The NATS stream key is the canonical remote identity. `session::new`
+    // also supports friendly local aliases and may otherwise synthesize a
+    // short ID for an arbitrary name, splitting the stream and index IDs.
+    header_session.id = session_id.to_string();
+    header_session.session_id = Some(session_id.to_string());
     header_session.set_agent(&input.agent)?;
     Ok(header_session.build_header_entry())
 }
@@ -1207,9 +1212,10 @@ fn build_remote_session_header(
 fn build_session_index_record_from_header(
     header: &harnx_core::session::SessionLogEntry,
     title: Option<String>,
+    stream_session_id: &str,
 ) -> Result<SessionIndexRecord> {
     let harnx_core::session::SessionLogEntry::Header {
-        session_id,
+        session_id: _,
         agent_name,
         working_dir,
         git_branch,
@@ -1221,9 +1227,12 @@ fn build_session_index_record_from_header(
     };
 
     Ok(SessionIndexRecord {
-        session_id: session_id
-            .clone()
-            .context("remote session header missing session_id")?,
+        // The stream name is authoritative. Older web clients supplied UUID
+        // v4 stream IDs that `session::new` replaced with a short header ID,
+        // so trusting that legacy header creates a picker row for an empty
+        // stream. New headers keep these equal; this override repairs the
+        // denormalized index on the next activation.
+        session_id: stream_session_id.to_string(),
         agent_name: agent_name
             .clone()
             .context("remote session header missing agent_name")?,
@@ -1253,8 +1262,9 @@ async fn upsert_session_index_record(
     store: &async_nats::jetstream::kv::Store,
     header: &harnx_core::session::SessionLogEntry,
     title: Option<String>,
+    stream_session_id: &str,
 ) -> Result<u64> {
-    let record = build_session_index_record_from_header(header, title)?;
+    let record = build_session_index_record_from_header(header, title, stream_session_id)?;
     put_record(store, &record)
         .await
         .with_context(|| format!("put session index record for {}", record.session_id))
@@ -1283,11 +1293,22 @@ async fn refresh_session_index_on_activation(
         return;
     };
     let title = latest_title_from_entries(effective_entries);
-    if let Err(err) = upsert_session_index_record(store, header, title).await {
+    let stale_header_session_id = match header {
+        SessionLogEntry::Header { session_id, .. } => session_id.as_deref(),
+        _ => None,
+    };
+    if let Err(err) = upsert_session_index_record(store, header, title, session_id).await {
         log::warn!(
             "failed to upsert remote session index during activation: \
              session_id={session_id} err={err:#}"
         );
+    } else if let Some(stale_id) = stale_header_session_id.filter(|id| *id != session_id) {
+        if let Err(err) = crate::nats_session_index::delete_record(store, stale_id).await {
+            log::warn!(
+                "failed to delete stale remote session index identity: stale_id={stale_id} \
+                 session_id={session_id} err={err:#}"
+            );
+        }
     }
 }
 
@@ -1375,7 +1396,7 @@ pub(crate) async fn write_header_and_load_session(
     let header = build_remote_session_header(config, input, session_id, working_dir)?;
     backend.append_event_blocking(&header)?;
     if let Some(store) = session_index {
-        if let Err(err) = upsert_session_index_record(store, &header, None).await {
+        if let Err(err) = upsert_session_index_record(store, &header, None, session_id).await {
             log::warn!(
                 "failed to upsert remote session index after header write: session_id={} err={err:#}",
                 session_id
@@ -1389,8 +1410,8 @@ pub(crate) async fn write_header_and_load_session(
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_resolved_hooks, dispatch_session_start, fold_new_user_messages_since, SessionOrigin,
-        SessionStartDispatch,
+        agent_resolved_hooks, build_session_index_record_from_header, dispatch_session_start,
+        fold_new_user_messages_since, SessionOrigin, SessionStartDispatch,
     };
     use crate::config::Config;
     use crate::nats_hook_provider::{DiscoveredHook, NatsHookProvider};
@@ -1430,6 +1451,27 @@ mod tests {
             }),
         );
         (provider, seen)
+    }
+
+    #[test]
+    fn session_index_uses_authoritative_stream_id_for_legacy_mismatched_header() {
+        let mut session = harnx_core::session::Session {
+            session_id: Some("stale-generated-id".to_string()),
+            agent_name: Some("coding/coder".to_string()),
+            ..Default::default()
+        };
+        session.id = "stale-generated-id".to_string();
+
+        let record = build_session_index_record_from_header(
+            &session.build_header_entry(),
+            Some("Title".to_string()),
+            "a4119d46-41fd-4f67-8a17-d56c9d141369",
+        )
+        .unwrap();
+
+        assert_eq!(record.session_id, "a4119d46-41fd-4f67-8a17-d56c9d141369");
+        assert_eq!(record.agent_name, "coding/coder");
+        assert_eq!(record.title.as_deref(), Some("Title"));
     }
 
     #[tokio::test]

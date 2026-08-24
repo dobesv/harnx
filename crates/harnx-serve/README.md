@@ -52,6 +52,13 @@ harnx-serve --web-assets ./web/dist
 
 The AG-UI surface allows modern web interfaces to interact with `harnx` agents using a real-time event stream and a JSON-RPC control plane.
 
+Harnx session identity and AG-UI thread identity are deliberately separate.
+The `:session` path segment is the canonical short Harnx ID used by URLs, the
+NATS stream, and the session index. AG-UI's `ThreadId` type requires a UUID, so
+`ag_ui::derive_thread_id` deterministically maps a short ID to UUID v5 at the
+wire boundary (and passes legacy UUID session IDs through). The derived UUID is
+never used as a persistence or routing key.
+
 ### Endpoints
 
 | Method | Path | Accept / Content-Type | Purpose |
@@ -59,7 +66,9 @@ The AG-UI surface allows modern web interfaces to interact with `harnx` agents u
 | `GET` | `/v1/agents` | `application/json` | List all configured agents. |
 | `GET` | `/v1/agents/:agent` | `application/json` | Agent details (name, description, active sessions). |
 | `GET` | `/v1/agents/:agent/sessions` | `application/json` | List sessions for the agent. |
+| `POST` | `/v1/agents/:agent/sessions` | `application/json` | Reserve a canonical short session ID. |
 | `GET` | `/v1/agents/:agent/sessions/:session` | `application/json` | Session history in AG-UI format. |
+| `GET` | `/v1/agents/:agent/sessions/:session/events` | `Accept: text/event-stream` | Notify passive clients when any frontend updates the session. |
 | `POST` | `/v1/agents/:agent/sessions/:session` | `Accept: text/event-stream` | **Subscription Plane**: SSE event stream. |
 | `POST` | `/v1/agents/:agent/sessions/:session` | `Content-Type: application/json` | **Control Plane**: JSON-RPC 2.0 interface. |
 
@@ -85,15 +94,25 @@ This rule keeps subscriber requests and JSON-RPC calls unambiguous even if both 
 
 Provides AG-UI events for a run. The body's **last message** selects the mode:
 
-- **Prompted run** (last message is a non-empty `user` message): a pure delta
+- **Prompted run** (last message is a non-empty `user` message whose ID is not
+  already present in the authoritative snapshot): a pure delta
   stream — `RUN_STARTED` → `STEP_*`/`TEXT_MESSAGE_*`/`THINKING_*`/`TOOL_CALL_*`/
   `CUSTOM` → `RUN_FINISHED` (or `RUN_ERROR`). The stream **terminates** after the
   terminal event so the client's `runAgent()` promise resolves. No
   `MESSAGES_SNAPSHOT` is emitted (it would predate the just-sent user message).
-- **Promptless join** (empty `messages`, i.e. `{"messages":[]}`, or an empty/
-  whitespace-only last user message): a one-shot hydrate — synthetic
-  `RUN_STARTED` → `MESSAGES_SNAPSHOT` (current history) → `RUN_FINISHED`, then the
-  stream closes. It does not forward another run's live events.
+- **Promptless join** (no non-empty trailing user message): hydrates with a
+  synthetic `RUN_STARTED` → `MESSAGES_SNAPSHOT`. For an idle session it appends
+  a synthetic `RUN_FINISHED` and closes; for a running or interrupted session it
+  follows that run's live events through the real terminal event.
+
+Passive clients keep a separate `GET .../events` connection open. Each
+`session-updated` notification tells the client to run a promptless hydrate (or,
+when the server's session actor is active, join its live AG-UI run). This keeps
+the AG-UI run stream finite while allowing browser tabs to invalidate each
+other's snapshots. The event feed and underlying NATS fan-out are advisory, not
+history: clients rehydrate from the durable session log after notifications and
+at terminal or reconnect boundaries. Non-web frontends consume the same NATS
+fan-out directly and converge from that durable log as well.
 
 Note: the request body must be a JSON object containing a `messages` array (e.g.
 `{"messages":[]}`); a bare `{}` is rejected as an invalid AG-UI request.
@@ -108,7 +127,7 @@ Same canonical session URL, negotiated into programmatic control.
   ```json
   { "jsonrpc": "2.0", "id": 1, "method": "session/get" }
   ```
-  **Result:** `{ "state": { "status": "idle" }, "history_snapshot": [...], "capabilities": { "multiClient": true, "persistence": "nats" } }` (a running session reports `"state": { "status": "running", "run_id": "…", "started_at": "…" }`)
+  **Result:** `{ "state": { "status": "idle" }, "history_snapshot": [...], "history_warnings": [], "capabilities": { "multiClient": true, "persistence": "nats" } }` (a running session reports `"state": { "status": "running", "run_id": "…", "started_at": "…" }`)
 - **`session/prompt`**: Sends a new user prompt.
   ```json
   { "jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": { "text": "hello" } }
@@ -129,9 +148,10 @@ Same canonical session URL, negotiated into programmatic control.
 
 ### Client Implementation Flow
 
-1. **Connect**: Open SSE connection on session URL to receive history and subscribe to live events.
-2. **Drive**: Use JSON-RPC on same session URL to send prompts (`session/prompt`) or cancel runs (`session/cancel`).
-3. **Stateless UI**: Clients only send new inputs via RPC; they do not need to re-POST full transcript.
+1. **Create**: `POST` the session collection and use the returned `session_id` as the URL, NATS stream, and persistence identity.
+2. **Connect**: Open the session event feed and use promptless AG-UI runs to hydrate or join an active run.
+3. **Drive**: Use JSON-RPC on same canonical session URL to send prompts (`session/prompt`) or cancel runs (`session/cancel`).
+4. **Stateless UI**: Clients only send new inputs via RPC; they do not need to re-POST full transcript.
 
 ### Disconnect Semantics (D5)
 
@@ -143,7 +163,9 @@ This implementation deliberately diverges from generic AG-UI/assistant-ui standa
 - **Last-Message Inspection:** Decision to start a run is based on last message in SSE POST body.
 - **Two-Plane Control:** Uses JSON-RPC instead of standard RESTful run endpoints to support mid-run injection.
 - **Single Canonical URL:** Both planes share one session permalink and rely on content negotiation instead of sibling routes.
-- **No Staleness Guards:** Omits request reconciliation and version/sequence guards.
+- **Message-ID Replay Guard:** A trailing user row already present in the
+  authoritative snapshot is hydration, not a new prompt. There is no general
+  request-version or sequence reconciliation protocol.
 
 ### Phase B Scope
 
@@ -175,7 +197,9 @@ Intentionally dropped today:
 ## Operational Notes
 
 - **Persistence and `--dry-run`:** NATS transcript writes are skipped in `--dry-run` mode. A generated session ID is still reserved in the NATS session index.
-- **Consistency Barrier:** History reflects a turn only AFTER it completes and is persisted.
+- **Durable Refresh:** History reflects the latest durably appended log entries.
+  Live notifications are advisory; clients reload the authoritative transcript
+  after each notification and on reconnect.
 
 ## Quickstart
 

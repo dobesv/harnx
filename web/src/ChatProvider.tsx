@@ -1,5 +1,5 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { AssistantRuntimeProvider, useAui } from '@assistant-ui/react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { AssistantRuntimeProvider } from '@assistant-ui/react';
 import type { AttachmentAdapter } from '@assistant-ui/react';
 import { useAgUiRuntime } from '@assistant-ui/react-ag-ui';
 import { HttpAgent } from '@ag-ui/client';
@@ -7,7 +7,8 @@ import type { AgentSubscriber, Message } from '@ag-ui/client';
 import { PendingContext } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { uploadAttachment } from './api';
-import { setDocumentTitle } from './sessionTitle';
+import { RuntimeSessionSubscriber } from './RuntimeSessionSubscriber';
+import { handleHarnxCustomEvent } from './harnxCustomEvents';
 
 export interface ChatProviderProps {
   agentName: string;
@@ -18,27 +19,6 @@ export interface ChatProviderProps {
 }
 
 const EMPTY_STATE = {};
-
-const RuntimeSessionSubscriber = ({ enabled }: { enabled: boolean }) => {
-  const aui = useAui();
-  // The initial promptless subscribe/hydrate must fire exactly once per mount.
-  // React StrictMode double-invokes mount effects in dev (and the e2e suite runs
-  // against the dev server), so an unguarded startRun opens two concurrent runs
-  // on the same thread; they race and the surviving run can drop the transcript
-  // snapshot, leaving the thread empty. A session switch remounts this component
-  // (AssistantRuntimeProvider is keyed on agent:session), which re-arms the ref.
-  const startedRef = useRef(false);
-
-  useEffect(() => {
-    if (!enabled || startedRef.current) return;
-    startedRef.current = true;
-    aui.thread.startRun({
-      parentId: aui.thread.getState().messages.at(-1)?.id ?? null,
-    });
-  }, [enabled, aui]);
-
-  return null;
-};
 
 export interface AttachmentPart {
   type: string;
@@ -128,22 +108,14 @@ export class HarnxHttpAgent extends HttpAgent {
   }
 
   private handleCustomEvent(name: string, value: any) {
-    const handlers: Record<string, (v: any) => void> = {
-      status: (v) => this.onStatus(v?.text || null),
-      usage: (v) => this.onUsageCb(v),
-      tool_summary: (v) => this.onToolSummaryCb(v?.tool_call_id, v?.markdown),
-      session_title_updated: (v) => setDocumentTitle(v?.title),
-      session_title_generation_failed: (v) => {
-        console.error('session_title_generation_failed:', v?.error);
-        this.onStatus(v?.error || null);
-      },
-      session_handoff: (v) => {
-        if (this.isRunActive) {
-          this.onHandoff?.(v?.agent, v?.session_id ?? null);
-        }
-      },
-    };
-    handlers[name]?.(value);
+    handleHarnxCustomEvent(name, value, {
+      onStatus: this.onStatus,
+      onRunFailed: this.onRunFailedCb,
+      onUsage: this.onUsageCb,
+      onToolSummary: this.onToolSummaryCb,
+      onHandoff: this.onHandoff,
+      isRunActive: this.isRunActive,
+    });
   }
 
   override async runAgent(params: any, subscriber?: AgentSubscriber) {
@@ -267,7 +239,10 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId
     <PendingContext.Provider value={{ statusText, setStatusText, errorText, setErrorText }}>
       <UsageContext.Provider value={{ usage, toolSummaries }}>
         <AssistantRuntimeProvider key={`${agentName}:${sessionId}`} runtime={runtime}>
-          <RuntimeSessionSubscriber enabled={!isFreshSession} />
+          <RuntimeSessionSubscriber
+            enabled={!isFreshSession}
+            eventsUrl={`/v1/agents/${encodeURIComponent(agentName)}/sessions/${encodeURIComponent(sessionId)}/events`}
+          />
           {children}
         </AssistantRuntimeProvider>
       </UsageContext.Provider>

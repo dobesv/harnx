@@ -452,13 +452,13 @@ body {
   color: var(--danger);
 }
 
-.aui-message[data-role="user"] {
+.aui-user-message {
   align-self: flex-end;
   background: var(--accent-bg);
   border-radius: 16px 16px 4px 16px;
 }
 
-.aui-message[data-role="assistant"] {
+.aui-assistant-message {
   align-self: flex-start;
   background: transparent;
   border-radius: 16px 16px 16px 4px;
@@ -678,8 +678,8 @@ body {
   margin-top: 0;
   margin-bottom: 0;
 }
-.aui-message[data-role="user"] + .aui-message[data-role="assistant"],
-.aui-message[data-role="assistant"] + .aui-message[data-role="user"] {
+.aui-user-message + .aui-assistant-message,
+.aui-assistant-message + .aui-user-message {
   margin-top: 8px;
 }
 

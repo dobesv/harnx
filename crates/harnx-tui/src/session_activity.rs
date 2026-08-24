@@ -10,6 +10,48 @@ use tokio::task::JoinHandle;
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 type SessionTarget = (String, String);
 
+struct SessionEventForwarder<'a> {
+    event_tx: &'a UnboundedSender<TuiEvent>,
+    target: &'a SessionTarget,
+    attached_seq: u64,
+    attached_during_turn: bool,
+}
+
+impl SessionEventForwarder<'_> {
+    fn should_forward(
+        &self,
+        stream: &SessionEventStream,
+        envelope: &harnx_runtime::nats_event_sink::AdvisoryEnvelope,
+    ) -> bool {
+        stream.should_render(envelope) && self.follows_attach(envelope.after_seq)
+    }
+
+    fn follows_attach(&self, after_seq: u64) -> bool {
+        self.attached_during_turn || after_seq > self.attached_seq
+    }
+
+    fn send_activity(&self, active: bool) -> bool {
+        self.send(TuiEvent::SessionActivity {
+            session_id: self.target.0.clone(),
+            cluster: self.target.1.clone(),
+            active,
+        })
+    }
+
+    fn send_agent_event(&self, event: AgentEvent) -> bool {
+        let activity = event_activity(&event);
+        self.send(TuiEvent::SessionAgent {
+            session_id: self.target.0.clone(),
+            cluster: self.target.1.clone(),
+            event,
+        }) && activity.is_none_or(|active| self.send_activity(active))
+    }
+
+    fn send(&self, event: TuiEvent) -> bool {
+        self.event_tx.send(event).is_ok()
+    }
+}
+
 impl Tui {
     pub(super) fn draw_with_session_activity<B>(
         &mut self,
@@ -45,8 +87,56 @@ impl Tui {
             self.active_remote_session = Some(target);
             self.refresh_input_chrome();
         } else {
+            // A reconnect may miss the lossy TurnEnded advisory. If this TUI
+            // previously observed the foreign turn, converge from its durable
+            // history before clearing the busy state.
+            if self.active_remote_session.as_ref() == Some(&target) {
+                self.refresh_shared_session_transcript().await;
+            }
             self.complete_main_prompt().await;
         }
+    }
+
+    pub(super) async fn handle_shared_session_agent_event(
+        &mut self,
+        session_id: String,
+        cluster: String,
+        event: AgentEvent,
+    ) {
+        let target = (session_id, cluster);
+        if self.session_activity_target.as_ref() != Some(&target) {
+            return;
+        }
+        // The locally-owned prompt already delivers the same worker events
+        // through TuiAgentEventSink. Rendering the shared fan-out as well would
+        // duplicate every streamed chunk and tool row.
+        if self.current_prompt_abort.is_some() {
+            return;
+        }
+
+        let refresh_before = matches!(event, AgentEvent::Turn(TurnEvent::Started));
+        let refresh_after = matches!(event, AgentEvent::Turn(TurnEvent::Ended { .. }));
+        if refresh_before {
+            self.refresh_shared_session_transcript().await;
+        }
+        self.render_agent_event(event).await;
+        if refresh_after {
+            // Advisory fan-out is deliberately lossy. Rebuild at the durable
+            // turn boundary so a missed final chunk still converges exactly to
+            // what reopening the session would show.
+            self.refresh_shared_session_transcript().await;
+        }
+    }
+
+    async fn refresh_shared_session_transcript(&mut self) {
+        self.app.transcript =
+            crate::lifecycle::session_history_transcript_items(&self.config).await;
+        self.app.streaming_open = false;
+        self.app.main_streamed_text_idx = None;
+        self.app.last_ui_output_source = None;
+        self.app.transcript_focus = None;
+        self.app.transcript_selection_anchor = None;
+        self.pin_transcript_to_bottom();
     }
 
     pub(super) async fn handle_turn_activity(
@@ -76,7 +166,11 @@ impl Tui {
     }
 
     pub(super) fn sync_session_activity_monitor(&mut self) {
-        let desired = self.session_activity_destination();
+        let desired = self
+            .current_prompt_abort
+            .is_none()
+            .then(|| self.session_activity_destination())
+            .flatten();
         if desired == self.session_activity_target {
             return;
         }
@@ -149,10 +243,18 @@ async fn monitor_session_connection(
             return true;
         }
     };
-    if !send_activity(event_tx, target, history_has_pending_turn(stream.history())) {
+    let attached_during_turn = history_has_pending_turn(stream.history());
+    let attached_seq = stream.last_applied_seq();
+    let forwarder = SessionEventForwarder {
+        event_tx,
+        target,
+        attached_seq,
+        attached_during_turn,
+    };
+    if !forwarder.send_activity(attached_during_turn) {
         return false;
     }
-    forward_session_activity(&mut stream, event_tx, target).await
+    forward_session_activity(&mut stream, &forwarder).await
 }
 
 async fn attach_session_event_stream(
@@ -167,36 +269,17 @@ async fn attach_session_event_stream(
 
 async fn forward_session_activity(
     stream: &mut SessionEventStream,
-    event_tx: &UnboundedSender<TuiEvent>,
-    target: &SessionTarget,
+    forwarder: &SessionEventForwarder<'_>,
 ) -> bool {
     while let Some(envelope) = stream.next().await {
-        let active = stream
-            .should_render(&envelope)
-            .then(|| event_activity(&envelope.event))
-            .flatten();
-        let Some(active) = active else {
+        if !forwarder.should_forward(stream, &envelope) {
             continue;
-        };
-        if !send_activity(event_tx, target, active) {
+        }
+        if !forwarder.send_agent_event(envelope.event) {
             return false;
         }
     }
     true
-}
-
-fn send_activity(
-    event_tx: &UnboundedSender<TuiEvent>,
-    target: &SessionTarget,
-    active: bool,
-) -> bool {
-    event_tx
-        .send(TuiEvent::SessionActivity {
-            session_id: target.0.clone(),
-            cluster: target.1.clone(),
-            active,
-        })
-        .is_ok()
 }
 
 fn event_activity(event: &AgentEvent) -> Option<bool> {
@@ -331,5 +414,51 @@ mod tests {
             )),
             Some(true)
         );
+    }
+
+    #[test]
+    fn agent_event_precedes_its_activity_transition() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let target = ("session".to_string(), "cluster".to_string());
+        let forwarder = SessionEventForwarder {
+            event_tx: &event_tx,
+            target: &target,
+            attached_seq: 0,
+            attached_during_turn: true,
+        };
+
+        assert!(
+            forwarder.send_agent_event(AgentEvent::Turn(TurnEvent::Ended {
+                outcome: Default::default(),
+            }))
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::SessionAgent { .. })
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::SessionActivity { active: false, .. })
+        ));
+    }
+
+    #[test]
+    fn completed_tail_advisories_are_not_replayed_after_attach() {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let target = ("session".to_string(), "cluster".to_string());
+        let completed = SessionEventForwarder {
+            event_tx: &event_tx,
+            target: &target,
+            attached_seq: 7,
+            attached_during_turn: false,
+        };
+        assert!(!completed.follows_attach(7));
+        assert!(completed.follows_attach(8));
+
+        let active = SessionEventForwarder {
+            attached_during_turn: true,
+            ..completed
+        };
+        assert!(active.follows_attach(7));
     }
 }

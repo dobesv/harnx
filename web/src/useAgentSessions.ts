@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
-import { listAgents, listSessions, newSessionId } from './api';
-import type { Agent, SessionRef } from './types';
+import { listAgents } from './api';
+import type { Agent } from './types';
 import { setDocumentTitle } from './sessionTitle';
+import { useSessionDiscovery } from './useSessionDiscovery';
 
 export function useAgentSessions() {
   const getInitialState = () => {
@@ -21,11 +22,13 @@ export function useAgentSessions() {
 
   const [agents, setAgents] = useState<Agent[]>([]);
   const [agentsError, setAgentsError] = useState<string | null>(null);
-  const [sessions, setSessions] = useState<SessionRef[]>([]);
-  const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [selectedAgent, setSelectedAgent] = useState<string>(initial.agent);
   const [selectedSessionId, setSelectedSessionId] = useState<string>(initial.session);
-  const [freshSessionIds, setFreshSessionIds] = useState<string[]>(() => (initial.session ? [] : []));
+  const discovery = useSessionDiscovery({
+    selectedAgent,
+    selectedSessionId,
+    setSelectedSessionId,
+  });
 
   useEffect(() => {
     let newPath = '/';
@@ -51,18 +54,6 @@ export function useAgentSessions() {
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
 
-  const refreshSessions = useCallback(() => {
-    if (!selectedAgent) return;
-    setSessionsError(null);
-    listSessions(selectedAgent).then(data => {
-      setSessions(data);
-      setFreshSessionIds((prev) => prev.filter((id) => !data.some((session) => session.session_id === id)));
-    }).catch((err) => {
-      console.error(err);
-      setSessionsError(err.message || 'Failed to fetch sessions');
-    });
-  }, [selectedAgent]);
-
   useEffect(() => {
     setAgentsError(null);
     listAgents().then(data => {
@@ -71,16 +62,6 @@ export function useAgentSessions() {
       console.error(err);
       setAgentsError(err.message || 'Failed to fetch agents');
     });
-  }, []);
-
-  useEffect(() => {
-    refreshSessions();
-  }, [refreshSessions]);
-
-  const handleNewChat = useCallback(() => {
-    const id = newSessionId();
-    setFreshSessionIds((prev) => [...prev, id]);
-    setSelectedSessionId(id);
   }, []);
 
   const clearSession = useCallback(() => {
@@ -95,28 +76,26 @@ export function useAgentSessions() {
 
   useEffect(() => {
     const session = selectedSessionId
-      ? sessions.find(s => s.session_id === selectedSessionId)
+      ? discovery.sessions.find(s => s.session_id === selectedSessionId)
       : undefined;
     setDocumentTitle(session?.title);
-  }, [selectedSessionId, sessions]);
+  }, [selectedSessionId, discovery.sessions]);
   return {
     agents,
     agentsError,
-    sessions,
-    sessionsError,
+    sessions: discovery.sessions,
+    sessionsError: discovery.sessionsError,
+    sessionsLoading: discovery.sessionsLoading,
     selectedAgent,
     selectedSessionId,
-    isFreshSession: selectedSessionId ? freshSessionIds.includes(selectedSessionId) : false,
-    refreshSessions,
+    isFreshSession: discovery.isFreshSession,
+    refreshSessions: discovery.refreshSessions,
     selectAgent: (agent: string) => {
       setSelectedAgent(agent);
       setSelectedSessionId('');
     },
-    selectSession: (id: string) => {
-      setSelectedSessionId(id);
-      setFreshSessionIds((prev) => prev.filter((sessionId) => sessionId !== id));
-    },
-    newChat: handleNewChat,
+    selectSession: discovery.selectSession,
+    newChat: discovery.newChat,
     clearSession,
     clearAgent
   };

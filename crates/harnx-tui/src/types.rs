@@ -351,6 +351,12 @@ pub(crate) enum TuiEvent {
         cluster: String,
         active: bool,
     },
+    /// Agent output observed from another frontend on the selected session.
+    SessionAgent {
+        session_id: String,
+        cluster: String,
+        event: harnx_core::event::AgentEvent,
+    },
     /// Intermediate tool round completed; retained for queued-message tests.
     #[allow(dead_code)]
     ToolRoundComplete,

@@ -816,6 +816,14 @@ impl Tui {
                 self.handle_session_activity(session_id, cluster, active)
                     .await;
             }
+            TuiEvent::SessionAgent {
+                session_id,
+                cluster,
+                event,
+            } => {
+                self.handle_shared_session_agent_event(session_id, cluster, event)
+                    .await;
+            }
             TuiEvent::ToolRoundComplete => {
                 // Intermediate tool round — prompt loop continues, don't clear llm_busy.
                 // Flush any pending thought so follow-up thought after tool results
@@ -982,7 +990,7 @@ impl Tui {
         }
     }
 
-    async fn render_agent_event(&mut self, event: AgentEvent) {
+    pub(super) async fn render_agent_event(&mut self, event: AgentEvent) {
         use harnx_core::event::{ModelEvent, NoticeEvent, SessionEvent, ToolEvent, UserEvent};
 
         let (source, event, is_sub_agent) = match event {
@@ -1224,7 +1232,7 @@ impl Tui {
                 )]
             }
             AgentEvent::Session(SessionEvent::CompactingCompleted) => {
-                self.app.transcript = session_history_transcript_items(&self.config);
+                self.app.transcript = session_history_transcript_items(&self.config).await;
                 self.app.streaming_open = false;
                 // A compaction can land mid-turn after some assistant text has
                 // already streamed. The rebuild drops that streamed row, so the
@@ -1475,6 +1483,10 @@ impl Tui {
         // un-aborted by a future `abort_signal.reset()`.
         let new_abort = harnx_runtime::utils::create_abort_signal();
         self.current_prompt_abort = Some(new_abort.clone());
+        // This prompt receives its worker events directly through
+        // TuiAgentEventSink. Pause the shared observer before activating the
+        // worker so its advisory copy cannot be queued and rendered later.
+        self.sync_session_activity_monitor();
 
         self.app.llm_busy = true;
         self.app.streaming_open = false;
@@ -2078,7 +2090,7 @@ impl Tui {
         }
     }
 
-    pub(crate) fn reconcile_transcript_after_command(
+    pub(crate) async fn reconcile_transcript_after_command(
         &mut self,
         prev_session: Option<String>,
         prev_agent: Option<String>,
@@ -2112,7 +2124,7 @@ impl Tui {
         // Reset scroll state so the widget doesn't subtract-overflow when
         // the rebuilt transcript is shorter than the previous one.
         self.app.scroll_state = ratatui_widget_scrolling::ScrollState::new();
-        self.app.transcript = Self::build_initial_transcript(&self.config);
+        self.app.transcript = Self::build_initial_transcript(&self.config).await;
         self.pin_transcript_to_bottom();
     }
 
@@ -2295,7 +2307,8 @@ impl Tui {
                     llm_busy,
                     pending_message,
                 );
-                self.reconcile_transcript_after_command(prev_session, prev_agent, line);
+                self.reconcile_transcript_after_command(prev_session, prev_agent, line)
+                    .await;
                 if !clean.is_empty() {
                     if is_mutation_command {
                         self.app
@@ -2391,13 +2404,8 @@ impl Tui {
     }
 
     async fn handle_picker_key(&mut self, key: KeyEvent) -> Result<()> {
-        // Ctrl+D always exits — no prompt running in picker state.
-        if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL {
-            self.app.should_quit = true;
-            return Ok(());
-        }
-        // Ctrl+C exits in picker state — there is no in-flight prompt to abort.
-        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+        // Ctrl+C and Ctrl+D exit — there is no in-flight prompt to abort.
+        if matches!(key.code, KeyCode::Char('c' | 'd')) && key.modifiers == KeyModifiers::CONTROL {
             self.app.should_quit = true;
             return Ok(());
         }
@@ -2549,7 +2557,8 @@ impl Tui {
                                 origin_session,
                                 origin_agent,
                                 ".session",
-                            );
+                            )
+                            .await;
                         }
                     }
                     _ => {

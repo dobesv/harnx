@@ -148,8 +148,7 @@ impl Config {
     ///
     /// # Returns
     ///
-    /// - `Ok(vec![])` when the session index bucket does not exist or exists but is empty.
-    ///   These are legitimate "no sessions indexed yet" cases and do not indicate failure.
+    /// - `Ok(vec![])` when the session index bucket exists but is empty.
     ///
     /// - `Err(...)` for actual fetch failures: connection refused, auth/permission denied,
     ///   network timeouts, or errors listing records from an existing bucket. The error
@@ -190,15 +189,19 @@ impl Config {
         {
             Ok(store) => store,
             Err(e) => {
-                // Bucket not found -> empty result (no sessions indexed yet).
-                // All other errors (auth, network, permissions) -> propagate as Err.
+                // A missing bucket does not prove that there are no sessions: canonical
+                // session streams can outlive a lost/not-yet-created denormalized index.
+                // Report discovery as unavailable so clients do not mislabel that state as
+                // an authoritative empty list.
                 if kv_bucket_missing(&e) {
                     log::debug!(
-                        "Session index bucket '{}' not found for cluster '{}' (no sessions indexed yet)",
+                        "Session index bucket '{}' not found for cluster '{}' (session discovery unavailable)",
                         nats_session_index::SESSION_INDEX_BUCKET,
                         cluster
                     );
-                    return Ok(vec![]);
+                    anyhow::bail!(
+                        "Session discovery is not available yet because the session index for cluster '{cluster}' has not been initialized; try again shortly"
+                    );
                 }
                 return Err(e).with_context(|| {
                     format!(
