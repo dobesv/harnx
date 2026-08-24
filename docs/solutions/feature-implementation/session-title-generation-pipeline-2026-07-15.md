@@ -15,6 +15,7 @@ tags:
   - nats-index
   - backward-compatibility
 plan_ref: "session-title-generation"
+last_updated: 2026-08-23
 ---
 
 ## Problem
@@ -74,7 +75,7 @@ Fix: `scan_latest_title` reads the whole file (lossy utf8), string-splits on `--
 ### Async Title Pipeline (mirrors compaction)
 
 ```rust
-// session_ops_title.rs — fire-and-forget spawn pattern
+// session_ops_title.rs — background spawn pattern
 pub fn maybe_generate_title(config: GlobalConfig) {
     let threshold = config.read().data.title_update_threshold;
     let need = config.read().session.as_ref()
@@ -98,6 +99,15 @@ pub fn maybe_generate_title(config: GlobalConfig) {
     });
 }
 ```
+
+The task is fire-and-forget only when no external ownership lease governs its
+session sink. NATS workers attach a lease-fenced sink, so
+`WorkerRuntime::wait_for_post_turn_maintenance` in
+`crates/harnx-runtime/src/nats_worker/daemon_session_exec.rs` keeps the lease
+through both `titling` and `compressing`, then records `TurnEnd` and releases
+ownership. Releasing first fences the background append and produces
+`refusing worker-originated append: session lease not held (fenced out)`; that
+warning is legitimate after real lease loss, but not during an ordinary turn.
 
 ### First-Title Trigger Logic
 
@@ -178,6 +188,8 @@ fn last_title_in_buffer(contents: &str) -> Option<String> {
 ### Async Pipeline Patterns
 
 - Mirror compaction: `titling` flag, `tokio::spawn`, session-id guard against swap, flag clear in spawn
+- A NATS worker must retain its session lease until both `titling` and
+  `compressing` clear; these background tasks append through its fenced sink
 - Re-entrancy guard (`titling`) checked BEFORE spawn
 - Session-swap check AFTER spawn, BEFORE mutation
 

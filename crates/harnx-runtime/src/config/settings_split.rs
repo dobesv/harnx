@@ -76,7 +76,7 @@ impl Config {
             // Manual title: record the current token count for provenance;
             // `record_title` freezes regeneration (usize::MAX) for manual titles.
             let tokens = session.tokens;
-            crate::config::session::record_title(session, title.clone(), true, tokens);
+            crate::config::session::record_title(session, title.clone(), true, tokens)?;
         }
         harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
             harnx_core::event::SessionEvent::TitleUpdated(title),

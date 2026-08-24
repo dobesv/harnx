@@ -127,6 +127,12 @@ impl WorkerRuntime {
                 )
                 .await?;
 
+                // The shared agent loop starts compaction/title generation in
+                // background tasks. Their session sink is lease-fenced, so do not
+                // publish the durable turn boundary or release ownership while
+                // either task can still append to this session.
+                Self::wait_for_post_turn_maintenance(&per_session, &lease).await;
+
                 // After turn completes, update activation high-water from turn_cursor.
                 // turn_cursor covers everything this turn consumed: the seed
                 // messages, the header-insert re-map, and any mid-round
@@ -214,6 +220,23 @@ impl WorkerRuntime {
 
         let _ = lease.release().await;
         result
+    }
+
+    async fn wait_for_post_turn_maintenance(
+        config: &crate::config::GlobalConfig,
+        lease: &NatsSessionLease,
+    ) {
+        while lease.is_held() {
+            let pending = config
+                .read()
+                .session
+                .as_ref()
+                .is_some_and(|session| session.compressing() || session.titling());
+            if !pending {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// Append an `Error` entry for a turn that failed.

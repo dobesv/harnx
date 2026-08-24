@@ -87,6 +87,7 @@ pub enum SessionCommand {
 
 pub struct SubscribeResult {
     pub snapshot: Vec<AgUiMessage>,
+    pub history_warnings: Vec<String>,
     pub events: broadcast::Receiver<Event>,
 }
 
@@ -107,6 +108,7 @@ pub struct SessionCapabilities {
 pub struct SessionInfo {
     pub state: SessionState,
     pub history_snapshot: Vec<AgUiMessage>,
+    pub history_warnings: Vec<String>,
     pub capabilities: SessionCapabilities,
 }
 

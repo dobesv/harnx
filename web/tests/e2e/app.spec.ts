@@ -29,7 +29,7 @@ test('happy path: picker flow to chat with slash-named agent', async ({ page }) 
 
   await expect(page.locator('.aui-status-bar')).not.toBeVisible();
   await expect(page.locator('.aui-composer-send')).toHaveText('Send');
-  await expect(page).toHaveURL(/\/agents\/coding%2Fcoder\/sessions\//);
+  await expect(page).toHaveURL(/\/agents\/coding%2Fcoder\/sessions\/aMock1/);
 
   await page.locator('.aui-composer-input').fill('Hello agent');
   await page.locator('.aui-composer-send').click();
@@ -89,6 +89,7 @@ test('sessions-fetch error', async ({ page }) => {
   const errorEl = page.getByTestId('sessions-error');
   await expect(errorEl).toBeVisible();
   await expect(errorEl).toHaveText(/Not Found/i);
+  await expect(errorEl.getByRole('button', { name: 'Retry' })).toBeVisible();
 
   await expect(page).toHaveScreenshot('sessions-fetch-error.png');
 });

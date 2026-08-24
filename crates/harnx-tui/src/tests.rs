@@ -19,6 +19,7 @@ use tokio::sync::Notify;
 
 mod command_completion;
 mod delegation_tests;
+mod shared_session_event_tests;
 mod turn_activity_tests;
 
 fn yaml_to_json(yaml: &str) -> serde_json::Value {
@@ -7223,6 +7224,20 @@ async fn session_picker_enter_loads_selected_session() {
     )
     .await
     .expect("index picker session fixture");
+    harnx_runtime::nats_session_index::put_record(
+        &index,
+        &harnx_runtime::nats_session_index::SessionIndexRecord {
+            session_id: "other-agent-session".to_string(),
+            agent_name: "apollo".to_string(),
+            working_dir: Some("/tmp".to_string()),
+            git_branch: Some("main".to_string()),
+            git_remote: None,
+            title: None,
+            last_activity: 2,
+        },
+    )
+    .await
+    .expect("index other-agent session fixture");
     let log =
         harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, "my-session".to_string());
     for entry in [
@@ -7248,7 +7263,14 @@ async fn session_picker_enter_loads_selected_session() {
     let mut tui = Tui::init(&config).await.unwrap();
     let (sessions, error) = Tui::picker_sessions(&config).await;
     assert!(error.is_none(), "picker enumeration failed: {error:?}");
-    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["my-session"],
+        "session picker must only list sessions belonging to its selected agent"
+    );
 
     tui.app.modal = Some(crate::types::ModalState::SessionPicker {
         sessions,
@@ -7335,7 +7357,8 @@ async fn transcript_reconciliation_uses_origin_not_current_agent() {
     // origin_agent = Some("apollo") simulates "user was on apollo before entering picker".
     // Current config has "hermes" active (post-activation).
     // Reconciliation should detect origin("apollo") != current("hermes") → clear transcript.
-    tui.reconcile_transcript_after_command(None, Some("apollo".to_string()), ".session");
+    tui.reconcile_transcript_after_command(None, Some("apollo".to_string()), ".session")
+        .await;
 
     // Transcript should have been cleared by reconciliation (sentinel gone).
     assert!(

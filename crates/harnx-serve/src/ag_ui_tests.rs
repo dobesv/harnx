@@ -1083,6 +1083,18 @@ fn parse_run_input_accepts_nanoid_ids() {
     let parsed =
         parse_run_input(&serde_json::to_vec(&body).unwrap()).expect("nanoid ids should parse");
     assert_eq!(parsed.messages.len(), 1);
+    let parsed_again =
+        parse_run_input(&serde_json::to_vec(&body).unwrap()).expect("nanoid ids should reparse");
+    assert_eq!(
+        parsed.messages[0].id(),
+        parsed_again.messages[0].id(),
+        "non-UUID message IDs must map to a stable AG-UI UUID"
+    );
+    assert_eq!(
+        pending_user_prompt(&parsed_again, &parsed.messages),
+        None,
+        "the stable wire ID must make nanoid-backed hydration idempotent"
+    );
 }
 
 #[test]
@@ -1164,10 +1176,11 @@ fn resolve_agent_returns_not_found_for_unknown_agent() {
 
 #[test]
 fn derive_thread_id_is_deterministic_and_passes_through_uuid() {
-    let non_uuid = "not-a-uuid-session";
+    let non_uuid = "aok2Gw";
     let derived_a = derive_thread_id(non_uuid);
     let derived_b = derive_thread_id(non_uuid);
     assert_eq!(derived_a, derived_b);
+    assert!(Uuid::parse_str(&derived_a.to_string()).is_ok());
 
     let session_uuid = Uuid::new_v4();
     let thread_id = derive_thread_id(&session_uuid.to_string());
@@ -2201,6 +2214,24 @@ fn history_messages_for_snapshot_keeps_tool_turn_prose_and_tool_entries() {
 }
 
 #[test]
+fn history_messages_for_snapshot_keeps_plain_assistant_content() {
+    let history = vec![HistoryMsg {
+        role: MessageRole::Assistant,
+        content: MessageContent::Text("persisted final answer".to_string()),
+        id: Some(Uuid::new_v4().to_string()),
+        log_seq: Some(4),
+        log_timestamp: None,
+    }];
+
+    let snapshot = history_messages_for_snapshot(&history);
+    assert!(matches!(
+        snapshot.as_slice(),
+        [AgUiMessage::Assistant { content: Some(content), .. }]
+            if content == "persisted final answer"
+    ));
+}
+
+#[test]
 fn history_snapshot_prefers_tool_markdown_and_falls_back_to_output() {
     let tool_call_markdown = ToolCall::new(
         "read_history".to_string(),
@@ -2968,9 +2999,9 @@ fn assistant_msg(content: &str) -> AgUiMessage {
 }
 
 #[test]
-fn last_user_prompt_ignores_empty_or_whitespace_user_messages() {
+fn pending_user_prompt_ignores_empty_or_whitespace_user_messages() {
     let empty = parse_run_input(&ag_ui_request_body(Uuid::new_v4(), "")).expect("parse empty");
-    assert_eq!(last_user_prompt(&empty), None);
+    assert_eq!(pending_user_prompt(&empty, &[]), None);
 
     let whitespace = parse_run_input(&ag_ui_request_body(
         Uuid::new_v4(),
@@ -2978,10 +3009,47 @@ fn last_user_prompt_ignores_empty_or_whitespace_user_messages() {
 	  ",
     ))
     .expect("parse whitespace");
-    assert_eq!(last_user_prompt(&whitespace), None);
+    assert_eq!(pending_user_prompt(&whitespace, &[]), None);
 
     let text = parse_run_input(&ag_ui_request_body(Uuid::new_v4(), "hello")).expect("parse text");
-    assert_eq!(last_user_prompt(&text).as_deref(), Some("hello"));
+    assert_eq!(pending_user_prompt(&text, &[]).as_deref(), Some("hello"));
+}
+
+#[test]
+fn pending_user_prompt_ignores_a_user_message_already_in_the_snapshot() {
+    let message_id = Uuid::new_v4();
+    let body = serde_json::to_vec(&json!({
+        "threadId": Uuid::new_v4(),
+        "runId": Uuid::new_v4(),
+        "state": {},
+        "messages": [{
+            "id": message_id,
+            "role": "user",
+            "content": "what time is it in London?"
+        }],
+        "tools": [],
+        "context": [],
+        "forwardedProps": {}
+    }))
+    .unwrap();
+    let input = parse_run_input(&body).expect("parse hydration request");
+    let snapshot = vec![AgUiMessage::User {
+        id: MessageId::from(message_id),
+        content: "what time is it in London?".to_string(),
+        name: None,
+    }];
+
+    assert_eq!(pending_user_prompt(&input, &snapshot), None);
+
+    let intentionally_repeated = vec![AgUiMessage::User {
+        id: MessageId::random(),
+        content: "what time is it in London?".to_string(),
+        name: None,
+    }];
+    assert_eq!(
+        pending_user_prompt(&input, &intentionally_repeated).as_deref(),
+        Some("what time is it in London?")
+    );
 }
 
 #[tokio::test]

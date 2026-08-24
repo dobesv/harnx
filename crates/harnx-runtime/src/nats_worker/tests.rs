@@ -442,15 +442,6 @@ fn run_git(temp_repo: &Path, args: &[&str]) {
     );
 }
 
-/// Drop the `session_id:` line from a serialized header so two independently
-/// built headers can be compared ignoring their random session ids.
-fn strip_session_id_line(yaml: &str) -> String {
-    yaml.lines()
-        .filter(|line| !line.trim_start().starts_with("session_id:"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn create_test_git_repo() -> tempfile::TempDir {
     let temp_dir = tempfile::tempdir().expect("temp dir must be created");
     let repo = temp_dir.path();
@@ -674,6 +665,8 @@ async fn remote_header_matches_local_header_source_of_truth() {
         let expected_header = {
             let mut expected_session =
                 config::session::new(&config.read(), session_id, None).unwrap();
+            expected_session.id = session_id.to_string();
+            expected_session.session_id = Some(session_id.to_string());
             expected_session.set_agent(&input.agent).unwrap();
             expected_session.build_header_entry()
         };
@@ -707,16 +700,12 @@ async fn remote_header_matches_local_header_source_of_truth() {
         actual_header_yaml.contains(&expected_working_dir),
         "actual header must use hermetic working dir: {actual_header_yaml}"
     );
-    // Each header is built from an INDEPENDENT `session::new` call, so each
-    // generates its own random `session_id`. Normalize that legitimately
-    // non-deterministic line out before comparing the rest (which must match
-    // exactly) — otherwise the test is flaky under nextest parallelism. This
-    // equality also covers the git_branch/git_remote/working_dir fields, so no
-    // separate `expected_header_yaml.contains(...)` assertions are needed.
+    assert!(actual_header_yaml.contains("session_id: remote-header-test"));
+    // Remote headers must use the NATS stream key as their session ID. This
+    // equality also covers git_branch/git_remote/working_dir.
     assert_eq!(
-        strip_session_id_line(&actual_header_yaml),
-        strip_session_id_line(&expected_header_yaml),
-        "remote header must match locally built header (ignoring random session_id)"
+        actual_header_yaml, expected_header_yaml,
+        "remote header must match locally built header"
     );
     let loaded_header_yaml = serde_yaml::to_string(&session.build_header_entry()).unwrap();
     assert!(loaded_header_yaml.contains("agent_name: pkg/main"));

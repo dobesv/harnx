@@ -4,8 +4,10 @@
 
 pub mod ag_ui;
 pub mod ag_ui_rpc;
+mod ag_ui_sync;
 pub mod session_actor;
 mod session_actor_types;
+mod session_routes;
 // Not `#[cfg(test)]`: the `tests/` integration crates link the library built
 // WITHOUT the `test` cfg, so gating this out would break their
 // `harnx_serve::test_support` imports. Kept public for cross-crate test reuse.
@@ -194,6 +196,7 @@ enum AgentsRoute {
     Agent,
     Sessions,
     Session,
+    SessionEvents,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -505,12 +508,8 @@ impl Server {
                 }
             }
             AgentsRoute::Sessions => {
-                match negotiate_agents_route(&method, req.headers(), agent_route)? {
-                    AgentsRepresentation::Json => self.sessions_json(&agent_name).await,
-                    AgentsRepresentation::Html
-                    | AgentsRepresentation::AgUiSse
-                    | AgentsRepresentation::AgUiRpc => Err(anyhow!("Not Acceptable")),
-                }
+                self.handle_sessions_route(&method, req.headers(), &agent_name)
+                    .await
             }
             AgentsRoute::Session => {
                 let session_name = session_name.expect("session route always has session name");
@@ -536,6 +535,18 @@ impl Server {
                         .await
                     }
                 }
+            }
+            AgentsRoute::SessionEvents => {
+                let session_name = session_name.expect("session events route has a session name");
+                self.handle_session_events_route(
+                    &method,
+                    req.headers(),
+                    session_routes::AgentSessionRef {
+                        agent: &agent_name,
+                        session: &session_name,
+                    },
+                )
+                .await
             }
         }
     }
@@ -1006,6 +1017,11 @@ fn parse_agents_route(path: &str) -> Option<RouteMatch> {
             Some(percent_decode(session)),
             AgentsRoute::Session,
         )),
+        [agent, "sessions", session, "events"] => Some((
+            percent_decode(agent),
+            Some(percent_decode(session)),
+            AgentsRoute::SessionEvents,
+        )),
         _ => None,
     }
 }
@@ -1090,7 +1106,10 @@ fn negotiate_agents_route(
                 Ok(AgentsRepresentation::Json)
             }
         }
-        (&Method::GET, AgentsRoute::Sessions) => Ok(AgentsRepresentation::Json),
+        (&Method::GET | &Method::POST, AgentsRoute::Sessions) => Ok(AgentsRepresentation::Json),
+        (&Method::GET, AgentsRoute::SessionEvents) if accepts_event_stream(headers) => {
+            Ok(AgentsRepresentation::AgUiSse)
+        }
         (&Method::POST, AgentsRoute::Session) => {
             if accepts_event_stream(headers) {
                 Ok(AgentsRepresentation::AgUiSse)
@@ -1285,8 +1304,10 @@ pub(crate) async fn load_nats_session(
     if entries.is_empty() {
         bail!("Not Found");
     }
-    harnx_runtime::nats_session_log::load_session_from_entries(&entries, session)
-        .map_err(|err| anyhow!("Failed to reconstruct session history for '{session}': {err}"))
+    let loaded = harnx_runtime::nats_session_log::load_session_from_entries(&entries, session)
+        .map_err(|err| anyhow!("Failed to reconstruct session history for '{session}': {err}"))?;
+    session_routes::repair_legacy_session_index_identity(config, session, &loaded).await;
+    Ok(loaded)
 }
 
 #[doc(hidden)]
@@ -1461,6 +1482,14 @@ mod tests {
                 AgentsRoute::Session,
             ))
         );
+        assert_eq!(
+            parse_agents_route("/v1/agents/coding%2Fcoder/sessions/thread-1/events"),
+            Some((
+                "coding/coder".to_string(),
+                Some("thread-1".to_string()),
+                AgentsRoute::SessionEvents,
+            ))
+        );
         assert_eq!(parse_agents_route("/v1/agents"), None);
         assert_eq!(parse_agents_route("/v1/agents/hephaestus/extra"), None);
         assert_eq!(
@@ -1529,6 +1558,42 @@ mod tests {
         assert_eq!(
             negotiate_agents_route(&Method::GET, &headers, AgentsRoute::Session).unwrap(),
             AgentsRepresentation::Json
+        );
+    }
+
+    #[test]
+    fn negotiate_agents_route_accepts_session_collection_post_for_reservation() {
+        assert_eq!(
+            negotiate_agents_route(
+                &Method::POST,
+                &http::HeaderMap::new(),
+                AgentsRoute::Sessions,
+            )
+            .unwrap(),
+            AgentsRepresentation::Json
+        );
+    }
+
+    #[test]
+    fn negotiate_agents_route_accepts_session_event_feed() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        assert_eq!(
+            negotiate_agents_route(&Method::GET, &headers, AgentsRoute::SessionEvents).unwrap(),
+            AgentsRepresentation::AgUiSse
+        );
+        assert_eq!(
+            negotiate_agents_route(
+                &Method::GET,
+                &http::HeaderMap::new(),
+                AgentsRoute::SessionEvents,
+            )
+            .unwrap_err()
+            .to_string(),
+            "Method Not Allowed"
         );
     }
 

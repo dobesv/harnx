@@ -1283,14 +1283,16 @@ fn retry_all_fail_shows_warnings_in_tui() -> Result<()> {
     session.tmux.send_text("hello")?;
     session.tmux.send_keys(&["Enter"])?;
 
-    // Wait for the error to appear — all models should fail and we should see
-    // retry warnings and fallback transition messages.
+    // Wait for the transcript evidence we assert below. `HARNX_EXIT:` also
+    // appears in the shell command used to launch harnx, so matching it can
+    // return before the TUI has processed the prompt.
     let screen = session.tmux.wait_for_stable(
         Duration::from_secs(30),
         Duration::from_millis(500),
         |screen| {
-            screen.contains("error: Failed to call chat-completions api")
-                || screen.contains("HARNX_EXIT:")
+            screen.contains("Retryable error")
+                && screen.contains("exhausted retries")
+                && screen.contains("error: Failed to call chat-completions api")
         },
     )?;
 

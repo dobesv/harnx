@@ -278,5 +278,5 @@ let call_fn: AgentCallFn = Arc::new(move |_input, _config, _abort| {
 
 - **GitHub:** [Issue #1091](https://github.com/dobesv/harnx/issues/1091)
 - **Prior solution:** [logic-errors/agent-switch-with-session-consistency-2026-05-03.md](../logic-errors/agent-switch-with-session-consistency-2026-05-03.md) — exit_agent before activation invariant
-- **AG-UI protocol:** [integration-issues/ag-ui-server-protocol-integration-2026-07-04.md](../integration-issues/ag-ui-server-protocol-integration-2026-07-04.md) — raw session IDs, not UUID ThreadId
+- **AG-UI protocol:** [harnx-serve README](../../../crates/harnx-serve/README.md#ag-ui-agent-user-interaction-protocol) — canonical session IDs for routing and persistence; derived UUID `ThreadId` only on the AG-UI wire
 - **NATS index:** [integration-issues/nats-kv-session-index-enumeration-2026-06-27.md](../integration-issues/nats-kv-session-index-enumeration-2026-06-27.md) — session id handling

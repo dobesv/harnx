@@ -46,8 +46,10 @@ impl Config {
         paths::rags_dir()
     }
 
-    /// Atomically reserve a short session ID in NATS without holding the
-    /// configuration lock across network I/O.
+    /// Atomically reserve a short session ID in the NATS session index without
+    /// holding the configuration lock across network I/O. The reservation is
+    /// intentionally usable before a session log exists; the first worker turn
+    /// writes the canonical session header.
     pub async fn reserve_new_session_id(config: &GlobalConfig) -> Result<String> {
         const RESERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
         let config = config.read().clone();

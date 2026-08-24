@@ -488,7 +488,7 @@ impl Config {
             if session.id != session_id {
                 return Ok(None);
             }
-            crate::config::session::record_title(session, title.clone(), false, tokens);
+            crate::config::session::record_title(session, title.clone(), false, tokens)?;
         }
 
         Ok(Some(title))

@@ -1,4 +1,10 @@
 import { http, HttpResponse } from 'msw';
+import {
+  additionalSnapshot,
+  createSessionEventsStream,
+  finishExchange,
+  isPromptlessRun,
+} from './sessionUpdates';
 
 function isSseRequest(request: Request): boolean {
   return request.headers.get('accept')?.includes('text/event-stream') ?? false;
@@ -20,6 +26,19 @@ async function isRpcRequest(request: Request): Promise<boolean> {
 function encodeSseEvent(data: unknown): Uint8Array {
   return new TextEncoder().encode(`event: message\ndata: ${JSON.stringify(data)}\n\n`);
 }
+
+const SESSION_ONE_SNAPSHOT = [
+  {
+    id: 'm-system',
+    role: 'system',
+    content: 'You are mock system prompt content that should be collapsed by default.',
+  },
+  {
+    id: 'm1',
+    role: 'assistant',
+    content: 'Hello from mock session',
+  },
+];
 
 function buildSnapshot(session: string) {
   if (session === 'session-gallery') {
@@ -79,27 +98,18 @@ function buildSnapshot(session: string) {
       }
     ];
   }
-  if (session !== 'session-1') return [];
-  return [
-    {
-      id: 'm-system',
-      role: 'system',
-      content: 'You are mock system prompt content that should be collapsed by default.'
-    },
-    {
-      id: 'm1',
-      role: 'assistant',
-      content: 'Hello from mock session'
-    }
-  ];
+  if (session !== 'session-1') return additionalSnapshot(session);
+  return [...SESSION_ONE_SNAPSHOT, ...additionalSnapshot(session)];
 }
 
 function createAgUiStream({ session, body }: { session: string; body: any }) {
   const threadId = body?.threadId ?? `thread-${session}`;
   const runId = body?.runId ?? 'r-1';
   const messages = Array.isArray(body?.messages) ? body.messages : [];
-  const isPromptlessSubscribe = messages.length === 0;
   const lastMessage = messages[messages.length - 1];
+  // A refresh run carries the already-hydrated transcript. Like the real
+  // server, only a trailing user message makes this a prompted run.
+  const isPromptlessSubscribe = isPromptlessRun(messages, buildSnapshot(session));
   const userText = lastMessage?.role === 'user'
     ? Array.isArray(lastMessage.content)
       ? lastMessage.content.filter((part: any) => part.type === 'text').map((part: any) => part.text).join('\n').trim()
@@ -306,7 +316,7 @@ function createAgUiStream({ session, body }: { session: string; body: any }) {
         threadId,
         runId
       }));
-      controller.close();
+      finishExchange(controller, session, userText);
     },
     cancel() {
       // The client (browser EventSource) disconnected — e.g. the test navigated
@@ -344,6 +354,16 @@ export const happyPathHandlers = [
       // ids/timestamps in the assistant-ui runtime and drops streamed messages).
       { session_id: 'session-1', updated_at: '2024-01-01T12:00:00.000Z' }, { session_id: 'session-gallery', updated_at: '2024-01-01T12:00:00.000Z' }, { session_id: 'session-pending', updated_at: '2024-01-01T12:00:00.000Z' }, { session_id: 'session-restored', updated_at: '2024-01-01T12:00:00.000Z' }
     ]);
+  }),
+
+  http.post('/v1/agents/:agent/sessions', () => {
+    return HttpResponse.json({ session_id: 'aMock1' }, { status: 201 });
+  }),
+
+  http.get('/v1/agents/:agent/sessions/:session/events', ({ params }) => {
+    return new HttpResponse(createSessionEventsStream(String(params.session)), {
+      headers: { 'Content-Type': 'text/event-stream' },
+    });
   }),
 
   http.post('/v1/agents/:agent/sessions/:session/attachments', async () => {

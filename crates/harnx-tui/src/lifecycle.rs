@@ -211,7 +211,7 @@ impl Tui {
         install_tui_agent_event_sink(event_tx.clone());
 
         // Build the initial transcript: welcome + banner (if agent)
-        let initial_transcript = Self::build_initial_transcript(config);
+        let initial_transcript = Self::build_initial_transcript(config).await;
         let code_theme = config.read().render_options()?.theme;
 
         let mut app = build_initial_app(config, initial_transcript)?;
@@ -280,9 +280,20 @@ impl Tui {
             .as_ref()
             .map(|(_, cluster)| cluster.as_str())
             .unwrap_or(harnx_runtime::config::LOCAL_CLUSTER_KEY);
+        let agent_name = cfg
+            .remote_agent
+            .as_ref()
+            .map(|(agent, _)| agent.as_str())
+            .or_else(|| cfg.agent.as_ref().map(|agent| agent.name()));
 
         match cfg.list_remote_sessions_with_meta(cluster).await {
-            Ok(sessions) => (sessions, None),
+            Ok(sessions) => (
+                sessions
+                    .into_iter()
+                    .filter(|session| session.agent_name.as_deref() == agent_name)
+                    .collect(),
+                None,
+            ),
             Err(error) => {
                 log::warn!(
                     "Failed to list NATS sessions for cluster '{}': {:#}",
@@ -332,14 +343,13 @@ impl Tui {
         let llm_busy = self.app.llm_busy;
         let pending = self.app.pending_message.is_some();
         Self::refresh_input_chrome_from_state(&self.config, &mut self.app, llm_busy, pending);
-        self.reconcile_transcript_after_command(origin_session, origin_agent, ".session");
+        self.reconcile_transcript_after_command(origin_session, origin_agent, ".session")
+            .await;
         Ok(())
     }
 
-    pub(crate) fn build_initial_transcript(config: &GlobalConfig) -> Vec<TranscriptItem> {
+    pub(crate) async fn build_initial_transcript(config: &GlobalConfig) -> Vec<TranscriptItem> {
         let mut entries = vec![];
-        let cfg = config.read();
-        let state = cfg.state();
 
         // Show the welcome banner on startup, even when an agent/session status line is also present.
         entries.push(TranscriptItem::SystemText(format!(
@@ -347,7 +357,9 @@ impl Tui {
             env!("CARGO_PKG_VERSION")
         )));
 
-        let history = session_history_transcript_items(config);
+        let history = session_history_transcript_items(config).await;
+        let cfg = config.read();
+        let state = cfg.state();
         if !history.is_empty() {
             entries.extend(history);
         } else {
@@ -851,15 +863,29 @@ pub(crate) fn build_transcript_with_compaction(
     items
 }
 
-pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<TranscriptItem> {
+struct SessionHistoryContext {
+    source: SessionHistorySource,
+    declarations: HashMap<String, ToolDeclaration>,
+}
+
+enum SessionHistorySource {
+    Local {
+        compressed_messages: Vec<Message>,
+        messages: Vec<Message>,
+        compaction_summary: Option<String>,
+    },
+    Remote {
+        agent: String,
+        cluster: String,
+        session_id: String,
+    },
+}
+
+fn prepare_session_history(config: &GlobalConfig) -> Option<SessionHistoryContext> {
     let cfg = config.read();
+    let session = cfg.session.as_ref()?;
     // A NATS-backed session is deliberately only an identity in the local
-    // Config; its in-memory message vectors remain empty until a worker runs.
-    // Presence of a session ID is therefore enough to load its transcript.
-    let session_id = match cfg.session.as_ref() {
-        Some(session) => session.id().to_string(),
-        None => return vec![],
-    };
+    // Config, so its session ID is enough to select the remote history load.
     let session_agent = cfg.remote_agent.clone().or_else(|| {
         cfg.agent.as_ref().map(|agent| {
             (
@@ -868,49 +894,84 @@ pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<Tra
             )
         })
     });
-    // Spell handoff tool declaration names relative to the active agent's
-    // package so the transcript matches what the agent actually saw (#709).
+    #[cfg(test)]
+    let session_agent = cfg
+        .remote_agent
+        .is_some()
+        .then_some(session_agent)
+        .flatten();
+
+    // Spell handoff tool declaration names relative to the active package so
+    // the restored transcript matches what the agent actually saw (#709).
     let active_pkg = cfg.active_package();
     let (declarations, _handoff_targets) =
         cfg.tool_declarations_for_use_tools(Some("*"), active_pkg.as_deref());
-    let decl_map: HashMap<String, ToolDeclaration> = declarations
+    let declarations = declarations
         .into_iter()
-        .map(|d| (d.name.clone(), d))
+        .map(|declaration| (declaration.name.clone(), declaration))
         .collect();
+    let source = match session_agent {
+        Some((agent, cluster)) => SessionHistorySource::Remote {
+            agent,
+            cluster,
+            session_id: session.id().to_string(),
+        },
+        None => SessionHistorySource::Local {
+            compressed_messages: session.compressed_messages.clone(),
+            messages: session.messages.clone(),
+            compaction_summary: session.compaction_summary.clone(),
+        },
+    };
+    Some(SessionHistoryContext {
+        source,
+        declarations,
+    })
+}
 
-    #[cfg(test)]
-    if cfg.remote_agent.is_none() {
-        let session = cfg.session.as_ref().expect("checked above");
-        return build_transcript_with_compaction(
-            &session.compressed_messages,
-            &session.messages,
-            session.compaction_summary.as_deref(),
-            &decl_map,
-        );
+pub(crate) async fn session_history_transcript_items(config: &GlobalConfig) -> Vec<TranscriptItem> {
+    let Some(context) = prepare_session_history(config) else {
+        return vec![];
+    };
+    match context.source {
+        SessionHistorySource::Local {
+            compressed_messages,
+            messages,
+            compaction_summary,
+        } => build_transcript_with_compaction(
+            &compressed_messages,
+            &messages,
+            compaction_summary.as_deref(),
+            &context.declarations,
+        ),
+        SessionHistorySource::Remote {
+            agent,
+            cluster,
+            session_id,
+        } => {
+            let state = match crate::session_history_loader::load_remote_session_history(
+                config, agent, cluster, session_id,
+            )
+            .await
+            {
+                Ok(state) => state,
+                Err(error) => {
+                    return vec![TranscriptItem::ErrorText(format!(
+                        "Failed to load session history: {error:#}"
+                    ))];
+                }
+            };
+            let mut transcript = build_transcript_with_compaction(
+                &state.compressed_messages,
+                &state.messages,
+                state.compaction_summary.as_deref(),
+                &context.declarations,
+            );
+            transcript.extend(state.replay_warnings.into_iter().map(|warning| {
+                TranscriptItem::ErrorText(format!("Session history warning: {warning}"))
+            }));
+            transcript
+        }
     }
-
-    if let Some((agent, cluster)) = session_agent {
-        drop(cfg);
-        let Some(state) = crate::session_history_loader::load_remote_session_history(
-            config, agent, cluster, session_id,
-        ) else {
-            return vec![];
-        };
-        return build_transcript_with_compaction(
-            &state.compressed_messages,
-            &state.messages,
-            state.compaction_summary.as_deref(),
-            &decl_map,
-        );
-    }
-
-    let session = cfg.session.as_ref().expect("checked above");
-    build_transcript_with_compaction(
-        &session.compressed_messages,
-        &session.messages,
-        session.compaction_summary.as_deref(),
-        &decl_map,
-    )
 }
 
 /// Compact one-line preview of a tool call's arguments for the confirmation

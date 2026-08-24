@@ -295,6 +295,11 @@ pub struct Session {
     pub tokens: usize,
     #[serde(skip)]
     pub completion_usage: CompletionTokenUsage,
+    /// Non-fatal problems encountered while reconstructing an append-only log.
+    /// Callers should surface these while continuing to render the recovered
+    /// transcript.
+    #[serde(skip)]
+    pub replay_warnings: Vec<String>,
     #[serde(skip)]
     pub runtime: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }

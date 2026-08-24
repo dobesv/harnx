@@ -232,9 +232,12 @@ pub fn replay_log_entries_for_external(
                     timestamp,
                 }) = pending.take()
                 else {
-                    anyhow::bail!(
-                        "Invalid log entry in session {name}: tool_results without a                          preceding tool_calls entry"
+                    let warning = format!(
+                        "Ignored orphan tool results at log entry {seq} in session {name}; the corresponding tool call was missing or interrupted"
                     );
+                    log::warn!("{warning}");
+                    session.replay_warnings.push(warning);
+                    continue;
                 };
                 let mut message =
                     assemble_tool_message(text, thought, calls, results).with_log_seq(seq);
@@ -449,17 +452,25 @@ fn require_authoritative_appends(
 /// command (`manual = true`). A manual title freezes automatic regeneration by
 /// setting `title_last_updated_tokens` to `usize::MAX`; an automatic title
 /// records the token count it was generated at so reloads restore it exactly.
-pub fn record_title(session: &mut Session, title: String, manual: bool, tokens: usize) {
+pub fn record_title(
+    session: &mut Session,
+    title: String,
+    manual: bool,
+    tokens: usize,
+) -> Result<()> {
     let entry = SessionLogEntry::Title {
         title: title.clone(),
         manual,
         tokens,
     };
-    if !append_event(session, &entry) {
+    let appended = append_event(session, &entry);
+    if !appended {
         session.dirty = true;
     }
+    require_authoritative_appends(session, appended, "session title")?;
     session.set_title(title);
     session.set_title_last_updated_tokens(if manual { usize::MAX } else { tokens });
+    Ok(())
 }
 
 pub fn render(session: &Session) -> Result<String> {
@@ -1195,6 +1206,21 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_title_append_failure_does_not_publish_an_in_memory_title() {
+        let mut session = new(&Config::default(), "title-failure", None).unwrap();
+        session.runtime = Some(Arc::new(
+            Arc::new(FailingAuthoritativeSink) as Arc<dyn SessionAppendSink>
+        ));
+
+        let error = record_title(&mut session, "Unpersisted title".to_string(), false, 42)
+            .expect_err("authoritative title persistence failure must be visible");
+
+        assert!(error.to_string().contains("durably persist session title"));
+        assert_eq!(session.title(), None);
+        assert_eq!(session.title_last_updated_tokens(), 0);
+    }
+
+    #[test]
     fn load_from_log_enumerates_document_sequence_numbers() {
         let content = r#"---
 type: header
@@ -1575,6 +1601,41 @@ content: legacy reply
         );
         assert_eq!(loaded.messages[0].content.to_text(), "legacy prompt");
         assert_eq!(loaded.messages[1].content.to_text(), "legacy reply");
+    }
+
+    #[test]
+    fn replay_skips_orphan_tool_results_and_preserves_the_rest_of_the_transcript() {
+        let content = r#"---
+type: header
+model: openai:gpt-4o
+---
+type: message
+role: user
+content: before corruption
+---
+type: tool_results
+results:
+  - id: missing-call
+    name: time
+    output: ignored orphan result
+---
+type: message
+role: assistant
+content: recovered reply
+"#;
+
+        let loaded = load_from_log_for_test(content);
+
+        assert_eq!(
+            message_view(&loaded.messages),
+            vec![
+                (MessageRole::User, "before corruption".to_string()),
+                (MessageRole::Assistant, "recovered reply".to_string()),
+            ]
+        );
+        assert_eq!(loaded.replay_warnings.len(), 1);
+        assert!(loaded.replay_warnings[0].contains("orphan tool results"));
+        assert!(loaded.replay_warnings[0].contains("log entry 2"));
     }
 
     #[test]
