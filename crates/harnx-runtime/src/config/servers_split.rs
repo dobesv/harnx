@@ -1,6 +1,5 @@
 //! Tool server package loading extracted from config/mod.rs for code health.
 use super::*;
-use crate::config::patches_split::load_package_tool_server_patch;
 
 impl Config {
     /// Load tool servers from a single package directory.
@@ -8,16 +7,20 @@ impl Config {
     /// Servers are stored with their bare names (the yaml stem) and tagged with
     /// `package = Some(pkg_name)`. The actual display name used with the LLM
     /// — bare or prefixed — is decided at runtime based on which agent is active.
-    pub(super) fn load_package_servers(config: &mut Config, pkg_path: &Path, pkg_name: &str) {
+    pub(super) fn load_package_servers(
+        config: &mut Config,
+        pkg_path: &Path,
+        pkg_name: &str,
+        patch: Option<&harnx_core::package::PackagePatch>,
+    ) {
         let pkg_tool_dir = pkg_path.join(paths::TOOL_SERVERS_DIR_NAME);
         if !pkg_tool_dir.is_dir() {
             return;
         }
 
-        let patch = load_package_tool_server_patch(pkg_name);
         for mut server in Self::load_tool_servers_from_dir(&pkg_tool_dir).unwrap_or_default() {
             server.package = Some(pkg_name.to_string());
-            if let Some(patch) = &patch {
+            if let Some(patch) = patch {
                 if let Err(e) = apply_tool_server_patch(&mut server, &patch.tool_servers) {
                     log::error!(
                         "Package patch failed for tool server '{}': {e:#}",

@@ -14,8 +14,8 @@ use super::server_reconciler::{
 use super::subagent_toolset::{SubagentSessionRoute, SubagentToolset};
 use super::tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
 use crate::config::{
-    list_agents, resolve_local_nats_server_config, server_display_name, GlobalConfig,
-    ToolServerConfig,
+    list_agents, resolve_local_nats_server_config, selector_could_match_server,
+    server_display_name, GlobalConfig, ToolServerConfig,
 };
 use anyhow::{Context, Result};
 use async_nats::jetstream;
@@ -44,9 +44,9 @@ pub(crate) fn tool_servers_matching_use_tools(
             }
             let display_name =
                 server_display_name(&server.name, server.package.as_deref(), agent_package);
-            let matches = namespaced_use_tools.iter().any(|selector| {
-                super::super::config::selector_could_match_server(selector, &display_name)
-            });
+            let matches = namespaced_use_tools
+                .iter()
+                .any(|selector| selector_could_match_server(selector, &display_name));
             let identity_token = harnx_toolset::server_identity_token(
                 server.package.as_deref(),
                 &server.name,

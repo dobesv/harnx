@@ -1807,7 +1807,7 @@ async fn help_renders_in_tui_snapshot() {
 #[tokio::test]
 async fn representative_commands_render_into_tui_transcript() {
     let config = test_config();
-    let commands = [".help", ".info session", ".mcp list"];
+    let commands = [".help", ".info session", ".info tools"];
 
     for command in commands {
         let mut tui = Tui::init(&config).await.unwrap();

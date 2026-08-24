@@ -5,7 +5,7 @@ use inquire::{validator::Validation, Text};
 use std::path::Path;
 
 pub use harnx_core::agent_config::{
-    split_tool_selectors, AgentConfig, AgentRole, AgentVariable, AgentVariables, TEMP_AGENT_NAME,
+    AgentConfig, AgentRole, AgentVariable, AgentVariables, TEMP_AGENT_NAME,
 };
 
 const DEFAULT_AGENT_NAME: &str = "rag";
@@ -232,25 +232,6 @@ pub fn resolve_variables(agent: &mut Agent) -> Result<()> {
     )?;
     agent.set_shared_variables(new_variables);
     Ok(())
-}
-
-#[allow(dead_code)]
-fn expand_agent_use_tool_selectors(config: &Config, use_tools: Option<Vec<String>>) -> Vec<String> {
-    let Some(use_tools) = use_tools.filter(|selectors| !selectors.is_empty()) else {
-        return Vec::new();
-    };
-
-    split_tool_selectors(&use_tools.join(","))
-        .into_iter()
-        .flat_map(|selector| {
-            let selector = selector.trim();
-            config
-                .toolsets
-                .get(selector)
-                .cloned()
-                .unwrap_or_else(|| vec![selector.to_string()])
-        })
-        .collect()
 }
 
 pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) -> Result<Agent> {

@@ -15,9 +15,7 @@ pub(super) fn package_dir_name(path: &std::path::Path) -> Option<String> {
     Some(name.to_string())
 }
 
-pub(super) fn load_package_tool_server_patch(
-    pkg_name: &str,
-) -> Option<harnx_core::package::PackagePatch> {
+pub(super) fn load_package_patch(pkg_name: &str) -> Option<harnx_core::package::PackagePatch> {
     let patch_path = harnx_core::config_paths::package_patch_file(pkg_name);
     if !patch_path.exists() {
         return None;

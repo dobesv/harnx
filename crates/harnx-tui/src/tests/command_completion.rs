@@ -62,3 +62,28 @@ async fn command_completions_separate_names_from_usage_and_offer_subcommands() {
         ["agent", "agent-data", "macro", "message", "rag", "session"]
     );
 }
+
+#[tokio::test]
+async fn removed_mcp_commands_are_not_completed() {
+    let config = test_config();
+    let tui = Tui::init(&config).await.unwrap();
+
+    let mut info_subcommands: Vec<String> = tui
+        .compute_completions(".info ", ".info ".len())
+        .await
+        .into_iter()
+        .map(|(value, _)| value)
+        .collect();
+    info_subcommands.sort();
+
+    assert_eq!(
+        info_subcommands,
+        ["agent", "env", "model", "rag", "session", "theme", "tools"]
+    );
+    assert!(
+        tui.compute_completions(".mcp ", ".mcp ".len())
+            .await
+            .is_empty(),
+        "removed .mcp commands must not offer subcommand completions"
+    );
+}
