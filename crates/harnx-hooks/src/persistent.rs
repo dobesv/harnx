@@ -156,8 +156,8 @@ impl PersistentHookManager {
     }
 
     /// PID of the running persistent-hook process for `command`, if one is
-    /// currently spawned. Keyed by the exact hook command string. For
-    /// diagnostics (`.info mcp`).
+    /// currently spawned. Keyed by the exact hook command string for callers
+    /// that expose process diagnostics.
     pub fn pid_for(&self, command: &str) -> Option<u32> {
         self.processes.get(command).and_then(|process| process.pid)
     }

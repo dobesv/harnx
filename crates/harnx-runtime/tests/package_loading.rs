@@ -44,7 +44,7 @@ fn install_test_package(config_dir: &Path, pkg_name: &str, files: &[(&str, &str)
 }
 
 #[test]
-fn package_loading_test_package_client_patch_preserves_qualified_name() {
+fn package_loading_test_package_patch_applies_to_client_and_tool_server() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
@@ -66,6 +66,12 @@ model: openai:gpt-4o
 ---
 You work.",
             ),
+            (
+                "tool_servers/time.yaml",
+                "command: harnx-time-server
+description: original
+",
+            ),
         ],
     );
 
@@ -75,6 +81,8 @@ You work.",
         tmp.path().join("packages").join("mypkg.patch.yaml"),
         "clients:
   - 'if .name == \"openai\" then .api_key = \"patched-key\" else . end'
+tool_servers:
+  - 'if .name == \"time\" then .description = \"patched-description\" else . end'
 ",
     )
     .unwrap();
@@ -98,6 +106,16 @@ You work.",
         }
         _ => panic!("expected OpenAIConfig variant, got: {client:?}"),
     }
+
+    let tool_server = config
+        .tool_servers
+        .iter()
+        .find(|server| server.name == "time" && server.package.as_deref() == Some("mypkg"))
+        .expect("expected package tool server named time");
+    assert_eq!(
+        tool_server.description.as_deref(),
+        Some("patched-description")
+    );
 }
 
 #[test]

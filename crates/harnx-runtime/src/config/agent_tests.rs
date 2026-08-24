@@ -723,23 +723,3 @@ fn apply_agent_patch_with_invalid_jq_expression_returns_err() {
     assert!(result.is_err());
     assert_eq!(config.model_id(), original_model.as_deref());
 }
-
-#[test]
-fn expand_agent_use_tool_selectors_flattens_toolsets() {
-    let mut config = Config::default();
-    config.toolsets.insert(
-        "docs".to_string(),
-        vec!["context7_*".to_string(), "docs_search".to_string()],
-    );
-
-    assert_eq!(
-        expand_agent_use_tool_selectors(&config, Some(vec!["docs,fs_read".to_string()])),
-        vec![
-            "context7_*".to_string(),
-            "docs_search".to_string(),
-            "fs_read".to_string(),
-        ]
-    );
-    assert!(expand_agent_use_tool_selectors(&config, None).is_empty());
-    assert!(expand_agent_use_tool_selectors(&config, Some(vec![])).is_empty());
-}

@@ -152,7 +152,7 @@ You can override any package's configuration by creating a patch file next to th
 
 ### Patch file format
 
-Patch files use **jq filter strings** to modify package configurations. Each entry in `agents` and `clients` is an array of filters. (Patching `tool_servers` is not currently supported.) Each filter receives the full configuration object for the respective entity and must return the modified version.
+Patch files use **jq filter strings** to modify package configurations. Each entry in `agents`, `clients`, and `tool_servers` is an array of filters. Each filter receives the full configuration object for the respective entity and must return the modified version.
 
 ```yaml
 agents:
@@ -161,10 +161,13 @@ agents:
 
 clients:
   - 'if .name == "claude" then .api_key = "sk-..." end'
+
+tool_servers:
+  - 'if .name == "fs" then .enabled = false end'
 ```
 
 - **Matching**: Use `if .name == "..." then ... end` for exact matching, or `if (.name | test("...")) then ... end` for pattern matching. The `else .` (pass through unchanged) is implicit when omitted.
-- **Context**: Patches match against the **bare name** (filename stem), not the qualified `pkg/name` form. This applies to agents and clients.
+- **Context**: Patches match against the **bare name** (filename stem), not the qualified package form. This applies to agents, clients, and tool servers.
 - **Chaining**: Filters are applied in sequence. If a filter fails, it is skipped with a warning.
 
 ## manifest.yaml schema

@@ -1,6 +1,6 @@
 //! Config loading/initialization extracted from config/mod.rs for code health.
 use super::*;
-use crate::config::patches_split::load_package_tool_server_patch;
+use crate::config::patches_split::load_package_patch;
 use harnx_core::agent_config::AgentConfig;
 
 fn normalize_description(description: Option<String>) -> Option<String> {
@@ -119,9 +119,8 @@ impl Config {
             .collect::<Vec<_>>();
         packages.sort_by(|(left, _), (right, _)| left.cmp(right));
         for (pkg_name, path) in packages {
-            Self::load_package_servers(config, &path, &pkg_name);
-            // Load clients after tool servers so patch is available
-            let patch = load_package_tool_server_patch(&pkg_name);
+            let patch = load_package_patch(&pkg_name);
+            Self::load_package_servers(config, &path, &pkg_name, patch.as_ref());
             config
                 .clients
                 .extend(Self::load_package_clients(&path, &pkg_name, patch.as_ref()));
