@@ -11,11 +11,13 @@ use harnx_runtime::config::{
     Config, GlobalConfig, ToolServerConfig, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV,
     LOCAL_CLUSTER_KEY,
 };
+use harnx_runtime::nats_session_metadata::{SessionMetadata, SessionMetadataStore};
 use harnx_runtime::nats_worker::server_reconciler::{ServerReconciler, SupervisorLauncher};
 use harnx_runtime::nats_worker::{
     publish_session_activate, run_worker_daemon, SessionActivate, ToolServerStartConfig,
     WorkerDaemonConfig,
 };
+use harnx_runtime::SessionInitializer;
 use harnx_toolset::Registration;
 use harnx_toolset_server::TOOL_REGISTRY_BUCKET;
 use parking_lot::RwLock;
@@ -235,6 +237,20 @@ fn stub_call_fn() -> harnx_runtime::agent_loop::AgentCallFn {
     })
 }
 
+async fn reserve_named_session(
+    store: &SessionMetadataStore,
+    session_id: &str,
+    agent: &str,
+) -> anyhow::Result<()> {
+    store
+        .create(&SessionMetadata::new(
+            session_id,
+            SessionInitializer::named(agent, Default::default()),
+        ))
+        .await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_only_starts_the_servers_its_agent_uses() -> anyhow::Result<()> {
     harnx_core::require_nextest();
@@ -291,7 +307,11 @@ async fn a_session_only_starts_the_servers_its_agent_uses() -> anyhow::Result<()
         .await?;
     let jetstream = async_nats::jetstream::new(client.clone());
 
-    activate(&jetstream, &SessionActivate::new("s1", AGENT_TIME.name)).await?;
+    let metadata_store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    reserve_named_session(&metadata_store, "s1", AGENT_TIME.name).await?;
+    reserve_named_session(&metadata_store, "s2", AGENT_PLANS.name).await?;
+
+    activate(&jetstream, &SessionActivate::new("s1")).await?;
     await_registered(&client, "time").await?;
 
     assert!(
@@ -302,7 +322,7 @@ async fn a_session_only_starts_the_servers_its_agent_uses() -> anyhow::Result<()
         "no active session uses the plans server, so it must not be running"
     );
 
-    activate(&jetstream, &SessionActivate::new("s2", AGENT_PLANS.name)).await?;
+    activate(&jetstream, &SessionActivate::new("s2")).await?;
     await_registered(&client, "plans").await?;
     assert!(
         registered_config_names(&client)

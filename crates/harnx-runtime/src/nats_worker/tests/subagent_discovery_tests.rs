@@ -156,7 +156,10 @@ async fn first_package_agent_turn_waits_for_delegation_registrations() {
     let session = NatsSession::new(
         crate::NatsSessionConfig {
             cluster: "local".to_string(),
-            agent: "pantheon/aristarchus".to_string(),
+            initializer: crate::SessionInitializer::named(
+                "pantheon/aristarchus",
+                Default::default(),
+            ),
             session_id: None,
             activation_route: crate::SessionActivationRoute::ClusterShared,
         },

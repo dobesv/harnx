@@ -10,7 +10,7 @@ use super::daemon::{should_append_control_log_entry, SessionActivate};
 use super::daemon_runtime::WorkerRuntime;
 use super::daemon_turn_input::TurnInputCtx;
 use crate::nats_lease::NatsSessionLease;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -23,13 +23,24 @@ impl WorkerRuntime {
         abort_signal: crate::utils::AbortSignal,
         control_task: JoinHandle<()>,
     ) -> Result<()> {
-        // Per-session config clone with the requested agent (loaded from the
-        // worker's OWN config) and the session selected.
+        let metadata = self
+            .session_metadata
+            .get(&activation.session_id)
+            .await?
+            .with_context(|| {
+                format!(
+                    "refusing activation without canonical session metadata: {}",
+                    activation.session_id
+                )
+            })?
+            .metadata;
+        // Per-session config clone with the canonical session agent loaded
+        // fresh from the worker's configuration.
         let per_session = {
             let base = self.config.read().clone();
             Arc::new(parking_lot::RwLock::new(base))
         };
-        let agent_setup = super::daemon::install_activation_agent(&per_session, &activation.agent);
+        let agent_setup = super::daemon::install_session_metadata_agent(&per_session, &metadata);
 
         // Create event sink for live fan-out. `new` seeds `after_seq` from stream once.
         let event_sink = crate::nats_event_sink::NatsEventSink::new(
@@ -109,21 +120,12 @@ impl WorkerRuntime {
                         lease: None,
                         lease_config: self.lease.clone(),
                         after_seq_observer: None,
-                        header_insert_observer: None,
-                        session_index: self.session_index.as_ref(),
+                        session_metadata: Some(&self.session_metadata),
                         on_tool_round: Some(on_tool_round),
                         working_dir: None,
                     }
                     .with_lease(Arc::clone(&lease))
-                    .with_after_seq_observer(Arc::clone(&after_seq_observer))
-                    // The S2 header-insert migration re-maps this turn's
-                    // leading-user block onto the migration seq, which is ABOVE
-                    // the seed cursor. Point the observer at `turn_cursor` so
-                    // BOTH consumers skip the re-mapped block: the mid-round
-                    // injection callback (or round 2 re-injects the prompt this
-                    // turn is already answering) and, via `turn_cursor` below,
-                    // the end-of-turn drain (or it re-runs the answered turn).
-                    .with_header_insert_observer(Arc::clone(&turn_cursor)),
+                    .with_after_seq_observer(Arc::clone(&after_seq_observer)),
                 )
                 .await?;
 
@@ -135,8 +137,8 @@ impl WorkerRuntime {
 
                 // After turn completes, update activation high-water from turn_cursor.
                 // turn_cursor covers everything this turn consumed: the seed
-                // messages, the header-insert re-map, and any mid-round
-                // injection during multi-round tool execution.
+                // messages and any mid-round injection during multi-round
+                // tool execution.
                 let turn_cursor_val = turn_cursor.load(Ordering::SeqCst);
                 if turn_cursor_val > 0 {
                     activation_high_water = Some(activation_high_water.map_or(turn_cursor_val, |h| h.max(turn_cursor_val)));

@@ -176,10 +176,14 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
         params.abort_signal.clone(),
     )
     .await?;
+    let initializer = {
+        let config = params.prompt_config.read();
+        harnx_runtime::SessionInitializer::named_from_config(params.agent, &config)
+    };
     let session = NatsSession::from_global_config(
         NatsSessionConfig {
             cluster: LOCAL_CLUSTER_KEY.to_string(),
-            agent: params.agent,
+            initializer,
             session_id: Some(params.session_id),
             activation_route,
         },

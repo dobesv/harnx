@@ -214,9 +214,10 @@ See the [RAG Guide](rag-guide.md) for detailed setup instructions.
 ### Session Titles
 
 Harnx can automatically generate a short, human-readable title for each session
-using an LLM. Titles are stored in the session log and shown in session
-listings (local and remote). The active title is also used to set the terminal
-window title in the TUI and the browser tab title in the web UI (as
+using an LLM. For NATS-backed sessions, titles and regeneration bookkeeping are
+stored in canonical session metadata rather than in the conversation transcript.
+Titles are shown in session listings, and the active title is also used to set
+the terminal window title in the TUI and the browser tab title in the web UI (as
 `harnx — <title>`).
 
 - **title_agent**: Name of the agent used to generate titles. When unset, no

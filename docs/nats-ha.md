@@ -37,14 +37,20 @@ Harnx automatically manages the following JetStream resources:
   every durable write is fenced on the lease's KV revision, and a worker
   that loses its lease aborts. If this bucket can't survive a node loss,
   neither can a session mid-turn on that node.
-- **KV Bucket**: `harnx_sessions` — the session enumeration index. No expiry.
+- **KV Bucket**: `harnx_sessions` — canonical session state. Each session uses
+  `sessions/{id}/meta` for immutable identity plus CAS-updated title, variables,
+  overrides, and extensions, and `sessions/{id}/activity` for frequently
+  renewed lifecycle timestamps. No expiry. The `sessions/{id}/read/{viewer}`
+  prefix is reserved for future unread cursors.
 - **KV Bucket**: `harnx_tool_registry` — tool server discovery, with a
   per-registration TTL.
 - **KV Buckets**: `harnx_hook_registry` and `harnx_hook_expectations` — hook
   server discovery and its fail-closed fallback routes. Only the copies
   opened by the standalone `harnx-hookset-server` binary carry a TTL; the
   worker daemon's own copy of the same buckets does not set one.
-- **Streams**: `SESSION_<id>` (Subject: `sessions.{id}.log`) stores the durable append-only session history.
+- **Streams**: `SESSION_<id>` (Subject: `sessions.{id}.log`) stores only the
+  durable append-only conversation history. Agent identity, settings, rendered
+  prompts, and titles do not belong in this stream.
 - **Persistent activation streams**: `WORK_NOTIFY_<cluster>` captures
   `cluster.<cluster>.sessions.notify` with cluster-shared work-queue dispatch.
 - **Local activation stream**: `LOCAL_WORK_NOTIFY_V2` captures
@@ -144,9 +150,11 @@ worker ID and consumer route but starts a new PID.
 Frontend and worker executables may be built separately as long as their local
 readiness protocol is compatible. Build SHA is diagnostic and does not decide
 admission or affinity. A local protocol upgrade is a hard cutover: restart all
-local frontend and worker processes. Durable session history remains intact;
-legacy local activation streams, consumers, and `worker.lock` files are simply
-left inert.
+local frontend and worker processes. Legacy local activation streams,
+consumers, and `worker.lock` files are simply left inert. Canonical session
+metadata is also a hard protocol boundary: transcripts created with legacy
+embedded headers/title rows or without `sessions/{id}/meta` are rejected rather
+than repaired.
 
 On a persistent cluster, you can run multiple workers for redundancy. If the
 active worker for a session dies, another persistent worker will acquire the
@@ -207,8 +215,16 @@ harnx -a coder@local
 
 This works from the CLI and TUI.
 
-- **New Sessions**: A new session log and lease are created in NATS.
+- **New Sessions**: Canonical metadata and activity are reserved before the
+  first user row is appended. The worker creates a lease only when activated.
 - **Resuming Sessions**: Clients attach to an existing `session_id`. Multiple clients can attach to the same session simultaneously (Multiplayer Mode).
+
+Workers load agent identity from canonical metadata on every activation. Named
+agents are re-read from disk and then overlaid with persisted session variables
+and explicit overrides; inline sessions keep their raw instruction template in
+metadata. A client publishing directly to `sessions.{id}.log` must initialize
+metadata first. Supported frontends do this through `NatsSession` or the HTTP
+session-creation API.
 
 ## Agent Catalog (Static Discovery)
 
@@ -267,7 +283,9 @@ When a worker resumes an interrupted session:
 
 ## Cleanup
 
-Session logs and leases persist in JetStream until explicitly deleted.
+Session logs, leases, and canonical metadata persist in JetStream until
+explicitly deleted. Deletion purges the transcript stream, lease, and every KV
+key under `sessions/{id}`.
 
 ```bash
 harnx session delete <session_id> --cluster local

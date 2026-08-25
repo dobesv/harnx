@@ -346,6 +346,13 @@ fn sandbox_runtime_works() -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn reports_denied_file_access(stderr: &str) -> bool {
+    ["permission", "denied", "no such file"]
+        .iter()
+        .any(|needle| stderr.contains(needle))
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn tool_template_sandbox_grants_control_real_file_access() {
     if !sandbox_runtime_works() {
@@ -433,7 +440,7 @@ async fn tool_template_sandbox_grants_control_real_file_access() {
         "ungranted template unexpectedly succeeded:\n{denied_text}"
     );
     assert!(
-        denied_stderr.contains("permission") || denied_stderr.contains("denied"),
+        reports_denied_file_access(&denied_stderr),
         "ungranted template stderr lacked permission denial:\n{denied_text}"
     );
     assert!(

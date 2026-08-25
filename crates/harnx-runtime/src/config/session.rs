@@ -1,48 +1,20 @@
 use super::session_externalize::{
     externalize_content, externalize_tool_result_content, record_externalized,
 };
+#[cfg(test)]
+pub(crate) use super::session_persistence::attach_memory_log;
+use super::session_persistence::require_authoritative_appends;
+pub use super::session_persistence::{
+    append_event, persist_session_override, persist_session_overrides, record_title,
+    session_overrides, SessionAppendSink,
+};
 use super::*;
 use crate::nats_session::new_client_message_id;
 
 pub use harnx_core::session::{Session, SessionLogEntry};
 
-use std::any::Any;
+#[cfg(test)]
 use std::sync::Arc;
-
-pub trait SessionAppendSink: Send + Sync + Any {
-    /// Append an entry and return its one-based durable sequence number.
-    fn append(&self, entry: &SessionLogEntry) -> Result<u64>;
-
-    /// Whether an append failure makes the active turn invalid. File-backed
-    /// sessions can mark themselves dirty and rewrite later; a NATS worker log
-    /// is authoritative and must never publish a successful turn boundary
-    /// after losing an assistant/tool entry.
-    fn failure_is_fatal(&self) -> bool {
-        false
-    }
-}
-
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct MemorySessionLogSink {
-    entries: std::sync::Mutex<Vec<SessionLogEntry>>,
-}
-
-#[cfg(test)]
-impl SessionAppendSink for MemorySessionLogSink {
-    fn append(&self, entry: &SessionLogEntry) -> Result<u64> {
-        let mut entries = self.entries.lock().expect("memory session log poisoned");
-        entries.push(entry.clone());
-        Ok(entries.len() as u64)
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn attach_memory_log(session: &mut Session) {
-    session.runtime = Some(Arc::new(
-        Arc::new(MemorySessionLogSink::default()) as Arc<dyn SessionAppendSink>
-    ));
-}
 
 use crate::client::{CompletionTokenUsage, Message, MessageContent, MessageRole};
 use harnx_core::{
@@ -54,10 +26,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Deserialize;
 
-use crate::utils::{
-    session_name::{decode_timestamp_session_id, generate_session_id, git_branch, git_remote},
-    terminal_session_id,
-};
+use crate::utils::session_name::{decode_timestamp_session_id, generate_session_id};
 
 pub fn new(config: &Config, name: &str, working_dir: Option<&std::path::Path>) -> Result<Session> {
     let agent = config.extract_agent();
@@ -73,20 +42,7 @@ pub fn new(config: &Config, name: &str, working_dir: Option<&std::path::Path>) -
     let mut session = Session {
         id: name.to_string(),
         session_id: Some(session_id),
-        working_dir: working_dir
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| std::env::current_dir().ok())
-            .map(|path| path.to_string_lossy().into_owned()),
-        git_branch: {
-            let b = git_branch();
-            if b.is_empty() {
-                None
-            } else {
-                Some(b)
-            }
-        },
-        git_remote: git_remote(),
-        terminal_session_id: terminal_session_id(),
+        working_dir: working_dir.map(|path| path.to_string_lossy().into_owned()),
         ..Default::default()
     };
     session.set_agent(&agent)?;
@@ -128,8 +84,38 @@ pub fn replay_log_entries_for_external(
     raw_entries: &[(usize, SessionLogEntry)],
     name: &str,
 ) -> Result<Session> {
+    replay_log_entries_into_session(raw_entries, name, Session::default(), true)
+}
+
+/// Replay conversation-only NATS entries into state initialized from canonical
+/// session metadata. Header and title rows are protocol violations in this
+/// path: their state belongs in KV and must never be synthesized or repaired
+/// from transcript contents.
+pub fn replay_nats_entries_into_session(
+    raw_entries: &[(usize, SessionLogEntry)],
+    name: &str,
+    session: Session,
+) -> Result<Session> {
+    // `apply_log_mutations_with_name` intentionally ignores unknown rows for
+    // tolerant local-file replay. Canonical NATS transcripts are a hard
+    // protocol boundary, so reject legacy Header/Title rows (which deserialize
+    // as `Unknown`) before mutation resolution can discard them.
+    anyhow::ensure!(
+        !raw_entries
+            .iter()
+            .any(|(_, entry)| matches!(entry, SessionLogEntry::Unknown)),
+        "unsupported or legacy entry found in canonical NATS transcript '{name}'"
+    );
+    replay_log_entries_into_session(raw_entries, name, session, false)
+}
+
+fn replay_log_entries_into_session(
+    raw_entries: &[(usize, SessionLogEntry)],
+    name: &str,
+    mut session: Session,
+    allow_embedded_metadata: bool,
+) -> Result<Session> {
     let effective_entries = build_effective_log_entries(raw_entries, name);
-    let mut session = Session::default();
 
     // Pending ToolCalls entry awaiting a matching ToolResults entry.
     // On any other entry (or EOF) while pending, we repair by
@@ -140,39 +126,6 @@ pub fn replay_log_entries_for_external(
 
     for (seq, entry) in effective_entries {
         match entry {
-            SessionLogEntry::Header {
-                model_id,
-                temperature,
-                top_p,
-                use_tools,
-                compress_threshold,
-                agent_name,
-                session_id,
-                working_dir,
-                git_branch,
-                git_remote,
-                terminal_session_id,
-                agent_variables,
-                agent_instructions,
-                model_fallbacks,
-                compaction_agent,
-            } => {
-                session.model_id = model_id;
-                session.temperature = temperature;
-                session.top_p = top_p;
-                session.use_tools = use_tools;
-                session.compress_threshold = compress_threshold;
-                session.agent_name = agent_name;
-                session.session_id = session_id;
-                session.working_dir = working_dir;
-                session.git_branch = git_branch;
-                session.git_remote = git_remote;
-                session.terminal_session_id = terminal_session_id;
-                session.agent_variables = agent_variables;
-                session.agent_instructions = agent_instructions;
-                session.model_fallbacks = model_fallbacks;
-                session.compaction_agent = compaction_agent;
-            }
             SessionLogEntry::Message {
                 id,
                 role,
@@ -258,18 +211,6 @@ pub fn replay_log_entries_for_external(
                 session.compressed_messages.append(&mut session.messages);
                 session.compaction_summary = Some(prompt);
             }
-            SessionLogEntry::Title {
-                title,
-                manual,
-                tokens,
-            } => {
-                session.title = Some(title);
-                // A manually set title freezes automatic regeneration across
-                // reloads; auto-generated titles restore the exact token count
-                // recorded in the entry (session.tokens is still 0 mid-replay,
-                // so we must NOT derive it from session state here).
-                session.title_last_updated_tokens = if manual { usize::MAX } else { tokens };
-            }
             SessionLogEntry::Clear => {
                 pending = None;
                 session.messages.clear();
@@ -281,9 +222,11 @@ pub fn replay_log_entries_for_external(
             SessionLogEntry::Error { .. } => {}
             SessionLogEntry::TurnEnd { .. } => {}
             SessionLogEntry::Cancel { .. } => {}
-            SessionLogEntry::EditEntries { .. }
-            | SessionLogEntry::Rewind { .. }
-            | SessionLogEntry::Unknown => {}
+            SessionLogEntry::EditEntries { .. } | SessionLogEntry::Rewind { .. } => {}
+            SessionLogEntry::Unknown => anyhow::ensure!(
+                allow_embedded_metadata,
+                "unsupported or legacy entry found in canonical NATS transcript '{name}'"
+            ),
         }
     }
 
@@ -397,80 +340,6 @@ fn assemble_tool_message(
             sequence: false,
         }),
     )
-}
-
-/// Append a log entry through the session's runtime persistence sink.
-pub fn append_event(session: &mut Session, entry: &SessionLogEntry) -> bool {
-    if let Some(runtime) = session.runtime.as_ref() {
-        if let Some(append_sink) = runtime.downcast_ref::<Arc<dyn SessionAppendSink>>() {
-            return match append_sink.append(entry) {
-                Ok(seq) => {
-                    session.log_entry_count = seq as usize;
-                    true
-                }
-                Err(error) => {
-                    log::warn!(
-                        "session append failed: session_id={} entry_type={} error={error}",
-                        session.id(),
-                        crate::session_history::entry_type(entry)
-                    );
-                    false
-                }
-            };
-        }
-    }
-
-    log::warn!(
-        "session append dropped: no persistence sink attached (session_id={} entry_type={})",
-        session.id(),
-        crate::session_history::entry_type(entry)
-    );
-    false
-}
-
-fn require_authoritative_appends(
-    session: &Session,
-    all_appended: bool,
-    operation: &str,
-) -> Result<()> {
-    if all_appended {
-        return Ok(());
-    }
-    let fatal = session
-        .runtime
-        .as_ref()
-        .and_then(|runtime| runtime.downcast_ref::<Arc<dyn SessionAppendSink>>())
-        .is_some_and(|sink| sink.failure_is_fatal());
-    if fatal {
-        anyhow::bail!("failed to durably persist {operation}");
-    }
-    Ok(())
-}
-
-/// Append a `Title` log entry and update the in-memory session title state.
-/// Shared by automatic generation (`manual = false`) and the `.set title`
-/// command (`manual = true`). A manual title freezes automatic regeneration by
-/// setting `title_last_updated_tokens` to `usize::MAX`; an automatic title
-/// records the token count it was generated at so reloads restore it exactly.
-pub fn record_title(
-    session: &mut Session,
-    title: String,
-    manual: bool,
-    tokens: usize,
-) -> Result<()> {
-    let entry = SessionLogEntry::Title {
-        title: title.clone(),
-        manual,
-        tokens,
-    };
-    let appended = append_event(session, &entry);
-    if !appended {
-        session.dirty = true;
-    }
-    require_authoritative_appends(session, appended, "session title")?;
-    session.set_title(title);
-    session.set_title_last_updated_tokens(if manual { usize::MAX } else { tokens });
-    Ok(())
 }
 
 pub fn render(session: &Session) -> Result<String> {
@@ -1164,6 +1033,10 @@ mod tests {
             anyhow::bail!("simulated durable append failure")
         }
 
+        fn persist_title(&self, _title: &str, _manual: bool, _tokens: usize) -> Result<()> {
+            anyhow::bail!("simulated durable metadata failure")
+        }
+
         fn failure_is_fatal(&self) -> bool {
             true
         }
@@ -1221,11 +1094,24 @@ mod tests {
     }
 
     #[test]
+    fn canonical_nats_replay_rejects_legacy_header_before_mutation_resolution() {
+        let raw_entries = collect_raw_log_entries(
+            "---\ntype: header\nmodel_id: legacy-model\n---\ntype: message\nrole: user\ncontent: hello\n",
+            "legacy-session",
+        )
+        .expect("legacy YAML remains syntactically readable");
+        assert!(matches!(raw_entries[0].1, SessionLogEntry::Unknown));
+
+        let error =
+            replay_nats_entries_into_session(&raw_entries, "legacy-session", Session::default())
+                .expect_err("canonical NATS replay must reject embedded legacy metadata");
+
+        assert!(error.to_string().contains("unsupported or legacy entry"));
+    }
+
+    #[test]
     fn load_from_log_enumerates_document_sequence_numbers() {
         let content = r#"---
-type: header
-model: openai:gpt-4o
----
 type: message
 role: user
 content: first
@@ -1251,12 +1137,11 @@ content: second
             })
             .collect();
 
-        assert_eq!(seqs.len(), 5);
-        assert!(matches!(seqs[0], (0, SessionLogEntry::Header { .. })));
+        assert_eq!(seqs.len(), 4);
         assert!(matches!(
-            seqs[1],
+            seqs[0],
             (
-                1,
+                0,
                 SessionLogEntry::Message {
                     timestamp: None,
                     ..
@@ -1264,17 +1149,17 @@ content: second
             )
         ));
         assert!(matches!(
+            seqs[1],
+            (1, SessionLogEntry::Rewind { after_seq: 1 })
+        ));
+        assert!(matches!(
             seqs[2],
-            (2, SessionLogEntry::Rewind { after_seq: 1 })
+            (2, SessionLogEntry::EditEntries { from: 1, to: 1, .. })
         ));
         assert!(matches!(
             seqs[3],
-            (3, SessionLogEntry::EditEntries { from: 1, to: 1, .. })
-        ));
-        assert!(matches!(
-            seqs[4],
             (
-                4,
+                3,
                 SessionLogEntry::Message {
                     timestamp: None,
                     ..
@@ -1283,10 +1168,11 @@ content: second
         ));
 
         let session = super::load_from_log_for_test(content);
-        assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.messages[0].content.to_text(), "second");
-        assert_eq!(session.log_entry_count, 5);
-        assert_eq!(session.next_seq(), 5);
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].content.to_text(), "first");
+        assert_eq!(session.messages[1].content.to_text(), "second");
+        assert_eq!(session.log_entry_count, 4);
+        assert_eq!(session.next_seq(), 4);
     }
 
     #[test]
@@ -1383,32 +1269,6 @@ prompt: summary
                 (MessageRole::Assistant, "second".to_string()),
             ]
         );
-    }
-
-    #[test]
-    fn replay_auto_title_restores_token_count_from_entry_not_session_state() {
-        // Regression: title_last_updated_tokens must come from the Title entry's
-        // recorded token count, NOT session.tokens (which is 0 mid-replay). If
-        // derived from session state, large auto-titled sessions would re-title
-        // on every reload.
-        let content = "type: header\nmodel: openai:gpt-4o\nsession_id: sess-a\n---\ntype: message\nrole: user\ncontent: hello\n---\ntype: title\ntitle: Some generated title\ntokens: 30000\n";
-        let session = super::load_from_log_for_test(content);
-
-        assert_eq!(session.title.as_deref(), Some("Some generated title"));
-        assert_eq!(session.title_last_updated_tokens, 30000);
-        // With a 50k threshold and ~30k baseline, a freshly loaded session does
-        // not immediately re-title unless it has grown 50k tokens past 30k.
-        assert!(!session.need_generate_title(50_000));
-    }
-
-    #[test]
-    fn replay_manual_title_freezes_regeneration_across_reload() {
-        let content = "type: header\nmodel: openai:gpt-4o\nsession_id: sess-b\n---\ntype: message\nrole: user\ncontent: hello\n---\ntype: title\ntitle: My Manual Title\nmanual: true\n";
-        let session = super::load_from_log_for_test(content);
-
-        assert_eq!(session.title.as_deref(), Some("My Manual Title"));
-        assert_eq!(session.title_last_updated_tokens, usize::MAX);
-        assert!(!session.need_generate_title(1));
     }
 
     #[test]
@@ -2381,52 +2241,6 @@ replacements:
         );
         let messages = super::build_messages(&session, &input).unwrap();
         assert_eq!(messages[0].content.to_text(), "Model=openai:gpt-4o");
-    }
-
-    #[test]
-    fn load_from_log_drops_legacy_stored_system_message_and_reinjects_prompt() {
-        let content = r#"---
-type: header
-model: openai:gpt-4o
-agent_instructions: Agent prompt for openai:gpt-4o
-agent_prompt: Agent prompt for openai:gpt-4o
----
-type: message
-role: system
-content: old stored system prompt
----
-type: message
-role: user
-content: hi
----
-type: message
-role: assistant
-content: hello
-"#;
-
-        let session = super::load_from_log_for_test(content);
-
-        assert!(
-            session
-                .messages
-                .iter()
-                .all(|message| message.role != MessageRole::System),
-            "legacy stored system message should be dropped: {:#?}",
-            session.messages
-        );
-
-        let input = Input::new(
-            "follow up".to_string(),
-            ("follow up".to_string(), vec![]),
-            to_agent(&session).into_config(),
-        );
-        let messages = super::build_messages(&session, &input).unwrap();
-
-        assert_eq!(messages[0].role, MessageRole::System);
-        assert_eq!(
-            messages[0].content.to_text(),
-            "Agent prompt for openai:gpt-4o"
-        );
     }
 
     #[test]

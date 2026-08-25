@@ -5,13 +5,17 @@ async fn append_completed_transcript_fixture(config: &Config, session_id: &str) 
         .nats_jetstream("local")
         .await
         .expect("load local jetstream");
-    let log = NatsSessionLog::new(jetstream, session_id.to_string());
-    let header = crate::config::session::new(config, session_id, None)
-        .expect("build fixture session")
-        .build_header_entry();
-    log.append_event_async(&header)
+    let metadata_store = crate::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
         .await
-        .expect("append fixture header");
+        .expect("metadata store");
+    metadata_store
+        .create(&crate::nats_session_metadata::SessionMetadata::new(
+            session_id,
+            crate::SessionInitializer::named("metis", Default::default()),
+        ))
+        .await
+        .expect("create fixture metadata");
+    let log = NatsSessionLog::new(jetstream, session_id.to_string());
     log.append_event_async(&SessionLogEntry::Message {
         id: Some(uuid::Uuid::new_v4().to_string()),
         role: harnx_core::message::MessageRole::User,
@@ -134,7 +138,7 @@ async fn activate_nats_session(
     NatsSession::from_global_config(
         crate::NatsSessionConfig {
             cluster: "local".to_string(),
-            agent: "metis".to_string(),
+            initializer: crate::SessionInitializer::named("metis", Default::default()),
             session_id: Some(session_id),
             activation_route: crate::SessionActivationRoute::ClusterShared,
         },
@@ -167,7 +171,7 @@ async fn load_remote_transcript_for_render_prerenders_logical_rows() {
         .iter()
         .filter_map(|message| message.log_seq)
         .collect();
-    assert_eq!(row_seqs, vec![1, 2]);
+    assert_eq!(row_seqs, vec![0, 1]);
     let row_texts: Vec<_> = transcript
         .messages
         .iter()

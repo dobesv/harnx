@@ -17,54 +17,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-/// A single entry in the append-only session log file.
-///
-/// Session files use multi-document YAML (separated by `---`).
-/// The first document is always a `Header`; subsequent documents are events.
-// The Header variant is intentionally large — it holds all session-level metadata
-// fields. Boxing would require pervasive refactoring; the allocation cost is acceptable
-// since Headers are only created/read at session boundaries.
-fn is_zero_usize(value: &usize) -> bool {
-    *value == 0
-}
-
-#[allow(clippy::large_enum_variant)]
+/// A single conversation event in the append-only session transcript.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum SessionLogEntry {
-    #[serde(rename = "header")]
-    Header {
-        #[serde(rename = "model")]
-        model_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        temperature: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        top_p: Option<f64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        use_tools: Option<Vec<String>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        compress_threshold: Option<usize>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        agent_name: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        session_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        working_dir: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        git_branch: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        git_remote: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        terminal_session_id: Option<String>,
-        #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
-        agent_variables: AgentVariables,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        agent_instructions: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        model_fallbacks: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        compaction_agent: Option<String>,
-    },
     #[serde(rename = "message")]
     Message {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,21 +79,6 @@ pub enum SessionLogEntry {
     Rewind {
         /// All entries with seq > after_seq are excluded from context on replay.
         after_seq: usize,
-    },
-    #[serde(rename = "title")]
-    Title {
-        title: String,
-        /// `true` when the title was set manually (`.set title`). A manual title
-        /// freezes automatic regeneration across reloads. Defaults to `false`
-        /// so auto-generated and legacy title entries deserialize cleanly.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        manual: bool,
-        /// Session token count when this title was generated. Persisted so that
-        /// on reload `title_last_updated_tokens` can be restored exactly instead
-        /// of being derived from a mid-replay (still-zero) token count. Defaults
-        /// to `0` for legacy entries that predate this field.
-        #[serde(default, skip_serializing_if = "is_zero_usize")]
-        tokens: usize,
     },
     /// A turn that ended in a worker-side failure instead of an assistant
     /// reply. Written by the worker so attached clients stop waiting and the
@@ -305,37 +246,6 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn is_log_format(content: &str) -> bool {
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed == "---" {
-                continue;
-            }
-            return trimmed == "type: header";
-        }
-        false
-    }
-
-    pub fn build_header_entry(&self) -> SessionLogEntry {
-        SessionLogEntry::Header {
-            model_id: self.model_id.clone(),
-            temperature: self.temperature,
-            top_p: self.top_p,
-            use_tools: self.use_tools.clone(),
-            compress_threshold: self.compress_threshold,
-            agent_name: self.agent_name.clone(),
-            session_id: self.session_id.clone(),
-            working_dir: self.working_dir.clone(),
-            git_branch: self.git_branch.clone(),
-            git_remote: self.git_remote.clone(),
-            terminal_session_id: self.terminal_session_id.clone(),
-            agent_variables: self.agent_variables.clone(),
-            agent_instructions: self.agent_instructions.clone(),
-            model_fallbacks: self.model_fallbacks.clone(),
-            compaction_agent: self.compaction_agent.clone(),
-        }
-    }
-
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty() && self.compressed_messages.is_empty()
     }
@@ -756,30 +666,6 @@ mod tests {
         assert_eq!(config.name(), "resume-agent");
         let rendered = config.system_text().unwrap();
         assert_eq!(rendered, "---\nModel=openai:gpt-4o");
-    }
-
-    #[test]
-    fn session_header_serde_round_trip_preserves_model_fallbacks() {
-        let mut session = Session::default();
-        session.set_model_fallbacks(vec![
-            "anthropic:claude".to_string(),
-            "google:gemini".to_string(),
-        ]);
-
-        let yaml = serde_yaml::to_string(&session.build_header_entry()).unwrap();
-        let entry: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
-
-        match entry {
-            SessionLogEntry::Header {
-                model_fallbacks, ..
-            } => {
-                assert_eq!(
-                    model_fallbacks,
-                    vec!["anthropic:claude".to_string(), "google:gemini".to_string()]
-                );
-            }
-            _ => panic!("expected header entry"),
-        }
     }
 
     #[test]

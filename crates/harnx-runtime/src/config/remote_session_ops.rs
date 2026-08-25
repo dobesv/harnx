@@ -185,8 +185,8 @@ pub(crate) async fn delete_remote_message_range(
 
 /// Build group-aware deletion mutations: for each distinct physical seq touched,
 /// emit `EditEntries{seq,seq}` with `replacements` = surviving group members (in order).
-/// This preserves siblings in shared-seq groups (e.g. Header+U1 after header-insert migration)
-/// while deleting exactly the targeted logical rows.
+/// This preserves siblings in shared-sequence replacement groups while deleting
+/// exactly the targeted logical rows.
 fn group_aware_delete_mutations(
     state: &RemoteRenderState,
     targeted_logical_indices: std::collections::HashSet<usize>,
@@ -329,10 +329,14 @@ async fn remote_nats_session(
         (agent, cluster, session_id)
     };
 
+    let initializer = {
+        let config = config.read();
+        crate::SessionInitializer::named_from_config(agent, &config)
+    };
     NatsSession::from_global_config(
         NatsSessionConfig {
             cluster,
-            agent,
+            initializer,
             session_id: Some(session_id),
             activation_route: crate::SessionActivationRoute::ClusterShared,
         },
@@ -378,21 +382,15 @@ fn build_window_member_queues(
     window: &harnx_core::session_reconstruct::ActiveContextWindow<'_, (u64, SessionLogEntry)>,
 ) -> std::collections::HashMap<u64, std::collections::VecDeque<WindowMemberAssignment>> {
     // Pair each active-window entry with its OWN logical index (window.entries()
-    // and window.logical_entries() are in the same order). For a header-insert
-    // shared-physical-seq group [Header, U1, U2, ...] every member has a distinct
-    // logical index (Header=0, U1=1, ...). Queue the renderable (non-Header)
-    // members per physical seq, in order, each with its own logical index — so a
-    // transcript row sharing that seq is assigned the NEXT member's index rather
-    // than collapsing to the group's first/last. The Header renders no transcript
-    // row, so it is never queued/consumed.
+    // and window.logical_entries() are in the same order). Every member of a
+    // shared-physical-sequence replacement group has a distinct logical index.
+    // Queue the renderable members per physical sequence, in order, each with its
+    // own logical index, so rows do not collapse to the group's first or last.
     let mut available_members: std::collections::HashMap<
         u64,
         std::collections::VecDeque<WindowMemberAssignment>,
     > = std::collections::HashMap::new();
     for ((physical_seq, entry), logical) in window.entries().iter().zip(window.logical_entries()) {
-        if matches!(entry, SessionLogEntry::Header { .. }) {
-            continue;
-        }
         let Some(role) = message_role_for_assignment(entry) else {
             continue;
         };

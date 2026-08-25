@@ -12,7 +12,7 @@ retry-agent
 mock-llm:primary)), cooldown 60s. Trying next fallback.
 FALLBACK_SUCCESS: The fallback model handled it!
 
-🤖 retry-agent ▸   💬 [N]
+🤖 retry-agent ▸ mock-llm:primary ▸ [SID]  💬 [N](0%)
 
 
 

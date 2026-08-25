@@ -36,9 +36,6 @@ pub(crate) fn validate_not_deleting_protected(
     entries: &[SessionLogEntry],
     from: usize,
 ) -> Result<()> {
-    if matches!(entries.get(from), Some(SessionLogEntry::Header { .. })) {
-        bail!("Cannot edit or delete the session header (sequence 0)");
-    }
     if matches!(entries.get(from), Some(SessionLogEntry::Compress { .. })) {
         bail!("Cannot delete protected session history at or before most-recent boundary");
     }
@@ -139,24 +136,10 @@ mod tests {
         }
     }
 
-    fn header() -> SessionLogEntry {
-        Session::default().build_header_entry()
-    }
-
     fn compress() -> SessionLogEntry {
         SessionLogEntry::Compress {
             prompt: "summary".into(),
         }
-    }
-
-    #[test]
-    fn validate_not_deleting_protected_rejects_header() {
-        let entries = vec![header(), user("u")];
-        let err = validate_not_deleting_protected(&entries, 0).expect_err("header protected");
-        assert_eq!(
-            err.to_string(),
-            "Cannot edit or delete the session header (sequence 0)"
-        );
     }
 
     #[test]

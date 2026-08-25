@@ -8,7 +8,7 @@
 //! sessions, and let a server linger after its count hits zero before it is
 //! actually stopped.
 
-use super::daemon::{install_activation_agent, WorkerDaemonConfig};
+use super::daemon::{install_session_metadata_agent, WorkerDaemonConfig};
 use super::daemon_background::{configured_worker_services, should_start_tool_servers};
 use super::tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
 use crate::config::{resolve_local_nats_server_config, GlobalConfig, ToolServerConfig};
@@ -420,14 +420,12 @@ pub(super) async fn build_server_reconciler(
 /// the turn actually runs.
 pub(super) fn tool_servers_for_activation(
     config: &GlobalConfig,
-    agent_name: &str,
+    metadata: &crate::nats_session_metadata::SessionMetadata,
 ) -> Vec<ToolServerConfig> {
     let scratch: GlobalConfig = Arc::new(parking_lot::RwLock::new(config.read().clone()));
-    if let Err(error) = install_activation_agent(&scratch, agent_name) {
-        log::warn!(
-            "could not resolve agent '{agent_name}' for tool-server selection, \
-             falling back to the worker's own configuration: {error:#}"
-        );
+    if let Err(error) = install_session_metadata_agent(&scratch, metadata) {
+        log::warn!("could not resolve session agent for tool-server selection: {error:#}");
+        return Vec::new();
     }
     configured_worker_services(&scratch).0
 }

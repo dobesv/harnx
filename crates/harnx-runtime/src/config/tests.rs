@@ -121,8 +121,34 @@ fn test_new_session_has_session_id() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_new_session_has_short_id() {
-    let config = Arc::new(RwLock::new(Config::default()));
+    let config = Arc::new(RwLock::new(Config {
+        model: harnx_client::Model::new("test", "test-model"),
+        ..Config::default()
+    }));
     let session_id = Config::reserve_new_session_id(&config).await.unwrap();
+    let snapshot = config.read().clone();
+    let jetstream = snapshot.nats_jetstream(LOCAL_CLUSTER_KEY).await.unwrap();
+    let metadata_store = crate::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+        .await
+        .unwrap();
+    let metadata = metadata_store
+        .get(&session_id)
+        .await
+        .unwrap()
+        .expect("reservation creates complete metadata");
+    assert_eq!(metadata.metadata.session_id, session_id);
+    assert!(metadata_store
+        .get_activity(&session_id)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(
+        crate::nats_session_log::NatsSessionLog::new(jetstream, &session_id)
+            .load_events_async()
+            .await
+            .unwrap()
+            .is_empty()
+    );
     config.write().use_session(Some(&session_id)).unwrap();
 
     let guard = config.read();
@@ -140,7 +166,10 @@ async fn test_new_session_has_short_id() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_anonymous_session_id_collision_retries() {
-    let config = Arc::new(RwLock::new(Config::default()));
+    let config = Arc::new(RwLock::new(Config {
+        model: harnx_client::Model::new("test", "test-model"),
+        ..Config::default()
+    }));
     let id1 = Config::reserve_new_session_id(&config).await.unwrap();
     let id2 = Config::reserve_new_session_id(&config).await.unwrap();
     assert_ne!(

@@ -230,10 +230,14 @@ impl Tui {
             .session
             .as_ref()
             .map(|session| session.id().to_string());
+        let initializer = {
+            let config = ctx.config.read();
+            harnx_runtime::SessionInitializer::named_from_config(agent, &config)
+        };
         let session = NatsSession::from_global_config(
             NatsSessionConfig {
                 cluster: cluster.clone(),
-                agent,
+                initializer,
                 session_id,
                 activation_route,
             },

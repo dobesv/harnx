@@ -7,21 +7,29 @@ use harnx_core::session::{Session, SessionLogEntry};
 use harnx_runtime::config::session_ops_title::{
     build_title_transcript, DEFAULT_TITLE_SYSTEM_PROMPT,
 };
+use harnx_runtime::nats_session_metadata::{SessionInitializer, SessionMetadata, SessionTitle};
 
-/// A `Title` log entry round-trips through YAML and is NOT treated as Unknown.
+/// Title state round-trips in canonical metadata, not the transcript.
 #[test]
-fn title_log_entry_round_trips() -> Result<()> {
+fn title_metadata_round_trips() -> Result<()> {
     require_nextest();
 
-    let yaml = "type: title\ntitle: Debugging async lifetimes\n";
-    let entry: SessionLogEntry = serde_yaml::from_str(yaml)?;
-    match &entry {
-        SessionLogEntry::Title { title, .. } => assert_eq!(title, "Debugging async lifetimes"),
-        other => panic!("expected Title, got {other:?}"),
-    }
-    let reserialized = serde_yaml::to_string(&entry)?;
-    assert!(reserialized.contains("type: title"));
-    assert!(reserialized.contains("title: Debugging async lifetimes"));
+    let mut metadata = SessionMetadata::new(
+        "title-test",
+        SessionInitializer::named("metis", Default::default()),
+    );
+    metadata.title = SessionTitle {
+        value: Some("Debugging async lifetimes".to_string()),
+        manual: true,
+        last_updated_tokens: 42,
+    };
+    let encoded = serde_json::to_vec(&metadata)?;
+    let decoded: SessionMetadata = serde_json::from_slice(&encoded)?;
+    assert_eq!(decoded.title, metadata.title);
+
+    let legacy: SessionLogEntry =
+        serde_yaml::from_str("type: title\ntitle: legacy transcript title\n")?;
+    assert!(matches!(legacy, SessionLogEntry::Unknown));
     Ok(())
 }
 

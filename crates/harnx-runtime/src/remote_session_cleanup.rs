@@ -1,12 +1,12 @@
 use crate::config::Config;
 use crate::nats_admin::{self, kv_bucket_missing};
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
-use crate::nats_session_index::{self, SessionIndexRecord, SESSION_INDEX_BUCKET};
+use crate::nats_session_metadata::{ListedSession, SessionMetadataStore, SESSION_METADATA_BUCKET};
 use async_nats::jetstream::kv::{Operation, Store};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
-const GC_SESSION_ID: &str = "session_index_gc";
+const GC_SESSION_ID: &str = "session_metadata_gc";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RemoteCleanupStats {
@@ -71,7 +71,7 @@ async fn run_remote_cleanup_with_gc_id(
 struct CandidateContext<'a> {
     config: &'a Config,
     cluster: &'a str,
-    index_store: &'a Store,
+    metadata_store: &'a SessionMetadataStore,
     lease_store: Option<&'a Store>,
     threshold: u64,
 }
@@ -82,14 +82,15 @@ async fn run_remote_cleanup_inner(
     cluster: &str,
 ) -> anyhow::Result<RemoteCleanupStats> {
     let jetstream = config.nats_jetstream(cluster).await?;
-    let index_store = match jetstream.get_key_value(SESSION_INDEX_BUCKET).await {
+    let metadata_kv = match jetstream.get_key_value(SESSION_METADATA_BUCKET).await {
         Ok(store) => store,
         Err(error) if kv_bucket_missing(&error) => return Ok(RemoteCleanupStats::default()),
         Err(error) => return Err(error.into()),
     };
+    let metadata_store = SessionMetadataStore::from_store(metadata_kv, jetstream.client().clone());
     let lease_store = load_optional_lease_store(config, cluster).await?;
     let threshold = cleanup_threshold(now_unix_secs(), days);
-    let records = nats_session_index::list_records(&index_store).await?;
+    let records = metadata_store.list().await?;
     let candidates = candidate_session_ids(&records, threshold);
     let mut stats = RemoteCleanupStats {
         scanned: candidates.len(),
@@ -98,7 +99,7 @@ async fn run_remote_cleanup_inner(
     let context = CandidateContext {
         config,
         cluster,
-        index_store: &index_store,
+        metadata_store: &metadata_store,
         lease_store: lease_store.as_ref(),
         threshold,
     };
@@ -142,7 +143,7 @@ async fn acquire_gc_lease(
             replicas,
             ..NatsLeaseConfig::default()
         },
-        session_index: None,
+        session_metadata: None,
     })
     .await
 }
@@ -210,7 +211,7 @@ async fn candidate_is_active(
         return Ok(true);
     }
 
-    session_reactivated(context.index_store, session_id, context.threshold).await
+    session_reactivated(context.metadata_store, session_id, context.threshold).await
 }
 
 async fn lease_present(lease_store: Option<&Store>, session_id: &str) -> anyhow::Result<bool> {
@@ -228,28 +229,37 @@ async fn lease_present(lease_store: Option<&Store>, session_id: &str) -> anyhow:
 }
 
 async fn session_reactivated(
-    index_store: &Store,
+    metadata_store: &SessionMetadataStore,
     session_id: &str,
     threshold: u64,
 ) -> anyhow::Result<bool> {
     Ok(
-        match nats_session_index::get_record(index_store, session_id).await? {
-            Some(record) => record.last_activity >= threshold,
-            None => true,
+        match metadata_store.get_activity_for_cleanup(session_id).await? {
+            Some(activity) => activity.last_activity_at.timestamp() >= threshold as i64,
+            None => metadata_store
+                .get(session_id)
+                .await?
+                .is_none_or(|record| record.metadata.created_at.timestamp() >= threshold as i64),
         },
     )
 }
 
-fn candidate_session_ids(records: &[SessionIndexRecord], threshold: u64) -> Vec<String> {
+fn candidate_session_ids(records: &[ListedSession], threshold: u64) -> Vec<String> {
     records
         .iter()
         .filter(|record| is_cleanup_candidate(record, threshold))
-        .map(|record| record.session_id.clone())
+        .map(|record| record.metadata.session_id.clone())
         .collect()
 }
 
-fn is_cleanup_candidate(record: &SessionIndexRecord, threshold: u64) -> bool {
-    record.last_activity < threshold
+fn is_cleanup_candidate(record: &ListedSession, threshold: u64) -> bool {
+    record
+        .activity
+        .as_ref()
+        .map(|activity| activity.last_activity_at)
+        .unwrap_or(record.metadata.created_at)
+        .timestamp()
+        < threshold as i64
 }
 
 fn cleanup_threshold(now_unix_secs: u64, days: u64) -> u64 {
@@ -271,33 +281,86 @@ mod tests {
     };
     use crate::config::{Config, NatsServerConfig};
     use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
-    use crate::nats_session_index::{self, SessionIndexRecord};
     use crate::nats_session_log::stream_name_for_session;
+    use crate::nats_session_metadata::{
+        activity_key, ListedSession, SessionActivity, SessionInitializer, SessionMetadata,
+        SessionMetadataStore,
+    };
     use async_nats::jetstream::stream;
+    use chrono::{TimeZone, Utc};
 
-    fn sample_record(session_id: &str, last_activity: u64) -> SessionIndexRecord {
-        SessionIndexRecord {
-            session_id: session_id.to_string(),
-            agent_name: "hephaestus".to_string(),
-            working_dir: Some("/tmp/project".to_string()),
-            git_branch: Some("main".to_string()),
-            git_remote: Some("git@github.com:dobesv/harnx.git".to_string()),
-            title: None,
-            last_activity,
+    fn sample_record(session_id: &str, last_activity: u64) -> ListedSession {
+        ListedSession {
+            metadata: SessionMetadata::new(
+                session_id,
+                SessionInitializer::named("hephaestus", Default::default()),
+            ),
+            metadata_revision: 1,
+            activity: Some(SessionActivity {
+                first_activation_at: None,
+                last_activity_at: Utc.timestamp_opt(last_activity as i64, 0).unwrap(),
+            }),
         }
+    }
+
+    async fn put_test_metadata(
+        jetstream: &async_nats::jetstream::Context,
+        record: &ListedSession,
+    ) -> SessionMetadataStore {
+        let store = SessionMetadataStore::ensure(jetstream, 1)
+            .await
+            .expect("metadata bucket");
+        store
+            .create(&record.metadata)
+            .await
+            .expect("create metadata");
+        store
+            .kv_store()
+            .put(
+                activity_key(&record.metadata.session_id),
+                serde_json::to_vec(record.activity.as_ref().unwrap())
+                    .unwrap()
+                    .into(),
+            )
+            .await
+            .expect("put activity");
+        store
+    }
+
+    async fn assert_session_deleted(
+        stats: RemoteCleanupStats,
+        jetstream: &async_nats::jetstream::Context,
+        metadata_store: &SessionMetadataStore,
+        session_id: &str,
+    ) {
+        assert_eq!(stats.errors, 0);
+        assert!(!stream_exists(jetstream, session_id).await);
+        assert!(metadata_store
+            .get(session_id)
+            .await
+            .expect("get metadata")
+            .is_none());
     }
 
     #[test]
     fn candidate_filter_selects_only_stale_records() {
+        let mut missing_stale = sample_record("missing-stale", 200);
+        missing_stale.metadata.created_at = Utc.timestamp_opt(99, 0).unwrap();
+        missing_stale.activity = None;
+        let mut missing_fresh = sample_record("missing-fresh", 1);
+        missing_fresh.metadata.created_at = Utc.timestamp_opt(101, 0).unwrap();
+        missing_fresh.activity = None;
         let records = vec![
             sample_record("old", 99),
             sample_record("borderline", 100),
             sample_record("fresh", 101),
+            missing_stale,
+            missing_fresh,
         ];
 
         assert_eq!(
             candidate_session_ids(&records, 100),
-            vec!["old".to_string()]
+            vec!["old".to_string(), "missing-stale".to_string()]
         );
     }
 
@@ -328,26 +391,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_index_bucket_returns_zero_stats() {
+    async fn missing_metadata_bucket_returns_zero_stats() {
         let Some(server_url) = test_nats_url() else {
             eprintln!(
-                "skipping missing_index_bucket_returns_zero_stats: HARNX_NATS_TEST_URL unset"
+                "skipping missing_metadata_bucket_returns_zero_stats: HARNX_NATS_TEST_URL unset"
             );
             return;
         };
 
-        let cluster = unique_cluster_name("missing-index");
+        let cluster = unique_cluster_name("missing-metadata");
         let config = test_config(&cluster, &server_url);
 
         let stats = run_remote_cleanup_with_gc_id(
             &config,
             30,
             &cluster,
-            &unique_gc_session_id("missing-index-gc"),
+            &unique_gc_session_id("missing-metadata-gc"),
         )
         .await;
 
-        assert_eq!(stats.errors, 0);
+        assert_eq!(stats, RemoteCleanupStats::default());
     }
 
     #[tokio::test]
@@ -362,34 +425,97 @@ mod tests {
         let cluster = unique_cluster_name("stale-delete");
         let config = test_config(&cluster, &server_url);
         let jetstream = config.nats_jetstream(&cluster).await.expect("jetstream");
-        let index_store = nats_session_index::ensure_index_bucket(&jetstream, 1)
-            .await
-            .expect("index bucket");
         let lease_store = config
             .nats_kv_bucket(&cluster, "harnx_leases")
             .await
             .expect("lease bucket");
         let session_id = unique_session_id("stale-delete");
         put_test_stream(&jetstream, &session_id).await;
-        nats_session_index::put_record(&index_store, &sample_record(&session_id, 1))
-            .await
-            .expect("put record");
+        let metadata_store = put_test_metadata(&jetstream, &sample_record(&session_id, 1)).await;
 
         let stats =
             run_remote_cleanup_with_gc_id(&config, 1, &cluster, &unique_gc_session_id("stale-gc"))
                 .await;
 
-        assert_eq!(stats.errors, 0);
-        assert!(!stream_exists(&jetstream, &session_id).await);
-        assert!(nats_session_index::get_record(&index_store, &session_id)
+        assert_session_deleted(stats, &jetstream, &metadata_store, &session_id).await;
+        assert!(metadata_store
+            .get_activity(&session_id)
             .await
-            .expect("get record")
+            .expect("get activity")
             .is_none());
         assert!(lease_store
             .entry(NatsLeaseConfig::default().key_for_session(&session_id))
             .await
             .expect("lease entry")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_session_with_missing_activity_gets_deleted() {
+        let Some(server_url) = test_nats_url() else {
+            eprintln!(
+                "skipping stale_session_with_missing_activity_gets_deleted: HARNX_NATS_TEST_URL unset"
+            );
+            return;
+        };
+
+        let cluster = unique_cluster_name("missing-activity-delete");
+        let config = test_config(&cluster, &server_url);
+        let jetstream = config.nats_jetstream(&cluster).await.expect("jetstream");
+        let session_id = unique_session_id("missing-activity-delete");
+        put_test_stream(&jetstream, &session_id).await;
+        let mut record = sample_record(&session_id, 1);
+        record.metadata.created_at = Utc.timestamp_opt(1, 0).unwrap();
+        let metadata_store = put_test_metadata(&jetstream, &record).await;
+        metadata_store
+            .kv_store()
+            .purge(activity_key(&session_id))
+            .await
+            .expect("purge activity");
+
+        let stats = run_remote_cleanup_with_gc_id(
+            &config,
+            1,
+            &cluster,
+            &unique_gc_session_id("missing-activity-gc"),
+        )
+        .await;
+
+        assert_session_deleted(stats, &jetstream, &metadata_store, &session_id).await;
+    }
+
+    #[tokio::test]
+    async fn stale_session_with_malformed_activity_gets_deleted() {
+        let Some(server_url) = test_nats_url() else {
+            eprintln!(
+                "skipping stale_session_with_malformed_activity_gets_deleted: HARNX_NATS_TEST_URL unset"
+            );
+            return;
+        };
+
+        let cluster = unique_cluster_name("malformed-activity-delete");
+        let config = test_config(&cluster, &server_url);
+        let jetstream = config.nats_jetstream(&cluster).await.expect("jetstream");
+        let session_id = unique_session_id("malformed-activity-delete");
+        put_test_stream(&jetstream, &session_id).await;
+        let mut record = sample_record(&session_id, 1);
+        record.metadata.created_at = Utc.timestamp_opt(1, 0).unwrap();
+        let metadata_store = put_test_metadata(&jetstream, &record).await;
+        metadata_store
+            .kv_store()
+            .put(activity_key(&session_id), "not-json".into())
+            .await
+            .expect("corrupt activity");
+
+        let stats = run_remote_cleanup_with_gc_id(
+            &config,
+            1,
+            &cluster,
+            &unique_gc_session_id("malformed-activity-gc"),
+        )
+        .await;
+
+        assert_session_deleted(stats, &jetstream, &metadata_store, &session_id).await;
     }
 
     #[tokio::test]
@@ -402,18 +528,13 @@ mod tests {
         let cluster = unique_cluster_name("fresh-keep");
         let config = test_config(&cluster, &server_url);
         let jetstream = config.nats_jetstream(&cluster).await.expect("jetstream");
-        let index_store = nats_session_index::ensure_index_bucket(&jetstream, 1)
-            .await
-            .expect("index bucket");
         let session_id = unique_session_id("fresh-keep");
         put_test_stream(&jetstream, &session_id).await;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("now")
             .as_secs();
-        nats_session_index::put_record(&index_store, &sample_record(&session_id, now))
-            .await
-            .expect("put record");
+        let metadata_store = put_test_metadata(&jetstream, &sample_record(&session_id, now)).await;
 
         let stats =
             run_remote_cleanup_with_gc_id(&config, 1, &cluster, &unique_gc_session_id("fresh-gc"))
@@ -421,9 +542,10 @@ mod tests {
 
         assert_eq!(stats.errors, 0);
         assert!(stream_exists(&jetstream, &session_id).await);
-        assert!(nats_session_index::get_record(&index_store, &session_id)
+        assert!(metadata_store
+            .get(&session_id)
             .await
-            .expect("get record")
+            .expect("get metadata")
             .is_some());
     }
 
@@ -437,21 +559,16 @@ mod tests {
         let cluster = unique_cluster_name("lease-skip");
         let config = test_config(&cluster, &server_url);
         let jetstream = config.nats_jetstream(&cluster).await.expect("jetstream");
-        let index_store = nats_session_index::ensure_index_bucket(&jetstream, 1)
-            .await
-            .expect("index bucket");
         let session_id = unique_session_id("lease-skip");
         put_test_stream(&jetstream, &session_id).await;
-        nats_session_index::put_record(&index_store, &sample_record(&session_id, 1))
-            .await
-            .expect("put record");
+        let metadata_store = put_test_metadata(&jetstream, &sample_record(&session_id, 1)).await;
         let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
             jetstream: jetstream.clone(),
             session_id: &session_id,
             worker_id: "lease-holder".to_string(),
             generation: 1,
             config: NatsLeaseConfig::default(),
-            session_index: None,
+            session_metadata: None,
         })
         .await
         .expect("acquire lease")
@@ -468,9 +585,10 @@ mod tests {
         assert_eq!(stats.errors, 0);
         assert!(stats.skipped_active >= 1);
         assert!(stream_exists(&jetstream, &session_id).await);
-        assert!(nats_session_index::get_record(&index_store, &session_id)
+        assert!(metadata_store
+            .get(&session_id)
             .await
-            .expect("get record")
+            .expect("get metadata")
             .is_some());
         assert!(matches!(
             lease_entry_operation(&config, &cluster, &session_id).await,
@@ -491,14 +609,9 @@ mod tests {
         let cluster = unique_cluster_name("leader-race");
         let config = test_config(&cluster, &server_url);
         let jetstream = config.nats_jetstream(&cluster).await.expect("jetstream");
-        let index_store = nats_session_index::ensure_index_bucket(&jetstream, 1)
-            .await
-            .expect("index bucket");
         let session_id = unique_session_id("leader-race");
         put_test_stream(&jetstream, &session_id).await;
-        nats_session_index::put_record(&index_store, &sample_record(&session_id, 1))
-            .await
-            .expect("put record");
+        let metadata_store = put_test_metadata(&jetstream, &sample_record(&session_id, 1)).await;
 
         let gc_session_id = unique_gc_session_id("leader-race-gc");
         let (first, second) = tokio::join!(
@@ -509,9 +622,10 @@ mod tests {
         assert_eq!(first.errors, 0);
         assert_eq!(second.errors, 0);
         assert!(!stream_exists(&jetstream, &session_id).await);
-        assert!(nats_session_index::get_record(&index_store, &session_id)
+        assert!(metadata_store
+            .get(&session_id)
             .await
-            .expect("get record")
+            .expect("get metadata")
             .is_none());
         assert!(first == Default::default() || second == Default::default());
     }

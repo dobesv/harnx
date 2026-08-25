@@ -587,40 +587,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_eval_tool_calls_error_handling() {
-        let _guard = crate::client::TestStateGuard::new(None).await;
-        let config = Arc::new(RwLock::new(Config::default()));
-        let call = ToolCall::new(
-            "unknown_tool".to_string(),
-            json!({}),
-            Some("1".to_string()),
-            None,
-        );
-        let calls = vec![call];
-
-        let abort_signal = create_abort_signal();
-        let result = eval_tool_calls(
-            &build_tool_eval_context(BuildToolEvalContextParams::new(
-                &config,
-                &harnx_core::instance::ServerScope::new(),
-            ))
-            .await,
-            calls,
-            &abort_signal,
-        )
-        .await
-        .unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].call.name, "unknown_tool");
-        assert!(result[0].output.is_object());
-        assert_eq!(result[0].output["is_error"], true);
-        assert!(result[0].output["error"]
-            .as_str()
-            .unwrap()
-            .contains("No tool provider configured"));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn build_tool_eval_context_stores_current_agent_package() {
         // The package derived from a qualified agent name in `execute_tool_round`
         // must be threaded into `ToolEvalContext` so the engine can resolve

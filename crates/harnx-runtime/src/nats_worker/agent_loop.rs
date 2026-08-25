@@ -10,7 +10,7 @@ use crate::nats_hook_provider::{
 };
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use crate::nats_metrics;
-use crate::nats_session_index::{put_record, SessionIndexRecord};
+use crate::nats_session_metadata::SessionMetadataStore;
 use crate::tool_context::discover_nats_hook_provider_cached;
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result};
@@ -19,7 +19,6 @@ use harnx_core::message::Message;
 use harnx_core::session::SessionLogEntry;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 pub struct RunAgentLoopArgs<'a> {
@@ -36,21 +35,7 @@ pub struct RunAgentLoopArgs<'a> {
     pub lease: Option<Arc<NatsSessionLease>>,
     pub lease_config: NatsLeaseConfig,
     pub after_seq_observer: Option<Arc<AtomicU64>>,
-    /// Optional observer of the JetStream seq of the header-insert migration
-    /// EditEntries (S2), when the worker migrates a headerless remote session on
-    /// this activation. The migration re-maps the leading-user block onto this
-    /// seq, so every cursor tracking "user messages already fed into this turn"
-    /// must advance to cover it. Otherwise the re-mapped (already-answered)
-    /// leading users read as unanswered: the mid-round injection callback
-    /// re-injects the prompt the turn is answering, and the end-of-turn drain
-    /// re-runs the turn (S3).
-    pub header_insert_observer: Option<Arc<AtomicU64>>,
-    /// Optional NATS KV store for the session index. When set, the worker
-    /// upserts a `SessionIndexRecord` after the effective log has a `Header`
-    /// on this activation, so remote sessions taking the existing-session path
-    /// (headerless-migrated per S2, or normal resumes) are indexed and their
-    /// `last_activity` is refreshed — not just brand-new empty-log sessions.
-    pub session_index: Option<&'a async_nats::jetstream::kv::Store>,
+    pub session_metadata: Option<&'a SessionMetadataStore>,
     pub on_tool_round: Option<OnToolRoundFn>,
     pub working_dir: Option<std::path::PathBuf>,
 }
@@ -63,11 +48,6 @@ impl<'a> RunAgentLoopArgs<'a> {
 
     pub fn with_after_seq_observer(mut self, observer: Arc<AtomicU64>) -> Self {
         self.after_seq_observer = Some(observer);
-        self
-    }
-
-    pub fn with_header_insert_observer(mut self, observer: Arc<AtomicU64>) -> Self {
-        self.header_insert_observer = Some(observer);
         self
     }
 }
@@ -203,8 +183,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         lease,
         lease_config,
         after_seq_observer,
-        header_insert_observer,
-        session_index,
+        session_metadata,
         on_tool_round,
         working_dir,
     } = args;
@@ -213,13 +192,10 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         session_id,
         config: &config,
         instance_id: &instance_id,
-        initial_input: &initial_input,
         abort_signal: &abort_signal,
         lease: lease.as_ref(),
         after_seq_observer,
-        header_insert_observer: header_insert_observer.as_ref(),
-        session_index,
-        working_dir: working_dir.as_deref(),
+        session_metadata,
     })
     .await?;
 
@@ -260,7 +236,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         jetstream_ctx,
         lease,
         lease_config,
-        session_index: session_index.cloned(),
+        session_metadata: session_metadata.cloned(),
         hook_start_config,
         hook_supervisor,
     })
@@ -272,13 +248,10 @@ struct PrepareAgentSessionParams<'a> {
     session_id: &'a str,
     config: &'a GlobalConfig,
     instance_id: &'a harnx_core::instance::ServerScope,
-    initial_input: &'a Input,
     abort_signal: &'a AbortSignal,
     lease: Option<&'a Arc<NatsSessionLease>>,
     after_seq_observer: Option<Arc<AtomicU64>>,
-    header_insert_observer: Option<&'a Arc<AtomicU64>>,
-    session_index: Option<&'a async_nats::jetstream::kv::Store>,
-    working_dir: Option<&'a std::path::Path>,
+    session_metadata: Option<&'a SessionMetadataStore>,
 }
 
 async fn prepare_agent_session(
@@ -295,16 +268,19 @@ async fn prepare_agent_session(
         backend: &backend,
         config: params.config,
         instance_id: params.instance_id,
-        input: params.initial_input,
         lease: params.lease.map(Arc::as_ref),
-        session_index: params.session_index,
+        session_metadata: params.session_metadata,
         session_id: params.session_id,
-        working_dir: params.working_dir,
         abort_signal: params.abort_signal,
-        header_insert_observer: params.header_insert_observer,
     })
     .await?;
-    attach_session_to_config(params.config, session, &backend, params.lease);
+    attach_session_to_config(AttachSessionParams {
+        config: params.config,
+        session,
+        backend: &backend,
+        lease: params.lease,
+        metadata: params.session_metadata,
+    });
     Ok((jetstream, origin))
 }
 
@@ -425,7 +401,7 @@ struct AgentLoopSegmentArgs {
     jetstream_ctx: jetstream::Context,
     lease: Option<Arc<NatsSessionLease>>,
     lease_config: NatsLeaseConfig,
-    session_index: Option<async_nats::jetstream::kv::Store>,
+    session_metadata: Option<SessionMetadataStore>,
     hook_start_config: Option<HookServerStartConfig>,
     hook_supervisor: Option<HookServerSupervisor>,
 }
@@ -500,7 +476,7 @@ fn run_agent_loop_segment(
             jetstream_ctx,
             lease,
             lease_config,
-            session_index,
+            session_metadata,
             hook_start_config,
             hook_supervisor,
         } = args;
@@ -522,7 +498,7 @@ fn run_agent_loop_segment(
                     jetstream_ctx,
                     lease,
                     lease_config,
-                    session_index,
+                    session_metadata,
                     hook_start_config,
                     hook_supervisor,
                 };
@@ -567,7 +543,7 @@ async fn prepare_nats_handoff(
         worker_id: previous_lease.worker_id().to_string(),
         generation: previous_lease.generation(),
         config: args.lease_config.clone(),
-        session_index: args.session_index.clone(),
+        session_metadata: args.session_metadata.clone(),
     })
     .await?
     .with_context(|| {
@@ -591,7 +567,13 @@ async fn prepare_nats_handoff(
         .session
         .clone()
         .context("NATS handoff missing session after activation")?;
-    attach_session_to_config(&args.config, new_session, &new_backend, Some(&new_lease));
+    attach_session_to_config(AttachSessionParams {
+        config: &args.config,
+        session: new_session,
+        backend: &new_backend,
+        lease: Some(&new_lease),
+        metadata: args.session_metadata.as_ref(),
+    });
     args.lease = Some(new_lease);
     reconcile_handoff_target_hooks(&mut args, &new_session_id).await;
     Ok((args, new_event_sink))
@@ -706,21 +688,14 @@ struct LoadOrRepairSessionParams<'a> {
     backend: &'a NatsSessionLogBackend,
     config: &'a GlobalConfig,
     instance_id: &'a harnx_core::instance::ServerScope,
-    input: &'a Input,
     lease: Option<&'a NatsSessionLease>,
-    session_index: Option<&'a async_nats::jetstream::kv::Store>,
+    session_metadata: Option<&'a SessionMetadataStore>,
     session_id: &'a str,
-    working_dir: Option<&'a std::path::Path>,
     abort_signal: &'a AbortSignal,
-    /// When a header-insert migration is performed on this activation, its
-    /// JetStream seq is published here so the daemon can advance its high-water
-    /// cursor past the re-mapped leading-user block (S3).
-    header_insert_observer: Option<&'a Arc<AtomicU64>>,
 }
 
-/// Load the session from the backend, creating a new one when the log is empty
-/// or repairing orphan tool calls (with idempotency hints) when resuming an
-/// existing session.
+/// Load a conversation-only transcript into state initialized from canonical
+/// metadata, repairing orphan tool calls when resuming an interrupted turn.
 async fn load_or_repair_session(
     params: LoadOrRepairSessionParams<'_>,
 ) -> Result<(harnx_core::session::Session, SessionOrigin)> {
@@ -728,47 +703,31 @@ async fn load_or_repair_session(
         backend,
         config,
         instance_id,
-        input,
         lease,
-        session_index,
+        session_metadata,
         session_id,
-        working_dir,
         abort_signal,
-        header_insert_observer,
     } = params;
-    let entries = backend.load_events_blocking()?;
-    if entries.is_empty() {
-        // New session: write header and load
-        let session = write_header_and_load_session(
-            backend,
-            config,
-            input,
-            session_index,
-            session_id,
-            working_dir,
-        )
-        .await?;
-        return Ok((session, SessionOrigin::Created));
-    }
+    let store = session_metadata.context("NATS worker requires canonical session metadata")?;
+    let metadata = store
+        .get(session_id)
+        .await?
+        .with_context(|| format!("session '{session_id}' has no canonical metadata"))?
+        .metadata;
+    let previous_activity = store.get_activity(session_id).await?;
+    let origin = if previous_activity
+        .as_ref()
+        .and_then(|activity| activity.first_activation_at)
+        .is_none()
+    {
+        SessionOrigin::Created
+    } else {
+        SessionOrigin::Resumed
+    };
 
-    let mut entries_vec = entries;
-    let mut effective_entries =
+    let mut entries_vec = backend.load_events_blocking()?;
+    let effective_entries =
         harnx_core::session_reconstruct::apply_log_mutations_nats(&entries_vec)?;
-    // The client appends its user message before it activates a session, so a
-    // brand-new session reaches this path with a headerless log rather than an
-    // empty one. Writing the header here is what creates the session.
-    let header_written = maybe_insert_remote_header(MaybeInsertRemoteHeaderArgs {
-        backend,
-        config,
-        input,
-        session_id,
-        working_dir,
-        header_insert_observer,
-        entries_vec: &mut entries_vec,
-        effective_entries: &mut effective_entries,
-    })
-    .await?;
-    refresh_session_index_on_activation(session_index, &effective_entries, session_id).await;
     repair_orphan_tool_calls_if_any(RepairOrphanCallsParams {
         backend,
         config,
@@ -780,12 +739,26 @@ async fn load_or_repair_session(
         entries_vec: &mut entries_vec,
     })
     .await?;
-    let session = crate::nats_session_log::load_session_from_entries(&entries_vec, session_id)?;
-    let origin = if header_written {
-        SessionOrigin::Created
+    let mut session = crate::config::session::new(&config.read(), session_id, None)?;
+    session.id = session_id.to_string();
+    session.session_id = Some(session_id.to_string());
+    session.working_dir = None;
+    session.git_branch = None;
+    session.git_remote = None;
+    session.terminal_session_id = None;
+    session.agent_variables = metadata.variables.clone();
+    session.title = metadata.title.value.clone();
+    session.title_last_updated_tokens = if metadata.title.manual {
+        usize::MAX
     } else {
-        SessionOrigin::Resumed
+        metadata.title.last_updated_tokens
     };
+    let session = crate::nats_session_log::load_session_from_entries_with_metadata(
+        &entries_vec,
+        session_id,
+        session,
+    )?;
+    store.mark_activated(session_id).await?;
     Ok((session, origin))
 }
 
@@ -844,78 +817,31 @@ async fn repair_orphan_tool_calls_if_any(params: RepairOrphanCallsParams<'_>) ->
     Ok(())
 }
 
-fn should_insert_remote_header(effective_entries: &[(u64, SessionLogEntry)]) -> bool {
-    !effective_entries.iter().any(|(_, entry)| {
-        matches!(
-            entry,
-            SessionLogEntry::Header { .. } | SessionLogEntry::Compress { .. }
-        )
-    })
-}
-
-fn build_remote_header_insert_replacements(
-    raw_entries: &[(u64, SessionLogEntry)],
-    effective_entries: &[(u64, SessionLogEntry)],
-    config: &GlobalConfig,
-    input: &Input,
-    session_id: &str,
-    working_dir: Option<&std::path::Path>,
-) -> Result<Option<(usize, usize, Vec<String>)>> {
-    if effective_entries.is_empty() || !should_insert_remote_header(effective_entries) {
-        return Ok(None);
-    }
-
-    let mut first_user_seq = None;
-    let mut last_user_seq = None;
-    let mut replacements = Vec::new();
-    replacements.push(serde_yaml::to_string(&build_remote_session_header(
-        config,
-        input,
-        session_id,
-        working_dir,
-    )?)?);
-
-    for (seq, entry) in raw_entries {
-        match entry {
-            SessionLogEntry::Message { role, .. } if role.is_user() => {
-                let seq = usize::try_from(*seq)
-                    .context("session log sequence does not fit into usize")?;
-                if first_user_seq.is_none() {
-                    first_user_seq = Some(seq);
-                }
-                last_user_seq = Some(seq);
-                replacements.push(serde_yaml::to_string(entry)?);
-            }
-            _ if first_user_seq.is_some() => break,
-            _ => return Ok(None),
-        }
-    }
-
-    Ok(match (first_user_seq, last_user_seq) {
-        (Some(from), Some(to)) => Some((from, to, replacements)),
-        _ => None,
-    })
-}
-
-fn remote_header_insert_message_id(session_id: &str, first_user_seq: usize) -> String {
-    format!("{session_id}:header-insert:{first_user_seq}")
-}
-
 /// Attach the reconstructed session to the shared config with the NATS append
 /// sink for the unified persistence path. With a lease, use the fence-guarded
 /// sink so writes from a fenced-out worker are rejected.
-fn attach_session_to_config(
-    config: &GlobalConfig,
-    mut session: harnx_core::session::Session,
-    backend: &NatsSessionLogBackend,
-    lease: Option<&Arc<NatsSessionLease>>,
-) {
+struct AttachSessionParams<'a> {
+    config: &'a GlobalConfig,
+    session: harnx_core::session::Session,
+    backend: &'a NatsSessionLogBackend,
+    lease: Option<&'a Arc<NatsSessionLease>>,
+    metadata: Option<&'a SessionMetadataStore>,
+}
+
+fn attach_session_to_config(params: AttachSessionParams<'_>) {
+    let AttachSessionParams {
+        config,
+        mut session,
+        backend,
+        lease,
+        metadata,
+    } = params;
     let sink: Arc<dyn crate::config::session::SessionAppendSink> = match lease {
-        Some(lease) => Arc::new(FencedSessionLogSink::new(
-            backend.clone(),
-            Arc::clone(lease),
-        )),
-        None => Arc::new(backend.clone()),
+        Some(lease) => Arc::new(
+            FencedSessionLogSink::new(backend.clone(), Arc::clone(lease))
+                .with_metadata_store(metadata.cloned()),
+        ),
+        None => Arc::new(backend.clone().with_metadata_store(metadata.cloned())),
     };
     session.runtime = Some(Arc::new(sink));
     let mut cfg = config.write();
@@ -1193,225 +1119,11 @@ fn rerun_failure_output(
     }
 }
 
-fn build_remote_session_header(
-    config: &GlobalConfig,
-    input: &Input,
-    session_id: &str,
-    working_dir: Option<&std::path::Path>,
-) -> Result<harnx_core::session::SessionLogEntry> {
-    let mut header_session = crate::config::session::new(&config.read(), session_id, working_dir)?;
-    // The NATS stream key is the canonical remote identity. `session::new`
-    // also supports friendly local aliases and may otherwise synthesize a
-    // short ID for an arbitrary name, splitting the stream and index IDs.
-    header_session.id = session_id.to_string();
-    header_session.session_id = Some(session_id.to_string());
-    header_session.set_agent(&input.agent)?;
-    Ok(header_session.build_header_entry())
-}
-
-fn build_session_index_record_from_header(
-    header: &harnx_core::session::SessionLogEntry,
-    title: Option<String>,
-    stream_session_id: &str,
-) -> Result<SessionIndexRecord> {
-    let harnx_core::session::SessionLogEntry::Header {
-        session_id: _,
-        agent_name,
-        working_dir,
-        git_branch,
-        git_remote,
-        ..
-    } = header
-    else {
-        anyhow::bail!("remote session index requires header entry")
-    };
-
-    Ok(SessionIndexRecord {
-        // The stream name is authoritative. Older web clients supplied UUID
-        // v4 stream IDs that `session::new` replaced with a short header ID,
-        // so trusting that legacy header creates a picker row for an empty
-        // stream. New headers keep these equal; this override repairs the
-        // denormalized index on the next activation.
-        session_id: stream_session_id.to_string(),
-        agent_name: agent_name
-            .clone()
-            .context("remote session header missing agent_name")?,
-        working_dir: working_dir.clone(),
-        git_branch: git_branch.clone(),
-        git_remote: git_remote.clone(),
-        title,
-        last_activity: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock before unix epoch")?
-            .as_secs(),
-    })
-}
-
-/// Scan effective log entries for the most recent `Title` event so the session
-/// index reflects the latest generated/manual title on activation upsert.
-fn latest_title_from_entries(
-    entries: &[(u64, harnx_core::session::SessionLogEntry)],
-) -> Option<String> {
-    entries.iter().rev().find_map(|(_, entry)| match entry {
-        harnx_core::session::SessionLogEntry::Title { title, .. } => Some(title.clone()),
-        _ => None,
-    })
-}
-
-async fn upsert_session_index_record(
-    store: &async_nats::jetstream::kv::Store,
-    header: &harnx_core::session::SessionLogEntry,
-    title: Option<String>,
-    stream_session_id: &str,
-) -> Result<u64> {
-    let record = build_session_index_record_from_header(header, title, stream_session_id)?;
-    put_record(store, &record)
-        .await
-        .with_context(|| format!("put session index record for {}", record.session_id))
-}
-
-/// Keep the session index current on every activation that takes the
-/// existing-session path. Brand-new (empty-log) sessions register their index in
-/// `write_header_and_load_session`; but headerless sessions migrated here (S2)
-/// and normal resumes take THIS path, so we upsert from the effective `Header`
-/// (carrying the latest `Title`) — otherwise the session never appears in
-/// `list_remote_sessions_with_meta` (breaks resume/picker) and its
-/// `last_activity` is never refreshed. Best-effort: warn on failure, never fail
-/// activation. Idempotent (`put_record` upserts).
-async fn refresh_session_index_on_activation(
-    session_index: Option<&async_nats::jetstream::kv::Store>,
-    effective_entries: &[(u64, SessionLogEntry)],
-    session_id: &str,
-) {
-    let Some(store) = session_index else {
-        return;
-    };
-    let Some((_, header)) = effective_entries
-        .iter()
-        .find(|(_, entry)| matches!(entry, SessionLogEntry::Header { .. }))
-    else {
-        return;
-    };
-    let title = latest_title_from_entries(effective_entries);
-    let stale_header_session_id = match header {
-        SessionLogEntry::Header { session_id, .. } => session_id.as_deref(),
-        _ => None,
-    };
-    if let Err(err) = upsert_session_index_record(store, header, title, session_id).await {
-        log::warn!(
-            "failed to upsert remote session index during activation: \
-             session_id={session_id} err={err:#}"
-        );
-    } else if let Some(stale_id) = stale_header_session_id.filter(|id| *id != session_id) {
-        if let Err(err) = crate::nats_session_index::delete_record(store, stale_id).await {
-            log::warn!(
-                "failed to delete stale remote session index identity: stale_id={stale_id} \
-                 session_id={session_id} err={err:#}"
-            );
-        }
-    }
-}
-
-struct MaybeInsertRemoteHeaderArgs<'a> {
-    backend: &'a NatsSessionLogBackend,
-    config: &'a GlobalConfig,
-    input: &'a Input,
-    session_id: &'a str,
-    working_dir: Option<&'a std::path::Path>,
-    header_insert_observer: Option<&'a Arc<AtomicU64>>,
-    entries_vec: &'a mut Vec<(u64, SessionLogEntry)>,
-    effective_entries: &'a mut Vec<(u64, SessionLogEntry)>,
-}
-
-/// Headerless sessions migrated in (S2) need a `Header` synthesized from the
-/// leading user block. When required, this appends an `EditEntries` migration,
-/// publishes the resulting seq to the daemon's high-water observer, and reloads
-/// `entries_vec` / `effective_entries` so the caller sees the repaired log.
-/// No-op when the effective log already has a header.
-///
-/// Returns whether a header was written, which is how the worker recognizes the
-/// activation that brought this session into existence.
-async fn maybe_insert_remote_header(args: MaybeInsertRemoteHeaderArgs<'_>) -> Result<bool> {
-    let MaybeInsertRemoteHeaderArgs {
-        backend,
-        config,
-        input,
-        session_id,
-        working_dir,
-        header_insert_observer,
-        entries_vec,
-        effective_entries,
-    } = args;
-
-    if !should_insert_remote_header(effective_entries) {
-        return Ok(false);
-    }
-    let Some((first_user_seq, last_user_seq, replacements)) =
-        build_remote_header_insert_replacements(
-            entries_vec,
-            effective_entries,
-            config,
-            input,
-            session_id,
-            working_dir,
-        )?
-    else {
-        return Ok(false);
-    };
-
-    let edit_entry = SessionLogEntry::EditEntries {
-        from: first_user_seq,
-        to: last_user_seq,
-        replacements,
-    };
-    let message_id = remote_header_insert_message_id(session_id, first_user_seq);
-    let insert_seq =
-        crate::nats_session_log::NatsSessionLog::new(backend.jetstream(), session_id.to_string())
-            .append_event_with_message_id_async(&edit_entry, message_id)
-            .await?;
-    debug!("inserted header via EditEntries js{insert_seq}");
-    // Publish the migration seq so the worker's turn cursor advances past the
-    // re-mapped leading-user block. The migration re-maps those users onto
-    // `insert_seq`; the turn that runs this activation answers them, so without
-    // this they read as unanswered (seq > pre-migration cursor) and get folded
-    // back in — mid-round as a spurious injection, and again by the drain as a
-    // spurious continuation turn (S3).
-    if let Some(observer) = header_insert_observer {
-        observer.fetch_max(insert_seq, std::sync::atomic::Ordering::SeqCst);
-    }
-    *entries_vec = backend.load_events_blocking()?;
-    *effective_entries = harnx_core::session_reconstruct::apply_log_mutations_nats(entries_vec)?;
-    Ok(true)
-}
-
-/// Write a new session header and load the session.
-pub(crate) async fn write_header_and_load_session(
-    backend: &NatsSessionLogBackend,
-    config: &GlobalConfig,
-    input: &Input,
-    session_index: Option<&async_nats::jetstream::kv::Store>,
-    session_id: &str,
-    working_dir: Option<&std::path::Path>,
-) -> Result<harnx_core::session::Session> {
-    let header = build_remote_session_header(config, input, session_id, working_dir)?;
-    backend.append_event_blocking(&header)?;
-    if let Some(store) = session_index {
-        if let Err(err) = upsert_session_index_record(store, &header, None, session_id).await {
-            log::warn!(
-                "failed to upsert remote session index after header write: session_id={} err={err:#}",
-                session_id
-            );
-        }
-    }
-    let entries = backend.load_events_blocking()?;
-    crate::nats_session_log::load_session_from_entries(&entries, session_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_resolved_hooks, build_session_index_record_from_header, dispatch_session_start,
-        fold_new_user_messages_since, SessionOrigin, SessionStartDispatch,
+        agent_resolved_hooks, dispatch_session_start, fold_new_user_messages_since, SessionOrigin,
+        SessionStartDispatch,
     };
     use crate::config::Config;
     use crate::nats_hook_provider::{DiscoveredHook, NatsHookProvider};
@@ -1451,27 +1163,6 @@ mod tests {
             }),
         );
         (provider, seen)
-    }
-
-    #[test]
-    fn session_index_uses_authoritative_stream_id_for_legacy_mismatched_header() {
-        let mut session = harnx_core::session::Session {
-            session_id: Some("stale-generated-id".to_string()),
-            agent_name: Some("coding/coder".to_string()),
-            ..Default::default()
-        };
-        session.id = "stale-generated-id".to_string();
-
-        let record = build_session_index_record_from_header(
-            &session.build_header_entry(),
-            Some("Title".to_string()),
-            "a4119d46-41fd-4f67-8a17-d56c9d141369",
-        )
-        .unwrap();
-
-        assert_eq!(record.session_id, "a4119d46-41fd-4f67-8a17-d56c9d141369");
-        assert_eq!(record.agent_name, "coding/coder");
-        assert_eq!(record.title.as_deref(), Some("Title"));
     }
 
     #[tokio::test]

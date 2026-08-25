@@ -19,6 +19,7 @@ use harnx_runtime::{
     config::Config,
     nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease},
     nats_session_log::NatsSessionLog,
+    nats_session_metadata::SessionMetadataStore,
     nats_worker::{run_worker_daemon, WorkerDaemonConfig},
     NatsSession, NatsSessionConfig, NatsTurnResult,
 };
@@ -289,12 +290,25 @@ impl TestEnv {
     }
 
     async fn run_turn(&self, agent: &str, session_id: &str) -> Result<NatsTurnResult> {
+        self.run_turn_with_variables(agent, session_id, Default::default())
+            .await
+    }
+
+    async fn run_turn_with_variables(
+        &self,
+        agent: &str,
+        session_id: &str,
+        mut variables: harnx_core::agent_config::AgentVariables,
+    ) -> Result<NatsTurnResult> {
         let client = async_nats::connect(self.server.url()).await?;
         let jetstream = async_nats::jetstream::new(client.clone());
+        if agent == FILE_VARIABLE_AGENT {
+            variables.insert("agent_core".to_string(), VARIABLE_FILE_TEXT.to_string());
+        }
         let session = NatsSession::new(
             NatsSessionConfig {
                 cluster: "local".to_string(),
-                agent: agent.to_string(),
+                initializer: harnx_runtime::SessionInitializer::named(agent, variables),
                 session_id: Some(session_id.to_string()),
                 activation_route: harnx_runtime::SessionActivationRoute::ClusterShared,
             },
@@ -376,24 +390,16 @@ async fn load_entries(
         .await
 }
 
-/// The header's recorded agent variables. The worker inserts the header for a
-/// headerless session through an `EditEntries` replacement, so the mutations
-/// have to be applied before the header is visible.
-fn header_agent_variables(entries: &[(u64, SessionLogEntry)]) -> Result<Vec<(String, String)>> {
-    harnx_core::session_reconstruct::apply_log_mutations_nats(entries)?
-        .iter()
-        .find_map(|(_, entry)| match entry {
-            SessionLogEntry::Header {
-                agent_variables, ..
-            } => Some(
-                agent_variables
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .context("session header must record agent variables")
+async fn persisted_agent_variables(
+    jetstream: &async_nats::jetstream::Context,
+    session_id: &str,
+) -> Result<Vec<(String, String)>> {
+    let record = SessionMetadataStore::ensure(jetstream, 1)
+        .await?
+        .get(session_id)
+        .await?
+        .context("session metadata must exist")?;
+    Ok(record.metadata.variables.into_iter().collect())
 }
 
 fn error_entry_messages(entries: &[(u64, SessionLogEntry)]) -> Vec<String> {
@@ -431,13 +437,13 @@ async fn worker_renders_agent_prompt_with_file_backed_variables() -> Result<()> 
         "worker must answer a turn for an agent with file-backed variables"
     );
 
-    let entries = load_entries(&env.jetstream().await?, session_id).await?;
-    let variables = header_agent_variables(&entries)?;
+    let jetstream = env.jetstream().await?;
+    let variables = persisted_agent_variables(&jetstream, session_id).await?;
     assert!(
         variables
             .iter()
             .any(|(name, value)| name == "agent_core" && value == VARIABLE_FILE_TEXT),
-        "header must carry the file-loaded variable value, got {variables:?}"
+        "metadata must carry the initialized variable value, got {variables:?}"
     );
 
     worker.abort();
@@ -446,8 +452,8 @@ async fn worker_renders_agent_prompt_with_file_backed_variables() -> Result<()> 
 }
 
 /// A pantheon-shaped package agent: several `path:` fragments, an inline
-/// `default:`, and one variable supplied by the worker's `--agent-variable`.
-/// All of them must be interpolated into the prompt the model receives.
+/// `default:`, and one variable persisted by the session initializer. All of
+/// them must be interpolated into the prompt the model receives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_assembles_package_agent_prompt_from_multiple_files() -> Result<()> {
     require_nextest();
@@ -465,12 +471,16 @@ async fn worker_assembles_package_agent_prompt_from_multiple_files() -> Result<(
         .spawn_worker_with(
             "worker-package-agent",
             prompt_capturing_call_fn(Arc::clone(&captured)),
-            &[("repo", "harnx")],
+            &[],
         )
         .await?;
 
     let agent = format!("{PACKAGE_NAME}/{PACKAGE_AGENT_STEM}");
-    let turn = env.run_turn(&agent, "agent-package-assembled").await?;
+    let mut variables = harnx_core::agent_config::AgentVariables::new();
+    variables.insert("repo".to_string(), "harnx".to_string());
+    let turn = env
+        .run_turn_with_variables(&agent, "agent-package-assembled", variables)
+        .await?;
 
     assert_eq!(turn.error, None, "turn must not report a worker failure");
     assert_eq!(turn.response.as_deref(), Some("stub reply"));
@@ -492,7 +502,7 @@ async fn worker_assembles_package_agent_prompt_from_multiple_files() -> Result<(
     );
     assert!(
         prompt.contains("Repo: harnx"),
-        "worker --agent-variable must be interpolated; got:\n{prompt}"
+        "persisted session variable must be interpolated; got:\n{prompt}"
     );
     assert!(
         !prompt.contains("{{"),
@@ -715,7 +725,7 @@ async fn client_ends_turn_when_worker_vanishes_without_writing() -> Result<()> {
         worker_id: "worker-that-dies".to_string(),
         generation: 1,
         config: NatsLeaseConfig::default(),
-        session_index: None,
+        session_metadata: None,
     })
     .await?
     .context("test must be able to hold the session lease")?;
@@ -729,7 +739,10 @@ async fn client_ends_turn_when_worker_vanishes_without_writing() -> Result<()> {
             let session = NatsSession::new(
                 NatsSessionConfig {
                     cluster: "local".to_string(),
-                    agent: FILE_VARIABLE_AGENT.to_string(),
+                    initializer: harnx_runtime::SessionInitializer::named(
+                        FILE_VARIABLE_AGENT,
+                        Default::default(),
+                    ),
                     session_id: Some(session_id),
                     activation_route: harnx_runtime::SessionActivationRoute::ClusterShared,
                 },

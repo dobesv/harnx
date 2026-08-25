@@ -919,10 +919,14 @@ async fn ask(
     )
     .await?;
 
+    let initializer = {
+        let config = config.read();
+        crate::SessionInitializer::named_from_config(agent, &config)
+    };
     let session = crate::NatsSession::from_global_config(
         crate::NatsSessionConfig {
             cluster,
-            agent,
+            initializer,
             session_id,
             activation_route,
         },

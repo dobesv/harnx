@@ -7207,37 +7207,19 @@ async fn session_picker_enter_loads_selected_session() {
         eprintln!("skipping: local nats-server is unavailable");
         return;
     };
-    let index = harnx_runtime::nats_session_index::ensure_index_bucket(&jetstream, 1)
-        .await
-        .expect("create picker session index");
-    harnx_runtime::nats_session_index::put_record(
-        &index,
-        &harnx_runtime::nats_session_index::SessionIndexRecord {
-            session_id: "my-session".to_string(),
-            agent_name: "hermes".to_string(),
-            working_dir: Some("/tmp".to_string()),
-            git_branch: Some("main".to_string()),
-            git_remote: None,
-            title: None,
-            last_activity: 1,
-        },
-    )
-    .await
-    .expect("index picker session fixture");
-    harnx_runtime::nats_session_index::put_record(
-        &index,
-        &harnx_runtime::nats_session_index::SessionIndexRecord {
-            session_id: "other-agent-session".to_string(),
-            agent_name: "apollo".to_string(),
-            working_dir: Some("/tmp".to_string()),
-            git_branch: Some("main".to_string()),
-            git_remote: None,
-            title: None,
-            last_activity: 2,
-        },
-    )
-    .await
-    .expect("index other-agent session fixture");
+    let metadata_store =
+        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+            .await
+            .expect("create picker session metadata store");
+    for (session_id, agent) in [("my-session", "hermes"), ("other-agent-session", "apollo")] {
+        metadata_store
+            .create(&harnx_runtime::nats_session_metadata::SessionMetadata::new(
+                session_id,
+                harnx_runtime::SessionInitializer::named(agent, Default::default()),
+            ))
+            .await
+            .expect("create picker session metadata fixture");
+    }
     let log =
         harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, "my-session".to_string());
     for entry in [

@@ -22,6 +22,7 @@ mod session_ops_compaction;
 mod session_ops_core;
 mod session_ops_split;
 pub mod session_ops_title;
+mod session_persistence;
 mod settings_split;
 mod tool_servers_split;
 
@@ -50,7 +51,7 @@ pub const HARNX_NATS_TOKEN_ENV: &str = "HARNX_NATS_TOKEN";
 pub use harnx_nats_common::connect::HARNX_NATS_REPLICAS_ENV;
 /// Default JetStream replica count for buckets harnx creates that aren't
 /// wired to a cluster's configured `replicas` (currently `harnx_leases` and
-/// `harnx_sessions`; see `nats_lease` and `nats_session_index`). Shared here,
+/// `harnx_sessions`; see `nats_lease` and `nats_session_metadata`). Shared here,
 /// rather than declared separately in each module, so it can't drift the way
 /// two same-named-but-different constants would.
 pub const DEFAULT_BUCKET_REPLICAS: usize = 1;
@@ -71,10 +72,7 @@ pub use self::input::Input;
 pub(crate) use self::patches_split::server_display_name;
 use self::patches_split::{apply_client_patch, package_dir_name};
 use self::session::Session;
-pub use self::session_meta::{
-    build_picker_context, find_matching_session, sort_sessions_for_picker, PickerContext,
-    SessionMeta,
-};
+pub use self::session_meta::{find_matching_session, sort_sessions_for_picker, SessionMeta};
 pub use harnx_core::attachments::{
     expand_passthrough_reference, read_attachment, AttachmentRefCache, CachedRef,
     ExpandedAttachment, CID_PREFIX,
@@ -1140,24 +1138,6 @@ impl Config {
             )?;
             agent.set_shared_variables(new_variables);
         }
-        Ok(())
-    }
-
-    /// Like [`Self::init_agent_shared_variables`], but never prompts and fails
-    /// when a declared variable has no value. Used by the NATS worker, which is
-    /// never attached to a terminal and is about to render the prompt.
-    pub(crate) fn require_agent_shared_variables(&mut self) -> Result<()> {
-        let overrides = self.agent_variables.clone().unwrap_or_default();
-        let agent = match self.agent.as_mut() {
-            Some(v) => v,
-            None => return Ok(()),
-        };
-        if agent.defined_variables().is_empty() || !agent.shared_variables().is_empty() {
-            return Ok(());
-        }
-        let new_variables =
-            self::agent::require_agent_variables(agent.defined_variables(), &overrides)?;
-        agent.set_shared_variables(new_variables);
         Ok(())
     }
 

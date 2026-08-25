@@ -10,7 +10,6 @@ use harnx_core::{
     tool::ToolCall,
 };
 use harnx_runtime::{config::Config, nats_session_log::NatsSessionLog};
-use indexmap::IndexMap;
 use serde_json::json;
 
 #[tokio::test]
@@ -139,23 +138,6 @@ fn entry_yaml(entry: &SessionLogEntry) -> Result<String> {
 
 fn mixed_entries() -> Vec<SessionLogEntry> {
     vec![
-        SessionLogEntry::Header {
-            model_id: "test-model".to_string(),
-            temperature: Some(0.2),
-            top_p: Some(0.8),
-            use_tools: Some(vec!["Bash".to_string()]),
-            compress_threshold: Some(9000),
-            agent_name: Some("oracle".to_string()),
-            session_id: Some("session-roundtrip".to_string()),
-            working_dir: Some("/tmp/work".to_string()),
-            git_branch: Some("main".to_string()),
-            git_remote: Some("origin".to_string()),
-            terminal_session_id: Some("term-1".to_string()),
-            agent_variables: IndexMap::new(),
-            agent_instructions: "You are Oracle".to_string(),
-            model_fallbacks: vec!["backup-model".to_string()],
-            compaction_agent: Some("compactor".to_string()),
-        },
         SessionLogEntry::Message {
             id: None,
             role: MessageRole::User,
@@ -199,23 +181,6 @@ fn mixed_entries() -> Vec<SessionLogEntry> {
 
 fn orphan_entries() -> Vec<SessionLogEntry> {
     vec![
-        SessionLogEntry::Header {
-            model_id: "test-model".to_string(),
-            temperature: None,
-            top_p: None,
-            use_tools: None,
-            compress_threshold: None,
-            agent_name: Some("oracle".to_string()),
-            session_id: Some("session-orphan".to_string()),
-            working_dir: None,
-            git_branch: None,
-            git_remote: None,
-            terminal_session_id: None,
-            agent_variables: IndexMap::new(),
-            agent_instructions: "repair me".to_string(),
-            model_fallbacks: vec![],
-            compaction_agent: None,
-        },
         SessionLogEntry::Message {
             id: None,
             role: MessageRole::User,

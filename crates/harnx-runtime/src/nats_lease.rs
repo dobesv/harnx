@@ -1,11 +1,11 @@
 use crate::config::DEFAULT_BUCKET_REPLICAS;
 use crate::nats_metrics;
-use crate::nats_session_index::{self, update_record_with_revision, SessionIndexRecord};
+use crate::nats_session_metadata::SessionMetadataStore;
 use anyhow::{anyhow, bail, Context, Result};
 use async_nats::header::{NATS_EXPECTED_LAST_SUBJECT_SEQUENCE, NATS_MESSAGE_TTL};
 use async_nats::jetstream::{self, context::PublishErrorKind, kv, stream};
 use serde::{Deserialize, Serialize};
-use std::cmp;
+use std::future::Future;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
@@ -20,8 +20,7 @@ const LEASE_KEY_PREFIX: &str = "sessions";
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 pub const DEFAULT_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 pub const DEFAULT_TOMBSTONE_TTL: Duration = Duration::from_secs(3600);
-const INDEX_REFRESH_RETRY_LIMIT: usize = 3;
-const INDEX_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
+const ACTIVITY_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LeaseRecord {
@@ -64,7 +63,7 @@ pub struct NatsLeaseAcquireParams<'a> {
     pub worker_id: String,
     pub generation: u64,
     pub config: NatsLeaseConfig,
-    pub session_index: Option<kv::Store>,
+    pub session_metadata: Option<SessionMetadataStore>,
 }
 
 #[derive(Debug)]
@@ -75,7 +74,7 @@ struct RenewTaskParams {
     state: Arc<LeaseState>,
     renew_interval: Duration,
     session_id: String,
-    session_index: Option<kv::Store>,
+    session_metadata: Option<SessionMetadataStore>,
 }
 
 #[derive(Debug)]
@@ -105,7 +104,7 @@ impl NatsSessionLease {
             worker_id,
             generation,
             config,
-            session_index,
+            session_metadata,
         } = params;
         config.validate()?;
         let bucket = ensure_lease_bucket(&jetstream, &config).await?;
@@ -149,7 +148,7 @@ impl NatsSessionLease {
             state: Arc::clone(&state),
             renew_interval: config.renew_interval,
             session_id: session_id.to_string(),
-            session_index,
+            session_metadata,
         });
 
         Ok(Some(Self {
@@ -392,11 +391,12 @@ fn spawn_renew_task(params: RenewTaskParams) -> JoinHandle<()> {
         state,
         renew_interval,
         session_id,
-        session_index,
+        session_metadata,
     } = params;
     tokio::spawn(async move {
         let mut ticker = time::interval(renew_interval);
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        let mut activity_refresh: Option<JoinHandle<()>> = None;
         loop {
             ticker.tick().await;
             if !state.held.load(Ordering::SeqCst) {
@@ -404,32 +404,16 @@ fn spawn_renew_task(params: RenewTaskParams) -> JoinHandle<()> {
             }
             match renew_once(&jetstream, &bucket, &key, &state).await {
                 Ok(new_revision) => {
-                    if let Some(store) = session_index.as_ref() {
-                        match time::timeout(
-                            INDEX_REFRESH_TIMEOUT,
-                            refresh_session_index_last_activity(store, &session_id),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => {
-                                warn!(
-                                    "failed to refresh remote session index on lease renew: session_id={} worker_id={} generation={} err={error:#}",
-                                    session_id,
-                                    state.worker_id,
-                                    state.generation
-                                );
-                            }
-                            Err(_) => {
-                                warn!(
-                                    "timed out refreshing remote session index on lease renew: session_id={} worker_id={} generation={} timeout_ms={}",
-                                    session_id,
-                                    state.worker_id,
-                                    state.generation,
-                                    INDEX_REFRESH_TIMEOUT.as_millis()
-                                );
-                            }
-                        }
+                    if let Some(store) = session_metadata.clone() {
+                        schedule_activity_refresh(
+                            &mut activity_refresh,
+                            refresh_activity(
+                                store,
+                                session_id.clone(),
+                                state.worker_id.clone(),
+                                state.generation,
+                            ),
+                        );
                     }
                     info!(
                         "nats lease renewed: session_id={} worker_id={} generation={} revision={new_revision}",
@@ -453,7 +437,44 @@ fn spawn_renew_task(params: RenewTaskParams) -> JoinHandle<()> {
                 }
             }
         }
+        if let Some(refresh) = activity_refresh {
+            refresh.abort();
+        }
     })
+}
+
+fn schedule_activity_refresh(
+    task: &mut Option<JoinHandle<()>>,
+    refresh: impl Future<Output = ()> + Send + 'static,
+) {
+    if task.as_ref().is_some_and(JoinHandle::is_finished) {
+        task.take();
+    }
+    if task.is_none() {
+        *task = Some(tokio::spawn(refresh));
+    }
+}
+
+async fn refresh_activity(
+    store: SessionMetadataStore,
+    session_id: String,
+    worker_id: String,
+    generation: u64,
+) {
+    match time::timeout(ACTIVITY_REFRESH_TIMEOUT, store.touch_activity(&session_id)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            warn!(
+                "failed to refresh remote session activity on lease renew: session_id={session_id} worker_id={worker_id} generation={generation} err={error:#}"
+            );
+        }
+        Err(_) => {
+            warn!(
+                "timed out refreshing remote session activity on lease renew: session_id={session_id} worker_id={worker_id} generation={generation} timeout_ms={}",
+                ACTIVITY_REFRESH_TIMEOUT.as_millis()
+            );
+        }
+    }
 }
 
 async fn renew_once(
@@ -492,52 +513,6 @@ async fn renew_once(
     }
 }
 
-async fn refresh_session_index_last_activity(store: &kv::Store, session_id: &str) -> Result<()> {
-    for attempt in 0..INDEX_REFRESH_RETRY_LIMIT {
-        let Some((record, revision)) =
-            nats_session_index::get_record_with_revision(store, session_id).await?
-        else {
-            return Ok(());
-        };
-
-        let updated_record = with_refreshed_last_activity(record)?;
-        match update_record_with_revision(store, &updated_record, revision).await {
-            Ok(_) => return Ok(()),
-            Err(error)
-                if is_wrong_last_revision(&error) && attempt + 1 < INDEX_REFRESH_RETRY_LIMIT =>
-            {
-                continue;
-            }
-            Err(error) if is_wrong_last_revision(&error) => return Ok(()),
-            Err(error) => return Err(error),
-        }
-    }
-
-    Ok(())
-}
-
-fn with_refreshed_last_activity(mut record: SessionIndexRecord) -> Result<SessionIndexRecord> {
-    record.last_activity = cmp::max(
-        record.last_activity.saturating_add(1),
-        unix_timestamp_now()?,
-    );
-    Ok(record)
-}
-
-fn unix_timestamp_now() -> Result<u64> {
-    Ok(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("system clock before unix epoch")?
-        .as_secs())
-}
-
-fn is_wrong_last_revision(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<kv::UpdateError>())
-        .is_some_and(|error| error.kind() == kv::UpdateErrorKind::WrongLastRevision)
-}
-
 fn is_create_conflict(error: &kv::CreateError) -> bool {
     matches!(error.kind(), kv::CreateErrorKind::AlreadyExists)
 }
@@ -545,50 +520,39 @@ fn is_create_conflict(error: &kv::CreateError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[test]
-    fn with_refreshed_last_activity_saturates_on_overflow() {
-        let record = SessionIndexRecord {
-            session_id: "overflow-session".to_string(),
-            agent_name: "hephaestus".to_string(),
-            working_dir: None,
-            git_branch: None,
-            git_remote: None,
-            title: None,
-            last_activity: u64::MAX,
+    #[tokio::test]
+    async fn best_effort_activity_refresh_timeout_is_bounded() {
+        let never_returns = async {
+            futures_util::future::pending::<()>().await;
         };
 
-        let refreshed = with_refreshed_last_activity(record).expect("refresh should not panic");
+        let result = time::timeout(ACTIVITY_REFRESH_TIMEOUT, never_returns).await;
 
-        assert_eq!(refreshed.last_activity, u64::MAX);
-    }
-
-    #[test]
-    fn is_wrong_last_revision_detects_wrapped_update_error() {
-        let wrapped_error = Err::<(), _>(anyhow::Error::from(kv::UpdateError::new(
-            kv::UpdateErrorKind::WrongLastRevision,
-        )))
-        .with_context(|| {
-            "Failed to CAS-update session index record for key 'sessions/test/meta' at revision 7"
-        })
-        .expect_err("wrong-last-revision should remain an error");
-
-        assert!(is_wrong_last_revision(&wrapped_error));
-        assert!(!is_wrong_last_revision(&anyhow::anyhow!("unrelated error")));
+        assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn best_effort_index_refresh_times_out_without_blocking_long() {
-        let never_returns = async {
-            let store = futures_util::future::pending::<kv::Store>().await;
-            refresh_session_index_last_activity(&store, "session-timeout").await
-        };
+    async fn stalled_activity_refresh_does_not_block_renewal_cadence() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut task = None;
 
-        let result = time::timeout(INDEX_REFRESH_TIMEOUT, never_returns).await;
+        for _ in 0..3 {
+            let started = Arc::clone(&started);
+            schedule_activity_refresh(&mut task, async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                futures_util::future::pending::<()>().await;
+            });
+            time::timeout(
+                Duration::from_millis(50),
+                time::sleep(Duration::from_millis(5)),
+            )
+            .await
+            .expect("renewal cadence must continue while activity refresh stalls");
+        }
 
-        assert!(
-            result.is_err(),
-            "refresh_session_index_last_activity path should time out when store acquisition never completes"
-        );
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        task.expect("refresh task exists").abort();
     }
 }

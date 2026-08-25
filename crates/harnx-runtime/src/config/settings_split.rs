@@ -1,6 +1,7 @@
 //! Reserved for config/mod.rs cluster extraction (code health). Currently unused.
 use super::{update_rag, Config, GlobalConfig};
 use crate::client::ModelType;
+use crate::nats_session_metadata::SessionOverrideUpdate;
 use anyhow::{anyhow, bail, Context, Result};
 
 impl Config {
@@ -21,19 +22,38 @@ impl Config {
 
     fn apply_update(config: &GlobalConfig, key: &str, value: &str) -> Result<()> {
         match key {
-            "temperature" => Self::update_optional_f64(config, value, Config::set_temperature),
-            "top_p" => Self::update_optional_f64(config, value, Config::set_top_p),
+            "temperature" => Self::update_optional(
+                config,
+                value,
+                SessionOverrideUpdate::Temperature,
+                Config::set_temperature,
+            ),
+            "top_p" => Self::update_optional(
+                config,
+                value,
+                SessionOverrideUpdate::TopP,
+                Config::set_top_p,
+            ),
             "use_tools" => Self::update_use_tools(config, value),
             "model_fallbacks" => Self::update_model_fallbacks(config, value),
-            "compaction_agent" => {
-                Self::update_optional_string(config, value, Config::set_compaction_agent)
-            }
-            "max_output_tokens" => {
-                Self::update_optional_isize(config, value, Config::set_max_output_tokens)
-            }
-            "compress_threshold" => {
-                Self::update_optional_usize(config, value, Config::set_compress_threshold)
-            }
+            "compaction_agent" => Self::update_optional(
+                config,
+                value,
+                SessionOverrideUpdate::CompactionAgent,
+                Config::set_compaction_agent,
+            ),
+            "max_output_tokens" => Self::update_optional(
+                config,
+                value,
+                SessionOverrideUpdate::MaxOutputTokens,
+                Config::set_max_output_tokens,
+            ),
+            "compress_threshold" => Self::update_optional(
+                config,
+                value,
+                SessionOverrideUpdate::CompressThreshold,
+                Config::set_compress_threshold,
+            ),
             "rag_reranker_model" => {
                 let value = parse_value(value)?;
                 Self::set_rag_reranker_model(config, value)
@@ -58,7 +78,7 @@ impl Config {
     }
 
     /// Manually set the session title via `.set title <text>`. Appends a
-    /// `SessionLogEntry::Title` to the log, updates the in-memory session, and
+    /// canonical metadata record before it updates the in-memory session, and
     /// freezes automatic regeneration by setting `title_last_updated_tokens`
     /// to `usize::MAX`. Emits `TitleUpdated`. An empty value is rejected.
     fn set_session_title(config: &GlobalConfig, value: &str) -> Result<()> {
@@ -84,42 +104,18 @@ impl Config {
         Ok(())
     }
 
-    fn update_optional_f64(
+    fn update_optional<T>(
         config: &GlobalConfig,
         value: &str,
-        setter: impl Fn(&mut Config, Option<f64>),
-    ) -> Result<()> {
+        update: impl Fn(Option<T>) -> SessionOverrideUpdate,
+        setter: impl Fn(&mut Config, Option<T>),
+    ) -> Result<()>
+    where
+        T: Clone + std::str::FromStr,
+        T::Err: std::error::Error + Send + Sync + 'static,
+    {
         let value = parse_value(value)?;
-        setter(&mut config.write(), value);
-        Ok(())
-    }
-
-    fn update_optional_usize(
-        config: &GlobalConfig,
-        value: &str,
-        setter: impl Fn(&mut Config, Option<usize>),
-    ) -> Result<()> {
-        let value = parse_value(value)?;
-        setter(&mut config.write(), value);
-        Ok(())
-    }
-
-    fn update_optional_isize(
-        config: &GlobalConfig,
-        value: &str,
-        setter: impl Fn(&mut Config, Option<isize>),
-    ) -> Result<()> {
-        let value = parse_value(value)?;
-        setter(&mut config.write(), value);
-        Ok(())
-    }
-
-    fn update_optional_string(
-        config: &GlobalConfig,
-        value: &str,
-        setter: impl Fn(&mut Config, Option<String>),
-    ) -> Result<()> {
-        let value = parse_value(value)?;
+        Self::persist_override(config, update(value.clone()))?;
         setter(&mut config.write(), value);
         Ok(())
     }
@@ -150,6 +146,7 @@ impl Config {
                     .collect(),
             )
         };
+        Self::persist_override(config, SessionOverrideUpdate::UseTools(value.clone()))?;
         config.write().set_use_tools(value);
         Ok(())
     }
@@ -165,8 +162,17 @@ impl Config {
                 .map(String::from)
                 .collect()
         };
+        Self::persist_override(config, SessionOverrideUpdate::ModelFallbacks(value.clone()))?;
         config.write().set_model_fallbacks(value);
         Ok(())
+    }
+
+    fn persist_override(config: &GlobalConfig, update: SessionOverrideUpdate) -> Result<()> {
+        let guard = config.read();
+        let Some(session) = guard.session.as_ref() else {
+            return Ok(());
+        };
+        crate::config::session::persist_session_override(session, &update)
     }
 
     fn update_bool_field(
@@ -306,6 +312,10 @@ impl Config {
     pub fn set_model(&mut self, model_id: &str) -> Result<()> {
         let model = crate::client::retrieve_model(&self.clients, model_id, ModelType::Chat)?;
         if let Some(session) = self.session.as_mut() {
+            crate::config::session::persist_session_override(
+                session,
+                &SessionOverrideUpdate::Model(Some(model.id())),
+            )?;
             session.set_model(model);
         } else if let Some(agent) = self.agent.as_mut() {
             agent.set_model(model);
