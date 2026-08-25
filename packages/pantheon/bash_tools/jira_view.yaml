@@ -1,0 +1,10 @@
+name: jira_view
+description: View a Jira work item
+parameters:
+  key:    { type: string, required: true, pattern: "^[A-Z][A-Z0-9]+-[0-9]+$", description: "Issue key e.g. FDEV-1234" }
+  fields: { type: string, required: false, description: "Comma-separated fields; default summary,description,status,assignee,comment" }
+template: false
+script: |
+  set -euo pipefail
+  FIELDS="${FIELDS:-summary,description,status,assignee,comment}"
+  acli jira workitem view "$KEY" --fields "$FIELDS"

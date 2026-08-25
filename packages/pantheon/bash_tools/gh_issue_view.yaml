@@ -11,4 +11,4 @@ sandbox:
 template: false
 script: |
   set -euo pipefail
-  gh issue view "$NUMBER" --repo "$REPO" --json title,body,comments
+  gh issue view "$NUMBER" --repo "$REPO" --json title,body,comments,labels,state,assignees
