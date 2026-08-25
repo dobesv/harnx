@@ -31,7 +31,6 @@ pub struct HistoryQuery {
 /// The log-entry `type` discriminant string (matches the YAML `type:` tag).
 pub fn entry_type(entry: &SessionLogEntry) -> &'static str {
     match entry {
-        SessionLogEntry::Header { .. } => "header",
         SessionLogEntry::Message { .. } => "message",
         SessionLogEntry::ToolCalls { .. } => "tool_calls",
         SessionLogEntry::ToolResults { .. } => "tool_results",
@@ -43,7 +42,6 @@ pub fn entry_type(entry: &SessionLogEntry) -> &'static str {
         SessionLogEntry::TurnEnd { .. } => "turn_end",
         SessionLogEntry::EditEntries { .. } => "edit_entries",
         SessionLogEntry::Rewind { .. } => "rewind",
-        SessionLogEntry::Title { .. } => "title",
         SessionLogEntry::Unknown => "unknown",
     }
 }
@@ -66,8 +64,6 @@ fn entry_searchable_text(entry: &SessionLogEntry) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         SessionLogEntry::Compress { prompt } => prompt.clone(),
-        SessionLogEntry::Title { title, .. } => title.clone(),
-        SessionLogEntry::Header { model_id, .. } => format!("model: {model_id}"),
         SessionLogEntry::Error { message, .. } => message.clone(),
         _ => String::new(),
     }

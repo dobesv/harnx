@@ -18,22 +18,21 @@ pub async fn render_session_dump_for_agent(
     expected_agent: Option<&str>,
 ) -> Result<String> {
     let jetstream = config.nats_jetstream(cluster).await?;
+    let metadata_store =
+        crate::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let metadata = metadata_store
+        .get(session_id)
+        .await?
+        .with_context(|| format!("NATS session '{session_id}' was not found"))?
+        .metadata;
     let log = NatsSessionLog::new(jetstream, session_id.to_string());
     let raw = log
         .load_events_async()
         .await
         .with_context(|| format!("Failed to load NATS session '{session_id}'"))?;
-    if raw.is_empty() {
-        bail!("NATS session '{session_id}' was not found");
-    }
     let entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)?;
     if let Some(expected_agent) = expected_agent {
-        let actual_agent = entries.iter().find_map(|(_, entry)| match entry {
-            harnx_core::session::SessionLogEntry::Header { agent_name, .. } => {
-                agent_name.as_deref()
-            }
-            _ => None,
-        });
+        let actual_agent = metadata.agent.name();
         if actual_agent != Some(expected_agent) {
             bail!(
                 "NATS session '{session_id}' belongs to agent '{}', not '{expected_agent}'",

@@ -76,7 +76,7 @@ pub(super) struct WorkerRuntime {
     pub(super) identity: crate::worker_identity::WorkerReadiness,
     pub(super) lease: NatsLeaseConfig,
     pub(super) jetstream: jetstream::Context,
-    pub(super) session_index: Option<async_nats::jetstream::kv::Store>,
+    pub(super) session_metadata: crate::nats_session_metadata::SessionMetadataStore,
     /// Shared NATS client for control-plane subscriptions (cloned per session
     /// rather than reconnecting on each activation).
     pub(super) client: async_nats::Client,
@@ -114,7 +114,24 @@ impl WorkerRuntime {
         let Some(reconciler) = self.server_reconciler.clone() else {
             return;
         };
-        let servers = tool_servers_for_activation(&self.config, &activation.agent);
+        let metadata = match self.session_metadata.get(&activation.session_id).await {
+            Ok(Some(record)) => record.metadata,
+            Ok(None) => {
+                log::warn!(
+                    "refusing tool-server startup for session without metadata: session_id={}",
+                    activation.session_id
+                );
+                return;
+            }
+            Err(error) => {
+                log::warn!(
+                    "failed to load session metadata for tool-server startup: session_id={} error={error:#}",
+                    activation.session_id
+                );
+                return;
+            }
+        };
+        let servers = tool_servers_for_activation(&self.config, &metadata);
         if servers.is_empty() {
             return;
         }
@@ -167,7 +184,7 @@ impl WorkerRuntime {
             worker_id: self.worker_id.clone(),
             generation,
             config: self.lease.clone(),
-            session_index: self.session_index.clone(),
+            session_metadata: Some(self.session_metadata.clone()),
         })
         .await?;
         Ok(lease.map(Arc::new))
@@ -431,6 +448,52 @@ impl WorkerRuntime {
         self.active.lock().await.insert(session_id, handle);
     }
 
+    async fn metadata_preflight_passes(
+        &self,
+        message: &async_nats::jetstream::Message,
+        activation: &SessionActivate,
+    ) -> Result<bool> {
+        match self.session_metadata.get(&activation.session_id).await {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => {
+                log::warn!(
+                    "terminating SessionActivate without canonical metadata: session_id={}",
+                    activation.session_id
+                );
+                Self::terminate_activation(message, "metadata-less").await?;
+                Ok(false)
+            }
+            Err(error) => {
+                log::warn!(
+                    "session metadata preflight failed for '{}': {error:#}",
+                    activation.session_id
+                );
+                if self.uses_targeted_activation() {
+                    Self::delayed_nak(message).await?;
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    async fn targeted_route_preflight_passes(
+        &self,
+        message: &async_nats::jetstream::Message,
+        activation: &SessionActivate,
+    ) -> Result<bool> {
+        if !self.uses_targeted_activation() {
+            return Ok(true);
+        }
+        if let Err(error) = self.validate_targeted_activation(activation) {
+            log::warn!("terminating misrouted targeted SessionActivate: {error:#}");
+            Self::terminate_activation(message, "misrouted targeted").await?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     pub(super) async fn handle_activation(
         self: &Arc<Self>,
         message: async_nats::jetstream::Message,
@@ -438,12 +501,17 @@ impl WorkerRuntime {
         let Some(activation) = self.decode_activation(&message).await? else {
             return Ok(());
         };
-        if self.uses_targeted_activation() {
-            if let Err(error) = self.validate_targeted_activation(&activation) {
-                log::warn!("terminating misrouted targeted SessionActivate: {error:#}");
-                Self::terminate_activation(&message, "misrouted targeted").await?;
-                return Ok(());
-            }
+        if !self
+            .metadata_preflight_passes(&message, &activation)
+            .await?
+        {
+            return Ok(());
+        }
+        if !self
+            .targeted_route_preflight_passes(&message, &activation)
+            .await?
+        {
+            return Ok(());
         }
 
         // A targeted re-activation stays durable until the active loop's tool

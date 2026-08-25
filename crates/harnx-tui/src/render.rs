@@ -874,19 +874,9 @@ impl Tui {
                 let title = "Select Session";
                 let footer = "↑↓ navigate  Enter select  Esc cancel";
                 let mut items: Vec<String> = vec!["✦ New session".to_string()];
-                items.extend(sessions.iter().map(|s| {
-                    let branch = s.git_branch.as_deref().unwrap_or("");
-                    let cwd = s.working_dir.as_deref().unwrap_or("");
-                    let parts: Vec<&str> =
-                        cwd.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
-                    let cwd_tail = if parts.len() >= 2 {
-                        format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
-                    } else if parts.len() == 1 {
-                        parts[0].to_string()
-                    } else {
-                        String::new()
-                    };
-                    format!("{}  {}  {}", s.id, branch, cwd_tail)
+                items.extend(sessions.iter().map(|session| match &session.title {
+                    Some(title) => format!("{}  {}", session.id, title),
+                    None => session.id.clone(),
                 }));
                 // Prepend error message if present (visible in picker)
                 if let Some(err) = error {

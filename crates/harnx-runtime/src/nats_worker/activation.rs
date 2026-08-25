@@ -17,7 +17,6 @@ pub enum SessionActivationRoute {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionActivate {
     pub session_id: String,
-    pub agent: String,
     pub epoch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_seq: Option<u64>,
@@ -26,10 +25,9 @@ pub struct SessionActivate {
 }
 
 impl SessionActivate {
-    pub fn new(session_id: impl Into<String>, agent: impl Into<String>) -> Self {
+    pub fn new(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
-            agent: agent.into(),
             epoch: Utc::now().to_rfc3339(),
             requested_seq: None,
             target_worker_id: None,
@@ -38,14 +36,13 @@ impl SessionActivate {
 
     pub fn targeted(
         session_id: impl Into<String>,
-        agent: impl Into<String>,
         requested_seq: u64,
         worker_id: impl Into<String>,
     ) -> Self {
         Self {
             requested_seq: Some(requested_seq),
             target_worker_id: Some(worker_id.into()),
-            ..Self::new(session_id, agent)
+            ..Self::new(session_id)
         }
     }
 
@@ -70,8 +67,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_cloud_activation_payload_remains_wire_compatible() {
-        let legacy = br#"{"session_id":"s1","agent":"metis","epoch":"now"}"#;
+    fn activation_payload_contains_only_session_routing_state() {
+        let legacy = br#"{"session_id":"s1","epoch":"now"}"#;
         let activation: SessionActivate = serde_json::from_slice(legacy).unwrap();
         assert_eq!(activation.requested_seq, None);
         assert_eq!(activation.target_worker_id, None);

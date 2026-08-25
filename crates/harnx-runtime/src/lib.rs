@@ -25,8 +25,8 @@ pub mod nats_lease;
 pub mod nats_local_server;
 pub mod nats_metrics;
 pub mod nats_session;
-pub mod nats_session_index;
 pub mod nats_session_log;
+pub mod nats_session_metadata;
 pub mod nats_tool_provider;
 pub mod nats_worker;
 pub mod remote_session_cleanup;
@@ -42,6 +42,7 @@ mod worker_identity;
 
 // Re-export session types for frontends
 pub use nats_session::{send_control_command, NatsSession, NatsSessionConfig, NatsTurnResult};
+pub use nats_session_metadata::{SessionInitializer, SessionOverrides};
 pub use nats_worker::{ControlCommand, SessionActivationRoute};
 
 pub use agent_loop::{

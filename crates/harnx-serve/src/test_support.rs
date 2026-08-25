@@ -138,8 +138,9 @@ pub async fn seed_nats_session(config: &Config, seed: NatsSessionSeed<'_>) -> bo
     use harnx_core::session::SessionLogEntry;
     use harnx_runtime::{
         config::LOCAL_CLUSTER_KEY,
-        nats_session_index::{self, SessionIndexRecord},
         nats_session_log::NatsSessionLog,
+        nats_session_metadata::{SessionMetadata, SessionMetadataStore},
+        SessionInitializer,
     };
 
     if let Err(error) = crate::ensure_frontend_nats_owner().await {
@@ -151,19 +152,21 @@ pub async fn seed_nats_session(config: &Config, seed: NatsSessionSeed<'_>) -> bo
     }
     let mut scoped = config.clone();
     scoped.use_agent_by_name(seed.agent).expect("seed agent");
-    let mut session =
-        harnx_runtime::config::session::new(&scoped, seed.session_id, None).expect("seed session");
-    session.id = seed.session_id.to_string();
-    session.session_id = Some(seed.session_id.to_string());
-
     let jetstream = config
         .nats_jetstream(LOCAL_CLUSTER_KEY)
         .await
         .expect("local NATS context");
-    let log = NatsSessionLog::new(jetstream.clone(), seed.session_id.to_string());
-    log.append_event_async(&session.build_header_entry())
+    let metadata_store = SessionMetadataStore::ensure(&jetstream, 1)
         .await
-        .expect("append session header");
+        .expect("session metadata store");
+    metadata_store
+        .create(&SessionMetadata::new(
+            seed.session_id,
+            SessionInitializer::from_config(&scoped).expect("session initializer"),
+        ))
+        .await
+        .expect("create session metadata");
+    let log = NatsSessionLog::new(jetstream.clone(), seed.session_id.to_string());
     for message in seed.messages {
         log.append_event_async(&SessionLogEntry::Message {
             id: message.id.clone(),
@@ -175,27 +178,6 @@ pub async fn seed_nats_session(config: &Config, seed: NatsSessionSeed<'_>) -> bo
         .await
         .expect("append session message");
     }
-
-    let index = nats_session_index::ensure_index_bucket(&jetstream, 1)
-        .await
-        .expect("session index");
-    nats_session_index::put_record(
-        &index,
-        &SessionIndexRecord {
-            session_id: seed.session_id.to_string(),
-            agent_name: seed.agent.to_string(),
-            working_dir: session.working_dir,
-            git_branch: session.git_branch,
-            git_remote: session.git_remote,
-            title: None,
-            last_activity: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("current time")
-                .as_secs(),
-        },
-    )
-    .await
-    .expect("put session index record");
     true
 }
 

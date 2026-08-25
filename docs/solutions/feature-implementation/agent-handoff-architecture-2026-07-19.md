@@ -270,7 +270,6 @@ let call_fn: AgentCallFn = Arc::new(move |_input, _config, _abort| {
 
 ## Known Follow-ups
 
-- **Headerless NATS sessions**: Handoff-created sessions lack agent/model metadata header
 - **None-session_id navigation**: Web UI degrades gracefully when session_id is null
 - **Outer-loop duplication**: Four frontends have similar outer-loop pattern — extraction candidate
 
@@ -279,4 +278,4 @@ let call_fn: AgentCallFn = Arc::new(move |_input, _config, _abort| {
 - **GitHub:** [Issue #1091](https://github.com/dobesv/harnx/issues/1091)
 - **Prior solution:** [logic-errors/agent-switch-with-session-consistency-2026-05-03.md](../logic-errors/agent-switch-with-session-consistency-2026-05-03.md) — exit_agent before activation invariant
 - **AG-UI protocol:** [harnx-serve README](../../../crates/harnx-serve/README.md#ag-ui-agent-user-interaction-protocol) — canonical session IDs for routing and persistence; derived UUID `ThreadId` only on the AG-UI wire
-- **NATS index:** [integration-issues/nats-kv-session-index-enumeration-2026-06-27.md](../integration-issues/nats-kv-session-index-enumeration-2026-06-27.md) — session id handling
+- **Canonical NATS metadata:** [High-Availability Deployment](../../nats-ha.md#using-remote-agents) — session identity and agent source are initialized before the first transcript append

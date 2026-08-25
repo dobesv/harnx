@@ -69,7 +69,11 @@ impl TargetedFixture {
         NatsSession::new(
             NatsSessionConfig {
                 cluster: "__local__".to_string(),
-                agent: "ignored-agent".to_string(),
+                initializer: harnx_runtime::SessionInitializer::inline(
+                    "targeted test agent",
+                    Default::default(),
+                    Default::default(),
+                ),
                 session_id: Some(session_id.to_string()),
                 activation_route: harnx_runtime::SessionActivationRoute::WorkerTargeted {
                     session_scope: "__local__".to_string(),
@@ -95,7 +99,7 @@ impl TargetedFixture {
                 worker_id: worker_id.to_string(),
                 generation: 1,
                 config: NatsLeaseConfig::default(),
-                session_index: None,
+                session_metadata: None,
             },
         )
         .await?
@@ -121,7 +125,7 @@ impl TargetedFixture {
             .publish(subject.clone(), "not-json".into())
             .await?
             .await?;
-        let misrouted = SessionActivate::targeted("poison", "metis", 1, WORKER_A);
+        let misrouted = SessionActivate::targeted("poison", 1, WORKER_A);
         self.jetstream
             .publish(subject, serde_json::to_vec(&misrouted)?.into())
             .await?
@@ -162,6 +166,7 @@ impl TargetedFixture {
 
     async fn assert_retained_wakeup_survives_foreign_holder(&self) -> Result<()> {
         let session_id = "target-retained-after-lease";
+        let _initialized = self.session(session_id, WORKER_B).await?;
         let log = NatsSessionLog::new(self.jetstream.clone(), session_id);
         let requested_seq = log
             .append_event_async(&append_user_message_entry("retained", "run after release"))
@@ -170,7 +175,7 @@ impl TargetedFixture {
         publish_targeted_session_activate(
             &self.jetstream,
             LocalWorkerTarget::new("__local__", WORKER_B)?,
-            &SessionActivate::targeted(session_id, "ignored-agent", requested_seq, WORKER_B),
+            &SessionActivate::targeted(session_id, requested_seq, WORKER_B),
         )
         .await?;
         wait_for_consumer_redelivery(&self.jetstream, WORKER_B).await?;
@@ -393,7 +398,7 @@ async fn targeted_local_transport_rejects_an_incompatible_existing_stream() -> R
             ..Default::default()
         })
         .await?;
-    let activation = SessionActivate::targeted("s1", "metis", 1, "local-test");
+    let activation = SessionActivate::targeted("s1", 1, "local-test");
     let error = publish_targeted_session_activate(
         &jetstream,
         LocalWorkerTarget::new("__local__", "local-test")?,

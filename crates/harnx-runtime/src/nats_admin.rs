@@ -1,6 +1,8 @@
 use crate::{
-    config::Config, nats_lease::NatsLeaseConfig, nats_session_index,
+    config::Config,
+    nats_lease::NatsLeaseConfig,
     nats_session_log::stream_name_for_session,
+    nats_session_metadata::{SessionMetadataStore, SESSION_METADATA_BUCKET},
 };
 use anyhow::{Context, Result};
 use async_nats::jetstream::{
@@ -14,11 +16,12 @@ use std::error::Error as _;
 pub struct SessionDeleteResult {
     pub stream_deleted: bool,
     pub lease_deleted: bool,
+    pub metadata_keys_deleted: usize,
 }
 
 impl SessionDeleteResult {
     pub fn removed_anything(&self) -> bool {
-        self.stream_deleted || self.lease_deleted
+        self.stream_deleted || self.lease_deleted || self.metadata_keys_deleted > 0
     }
 }
 
@@ -31,39 +34,27 @@ pub async fn delete_remote_session(
     let lease_bucket = load_optional_lease_bucket(config, cluster).await?;
     let stream_deleted = delete_session_stream(&jetstream, session_id).await?;
     let lease_deleted = delete_session_lease(lease_bucket, session_id).await?;
-    best_effort_delete_session_index_record(&jetstream, session_id).await;
+    let metadata_keys_deleted = purge_session_metadata(&jetstream, session_id).await?;
 
     Ok(SessionDeleteResult {
         stream_deleted,
         lease_deleted,
+        metadata_keys_deleted,
     })
 }
 
-async fn best_effort_delete_session_index_record(
+async fn purge_session_metadata(
     jetstream: &async_nats::jetstream::Context,
     session_id: &str,
-) {
-    let store = match jetstream
-        .get_key_value(nats_session_index::SESSION_INDEX_BUCKET)
-        .await
-    {
+) -> Result<usize> {
+    let store = match jetstream.get_key_value(SESSION_METADATA_BUCKET).await {
         Ok(store) => store,
-        Err(error) if kv_bucket_missing(&error) => return,
-        Err(error) => {
-            log::warn!(
-                "failed to open remote session index for cleanup: session_id={} err={error:#}",
-                session_id
-            );
-            return;
-        }
+        Err(error) if kv_bucket_missing(&error) => return Ok(0),
+        Err(error) => return Err(error).context("failed to open session metadata for deletion"),
     };
-
-    if let Err(error) = nats_session_index::delete_record(&store, session_id).await {
-        log::warn!(
-            "failed to delete remote session index record: session_id={} err={error:#}",
-            session_id
-        );
-    }
+    SessionMetadataStore::from_store(store, jetstream.client().clone())
+        .purge_session_prefix(session_id)
+        .await
 }
 
 async fn load_optional_lease_bucket(

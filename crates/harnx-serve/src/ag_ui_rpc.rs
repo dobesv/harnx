@@ -494,7 +494,7 @@ async fn session_exists(config: &harnx_runtime::config::Config, key: &SessionKey
         Err(error) if error.to_string() == "Not Found" => {}
         Err(_) => return false,
     }
-    crate::session_routes::indexed_agent_session_exists(
+    crate::session_routes::canonical_agent_session_exists(
         config,
         crate::session_routes::AgentSessionRef {
             agent: &key.agent,

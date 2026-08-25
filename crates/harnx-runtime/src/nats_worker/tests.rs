@@ -5,29 +5,25 @@ use crate::config::remote_session_ops::{
     load_remote_transcript_for_render, rewind_remote_session,
 };
 use crate::config::{self, Config};
-use crate::nats_session_index::{
-    ensure_index_bucket, get_record, session_index_key, SessionIndexRecord,
-};
 use crate::nats_session_log::NatsSessionLog;
-use crate::nats_worker::agent_loop::{tool_can_rerun, write_header_and_load_session};
+use crate::nats_session_metadata::{
+    activity_key, SessionActivity, SessionAgentSource, SessionMetadata, SessionMetadataStore,
+};
+use crate::nats_worker::agent_loop::tool_can_rerun;
 use crate::nats_worker::run_worker_daemon;
 use crate::NatsSession;
 use anyhow::{bail, Context};
 use futures_util::StreamExt;
 use harnx_core::agent_config::AgentConfig;
-use harnx_core::config_data::ConfigData;
-use harnx_core::event::{AgentEvent, AgentEventSink, SessionEvent};
+use harnx_core::event::{AgentEvent, AgentEventSink};
 use harnx_core::session::{SessionLogEntry, ToolOutput};
-use harnx_core::session_reconstruct::{
-    active_context_window, reconstruct_state_from_nats, TurnStatus,
-};
+use harnx_core::session_reconstruct::{reconstruct_state_from_nats, TurnStatus};
 use harnx_core::tool::{ToolCall, ToolDeclaration, ToolProvider};
 use harnx_toolset::Toolset;
 use serde_json::json;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
@@ -73,32 +69,7 @@ pub(super) async fn spawn_test_nats() -> Option<(String, std::process::Child, te
     None
 }
 
-static CWD_MUTEX: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
 const NATS_TEST_CONDITION_TIMEOUT: Duration = Duration::from_secs(15);
-
-struct CurrentDirGuard {
-    original_dir: PathBuf,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl CurrentDirGuard {
-    fn change_to(path: &Path) -> std::io::Result<Self> {
-        let lock = CWD_MUTEX.lock().unwrap();
-        let original_dir = std::env::current_dir()?;
-        std::env::set_current_dir(path)?;
-        Ok(Self {
-            original_dir,
-            _lock: lock,
-        })
-    }
-}
-
-impl Drop for CurrentDirGuard {
-    fn drop(&mut self) {
-        std::env::set_current_dir(&self.original_dir)
-            .expect("must restore original working directory after test");
-    }
-}
 
 pub(super) use crate::test_environment::{env_lock_async as env_lock, EnvGuard as TestEnvGuard};
 
@@ -130,6 +101,7 @@ pub(super) fn seed_remote_config(url: &str) -> SeededRemoteParentConfig {
 
     let temp = tempfile::TempDir::new().unwrap();
     fs::create_dir_all(temp.path().join("nats_servers")).unwrap();
+    fs::create_dir_all(temp.path().join("agents")).unwrap();
     fs::write(
         temp.path().join("nats_servers/local.yaml"),
         format!(
@@ -139,6 +111,11 @@ agents:
     description: Remote planner over NATS
 "
         ),
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("agents/metis.md"),
+        "---\nmodel: test:test-model\nuse_tools: \"*\"\n---\nstub worker prompt\n",
     )
     .unwrap();
     fs::write(
@@ -193,19 +170,17 @@ fn assert_remote_tool_descriptions(parent_config: &mut Config) {
 
 async fn seed_remote_dispatch_session_log(
     log: &NatsSessionLog,
+    jetstream: &async_nats::jetstream::Context,
     session_id: &str,
 ) -> anyhow::Result<()> {
     use harnx_core::message::{MessageContent, MessageRole};
-    use harnx_core::session::Session;
 
-    let header_session = Session {
-        id: session_id.to_string(),
-        model_id: "test:test-model".to_string(),
-        agent_name: Some("metis".to_string()),
-        session_id: Some(session_id.to_string()),
-        ..Default::default()
-    };
-    log.append_event_async(&header_session.build_header_entry())
+    let metadata_store = SessionMetadataStore::ensure(jetstream, 1).await?;
+    metadata_store
+        .create(&SessionMetadata::new(
+            session_id,
+            crate::SessionInitializer::named("metis", Default::default()),
+        ))
         .await?;
     log.append_event_async(&SessionLogEntry::Message {
         id: None,
@@ -376,7 +351,7 @@ fn cluster_shared_session_config(
 ) -> crate::NatsSessionConfig {
     crate::NatsSessionConfig {
         cluster: cluster.into(),
-        agent: "metis".to_string(),
+        initializer: crate::SessionInitializer::named("metis", Default::default()),
         session_id: Some(session_id.into()),
         activation_route: crate::SessionActivationRoute::ClusterShared,
     }
@@ -425,59 +400,6 @@ pub(super) async fn run_remote_round_trip_with_session_id_and_sink(
     );
     Ok(())
 }
-fn run_git(temp_repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(temp_repo)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
-        .expect("git command must spawn");
-    assert!(
-        output.status.success(),
-        "git {:?} failed: stdout={} stderr={}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn create_test_git_repo() -> tempfile::TempDir {
-    let temp_dir = tempfile::tempdir().expect("temp dir must be created");
-    let repo = temp_dir.path();
-    let tracked_file = repo.join("README.md");
-
-    run_git(repo, &["init", "-b", "main"]);
-    std::fs::write(&tracked_file, "hermetic test repo\n").expect("tracked file must be written");
-    run_git(repo, &["add", "README.md"]);
-    run_git(
-        repo,
-        &[
-            "-c",
-            "user.email=test@example.com",
-            "-c",
-            "user.name=test",
-            "commit",
-            "-m",
-            "initial commit",
-            "--no-gpg-sign",
-            "--no-verify",
-        ],
-    );
-    run_git(repo, &["checkout", "-b", "test-branch"]);
-    run_git(
-        repo,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://example.com/test/repo.git",
-        ],
-    );
-
-    temp_dir
-}
-
 #[test]
 fn metrics_snapshot_tracks_counters() {
     crate::nats_metrics::reset_for_test();
@@ -605,118 +527,6 @@ fn test_non_idempotent_output_is_synthesized() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn remote_header_matches_local_header_source_of_truth() {
-    // Changes the process-global current directory (via CurrentDirGuard) to
-    // generate the header from a hermetic git repo. Under `cargo test` that cwd
-    // mutation races every other test that resolves paths against the cwd;
-    // nextest's per-test process isolation is required to keep it hermetic.
-    harnx_core::require_nextest();
-    let _env_guard = env_lock().await;
-    let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
-        return;
-    };
-    let temp_repo = create_test_git_repo();
-    // Canonicalize so the expected `working_dir` matches the physical path that
-    // `std::env::current_dir()` returns after `set_current_dir`. On platforms
-    // where the temp root is a symlink (macOS `/var` -> `/private/var`, or a
-    // symlinked `TMPDIR`), the raw temp path and the resolved cwd differ.
-    let temp_repo_path = temp_repo
-        .path()
-        .canonicalize()
-        .expect("temp repo path must canonicalize");
-    let original_cwd = std::env::current_dir().expect("current dir must exist before test");
-    let client = async_nats::connect(&url).await.unwrap();
-    let jetstream = async_nats::jetstream::new(client);
-    let session_id = "remote-header-test";
-    let backend = crate::nats_worker::backend::NatsSessionLogBackend::new(jetstream, session_id);
-
-    let mut config = config::Config {
-        data: ConfigData {
-            compress_threshold: 17,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    config.set_model_fallbacks(vec!["openai:gpt-4o-mini".to_string()]);
-    config.set_compaction_agent(Some("pkg/compactor".to_string()));
-    let agent = config::Agent::new(
-        AgentConfig::from_markdown(
-            "pkg/main",
-            "---\nmodel: openai:gpt-4.1\n---\nAgent instructions without variables.",
-        )
-        .unwrap(),
-    );
-    config.agent = Some(agent.clone());
-    let config = Arc::new(parking_lot::RwLock::new(config));
-
-    let input = harnx_core::input::Input::new(
-        "hello".to_string(),
-        ("hello".to_string(), vec![]),
-        agent.into_config(),
-    );
-
-    let (session, expected_header) = {
-        let _cwd_guard = CurrentDirGuard::change_to(&temp_repo_path)
-            .expect("must switch into hermetic git repo for header generation");
-        let session =
-            write_header_and_load_session(&backend, &config, &input, None, session_id, None)
-                .await
-                .unwrap();
-        let expected_header = {
-            let mut expected_session =
-                config::session::new(&config.read(), session_id, None).unwrap();
-            expected_session.id = session_id.to_string();
-            expected_session.session_id = Some(session_id.to_string());
-            expected_session.set_agent(&input.agent).unwrap();
-            expected_session.build_header_entry()
-        };
-        (session, expected_header)
-    };
-
-    assert_eq!(
-        std::env::current_dir().unwrap(),
-        original_cwd,
-        "test must restore original working directory"
-    );
-
-    let entries = backend.load_events_blocking().unwrap();
-    let actual_header = entries
-        .iter()
-        .find(|(_, entry)| matches!(entry, harnx_core::session::SessionLogEntry::Header { .. }))
-        .expect("header entry present");
-    let actual_header_yaml = serde_yaml::to_string(&actual_header.1).unwrap();
-    let expected_header_yaml = serde_yaml::to_string(&expected_header).unwrap();
-    assert!(actual_header_yaml.contains("agent_name: pkg/main"));
-    assert!(
-        actual_header_yaml.contains("agent_instructions: Agent instructions without variables.")
-    );
-    assert!(actual_header_yaml.contains("git_branch: test-branch"));
-    assert!(
-        actual_header_yaml.contains("git_remote: https://example.com/test/repo.git"),
-        "actual header must use hermetic git remote: {actual_header_yaml}"
-    );
-    let expected_working_dir = format!("working_dir: {}", temp_repo_path.display());
-    assert!(
-        actual_header_yaml.contains(&expected_working_dir),
-        "actual header must use hermetic working dir: {actual_header_yaml}"
-    );
-    assert!(actual_header_yaml.contains("session_id: remote-header-test"));
-    // Remote headers must use the NATS stream key as their session ID. This
-    // equality also covers git_branch/git_remote/working_dir.
-    assert_eq!(
-        actual_header_yaml, expected_header_yaml,
-        "remote header must match locally built header"
-    );
-    let loaded_header_yaml = serde_yaml::to_string(&session.build_header_entry()).unwrap();
-    assert!(loaded_header_yaml.contains("agent_name: pkg/main"));
-    assert!(expected_header_yaml.contains("agent_name: pkg/main"));
-    assert!(loaded_header_yaml.contains("git_branch: test-branch"));
-
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn control_log_append_requires_live_lease() {
     use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
     use crate::nats_worker::daemon::should_append_control_log_entry;
@@ -739,7 +549,7 @@ async fn control_log_append_requires_live_lease() {
             tombstone_ttl: std::time::Duration::from_secs(10),
             ..Default::default()
         },
-        session_index: None,
+        session_metadata: None,
     })
     .await
     .unwrap()
@@ -774,23 +584,6 @@ pub(super) struct NoopEventSink;
 
 impl AgentEventSink for NoopEventSink {
     fn emit(&self, _event: AgentEvent) {}
-}
-
-#[derive(Default)]
-struct RecordingEventSink {
-    events: std::sync::Mutex<Vec<AgentEvent>>,
-}
-
-impl RecordingEventSink {
-    fn events(&self) -> Vec<AgentEvent> {
-        self.events.lock().unwrap().clone()
-    }
-}
-
-impl AgentEventSink for RecordingEventSink {
-    fn emit(&self, event: AgentEvent) {
-        self.events.lock().unwrap().push(event);
-    }
 }
 
 pub(super) fn fixed_prompt_call_fn(reply: &'static str) -> crate::agent_loop::AgentCallFn {
@@ -852,47 +645,6 @@ fn subagent_test_env<'a>(
     )
 }
 
-async fn run_remote_turn_returning_reply(
-    parent_config: Config,
-    session_id: String,
-    prompt: &str,
-) -> anyhow::Result<String> {
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let mut parent_config = parent_config;
-    let parent_session =
-        crate::config::session::new(&parent_config, "parent-nats-roundtrip", None)?;
-    parent_config.session = Some(parent_session);
-    let parent_global_config = Arc::new(parking_lot::RwLock::new(parent_config));
-    let abort_signal = harnx_core::abort::create_abort_signal();
-    let session_cfg = cluster_shared_session_config("local", session_id);
-    let session =
-        crate::NatsSession::from_global_config(session_cfg, &parent_global_config, abort_signal)
-            .await?;
-
-    let turn_result = tokio::time::timeout(
-        Duration::from_secs(10),
-        session.run_turn(prompt, Arc::new(NoopEventSink), None),
-    )
-    .await
-    .context("run_turn timed out after 10s in remote NATS round-trip test")??;
-    turn_result
-        .response
-        .context("NATS session turn must return final assistant response")
-}
-
-fn leading_user_texts(entries: &[(u64, SessionLogEntry)]) -> Vec<String> {
-    entries
-        .iter()
-        .filter_map(|(_, entry)| match entry {
-            SessionLogEntry::Message { role, content, .. } if role.is_user() => {
-                Some(content.to_text())
-            }
-            _ => None,
-        })
-        .collect()
-}
-
 async fn load_effective_entries(log: &NatsSessionLog) -> Vec<(u64, SessionLogEntry)> {
     let entries = log
         .load_events_async()
@@ -900,65 +652,6 @@ async fn load_effective_entries(log: &NatsSessionLog) -> Vec<(u64, SessionLogEnt
         .expect("load session log entries");
     harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)
         .expect("reconstruct effective session log")
-}
-
-async fn assert_remote_header_inserted_once(log: &NatsSessionLog, expected_first_prompt: &str) {
-    let raw_entries = log
-        .load_events_async()
-        .await
-        .expect("load raw session log entries");
-    let effective_entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw_entries)
-        .expect("reconstruct effective session log");
-
-    assert!(
-        matches!(
-            effective_entries.first().map(|(_, entry)| entry),
-            Some(SessionLogEntry::Header { .. })
-        ),
-        "effective log must start with header after worker activation"
-    );
-    assert_eq!(
-        leading_user_texts(&effective_entries)
-            .first()
-            .map(std::string::String::as_str),
-        Some(expected_first_prompt),
-        "first user prompt must remain in active window after migration"
-    );
-
-    let edits: Vec<_> = raw_entries
-        .iter()
-        .filter(|(_, entry)| matches!(entry, SessionLogEntry::EditEntries { .. }))
-        .collect();
-    assert_eq!(
-        edits.len(),
-        1,
-        "worker must append exactly one migration EditEntries"
-    );
-
-    match &edits[0].1 {
-        SessionLogEntry::EditEntries {
-            from,
-            to,
-            replacements,
-        } => {
-            assert!(
-                replacements.len() >= 2,
-                "migration must prepend header and clone users"
-            );
-            let header_replacement = serde_yaml::from_str::<SessionLogEntry>(&replacements[0])
-                .expect("header replacement parses");
-            assert!(matches!(header_replacement, SessionLogEntry::Header { .. }));
-            assert_eq!(
-                *from, 1,
-                "headerless realistic origin starts at first user seq"
-            );
-            assert_eq!(
-                *to, 1,
-                "single-prompt fixture edits leading user block only"
-            );
-        }
-        other => panic!("expected EditEntries migration, got {other:?}"),
-    }
 }
 
 pub(super) async fn wait_for_condition<F>(timeout: Duration, mut predicate: F) -> bool
@@ -978,389 +671,6 @@ where
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn remote_headerless_session_inserts_header_on_first_activation() {
-    let _env_guard = env_lock().await;
-    let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
-        return;
-    };
-
-    let mut seeded = seed_remote_config(&url);
-    let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
-    assert_remote_tool_family(&mut seeded.parent_config);
-    assert_remote_tool_descriptions(&mut seeded.parent_config);
-
-    let worker =
-        spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("stub remote reply over nats"));
-    let session_id = crate::nats_worker::new_remote_session_id();
-    run_remote_round_trip_with_session_id(seeded.parent_config, session_id.clone())
-        .await
-        .expect("run realistic headerless NATS session");
-
-    let log_client = async_nats::connect(&url)
-        .await
-        .expect("connect nats client for session log verification");
-    let log = NatsSessionLog::new(async_nats::jetstream::new(log_client), session_id);
-    assert_remote_header_inserted_once(&log, "delegate over nats").await;
-
-    worker.abort();
-    let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn remote_multi_turn_after_header_insert_preserves_input_derivation() {
-    let _env_guard = env_lock().await;
-    let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
-        return;
-    };
-
-    let mut seeded = seed_remote_config(&url);
-    let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
-    assert_remote_tool_family(&mut seeded.parent_config);
-    assert_remote_tool_descriptions(&mut seeded.parent_config);
-
-    let prompts = ["turn one prompt", "turn two prompt", "turn three prompt"];
-    let captured = Arc::new(AsyncMutex::new(Vec::<String>::new()));
-    let worker = spawn_metis_worker_with_call_fn(&url, echoing_call_fn(Arc::clone(&captured)));
-    let session_id = crate::nats_worker::new_remote_session_id();
-
-    for prompt in prompts {
-        let reply = run_remote_turn_returning_reply(
-            seeded.parent_config.clone(),
-            session_id.clone(),
-            prompt,
-        )
-        .await
-        .expect("run remote NATS session turn");
-        assert_eq!(
-            reply,
-            format!("stub remote reply over nats: {prompt}"),
-            "assistant reply must echo exact derived turn input"
-        );
-    }
-
-    worker.abort();
-    let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
-
-    let derived_inputs = captured.lock().await.clone();
-    assert_eq!(
-        derived_inputs,
-        prompts
-            .iter()
-            .map(|prompt| (*prompt).to_string())
-            .collect::<Vec<_>>(),
-        "worker must derive exactly one turn-input per turn, in order, with no dup/drop"
-    );
-
-    let log_client = async_nats::connect(&url)
-        .await
-        .expect("connect nats client for session log verification");
-    let log = NatsSessionLog::new(async_nats::jetstream::new(log_client), session_id);
-    let raw_entries = log
-        .load_events_async()
-        .await
-        .expect("load raw session log entries");
-    let effective_entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw_entries)
-        .expect("reconstruct effective session log");
-
-    let edit_count = raw_entries
-        .iter()
-        .filter(|(_, entry)| matches!(entry, SessionLogEntry::EditEntries { .. }))
-        .count();
-    assert_eq!(
-        edit_count, 1,
-        "exactly one header-migration EditEntries across whole multi-turn session"
-    );
-
-    let header_count = effective_entries
-        .iter()
-        .filter(|(_, entry)| matches!(entry, SessionLogEntry::Header { .. }))
-        .count();
-    assert_eq!(
-        header_count, 1,
-        "effective log must carry exactly one header"
-    );
-    let Some((_, SessionLogEntry::Header { agent_name, .. })) = effective_entries.first() else {
-        panic!("effective log must start with migrated header at logical 0");
-    };
-    assert_eq!(
-        agent_name.as_deref(),
-        Some("metis"),
-        "migrated header must carry worker agent config"
-    );
-
-    let user_texts = leading_user_texts(&effective_entries);
-    assert_eq!(
-        user_texts,
-        prompts
-            .iter()
-            .map(|prompt| (*prompt).to_string())
-            .collect::<Vec<_>>(),
-        "effective log user messages must be exact prompt sequence, once each"
-    );
-
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn remote_headerless_session_reactivation_is_idempotent() {
-    let _env_guard = env_lock().await;
-    let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
-        return;
-    };
-
-    let mut seeded = seed_remote_config(&url);
-    let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
-    assert_remote_tool_family(&mut seeded.parent_config);
-
-    let first_worker =
-        spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("stub remote reply over nats"));
-    let session_id = crate::nats_worker::new_remote_session_id();
-    run_remote_round_trip_with_session_id(seeded.parent_config.clone(), session_id.clone())
-        .await
-        .expect("first activation round trip succeeds");
-    first_worker.abort();
-    let _ = tokio::time::timeout(Duration::from_secs(5), first_worker).await;
-
-    let second_worker =
-        spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("stub remote reply over nats"));
-    run_remote_round_trip_with_session_id(seeded.parent_config, session_id.clone())
-        .await
-        .expect("reactivation round trip succeeds");
-
-    let log_client = async_nats::connect(&url)
-        .await
-        .expect("connect nats client for session log verification");
-    let log = NatsSessionLog::new(async_nats::jetstream::new(log_client), session_id);
-    let raw_entries = log
-        .load_events_async()
-        .await
-        .expect("load raw session log entries");
-    let edit_count = raw_entries
-        .iter()
-        .filter(|(_, entry)| matches!(entry, SessionLogEntry::EditEntries { .. }))
-        .count();
-    assert_eq!(
-        edit_count, 1,
-        "reactivation must not append a second header migration edit"
-    );
-    let effective_entries = load_effective_entries(&log).await;
-    assert!(matches!(
-        effective_entries.first().map(|(_, entry)| entry),
-        Some(SessionLogEntry::Header { .. })
-    ));
-
-    second_worker.abort();
-    let _ = tokio::time::timeout(Duration::from_secs(5), second_worker).await;
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn legacy_headerless_session_migrates_on_first_activation() {
-    let _env_guard = env_lock().await;
-    let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
-        return;
-    };
-
-    let seeded = seed_remote_config(&url);
-    let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
-    let session_id = crate::nats_worker::new_remote_session_id();
-    let client = async_nats::connect(&url)
-        .await
-        .expect("connect nats client");
-    let jetstream = async_nats::jetstream::new(client);
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
-    let user_seq = log
-        .append_event_async(&SessionLogEntry::Message {
-            id: Some(uuid::Uuid::new_v4().to_string()),
-            role: harnx_core::message::MessageRole::User,
-            content: harnx_core::message::MessageContent::Text("legacy prompt".to_string()),
-            timestamp: None,
-            fence_token: None,
-        })
-        .await
-        .expect("append legacy user message");
-    assert_eq!(
-        user_seq, 1,
-        "legacy fixture should be truly headerless at origin"
-    );
-
-    let worker =
-        spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("stub remote reply over nats"));
-    run_remote_round_trip_with_session_id(seeded.parent_config, session_id.clone())
-        .await
-        .expect("worker should migrate legacy session then answer turn");
-
-    let raw_entries = log
-        .load_events_async()
-        .await
-        .expect("load raw entries after migration");
-    let effective_after = load_effective_entries(&log).await;
-    assert!(matches!(
-        effective_after.first().map(|(_, entry)| entry),
-        Some(SessionLogEntry::Header { .. })
-    ));
-    assert!(
-        raw_entries
-            .iter()
-            .all(|(_, entry)| !matches!(entry, SessionLogEntry::Header { .. })),
-        "migration must not physically reorder or prepend raw header entries"
-    );
-    assert!(
-        raw_entries.iter().any(|(_, entry)| matches!(
-            entry,
-            SessionLogEntry::TurnEnd { through_seq, .. } if *through_seq >= user_seq
-        )),
-        "the worker must persist the successful full-loop boundary"
-    );
-    assert_eq!(
-        leading_user_texts(&effective_after),
-        vec![
-            "legacy prompt".to_string(),
-            "delegate over nats".to_string()
-        ]
-    );
-
-    worker.abort();
-    let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn remote_replay_and_live_rows_emit_logical_seq_assignments() {
-    let _env_guard = env_lock().await;
-    let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
-        return;
-    };
-
-    let seeded = seed_remote_config(&url);
-    let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
-    let session_id = crate::nats_worker::new_remote_session_id();
-    let client = async_nats::connect(&url)
-        .await
-        .expect("connect nats client");
-    let jetstream = async_nats::jetstream::new(client);
-    let log = NatsSessionLog::new(jetstream, session_id.clone());
-    let legacy_user_seq = log
-        .append_event_async(&SessionLogEntry::Message {
-            id: Some(uuid::Uuid::new_v4().to_string()),
-            role: harnx_core::message::MessageRole::User,
-            content: harnx_core::message::MessageContent::Text("legacy prompt".to_string()),
-            timestamp: None,
-            fence_token: None,
-        })
-        .await
-        .expect("append legacy user message");
-    assert_eq!(
-        legacy_user_seq, 1,
-        "fixture must start headerless so worker performs realistic migration"
-    );
-
-    let worker =
-        spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("stub remote reply over nats"));
-    let sink = Arc::new(RecordingEventSink::default());
-    run_remote_round_trip_with_session_id_and_sink(
-        seeded.parent_config,
-        session_id.clone(),
-        sink.clone(),
-        "local",
-    )
-    .await
-    .expect("worker should migrate legacy session, replay history, then answer turn");
-
-    let replayed_seqs: Vec<usize> = sink
-        .events()
-        .into_iter()
-        .filter_map(|event| match event {
-            AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }) => Some(seq),
-            _ => None,
-        })
-        .collect();
-
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let raw_entries = log
-        .load_events_async()
-        .await
-        .expect("load raw entries after replay/live turn");
-    let effective_entries = load_effective_entries(&log).await;
-    let logical_indices: Vec<usize> = active_context_window(&effective_entries)
-        .logical_entries()
-        .map(|entry| entry.logical_index)
-        .collect();
-    assert_eq!(
-        logical_indices,
-        vec![0, 1, 2, 3],
-        "effective migrated session must expose contiguous logical numbering"
-    );
-    let physical_seqs: Vec<u64> = active_context_window(&effective_entries)
-        .logical_entries()
-        .map(|entry| entry.physical_seq)
-        .collect();
-    let user_message_count = raw_entries
-        .iter()
-        .filter(|(_, entry)| {
-            matches!(
-                entry,
-                SessionLogEntry::Message { role, .. } if role.is_user()
-            )
-        })
-        .count();
-    let assistant_message_count = raw_entries
-        .iter()
-        .filter(|(_, entry)| {
-            matches!(
-                entry,
-                SessionLogEntry::Message { role, .. } if role.is_assistant()
-            )
-        })
-        .count();
-    assert_eq!(
-        user_message_count, 2,
-        "realistic round trip must durably append legacy + live user messages"
-    );
-    assert_eq!(
-        assistant_message_count, 1,
-        "realistic round trip must durably append one assistant reply"
-    );
-    assert_eq!(
-        physical_seqs,
-        vec![3, 3, 3, 4],
-        "migrated active window should coalesce migrated header/user/live user onto worker turn seq, then assistant reply"
-    );
-    // The migrated active window is logically [Header(0), legacy user(1), live
-    // user(2), assistant(3)] — but the Header renders NO transcript row, so it
-    // emits no LogSeqAssigned (exactly like a LOCAL session, whose header is
-    // document 0 and whose first USER message is log_seq 1). The numberable
-    // rows therefore carry logical seqs [1, 2, 3]: replayed migrated legacy
-    // user, live client user, then live worker assistant. This is the
-    // local==remote numbering parity that makes resumed/live remote rows
-    // targetable for edit/delete/rewind.
-    assert_eq!(
-        replayed_seqs,
-        vec![1, 2, 3],
-        "sink should number the migrated legacy user, live client user, and live worker assistant rows (Header at logical 0 renders no row, matching local numbering)"
-    );
-    assert_eq!(
-        replayed_seqs
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>()
-            .len(),
-        replayed_seqs.len(),
-        "each logical seq should emit once; duplicates would wedge TUI numbering"
-    );
-
-    worker.abort();
-    let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
     let _env_guard = env_lock().await;
     let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
@@ -1375,20 +685,22 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
     let session_id = crate::nats_worker::new_remote_session_id();
     let entered = Arc::new(Notify::new());
     let worker_saw_abort = Arc::new(AtomicBool::new(false));
+    let release_after_assertion = Arc::new(Notify::new());
     let call_fn: crate::agent_loop::AgentCallFn = {
         let entered = Arc::clone(&entered);
         let worker_saw_abort = Arc::clone(&worker_saw_abort);
+        let release_after_assertion = Arc::clone(&release_after_assertion);
         Arc::new(move |_input, _config, abort| {
             let entered = Arc::clone(&entered);
             let worker_saw_abort = Arc::clone(&worker_saw_abort);
+            let release_after_assertion = Arc::clone(&release_after_assertion);
             Box::pin(async move {
                 entered.notify_one();
                 tokio::select! {
                     _ = harnx_core::abort::wait_abort_signal(&abort) => {
                         worker_saw_abort.store(true, Ordering::SeqCst);
-                        loop {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
-                        }
+                        release_after_assertion.notified().await;
+                        bail!("worker call_fn interrupted after remote cancel")
                     }
                     _ = tokio::time::sleep(Duration::from_secs(20)) => {
                         bail!("worker call_fn timed out waiting for remote cancel abort")
@@ -1484,6 +796,14 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
         reconstructed.turn_status,
         TurnStatus::InFlightCancelled,
         "durable log should reconstruct to InFlightCancelled after remote cancel when no assistant message follows cancel; cancel fence={cancel_fence_token:?}, assistant fence={first_assistant_fence_token:?}, entries={final_entries:#?}"
+    );
+    release_after_assertion.notify_one();
+    assert!(
+        wait_for_condition(NATS_TEST_CONDITION_TIMEOUT, || {
+            crate::nats_metrics::snapshot().active_sessions_per_worker == 0
+        })
+        .await,
+        "worker session task did not finish after remote cancel"
     );
 
     daemon.abort();
@@ -2307,7 +1627,7 @@ async fn remote_agent_tool_family_and_nats_call_and_return_round_trip() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn remote_session_activation_writes_session_index_record() {
+async fn remote_session_activation_writes_canonical_metadata_and_activity() {
     let _env_guard = env_lock().await;
     // Use an ISOLATED, self-provisioned NATS server (not the shared
     // HARNX_NATS_TEST_URL) so `run_turn` isn't slowed by
@@ -2329,9 +1649,9 @@ async fn remote_session_activation_writes_session_index_record() {
         .await
         .expect("connect to test nats");
     let jetstream = async_nats::jetstream::new(client);
-    let store = ensure_index_bucket(&jetstream, 1)
+    let store = SessionMetadataStore::ensure(&jetstream, 1)
         .await
-        .expect("ensure session index bucket");
+        .expect("ensure session metadata bucket");
 
     let daemon = spawn_metis_worker(&server_url);
     // Use the expected_session_id in the NATS session config
@@ -2340,13 +1660,24 @@ async fn remote_session_activation_writes_session_index_record() {
             .await;
 
     // Assert on the specific session_id we created, not just "first key in bucket"
-    let record = get_record(&store, &expected_session_id)
+    let record = store
+        .get(&expected_session_id)
         .await
-        .expect("load session index record")
-        .expect("remote session index record exists");
-    assert_eq!(record.session_id, expected_session_id);
-    assert_eq!(record.agent_name, "metis");
-    assert!(record.last_activity > 0);
+        .expect("load session metadata")
+        .expect("remote session metadata exists");
+    assert_eq!(record.metadata.session_id, expected_session_id);
+    assert_eq!(
+        record.metadata.agent,
+        SessionAgentSource::Named {
+            name: "metis".to_string()
+        }
+    );
+    let activity = store
+        .get_activity(&record.metadata.session_id)
+        .await
+        .expect("load session activity")
+        .expect("remote session activity exists");
+    assert!(activity.first_activation_at.is_some());
 
     daemon.abort();
     let _ = daemon.await;
@@ -2356,7 +1687,7 @@ async fn remote_session_activation_writes_session_index_record() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn remote_session_renew_updates_last_activity_without_clobbering_header_fields() {
+async fn remote_session_renew_updates_activity_without_clobbering_metadata() {
     let _env_guard = env_lock().await;
     // Isolated NATS (see activation test) so `run_turn` isn't delayed by shared
     // JetStream state into a 10s timeout.
@@ -2376,19 +1707,20 @@ async fn remote_session_renew_updates_last_activity_without_clobbering_header_fi
         .await
         .expect("connect to test nats");
     let jetstream = async_nats::jetstream::new(client);
-    let store = ensure_index_bucket(&jetstream, 1)
+    let store = SessionMetadataStore::ensure(&jetstream, 1)
         .await
-        .expect("ensure session index bucket");
+        .expect("ensure session metadata bucket");
 
     // Arm the KV watcher BEFORE the session runs. `Store::watch` uses
     // DeliverPolicy::New (future updates only), so it must be established before
     // the initial index write and the lease-renewal refresh — otherwise both
     // Puts happen before the watcher exists and it waits forever.
-    let record_key = session_index_key(&expected_session_id);
+    let record_key = activity_key(&expected_session_id);
     let mut watcher = store
+        .kv_store()
         .watch(record_key.clone())
         .await
-        .expect("watch session index record");
+        .expect("watch session activity");
 
     // Fast lease renewal + a turn slow enough to stay active past a renew
     // interval, so a renewal (and its index `last_activity` refresh) fires while
@@ -2407,8 +1739,8 @@ async fn remote_session_renew_updates_last_activity_without_clobbering_header_fi
 
     // Collect Puts for our session in order: the first is the activation write,
     // a later one (strictly greater last_activity) is the renewal refresh.
-    let mut first_record: Option<SessionIndexRecord> = None;
-    let mut refreshed_record: Option<SessionIndexRecord> = None;
+    let mut first_record: Option<SessionActivity> = None;
+    let mut refreshed_record: Option<SessionActivity> = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while tokio::time::Instant::now() < deadline && refreshed_record.is_none() {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -2419,28 +1751,36 @@ async fn remote_session_renew_updates_last_activity_without_clobbering_header_fi
         if !matches!(entry.operation, async_nats::jetstream::kv::Operation::Put) {
             continue;
         }
-        let record: SessionIndexRecord =
-            serde_json::from_slice(&entry.value).expect("deserialize watched session index record");
-        if record.session_id != expected_session_id {
-            continue;
-        }
+        let record: SessionActivity =
+            serde_json::from_slice(&entry.value).expect("deserialize watched session activity");
         match &first_record {
             None => first_record = Some(record),
-            Some(first) if record.last_activity > first.last_activity => {
+            Some(first) if record.last_activity_at > first.last_activity_at => {
                 refreshed_record = Some(record);
             }
             _ => {}
         }
     }
 
-    let first_record = first_record.expect("activation should write initial session index record");
-    let refreshed_record = refreshed_record.expect("renew should refresh last_activity");
-    assert!(refreshed_record.last_activity > first_record.last_activity);
-    // Renewal must refresh only last_activity, never clobber the header fields.
-    assert_eq!(refreshed_record.agent_name, first_record.agent_name);
-    assert_eq!(refreshed_record.working_dir, first_record.working_dir);
-    assert_eq!(refreshed_record.git_branch, first_record.git_branch);
-    assert_eq!(refreshed_record.git_remote, first_record.git_remote);
+    let first_record = first_record.expect("activation should write initial session activity");
+    let refreshed_record = refreshed_record.expect("renew should refresh last activity");
+    assert!(refreshed_record.last_activity_at > first_record.last_activity_at);
+    assert_eq!(
+        refreshed_record.first_activation_at,
+        first_record.first_activation_at
+    );
+
+    let metadata = store
+        .get(&expected_session_id)
+        .await
+        .expect("load metadata")
+        .expect("metadata exists");
+    assert_eq!(
+        metadata.metadata.agent,
+        SessionAgentSource::Named {
+            name: "metis".to_string()
+        }
+    );
 
     daemon.abort();
     let _ = daemon.await;
@@ -2474,16 +1814,16 @@ async fn remote_dispatch_retract_round_trip() {
         .nats_jetstream("local")
         .await
         .expect("load local jetstream");
-    let log = NatsSessionLog::new(jetstream, session_id.clone());
-    seed_remote_dispatch_session_log(&log, &session_id)
+    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    seed_remote_dispatch_session_log(&log, &jetstream, &session_id)
         .await
         .expect("seed remote session log");
     let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
-    delete_remote_message_range(&global_config, 3, 3, &abort)
+    delete_remote_message_range(&global_config, 2, 2, &abort)
         .await
-        .expect("delete display index 3");
+        .expect("delete final user row");
 
     let entries = log
         .load_events_async()
@@ -2498,8 +1838,8 @@ async fn remote_dispatch_retract_round_trip() {
         } => {
             assert_eq!(
                 (*from, *to),
-                (4, 4),
-                "display index 3 must target JetStream seq 4"
+                (3, 3),
+                "display index 2 must target JetStream seq 3"
             );
             assert!(
                 replacements.is_empty(),
@@ -2546,8 +1886,8 @@ async fn remote_dispatch_edit_round_trip() {
         .nats_jetstream("local")
         .await
         .expect("load local jetstream");
-    let log = NatsSessionLog::new(jetstream, session_id.clone());
-    seed_remote_dispatch_session_log(&log, &session_id)
+    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    seed_remote_dispatch_session_log(&log, &jetstream, &session_id)
         .await
         .expect("seed remote session log");
     let editor_tmp = tempfile::TempDir::new().expect("create editor temp dir");
@@ -2568,9 +1908,9 @@ async fn remote_dispatch_edit_round_trip() {
     let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
-    edit_remote_message_range(&global_config, 3, 3, &abort)
+    edit_remote_message_range(&global_config, 2, 2, &abort)
         .await
-        .expect("edit display index 3");
+        .expect("edit display index 2");
 
     let entries = log
         .load_events_async()
@@ -2585,8 +1925,8 @@ async fn remote_dispatch_edit_round_trip() {
         } => {
             assert_eq!(
                 (*from, *to),
-                (4, 4),
-                "display index 3 must target JetStream seq 4"
+                (3, 3),
+                "display index 2 must target JetStream seq 3"
             );
             assert_eq!(replacements.len(), 1, "edit should append one replacement");
             let replacement = serde_yaml::from_str::<SessionLogEntry>(&replacements[0])
@@ -2648,7 +1988,7 @@ async fn remote_delete_turn_matches_local_any_role_parity() {
     let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
-    delete_remote_message_range(&global_config, 2, 2, &abort)
+    delete_remote_message_range(&global_config, 1, 1, &abort)
         .await
         .expect("delete assistant row by logical row");
 
@@ -2665,8 +2005,8 @@ async fn remote_delete_turn_matches_local_any_role_parity() {
         } => {
             assert_eq!(
                 (*from, *to),
-                (3, 3),
-                "assistant message must map to physical seq 3"
+                (2, 2),
+                "assistant message must map to physical seq 2"
             );
             assert!(
                 replacements.is_empty(),
@@ -2700,7 +2040,7 @@ async fn remote_delete_turn_matches_local_any_role_parity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn remote_delete_rejects_protected_rows() {
+async fn remote_delete_accepts_first_transcript_row() {
     let _env_guard = env_lock().await;
     let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
         return;
@@ -2713,24 +2053,33 @@ async fn remote_delete_rejects_protected_rows() {
         .await
         .expect("connect nats client");
     let jetstream = async_nats::jetstream::new(client);
+    SessionMetadataStore::ensure(&jetstream, 1)
+        .await
+        .expect("ensure metadata store")
+        .create(&SessionMetadata::new(
+            &session_id,
+            crate::SessionInitializer::named("metis", Default::default()),
+        ))
+        .await
+        .expect("create canonical metadata");
     let log = NatsSessionLog::new(jetstream, session_id.clone());
-    let legacy_user_seq = log
+    let first_user_seq = log
         .append_event_async(&SessionLogEntry::Message {
             id: Some(uuid::Uuid::new_v4().to_string()),
             role: harnx_core::message::MessageRole::User,
-            content: harnx_core::message::MessageContent::Text("legacy prompt".to_string()),
+            content: harnx_core::message::MessageContent::Text("first prompt".to_string()),
             timestamp: None,
             fence_token: None,
         })
         .await
-        .expect("append legacy user message");
-    assert_eq!(legacy_user_seq, 1, "fixture should start headerless");
+        .expect("append first user message");
+    assert_eq!(first_user_seq, 1, "first physical row is the user message");
 
     let worker =
         spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("stub remote reply over nats"));
     run_remote_round_trip_with_session_id(seeded.parent_config.clone(), session_id.clone())
         .await
-        .expect("worker should migrate headerless session");
+        .expect("worker should load canonical session");
 
     let mut parent_config = seeded.parent_config;
     parent_config.set_remote_agent("metis".to_string(), "local".to_string());
@@ -2740,21 +2089,17 @@ async fn remote_delete_rejects_protected_rows() {
     let global_config = Arc::new(parking_lot::RwLock::new(parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
-    let err = delete_remote_message_range(&global_config, 0, 0, &abort)
+    delete_remote_message_range(&global_config, 0, 0, &abort)
         .await
-        .expect_err("header row must stay protected");
-    assert_eq!(
-        err.to_string(),
-        "Cannot edit or delete the session header (sequence 0)"
-    );
-
-    let err = delete_remote_message_range(&global_config, 0, 0, &abort)
-        .await
-        .expect_err("header row must stay protected");
-    assert_eq!(
-        err.to_string(),
-        "Cannot edit or delete the session header (sequence 0)"
-    );
+        .expect("the first conversation row is editable");
+    assert!(matches!(
+        log.load_events_async()
+            .await
+            .expect("reload transcript")
+            .last(),
+        Some((_, SessionLogEntry::EditEntries { from: 1, to: 1, replacements }))
+            if replacements.is_empty()
+    ));
 
     worker.abort();
     let _ = worker.await;
@@ -2801,9 +2146,9 @@ async fn remote_rewind_appends_mutation_without_truncating_stream() {
     let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
-    rewind_remote_session(&global_config, 1, &abort)
+    rewind_remote_session(&global_config, 0, &abort)
         .await
-        .expect("rewind to first post-header row");
+        .expect("rewind to first conversation row");
 
     let after_raw = log
         .load_events_async()
@@ -2818,17 +2163,14 @@ async fn remote_rewind_appends_mutation_without_truncating_stream() {
     let last = after_raw.last().expect("mutation entry appended");
     match &last.1 {
         SessionLogEntry::Rewind { after_seq } => {
-            assert_eq!(
-                *after_seq, 2,
-                "logical row 1 must map to physical seq 2 (legacy Rewind path)"
-            );
+            assert_eq!(*after_seq, 1, "logical row 0 must map to physical seq 1");
         }
         SessionLogEntry::EditEntries {
             from,
             to,
             replacements,
         } => {
-            assert!(*from > 0, "edit entries must target post-header sequences");
+            assert!(*from > 0, "edit entries must target transcript sequences");
             assert_eq!(*from, *to, "exact-set deletion uses from==to");
             assert!(
                 replacements.is_empty(),
@@ -2955,13 +2297,14 @@ async fn remote_delete_refreshes_after_concurrent_mutation() {
     ignore = "JetStream mutation acknowledgement hangs on Windows"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn remote_edit_preserves_header_in_migrated_session() {
+async fn remote_edit_preserves_canonical_transcript_messages() {
     let _env_guard = env_lock().await;
     let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
         return;
     };
 
     let mut seeded = seed_remote_config(&url);
+    let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
     let session_id = crate::nats_worker::new_remote_session_id();
     let worker =
         spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("stub remote reply over nats"));
@@ -2983,8 +2326,7 @@ async fn remote_edit_preserves_header_in_migrated_session() {
     let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
-    // Edit the first user message (logical index 1) which shares physical seq with header
-    edit_remote_message_range(&global_config, 1, 1, &abort)
+    edit_remote_message_range(&global_config, 0, 0, &abort)
         .await
         .expect("edit older user message");
 
@@ -2998,17 +2340,6 @@ async fn remote_edit_preserves_header_in_migrated_session() {
     let state = load_remote_session_for_render(&session)
         .await
         .expect("load remote render state");
-
-    // CRITICAL: header must survive the edit
-    let header_count = state
-        .logical_entries
-        .iter()
-        .filter(|entry| matches!(entry, SessionLogEntry::Header { .. }))
-        .count();
-    assert_eq!(
-        header_count, 1,
-        "header must survive edit of first user message in migrated session (shared-seq bug fix)"
-    );
 
     // Verify all expected messages are present
     let texts: Vec<String> = state
@@ -3043,6 +2374,7 @@ async fn remote_delete_after_older_edit_deletes_exact_late_range() {
     };
 
     let mut seeded = seed_remote_config(&url);
+    let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
     let session_id = crate::nats_worker::new_remote_session_id();
     let worker =
         spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("stub remote reply over nats"));
@@ -3064,10 +2396,10 @@ async fn remote_delete_after_older_edit_deletes_exact_late_range() {
     let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
-    edit_remote_message_range(&global_config, 1, 1, &abort)
+    edit_remote_message_range(&global_config, 0, 0, &abort)
         .await
         .expect("edit older user message");
-    delete_remote_message_range(&global_config, 3, 4, &abort)
+    delete_remote_message_range(&global_config, 2, 3, &abort)
         .await
         .expect("delete later logical range");
 
@@ -3081,16 +2413,6 @@ async fn remote_delete_after_older_edit_deletes_exact_late_range() {
     let state = load_remote_session_for_render(&session)
         .await
         .expect("load remote render state");
-    // Assert header survives the edit (key coverage for shared-seq bug fix)
-    let header_count = state
-        .logical_entries
-        .iter()
-        .filter(|entry| matches!(entry, SessionLogEntry::Header { .. }))
-        .count();
-    assert_eq!(
-        header_count, 1,
-        "header must survive edit of first user message in migrated session"
-    );
     let texts: Vec<String> = state
         .logical_entries
         .iter()
@@ -3125,6 +2447,7 @@ async fn remote_rewind_after_older_edit_preserves_correct_logical_prefix() {
     };
 
     let mut seeded = seed_remote_config(&url);
+    let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
     let session_id = crate::nats_worker::new_remote_session_id();
     let worker =
         spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("stub remote reply over nats"));
@@ -3146,10 +2469,10 @@ async fn remote_rewind_after_older_edit_preserves_correct_logical_prefix() {
     let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
-    edit_remote_message_range(&global_config, 1, 1, &abort)
+    edit_remote_message_range(&global_config, 0, 0, &abort)
         .await
         .expect("edit older user message");
-    rewind_remote_session(&global_config, 2, &abort)
+    rewind_remote_session(&global_config, 1, &abort)
         .await
         .expect("rewind logical suffix");
 
@@ -3163,16 +2486,6 @@ async fn remote_rewind_after_older_edit_preserves_correct_logical_prefix() {
     let state = load_remote_session_for_render(&session)
         .await
         .expect("load remote render state");
-    // Assert header survives the edit (key coverage for shared-seq bug fix)
-    let header_count = state
-        .logical_entries
-        .iter()
-        .filter(|entry| matches!(entry, SessionLogEntry::Header { .. }))
-        .count();
-    assert_eq!(
-        header_count, 1,
-        "header must survive edit of first user message in migrated session"
-    );
     let texts: Vec<String> = state
         .logical_entries
         .iter()
@@ -3207,6 +2520,7 @@ async fn remote_delete_command_routes_to_exact_set_mutations() {
     };
 
     let mut seeded = seed_remote_config(&url);
+    let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
     let session_id = crate::nats_worker::new_remote_session_id();
     let worker =
         spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("stub remote reply over nats"));
@@ -3228,10 +2542,10 @@ async fn remote_delete_command_routes_to_exact_set_mutations() {
     let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
-    edit_remote_message_range(&global_config, 1, 1, &abort)
+    edit_remote_message_range(&global_config, 0, 0, &abort)
         .await
         .expect("edit older user message");
-    crate::commands::run_command(&global_config, abort.clone(), ".delete message 3-4")
+    crate::commands::run_command(&global_config, abort.clone(), ".delete message 2-3")
         .await
         .expect("remote delete command succeeds");
 
@@ -3245,16 +2559,6 @@ async fn remote_delete_command_routes_to_exact_set_mutations() {
     let state = load_remote_session_for_render(&session)
         .await
         .expect("load remote render state");
-    // Assert header survives the edit (key coverage for shared-seq bug fix)
-    let header_count = state
-        .logical_entries
-        .iter()
-        .filter(|entry| matches!(entry, SessionLogEntry::Header { .. }))
-        .count();
-    assert_eq!(
-        header_count, 1,
-        "header must survive edit of first user message in migrated session"
-    );
     let texts: Vec<String> = state
         .logical_documents
         .iter()
@@ -3288,13 +2592,6 @@ async fn remote_delete_command_routes_to_exact_set_mutations() {
     // Check reconstructed state instead of counting mutation shapes
     let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)
         .expect("reconstruct effective log");
-    let header_present = effective
-        .iter()
-        .any(|(_, entry)| matches!(entry, SessionLogEntry::Header { .. }));
-    assert!(
-        header_present,
-        "header must be present in reconstructed log after edit+delete"
-    );
     let effective_texts: Vec<String> = effective
         .iter()
         .filter_map(|(_, entry)| match entry {
@@ -3329,6 +2626,7 @@ async fn remote_rewind_command_routes_to_exact_suffix_deletions() {
     };
 
     let mut seeded = seed_remote_config(&url);
+    let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
     let session_id = crate::nats_worker::new_remote_session_id();
     let worker =
         spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("stub remote reply over nats"));
@@ -3350,10 +2648,10 @@ async fn remote_rewind_command_routes_to_exact_suffix_deletions() {
     let global_config = Arc::new(parking_lot::RwLock::new(seeded.parent_config));
     let abort = harnx_core::abort::create_abort_signal();
 
-    edit_remote_message_range(&global_config, 1, 1, &abort)
+    edit_remote_message_range(&global_config, 0, 0, &abort)
         .await
         .expect("edit older user message");
-    crate::commands::run_command(&global_config, abort.clone(), ".rewind 2")
+    crate::commands::run_command(&global_config, abort.clone(), ".rewind 1")
         .await
         .expect("remote rewind command succeeds");
 
@@ -3367,16 +2665,6 @@ async fn remote_rewind_command_routes_to_exact_suffix_deletions() {
     let state = load_remote_session_for_render(&session)
         .await
         .expect("load remote render state");
-    // Assert header survives the edit (key coverage for shared-seq bug fix)
-    let header_count = state
-        .logical_entries
-        .iter()
-        .filter(|entry| matches!(entry, SessionLogEntry::Header { .. }))
-        .count();
-    assert_eq!(
-        header_count, 1,
-        "header must survive edit of first user message in migrated session"
-    );
     let texts: Vec<String> = state
         .logical_documents
         .iter()
@@ -3418,13 +2706,6 @@ async fn remote_rewind_command_routes_to_exact_suffix_deletions() {
     // Check reconstructed state instead of counting mutation shapes
     let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)
         .expect("reconstruct effective log");
-    let header_present = effective
-        .iter()
-        .any(|(_, entry)| matches!(entry, SessionLogEntry::Header { .. }));
-    assert!(
-        header_present,
-        "header must be present in reconstructed log after edit+rewind"
-    );
     let effective_texts: Vec<String> = effective
         .iter()
         .filter_map(|(_, entry)| match entry {
@@ -3447,12 +2728,8 @@ async fn remote_rewind_command_routes_to_exact_suffix_deletions() {
     let _ = child.wait();
 }
 
-/// Regression (PR #956 F-B): a headerless remote session with MULTIPLE leading
-/// user messages before worker activation. The worker migration clones all
-/// leading users into ONE header-insert EditEntries, so Header + every leading
-/// user share the SAME physical JetStream seq. The resume renumbering must give
-/// each shared-seq user row its OWN distinct logical index ([1,2,3,...]) rather
-/// than collapsing them to a single index.
+/// Multiple leading user messages remain distinct logical rows even when they
+/// precede a worker activation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
     use harnx_core::message::{MessageContent, MessageRole};
@@ -3462,6 +2739,7 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
     };
 
     let mut seeded = seed_remote_config(&url);
+    let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
     let session_id = crate::nats_worker::new_remote_session_id();
 
     // Seed two leading user messages directly to the durable log BEFORE the
@@ -3472,6 +2750,15 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
         .nats_jetstream("local")
         .await
         .expect("load local jetstream");
+    SessionMetadataStore::ensure(&jetstream, 1)
+        .await
+        .expect("ensure canonical session metadata store")
+        .create(&SessionMetadata::new(
+            &session_id,
+            crate::SessionInitializer::named("metis", Default::default()),
+        ))
+        .await
+        .expect("seed canonical session metadata");
     let seed_log = NatsSessionLog::new(jetstream, session_id.clone());
     for text in ["leading one", "leading two"] {
         seed_log
@@ -3490,7 +2777,7 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
         spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("stub remote reply over nats"));
     run_remote_round_trip_with_session_id(seeded.parent_config.clone(), session_id.clone())
         .await
-        .expect("worker migrates multi-leading-user session");
+        .expect("worker loads multi-leading-user session");
 
     seeded
         .parent_config
@@ -3518,12 +2805,11 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
         .iter()
         .filter_map(|message| message.log_seq)
         .collect();
-    // Header = logical 0 (no row). Rows: leading one=1, leading two=2,
-    // "delegate over nats"=3, assistant=4. On the pre-fix code these collapsed
-    // to [3,3,3,4]. Assert distinct + contiguous starting at 1.
+    // Metadata is outside the transcript. Rows are numbered from zero:
+    // leading one=0, leading two=1, "delegate over nats"=2, assistant=3.
     assert_eq!(
         row_seqs,
-        vec![1, 2, 3, 4],
+        vec![0, 1, 2, 3],
         "shared-seq leading-user rows must get distinct contiguous logical seqs, not collapse"
     );
     let mut sorted = row_seqs.clone();

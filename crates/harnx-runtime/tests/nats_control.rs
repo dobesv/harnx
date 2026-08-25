@@ -59,7 +59,6 @@ async fn cancel_appends_entry_before_abort() -> Result<()> {
     let session_id = "control-cancel-session";
 
     let log = NatsSessionLog::new(js.clone(), session_id);
-    log.append_event_async(&header(session_id)).await?;
     log.append_event_async(&SessionLogEntry::Message {
         id: None,
         role: harnx_core::message::MessageRole::User,
@@ -104,7 +103,6 @@ async fn cancel_prevents_resume_on_reactivation() -> Result<()> {
     let session_id = "control-cancel-no-resume";
 
     let log = NatsSessionLog::new(js.clone(), session_id);
-    log.append_event_async(&header(session_id)).await?;
     log.append_event_async(&SessionLogEntry::Message {
         id: None,
         role: harnx_core::message::MessageRole::User,
@@ -130,24 +128,4 @@ async fn cancel_prevents_resume_on_reactivation() -> Result<()> {
 
     assert_eq!(state.turn_status, TurnStatus::InFlightCancelled);
     Ok(())
-}
-
-fn header(session_id: &str) -> SessionLogEntry {
-    SessionLogEntry::Header {
-        model_id: "test".to_string(),
-        temperature: None,
-        top_p: None,
-        use_tools: None,
-        compress_threshold: None,
-        agent_name: None,
-        session_id: Some(session_id.to_string()),
-        working_dir: None,
-        git_branch: None,
-        git_remote: None,
-        terminal_session_id: None,
-        agent_variables: Default::default(),
-        agent_instructions: String::new(),
-        model_fallbacks: vec![],
-        compaction_agent: None,
-    }
 }

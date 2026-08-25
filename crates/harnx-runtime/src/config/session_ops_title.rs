@@ -4,7 +4,7 @@
 //! guard (`need_generate_title`) decides when to (re)generate, a title agent
 //! is resolved from config, and the actual LLM call runs on a spawned task so
 //! the agent loop is never blocked. The generated title is appended to the
-//! session log as `SessionLogEntry::Title`, stored on the in-memory session,
+//! canonical session metadata, stored on the in-memory session,
 //! and surfaced via a `TitleUpdated` event. There is no fallback: if
 //! generation fails or no title agent is configured, the title is left unset.
 

@@ -12,6 +12,7 @@ use harnx_core::{
 use harnx_runtime::{
     nats_event_sink::{events_subject, AdvisoryEnvelope},
     nats_session_log::NatsSessionLog,
+    nats_session_metadata::{SessionAgentSource, SessionMetadataStore},
     nats_worker::ControlCommand,
     send_control_command, NatsSession, NatsSessionConfig,
 };
@@ -48,7 +49,7 @@ async fn seed_prior_completed_turn(log: &NatsSessionLog) -> Result<u64> {
 fn resumed_session_config(session_id: String) -> NatsSessionConfig {
     NatsSessionConfig {
         cluster: "test".to_string(),
-        agent: "test-agent".to_string(),
+        initializer: harnx_runtime::SessionInitializer::named("test-agent", Default::default()),
         session_id: Some(session_id),
         activation_route: harnx_runtime::SessionActivationRoute::ClusterShared,
     }
@@ -171,26 +172,6 @@ async fn user_message_has_client_id() -> Result<()> {
     let session_id = new_remote_session_id();
     let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
 
-    // Append a header first (required for session reconstruct)
-    let header = SessionLogEntry::Header {
-        model_id: "test-model".to_string(),
-        temperature: None,
-        top_p: None,
-        use_tools: None,
-        compress_threshold: None,
-        agent_name: Some("test-agent".to_string()),
-        session_id: Some(session_id.clone()),
-        working_dir: None,
-        git_branch: None,
-        git_remote: None,
-        terminal_session_id: None,
-        agent_variables: Default::default(),
-        agent_instructions: String::new(),
-        model_fallbacks: vec![],
-        compaction_agent: None,
-    };
-    log.append_event_async(&header).await?;
-
     // Create a NATS session (mirrors retract test pattern)
     let config = resumed_session_config(session_id.clone());
     let abort_signal = harnx_runtime::utils::create_abort_signal();
@@ -251,25 +232,9 @@ async fn retract_queued_user_message() -> Result<()> {
     let session_id = new_remote_session_id();
     let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
 
-    // Append a header first
-    let header = SessionLogEntry::Header {
-        model_id: "test-model".to_string(),
-        temperature: None,
-        top_p: None,
-        use_tools: None,
-        compress_threshold: None,
-        agent_name: Some("test-agent".to_string()),
-        session_id: Some(session_id.clone()),
-        working_dir: None,
-        git_branch: None,
-        git_remote: None,
-        terminal_session_id: None,
-        agent_variables: Default::default(),
-        agent_instructions: String::new(),
-        model_fallbacks: vec![],
-        compaction_agent: None,
-    };
-    let _header_seq = log.append_event_async(&header).await?;
+    let config = resumed_session_config(session_id.clone());
+    let abort_signal = harnx_runtime::utils::create_abort_signal();
+    let session = NatsSession::new(config, client, jetstream.clone(), abort_signal).await?;
 
     // Append a user message directly (simulating what NatsSession does)
     let user_msg_id = uuid::Uuid::new_v4().to_string();
@@ -289,12 +254,6 @@ async fn retract_queued_user_message() -> Result<()> {
         user_msg_before.is_some(),
         "User message should exist before retract"
     );
-
-    // Create NatsSession and retract the message
-    let config = resumed_session_config(session_id.clone());
-    let abort_signal = harnx_runtime::utils::create_abort_signal();
-
-    let session = NatsSession::new(config, client, jetstream.clone(), abort_signal).await?;
 
     // Retract the message
     let edit_seq = session.retract_user_message(user_msg_seq).await?;
@@ -378,24 +337,9 @@ async fn edit_queued_user_message_replaces_text_in_reconstructed_state() -> Resu
     let session_id = new_remote_session_id();
     let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
 
-    let header = SessionLogEntry::Header {
-        model_id: "test-model".to_string(),
-        temperature: None,
-        top_p: None,
-        use_tools: None,
-        compress_threshold: None,
-        agent_name: Some("test-agent".to_string()),
-        session_id: Some(session_id.clone()),
-        working_dir: None,
-        git_branch: None,
-        git_remote: None,
-        terminal_session_id: None,
-        agent_variables: Default::default(),
-        agent_instructions: String::new(),
-        model_fallbacks: vec![],
-        compaction_agent: None,
-    };
-    let _header_seq = log.append_event_async(&header).await?;
+    let config = resumed_session_config(session_id.clone());
+    let abort_signal = harnx_runtime::utils::create_abort_signal();
+    let session = NatsSession::new(config, client, jetstream.clone(), abort_signal).await?;
 
     let original_entry = SessionLogEntry::Message {
         id: Some(Uuid::new_v4().to_string()),
@@ -405,10 +349,6 @@ async fn edit_queued_user_message_replaces_text_in_reconstructed_state() -> Resu
         fence_token: None,
     };
     let user_msg_seq = log.append_event_async(&original_entry).await?;
-
-    let config = resumed_session_config(session_id.clone());
-    let abort_signal = harnx_runtime::utils::create_abort_signal();
-    let session = NatsSession::new(config, client, jetstream.clone(), abort_signal).await?;
 
     let edit_seq = session
         .edit_user_message(user_msg_seq, "edited text".to_string())
@@ -490,7 +430,6 @@ async fn resumed_session_run_turn_ignores_stale_prior_reply_and_returns_new_repl
     let jetstream = async_nats::jetstream::new(client.clone());
     let session_id = new_remote_session_id();
     let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
-    let prior_assistant_seq = seed_prior_completed_turn(&log).await?;
 
     let abort_signal = harnx_runtime::utils::create_abort_signal();
     let session = NatsSession::new(
@@ -500,6 +439,7 @@ async fn resumed_session_run_turn_ignores_stale_prior_reply_and_returns_new_repl
         abort_signal,
     )
     .await?;
+    let prior_assistant_seq = seed_prior_completed_turn(&log).await?;
 
     let log_for_reply = log.clone();
     let client_for_reply = client.clone();
@@ -525,5 +465,231 @@ async fn resumed_session_run_turn_ignores_stale_prior_reply_and_returns_new_repl
     assert_ne!(result.response.as_deref(), Some("old reply"));
     assert_eq!(result.response.as_deref(), Some("new reply"));
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_arbitrary_id_creation_precedes_the_first_user_entry() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_id = format!("arbitrary-id-{}", Uuid::new_v4());
+    let abort = harnx_runtime::utils::create_abort_signal();
+    let session = NatsSession::new(
+        resumed_session_config(session_id.clone()),
+        client,
+        jetstream.clone(),
+        abort.clone(),
+    )
+    .await?;
+
+    let metadata_store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let metadata = metadata_store
+        .get(&session_id)
+        .await?
+        .expect("lazy construction creates metadata");
+    assert_eq!(
+        metadata.metadata.agent,
+        SessionAgentSource::Named {
+            name: "test-agent".to_string()
+        }
+    );
+    assert!(metadata_store.get_activity(&session_id).await?.is_some());
+
+    let log = NatsSessionLog::new(jetstream, session_id);
+    assert!(log.load_events_async().await?.is_empty());
+    let turn = tokio::spawn(async move {
+        session
+            .run_turn("first prompt", Arc::new(NoopEventSink), None)
+            .await
+    });
+    let entries = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let entries = log.load_events_async().await?;
+            if !entries.is_empty() {
+                break Ok::<_, anyhow::Error>(entries);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    abort.set_ctrlc();
+    let _ = tokio::time::timeout(Duration::from_secs(2), turn).await;
+
+    assert_eq!(entries.len(), 1);
+    assert!(matches!(
+        &entries[0].1,
+        SessionLogEntry::Message {
+            role: MessageRole::User,
+            content: MessageContent::Text(text),
+            ..
+        } if text == "first prompt"
+    ));
+    assert!(!entries
+        .iter()
+        .any(|(_, entry)| matches!(entry, SessionLogEntry::EditEntries { .. })));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_creation_validates_the_winning_identity() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_id = format!("creation-race-{}", Uuid::new_v4());
+    let mut first = resumed_session_config(session_id.clone());
+    first.initializer = harnx_runtime::SessionInitializer::named("alpha", Default::default());
+    let mut second = resumed_session_config(session_id.clone());
+    second.initializer = harnx_runtime::SessionInitializer::named("beta", Default::default());
+
+    let (first, second) = tokio::join!(
+        NatsSession::new(
+            first,
+            client.clone(),
+            jetstream.clone(),
+            harnx_runtime::utils::create_abort_signal(),
+        ),
+        NatsSession::new(
+            second,
+            client,
+            jetstream.clone(),
+            harnx_runtime::utils::create_abort_signal(),
+        )
+    );
+    assert_ne!(
+        first.is_ok(),
+        second.is_ok(),
+        "exactly one identity must win"
+    );
+    let record = SessionMetadataStore::ensure(&jetstream, 1)
+        .await?
+        .get(&session_id)
+        .await?
+        .expect("winning metadata exists");
+    assert!(matches!(
+        record.metadata.agent,
+        SessionAgentSource::Named { ref name } if name == "alpha" || name == "beta"
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_creation_with_the_same_identity_reloads_the_winner() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_id = format!("same-identity-race-{}", Uuid::new_v4());
+    let config = resumed_session_config(session_id.clone());
+    let (first, second) = tokio::join!(
+        NatsSession::new(
+            config.clone(),
+            client.clone(),
+            jetstream.clone(),
+            harnx_runtime::utils::create_abort_signal(),
+        ),
+        NatsSession::new(
+            config,
+            client,
+            jetstream.clone(),
+            harnx_runtime::utils::create_abort_signal(),
+        )
+    );
+    assert!(first.is_ok(), "first creator failed: {:?}", first.err());
+    assert!(second.is_ok(), "race loser failed: {:?}", second.err());
+    assert!(SessionMetadataStore::ensure(&jetstream, 1)
+        .await?
+        .get(&session_id)
+        .await?
+        .is_some());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_creation_failure_leaves_the_transcript_empty() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_id = format!("invalid-metadata-{}", Uuid::new_v4());
+    let result = NatsSession::new(
+        NatsSessionConfig {
+            cluster: "test".to_string(),
+            initializer: harnx_runtime::SessionInitializer::named("", Default::default()),
+            session_id: Some(session_id.clone()),
+            activation_route: harnx_runtime::SessionActivationRoute::ClusterShared,
+        },
+        client,
+        jetstream.clone(),
+        harnx_runtime::utils::create_abort_signal(),
+    )
+    .await;
+    assert!(result.is_err(), "invalid metadata must reject construction");
+    assert!(NatsSessionLog::new(jetstream.clone(), &session_id)
+        .load_events_async()
+        .await?
+        .is_empty());
+    assert!(SessionMetadataStore::ensure(&jetstream, 1)
+        .await?
+        .get(&session_id)
+        .await?
+        .is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transcript_without_metadata_is_rejected_without_an_append() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_id = format!("legacy-headerless-{}", Uuid::new_v4());
+    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    log.append_event_async(&SessionLogEntry::Message {
+        id: Some(Uuid::new_v4().to_string()),
+        role: MessageRole::User,
+        content: MessageContent::Text("legacy prompt".to_string()),
+        timestamp: None,
+        fence_token: None,
+    })
+    .await?;
+
+    let result = NatsSession::new(
+        resumed_session_config(session_id.clone()),
+        client,
+        jetstream.clone(),
+        harnx_runtime::utils::create_abort_signal(),
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("metadata-less transcript must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("transcript entries but no canonical metadata"));
+    assert_eq!(log.load_events_async().await?.len(), 1);
+    assert!(SessionMetadataStore::ensure(&jetstream, 1)
+        .await?
+        .get(&session_id)
+        .await?
+        .is_none());
     Ok(())
 }

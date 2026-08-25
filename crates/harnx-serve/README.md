@@ -54,7 +54,7 @@ The AG-UI surface allows modern web interfaces to interact with `harnx` agents u
 
 Harnx session identity and AG-UI thread identity are deliberately separate.
 The `:session` path segment is the canonical short Harnx ID used by URLs, the
-NATS stream, and the session index. AG-UI's `ThreadId` type requires a UUID, so
+NATS stream, and canonical session metadata. AG-UI's `ThreadId` type requires a UUID, so
 `ag_ui::derive_thread_id` deterministically maps a short ID to UUID v5 at the
 wire boundary (and passes legacy UUID session IDs through). The derived UUID is
 never used as a persistence or routing key.
@@ -68,9 +68,27 @@ never used as a persistence or routing key.
 | `GET` | `/v1/agents/:agent/sessions` | `application/json` | List sessions for the agent. |
 | `POST` | `/v1/agents/:agent/sessions` | `application/json` | Reserve a canonical short session ID. |
 | `GET` | `/v1/agents/:agent/sessions/:session` | `application/json` | Session history in AG-UI format. |
+| `GET` | `/v1/agents/:agent/sessions/:session/metadata` | `application/json` | Read redacted canonical session metadata. |
+| `PATCH` | `/v1/agents/:agent/sessions/:session/metadata` | `application/json` | Update title, variables, or explicit session overrides. |
+| `PUT` | `/v1/agents/:agent/sessions/:session/metadata/extensions/:namespace` | `application/json` | Atomically replace one extension namespace. |
+| `DELETE` | `/v1/agents/:agent/sessions/:session/metadata/extensions/:namespace` | `application/json` | Delete one extension namespace. |
 | `GET` | `/v1/agents/:agent/sessions/:session/events` | `Accept: text/event-stream` | Notify passive clients when any frontend updates the session. |
 | `POST` | `/v1/agents/:agent/sessions/:session` | `Accept: text/event-stream` | **Subscription Plane**: SSE event stream. |
 | `POST` | `/v1/agents/:agent/sessions/:session` | `Content-Type: application/json` | **Control Plane**: JSON-RPC 2.0 interface. |
+
+### Canonical session metadata
+
+The metadata response contains immutable session/agent identity, creation and
+activity timestamps, title state, explicit overrides, extension namespaces,
+and the current KV revision. Variable values and inline agent instructions are
+redacted; variables are represented by name and whether a value is set.
+
+`PATCH` accepts a typed object containing any of `title`, `variables`, and
+`overrides`. Identity, agent source, and creation time cannot be changed. A
+title can be cleared with `{"title":{"value":null}}`. Extension `PUT` replaces
+one namespace as a single CAS update; namespaces are limited to 64 KiB and the
+combined extension map to 256 KiB. Successful writes publish a session
+invalidation advisory so attached clients can reload authoritative state.
 
 ## AG-UI Support (Phase 2)
 
@@ -196,7 +214,7 @@ Intentionally dropped today:
 - `Notice::Info` / `Notice::Warning` — not currently emitted in server flows worth surfacing; omitted to avoid custom-event spam.
 ## Operational Notes
 
-- **Persistence and `--dry-run`:** NATS transcript writes are skipped in `--dry-run` mode. A generated session ID is still reserved in the NATS session index.
+- **Persistence and `--dry-run`:** NATS transcript writes are skipped in `--dry-run` mode. A generated session ID is still reserved with canonical NATS session metadata.
 - **Durable Refresh:** History reflects the latest durably appended log entries.
   Live notifications are advisory; clients reload the authoritative transcript
   after each notification and on reconnect.

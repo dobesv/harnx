@@ -21,7 +21,8 @@ use harnx_runtime::{
     config::Config,
     nats_hook_provider::{HookDispatchMeta, NatsHookProvider},
     nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease},
-    nats_session_log::{load_session_from_entries, NatsSessionLog},
+    nats_session_log::NatsSessionLog,
+    nats_session_metadata::{SessionMetadata, SessionMetadataStore},
     nats_worker::{run_agent_loop_with_nats, NatsSessionLogBackend, RunAgentLoopArgs},
     utils::create_abort_signal,
 };
@@ -78,37 +79,22 @@ fn write_test_agents(config_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn session_header(session_id: &str) -> harnx_core::session::SessionLogEntry {
-    harnx_core::session::SessionLogEntry::Header {
-        model_id: "test-model".to_string(),
-        temperature: None,
-        top_p: None,
-        use_tools: None,
-        compress_threshold: None,
-        agent_name: None,
-        session_id: Some(session_id.to_string()),
-        working_dir: None,
-        git_branch: None,
-        git_remote: None,
-        terminal_session_id: None,
-        agent_variables: Default::default(),
-        agent_instructions: String::new(),
-        model_fallbacks: vec![],
-        compaction_agent: None,
-    }
-}
-
 async fn seed_session_and_attach_runtime(
     global_config: &Arc<RwLock<Config>>,
     jetstream: async_nats::jetstream::Context,
     session_id: &str,
 ) -> Result<NatsSessionLog> {
-    let backend = NatsSessionLogBackend::new(jetstream.clone(), session_id);
-    backend.append_event_blocking(&session_header(session_id))?;
+    let metadata_store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let metadata = SessionMetadata::new(
+        session_id,
+        harnx_runtime::SessionInitializer::named("alpha", Default::default()),
+    );
+    metadata_store.create(&metadata).await?;
+    let backend = NatsSessionLogBackend::new(jetstream.clone(), session_id)
+        .with_metadata_store(Some(metadata_store));
 
     let log = NatsSessionLog::new(jetstream, session_id);
-    let entries = log.load_events_async().await?;
-    let mut session = load_session_from_entries(&entries, session_id)?;
+    let mut session = metadata.base_session();
     let runtime = std::sync::Arc::new(backend.clone())
         as std::sync::Arc<dyn harnx_runtime::config::session::SessionAppendSink>;
     session.runtime = Some(std::sync::Arc::new(runtime));
@@ -284,6 +270,7 @@ async fn handoff_to_agent_with_hooks_starts_its_hook_enforcement() -> Result<()>
     let session_id = "handoff-hooks-root";
     let env = setup_test_env(server.url())?;
     let (config, js) = build_activated_config(&env, session_id).await?;
+    let metadata_store = SessionMetadataStore::ensure(&js, 1).await?;
 
     let lease = Arc::new(
         NatsSessionLease::acquire(NatsLeaseAcquireParams {
@@ -292,7 +279,7 @@ async fn handoff_to_agent_with_hooks_starts_its_hook_enforcement() -> Result<()>
             worker_id: "worker-handoff-hooks".to_string(),
             generation: 1,
             config: NatsLeaseConfig::default(),
-            session_index: None,
+            session_metadata: Some(metadata_store.clone()),
         })
         .await?
         .expect("acquire"),
@@ -312,8 +299,7 @@ async fn handoff_to_agent_with_hooks_starts_its_hook_enforcement() -> Result<()>
         lease: Some(lease),
         lease_config: NatsLeaseConfig::default(),
         after_seq_observer: None,
-        header_insert_observer: None,
-        session_index: None,
+        session_metadata: Some(&metadata_store),
         on_tool_round: None,
         working_dir: None,
     })

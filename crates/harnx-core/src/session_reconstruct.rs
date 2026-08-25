@@ -238,12 +238,6 @@ pub fn active_context_window<T: PhysicalSessionEntry>(entries: &[T]) -> ActiveCo
         .iter()
         .rposition(|entry| is_context_boundary(entry.entry()));
     match boundary_index {
-        Some(index) if matches!(entries[index].entry(), SessionLogEntry::Header { .. }) => {
-            ActiveContextWindow {
-                entries: &entries[index..],
-                boundary_index: Some(index),
-            }
-        }
         Some(index) => ActiveContextWindow {
             entries: &entries[index + 1..],
             boundary_index: Some(index),
@@ -256,10 +250,7 @@ pub fn active_context_window<T: PhysicalSessionEntry>(entries: &[T]) -> ActiveCo
 }
 
 fn is_context_boundary(entry: &SessionLogEntry) -> bool {
-    matches!(
-        entry,
-        SessionLogEntry::Header { .. } | SessionLogEntry::Compress { .. }
-    )
+    matches!(entry, SessionLogEntry::Compress { .. })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1183,47 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn active_context_window_includes_header_boundary_as_logical_zero() {
-        let entries = vec![
-            (10_u64, header_entry()),
-            (11, user_message("u1")),
-            (12, final_assistant("a1")),
-        ];
-
-        let window = active_context_window(&entries);
-        let logical_entries: Vec<_> = window.logical_entries().collect();
-
-        assert_eq!(window.boundary_index(), Some(0));
-        assert_eq!(window.entries().len(), 3);
-        assert_eq!(
-            logical_entries,
-            vec![
-                LogicalEntryRef {
-                    logical_index: 0,
-                    physical_seq: 10
-                },
-                LogicalEntryRef {
-                    logical_index: 1,
-                    physical_seq: 11
-                },
-                LogicalEntryRef {
-                    logical_index: 2,
-                    physical_seq: 12
-                },
-            ]
-        );
-        assert_eq!(window.physical_seq_for_logical(0), Some(10));
-        assert_eq!(window.physical_seq_for_logical(1), Some(11));
-        assert!(window.is_protected_logical_index(0));
-        assert!(!window.is_protected_logical_index(1));
-        assert_eq!(
-            window.logical_indices_for_physical(10).collect::<Vec<_>>(),
-            vec![0]
-        );
-    }
-
-    #[test]
-    fn active_context_window_uses_whole_log_when_headerless() {
+    fn active_context_window_uses_whole_log_without_compaction() {
         let entries = vec![(0_usize, user_message("u1")), (1, final_assistant("a1"))];
 
         let window = active_context_window(&entries);
@@ -1252,8 +1203,7 @@ mod tests {
     #[test]
     fn active_context_window_starts_after_most_recent_compress() {
         let entries = vec![
-            (20_u64, header_entry()),
-            (21, user_message("u1")),
+            (21_u64, user_message("u1")),
             (22, final_assistant("a1")),
             (
                 30,
@@ -1268,7 +1218,7 @@ mod tests {
         let window = active_context_window(&entries);
         let logical_entries: Vec<_> = window.logical_entries().collect();
 
-        assert_eq!(window.boundary_index(), Some(3));
+        assert_eq!(window.boundary_index(), Some(2));
         assert_eq!(window.entries().len(), 2);
         assert_eq!(
             logical_entries,
@@ -1293,8 +1243,7 @@ mod tests {
     #[test]
     fn active_context_window_preserves_many_logical_entries_for_one_physical_seq() {
         let entries = vec![
-            (40_u64, header_entry()),
-            (50, user_message("u1")),
+            (50_u64, user_message("u1")),
             (
                 51,
                 SessionLogEntry::EditEntries {
@@ -1312,13 +1261,13 @@ mod tests {
         let window = active_context_window(&effective);
         let logical_entries: Vec<_> = window.logical_entries().collect();
 
-        assert_eq!(window.boundary_index(), Some(0));
+        assert_eq!(window.boundary_index(), None);
         assert_eq!(
             logical_entries,
             vec![
                 LogicalEntryRef {
                     logical_index: 0,
-                    physical_seq: 40
+                    physical_seq: 51
                 },
                 LogicalEntryRef {
                     logical_index: 1,
@@ -1328,39 +1277,15 @@ mod tests {
                     logical_index: 2,
                     physical_seq: 51
                 },
-                LogicalEntryRef {
-                    logical_index: 3,
-                    physical_seq: 51
-                },
             ]
         );
+        assert_eq!(window.physical_seq_for_logical(0), Some(51));
         assert_eq!(window.physical_seq_for_logical(1), Some(51));
         assert_eq!(window.physical_seq_for_logical(2), Some(51));
-        assert_eq!(window.physical_seq_for_logical(3), Some(51));
         assert_eq!(
             window.logical_indices_for_physical(51).collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            vec![0, 1, 2]
         );
-    }
-
-    fn header_entry() -> SessionLogEntry {
-        SessionLogEntry::Header {
-            model_id: "model".to_string(),
-            temperature: None,
-            top_p: None,
-            use_tools: None,
-            compress_threshold: None,
-            agent_name: None,
-            session_id: None,
-            working_dir: None,
-            git_branch: None,
-            git_remote: None,
-            terminal_session_id: None,
-            agent_variables: Default::default(),
-            agent_instructions: String::new(),
-            model_fallbacks: vec![],
-            compaction_agent: None,
-        }
     }
 
     fn cancel(fence_token: u64) -> SessionLogEntry {

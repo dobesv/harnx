@@ -219,6 +219,46 @@ async fn apply_session_arg(config: &GlobalConfig, cli: &Cli) -> Result<()> {
     config.write().use_session(Some(&session))
 }
 
+async fn activate_cli_agent(
+    config: &GlobalConfig,
+    cli: &Cli,
+    agent: &str,
+    abort_signal: &AbortSignal,
+) -> Result<()> {
+    config.write().agent_variables = collect_agent_variables(&cli.agent_variable)?;
+
+    // A bare --session must reserve its canonical metadata only after the
+    // requested agent is active. Reserving first would snapshot the
+    // pre-activation (usually temporary inline) configuration and make the
+    // immutable identity disagree with the first turn.
+    let result = async {
+        if command_only_needs_supplied_session(cli) {
+            let session = cli.session.as_ref().and_then(Option::as_deref);
+            return Config::use_agent(config, agent, session, abort_signal.clone()).await;
+        }
+        match cli.session.as_ref() {
+            Some(None) => {
+                Config::use_agent(config, agent, None, abort_signal.clone()).await?;
+                let session_id = Config::reserve_new_session_id(config).await?;
+                config.write().use_session(Some(&session_id))
+            }
+            Some(Some(session)) => {
+                Config::use_agent(config, agent, Some(session), abort_signal.clone()).await
+            }
+            None => Config::use_agent(config, agent, None, abort_signal.clone()).await,
+        }
+    }
+    .await;
+
+    // Local agents copy these values into their active Agent. Remote agents
+    // have no local Agent object, so retain the values until their lazy NATS
+    // metadata initialization snapshots them.
+    if config.read().remote_agent.is_none() {
+        config.write().agent_variables = None;
+    }
+    result
+}
+
 fn spawn_remote_session_cleanup(config: &GlobalConfig) {
     let Some(days) = config
         .read()
@@ -310,20 +350,7 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     }
 
     if let Some(agent) = &cli.agent {
-        // cli.session is Option<Option<String>>:
-        //   None          → --session not provided; no session
-        //   Some(None)    → bare --session flag; generate a new session ID
-        //   Some(Some(s)) → --session <id>; use that ID
-        let session = if command_only_needs_supplied_session(&cli) {
-            cli.session.as_ref().and_then(Clone::clone)
-        } else {
-            resolve_session_arg(&config, cli.session.as_ref()).await?
-        };
-        config.write().agent_variables = collect_agent_variables(&cli.agent_variable)?;
-
-        let ret = Config::use_agent(&config, agent, session.as_deref(), abort_signal.clone()).await;
-        config.write().agent_variables = None;
-        ret?;
+        activate_cli_agent(&config, &cli, agent, &abort_signal).await?;
     } else {
         if let Some(prompt) = &cli.prompt {
             config.write().use_prompt(prompt)?;
@@ -601,10 +628,14 @@ async fn start_directive(
     )
     .await?;
 
+    let initializer = {
+        let config = config.read();
+        harnx_runtime::SessionInitializer::named_from_config(agent, &config)
+    };
     let session = harnx_runtime::NatsSession::from_global_config(
         harnx_runtime::NatsSessionConfig {
             cluster,
-            agent,
+            initializer,
             session_id,
             activation_route,
         },
@@ -964,10 +995,6 @@ mod tests_list_sessions_routing {
             SessionMeta {
                 id: "session-1".to_string(),
                 session_id: Some("session-1".to_string()),
-                working_dir: None,
-                git_branch: None,
-                git_remote: None,
-                terminal_session_id: None,
                 agent_name: None,
                 title: None,
                 modified: None,
@@ -975,10 +1002,6 @@ mod tests_list_sessions_routing {
             SessionMeta {
                 id: "session-2".to_string(),
                 session_id: Some("session-2".to_string()),
-                working_dir: None,
-                git_branch: None,
-                git_remote: None,
-                terminal_session_id: None,
                 agent_name: None,
                 title: None,
                 modified: None,
@@ -1002,10 +1025,6 @@ mod tests_list_sessions_routing {
         let sessions = [SessionMeta {
             id: "only-session".to_string(),
             session_id: Some("only-session".to_string()),
-            working_dir: None,
-            git_branch: None,
-            git_remote: None,
-            terminal_session_id: None,
             agent_name: None,
             title: None,
             modified: None,
@@ -1030,10 +1049,6 @@ mod tests_list_sessions_routing {
             SessionMeta {
                 id: "sess-a".to_string(),
                 session_id: Some("sess-a".to_string()),
-                working_dir: None,
-                git_branch: None,
-                git_remote: None,
-                terminal_session_id: None,
                 agent_name: None,
                 title: None,
                 modified: None,
@@ -1041,10 +1056,6 @@ mod tests_list_sessions_routing {
             SessionMeta {
                 id: "sess-b".to_string(),
                 session_id: Some("sess-b".to_string()),
-                working_dir: None,
-                git_branch: None,
-                git_remote: None,
-                terminal_session_id: None,
                 agent_name: None,
                 title: None,
                 modified: None,

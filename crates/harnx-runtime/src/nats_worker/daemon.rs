@@ -4,7 +4,7 @@ use super::daemon_background::launch_worker_services;
 use super::daemon_runtime::WorkerRuntime;
 use crate::config::{GlobalConfig, LOCAL_CLUSTER_KEY};
 use crate::nats_lease::NatsSessionLease;
-use crate::nats_session_index;
+use crate::nats_session_metadata::SessionMetadataStore;
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, consumer::pull};
 use futures_util::StreamExt;
@@ -36,7 +36,7 @@ pub(super) struct WorkerStartup {
     pub(super) client: async_nats::Client,
     pub(super) consumer: jetstream::consumer::Consumer<pull::Config>,
     /// JetStream replica count for the daemon connection, resolved once here so
-    /// every bucket this worker creates (leases, session index, tool/hook
+    /// every bucket this worker creates (leases, session metadata, tool/hook
     /// registries) agrees on it instead of drifting to a per-site default.
     pub(super) replicas: usize,
     pub(super) identity: crate::worker_identity::WorkerReadiness,
@@ -94,20 +94,99 @@ async fn connect_worker(
     Ok((jetstream, client, replicas))
 }
 
-pub(super) async fn optional_session_index(
+pub(super) async fn ensure_session_metadata(
     jetstream: &jetstream::Context,
     replicas: usize,
-) -> Option<async_nats::jetstream::kv::Store> {
-    match nats_session_index::ensure_index_bucket(jetstream, replicas).await {
-        Ok(store) => Some(store),
-        Err(error) => {
-            log::warn!(
-                "session index disabled: failed to ensure harnx_sessions index bucket: {:#}",
-                error
-            );
-            None
+) -> Result<SessionMetadataStore> {
+    SessionMetadataStore::ensure(jetstream, replicas)
+        .await
+        .context("failed to ensure canonical harnx_sessions metadata bucket")
+}
+
+fn load_session_agent(
+    per_session: &GlobalConfig,
+    metadata: &crate::nats_session_metadata::SessionMetadata,
+) -> Result<crate::config::Agent> {
+    use crate::nats_session_metadata::SessionAgentSource;
+
+    let mut agent = match &metadata.agent {
+        SessionAgentSource::Named { name } => {
+            let mut agent = per_session
+                .read()
+                .retrieve_agent(name)
+                .with_context(|| format!("load named session agent '{name}'"))?;
+            crate::config::agent::resolve_file_defaults(&mut agent)
+                .with_context(|| format!("resolve file-backed variables for agent '{name}'"))?;
+            let variables = crate::config::agent::require_agent_variables(
+                agent.defined_variables(),
+                &metadata.variables,
+            )
+            .with_context(|| format!("initialize variables for agent '{name}'"))?;
+            agent.set_shared_variables(variables);
+            agent
         }
+        SessionAgentSource::Inline { instructions } => crate::config::Agent::new(
+            harnx_core::agent_config::AgentConfig::from_prompt(instructions),
+        ),
+    };
+    if agent.defined_variables().is_empty() {
+        agent.set_shared_variables(metadata.variables.clone());
     }
+    Ok(agent)
+}
+
+fn apply_session_overrides(
+    config: &mut crate::config::Config,
+    overrides: &crate::nats_session_metadata::SessionOverrides,
+) -> Result<()> {
+    apply_model_overrides(config, overrides)?;
+    apply_tool_overrides(config, overrides)?;
+    apply_limit_overrides(config, overrides)
+}
+
+fn apply_model_overrides(
+    config: &mut crate::config::Config,
+    overrides: &crate::nats_session_metadata::SessionOverrides,
+) -> Result<()> {
+    if let Some(model) = &overrides.model {
+        config.set_model(model)?;
+    }
+    if let Some(temperature) = overrides.temperature {
+        config.set_temperature(Some(temperature));
+    }
+    if let Some(top_p) = overrides.top_p {
+        config.set_top_p(Some(top_p));
+    }
+    Ok(())
+}
+
+fn apply_tool_overrides(
+    config: &mut crate::config::Config,
+    overrides: &crate::nats_session_metadata::SessionOverrides,
+) -> Result<()> {
+    if let Some(use_tools) = &overrides.use_tools {
+        config.set_use_tools(Some(use_tools.clone()));
+    }
+    if !overrides.model_fallbacks.is_empty() {
+        config.set_model_fallbacks(overrides.model_fallbacks.clone());
+    }
+    Ok(())
+}
+
+fn apply_limit_overrides(
+    config: &mut crate::config::Config,
+    overrides: &crate::nats_session_metadata::SessionOverrides,
+) -> Result<()> {
+    if let Some(threshold) = overrides.compress_threshold {
+        config.set_compress_threshold(Some(threshold));
+    }
+    if let Some(compaction_agent) = &overrides.compaction_agent {
+        config.set_compaction_agent(Some(compaction_agent.clone()));
+    }
+    if let Some(max_output_tokens) = overrides.max_output_tokens {
+        config.set_max_output_tokens(Some(max_output_tokens));
+    }
+    Ok(())
 }
 
 /// Install the activation's agent into the per-session config.
@@ -118,35 +197,20 @@ pub(super) async fn optional_session_index(
 /// an agent like `pantheon/sisyphus` fails with an undefined value on its
 /// first render.
 ///
-/// An agent the worker simply does not have is not fatal — the session falls
-/// back to the worker's own configuration, as it has always done. Anything
-/// else is: an agent whose file is present but unreadable, unparseable, or
-/// names a model the worker cannot resolve must not silently answer as some
-/// other agent.
+/// A missing or invalid named agent is fatal; workers never substitute their
+/// own active configuration for the session's immutable identity.
 ///
 /// `pub(super)`: also used by `server_reconciler::tool_servers_for_activation`
 /// to resolve which servers a session's agent needs, on a throwaway config
 /// clone, before the real per-session config below is built.
-pub(super) fn install_activation_agent(per_session: &GlobalConfig, agent_name: &str) -> Result<()> {
-    let retrieved = per_session.read().retrieve_agent(agent_name);
-    let mut agent = match retrieved {
-        Ok(agent) => agent,
-        // No file and no built-in by this name: nothing to load.
-        Err(error) if !crate::config::Config::agent_file(agent_name).exists() => {
-            log::warn!(
-                "activation agent '{agent_name}' not available, using worker config: {error:#}"
-            );
-            return Ok(());
-        }
-        Err(error) => return Err(error).context(format!("load agent '{agent_name}'")),
-    };
-    crate::config::agent::resolve_file_defaults(&mut agent)
-        .with_context(|| format!("resolve file-backed variables for agent '{agent_name}'"))?;
+pub(super) fn install_session_metadata_agent(
+    per_session: &GlobalConfig,
+    metadata: &crate::nats_session_metadata::SessionMetadata,
+) -> Result<()> {
+    let agent = load_session_agent(per_session, metadata)?;
     let mut cfg = per_session.write();
-    cfg.use_agent_obj(agent)
-        .with_context(|| format!("activate agent '{agent_name}'"))?;
-    cfg.require_agent_shared_variables()
-        .with_context(|| format!("initialize variables for agent '{agent_name}'"))
+    cfg.use_agent_obj(agent).context("activate session agent")?;
+    apply_session_overrides(&mut cfg, &metadata.overrides)
 }
 
 /// Run a worker daemon: pull `SessionActivate` notifications, claim each via a
@@ -187,7 +251,7 @@ pub async fn run_worker_daemon(
         identity: startup.identity.clone(),
         lease: daemon.lease,
         jetstream: startup.jetstream,
-        session_index: services.session_index,
+        session_metadata: services.session_metadata,
         client: startup.client,
         call_fn,
         generation: AtomicU64::new(1),

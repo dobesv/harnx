@@ -45,7 +45,10 @@ impl SubagentSessionRoute {
     fn session_config(&self, agent: &str, session_id: Option<String>) -> NatsSessionConfig {
         NatsSessionConfig {
             cluster: self.cluster.clone(),
-            agent: agent.to_string(),
+            initializer: crate::SessionInitializer::named(
+                agent,
+                harnx_core::agent_config::AgentVariables::default(),
+            ),
             session_id,
             activation_route: self.activation.clone(),
         }
@@ -643,7 +646,7 @@ mod tests {
         let config = route.session_config("helper", Some("child".to_string()));
 
         assert_eq!(config.cluster, "__local__");
-        assert_eq!(config.agent, "helper");
+        assert_eq!(config.initializer.agent_name(), Some("helper"));
         assert_eq!(config.session_id.as_deref(), Some("child"));
         assert_eq!(config.activation_route, activation);
     }

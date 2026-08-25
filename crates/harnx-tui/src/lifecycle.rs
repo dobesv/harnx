@@ -15,9 +15,7 @@ use crossterm::event::{
 use crossterm::terminal::{enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen};
 use crossterm::ExecutableCommand;
 use harnx_core::message::Message;
-use harnx_runtime::config::{
-    build_picker_context, list_assistant_agents, sort_sessions_for_picker,
-};
+use harnx_runtime::config::{list_assistant_agents, sort_sessions_for_picker};
 use harnx_runtime::config::{GlobalConfig, SessionMeta};
 use harnx_runtime::tool::ToolDeclaration;
 use harnx_runtime::utils::create_abort_signal;
@@ -254,8 +252,7 @@ impl Tui {
         if config.read().session.is_none() {
             let (sessions, fetch_error) = Self::picker_sessions(config).await;
 
-            let ctx = build_picker_context(None);
-            let sorted = sort_sessions_for_picker(sessions, &ctx);
+            let sorted = sort_sessions_for_picker(sessions);
             // Always show picker when agent active but no session — even empty list
             // because picker now always has a "New session" first item
             let origin_agent = config.read().agent.as_ref().map(|a| a.name().to_string());

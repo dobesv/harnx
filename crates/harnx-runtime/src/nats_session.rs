@@ -49,6 +49,7 @@ use std::sync::Arc;
 
 use crate::nats_event_sink::SessionEventStream;
 use crate::nats_session_log::NatsSessionLog;
+use crate::nats_session_metadata::{SessionInitializer, SessionMetadata, SessionMetadataStore};
 use crate::nats_worker::{
     new_remote_session_id, publish_control_command, publish_session_activate,
     publish_targeted_session_activate, ControlCommand, LocalWorkerTarget, SessionActivate,
@@ -158,8 +159,9 @@ impl OrphanWatchdog {
 pub struct NatsSessionConfig {
     /// Cluster key (from AgentRef::Remote { cluster, ... }).
     pub cluster: String,
-    /// Agent name (from AgentRef::Remote { agent, ... }).
-    pub agent: String,
+    /// Immutable identity and initial persisted values for a named or inline
+    /// session. Existing sessions validate only the immutable agent source.
+    pub initializer: SessionInitializer,
     /// Existing session ID to resume/attach (None = new session).
     pub session_id: Option<String>,
     /// Where turn activations are dispatched. History access remains tied only
@@ -171,6 +173,42 @@ pub struct NatsSessionConfig {
 pub(crate) enum RequestedSeqStatus {
     Pending,
     Covered,
+}
+
+async fn ensure_session_metadata(
+    store: &SessionMetadataStore,
+    jetstream: &jetstream::Context,
+    session_id: &str,
+    initializer: &SessionInitializer,
+) -> Result<()> {
+    if let Some(record) = store.get(session_id).await? {
+        record.metadata.validate_initializer(initializer)?;
+        store.ensure_reserved_activity(session_id).await?;
+        return Ok(());
+    }
+
+    let log = NatsSessionLog::new(jetstream.clone(), session_id.to_string());
+    let existing_entries = log
+        .load_events_async()
+        .await
+        .context("failed to inspect transcript before creating session metadata")?;
+    anyhow::ensure!(
+        existing_entries.is_empty(),
+        "session '{session_id}' has transcript entries but no canonical metadata; legacy or inconsistent sessions are not supported"
+    );
+
+    let metadata = SessionMetadata::new(session_id, initializer.clone());
+    if store.create(&metadata).await?.is_some() {
+        return Ok(());
+    }
+
+    // Another client won the create race. Its immutable identity must agree
+    // with ours before either client is allowed to append a first message.
+    let winner = store.get(session_id).await?.with_context(|| {
+        format!("session metadata creation race for '{session_id}' had no winner")
+    })?;
+    winner.metadata.validate_initializer(initializer)?;
+    store.ensure_reserved_activity(session_id).await
 }
 
 /// Determine whether a durable request still needs worker execution.
@@ -232,6 +270,7 @@ pub struct NatsSession {
     jetstream: jetstream::Context,
     client: async_nats::Client,
     abort_signal: AbortSignal,
+    metadata_store: SessionMetadataStore,
 }
 
 impl NatsSession {
@@ -253,12 +292,24 @@ impl NatsSession {
             .clone()
             .unwrap_or_else(new_remote_session_id);
 
+        let metadata_store = SessionMetadataStore::ensure(&jetstream, 1)
+            .await
+            .context("failed to open canonical session metadata store")?;
+        ensure_session_metadata(
+            &metadata_store,
+            &jetstream,
+            &session_id,
+            &config.initializer,
+        )
+        .await?;
+
         Ok(Self {
             config,
             session_id,
             jetstream,
             client,
             abort_signal,
+            metadata_store,
         })
     }
 
@@ -276,7 +327,24 @@ impl NatsSession {
             .context("failed to connect to NATS cluster")?;
         let jetstream = async_nats::jetstream::new(client.clone());
 
-        Self::new(config, client, jetstream, abort_signal).await
+        let nats_session = Self::new(config, client, jetstream, abort_signal).await?;
+
+        // Front-end dot commands mutate the active Config session synchronously.
+        // Give that in-memory session a metadata-capable sink so `.model`,
+        // `.set`, and title changes commit through CAS before local state moves.
+        let backend = crate::nats_worker::NatsSessionLogBackend::new(
+            nats_session.jetstream.clone(),
+            nats_session.session_id.clone(),
+        )
+        .with_metadata_store(Some(nats_session.metadata_store.clone()));
+        let sink = Arc::new(backend) as Arc<dyn crate::config::session::SessionAppendSink>;
+        if let Some(active_session) = global_config.write().session.as_mut() {
+            if active_session.id() == nats_session.session_id {
+                active_session.runtime = Some(Arc::new(sink));
+            }
+        }
+
+        Ok(nats_session)
     }
 
     /// Get the session ID.
@@ -286,6 +354,10 @@ impl NatsSession {
 
     pub(crate) fn jetstream(&self) -> &jetstream::Context {
         &self.jetstream
+    }
+
+    pub fn metadata_store(&self) -> &SessionMetadataStore {
+        &self.metadata_store
     }
 
     /// Run a turn: append user message, activate worker, stream events until completion.
@@ -358,7 +430,7 @@ impl NatsSession {
         // Step 3: Publish activation to wake a worker.
         match &self.config.activation_route {
             SessionActivationRoute::ClusterShared => {
-                let activation = SessionActivate::new(&self.session_id, &self.config.agent);
+                let activation = SessionActivate::new(&self.session_id);
                 publish_session_activate(&self.jetstream, &self.config.cluster, &activation)
                     .await
                     .context("failed to publish session activation")?;
@@ -367,12 +439,8 @@ impl NatsSession {
                 session_scope,
                 worker_id,
             } => {
-                let activation = SessionActivate::targeted(
-                    &self.session_id,
-                    &self.config.agent,
-                    user_msg_seq,
-                    worker_id,
-                );
+                let activation =
+                    SessionActivate::targeted(&self.session_id, user_msg_seq, worker_id);
                 publish_targeted_session_activate(
                     &self.jetstream,
                     LocalWorkerTarget::new(session_scope, worker_id)?,
@@ -384,9 +452,8 @@ impl NatsSession {
         }
 
         log::info!(
-            "nats session: published activation session_id={} agent={} cluster={}",
+            "nats session: published activation session_id={} cluster={}",
             self.session_id,
-            self.config.agent,
             self.config.cluster
         );
 
@@ -889,25 +956,15 @@ fn render_log_entry_to_sink(
             render_error_entry(message, &sink);
             false
         }
-        SessionLogEntry::Header { .. }
-        | SessionLogEntry::DataUrls { .. }
+        SessionLogEntry::DataUrls { .. }
         | SessionLogEntry::Compress { .. }
-        | SessionLogEntry::Title { .. }
         | SessionLogEntry::TurnEnd { .. }
         | SessionLogEntry::Clear
         | SessionLogEntry::EditEntries { .. }
         | SessionLogEntry::Rewind { .. }
         | SessionLogEntry::Unknown => false,
     };
-    // Only emit logical seqs during replay when the window has a Header/Compress
-    // boundary. A headerless-origin remote session has no boundary at replay
-    // time (the worker inserts the Header via migration only AFTER activation),
-    // so any replay-time number would be wrong and — because the TUI never
-    // overrides a `Some(seq)` — would permanently mis-label the row. In that
-    // case seq assignment is deferred to the post-migration reload pass
-    // (`emit_all_logical_seqs_for_window`). An already-headered session (resume)
-    // has a boundary and numbers replayed rows immediately here.
-    if rendered && history_window.boundary_index().is_some() {
+    if rendered {
         for logical_index in logical_indices_for_entry(physical_seq, entry, history_window) {
             sink.emit(AgentEvent::Session(SessionEvent::LogSeqAssigned {
                 seq: logical_index,
@@ -956,11 +1013,10 @@ fn flush_pending_advisories(
         None => None,
     };
     while let Some(envelope) = pending_advisories.pop_front() {
-        // `after_seq` may point at a physical mutation entry (for example the
-        // worker's header EditEntries append) that reconstruction intentionally
-        // removes. Sequence decoration is therefore best-effort; never hold a
-        // live streaming advisory forever merely because that physical seq has
-        // no effective logical entry.
+        // `after_seq` may point at a physical mutation entry that reconstruction
+        // intentionally removes. Sequence decoration is therefore best-effort;
+        // never hold a live streaming advisory forever merely because that
+        // physical seq has no effective logical entry.
         if let Some(window) = &window {
             let _ = emit_live_logical_seq_for_physical(
                 envelope.after_seq,
@@ -978,19 +1034,9 @@ fn flush_pending_advisories(
     }
 }
 
-/// Assign logical `LogSeqAssigned` seqs for every renderable row in the
-/// post-migration active window, deduped.
-///
-/// Remote sessions start headerless; the worker inserts the Header via an
-/// `EditEntries` migration only AFTER activation (S2). Replay renders the
-/// historical rows BEFORE that migration, when the window has no boundary and
-/// logical numbers are not yet authoritative — so replay defers seq emission
-/// (see `render_log_entry_to_sink`). This pass runs on each post-activation
-/// durable reload: once the effective log carries a Header/Compress boundary,
-/// it emits the FINAL logical index for each renderable row (replayed history
-/// rows AND the just-submitted live user), exactly once via the shared dedup
-/// set. The TUI backfills each `seq: None` row with its number and never
-/// overrides it, so emitting the correct number once is essential.
+/// Assign logical `LogSeqAssigned` seqs for every renderable row in the active
+/// window, deduped. Metadata lives outside the transcript, so an uncompacted
+/// transcript is authoritative from its first physical user entry.
 ///
 /// Live worker rows (streamed assistant/tool events) are numbered via advisory
 /// translation; the shared dedup set keeps this pass and that path consistent.
@@ -1003,13 +1049,8 @@ fn emit_all_logical_seqs_for_window(
         return;
     };
     let window = active_context_window(effective_entries);
-    // Wait for the header-insert migration to land: no boundary means the
-    // numbering isn't authoritative yet.
-    if window.boundary_index().is_none() {
-        return;
-    }
-    // The logical index of a row is its position WITHIN the active window
-    // (Header/Compress boundary = 0). Iterate the window slice directly so the
+    // The logical index of a row is its position within the active window.
+    // Iterate the window slice directly so the
     // logical index stays aligned even when a boundary trims a pre-window prefix.
     for (logical_index, (_js_seq, entry)) in window.entries().iter().enumerate() {
         let renders = matches!(
@@ -1046,7 +1087,16 @@ pub(crate) fn logical_indices_for_entry(
         return logical_indices;
     }
     match entry {
-        SessionLogEntry::Message { role, .. } if role.is_user() => logical_indices,
+        SessionLogEntry::Message { role, .. } if role.is_user() => history_window
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(logical_index, (candidate_seq, candidate))| {
+                (*candidate_seq == physical_seq
+                    && matches!(candidate, SessionLogEntry::Message { role, .. } if role.is_user()))
+                .then_some(logical_index)
+            })
+            .collect(),
         _ => logical_indices.into_iter().rev().take(1).collect(),
     }
 }
@@ -1398,11 +1448,9 @@ mod tests {
         let window = active_context_window(&effective_history);
         replay_history_to_sink(&effective_history, &window, 3, sink.clone());
 
-        // This fixture is HEADERLESS (no boundary): replay RENDERS the two
-        // non-current rows but DEFERS seq emission (the worker will migrate a
-        // Header in; numbering is only authoritative post-migration). So we see
-        // 2 render events and ZERO LogSeqAssigned events.
-        assert_eq!(count.load(Ordering::SeqCst), 2);
+        // Metadata is outside the transcript, so the first user row is logical
+        // zero and sequence assignment is immediately authoritative.
+        assert_eq!(count.load(Ordering::SeqCst), 4);
         let rendered_messages: Vec<String> = sink
             .events
             .lock()
@@ -1428,52 +1476,25 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(
-            replayed_seqs.is_empty(),
-            "headerless replay defers seq emission until the migration boundary exists, got {replayed_seqs:?}"
-        );
+        assert_eq!(replayed_seqs, vec![0, 1]);
     }
 
     #[test]
-    fn test_replay_with_header_boundary_emits_row_seqs() {
+    fn test_replay_without_compaction_emits_row_seqs() {
         let count = Arc::new(AtomicUsize::new(0));
         let sink = Arc::new(TestSink {
             count: Arc::clone(&count),
             events: Mutex::new(Vec::new()),
         });
 
-        // Resume case: the log already carries a Header (boundary present), so
-        // replay numbers rows immediately. Header is logical 0 (renders no row);
-        // the first user is logical 1, the assistant logical 2. The current
-        // user (seq 4) is skipped from replay.
-        let mut effective_history = vec![(
-            1u64,
-            SessionLogEntry::Header {
-                model_id: "m".to_string(),
-                temperature: None,
-                top_p: None,
-                use_tools: None,
-                compress_threshold: None,
-                agent_name: Some("a".to_string()),
-                session_id: Some("s".to_string()),
-                working_dir: None,
-                git_branch: None,
-                git_remote: None,
-                terminal_session_id: None,
-                agent_variables: Default::default(),
-                agent_instructions: String::new(),
-                model_fallbacks: vec![],
-                compaction_agent: None,
-            },
-        )];
-        effective_history.extend(test_entries(&[
-            (2, MessageRole::User, "first user"),
-            (3, MessageRole::Assistant, "assistant"),
-            (4, MessageRole::User, "current user"),
-        ]));
+        let effective_history = test_entries(&[
+            (1, MessageRole::User, "first user"),
+            (2, MessageRole::Assistant, "assistant"),
+            (3, MessageRole::User, "current user"),
+        ]);
 
         let window = active_context_window(&effective_history);
-        replay_history_to_sink(&effective_history, &window, 4, sink.clone());
+        replay_history_to_sink(&effective_history, &window, 3, sink.clone());
 
         let replayed_seqs: Vec<usize> = sink
             .events
@@ -1485,7 +1506,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(replayed_seqs, vec![1, 2]);
+        assert_eq!(replayed_seqs, vec![0, 1]);
     }
 
     #[test]
@@ -1498,26 +1519,6 @@ mod tests {
         let sink_trait: Arc<dyn AgentEventSink> = sink.clone();
         let user_msg_id = "live-user".to_string();
         let effective_history = vec![
-            (
-                3,
-                SessionLogEntry::Header {
-                    model_id: "test-model".to_string(),
-                    temperature: None,
-                    top_p: None,
-                    use_tools: None,
-                    compress_threshold: None,
-                    agent_name: Some("test-agent".to_string()),
-                    session_id: Some("session".to_string()),
-                    working_dir: None,
-                    git_branch: None,
-                    git_remote: None,
-                    terminal_session_id: None,
-                    agent_variables: Default::default(),
-                    agent_instructions: String::new(),
-                    model_fallbacks: vec![],
-                    compaction_agent: None,
-                },
-            ),
             (
                 3,
                 SessionLogEntry::Message {
@@ -1557,9 +1558,8 @@ mod tests {
             &mut emitted_logical_seqs,
         );
 
-        // Window = [Header(0), legacy-user(1), live-user(2), assistant(3)].
-        // The Header renders no row; every message row is numbered by its
-        // logical position, deduped and in order.
+        // Every message row is numbered by its logical position, deduped and
+        // in order.
         let assigned_seqs: Vec<usize> = sink
             .events
             .lock()
@@ -1570,32 +1570,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(assigned_seqs, vec![1, 2, 3]);
+        assert_eq!(assigned_seqs, vec![0, 1, 2]);
     }
 
     #[test]
     fn test_logical_indices_for_entry_user_fans_out_shared_seq() {
         let effective_history = vec![
-            (
-                50,
-                SessionLogEntry::Header {
-                    model_id: "test-model".to_string(),
-                    temperature: None,
-                    top_p: None,
-                    use_tools: None,
-                    compress_threshold: None,
-                    agent_name: Some("test-agent".to_string()),
-                    session_id: Some("session".to_string()),
-                    working_dir: None,
-                    git_branch: None,
-                    git_remote: None,
-                    terminal_session_id: None,
-                    agent_variables: Default::default(),
-                    agent_instructions: String::new(),
-                    model_fallbacks: vec![],
-                    compaction_agent: None,
-                },
-            ),
             (
                 51,
                 SessionLogEntry::Message {
@@ -1629,11 +1609,11 @@ mod tests {
         ];
         let window = active_context_window(&effective_history);
 
-        let user_indices = logical_indices_for_entry(51, &effective_history[1].1, &window);
-        let assistant_indices = logical_indices_for_entry(51, &effective_history[3].1, &window);
+        let user_indices = logical_indices_for_entry(51, &effective_history[0].1, &window);
+        let assistant_indices = logical_indices_for_entry(51, &effective_history[2].1, &window);
 
-        assert_eq!(user_indices, vec![1, 2, 3]);
-        assert_eq!(assistant_indices, vec![3]);
+        assert_eq!(user_indices, vec![0, 1]);
+        assert_eq!(assistant_indices, vec![2]);
     }
     #[test]
     fn test_render_tool_results_entry() {

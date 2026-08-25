@@ -4,10 +4,9 @@
 #[allow(dead_code)]
 mod common;
 
-use harnx_core::{event::NullSink, require_nextest, session::SessionLogEntry};
+use harnx_core::{event::NullSink, require_nextest};
 use harnx_runtime::config::LOCAL_CLUSTER_KEY;
 use harnx_runtime::local_orchestrator::LocalWorkerSupervisor;
-use harnx_runtime::nats_session_log::NatsSessionLog;
 use harnx_runtime::nats_worker::{
     targeted_consumer_name, targeted_worker_ready_subject, LocalWorkerTarget,
 };
@@ -154,31 +153,10 @@ async fn assert_worker_completes_turn(
         .expect("connect to NATS");
     let jetstream = async_nats::jetstream::new(client.clone());
     let session_id = format!("local-supervisor-{}", uuid::Uuid::new_v4());
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
-    log.append_event_async(&SessionLogEntry::Header {
-        model_id: "mock:test".to_string(),
-        temperature: None,
-        top_p: None,
-        use_tools: Some(vec![]),
-        compress_threshold: None,
-        agent_name: Some("trivial".to_string()),
-        session_id: Some(session_id.clone()),
-        working_dir: None,
-        git_branch: None,
-        git_remote: None,
-        terminal_session_id: None,
-        agent_variables: Default::default(),
-        agent_instructions: "Complete the turn.".to_string(),
-        model_fallbacks: vec![],
-        compaction_agent: None,
-    })
-    .await
-    .expect("seed local session header");
-
     let session = NatsSession::new(
         NatsSessionConfig {
             cluster: LOCAL_CLUSTER_KEY.to_string(),
-            agent: "trivial".to_string(),
+            initializer: harnx_runtime::SessionInitializer::named("trivial", Default::default()),
             session_id: Some(session_id),
             activation_route: supervisor.route().activation_route(),
         },

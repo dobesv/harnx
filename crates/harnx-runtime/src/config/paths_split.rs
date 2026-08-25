@@ -46,10 +46,10 @@ impl Config {
         paths::rags_dir()
     }
 
-    /// Atomically reserve a short session ID in the NATS session index without
-    /// holding the configuration lock across network I/O. The reservation is
-    /// intentionally usable before a session log exists; the first worker turn
-    /// writes the canonical session header.
+    /// Atomically reserve a short session ID by creating its complete canonical
+    /// metadata record without holding the configuration lock across network
+    /// I/O. The reserved session may remain transcript-empty until its first
+    /// turn.
     pub async fn reserve_new_session_id(config: &GlobalConfig) -> Result<String> {
         const RESERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
         let config = config.read().clone();
@@ -61,13 +61,20 @@ impl Config {
     async fn reserve_new_session_id_inner(&self) -> Result<String> {
         const LOCAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
+        // Validate and snapshot the initializer before entering the local
+        // broker handoff retry loop. Configuration errors are deterministic;
+        // retrying them would turn an actionable failure into a timeout.
+        let initializer = crate::nats_session_metadata::SessionInitializer::from_config(self)?;
+
         let cluster = self
             .remote_agent
             .as_ref()
             .map(|(_, cluster)| cluster.as_str())
             .unwrap_or(LOCAL_CLUSTER_KEY);
         if cluster != LOCAL_CLUSTER_KEY {
-            return self.reserve_new_session_id_once(cluster).await;
+            return self
+                .reserve_new_session_id_once(cluster, &initializer)
+                .await;
         }
 
         // The embedded broker is owned by one of the connected processes. It
@@ -75,63 +82,59 @@ impl Config {
         // when that process exits, so rediscover and retry during that narrow
         // handoff rather than surfacing a transient no-responders error.
         loop {
-            match self.reserve_new_session_id_once(cluster).await {
+            match self
+                .reserve_new_session_id_once(cluster, &initializer)
+                .await
+            {
                 Ok(session_id) => return Ok(session_id),
                 Err(_) => tokio::time::sleep(LOCAL_RETRY_DELAY).await,
             }
         }
     }
 
-    async fn reserve_new_session_id_once(&self, cluster: &str) -> Result<String> {
+    async fn reserve_new_session_id_once(
+        &self,
+        cluster: &str,
+        initializer: &crate::nats_session_metadata::SessionInitializer,
+    ) -> Result<String> {
         const LOCAL_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
         let server = self.resolve_nats_server(cluster).await?;
         if cluster == LOCAL_CLUSTER_KEY {
             tokio::time::timeout(
                 LOCAL_OPERATION_TIMEOUT,
-                self.reserve_new_session_id_on_server(&server),
+                self.reserve_new_session_id_on_server(&server, initializer),
             )
             .await
             .context("Timed out reserving an ID on the shared local NATS server")?
         } else {
-            self.reserve_new_session_id_on_server(&server).await
+            self.reserve_new_session_id_on_server(&server, initializer)
+                .await
         }
     }
 
-    async fn reserve_new_session_id_on_server(&self, server: &NatsServerConfig) -> Result<String> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
+    async fn reserve_new_session_id_on_server(
+        &self,
+        server: &NatsServerConfig,
+        initializer: &crate::nats_session_metadata::SessionInitializer,
+    ) -> Result<String> {
         let client = Self::connect_nats_server(server).await?;
-        let store = crate::nats_session_index::ensure_index_bucket(
-            &async_nats::jetstream::new(client),
+        let jetstream = async_nats::jetstream::new(client);
+        let store = crate::nats_session_metadata::SessionMetadataStore::ensure(
+            &jetstream,
             server.replicas.unwrap_or(1),
         )
         .await?;
-        let activity_seconds = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+        let mut seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mut seconds = activity_seconds;
 
         loop {
             let candidate = crate::utils::session_name::encode_timestamp_session_id(seconds);
-            let record = crate::nats_session_index::SessionIndexRecord {
-                session_id: candidate.clone(),
-                agent_name: self
-                    .agent
-                    .as_ref()
-                    .map(|agent| agent.name().to_string())
-                    .unwrap_or_default(),
-                working_dir: std::env::current_dir()
-                    .ok()
-                    .map(|path| path.to_string_lossy().into_owned()),
-                git_branch: Some(crate::utils::session_name::git_branch())
-                    .filter(|branch| !branch.is_empty()),
-                git_remote: crate::utils::session_name::git_remote(),
-                title: None,
-                last_activity: activity_seconds,
-            };
-            if crate::nats_session_index::try_create_record(&store, &record).await? {
+            let metadata =
+                crate::nats_session_metadata::SessionMetadata::new(&candidate, initializer.clone());
+            if store.create(&metadata).await?.is_some() {
                 return Ok(candidate);
             }
             seconds = seconds.saturating_add(1);

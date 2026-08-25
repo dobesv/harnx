@@ -18,7 +18,18 @@ tags:
   - logical-index
   - physical-seq
 plan_ref: "p915-remote-tui-wiring"
+status: superseded
+superseded_by: "docs/nats-ha.md#jetstream-resources"
 ---
+
+> **Superseded (2026-08-24):** Canonical NATS sessions no longer insert or
+> migrate transcript `Header` rows. Metadata is created before the first user
+> append, and legacy header-bearing transcripts are rejected. The historical
+> group-aware mutation analysis below remains useful for understanding physical
+> sequences shared by multi-row `EditEntries` replacements, but its
+> header-migration fixtures and logical offsets are no longer current. See
+> [High-Availability Deployment](../../nats-ha.md#jetstream-resources) and
+> `nats_session::logical_indices_for_entry` for the current protocol.
 
 ## Problem
 

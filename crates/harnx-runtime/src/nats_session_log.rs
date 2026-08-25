@@ -303,6 +303,22 @@ pub fn load_session_from_entries(
     crate::config::session::replay_log_entries_for_external(&raw_entries, name)
 }
 
+pub fn load_session_from_entries_with_metadata(
+    entries: &[(u64, SessionLogEntry)],
+    name: &str,
+    session: harnx_core::session::Session,
+) -> Result<harnx_core::session::Session> {
+    let raw_entries: Vec<(usize, SessionLogEntry)> = entries
+        .iter()
+        .map(|(seq, entry)| {
+            usize::try_from(*seq)
+                .map(|seq| (seq, entry.clone()))
+                .context("session log sequence does not fit into usize")
+        })
+        .collect::<Result<_>>()?;
+    crate::config::session::replay_nats_entries_into_session(&raw_entries, name, session)
+}
+
 pub fn load_session_from_yaml(content: &str, name: &str) -> Result<harnx_core::session::Session> {
     let raw_entries = crate::config::session::collect_raw_log_entries(content, name)?;
     crate::config::session::replay_log_entries_for_external(&raw_entries, name)

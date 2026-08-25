@@ -3,6 +3,8 @@
 //! Validates end-to-end persistence of a full turn via NatsSessionLog.
 
 mod common;
+#[path = "nats_worker/session_metadata.rs"]
+mod session_metadata;
 
 use anyhow::Result;
 use common::spawn_nats_server;
@@ -17,8 +19,11 @@ use harnx_core::{
 use harnx_runtime::{
     client::CompletionTokenUsage,
     config::{Config, NatsServerConfig},
-    nats_lease::NatsLeaseConfig,
+    nats_lease::{lease_holder_in, open_lease_bucket, NatsLeaseConfig},
     nats_session_log::NatsSessionLog,
+    nats_session_metadata::{
+        SessionInitializer, SessionMetadata, SessionMetadataStore, SessionOverrides,
+    },
     nats_worker::{
         publish_session_activate, run_agent_loop_with_nats, run_worker_daemon,
         NatsSessionLogBackend, RunAgentLoopArgs, SessionActivate, WorkerDaemonConfig,
@@ -203,24 +208,17 @@ fn assert_retracted_orphan_absent(entries: &[(u64, SessionLogEntry)], call_id: &
     );
     Ok(())
 }
-fn session_header(session_id: &str) -> SessionLogEntry {
-    SessionLogEntry::Header {
-        model_id: "test-model".to_string(),
-        temperature: None,
-        top_p: None,
-        use_tools: None,
-        compress_threshold: None,
-        agent_name: None,
-        session_id: Some(session_id.to_string()),
-        working_dir: None,
-        git_branch: None,
-        git_remote: None,
-        terminal_session_id: None,
-        agent_variables: Default::default(),
-        agent_instructions: String::new(),
-        model_fallbacks: vec![],
-        compaction_agent: None,
-    }
+async fn seed_session_metadata(
+    jetstream: &async_nats::jetstream::Context,
+    session_id: &str,
+) -> Result<(SessionMetadataStore, SessionMetadata)> {
+    let store = SessionMetadataStore::ensure(jetstream, 1).await?;
+    let metadata = SessionMetadata::new(
+        session_id,
+        SessionInitializer::inline("", Default::default(), SessionOverrides::default()),
+    );
+    store.create(&metadata).await?;
+    Ok((store, metadata))
 }
 
 async fn seed_session_and_attach_runtime(
@@ -228,13 +226,12 @@ async fn seed_session_and_attach_runtime(
     jetstream: async_nats::jetstream::Context,
     session_id: &str,
 ) -> Result<NatsSessionLog> {
-    let backend = NatsSessionLogBackend::new(jetstream.clone(), session_id);
-    backend.append_event_blocking(&session_header(session_id))?;
+    let (metadata_store, metadata) = seed_session_metadata(&jetstream, session_id).await?;
+    let backend = NatsSessionLogBackend::new(jetstream.clone(), session_id)
+        .with_metadata_store(Some(metadata_store));
 
     let log = NatsSessionLog::new(jetstream, session_id);
-    let entries = log.load_events_at_least_async(1).await?;
-    let mut session =
-        harnx_runtime::nats_session_log::load_session_from_entries(&entries, session_id)?;
+    let mut session = metadata.base_session();
     let runtime = std::sync::Arc::new(backend.clone())
         as std::sync::Arc<dyn harnx_runtime::config::session::SessionAppendSink>;
     session.runtime = Some(std::sync::Arc::new(runtime));
@@ -267,6 +264,11 @@ async fn run_worker_turn(params: WorkerTurnParams<'_>) -> Result<()> {
         call_fn,
         lease,
     } = params;
+    let metadata_store = {
+        let config = global_config.read().clone();
+        let jetstream = config.nats_jetstream(cluster_key).await?;
+        SessionMetadataStore::ensure(&jetstream, 1).await?
+    };
     let input = harnx_runtime::config::input::from_str(&global_config, prompt, None);
     run_agent_loop_with_nats(RunAgentLoopArgs {
         cluster_key,
@@ -280,8 +282,7 @@ async fn run_worker_turn(params: WorkerTurnParams<'_>) -> Result<()> {
         lease,
         lease_config: NatsLeaseConfig::default(),
         after_seq_observer: None,
-        header_insert_observer: None,
-        session_index: None,
+        session_metadata: Some(&metadata_store),
         on_tool_round: None,
         working_dir: None,
     })
@@ -422,6 +423,15 @@ fn abort_blocked_call_fn(
     })
 }
 
+fn abort_returning_call_fn() -> harnx_runtime::agent_loop::AgentCallFn {
+    Arc::new(move |_input, _config, abort| {
+        Box::pin(async move {
+            harnx_core::abort::wait_abort_signal(&abort).await;
+            anyhow::bail!("interrupted by user")
+        })
+    })
+}
+
 async fn wait_for_cancel(log: &NatsSessionLog) -> Result<Vec<(u64, SessionLogEntry)>> {
     tokio::time::timeout(CI_SAFE_TIMEOUT, async {
         loop {
@@ -438,6 +448,32 @@ async fn wait_for_cancel(log: &NatsSessionLog) -> Result<Vec<(u64, SessionLogEnt
     .await?
 }
 
+async fn wait_for_worker_session_cleanup(
+    jetstream: &async_nats::jetstream::Context,
+    session_id: &str,
+) -> Result<()> {
+    let lease_config = NatsLeaseConfig::default();
+    let lease_bucket = open_lease_bucket(jetstream, &lease_config)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("worker lease bucket should exist after activation ack"))?;
+    tokio::time::timeout(CI_SAFE_TIMEOUT, async {
+        loop {
+            if lease_holder_in(&lease_bucket, &lease_config, session_id)
+                .await?
+                .is_none()
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    wait_until(CI_SAFE_TIMEOUT, || {
+        harnx_runtime::nats_metrics::snapshot().active_sessions_per_worker == 0
+    })
+    .await
+}
+
 async fn local_test_nats(server_url: &str) -> Result<async_nats::jetstream::Context> {
     Ok(async_nats::jetstream::new(
         async_nats::connect(server_url).await?,
@@ -448,12 +484,11 @@ async fn activate_session(
     jetstream: &async_nats::jetstream::Context,
     session_id: &str,
 ) -> Result<()> {
-    publish_session_activate(
-        jetstream,
-        "local",
-        &SessionActivate::new(session_id, "ignored-agent"),
-    )
-    .await?;
+    let store = SessionMetadataStore::ensure(jetstream, 1).await?;
+    if store.get(session_id).await?.is_none() {
+        seed_session_metadata(jetstream, session_id).await?;
+    }
+    publish_session_activate(jetstream, "local", &SessionActivate::new(session_id)).await?;
     Ok(())
 }
 
@@ -695,15 +730,10 @@ fn reset_test_state() {
 /// A lone user prompt driving a multi-round tool loop must never be re-injected
 /// into its own turn.
 ///
-/// A headerless session gets a `Header` synthesized by an `EditEntries`
-/// migration that re-maps the leading user block onto the migration's seq —
-/// which is ABOVE the seed cursor the turn started from. The mid-round
-/// injection cursor has to account for that, or round 2 folds the very prompt
-/// the turn is already answering back in as a "new" user message. And because
-/// each injection is itself persisted as a user log entry, one bad injection
-/// makes every later round inject again, growing the prompt duplicate per
-/// round and leaving a leftover message the end-of-turn drain runs as yet
-/// another turn.
+/// The mid-round injection cursor must not fold the prompt that started the
+/// activation back into a later tool round. Each injection is persisted as a
+/// user log entry, so one bad cursor creates another candidate for every later
+/// round and can leave a duplicate continuation after the turn ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lone_prompt_is_not_reinjected_across_tool_rounds() -> Result<()> {
     reset_test_state();
@@ -898,12 +928,7 @@ async fn mid_tool_round_user_message_is_injected_once_into_same_turn() -> Result
 
     log.append_event_async(&append_user_message_entry("user-1", "seed message"))
         .await?;
-    publish_session_activate(
-        &js,
-        "local",
-        &SessionActivate::new(session_id, "ignored-agent"),
-    )
-    .await?;
+    activate_session(&js, session_id).await?;
 
     // Now await the ready signal - the permit was stored by notify_one()
     ready_fut.await;
@@ -968,12 +993,7 @@ async fn end_of_turn_reread_runs_continuation_turn_with_same_activation() -> Res
 
     log.append_event_async(&append_user_message_entry("user-1", "first"))
         .await?;
-    publish_session_activate(
-        &js,
-        "local",
-        &SessionActivate::new(session_id, "ignored-agent"),
-    )
-    .await?;
+    activate_session(&js, session_id).await?;
 
     // Now await the ready signal - the permit was stored by notify_one()
     ready_fut.await;
@@ -1081,12 +1101,7 @@ async fn idle_concurrent_messages_fold_in_seq_order_into_single_turn() -> Result
         .await?;
     log.append_event_async(&append_user_message_entry("user-2", "beta"))
         .await?;
-    publish_session_activate(
-        &js,
-        "local",
-        &SessionActivate::new(session_id, "ignored-agent"),
-    )
-    .await?;
+    activate_session(&js, session_id).await?;
 
     wait_until(CI_SAFE_TIMEOUT, || calls.load(Ordering::SeqCst) >= 1).await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1320,7 +1335,8 @@ async fn dispatch_runs_exactly_one_worker_per_activation_and_reactivation_is_noo
         })
         .await?;
 
-    let activation = SessionActivate::new(session_id, "ignored-agent");
+    seed_session_metadata(&js, session_id).await?;
+    let activation = SessionActivate::new(session_id);
     publish_session_activate(&js, "local", &activation).await?;
     // Duplicate publish is deduped by Nats-Msg-Id; still only one execution.
     publish_session_activate(&js, "local", &activation).await?;
@@ -1369,7 +1385,7 @@ async fn fenced_sink_rejects_append_when_lease_lost() -> Result<()> {
                 renew_interval: Duration::from_secs(10),
                 ..Default::default()
             },
-            session_index: None,
+            session_metadata: None,
         })
         .await?
         .expect("acquire"),
@@ -1450,7 +1466,7 @@ async fn acquire_test_lease(
                 renew_interval: Duration::from_secs(10),
                 ..Default::default()
             },
-            session_index: None,
+            session_metadata: None,
         })
         .await?
         .expect("acquire"),
@@ -1546,8 +1562,7 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
             lease: None,
             lease_config: NatsLeaseConfig::default(),
             after_seq_observer: None,
-            header_insert_observer: None,
-            session_index: None,
+            session_metadata: None,
             on_tool_round: None,
             working_dir: None,
         }
@@ -1626,7 +1641,7 @@ async fn nats_worker_handoff_persists_to_jetstream_not_file() -> Result<()> {
                 worker_id: "worker-handoff".to_string(),
                 generation: 1,
                 config: NatsLeaseConfig::default(),
-                session_index: None,
+                session_metadata: None,
             },
         )
         .await?
@@ -1916,7 +1931,7 @@ async fn retracted_orphan_tool_call_is_not_repaired_by_worker() -> Result<()> {
     let session_id = "retracted-orphan-test";
     let log = NatsSessionLog::new(js.clone(), session_id);
 
-    log.append_event_async(&session_header(session_id)).await?;
+    seed_session_metadata(&js, session_id).await?;
     // NOTE: deliberately NO unanswered user message in the seed. We want the log to
     // contain ONLY a retracted tool round, so that after mutations are applied the
     // effective log is idle and the worker has nothing to do. A pending user message
@@ -2126,12 +2141,7 @@ async fn retracted_user_message_is_not_executed_by_worker() -> Result<()> {
         .await?;
 
     // Activate the session.
-    publish_session_activate(
-        &js,
-        "local",
-        &SessionActivate::new(session_id, "ignored-agent"),
-    )
-    .await?;
+    activate_session(&js, session_id).await?;
 
     // Wait for the worker to process.
     wait_until(CI_SAFE_TIMEOUT, || counter.load(Ordering::SeqCst) >= 1).await?;
@@ -2189,7 +2199,11 @@ async fn abort_signal_cancels_blocked_worker_and_persists_tombstone() -> Result<
     let session = NatsSession::new(
         NatsSessionConfig {
             cluster: "local".to_string(),
-            agent: "ignored-agent".to_string(),
+            initializer: harnx_runtime::SessionInitializer::inline(
+                "",
+                Default::default(),
+                SessionOverrides::default(),
+            ),
             session_id: Some(session_id.to_string()),
             activation_route: harnx_runtime::SessionActivationRoute::ClusterShared,
         },
@@ -2245,19 +2259,20 @@ async fn cancel_immediately_after_activation_ack_is_not_lost() -> Result<()> {
         return Ok(());
     };
 
-    let entered = Arc::new(Notify::new());
-    let saw_abort = Arc::new(AtomicBool::new(false));
     let config = local_nats_runtime_config(server.url());
     let daemon = spawn_worker_daemon_with_call_fn(
         config,
         "worker-activation-cancel",
-        abort_blocked_call_fn(Arc::clone(&entered), Arc::clone(&saw_abort)),
+        abort_returning_call_fn(),
     )
     .await;
 
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client.clone());
     let session_id = "immediate-activation-cancel";
+    // Raw log writers are an internal protocol and must initialize canonical
+    // metadata before the first transcript entry.
+    seed_session_metadata(&jetstream, session_id).await?;
     let log = NatsSessionLog::new(jetstream.clone(), session_id);
     log.append_event_async(&append_user_message_entry(
         "immediate-cancel-user",
@@ -2280,18 +2295,16 @@ async fn cancel_immediately_after_activation_ack_is_not_lost() -> Result<()> {
     .await??;
     harnx_runtime::send_control_command(&client, session_id, ControlCommand::Cancel).await?;
 
-    tokio::time::timeout(CI_SAFE_TIMEOUT, async {
-        while !saw_abort.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await?;
+    // Cancellation can win before the model call starts. The durable tombstone,
+    // rather than an observer inside the call, proves the control was not lost.
     let entries = wait_for_cancel(&log).await?;
     assert_eq!(
         reconstruct_state_from_nats(&entries).turn_status,
         TurnStatus::InFlightCancelled,
         "turn must end cancelled when control follows activation ack; entries={entries:#?}"
     );
+
+    wait_for_worker_session_cleanup(&jetstream, session_id).await?;
 
     daemon.abort();
     let _ = daemon.await;

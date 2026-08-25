@@ -16,6 +16,7 @@ pub mod test_support;
 use crate::ag_ui::{resolve_agent, AgUiError, AppResponse as AgUiAppResponse};
 use crate::ag_ui_rpc::{handle_ag_ui_rpc, PersistenceKind};
 use crate::session_actor::SessionRegistry;
+use crate::session_routes::AgentSessionRef;
 
 use harnx_core::message::MessageRole;
 use harnx_rag::*;
@@ -489,6 +490,11 @@ impl Server {
     async fn handle_agent_tree(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
+        if let Some((agent, session, route)) = session_routes::parse_session_metadata_route(&path) {
+            resolve_agent(&self.config, &agent).map_err(ag_ui_error_to_anyhow)?;
+            let target = AgentSessionRef::new(&agent, &session);
+            return self.handle_session_metadata_route(req, target, route).await;
+        }
         let route = match parse_agents_route(&path) {
             Some(route) => route,
             None => return Err(anyhow!("Not Found")),
@@ -1296,17 +1302,24 @@ pub(crate) async fn load_nats_session(
 ) -> Result<harnx_core::session::Session> {
     ensure_frontend_nats_owner().await?;
     let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
+    let metadata_store =
+        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let metadata = metadata_store
+        .get(session)
+        .await?
+        .ok_or_else(|| anyhow!("Not Found"))?
+        .metadata;
     let log = harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, session.to_string());
     let entries = log
         .load_events_async()
         .await
         .map_err(|err| anyhow!("Failed to load session history for '{session}': {err}"))?;
-    if entries.is_empty() {
-        bail!("Not Found");
-    }
-    let loaded = harnx_runtime::nats_session_log::load_session_from_entries(&entries, session)
-        .map_err(|err| anyhow!("Failed to reconstruct session history for '{session}': {err}"))?;
-    session_routes::repair_legacy_session_index_identity(config, session, &loaded).await;
+    let loaded = harnx_runtime::nats_session_log::load_session_from_entries_with_metadata(
+        &entries,
+        session,
+        metadata.base_session(),
+    )
+    .map_err(|err| anyhow!("Failed to reconstruct session history for '{session}': {err}"))?;
     Ok(loaded)
 }
 
@@ -1832,10 +1845,6 @@ mod tests {
             SessionMeta {
                 id: "local-1".into(),
                 session_id: Some("alpha".into()),
-                working_dir: None,
-                git_branch: None,
-                git_remote: None,
-                terminal_session_id: None,
                 agent_name: Some("plain".into()),
                 title: None,
                 modified: None,
@@ -1843,10 +1852,6 @@ mod tests {
             SessionMeta {
                 id: "local-2".into(),
                 session_id: Some("beta".into()),
-                working_dir: None,
-                git_branch: None,
-                git_remote: None,
-                terminal_session_id: None,
                 agent_name: Some("other".into()),
                 title: None,
                 modified: None,
@@ -1854,10 +1859,6 @@ mod tests {
             SessionMeta {
                 id: "local-3".into(),
                 session_id: None,
-                working_dir: None,
-                git_branch: None,
-                git_remote: None,
-                terminal_session_id: None,
                 agent_name: None,
                 title: None,
                 modified: None,
@@ -1884,10 +1885,6 @@ mod tests {
         let meta = |id: &str, modified: Option<SystemTime>| SessionMeta {
             id: id.into(),
             session_id: Some(id.into()),
-            working_dir: None,
-            git_branch: None,
-            git_remote: None,
-            terminal_session_id: None,
             agent_name: Some("plain".into()),
             title: None,
             modified,

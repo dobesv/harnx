@@ -245,7 +245,7 @@ async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandl
 
 pub(super) struct WorkerServices {
     pub(super) background: Arc<Mutex<Option<BackgroundServices>>>,
-    pub(super) session_index: Option<async_nats::jetstream::kv::Store>,
+    pub(super) session_metadata: crate::nats_session_metadata::SessionMetadataStore,
     pub(super) tools_attempted: tokio::sync::watch::Receiver<bool>,
     /// `None` for a consuming worker, or a managing worker with nothing
     /// configured to spawn. Tool servers now start on demand per session
@@ -302,6 +302,13 @@ pub(super) async fn launch_worker_services(
     startup: &WorkerStartup,
     instance_id: &harnx_core::instance::ServerScope,
 ) -> Result<WorkerServices> {
+    // Canonical metadata is a hard protocol prerequisite. Establish it before
+    // announcing readiness or detaching any background service so a worker
+    // that cannot load metadata never appears ready and leaves no orphaned
+    // startup tasks behind.
+    let session_metadata =
+        super::daemon::ensure_session_metadata(&startup.jetstream, startup.replicas).await?;
+
     // Announce readiness before starting hooks and sub-agent toolsets. Those
     // can take tens of seconds — or never finish, when a server is
     // misconfigured — and neither is required for the worker to accept and
@@ -339,11 +346,9 @@ pub(super) async fn launch_worker_services(
         tools_attempted: tools_attempted_tx,
     });
 
-    let session_index =
-        super::daemon::optional_session_index(&startup.jetstream, startup.replicas).await;
     Ok(WorkerServices {
         background,
-        session_index,
+        session_metadata,
         tools_attempted,
         server_reconciler,
     })

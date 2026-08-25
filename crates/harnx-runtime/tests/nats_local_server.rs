@@ -216,22 +216,20 @@ async fn nats_local_server_owner_drop_preserves_jetstream_data() {
     let first = ensure_shared_server().await.expect("start first owner");
     let first_client = authenticated_client(&first).await;
     let first_jetstream = async_nats::jetstream::new(first_client);
-    let index = harnx_runtime::nats_session_index::ensure_index_bucket(&first_jetstream, 1)
+    let metadata_store =
+        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&first_jetstream, 1)
+            .await
+            .expect("create session metadata store");
+    let mut record = harnx_runtime::nats_session_metadata::SessionMetadata::new(
+        "saved-session",
+        harnx_runtime::SessionInitializer::named("test-agent", Default::default()),
+    );
+    record.title.value = Some("Saved session".to_string());
+    metadata_store
+        .create(&record)
         .await
-        .expect("create session index");
-    let record = harnx_runtime::nats_session_index::SessionIndexRecord {
-        session_id: "saved-session".to_string(),
-        agent_name: "test-agent".to_string(),
-        working_dir: None,
-        git_branch: None,
-        git_remote: None,
-        title: Some("Saved session".to_string()),
-        last_activity: 1,
-    };
-    harnx_runtime::nats_session_index::put_record(&index, &record)
-        .await
-        .expect("write session index record");
-    drop(index);
+        .expect("write session metadata");
+    drop(metadata_store);
     drop(first_jetstream);
     drop(first);
 
@@ -242,7 +240,7 @@ async fn nats_local_server_owner_drop_preserves_jetstream_data() {
     let restored = config
         .list_remote_sessions_with_meta(harnx_runtime::config::LOCAL_CLUSTER_KEY)
         .await
-        .expect("list persisted sessions through the local NATS index");
+        .expect("list persisted sessions through canonical metadata");
 
     assert_eq!(restored.len(), 1);
     assert_eq!(restored[0].id, record.session_id);
