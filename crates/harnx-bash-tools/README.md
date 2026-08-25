@@ -22,10 +22,8 @@ cargo install --path crates/harnx-bash-tools
 | `--allow-dev-tools` | Grant supported development toolchains and caches. |
 | `--allow-repo-work` | Grant detected project paths and session working directory. |
 | `--allow-all` | Request full filesystem access, subject to `$HOME` ancestor guard. |
-| `--tool <PATH>` | Load a single YAML command template file. Repeatable. |
-| `--tools-dir <PATH>` | Load all `.yaml` command template files from a directory. Repeatable. |
 
-Other options include `--no-sandbox`, `--sandbox-run <PATH>`, `--env`/`-e`, `--mcp-stdio`, and `--help`/`-h`.
+Other options include `--tool <PATH>` (load one YAML command template; repeatable), `--tools-dir <PATH>` (load every `.yaml` command template in a directory; repeatable), `--no-sandbox`, `--sandbox-run <PATH>`, `--env`/`-e`, `--mcp-stdio`, and `--help`/`-h`.
 
 ## Environment variables
 
@@ -86,7 +84,7 @@ Each entry under `parameters` defines an input argument:
 | `type` | String (required) | `string`, `integer`, `number`, or `boolean`. |
 | `required` | Boolean (optional) | Whether the argument must be supplied by the caller. Default is `false`. |
 | `description` | String (optional) | Description of the parameter shown in the MCP schema. |
-| `pattern` | String (optional) | Regex pattern constraint (regex crate syntax; string parameters only). |
+| `pattern` | String (optional) | Regex pattern constraint (regex crate syntax), matched against the value's string form for any parameter type. |
 | `enum` | List (optional) | List of allowed values for the parameter. |
 | `min` | Number (optional) | Minimum numeric value for `integer`/`number`, or minimum character length for `string`. |
 | `max` | Number (optional) | Maximum numeric value for `integer`/`number`, or maximum character length for `string`. |

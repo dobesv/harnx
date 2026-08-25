@@ -81,6 +81,7 @@ pub(crate) struct RegisteredToolTemplate {
     pub(crate) ignored_grants: bool,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct TemplateSandbox<'a> {
     pub(crate) enabled: bool,
     pub(crate) read_paths: &'a [PathBuf],

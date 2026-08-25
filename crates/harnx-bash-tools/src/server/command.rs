@@ -10,14 +10,22 @@ pub(crate) fn expand_path(raw: &str) -> anyhow::Result<PathBuf> {
         return Ok(PathBuf::from(expanded));
     };
 
-    let home = std::env::var("HOME").map_err(|err| match err {
-        std::env::VarError::NotPresent => {
-            anyhow::anyhow!("cannot expand '~' in path '{raw}': HOME is not set")
+    let home = match std::env::var("HOME") {
+        Ok(home) => home,
+        Err(std::env::VarError::NotPresent) => {
+            std::env::var("USERPROFILE").map_err(|err| match err {
+                std::env::VarError::NotPresent => anyhow::anyhow!(
+                    "cannot expand '~' in path '{raw}': neither HOME nor USERPROFILE is set"
+                ),
+                std::env::VarError::NotUnicode(_) => anyhow::anyhow!(
+                    "cannot expand '~' in path '{raw}': USERPROFILE is not valid UTF-8"
+                ),
+            })?
         }
-        std::env::VarError::NotUnicode(_) => {
-            anyhow::anyhow!("cannot expand '~' in path '{raw}': HOME is not valid UTF-8")
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("cannot expand '~' in path '{raw}': HOME is not valid UTF-8")
         }
-    })?;
+    };
     let rest = rest.strip_prefix('/').unwrap_or(rest);
     Ok(PathBuf::from(home).join(rest))
 }
@@ -247,6 +255,8 @@ impl BashServer {
         stdout: Stdio,
         stderr: Stdio,
     ) -> Result<CommandWrap, ErrorData> {
+        #[cfg(not(unix))]
+        let _ = &template_sandbox;
         #[cfg(unix)]
         let use_sandbox = self.inner.sandbox_config.enabled
             && template_sandbox
@@ -493,6 +503,19 @@ mod sandbox_capability_tests {
         assert_eq!(expand_path("$HOME/foo").unwrap(), home.join("foo"));
         assert_eq!(expand_path("${HOME}/foo").unwrap(), home.join("foo"));
         assert_eq!(expand_path("/abs/x").unwrap(), PathBuf::from("/abs/x"));
+    }
+
+    #[test]
+    fn expand_path_uses_userprofile_when_home_is_unset() {
+        let _env_guard = crate::test_support::env_lock();
+        let _home = crate::test_support::EnvVar::unset("HOME");
+        let profile = std::env::temp_dir().join("harnx-user-profile");
+        let _profile = crate::test_support::EnvVar::set(
+            "USERPROFILE",
+            profile.to_str().expect("test profile should be UTF-8"),
+        );
+
+        assert_eq!(expand_path("~/foo").unwrap(), profile.join("foo"));
     }
 
     #[test]

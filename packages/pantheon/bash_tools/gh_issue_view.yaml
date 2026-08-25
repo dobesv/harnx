@@ -5,9 +5,8 @@ parameters:
   repo:   { type: string,  required: true, pattern: "^[\\w.-]+/[\\w.-]+$" }
 env: { GH_PAGER: "" }
 sandbox:
-  read:  ["~/.config/gh"]
-  write: ["/tmp/out"]
-  env:   ["GH_TOKEN"]
+  read: ["~/.config/gh"]
+  env:  ["GH_TOKEN"]
 template: false
 script: |
   set -euo pipefail

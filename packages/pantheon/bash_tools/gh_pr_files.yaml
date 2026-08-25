@@ -4,6 +4,9 @@ parameters:
   number: { type: integer, required: true, description: "PR number" }
   repo:   { type: string, required: false, pattern: "^[\\w.-]+/[\\w.-]+$", description: "owner/repo" }
 env: { GH_PAGER: "" }
+sandbox:
+  read: ["~/.config/gh"]
+  env:  ["GH_TOKEN"]
 template: false
 script: |
   set -euo pipefail

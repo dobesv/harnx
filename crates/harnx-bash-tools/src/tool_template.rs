@@ -34,50 +34,13 @@ impl ToolTemplate {
         let mut required = Vec::new();
 
         for (name, parameter) in &self.parameters {
-            let mut schema = Map::new();
-            schema.insert("type".to_string(), json!(parameter.ty.schema_type()));
-
-            if let Some(description) = &parameter.description {
-                schema.insert("description".to_string(), json!(description));
-            }
-            if let Some(values) = &parameter.r#enum {
-                let values = values
-                    .iter()
-                    .map(yaml_value_to_json)
-                    .collect::<Result<Vec<_>>>()
-                    .with_context(|| format!("invalid enum for parameter `{name}`"))?;
-                schema.insert("enum".to_string(), Value::Array(values));
-            }
-
-            match parameter.ty {
-                ParamType::String => {
-                    if let Some(min) = parameter.min {
-                        schema.insert("minLength".to_string(), json!(min as u64));
-                    }
-                    if let Some(max) = parameter.max {
-                        schema.insert("maxLength".to_string(), json!(max as u64));
-                    }
-                    if let Some(pattern) = &parameter.pattern {
-                        // JSON Schema pattern uses regex-crate syntax here: ECMA-262-ish,
-                        // without PCRE features such as lookbehind.
-                        schema.insert("pattern".to_string(), json!(pattern));
-                    }
-                }
-                ParamType::Integer | ParamType::Number => {
-                    if let Some(min) = parameter.min {
-                        schema.insert("minimum".to_string(), json!(min));
-                    }
-                    if let Some(max) = parameter.max {
-                        schema.insert("maximum".to_string(), json!(max));
-                    }
-                }
-                ParamType::Boolean => {}
-            }
-
             if parameter.required {
                 required.push(Value::String(name.clone()));
             }
-            properties.insert(name.clone(), Value::Object(schema));
+            properties.insert(
+                name.clone(),
+                Value::Object(schema_for_parameter(name, parameter)?),
+            );
         }
 
         Ok(json!({
@@ -177,6 +140,54 @@ impl ToolTemplate {
             format!("'{}'", value.replace('\'', r#"'\''"#))
         });
         env.render_str(&self.script, context).map_err(Into::into)
+    }
+}
+
+fn schema_for_parameter(name: &str, parameter: &ParameterDef) -> Result<Map<String, Value>> {
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), json!(parameter.ty.schema_type()));
+
+    if let Some(description) = &parameter.description {
+        schema.insert("description".to_string(), json!(description));
+    }
+    if let Some(values) = &parameter.r#enum {
+        let values = values
+            .iter()
+            .map(yaml_value_to_json)
+            .collect::<Result<Vec<_>>>()
+            .with_context(|| format!("invalid enum for parameter `{name}`"))?;
+        schema.insert("enum".to_string(), Value::Array(values));
+    }
+
+    match parameter.ty {
+        ParamType::String => add_string_constraints(&mut schema, parameter),
+        ParamType::Integer | ParamType::Number => add_numeric_constraints(&mut schema, parameter),
+        ParamType::Boolean => {}
+    }
+
+    Ok(schema)
+}
+
+fn add_string_constraints(schema: &mut Map<String, Value>, parameter: &ParameterDef) {
+    if let Some(min) = parameter.min {
+        schema.insert("minLength".to_string(), json!(min.ceil().max(0.0) as u64));
+    }
+    if let Some(max) = parameter.max {
+        schema.insert("maxLength".to_string(), json!(max.floor().max(0.0) as u64));
+    }
+    if let Some(pattern) = &parameter.pattern {
+        // JSON Schema pattern uses regex-crate syntax here: ECMA-262-ish,
+        // without PCRE features such as lookbehind.
+        schema.insert("pattern".to_string(), json!(pattern));
+    }
+}
+
+fn add_numeric_constraints(schema: &mut Map<String, Value>, parameter: &ParameterDef) {
+    if let Some(min) = parameter.min {
+        schema.insert("minimum".to_string(), json!(min));
+    }
+    if let Some(max) = parameter.max {
+        schema.insert("maximum".to_string(), json!(max));
     }
 }
 
@@ -1322,7 +1333,7 @@ script: echo ok
                         "type": "string",
                         "description": "Git branch name",
                         "enum": ["main", 7, true],
-                        "minLength": 2,
+                        "minLength": 3,
                         "maxLength": 12,
                         "pattern": "^[a-z]+$",
                     },
