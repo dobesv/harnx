@@ -1,6 +1,82 @@
 // Auto-split from server.rs / handlers.rs for cohesion. See server/mod.rs.
 #![allow(deprecated)]
 use super::*;
+use anyhow::Context as _;
+
+fn register_tool_templates(
+    tool_templates: Vec<ToolTemplate>,
+) -> anyhow::Result<BTreeMap<String, RegisteredToolTemplate>> {
+    let mut registered = BTreeMap::new();
+    for template in tool_templates {
+        if BUILTIN_TOOL_NAMES.contains(&template.name.as_str()) {
+            anyhow::bail!(
+                "tool template `{}` conflicts with reserved built-in tool `{}`",
+                template.name,
+                template.name
+            );
+        }
+
+        let input_schema = template
+            .input_schema()?
+            .as_object()
+            .cloned()
+            .context("tool template input schema must be a JSON object")?;
+        let sandbox = template.sandbox.clone().unwrap_or_default();
+        let has_grants = !sandbox.read.is_empty()
+            || !sandbox.write.is_empty()
+            || !sandbox.env.is_empty()
+            || !sandbox.network;
+        let (read_paths, write_paths) = if sandbox.enabled {
+            let read_paths = sandbox
+                .read
+                .iter()
+                .map(|path| {
+                    command::expand_path(path).with_context(|| {
+                        format!(
+                            "failed to expand read grant `{path}` for tool `{}`",
+                            template.name
+                        )
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let write_paths = sandbox
+                .write
+                .iter()
+                .map(|path| {
+                    command::expand_path(path).with_context(|| {
+                        format!(
+                            "failed to expand write grant `{path}` for tool `{}`",
+                            template.name
+                        )
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            (read_paths, write_paths)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let name = template.name.clone();
+        let description = template
+            .description
+            .clone()
+            .unwrap_or_else(|| format!("Run shell command template `{name}`."));
+        let entry = RegisteredToolTemplate {
+            template,
+            description,
+            input_schema,
+            read_paths,
+            write_paths,
+            pass_env: sandbox.env,
+            sandbox_enabled: sandbox.enabled,
+            no_network: !sandbox.network,
+            ignored_grants: !sandbox.enabled && has_grants,
+        };
+        if registered.insert(name.clone(), entry).is_some() {
+            anyhow::bail!("duplicate registered tool template name `{name}`");
+        }
+    }
+    Ok(registered)
+}
 
 impl BashServer {
     pub(crate) const DEFAULT_ENV_ALLOWLIST: &[&str] = &[
@@ -60,9 +136,18 @@ impl BashServer {
     }
 
     pub fn new_with_sandbox(sandbox_config: SandboxConfig) -> Self {
+        Self::new_with_templates(sandbox_config, Vec::new())
+            .expect("empty template registration cannot fail")
+    }
+
+    pub fn new_with_templates(
+        sandbox_config: SandboxConfig,
+        tool_templates: Vec<ToolTemplate>,
+    ) -> anyhow::Result<Self> {
         let allowlist = sandbox_config.allowlist.clone();
         let log_dir = std::env::temp_dir().join(format!("harnx-bash-tools-{}", Uuid::new_v4()));
-        Self {
+        let templates = register_tool_templates(tool_templates)?;
+        Ok(Self {
             inner: Arc::new(BashServerInner {
                 allowlist,
                 spawned: Mutex::new(HashMap::new()),
@@ -72,8 +157,19 @@ impl BashServer {
                 // scanning every writable path here is both unnecessary and unbounded.
                 history: Arc::new(HistoryManager::new()),
                 sandbox_config,
+                templates,
             }),
-        }
+        })
+    }
+
+    pub(crate) fn tool_templates(
+        &self,
+    ) -> impl Iterator<Item = (&String, &RegisteredToolTemplate)> {
+        self.inner.templates.iter()
+    }
+
+    pub(crate) fn has_tool_template(&self, name: &str) -> bool {
+        self.inner.templates.contains_key(name)
     }
 
     /// Native and MCP stdio modes share the immutable allowlist resolved at startup.

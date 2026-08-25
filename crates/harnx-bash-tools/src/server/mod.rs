@@ -26,7 +26,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(unix)]
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -56,7 +56,38 @@ pub(crate) use handlers::*;
 pub(crate) use params::*;
 pub(crate) use render::*;
 
+use crate::tool_template::ToolTemplate;
 use crate::tool_templates;
+
+pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "exec",
+    "read_exec_log",
+    "spawn",
+    "wait",
+    "terminate",
+    "rollback_file",
+];
+
+#[derive(Clone)]
+pub(crate) struct RegisteredToolTemplate {
+    pub(crate) template: ToolTemplate,
+    pub(crate) description: String,
+    pub(crate) input_schema: Map<String, Value>,
+    pub(crate) read_paths: Vec<PathBuf>,
+    pub(crate) write_paths: Vec<PathBuf>,
+    pub(crate) pass_env: Vec<String>,
+    pub(crate) sandbox_enabled: bool,
+    pub(crate) no_network: bool,
+    pub(crate) ignored_grants: bool,
+}
+
+pub(crate) struct TemplateSandbox<'a> {
+    pub(crate) enabled: bool,
+    pub(crate) read_paths: &'a [PathBuf],
+    pub(crate) write_paths: &'a [PathBuf],
+    pub(crate) pass_env: &'a [String],
+    pub(crate) no_network: bool,
+}
 
 /// Build a `_meta` block carrying only the call template. Bash tools omit
 /// `result_template` so the client keeps its audience-aware renderer, which is
@@ -91,6 +122,7 @@ struct BashServerInner {
     /// (`extra_env_passthrough`, `env_overrides`) are
     /// honoured on every platform.
     sandbox_config: SandboxConfig,
+    templates: BTreeMap<String, RegisteredToolTemplate>,
 }
 
 #[derive(Clone)]

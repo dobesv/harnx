@@ -7,6 +7,11 @@ use rmcp::handler::client::ClientHandler;
 use rmcp::model::{ClientCapabilities, InitializeRequestParams};
 use rmcp::service::{serve_client, serve_server, RoleClient, RoleServer, RunningService};
 use tokio::io::duplex;
+
+#[cfg(target_os = "linux")]
+use harnx_toolset::Toolset;
+#[cfg(target_os = "linux")]
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 struct TestDir {
@@ -338,6 +343,123 @@ fn sandbox_runtime_works() -> bool {
             false
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tool_template_sandbox_grants_control_real_file_access() {
+    if !sandbox_runtime_works() {
+        return;
+    }
+
+    let working_dir = TestDir::new();
+    let secret_dir = TestDir::new();
+    let secret_file = secret_dir.path().join("capability-marker.txt");
+    let marker = "template-sandbox-capability-marker";
+    std::fs::write(&secret_file, marker).expect("write capability marker");
+
+    let secret_dir_yaml =
+        serde_json::to_string(&secret_dir.path().to_string_lossy()).expect("quote grant path");
+    let cat_script = format!(
+        "cat {}",
+        serde_json::to_string(&secret_file.to_string_lossy()).expect("quote marker path")
+    );
+    let granted = crate::tool_template::parse_template_str(
+        &format!(
+            "name: read_granted\nsandbox:\n  read:\n    - {secret_dir_yaml}\nscript: |\n  {cat_script}\n"
+        ),
+        Path::new("read_granted.yaml"),
+    )
+    .expect("parse granted template");
+    let denied = crate::tool_template::parse_template_str(
+        &format!("name: read_denied\nscript: |\n  {cat_script}\n"),
+        Path::new("read_denied.yaml"),
+    )
+    .expect("parse denied template");
+    let unsandboxed = crate::tool_template::parse_template_str(
+        &format!("name: read_unsandboxed\nsandbox:\n  enabled: false\nscript: |\n  {cat_script}\n"),
+        Path::new("read_unsandboxed.yaml"),
+    )
+    .expect("parse unsandboxed template");
+
+    let mut sandbox_config = enabled_sandbox_config();
+    sandbox_config.allowlist = allowlist_for_paths(vec![working_dir.path().to_path_buf()]);
+    sandbox_config.sandbox_run_path = sandbox_run_test_path();
+    let toolset = crate::BashToolset::new(sandbox_config, vec![granted, denied, unsandboxed])
+        .await
+        .expect("build template toolset");
+
+    let granted: CallToolResult = serde_json::from_value(
+        toolset
+            .invoke(
+                "read_granted",
+                serde_json::json!({}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("invoke granted template"),
+    )
+    .expect("deserialize granted result");
+    let granted_text = text_content(&granted);
+    assert_eq!(extract_field(&granted_text, "exit_code"), "0");
+    assert!(
+        granted_text.contains(marker),
+        "granted template did not read marker:\n{granted_text}"
+    );
+
+    let denied: CallToolResult = serde_json::from_value(
+        toolset
+            .invoke(
+                "read_denied",
+                serde_json::json!({}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("invoke denied template"),
+    )
+    .expect("deserialize denied result");
+    let denied_text = text_content(&denied);
+    let denied_exit = extract_field(&denied_text, "exit_code")
+        .parse::<i32>()
+        .expect("numeric denied exit code");
+    let denied_stderr = denied_text
+        .split_once("<!-- start stderr -->")
+        .and_then(|(_, rest)| rest.split_once("<!-- end stderr -->"))
+        .map(|(stderr, _)| stderr)
+        .expect("denied result stderr block")
+        .to_ascii_lowercase();
+    assert_ne!(
+        denied_exit, 0,
+        "ungranted template unexpectedly succeeded:\n{denied_text}"
+    );
+    assert!(
+        denied_stderr.contains("permission") || denied_stderr.contains("denied"),
+        "ungranted template stderr lacked permission denial:\n{denied_text}"
+    );
+    assert!(
+        !denied_text.contains(marker),
+        "ungranted template exposed marker:\n{denied_text}"
+    );
+
+    let unsandboxed: CallToolResult = serde_json::from_value(
+        toolset
+            .invoke(
+                "read_unsandboxed",
+                serde_json::json!({}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("invoke unsandboxed template"),
+    )
+    .expect("deserialize unsandboxed result");
+    let unsandboxed_text = text_content(&unsandboxed);
+    assert_eq!(extract_field(&unsandboxed_text, "exit_code"), "0");
+    assert!(
+        unsandboxed_text.contains(marker),
+        "unsandboxed template did not read marker:\n{unsandboxed_text}"
+    );
+
+    let _ = toolset.cleanup_log_dir();
 }
 
 #[cfg(unix)]
@@ -1819,6 +1941,10 @@ mod shebangs {
                     exec_dir: &root,
                     command: "#!/opt/notallowed/x\nexit 0",
                     extra_env: None,
+                    read_paths: Vec::new(),
+                    write_paths: Vec::new(),
+                    pass_env: Vec::new(),
+                    no_network: false,
                 },
                 Stdio::null(),
                 Stdio::null(),

@@ -1,6 +1,116 @@
 // Auto-split from server.rs / handlers.rs for cohesion. See server/mod.rs.
 use super::*;
 
+/// Expands template grant paths against the server process's ambient
+/// environment. Callers run this while loading templates, before child
+/// processes clear their environment.
+pub(crate) fn expand_path(raw: &str) -> anyhow::Result<PathBuf> {
+    let expanded = expand_env_references(raw)?;
+    let Some(rest) = expanded.strip_prefix('~') else {
+        return Ok(PathBuf::from(expanded));
+    };
+
+    let home = std::env::var("HOME").map_err(|err| match err {
+        std::env::VarError::NotPresent => {
+            anyhow::anyhow!("cannot expand '~' in path '{raw}': HOME is not set")
+        }
+        std::env::VarError::NotUnicode(_) => {
+            anyhow::anyhow!("cannot expand '~' in path '{raw}': HOME is not valid UTF-8")
+        }
+    })?;
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    Ok(PathBuf::from(home).join(rest))
+}
+
+fn expand_env_references(raw: &str) -> anyhow::Result<String> {
+    let mut expanded = String::with_capacity(raw.len());
+    let mut index = 0;
+
+    while let Some(relative_dollar) = raw[index..].find('$') {
+        let dollar = index + relative_dollar;
+        expanded.push_str(&raw[index..dollar]);
+        let suffix = &raw[dollar + 1..];
+
+        let (name, consumed) = if let Some(braced) = suffix.strip_prefix('{') {
+            let Some(end) = braced.find('}') else {
+                expanded.push_str(&raw[dollar..]);
+                return Ok(expanded);
+            };
+            let name = &braced[..end];
+            if name.is_empty() {
+                anyhow::bail!("empty environment variable reference in path '{raw}'");
+            }
+            (name, end + 3)
+        } else {
+            let name_len = suffix
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                .count();
+            let name = &suffix[..name_len];
+            let starts_validly = name
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_');
+            if !starts_validly {
+                expanded.push('$');
+                index = dollar + 1;
+                continue;
+            }
+            (name, name_len + 1)
+        };
+
+        let value = std::env::var(name).map_err(|err| match err {
+            std::env::VarError::NotPresent => anyhow::anyhow!(
+                "environment variable '{name}' is not set while expanding path '{raw}'"
+            ),
+            std::env::VarError::NotUnicode(_) => anyhow::anyhow!(
+                "environment variable '{name}' is not valid UTF-8 while expanding path '{raw}'"
+            ),
+        })?;
+        expanded.push_str(&value);
+        index = dollar + consumed;
+    }
+
+    expanded.push_str(&raw[index..]);
+    Ok(expanded)
+}
+
+#[cfg(unix)]
+fn append_sandbox_command_args(args: &mut Vec<OsString>, spec: &SandboxCommandSpec<'_>) {
+    // The server writes shebang scripts and execution logs here. Grant the
+    // helper access to its own private directory even when callers use a
+    // deliberately narrow filesystem allowlist.
+    args.push(OsString::from("--write"));
+    args.push(spec.exec_dir.as_os_str().to_owned());
+    args.push(OsString::from("--exec"));
+    args.push(spec.exec_dir.as_os_str().to_owned());
+    args.push(OsString::from("--working-dir"));
+    args.push(spec.working_dir.as_os_str().to_owned());
+    for name in &spec.pass_env {
+        args.push(OsString::from("--env"));
+        args.push(OsString::from(name));
+    }
+    // Explicit template env and validated parameter bindings come last so they
+    // win if a template also allows the same ambient variable through.
+    if let Some(extra_env) = spec.extra_env {
+        for (key, value) in extra_env {
+            args.push(OsString::from("--env"));
+            args.push(OsString::from(format!("{key}={value}")));
+        }
+    }
+    for path in &spec.read_paths {
+        args.push(OsString::from("--read"));
+        args.push(path.as_os_str().to_owned());
+    }
+    for path in &spec.write_paths {
+        args.push(OsString::from("--write"));
+        args.push(path.as_os_str().to_owned());
+    }
+    if spec.no_network {
+        args.push(OsString::from("--no-network"));
+    }
+}
+
 impl BashServer {
     #[cfg(unix)]
     pub(crate) fn build_sandbox_args(&self, _working_dir: &Path) -> Vec<OsString> {
@@ -40,28 +150,14 @@ impl BashServer {
         stdout: Stdio,
         stderr: Stdio,
     ) -> Result<CommandWrap, ErrorData> {
+        let mut sb_args = self.build_sandbox_args(spec.working_dir);
+        append_sandbox_command_args(&mut sb_args, &spec);
         let SandboxCommandSpec {
             working_dir,
             exec_dir,
             command,
-            extra_env,
+            ..
         } = spec;
-        let mut sb_args = self.build_sandbox_args(working_dir);
-        // The server writes shebang scripts and execution logs here. Grant the
-        // helper access to its own private directory even when callers use a
-        // deliberately narrow filesystem allowlist.
-        sb_args.push(OsString::from("--write"));
-        sb_args.push(exec_dir.as_os_str().to_owned());
-        sb_args.push(OsString::from("--exec"));
-        sb_args.push(exec_dir.as_os_str().to_owned());
-        sb_args.push(OsString::from("--working-dir"));
-        sb_args.push(working_dir.as_os_str().to_owned());
-        if let Some(extra_env) = extra_env {
-            for (key, value) in extra_env {
-                sb_args.push(OsString::from("--env"));
-                sb_args.push(OsString::from(format!("{key}={value}")));
-            }
-        }
         sb_args.push(OsString::from("--"));
         if let Some((interp, shebang_args)) = parse_shebang(command) {
             let script_path = self.write_script_file(exec_dir, command).await?;
@@ -140,20 +236,48 @@ impl BashServer {
         stdout: Stdio,
         stderr: Stdio,
     ) -> Result<CommandWrap, ErrorData> {
+        self.build_command_with_sandbox(ctx, None, stdout, stderr)
+            .await
+    }
+
+    pub(crate) async fn build_command_with_sandbox(
+        &self,
+        ctx: CommandBuildCtx<'_>,
+        template_sandbox: Option<TemplateSandbox<'_>>,
+        stdout: Stdio,
+        stderr: Stdio,
+    ) -> Result<CommandWrap, ErrorData> {
         #[cfg(unix)]
-        let use_sandbox = self.inner.sandbox_config.enabled;
+        let use_sandbox = self.inner.sandbox_config.enabled
+            && template_sandbox
+                .as_ref()
+                .is_none_or(|sandbox| sandbox.enabled);
         #[cfg(not(unix))]
         let use_sandbox = false;
 
         if use_sandbox {
             #[cfg(unix)]
             {
+                let (read_paths, write_paths, pass_env, no_network) = template_sandbox
+                    .map(|sandbox| {
+                        (
+                            sandbox.read_paths.to_vec(),
+                            sandbox.write_paths.to_vec(),
+                            sandbox.pass_env.to_vec(),
+                            sandbox.no_network,
+                        )
+                    })
+                    .unwrap_or_default();
                 self.build_sandbox_command(
                     SandboxCommandSpec {
                         working_dir: ctx.working_dir,
                         exec_dir: ctx.exec_dir,
                         command: ctx.command,
                         extra_env: ctx.env,
+                        read_paths,
+                        write_paths,
+                        pass_env,
+                        no_network,
                     },
                     stdout,
                     stderr,
@@ -292,6 +416,97 @@ fn redact_env_value(arg: &std::ffi::OsStr) -> String {
     match raw.split_once('=') {
         Some((name, _)) => format!("{name}=<redacted>"),
         None => raw.into_owned(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod sandbox_capability_tests {
+    use super::*;
+
+    fn spec<'a>(working_dir: &'a Path, exec_dir: &'a Path) -> SandboxCommandSpec<'a> {
+        SandboxCommandSpec {
+            working_dir,
+            exec_dir,
+            command: "true",
+            extra_env: None,
+            read_paths: Vec::new(),
+            write_paths: Vec::new(),
+            pass_env: Vec::new(),
+            no_network: false,
+        }
+    }
+
+    fn contains_pair(args: &[OsString], flag: &str, value: &str) -> bool {
+        args.windows(2)
+            .any(|pair| pair[0] == flag && pair[1] == value)
+    }
+
+    #[test]
+    fn sandbox_capabilities_emit_read_env_and_no_network_args() {
+        let mut spec = spec(Path::new("/workspace"), Path::new("/tmp/execution"));
+        spec.read_paths = vec![PathBuf::from("/home/x/.config/gh")];
+        spec.pass_env = vec!["GH_TOKEN".to_string()];
+        spec.no_network = true;
+        let mut args = Vec::new();
+
+        append_sandbox_command_args(&mut args, &spec);
+
+        assert!(contains_pair(&args, "--read", "/home/x/.config/gh"));
+        assert!(contains_pair(&args, "--env", "GH_TOKEN"));
+        assert!(!args.iter().any(|arg| arg == "GH_TOKEN="));
+        assert!(args.iter().any(|arg| arg == "--no-network"));
+    }
+
+    #[test]
+    fn default_sandbox_capabilities_emit_no_additional_args() {
+        let spec = spec(Path::new("/workspace"), Path::new("/tmp/execution"));
+        let mut args = Vec::new();
+
+        append_sandbox_command_args(&mut args, &spec);
+
+        assert!(!args.iter().any(|arg| arg == "--read"));
+        assert!(!args.iter().any(|arg| arg == "--env"));
+        assert!(!args.iter().any(|arg| arg == "--no-network"));
+        assert_eq!(args.iter().filter(|arg| *arg == "--write").count(), 1);
+    }
+
+    #[test]
+    fn explicit_env_value_follows_same_named_passthrough() {
+        let mut spec = spec(Path::new("/workspace"), Path::new("/tmp/execution"));
+        let extra_env = HashMap::from([("TOKEN".to_string(), "bound".to_string())]);
+        spec.pass_env = vec!["TOKEN".to_string()];
+        spec.extra_env = Some(&extra_env);
+        let mut args = Vec::new();
+
+        append_sandbox_command_args(&mut args, &spec);
+
+        let passthrough = args.iter().position(|arg| arg == "TOKEN").unwrap();
+        let explicit = args.iter().position(|arg| arg == "TOKEN=bound").unwrap();
+        assert!(passthrough < explicit);
+    }
+
+    #[test]
+    fn expand_path_resolves_home_and_preserves_plain_paths() {
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME should be set for test"));
+
+        assert_eq!(expand_path("~/foo").unwrap(), home.join("foo"));
+        assert_eq!(expand_path("$HOME/foo").unwrap(), home.join("foo"));
+        assert_eq!(expand_path("${HOME}/foo").unwrap(), home.join("foo"));
+        assert_eq!(expand_path("/abs/x").unwrap(), PathBuf::from("/abs/x"));
+    }
+
+    #[test]
+    fn expand_path_rejects_unset_environment_variables() {
+        const NAME: &str = "DEFINITELY_UNSET_VAR_xyz";
+        let _env_guard = crate::test_support::env_lock();
+        let _unset = crate::test_support::EnvVar::unset(NAME);
+
+        let error = expand_path("$DEFINITELY_UNSET_VAR_xyz/foo").unwrap_err();
+
+        assert!(
+            error.to_string().contains(NAME),
+            "unexpected error: {error}"
+        );
     }
 }
 

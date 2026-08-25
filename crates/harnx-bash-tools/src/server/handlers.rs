@@ -1,6 +1,15 @@
 // Auto-split from server.rs for cohesion. See server/mod.rs.
 use super::*;
 
+pub(crate) struct ExecPipelineParams<'a> {
+    pub(crate) command: &'a str,
+    pub(crate) working_dir: Option<&'a str>,
+    pub(crate) extra_env: Option<&'a HashMap<String, String>>,
+    pub(crate) timeout_secs: u64,
+    pub(crate) truncate_opts: TruncateOpts,
+    pub(crate) template_sandbox: Option<TemplateSandbox<'a>>,
+}
+
 /// Inputs for building a sandboxed child command. Groups the parameters
 /// shared by `build_sandbox_command` to keep its argument count manageable.
 #[cfg(unix)]
@@ -9,6 +18,10 @@ pub(crate) struct SandboxCommandSpec<'a> {
     pub(crate) exec_dir: &'a Path,
     pub(crate) command: &'a str,
     pub(crate) extra_env: Option<&'a HashMap<String, String>>,
+    pub(crate) read_paths: Vec<PathBuf>,
+    pub(crate) write_paths: Vec<PathBuf>,
+    pub(crate) pass_env: Vec<String>,
+    pub(crate) no_network: bool,
 }
 
 pub(crate) struct TimeoutResultCtx<'a> {

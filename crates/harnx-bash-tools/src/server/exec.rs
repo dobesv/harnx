@@ -10,11 +10,74 @@ impl BashServer {
         &self,
         params: ExecCommandParams,
     ) -> Result<CallToolResult, ErrorData> {
+        self.exec_pipeline(ExecPipelineParams {
+            command: &params.command,
+            working_dir: params.working_dir.as_deref(),
+            extra_env: params.env.as_ref(),
+            timeout_secs: params.timeout_secs.unwrap_or(120),
+            truncate_opts: Self::truncate_opts_from(
+                params.head_lines,
+                params.tail_lines,
+                params.max_output_bytes,
+            ),
+            template_sandbox: None,
+        })
+        .await
+    }
+
+    pub(crate) async fn invoke_template(
+        &self,
+        name: &str,
+        args: &Map<String, Value>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let registered = self.inner.templates.get(name).ok_or_else(|| {
+            ErrorData::invalid_params(format!("unknown tool template: {name}"), None)
+        })?;
+        let bound = registered
+            .template
+            .validate_and_bind(args)
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        let command = registered
+            .template
+            .render_script(&bound)
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+
+        // Parameter bindings take precedence over author-supplied top-level env.
+        let mut extra_env = registered.template.env.clone().unwrap_or_default();
+        extra_env.extend(bound);
+        if !registered.sandbox_enabled {
+            log::warn!("tool '{name}' runs UNSANDBOXED (sandbox.enabled=false)");
+            if registered.ignored_grants {
+                log::warn!("tool '{name}' ignores sandbox grants because sandbox.enabled=false");
+            }
+        }
+
+        self.exec_pipeline(ExecPipelineParams {
+            command: &command,
+            working_dir: None,
+            extra_env: Some(&extra_env),
+            timeout_secs: 120,
+            truncate_opts: Self::truncate_opts_from(None, None, None),
+            template_sandbox: Some(TemplateSandbox {
+                enabled: registered.sandbox_enabled,
+                read_paths: &registered.read_paths,
+                write_paths: &registered.write_paths,
+                pass_env: &registered.pass_env,
+                no_network: registered.no_network,
+            }),
+        })
+        .await
+    }
+
+    pub(crate) async fn exec_pipeline(
+        &self,
+        params: ExecPipelineParams<'_>,
+    ) -> Result<CallToolResult, ErrorData> {
         let prepared = self
             .prepare_exec(
-                &params.command,
-                params.working_dir.as_deref(),
-                params.env.as_ref(),
+                params.command,
+                params.working_dir,
+                params.extra_env,
                 "before exec",
             )
             .await?;
@@ -23,13 +86,6 @@ impl BashServer {
             snapshot_decision,
             before_snap_ids: before_snaps,
         } = prepared;
-
-        let timeout_secs = params.timeout_secs.unwrap_or(120);
-        let truncate_opts = Self::truncate_opts_from(
-            params.head_lines,
-            params.tail_lines,
-            params.max_output_bytes,
-        );
 
         let ExecLog {
             exec_dir,
@@ -41,13 +97,14 @@ impl BashServer {
         } = self.setup_exec_log().await?;
 
         let command = self
-            .build_command(
+            .build_command_with_sandbox(
                 CommandBuildCtx {
-                    command: &params.command,
+                    command: params.command,
                     working_dir: &working_dir,
                     exec_dir: &exec_dir,
-                    env: params.env.as_ref(),
+                    env: params.extra_env,
                 },
+                params.template_sandbox,
                 Stdio::piped(),
                 Stdio::piped(),
             )
@@ -59,7 +116,7 @@ impl BashServer {
             stderr_str,
         } = Self::run_to_completion(
             command,
-            timeout_secs,
+            params.timeout_secs,
             LogTargets {
                 stdout_file,
                 stderr_file,
@@ -74,7 +131,7 @@ impl BashServer {
             render_streams_block(
                 &stdout_str,
                 &stderr_str,
-                &truncate_opts,
+                &params.truncate_opts,
                 None,
                 &execution_id,
                 &stdout_log_path,
@@ -87,7 +144,7 @@ impl BashServer {
             (Some(status), false) => {
                 self.build_exec_success_result(ExitResultCtx {
                     execution_id: &execution_id,
-                    command: &params.command,
+                    command: params.command,
                     working_dir: &working_dir,
                     stdout_log_path: &stdout_log_path,
                     stderr_log_path: &stderr_log_path,
@@ -103,15 +160,15 @@ impl BashServer {
             (Some(status), true) => {
                 let _ = status;
                 self.build_timeout_result(TimeoutResultCtx {
-                    command: &params.command,
+                    command: params.command,
                     working_dir: &working_dir,
                     execution_id: &execution_id,
-                    timeout_secs,
+                    timeout_secs: params.timeout_secs,
                     total_lines,
                     total_bytes,
                     stdout: &stdout_str,
                     stderr: &stderr_str,
-                    truncate_opts: &truncate_opts,
+                    truncate_opts: &params.truncate_opts,
                     stdout_log_path: &stdout_log_path,
                     stderr_log_path: &stderr_log_path,
                 })

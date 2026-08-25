@@ -18,7 +18,7 @@ impl ServerHandler for BashServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(vec![
+        let mut tools = vec![
             Tool::new(
                 "exec",
                 "Execute a command and return truncated combined stdout/stderr. When output is cropped, stdout/stderr temp log files are included for later retrieval. Prefer head_lines/tail_lines/max_output_bytes params over piping to head/tail in the command string. Supports shebang lines: if the command starts with #!, the script is written to a temp file and executed with the named interpreter (python3, node, ruby, etc.) — prefer this over python3 -c or node -e for multi-line scripts.",
@@ -61,7 +61,16 @@ impl ServerHandler for BashServer {
             )
             .with_input_schema::<RollbackParams>()
             .with_meta(call_template_meta(tool_templates::ROLLBACK_FILE_CALL)),
-        ]))
+        ];
+        tools.extend(self.tool_templates().map(|(name, registered)| {
+            Tool::new(
+                name.clone(),
+                registered.description.clone(),
+                registered.input_schema.clone(),
+            )
+            .with_meta(call_template_meta(name))
+        }));
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
@@ -113,6 +122,10 @@ impl BashServer {
             "rollback_file" => {
                 let params = parse_arguments::<RollbackParams>(request.arguments)?;
                 self.rollback_file_impl(params).await
+            }
+            template if self.has_tool_template(template) => {
+                self.invoke_template(template, &request.arguments.unwrap_or_default())
+                    .await
             }
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),

@@ -2,6 +2,7 @@ use crate::server::{
     BashServer, ExecCommandParams, ReadExecLogParams, RollbackParams, SpawnCommandParams,
     TerminateParams, WaitParams,
 };
+use crate::tool_template::ToolTemplate;
 use crate::tool_templates;
 use async_trait::async_trait;
 use harnx_sandbox_common::SandboxConfig;
@@ -20,10 +21,13 @@ pub struct BashToolset {
 
 impl BashToolset {
     /// Build a toolset from resolved filesystem permissions and sandbox configuration.
-    pub async fn new(sandbox_config: SandboxConfig) -> Self {
-        let server = BashServer::new_with_sandbox(sandbox_config);
+    pub async fn new(
+        sandbox_config: SandboxConfig,
+        templates: Vec<ToolTemplate>,
+    ) -> anyhow::Result<Self> {
+        let server = BashServer::new_with_templates(sandbox_config, templates)?;
         server.initialize_allowlist().await;
-        Self { server }
+        Ok(Self { server })
     }
 
     /// Remove temporary execution logs created by this toolset instance.
@@ -75,7 +79,7 @@ impl Toolset for BashToolset {
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
-        vec![
+        let mut tools = vec![
             spec::<ExecCommandParams>(
                 "exec",
                 "Execute a command and return truncated combined stdout/stderr. When output is cropped, stdout/stderr temp log files are included for later retrieval. Prefer head_lines/tail_lines/max_output_bytes params over piping to head/tail in the command string. Supports shebang lines: if the command starts with #!, the script is written to a temp file and executed with the named interpreter (python3, node, ruby, etc.) — prefer this over python3 -c or node -e for multi-line scripts.",
@@ -106,7 +110,24 @@ impl Toolset for BashToolset {
                 "Restore a repository to a prior harnx history snapshot. Pass the commit SHA from the 'commit <sha>' line at the top of a prior tool response's diff as the commit_id parameter.",
                 tool_templates::ROLLBACK_FILE_CALL,
             ),
-        ]
+        ];
+        tools.extend(self.server.tool_templates().map(|(name, registered)| {
+            ToolSpec {
+                name: name.clone(),
+                description: registered.description.clone(),
+                input_schema: Value::Object(registered.input_schema.clone()),
+                idempotent_hint: false,
+                read_only_hint: false,
+                timeout_secs: None,
+                meta: Some(
+                    serde_json::json!({ "call_template": name })
+                        .as_object()
+                        .expect("object literal")
+                        .clone(),
+                ),
+            }
+        }));
+        tools
     }
 
     async fn invoke(
@@ -122,6 +143,18 @@ impl Toolset for BashToolset {
             "wait" => self.server.wait_impl(parse_args(args)?).await,
             "terminate" => self.server.terminate_impl(parse_args(args)?).await,
             "rollback_file" => self.server.rollback_file_impl(parse_args(args)?).await,
+            _ if self.server.has_tool_template(tool) => {
+                let arguments = match args {
+                    Value::Object(arguments) => arguments,
+                    Value::Null => Map::new(),
+                    _ => {
+                        return Err(ToolInvokeError::Recoverable(
+                            "invalid tool arguments: expected a JSON object".to_string(),
+                        ));
+                    }
+                };
+                self.server.invoke_template(tool, &arguments).await
+            }
             _ => {
                 return Err(ToolInvokeError::Recoverable(format!(
                     "unknown bash tool: {tool}"
@@ -169,7 +202,7 @@ mod tests {
             allowlist.insert_rwx(path);
         }
         config.allowlist = Arc::new(allowlist);
-        BashToolset::new(config).await
+        BashToolset::new(config, Vec::new()).await.unwrap()
     }
 
     #[tokio::test]
@@ -189,14 +222,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
-            [
-                "exec",
-                "read_exec_log",
-                "spawn",
-                "wait",
-                "terminate",
-                "rollback_file"
-            ]
+            crate::server::BUILTIN_TOOL_NAMES
         );
         assert!(tools.iter().all(|tool| {
             tool.input_schema.get("type") == Some(&json!("object"))

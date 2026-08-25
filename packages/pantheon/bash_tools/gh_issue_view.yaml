@@ -1,0 +1,14 @@
+name: gh_issue_view
+description: View a GitHub issue as JSON
+parameters:
+  number: { type: integer, required: true, description: Issue number }
+  repo:   { type: string,  required: true, pattern: "^[\\w.-]+/[\\w.-]+$" }
+env: { GH_PAGER: "" }
+sandbox:
+  read:  ["~/.config/gh"]
+  write: ["/tmp/out"]
+  env:   ["GH_TOKEN"]
+template: false
+script: |
+  set -euo pipefail
+  gh issue view "$NUMBER" --repo "$REPO" --json title,body,comments

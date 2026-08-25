@@ -20,7 +20,9 @@ harnx-toolset = { path = "../harnx-toolset" }
 harnx-toolset-server = { path = "../harnx-toolset-server" }
 libc = { workspace = true }
 log = { workspace = true }
+minijinja = { workspace = true }
 process-wrap = { workspace = true }
+regex = { workspace = true }
 rmcp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
