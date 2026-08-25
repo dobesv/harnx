@@ -69,6 +69,20 @@ impl SharedNatsServer {
             .await
             .unwrap_or(false)
     }
+
+    /// Replace a stale broker identity, returning whether it changed.
+    ///
+    /// The old owner must be dropped before discovery runs again: even after
+    /// its child exits, it retains the lifetime lock until cleanup completes.
+    pub(crate) async fn refresh_if_stale(&mut self) -> Result<bool> {
+        if self.is_current().await {
+            return Ok(false);
+        }
+
+        self.owner.take();
+        *self = ensure_shared_server().await?;
+        Ok(true)
+    }
 }
 
 fn joiner_is_current(cached_identity: (String, String, String)) -> bool {
