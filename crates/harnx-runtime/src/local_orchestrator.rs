@@ -177,6 +177,18 @@ impl LocalWorkerSupervisor {
     /// Check health and respawn this supervisor's worker after a crash.
     /// Running workers are never restarted for binary or configuration changes.
     pub async fn ensure(&mut self, abort_signal: AbortSignal) -> Result<LocalWorkerRoute> {
+        if self
+            .server
+            .refresh_if_stale()
+            .await
+            .context("refresh shared local NATS server")?
+        {
+            // A worker is affine to the broker identity passed in its
+            // environment. It cannot serve turns on the replacement broker,
+            // even if its process has not noticed the old broker's exit yet.
+            self.stop_worker();
+        }
+
         if self.child_is_running()? {
             return Ok(self.route.clone());
         }
@@ -353,6 +365,20 @@ impl LocalWorkerSupervisor {
     pub fn server(&self) -> &SharedNatsServer {
         &self.server
     }
+
+    fn stop_worker(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        signal_worker_tree(&mut child);
+        let _ = std::thread::Builder::new()
+            .name("harnx-worker-reaper".to_string())
+            .spawn(move || {
+                while matches!(child.try_wait(), Ok(None)) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+    }
 }
 
 /// Build the frontend-managed local worker subprocess command.
@@ -382,17 +408,7 @@ pub fn build_local_worker_command(
 
 impl Drop for LocalWorkerSupervisor {
     fn drop(&mut self) {
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        signal_worker_tree(&mut child);
-        let _ = std::thread::Builder::new()
-            .name("harnx-worker-reaper".to_string())
-            .spawn(move || {
-                while matches!(child.try_wait(), Ok(None)) {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            });
+        self.stop_worker();
     }
 }
 
