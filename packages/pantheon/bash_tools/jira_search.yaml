@@ -1,0 +1,9 @@
+name: jira_search
+description: Search Jira work items by text
+parameters:
+  query: { type: string, required: true, description: "Text to search" }
+  limit: { type: integer, required: false, min: 1, max: 100, description: "Max results" }
+template: false
+script: |
+  set -euo pipefail
+  acli jira workitem search --jql "text ~ \"$QUERY\"" ${LIMIT:+--limit "$LIMIT"}

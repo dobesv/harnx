@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod test_support;
 
-use harnx_bash_tools::BashToolset;
+use harnx_bash_tools::{discover_tool_templates, BashToolset, ToolTemplate};
 use harnx_sandbox_common::SandboxConfig;
 use harnx_tool_allow::{resolve_allowlist, AllowEnv, AllowInputs};
 use std::path::PathBuf;
@@ -10,15 +10,16 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
-    let sandbox_config = parse_args()?;
+    let (sandbox_config, templates) = parse_args()?;
     let allowlist = &sandbox_config.allowlist;
 
     log::info!(
-        "harnx-bash-tools v{}: starting ({} read, {} write, {} exec allow paths)",
+        "harnx-bash-tools v{}: starting ({} read, {} write, {} exec allow paths, {} command templates)",
         env!("CARGO_PKG_VERSION"),
         allowlist.read_paths().len(),
         allowlist.write_paths().len(),
         allowlist.exec_paths().len(),
+        templates.len(),
     );
 
     #[cfg(unix)]
@@ -31,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
         log::info!("  sandbox: disabled");
     }
 
-    let toolset = BashToolset::new(sandbox_config).await;
+    let toolset = BashToolset::new(sandbox_config, templates).await?;
     let cleanup_toolset = toolset.clone();
     let result = harnx_toolset_server::run_toolset_main(toolset).await;
     if let Err(err) = cleanup_toolset.cleanup_log_dir() {
@@ -140,6 +141,8 @@ fn print_help_and_exit() -> ! {
     eprintln!("  --allow-all               Allow all filesystem paths (HOME guard still applies)");
     eprintln!("  --no-sandbox              Disable filesystem sandboxing explicitly");
     eprintln!("  --sandbox-run <path>      Override sandbox helper binary path");
+    eprintln!("  --tool <path>             Load a command template YAML file (repeatable)");
+    eprintln!("  --tools-dir <path>        Load command template YAML files from a directory (repeatable)");
     eprintln!("  --env, -e <VAR>           Pass VAR from host env to child (repeatable)");
     eprintln!("  --env, -e <VAR=VALUE>     Set VAR=VALUE in child env (repeatable)");
     eprintln!("  --mcp-stdio               Use MCP stdio transport instead of NATS");
@@ -155,6 +158,7 @@ fn print_help_and_exit() -> ! {
     eprintln!("  HARNX_TOOLS_ALLOW_REPO_WORK       Enable repo-work batch (1/true/yes/on)");
     eprintln!("  HARNX_TOOLS_ALLOW_ALL             Enable allow-all batch (1/true/yes/on)");
     eprintln!("  HARNX_BASH_ENV_PASSTHROUGH        Comma-separated extra child env names");
+    eprintln!("  HARNX_PACKAGE_DIR                 Package directory containing bash_tools/");
     eprintln!();
     eprintln!("No allow flags or batch toggles means deny-all filesystem access.");
     #[cfg(not(unix))]
@@ -176,6 +180,8 @@ fn parse_cli_args(
     args: &[String],
     inputs: &mut AllowInputs,
     config: &mut SandboxConfig,
+    cli_files: &mut Vec<PathBuf>,
+    cli_dirs: &mut Vec<PathBuf>,
 ) -> Result<Option<PathBuf>, String> {
     let mut sandbox_run_override = None;
     let mut i = 1;
@@ -222,6 +228,14 @@ fn parse_cli_args(
                 sandbox_run_override = Some(required_path(args, i));
                 i += 2;
             }
+            "--tool" => {
+                cli_files.push(required_path(args, i));
+                i += 2;
+            }
+            "--tools-dir" => {
+                cli_dirs.push(required_path(args, i));
+                i += 2;
+            }
             "--env" | "-e" => parse_env_option(args, &mut i, config),
             "--mcp-stdio" => i += 1,
             "--help" | "-h" => print_help_and_exit(),
@@ -236,16 +250,24 @@ fn parse_cli_args(
     Ok(sandbox_run_override)
 }
 
-fn parse_args() -> anyhow::Result<SandboxConfig> {
+fn parse_args() -> anyhow::Result<(SandboxConfig, Vec<ToolTemplate>)> {
     let args: Vec<String> = std::env::args().collect();
     let cwd = std::env::current_dir()?;
     let mut inputs = initial_allow_inputs();
     let mut config = initial_sandbox_config();
-    let sandbox_run_override =
-        parse_cli_args(&args, &mut inputs, &mut config).unwrap_or_else(|error| {
-            eprintln!("{error}");
-            std::process::exit(1);
-        });
+    let mut cli_files = Vec::new();
+    let mut cli_dirs = Vec::new();
+    let sandbox_run_override = parse_cli_args(
+        &args,
+        &mut inputs,
+        &mut config,
+        &mut cli_files,
+        &mut cli_dirs,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
 
     #[cfg(unix)]
     {
@@ -277,7 +299,12 @@ fn parse_args() -> anyhow::Result<SandboxConfig> {
         &cwd,
         &AllowEnv::from_current_process(),
     ));
-    Ok(config)
+
+    let package_dir = std::env::var_os("HARNX_PACKAGE_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let templates = discover_tool_templates(package_dir.as_deref(), &cli_files, &cli_dirs)?;
+    Ok((config, templates))
 }
 
 #[cfg(test)]
@@ -314,6 +341,39 @@ mod tests {
     }
 
     #[test]
+    fn repeated_template_flags_collect_paths() {
+        let args = [
+            "harnx-bash-tools",
+            "--tool",
+            "one.yaml",
+            "--tools-dir",
+            "templates",
+            "--tool",
+            "two.yaml",
+        ]
+        .map(str::to_string);
+        let mut inputs = AllowInputs::default();
+        let mut config = initial_sandbox_config();
+        let mut cli_files = Vec::new();
+        let mut cli_dirs = Vec::new();
+
+        parse_cli_args(
+            &args,
+            &mut inputs,
+            &mut config,
+            &mut cli_files,
+            &mut cli_dirs,
+        )
+        .expect("template flags should parse");
+
+        assert_eq!(
+            cli_files,
+            [PathBuf::from("one.yaml"), PathBuf::from("two.yaml")]
+        );
+        assert_eq!(cli_dirs, [PathBuf::from("templates")]);
+    }
+
+    #[test]
     fn rejects_legacy_allowlist_flags() {
         let legacy_flags = [
             ["--", "root"].concat(),
@@ -325,8 +385,16 @@ mod tests {
             let args = vec!["harnx-bash-tools".to_string(), flag.clone()];
             let mut inputs = AllowInputs::default();
             let mut config = initial_sandbox_config();
-            let error = parse_cli_args(&args, &mut inputs, &mut config)
-                .expect_err("legacy flag should be rejected");
+            let mut cli_files = Vec::new();
+            let mut cli_dirs = Vec::new();
+            let error = parse_cli_args(
+                &args,
+                &mut inputs,
+                &mut config,
+                &mut cli_files,
+                &mut cli_dirs,
+            )
+            .expect_err("legacy flag should be rejected");
             assert!(error.contains(&format!("unknown argument: {flag}")));
         }
     }

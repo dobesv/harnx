@@ -1,0 +1,13 @@
+name: gh_pr_files
+description: List files changed in a GitHub pull request
+parameters:
+  number: { type: integer, required: true, description: "PR number" }
+  repo:   { type: string, required: false, pattern: "^[\\w.-]+/[\\w.-]+$", description: "owner/repo" }
+env: { GH_PAGER: "" }
+sandbox:
+  read: ["~/.config/gh"]
+  env:  ["GH_TOKEN"]
+template: false
+script: |
+  set -euo pipefail
+  gh pr diff "$NUMBER" ${REPO:+--repo "$REPO"} --name-only

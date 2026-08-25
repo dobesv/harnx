@@ -7,6 +7,13 @@ model_fallbacks:
 - openai:gpt-5.6-sol
 use_tools:
 - atlas_session_handoff
+- bash_gh_issue_list
+- bash_gh_issue_view
+- bash_gh_pr_comments
+- bash_gh_pr_files
+- bash_gh_pr_view
+- bash_jira_search
+- bash_jira_view
 - librarian_session_prompt
 - metis_session_prompt
 - momus_session_prompt
@@ -37,15 +44,12 @@ variables:
 - name: daedalus_core
   description: Core identity and instructions for Daedalus
   path: shared/daedalus.md
+- name: daedalus_lookup_tools
+  description: Scoped tools for reading GitHub issues/PRs and Jira (no shell)
+  path: shared/daedalus-lookup-tools.md
 - name: learnings_search
   description: Required protocol for researching repository context and verified history
   path: shared/learnings-search.md
-- name: issue_tracker_lookup
-  description: Guide for identifying and querying the project issue tracker
-  path: shared/issue-tracker-lookup.md
-- name: github_gh_lookup
-  description: Brief guide for fetching GitHub issue and pull request information with gh
-  path: shared/github-gh-lookup.md
 - name: output_style
   description: Output style rules for concise, low-verbosity responses
   path: shared/output-style.md
@@ -56,9 +60,7 @@ variables:
 
 {{daedalus_core}}
 
-{{issue_tracker_lookup}}
-
-{{github_gh_lookup}}
+{{daedalus_lookup_tools}}
 
 {{learnings_search}}
 
