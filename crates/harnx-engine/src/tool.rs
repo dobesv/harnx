@@ -790,6 +790,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_provider_returns_recoverable_error() {
+        let ctx = test_context(Vec::new(), |_| continue_hook_outcome());
+        let abort_signal = create_abort_signal();
+        let result = eval_tool_calls(&ctx, vec![test_call("unknown_tool")], &abort_signal)
+            .await
+            .expect("a missing provider should become a tool result");
+
+        let [result] = result.as_slice() else {
+            panic!("missing provider should return exactly one tool result");
+        };
+        assert_eq!(
+            (
+                result.call.name.as_str(),
+                result.output["is_error"].as_bool()
+            ),
+            ("unknown_tool", Some(true))
+        );
+        assert!(result.output["error"]
+            .as_str()
+            .expect("missing-provider error should be text")
+            .contains("No tool provider configured"));
+    }
+
+    #[tokio::test]
     async fn blocked_call_emits_blocked_event() {
         let started_emit_count = Arc::new(AtomicUsize::new(0));
         let started_emit_count_clone = Arc::clone(&started_emit_count);
