@@ -40,7 +40,21 @@ const SESSION_ONE_SNAPSHOT = [
   },
 ];
 
+const HANDOFF_TARGET_SNAPSHOT = [
+  {
+    id: 'handoff-user',
+    role: 'user',
+    content: 'Delegated work from coding/coder',
+  },
+  {
+    id: 'handoff-assistant',
+    role: 'assistant',
+    content: 'Durable handoff target history',
+  },
+];
+
 function buildSnapshot(session: string) {
+  if (session === 'handoff-target') return HANDOFF_TARGET_SNAPSHOT;
   if (session === 'session-gallery') {
     return [
       {
@@ -100,6 +114,44 @@ function buildSnapshot(session: string) {
   }
   if (session !== 'session-1') return additionalSnapshot(session);
   return [...SESSION_ONE_SNAPSHOT, ...additionalSnapshot(session)];
+}
+
+async function emitHandoff(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  threadId: string,
+  runId: string
+) {
+  controller.enqueue(encodeSseEvent({
+    type: 'CUSTOM',
+    threadId,
+    runId,
+    name: 'turn_handoff_requested',
+    value: { agent: 'assistant', session_id: null },
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  controller.enqueue(encodeSseEvent({
+    type: 'CUSTOM',
+    threadId,
+    runId,
+    name: 'session_handoff',
+    value: { agent: 'assistant', session_id: 'handoff-target' },
+  }));
+  controller.enqueue(encodeSseEvent({ type: 'RUN_FINISHED', threadId, runId }));
+  controller.close();
+}
+
+function emitSnapshot(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  session: string,
+  threadId: string,
+  runId: string
+) {
+  controller.enqueue(encodeSseEvent({
+    type: 'MESSAGES_SNAPSHOT',
+    messages: buildSnapshot(session),
+  }));
+  controller.enqueue(encodeSseEvent({ type: 'RUN_FINISHED', threadId, runId }));
+  controller.close();
 }
 
 function createAgUiStream({ session, body }: { session: string; body: any }) {
@@ -181,16 +233,7 @@ function createAgUiStream({ session, body }: { session: string; body: any }) {
         // RUN_STARTED -> MESSAGES_SNAPSHOT -> RUN_FINISHED). A prompted run below
         // is a pure delta and must NOT emit MESSAGES_SNAPSHOT — applying an empty/
         // stale snapshot mid-run would wipe the optimistic user message + reply.
-        controller.enqueue(encodeSseEvent({
-          type: 'MESSAGES_SNAPSHOT',
-          messages: buildSnapshot(session),
-        }));
-        controller.enqueue(encodeSseEvent({
-          type: 'RUN_FINISHED',
-          threadId,
-          runId,
-        }));
-        controller.close();
+        emitSnapshot(controller, session, threadId, runId);
         return;
       }
 
@@ -276,6 +319,11 @@ function createAgUiStream({ session, body }: { session: string; body: any }) {
           runId,
         }));
         controller.close();
+        return;
+      }
+
+      if (userText === 'handoff now') {
+        await emitHandoff(controller, threadId, runId);
         return;
       }
 

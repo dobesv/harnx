@@ -1,0 +1,18 @@
+---
+source: crates/harnx-tui/src/tests/subagent_session_tests.rs
+expression: normalize_screen(&harness.screen_contents())
+---
+ ⠋ @ researcher [parent-s]  running
+parent transcript
+
+✓ @ fact-checker [nested-s]  done
+
+
+
+
+
+
+
+
+
+ ↑↓/browse  ENTER/open  PgUp/PgDn/scroll  ESC/back

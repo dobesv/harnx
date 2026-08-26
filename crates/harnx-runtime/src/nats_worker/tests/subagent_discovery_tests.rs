@@ -1,5 +1,18 @@
 use super::*;
 
+pub(super) async fn wait_for_cluster_worker(config: &Config, cluster: &str) -> anyhow::Result<()> {
+    let client = config.nats_client(cluster).await?;
+    let mut readiness = client
+        .subscribe(crate::nats_worker::worker_ready_subject(cluster))
+        .await?;
+    client.flush().await?;
+    tokio::time::timeout(Duration::from_secs(10), readiness.next())
+        .await
+        .context("worker readiness timed out")?
+        .context("worker readiness subscription closed")?;
+    Ok(())
+}
+
 fn write_package_agent(seeded: &SeededRemoteParentConfig, agent: &str, contents: &str) {
     let agents_dir = seeded
         .config_dir()

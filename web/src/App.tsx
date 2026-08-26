@@ -527,9 +527,9 @@ export default function App() {
     isFreshSession
   } = useAgentSessions();
 
-  const handleHandoff = useCallback((agent: string, sessionId: string | null) => {
-    if (agent) selectAgent(agent);
-    if (sessionId) selectSession(sessionId);
+  const handleHandoff = useCallback((agent: string, sessionId: string) => {
+    selectAgent(agent);
+    selectSession(sessionId);
   }, [selectAgent, selectSession]);
 
   return (
@@ -560,7 +560,8 @@ export default function App() {
             onSwitchSession={clearSession}
           />
           <div className="chat-main">
-            <ChatProvider 
+            <ChatProvider
+              key={`${selectedAgent}:${selectedSessionId}`}
               agentName={selectedAgent} 
               sessionId={selectedSessionId} 
               isFreshSession={isFreshSession}

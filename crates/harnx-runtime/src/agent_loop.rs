@@ -248,6 +248,37 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
     with_turn_lifecycle(ctx, run_agent_loop_inner(ctx, initial_input)).await
 }
 
+/// Run one turn while allowing a caller to commit control-plane work before
+/// the terminal [`TurnEvent::Ended`] advisory is emitted.
+///
+/// NATS handoffs use this seam to durably queue and activate the target, then
+/// publish their committed destination while the source turn is still active.
+pub(crate) async fn run_agent_loop_with_before_end<F, Fut>(
+    ctx: &AgentLoopContext,
+    initial_input: Input,
+    before_end: F,
+) -> Result<LoopResult>
+where
+    F: FnOnce(&LoopResult) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    if initial_input.is_empty() {
+        let result = run_agent_loop_inner(ctx, initial_input).await?;
+        before_end(&result).await?;
+        return Ok(result);
+    }
+
+    emit_turn_started();
+    let result = async {
+        let result = run_agent_loop_inner(ctx, initial_input).await?;
+        before_end(&result).await?;
+        Ok(result)
+    }
+    .await;
+    emit_turn_ended(ctx, &result);
+    result
+}
+
 async fn with_turn_lifecycle<T>(
     ctx: &AgentLoopContext,
     future: impl Future<Output = Result<T>>,
@@ -318,9 +349,6 @@ async fn apply_local_handoff(
 ) -> Result<()> {
     ctx.config.write().exit_agent()?;
     Config::use_agent(&ctx.config, agent, session_id, ctx.abort_signal.clone()).await?;
-    if ctx.config.read().session.is_some() {
-        ctx.config.write().empty_session()?;
-    }
     Ok(())
 }
 
@@ -476,6 +504,12 @@ async fn fail_model_turn(params: FailedModelTurn<'_>) -> Result<LoopResult> {
         resume_count,
         error,
     } = params;
+    // Remote cancellation is already represented by its durable Cancel entry.
+    // Persisting an empty assistant response here would come after that entry
+    // and incorrectly make reconstruction treat the cancelled turn as idle.
+    if ctx.abort_signal.aborted() {
+        return Err(error);
+    }
     let _ = dispatch_agent_loop_hook(AgentHookDispatch {
         ctx,
         event: HookEvent::StopFailure {
@@ -681,17 +715,15 @@ async fn advance_tool_round(
 }
 
 fn emit_handoff_request(ctx: &AgentLoopContext, switch: &harnx_core::tool::SwitchAgentData) {
-    let source = harnx_core::event::AgentSource {
-        agent: switch.agent.clone(),
-        session_id: switch.session_id.clone(),
-        model: ctx.config.read().current_model_id(),
-    };
-    harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::sub_agent(
-        source,
-        harnx_core::event::AgentEvent::Turn(harnx_core::event::TurnEvent::HandoffRequested {
+    let _ = ctx;
+    harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Turn(
+        harnx_core::event::TurnEvent::HandoffRequested {
             agent: switch.agent.clone(),
-            session_id: switch.session_id.clone(),
-        }),
+            session_id: switch
+                .session_id
+                .clone()
+                .filter(|session_id| !session_id.trim().is_empty()),
+        },
     ));
 }
 
@@ -1129,139 +1161,66 @@ user prompt"
             AgentEvent::Turn(TurnEvent::HandoffRequested { agent, session_id })
                 if agent == "delegate-agent"
                     && session_id.as_deref() == Some("handoff-target-session")
-        ) && source.as_ref().is_some_and(|source| {
-            source.agent == "delegate-agent"
-                && source.session_id.as_deref() == Some("handoff-target-session")
-        })
+        ) && source.is_none()
     }
 
-    /// Test that the dispatch path for _session_handoff tools returns a
-    /// ToolResult.switch_agent that the loop detects.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn handoff_returns_handoff_requested_and_emits_event() {
+    /// A synthesized handoff result must terminate the loop segment and emit
+    /// an unwrapped source-stream request before dispatch begins.
+    #[tokio::test]
+    async fn handoff_result_returns_request_and_emits_event() {
         let _guard = SINK_LOCK.lock().await;
-        let _state_guard = crate::client::TestStateGuard::new(None).await;
-
         harnx_core::sink::clear_agent_event_sink();
 
-        // Write a delegate-agent file so list_agents() discovers it.
-        let tmp = TempDir::new().unwrap();
-        let agents_dir = tmp.path().join("agents");
-        std::fs::create_dir_all(&agents_dir).unwrap();
-        std::fs::write(
-            agents_dir.join("delegate-agent.md"),
-            "---\nmodel: test-model\n---\nDelegate agent instructions\n",
-        )
-        .unwrap();
-
-        // Set HARNX_CONFIG_DIR to our temp dir for agent discovery
-        struct EnvGuard {
-            key: &'static str,
-            previous: Option<std::ffi::OsString>,
-        }
-        impl EnvGuard {
-            fn set_path(key: &'static str, value: &std::path::Path) -> Self {
-                let previous = std::env::var_os(key);
-                unsafe { std::env::set_var(key, value) };
-                Self { key, previous }
-            }
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match &self.previous {
-                    Some(value) => unsafe { std::env::set_var(self.key, value) },
-                    None => unsafe { std::env::remove_var(self.key) },
-                }
-            }
-        }
-        let _config_dir_guard = EnvGuard::set_path("HARNX_CONFIG_DIR", tmp.path());
-
-        let mut config = crate::config::Config {
-            model: crate::client::Model::new("test", "test-model"),
-            ..Default::default()
-        };
-        let session = crate::config::session::new(&config, "handoff-session", None).unwrap();
-        config.session = Some(session);
-        config.set_use_tools(Some(vec!["delegate-agent_session_handoff".to_string()]));
-
-        let global_config = Arc::new(RwLock::new(config));
-
-        // Use the handoff built-in dispatch path which checks allowed_tool_names
-        // and handoff_targets. The mock provider is an alternative but the
-        // dispatch path for _session_handoff tools in dispatch_tool_call
-        // synthesizes the switch_agent JSON directly when allowed_tool_names
-        // contains the tool name.
-        //
-        // We need delegates-agent to be in handoff_targets. That's populated
-        // by handoff_tool_declarations_for_agents which calls list_agents().
-        // With HARNX_CONFIG_DIR set, list_agents() will find our test agent.
-        //
-        // However the problem is that build_tool_eval_context creates the
-        // context from Config which doesn't have MCP managers. We need to
-        // make the handoff tool be recognized. The dispatch path checks:
-        // 1. Name ends with "_session_handoff"
-        // 2. Name is in allowed_tool_names
-        // 3. handoff_targets maps the bare name to target agent
-        //
-        // Since list_agents() will now find delegate-agent, handoff_targets
-        // should contain "delegate-agent" -> "delegate-agent". We don't need
-        // a mock provider — the dispatch path handles it.
-
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let cc = call_count.clone();
-        let call_fn: AgentCallFn = Arc::new(move |_input, _config, _abort| {
-            let cc = cc.clone();
-            Box::pin(async move {
-                let _n = cc.fetch_add(1, Ordering::SeqCst);
-                Ok((
-                    "handoff now".to_string(),
-                    None,
-                    vec![ToolCall::new(
-                        "delegate-agent_session_handoff".to_string(),
-                        json!({
-                            "prompt": "finish delegated work",
-                            "session_id": "handoff-target-session"
-                        }),
-                        Some("handoff-call-1".to_string()),
-                        None,
-                    )],
-                    CompletionTokenUsage::default(),
-                ))
-            })
+        let config = Arc::new(RwLock::new(crate::config::Config::default()));
+        let call_fn: AgentCallFn = Arc::new(|_, _, _| unreachable!("model is not called"));
+        let ctx = make_test_context(config.clone(), call_fn, handoff_on_tool_round());
+        let input = crate::config::input::from_str(&config, "start handoff", None);
+        let call = ToolCall::new(
+            "delegate-agent_session_handoff".to_string(),
+            json!({ "prompt": "finish delegated work" }),
+            Some("handoff-call-1".to_string()),
+            None,
+        );
+        let mut tool_result = harnx_core::tool::ToolResult::new(call, json!({}));
+        tool_result.switch_agent = Some(harnx_core::tool::SwitchAgentData {
+            agent: "delegate-agent".to_string(),
+            prompt: "finish delegated work".to_string(),
+            session_id: Some("handoff-target-session".to_string()),
         });
 
-        let ctx = make_test_context(global_config.clone(), call_fn, handoff_on_tool_round());
-
-        assert!(!global_config.read().is_compacting_session());
         let sink = Arc::new(CollectingSink::default());
-        let input = crate::config::input::from_str(&global_config, "start handoff", None);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            harnx_core::sink::with_agent_event_sink(sink.clone(), async {
-                run_agent_loop(&ctx, input).await
-            }),
-        )
-        .await
-        .expect("run_agent_loop timed out in handoff test")
-        .unwrap();
+        let result = harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+            advance_tool_round(
+                &ctx,
+                input,
+                ToolRoundOutput {
+                    output: "handoff now".to_string(),
+                    thought: None,
+                    tool_results: vec![tool_result],
+                },
+            )
+            .await
+        })
+        .await;
 
-        match result {
-            LoopResult::HandoffRequested {
-                agent,
-                session_id,
-                prompt,
-            } => {
-                assert_eq!(agent, "delegate-agent");
-                assert_eq!(session_id.as_deref(), Some("handoff-target-session"));
-                assert_eq!(prompt, "finish delegated work");
-            }
-            LoopResult::Completed => panic!("expected handoff result, got Completed"),
-        }
+        let ToolRoundAdvance::Handoff(LoopResult::HandoffRequested {
+            agent,
+            session_id,
+            prompt,
+        }) = result
+        else {
+            panic!("expected handoff advance");
+        };
+        assert_eq!(agent, "delegate-agent");
+        assert_eq!(session_id.as_deref(), Some("handoff-target-session"));
+        assert_eq!(prompt, "finish delegated work");
+        assert!(sink
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(handoff_event_matches_expected));
 
-        let events = sink.events.lock().unwrap();
-        assert!(events.iter().any(handoff_event_matches_expected));
-
-        drop(events);
         harnx_core::sink::clear_agent_event_sink();
     }
 }

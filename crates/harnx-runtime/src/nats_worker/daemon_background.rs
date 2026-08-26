@@ -246,7 +246,7 @@ async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandl
 pub(super) struct WorkerServices {
     pub(super) background: Arc<Mutex<Option<BackgroundServices>>>,
     pub(super) session_metadata: crate::nats_session_metadata::SessionMetadataStore,
-    pub(super) tools_attempted: tokio::sync::watch::Receiver<bool>,
+    pub(super) background_services_attempted: tokio::sync::watch::Receiver<bool>,
     /// `None` for a consuming worker, or a managing worker with nothing
     /// configured to spawn. Tool servers now start on demand per session
     /// (see `handle_activation`) rather than as one batch here.
@@ -321,10 +321,12 @@ pub(super) async fn launch_worker_services(
 
     let background = Arc::new(Mutex::new(None));
     // Session-specific tool servers are awaited during activation, but the
-    // worker-wide sub-agent toolsets still start in the background. Keep the
-    // first activation behind this barrier so its registry snapshot cannot
-    // race those registrations and cache an incomplete tool list.
-    let (tools_attempted_tx, tools_attempted) = tokio::sync::watch::channel(false);
+    // worker-wide sub-agent toolsets and global hooks still start in the
+    // background. Keep the first activation behind this barrier so neither
+    // tool discovery nor the one-shot SessionStart hook dispatch can race the
+    // corresponding registrations.
+    let (background_services_tx, background_services_attempted) =
+        tokio::sync::watch::channel(false);
 
     let all_tool_servers = all_enabled_tool_servers(config);
     let server_reconciler = build_server_reconciler(
@@ -343,13 +345,13 @@ pub(super) async fn launch_worker_services(
         instance_id: instance_id.clone(),
         slot: Arc::clone(&background),
         replicas: startup.replicas,
-        tools_attempted: tools_attempted_tx,
+        background_services_attempted: background_services_tx,
     });
 
     Ok(WorkerServices {
         background,
         session_metadata,
-        tools_attempted,
+        background_services_attempted,
         server_reconciler,
     })
 }
@@ -357,14 +359,14 @@ pub(super) async fn launch_worker_services(
 /// Block until the worker's first sub-agent registration round has finished,
 /// so the session's registry snapshot includes every available delegation
 /// toolset. Session-specific tool servers have their own activation barrier.
-pub(super) async fn await_initial_tool_registration(
-    tools_attempted: &tokio::sync::watch::Receiver<bool>,
+pub(super) async fn await_initial_background_services(
+    services_attempted: &tokio::sync::watch::Receiver<bool>,
 ) {
-    if *tools_attempted.borrow() {
+    if *services_attempted.borrow() {
         return;
     }
-    let mut attempted = tools_attempted.clone();
-    log::debug!("waiting for the first sub-agent tool registration round");
+    let mut attempted = services_attempted.clone();
+    log::debug!("waiting for the first background service registration round");
     // The only sender lives in the background task; if it is gone the round can
     // never complete and there is nothing left to wait for. Cap the wait so a
     // wedged round costs the session its tools rather than the whole turn — the
@@ -378,8 +380,8 @@ pub(super) async fn await_initial_tool_registration(
     .is_err()
     {
         log::warn!(
-            "sub-agent tools did not finish their first registration round within {}s; \
-             starting this session with the tools registered so far",
+            "background services did not finish their first registration round within {}s; \
+             starting this session with the registrations available so far",
             INITIAL_TOOL_REGISTRATION_WAIT.as_secs()
         );
     }
@@ -394,7 +396,7 @@ struct BackgroundServicesCtx {
     instance_id: harnx_core::instance::ServerScope,
     slot: Arc<Mutex<Option<BackgroundServices>>>,
     replicas: usize,
-    tools_attempted: tokio::sync::watch::Sender<bool>,
+    background_services_attempted: tokio::sync::watch::Sender<bool>,
 }
 
 fn spawn_background_services(ctx: BackgroundServicesCtx) {
@@ -407,7 +409,7 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
             instance_id,
             slot,
             replicas,
-            tools_attempted,
+            background_services_attempted,
         } = ctx;
         // Tool servers aren't started here anymore — each session's own
         // servers start on demand through `WorkerRuntime::server_reconciler`.
@@ -436,13 +438,14 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
                 }
             }
         }
-        // Release waiting activations once every sub-agent registration has
-        // either succeeded or failed. Global hooks are independent and must
-        // not delay delegation-tool discovery.
-        let _ = tools_attempted.send(true);
-
         let global_hook_supervisor =
             start_global_hooks(&daemon, client.clone(), &instance_id, &global_hooks).await;
+
+        // SessionStart is dispatched once, immediately after activation. Do
+        // not release that activation until global hook startup has either
+        // succeeded or reached its bounded failure path, or a cold worker can
+        // permanently miss the event.
+        let _ = background_services_attempted.send(true);
 
         *slot.lock().await = Some(BackgroundServices {
             _global_hook_supervisor: global_hook_supervisor,

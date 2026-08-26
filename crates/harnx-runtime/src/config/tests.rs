@@ -119,67 +119,6 @@ fn test_new_session_has_session_id() {
     assert!(session.session_id.is_some());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_new_session_has_short_id() {
-    let config = Arc::new(RwLock::new(Config {
-        model: harnx_client::Model::new("test", "test-model"),
-        ..Config::default()
-    }));
-    let session_id = Config::reserve_new_session_id(&config).await.unwrap();
-    let snapshot = config.read().clone();
-    let jetstream = snapshot.nats_jetstream(LOCAL_CLUSTER_KEY).await.unwrap();
-    let metadata_store = crate::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
-        .await
-        .unwrap();
-    let metadata = metadata_store
-        .get(&session_id)
-        .await
-        .unwrap()
-        .expect("reservation creates complete metadata");
-    assert_eq!(metadata.metadata.session_id, session_id);
-    assert!(metadata_store
-        .get_activity(&session_id)
-        .await
-        .unwrap()
-        .is_some());
-    assert!(
-        crate::nats_session_log::NatsSessionLog::new(jetstream, &session_id)
-            .load_events_async()
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    config.write().use_session(Some(&session_id)).unwrap();
-
-    let guard = config.read();
-    let session = guard.session.as_ref().unwrap();
-    assert_eq!(
-        session.id.len(),
-        6,
-        "anonymous session ID should be 6-char short ID"
-    );
-    assert!(
-        crate::utils::session_name::decode_timestamp_session_id(&session.id).is_some(),
-        "anonymous session ID should be a valid base64url timestamp short ID"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_anonymous_session_id_collision_retries() {
-    let config = Arc::new(RwLock::new(Config {
-        model: harnx_client::Model::new("test", "test-model"),
-        ..Config::default()
-    }));
-    let id1 = Config::reserve_new_session_id(&config).await.unwrap();
-    let id2 = Config::reserve_new_session_id(&config).await.unwrap();
-    assert_ne!(
-        id1, id2,
-        "concurrent anonymous sessions must get unique IDs"
-    );
-    assert_eq!(id1.len(), 6);
-    assert_eq!(id2.len(), 6);
-}
-
 #[test]
 fn empty_session_after_persisted_clear_clears_named_session_with_messages() {
     let mut config = Config::default();

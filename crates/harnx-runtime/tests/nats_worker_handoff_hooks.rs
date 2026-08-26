@@ -10,26 +10,19 @@
 mod common;
 
 use anyhow::Result;
-use harnx_core::{
-    hooks::{HookEvent, HookResultControl},
-    instance::ServerScope,
-    require_nextest,
-    tool::ToolCall,
-};
+use harnx_core::{event::NullSink, require_nextest, session::SessionLogEntry, tool::ToolCall};
 use harnx_runtime::{
     client::CompletionTokenUsage,
     config::Config,
-    nats_hook_provider::{HookDispatchMeta, NatsHookProvider},
-    nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease},
+    nats_session::{NatsSession, NatsSessionConfig},
     nats_session_log::NatsSessionLog,
-    nats_session_metadata::{SessionMetadata, SessionMetadataStore},
-    nats_worker::{run_agent_loop_with_nats, NatsSessionLogBackend, RunAgentLoopArgs},
+    nats_session_metadata::SessionInitializer,
+    nats_worker::{run_worker_daemon, WorkerDaemonConfig},
     utils::create_abort_signal,
 };
 use parking_lot::RwLock;
 use serde_json::json;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 async fn require_nats_server() -> Result<Option<common::NatsServerHandle>> {
@@ -79,63 +72,40 @@ fn write_test_agents(config_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn seed_session_and_attach_runtime(
-    global_config: &Arc<RwLock<Config>>,
-    jetstream: async_nats::jetstream::Context,
-    session_id: &str,
-) -> Result<NatsSessionLog> {
-    let metadata_store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let metadata = SessionMetadata::new(
-        session_id,
-        harnx_runtime::SessionInitializer::named("alpha", Default::default()),
-    );
-    metadata_store.create(&metadata).await?;
-    let backend = NatsSessionLogBackend::new(jetstream.clone(), session_id)
-        .with_metadata_store(Some(metadata_store));
-
-    let log = NatsSessionLog::new(jetstream, session_id);
-    let mut session = metadata.base_session();
-    let runtime = std::sync::Arc::new(backend.clone())
-        as std::sync::Arc<dyn harnx_runtime::config::session::SessionAppendSink>;
-    session.runtime = Some(std::sync::Arc::new(runtime));
-    global_config.write().session = Some(session);
-    Ok(log)
-}
-
 /// First turn requests a handoff to `beta` (naming convention:
 /// `<agent>_session_handoff`); the delegated turn then finishes with plain
 /// text and no further tool calls.
 fn make_beta_handoff_call_fn() -> harnx_runtime::agent_loop::AgentCallFn {
-    let call_count = Arc::new(AtomicUsize::new(0));
-    Arc::new(move |_input, _config, _abort| {
-        let cc = call_count.clone();
-        Box::pin(async move {
-            let n = cc.fetch_add(1, Ordering::SeqCst);
-            if n == 0 {
-                Ok((
-                    "handoff requested".to_string(),
-                    None,
-                    vec![ToolCall::new(
-                        "beta_session_handoff".to_string(),
-                        json!({
-                            "prompt": "finish delegated work",
-                            "session_id": "handoff-hooks-remote-session"
-                        }),
-                        Some("handoff-hooks-call-1".to_string()),
+    let call_fn: harnx_runtime::agent_loop::AgentCallFn =
+        Arc::new(move |_input, config, _abort| {
+            let agent = config.read().extract_agent().name().to_string();
+            Box::pin(async move {
+                if agent == "alpha" {
+                    Ok((
+                        "handoff requested".to_string(),
                         None,
-                    )],
-                    CompletionTokenUsage::default(),
-                ))
-            } else {
-                Ok((
-                    "handoff completed".to_string(),
-                    None,
-                    vec![],
-                    CompletionTokenUsage::default(),
-                ))
-            }
-        })
-    })
+                        vec![ToolCall::new(
+                            "beta_session_handoff".to_string(),
+                            json!({
+                                "prompt": "finish delegated work",
+                                "session_id": "handoff-hooks-remote-session"
+                            }),
+                            Some("handoff-hooks-call-1".to_string()),
+                            None,
+                        )],
+                        CompletionTokenUsage::default(),
+                    ))
+                } else {
+                    Ok((
+                        "handoff completed".to_string(),
+                        None,
+                        vec![],
+                        CompletionTokenUsage::default(),
+                    ))
+                }
+            })
+        });
+    call_fn
 }
 
 /// Directory layout plus env guards for one test run: config/data/state
@@ -193,63 +163,28 @@ fn setup_test_env(server_url: &str) -> Result<TestEnv> {
     })
 }
 
-/// Load config, activate `alpha` for `session_id`, and seed the session log.
-async fn build_activated_config(
+/// Load the worker config and connect to the test cluster.
+async fn build_test_config(
     env: &TestEnv,
-    session_id: &str,
-) -> Result<(Arc<RwLock<Config>>, async_nats::jetstream::Context)> {
+) -> Result<(
+    Arc<RwLock<Config>>,
+    async_nats::Client,
+    async_nats::jetstream::Context,
+)> {
     let config_path = env.config_dir.join("config.yaml");
     let base = {
         let _config_guard = EnvVarGuard::set_path("HARNX_CONFIG_DIR", &env.config_dir);
         Config::load_from_file(&config_path)?
     };
     let config = Arc::new(RwLock::new(base));
-    harnx_runtime::config::Config::use_agent(
-        &config,
-        "alpha",
-        Some(session_id),
-        create_abort_signal(),
-    )
-    .await?;
-
-    let js = {
+    let (client, js) = {
         let cfg = config.read().clone();
-        cfg.nats_jetstream("local").await?
-    };
-    seed_session_and_attach_runtime(&config, js.clone(), session_id).await?;
-    Ok((config, js))
-}
-
-/// Fresh post-run discovery: query NATS directly rather than through the
-/// worker's own (now-dropped) `ctx.nats_hook_provider`, so this reflects
-/// whatever registration the handoff's hook supervisor actually left behind.
-async fn assert_pre_tool_use_blocked(
-    js: &async_nats::jetstream::Context,
-    instance_id: ServerScope,
-) -> Result<()> {
-    let provider = NatsHookProvider::discover_with_client(js.client().clone(), instance_id).await?;
-    let outcome = provider
-        .dispatch_event(
-            HookEvent::PreToolUse {
-                tool_name: "exec".to_string(),
-                tool_input: json!({"command": "true"}),
-                tool_use_id: "post-handoff-check".to_string(),
-            },
-            None,
-            HookDispatchMeta {
-                session_id: "handoff-hooks-remote-session".to_string(),
-                cwd: std::env::current_dir()?,
-                resume_count: 0,
-            },
+        (
+            cfg.nats_client("local").await?,
+            cfg.nats_jetstream("local").await?,
         )
-        .await;
-    assert!(
-        matches!(outcome.control, HookResultControl::Block { .. }),
-        "handoff to an agent with hooks must attempt to enforce them (fail-closed) even \
-         when the hook server itself fails to start; got {:?}",
-        outcome.control
-    );
-    Ok(())
+    };
+    Ok((config, client, js))
 }
 
 /// Regression test for the handoff hook-enforcement gap: activation agent
@@ -269,41 +204,56 @@ async fn handoff_to_agent_with_hooks_starts_its_hook_enforcement() -> Result<()>
     };
     let session_id = "handoff-hooks-root";
     let env = setup_test_env(server.url())?;
-    let (config, js) = build_activated_config(&env, session_id).await?;
-    let metadata_store = SessionMetadataStore::ensure(&js, 1).await?;
+    let (config, client, js) = build_test_config(&env).await?;
+    let call_fn = make_beta_handoff_call_fn();
+    let daemon_config = WorkerDaemonConfig::managing("local", "worker-handoff-hooks");
+    let daemon = tokio::spawn({
+        let config = config.clone();
+        async move { run_worker_daemon(config, daemon_config, Some(call_fn)).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    let lease = Arc::new(
-        NatsSessionLease::acquire(NatsLeaseAcquireParams {
-            jetstream: js.clone(),
-            session_id,
-            worker_id: "worker-handoff-hooks".to_string(),
-            generation: 1,
-            config: NatsLeaseConfig::default(),
-            session_metadata: Some(metadata_store.clone()),
-        })
-        .await?
-        .expect("acquire"),
+    let source = NatsSession::new(
+        NatsSessionConfig {
+            cluster: "local".to_string(),
+            initializer: SessionInitializer::named("alpha", Default::default()),
+            session_id: Some(session_id.to_string()),
+            activation_route: harnx_runtime::SessionActivationRoute::ClusterShared,
+        },
+        client,
+        js.clone(),
+        create_abort_signal(),
+    )
+    .await?;
+    source
+        .run_turn("start handoff", Arc::new(NullSink), None)
+        .await?;
+
+    let target_log = NatsSessionLog::new(js, "handoff-hooks-remote-session");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let target_entries = loop {
+        let entries = target_log.load_events_async().await?;
+        if entries
+            .iter()
+            .any(|(_, entry)| matches!(entry, SessionLogEntry::TurnEnd { .. }))
+        {
+            break entries;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "target hook-enforced turn did not finish"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert!(
+        !target_entries.iter().any(|(_, entry)| matches!(
+            entry,
+            SessionLogEntry::Message { role, .. } if role.is_assistant()
+        )),
+        "beta's failed hook must block the target model response: {target_entries:?}"
     );
 
-    let instance_id = ServerScope::new();
-    let input = harnx_runtime::config::input::from_str(&config, "start handoff", None);
-    run_agent_loop_with_nats(RunAgentLoopArgs {
-        cluster_key: "local",
-        manage_servers: true,
-        session_id,
-        config: config.clone(),
-        instance_id: instance_id.clone(),
-        initial_input: input,
-        abort_signal: create_abort_signal(),
-        call_fn: Some(make_beta_handoff_call_fn()),
-        lease: Some(lease),
-        lease_config: NatsLeaseConfig::default(),
-        after_seq_observer: None,
-        session_metadata: Some(&metadata_store),
-        on_tool_round: None,
-        working_dir: None,
-    })
-    .await?;
-
-    assert_pre_tool_use_blocked(&js, instance_id).await
+    daemon.abort();
+    let _ = daemon.await;
+    Ok(())
 }

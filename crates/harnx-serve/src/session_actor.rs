@@ -5,13 +5,12 @@ mod test_executor;
 #[path = "session_actor_test_log.rs"]
 mod test_log;
 
+mod handoff;
 mod registry;
 
 pub use crate::session_actor_types::*;
 pub use registry::SessionRegistry;
 pub use test_log::load_test_session_messages;
-
-use registry::get_or_spawn_in;
 
 use crate::ag_ui::{derive_thread_id, AgUiSink};
 use ag_ui_core::{
@@ -45,7 +44,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{broadcast, mpsc, oneshot, Mutex},
+    sync::{broadcast, mpsc, Mutex},
     time::{sleep_until, Instant, Sleep},
 };
 use tokio_util::task::AbortOnDropHandle;
@@ -286,10 +285,10 @@ impl SessionActor {
                     self.handle_run_done(done, &mut reap_sleep).await;
                 }
                 _ = &mut reap_sleep, if self.reap_deadline.is_some() => {
+                    if self.reap_now() {
+                        break;
+                    }
                     if self.subscribers == 0 && !self.is_running() {
-                        if self.reap_now() {
-                            break;
-                        }
                         self.arm_reap(&mut reap_sleep);
                     } else {
                         self.cancel_reap(&mut reap_sleep);
@@ -399,9 +398,11 @@ impl SessionActor {
             }) => {
                 self.dispatch_handoff_to_target(
                     &done,
-                    agent.clone(),
-                    session_id.clone(),
-                    prompt.clone(),
+                    handoff::HandoffRequest {
+                        agent: agent.clone(),
+                        session_id: session_id.clone(),
+                        prompt: prompt.clone(),
+                    },
                 )
                 .await;
             }
@@ -482,72 +483,6 @@ impl SessionActor {
         } else if self.subscribers == 0 {
             self.arm_reap(reap_sleep);
         }
-    }
-
-    async fn dispatch_handoff_to_target(
-        &mut self,
-        done: &RunFinished,
-        agent: String,
-        session_id: Option<String>,
-        prompt: String,
-    ) {
-        let Some(target_session_id) = self.resolve_handoff_session_id(session_id).await else {
-            self.state = SessionState::Idle;
-            return;
-        };
-
-        let target_key = SessionKey {
-            agent,
-            session: target_session_id,
-        };
-        let target_handle = self.get_or_spawn_target_session_actor(target_key.clone());
-        let (reply_tx, _reply_rx) = oneshot::channel();
-        target_handle
-            .tx
-            .send(SessionCommand::Prompt {
-                text: prompt,
-                options: SessionPromptOptions::default(),
-                reply: reply_tx,
-            })
-            .await
-            .ok();
-
-        self.finish_run(done, None);
-        self.state = SessionState::Idle;
-    }
-
-    async fn resolve_handoff_session_id(&self, session_id: Option<String>) -> Option<String> {
-        match session_id {
-            Some(id) => Some(id),
-            None => {
-                let prompt_config = prompt_config_for_agent_session_from_global(
-                    &self.actor_config.base_config,
-                    &self.key,
-                    self.actor_config.call_fn.is_some(),
-                );
-                let new_session_id = Config::reserve_new_session_id(&prompt_config).await;
-                match new_session_id {
-                    Ok(id) => Some(id),
-                    Err(e) => {
-                        let _ = self.broadcast_tx.send(Event::RunError(RunErrorEvent {
-                            base: base_event(),
-                            message: format!("handoff failed: could not allocate session ID: {e}"),
-                            code: None,
-                        }));
-                        None
-                    }
-                }
-            }
-        }
-    }
-
-    fn get_or_spawn_target_session_actor(&mut self, target_key: SessionKey) -> SessionHandle {
-        get_or_spawn_in(
-            &self.registry,
-            target_key,
-            self.reap_ttl,
-            &self.actor_config,
-        )
     }
 
     async fn start_run(
@@ -756,6 +691,7 @@ impl SessionActor {
             .is_some_and(|deadline| Instant::now() >= deadline)
             && self.subscribers == 0
             && !self.is_running()
+            && self.rx.is_empty()
     }
 
     async fn refresh_history_snapshot(&mut self) {
@@ -925,55 +861,23 @@ impl SessionActor {
             session_event_context,
         ));
         let sink_for_task = sink.clone();
-        let abort_signal_for_task = abort_signal.clone();
         let task = AbortOnDropHandle::new(tokio::spawn(async move {
             let loop_result = with_agent_event_sink(sink_for_task.clone(), async {
-                let mut input = input;
-                loop {
-                    match continue_agent_loop_from_tool_round(
-                        &loop_ctx,
-                        input,
-                        resume.pending.completion_output.clone(),
-                        resume.pending.completion_thought.clone(),
-                        resume.pending.tool_calls.clone(),
-                        resume.decisions.clone(),
-                        resume
-                            .pending
-                            .interrupts
-                            .iter()
-                            .map(|i| i.tool_call_id.clone())
-                            .collect(),
-                    )
-                    .await
-                    {
-                        Ok(harnx_runtime::LoopResult::Completed) => {
-                            break Ok(harnx_runtime::LoopResult::Completed)
-                        }
-                        Ok(harnx_runtime::LoopResult::HandoffRequested {
-                            agent,
-                            session_id,
-                            prompt,
-                        }) => {
-                            prompt_config.write().exit_agent()?;
-                            harnx_runtime::config::Config::use_agent(
-                                &prompt_config,
-                                &agent,
-                                session_id.as_deref(),
-                                abort_signal_for_task.clone(),
-                            )
-                            .await?;
-                            if prompt_config.read().session.is_some() {
-                                prompt_config.write().empty_session()?;
-                            }
-                            input = harnx_runtime::config::input::from_str(
-                                &prompt_config,
-                                &prompt,
-                                None,
-                            );
-                        }
-                        Err(e) => break Err(e),
-                    }
-                }
+                continue_agent_loop_from_tool_round(
+                    &loop_ctx,
+                    input,
+                    resume.pending.completion_output.clone(),
+                    resume.pending.completion_thought.clone(),
+                    resume.pending.tool_calls.clone(),
+                    resume.decisions.clone(),
+                    resume
+                        .pending
+                        .interrupts
+                        .iter()
+                        .map(|i| i.tool_call_id.clone())
+                        .collect(),
+                )
+                .await
             })
             .await;
             let _ = done_tx
@@ -1220,7 +1124,10 @@ mod tests {
     };
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::{sync::Notify, time::sleep};
+    use tokio::{
+        sync::{oneshot, Notify},
+        time::sleep,
+    };
 
     fn key(agent: &str, session: &str) -> SessionKey {
         SessionKey {

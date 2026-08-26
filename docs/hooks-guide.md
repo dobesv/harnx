@@ -18,7 +18,7 @@ Hooks can be configured in three places depending on their intended scope:
 
 1. **Global Hooks** (`config.yaml` under `hooks:`): Apply across all sessions and agents for the lifetime of the Harnx worker daemon.
 2. **Tool-Server Hooks** (`tool_servers/*.yaml` under `hooks:`): Co-launched alongside a specific tool server and attached directly to tool calls handled by that server (e.g., attaching authentication proxies to `bash.yaml`).
-3. **Agent Hooks** (agent `.md` front-matter under `hooks:`): Session-scoped hooks managed dynamically by the worker. When an agent handoff occurs mid-session, old agent hooks are safely stopped and the new agent's hooks are started.
+3. **Agent Hooks** (agent `.md` front-matter under `hooks:`): Session-scoped hooks managed dynamically by the worker. A handoff finishes the source session without mutating its hooks; the independently activated target session starts its own agent hooks through the normal worker lifecycle.
 
 ### Configuration Fields
 
@@ -638,7 +638,7 @@ Hooks are scoped according to where they are configured:
 
 * **Global Hooks** (`config.yaml`): Instance-scoped lifetime, launched by the worker daemon during worker startup.
 * **Tool-Server Hooks** (`tool_servers/*.yaml`): Co-launched alongside the specific tool server by `ToolServerSupervisor` and bound to that tool server's lifecycle.
-* **Agent Hooks** (agent `.md` front-matter): Session-scoped, launched when an agent binds to a session. When an agent handoff occurs mid-session, `reconcile_agent_hooks` tears down the old agent's hook processes and registers the new agent's hook processes seamlessly.
+* **Agent Hooks** (agent `.md` front-matter): Session-scoped, launched when an agent binds to a session. A handoff leaves the source session's hook lifecycle intact and activates an independent target session, whose worker reconciles and starts the target agent's hooks normally.
 
 ### Registry Discovery and Routing
 

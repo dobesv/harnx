@@ -90,9 +90,6 @@ pub struct ToolEvalContext {
     pub render: Option<ToolEvalRenderContext>,
     /// Ordered tool providers to search when dispatching a call.
     pub providers: Vec<Arc<dyn ToolProvider>>,
-    /// Optional session name used when synthesizing `_session_handoff`
-    /// results and the call omitted `session_id`.
-    pub session_name: Option<String>,
     /// Allow-list of synthetic tool names that do not come from a real
     /// provider but are handled directly in `dispatch_tool_call`
     /// (currently `_session_handoff`).
@@ -365,6 +362,7 @@ fn detect_switch_agent(output: &Value) -> Option<SwitchAgentData> {
         session_id: obj
             .get("session_id")
             .and_then(|v| v.as_str())
+            .filter(|session_id| !session_id.trim().is_empty())
             .map(ToString::to_string),
     })
 }
@@ -410,8 +408,8 @@ async fn dispatch_tool_call(
         })?;
         let session_id = json_data["session_id"]
             .as_str()
-            .map(ToString::to_string)
-            .or_else(|| ctx.session_name.clone());
+            .filter(|session_id| !session_id.trim().is_empty())
+            .map(ToString::to_string);
 
         return Ok(json!({
             "content": [{
@@ -618,7 +616,6 @@ mod tests {
             instance_id: harnx_core::instance::ServerScope::new(),
             render: None,
             providers,
-            session_name: None,
             allowed_tool_names: HashSet::new(),
             current_agent_package: None,
             handoff_targets: HashMap::new(),
@@ -1115,6 +1112,17 @@ mod tests {
             .to_string()
     }
 
+    async fn dispatched_handoff(ctx: &ToolEvalContext, tool_name: &str, arguments: Value) -> Value {
+        let call = ToolCall::new(tool_name.to_string(), arguments.clone(), None, None);
+        let abort_signal = create_abort_signal();
+        match dispatch_tool_call(call, arguments, ctx, &abort_signal).await {
+            Ok(result) => result,
+            Err(ToolError::Recoverable(err) | ToolError::Fatal(err)) => {
+                panic!("handoff dispatch should succeed: {err:#}")
+            }
+        }
+    }
+
     #[tokio::test]
     async fn handoff_bare_target_resolves_to_current_package() {
         // #709: `pantheon/daedalus` handing off to bare `atlas` must land on
@@ -1154,42 +1162,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handoff_uses_exact_map_for_same_package_display_name() {
-        let ctx = handoff_context(
-            Some("pantheon"),
-            "atlas_session_handoff",
-            HashMap::from([("atlas".to_string(), "pantheon/atlas".to_string())]),
-        );
-        let agent = dispatched_handoff_agent(&ctx, "atlas_session_handoff").await;
-        assert_eq!(agent, "pantheon/atlas");
-    }
-
-    #[tokio::test]
-    async fn handoff_uses_exact_map_for_cross_package_display_name() {
-        let ctx = handoff_context(
-            Some("pantheon"),
-            "otherpkg__helper_session_handoff",
-            HashMap::from([(
-                "otherpkg__helper".to_string(),
-                "otherpkg/helper".to_string(),
-            )]),
-        );
-        let agent = dispatched_handoff_agent(&ctx, "otherpkg__helper_session_handoff").await;
-        assert_eq!(agent, "otherpkg/helper");
-    }
-
-    #[tokio::test]
-    async fn handoff_uses_exact_map_for_top_level_from_package() {
-        // A top-level agent targeted from within a package is spelled `__stem`
-        // and maps to the BARE top-level name. It must NOT be re-qualified into
-        // the active package (would be `pantheon/global` — wrong).
-        let ctx = handoff_context(
-            Some("pantheon"),
-            "__global_session_handoff",
-            HashMap::from([("__global".to_string(), "global".to_string())]),
-        );
-        let agent = dispatched_handoff_agent(&ctx, "__global_session_handoff").await;
-        assert_eq!(agent, "global");
+    async fn handoff_uses_exact_target_map() {
+        // The exact map covers same-package, cross-package, remote, and bare
+        // top-level targets without applying legacy package qualification.
+        for (stem, expected) in [
+            ("atlas", "pantheon/atlas"),
+            ("otherpkg__helper", "otherpkg/helper"),
+            ("atlas__remote", "pantheon/atlas@remote"),
+            ("__global", "global"),
+        ] {
+            let tool_name = format!("{stem}_session_handoff");
+            let ctx = handoff_context(
+                Some("pantheon"),
+                &tool_name,
+                HashMap::from([(stem.to_string(), expected.to_string())]),
+            );
+            assert_eq!(dispatched_handoff_agent(&ctx, &tool_name).await, expected);
+        }
     }
 
     #[tokio::test]
@@ -1239,6 +1228,45 @@ mod tests {
         assert_eq!(result["action"].as_str(), Some("switch_agent"));
         assert_eq!(result["agent"].as_str(), Some("pantheon/atlas"));
         assert_eq!(result["prompt"].as_str(), Some("do the thing"));
+    }
+
+    #[tokio::test]
+    async fn handoff_normalizes_blank_session_ids_without_substituting_source_id() {
+        let ctx = handoff_context(None, "atlas_session_handoff", HashMap::new());
+        for arguments in [
+            json!({ "prompt": "go" }),
+            json!({ "prompt": "go", "session_id": "" }),
+            json!({ "prompt": "go", "session_id": "  \t " }),
+        ] {
+            let result = dispatched_handoff(&ctx, "atlas_session_handoff", arguments.clone()).await;
+            assert_eq!(result["session_id"], Value::Null, "arguments: {arguments}");
+            assert_eq!(
+                detect_switch_agent(&result)
+                    .expect("handoff result")
+                    .session_id,
+                None,
+                "arguments: {arguments}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_preserves_explicit_session_id_exactly() {
+        let ctx = handoff_context(None, "atlas_session_handoff", HashMap::new());
+        let result = dispatched_handoff(
+            &ctx,
+            "atlas_session_handoff",
+            json!({ "prompt": "go", "session_id": "atlas-existing" }),
+        )
+        .await;
+        assert_eq!(result["session_id"].as_str(), Some("atlas-existing"));
+        assert_eq!(
+            detect_switch_agent(&result)
+                .expect("handoff result")
+                .session_id
+                .as_deref(),
+            Some("atlas-existing")
+        );
     }
 
     #[tokio::test]

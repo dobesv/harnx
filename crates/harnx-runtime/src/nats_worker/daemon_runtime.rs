@@ -63,7 +63,7 @@ pub(super) struct WorkerRuntime {
     pub(super) config: GlobalConfig,
     pub(super) instance_id: harnx_core::instance::ServerScope,
     pub(super) _background_services: Arc<Mutex<Option<BackgroundServices>>>,
-    pub(super) tools_attempted: tokio::sync::watch::Receiver<bool>,
+    pub(super) background_services_attempted: tokio::sync::watch::Receiver<bool>,
     /// `None` for a consuming worker, or a managing worker with nothing
     /// configured to spawn anywhere.
     pub(super) server_reconciler: Option<Arc<ServerReconciler>>,
@@ -379,7 +379,10 @@ impl WorkerRuntime {
         lease: Arc<NatsSessionLease>,
     ) -> Result<PreparedActivation> {
         self.start_session_tool_servers(&activation).await;
-        super::daemon_background::await_initial_tool_registration(&self.tools_attempted).await;
+        super::daemon_background::await_initial_background_services(
+            &self.background_services_attempted,
+        )
+        .await;
         log::info!(
             "session activate claimed: session_id={} worker_id={} worker_pid={} build={} activation_route={:?} revision={} epoch={}",
             activation.session_id,

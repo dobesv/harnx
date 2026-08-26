@@ -1,0 +1,14 @@
+---
+source: crates/harnx-tui/src/tests/subagent_session_tests.rs
+expression: normalize_screen(&harness.screen_contents())
+---
+● @ researcher [01234567]  running
+
+
+
+
+
+
+
+
+• Input

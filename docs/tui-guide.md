@@ -18,6 +18,30 @@ There is no readline-based REPL.
 - **History:** `↑` / `↓` to navigate prior submissions.
 - **Attachments:** `.attach <path>` to attach a file to the next message; `.detach` to remove.
   - **Large pastes** (more than 8 lines or more than 512 characters) are automatically saved as a text attachment instead of being inserted inline. Smaller multi-line pastes are inserted directly into the input.
+- **Sub-agent monitoring:** Delegated child sessions appear as compact rows with
+  running, done, or failed status. Focus a row with normal transcript `↑` / `↓`
+  navigation and press `Enter` to open the child's complete transcript
+  fullscreen.
+
+### Transcript and sub-agent navigation
+
+When the input is blank, `↑` enters transcript navigation. Navigable rows
+include user and assistant messages, tool calls, compaction markers, and
+sub-agent sessions. Press `Enter` on a focused sub-agent row to open it in the
+fullscreen transcript surface.
+
+Inside a child transcript:
+
+- `↑` / `↓` moves between navigable rows and keeps the focused row visible.
+- `Enter` opens full details for a regular row or drills into a focused nested
+  sub-agent session.
+- `PgUp` / `PgDn` or mouse-wheel scrolling moves through the displayed child.
+- `Esc` returns to the parent transcript one level at a time.
+
+Child activity is monitored separately from the root turn, so it does not
+change the root input, busy indicator, or streaming message. Completed child
+views remain available while the same root session is selected; switching the
+root agent/session closes all child monitors and clears those views.
 
 ## Dot-Commands
 

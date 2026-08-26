@@ -53,3 +53,24 @@ pub fn load_test_session_messages(agent: &str, session: &str) -> Vec<harnx_core:
         .expect("replay test session log")
         .messages
 }
+
+pub(super) fn test_session_owner(session: &str) -> Option<String> {
+    let scope = std::env::var("HARNX_CONFIG_DIR").unwrap_or_default();
+    let prefix = format!("{scope}\0");
+    let suffix = format!("\0{session}");
+    TEST_SESSION_LOGS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("test session log registry poisoned")
+        .iter()
+        .find_map(|(key, log)| {
+            (!log.entries().is_empty() && key.starts_with(&prefix) && key.ends_with(&suffix)).then(
+                || {
+                    key.strip_prefix(&prefix)
+                        .and_then(|key| key.strip_suffix(&suffix))
+                        .unwrap_or_default()
+                        .to_string()
+                },
+            )
+        })
+}

@@ -1,6 +1,36 @@
 use super::*;
+use std::path::Path;
 
 type CapturedAgent = (String, Option<f64>);
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set_path(key: &'static str, value: &Path) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
+fn write_test_agent(config_dir: &Path, agent_name: &str, body: &str) -> Result<()> {
+    let agents_dir = config_dir.join("agents");
+    std::fs::create_dir_all(&agents_dir)?;
+    std::fs::write(agents_dir.join(format!("{agent_name}.md")), body)?;
+    Ok(())
+}
 
 fn capture_agent_call(
     captured: Arc<AsyncMutex<Vec<CapturedAgent>>>,

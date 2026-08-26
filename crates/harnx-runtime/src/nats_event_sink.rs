@@ -22,6 +22,23 @@ use harnx_core::event::{AgentEvent, AgentEventSink};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+
+const CONTROL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy)]
+enum DeliveryMode {
+    BestEffort,
+    Required,
+}
+
+enum PublisherCommand {
+    Event {
+        envelope: AdvisoryEnvelope,
+        delivery: DeliveryMode,
+    },
+    Flush(tokio::sync::oneshot::Sender<std::result::Result<(), String>>),
+}
 
 /// Advisory subject pattern for a session's live events.
 ///
@@ -92,7 +109,7 @@ pub struct NatsEventSink {
     /// concurrent publishes finish in any order — a warning and the notice that
     /// followed it could arrive swapped, and no consumer could recover the
     /// intended sequence.
-    publisher: tokio::sync::mpsc::UnboundedSender<AdvisoryEnvelope>,
+    publisher: tokio::sync::mpsc::UnboundedSender<PublisherCommand>,
 }
 
 impl NatsEventSink {
@@ -119,13 +136,45 @@ impl NatsEventSink {
             Err(_) => 0,
         };
         let subject = events_subject(&session_id);
-        let (publisher, mut rx) = tokio::sync::mpsc::unbounded_channel::<AdvisoryEnvelope>();
+        let (publisher, mut rx) = tokio::sync::mpsc::unbounded_channel::<PublisherCommand>();
         let publisher_client = client.clone();
         let publisher_subject = subject.clone();
         // Ends when every clone of this sink is dropped and the channel closes.
         tokio::spawn(async move {
-            while let Some(envelope) = rx.recv().await {
-                publish_envelope(&publisher_client, &publisher_subject, envelope).await;
+            let mut pending_error = None;
+            while let Some(command) = rx.recv().await {
+                match command {
+                    PublisherCommand::Event { envelope, delivery } => {
+                        let result = tokio::time::timeout(
+                            CONTROL_DELIVERY_TIMEOUT,
+                            publish_envelope(&publisher_client, &publisher_subject, envelope),
+                        )
+                        .await;
+                        let error = match result {
+                            Ok(Ok(())) => None,
+                            Ok(Err(error)) => Some(format!("{error:#}")),
+                            Err(_) => Some("publish advisory event timed out".to_string()),
+                        };
+                        if let Some(error) = error {
+                            log::debug!("advisory event publish failed: {error}");
+                            remember_publish_error(&mut pending_error, delivery, error);
+                        }
+                    }
+                    PublisherCommand::Flush(reply) => {
+                        let flush_error = match tokio::time::timeout(
+                            CONTROL_DELIVERY_TIMEOUT,
+                            publisher_client.flush(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => None,
+                            Ok(Err(error)) => Some(format!("flush advisory events: {error}")),
+                            Err(_) => Some("flush advisory events timed out".to_string()),
+                        };
+                        let result = pending_error.take().or(flush_error).map_or(Ok(()), Err);
+                        let _ = reply.send(result);
+                    }
+                }
             }
         });
         Self {
@@ -154,26 +203,112 @@ impl NatsEventSink {
     /// round-trip — `after_seq` comes from the cached atomic.
     pub async fn publish_event(&self, event: AgentEvent) {
         let after_seq = self.after_seq.load(Ordering::Relaxed);
-        publish_envelope(
+        if let Err(error) = publish_envelope(
             &self.client,
             &self.subject,
             AdvisoryEnvelope::new(after_seq, event),
         )
-        .await;
+        .await
+        {
+            log::debug!("advisory event publish failed (lossy-OK): {error:#}");
+        }
+    }
+
+    /// Wait until every event enqueued before this call has been published and
+    /// flushed to the NATS server. Unlike ordinary advisory delivery, this is
+    /// fallible because control events such as a committed handoff must not be
+    /// overtaken or silently lost before the source turn finishes.
+    pub async fn flush(&self) -> Result<()> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.publisher
+            .send(PublisherCommand::Flush(reply_tx))
+            .map_err(|_| anyhow::anyhow!("NATS event publisher stopped before flush"))?;
+        await_flush_reply(reply_rx, CONTROL_DELIVERY_TIMEOUT).await
+    }
+
+    /// Enqueue a control event whose publish failure must be reported by the
+    /// next [`Self::flush`]. Earlier best-effort advisory failures remain
+    /// lossy and do not contaminate the control-event barrier.
+    pub fn emit_required(&self, event: AgentEvent) {
+        self.enqueue(event, DeliveryMode::Required);
+    }
+
+    fn enqueue(&self, event: AgentEvent, delivery: DeliveryMode) {
+        let after_seq = self.after_seq.load(Ordering::Relaxed);
+        let _ = self.publisher.send(PublisherCommand::Event {
+            envelope: AdvisoryEnvelope::new(after_seq, event),
+            delivery,
+        });
+    }
+}
+
+fn remember_publish_error(
+    pending_error: &mut Option<String>,
+    delivery: DeliveryMode,
+    error: String,
+) {
+    if matches!(delivery, DeliveryMode::Required) {
+        pending_error.get_or_insert(error);
+    }
+}
+
+async fn await_flush_reply(
+    reply_rx: tokio::sync::oneshot::Receiver<std::result::Result<(), String>>,
+    wait: Duration,
+) -> Result<()> {
+    tokio::time::timeout(wait, reply_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for NATS event flush"))?
+        .map_err(|_| anyhow::anyhow!("NATS event publisher dropped flush acknowledgement"))?
+        .map_err(anyhow::Error::msg)
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    #[test]
+    fn only_required_publish_errors_reach_the_flush_barrier() {
+        let mut pending_error = None;
+        remember_publish_error(
+            &mut pending_error,
+            DeliveryMode::BestEffort,
+            "lossy chunk failed".into(),
+        );
+        assert_eq!(pending_error, None);
+
+        remember_publish_error(
+            &mut pending_error,
+            DeliveryMode::Required,
+            "handoff commit failed".into(),
+        );
+        assert_eq!(pending_error.as_deref(), Some("handoff commit failed"));
+    }
+
+    #[tokio::test]
+    async fn flush_ack_wait_is_bounded() {
+        let (_reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        let error = await_flush_reply(reply_rx, Duration::ZERO)
+            .await
+            .expect_err("a stalled publisher must time out");
+
+        assert!(error.to_string().contains("timed out"));
     }
 }
 
 /// Publish one advisory. Best-effort core NATS (non-durable); failures are
 /// logged, never propagated.
-async fn publish_envelope(client: &async_nats::Client, subject: &str, envelope: AdvisoryEnvelope) {
-    match envelope.to_bytes() {
-        Ok(payload) => {
-            if let Err(e) = client.publish(subject.to_string(), payload.into()).await {
-                log::debug!("advisory event publish failed (lossy-OK): {e}");
-            }
-        }
-        Err(e) => log::debug!("failed to serialize advisory event: {e}"),
-    }
+async fn publish_envelope(
+    client: &async_nats::Client,
+    subject: &str,
+    envelope: AdvisoryEnvelope,
+) -> Result<()> {
+    let payload = envelope.to_bytes()?;
+    client
+        .publish(subject.to_string(), payload.into())
+        .await
+        .map_err(|error| anyhow::anyhow!("publish advisory event: {error}"))
 }
 
 impl AgentEventSink for NatsEventSink {
@@ -187,8 +322,7 @@ impl AgentEventSink for NatsEventSink {
         // overtake the one emitted before it. Enqueuing is just as non-blocking
         // and needs no runtime handle. Delivery stays lossy by contract — a send
         // failure means the publisher task is gone, and is dropped as before.
-        let after_seq = self.after_seq.load(Ordering::Relaxed);
-        let _ = self.publisher.send(AdvisoryEnvelope::new(after_seq, event));
+        self.enqueue(event, DeliveryMode::BestEffort);
     }
 }
 

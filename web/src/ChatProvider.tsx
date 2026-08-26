@@ -14,7 +14,7 @@ export interface ChatProviderProps {
   agentName: string;
   sessionId: string;
   isFreshSession: boolean;
-  onHandoff?: (agent: string, sessionId: string | null) => void;
+  onHandoff?: (agent: string, sessionId: string) => void;
   children: React.ReactNode;
 }
 
@@ -86,7 +86,7 @@ export interface HarnxHttpAgentOptions {
   onRunFailed: (message: string) => void;
   onUsage: (usage: UsageData) => void;
   onToolSummary: (id: string, summary: string) => void;
-  onHandoff?: (agent: string, sessionId: string | null) => void;
+  onHandoff?: (agent: string, sessionId: string) => void;
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
@@ -95,7 +95,7 @@ export class HarnxHttpAgent extends HttpAgent {
   private readonly onRunFailedCb: (message: string) => void;
   private readonly onUsageCb: (usage: UsageData) => void;
   private readonly onToolSummaryCb: (id: string, summary: string) => void;
-  private readonly onHandoff?: (agent: string, sessionId: string | null) => void;
+  private readonly onHandoff?: (agent: string, sessionId: string) => void;
   private isRunActive = false;
 
   constructor(options: HarnxHttpAgentOptions) {
@@ -107,7 +107,7 @@ export class HarnxHttpAgent extends HttpAgent {
     this.onHandoff = options.onHandoff;
   }
 
-  private handleCustomEvent(name: string, value: any) {
+  private handleCustomEvent(name: string, value: unknown) {
     handleHarnxCustomEvent(name, value, {
       onStatus: this.onStatus,
       onRunFailed: this.onRunFailedCb,
