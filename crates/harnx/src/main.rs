@@ -164,11 +164,12 @@ async fn run_session_delete_command(delete_args: &DeleteSessionArgs) -> Result<(
 
     if result.removed_anything() {
         println!(
-            "Deleted remote session '{}' on cluster '{}' (stream_deleted={}, lease_deleted={})",
+            "Deleted remote session '{}' on cluster '{}' (stream_deleted={}, lease_deleted={}, attachments_deleted={})",
             delete_args.session_id,
             delete_args.cluster,
             result.stream_deleted,
-            result.lease_deleted
+            result.lease_deleted,
+            result.attachments_deleted
         );
     } else {
         println!(

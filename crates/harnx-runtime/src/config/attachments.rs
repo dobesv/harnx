@@ -1,18 +1,17 @@
-//! Content-addressed storage for image/binary attachments referenced from
-//! NATS session transcripts. Blobs live in a per-session attachment directory
-//! and are referenced from message content as `cid:<sha256>`, keeping
-//! multi-megabyte base64 out of NATS and out of memory at rest. Runtime owns
-//! session-local blob storage and provider-specific wire
-//! encoders; shared expansion/cache scaffolding lives in `harnx-core`.
+//! Content-addressed filesystem access for image/binary attachments referenced
+//! from session transcripts. For NATS sessions, the per-session directory is a
+//! worker cache backed by the JetStream object store; local sessions use it as
+//! their durable store. Runtime owns this filesystem layer and provider-specific
+//! wire encoders; shared expansion/cache scaffolding lives in `harnx-core`.
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use harnx_core::attachments::{
-    cid_for_data_url, expand_passthrough_reference, read_attachment, ExpandedAttachment, CID_PREFIX,
+    expand_passthrough_reference, read_attachment, store_attachment_data_url, ExpandedAttachment,
+    CID_PREFIX,
 };
-use harnx_core::crypto::base64_decode;
 use harnx_core::message::MessageContentPart;
 
 /// Map a data URI's MIME type to a file extension. Defaults to `bin` for
@@ -27,40 +26,16 @@ pub fn extension_for_data_url(data_url: &str) -> &'static str {
         "image/jpeg" => "jpg",
         "image/webp" => "webp",
         "image/gif" => "gif",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
         _ => "bin",
     }
-}
-
-/// Parse an inline data URI into (`mime_type`, `raw_bytes`). Only `;base64,`
-/// form is supported because that's what upstream message schemas already use
-/// for image parts.
-fn parse_data_url(data_url: &str) -> Result<(&str, Vec<u8>)> {
-    let rest = data_url
-        .strip_prefix("data:")
-        .ok_or_else(|| anyhow::anyhow!("attachment must be a data: URI"))?;
-    let (mime, b64) = rest
-        .split_once(";base64,")
-        .ok_or_else(|| anyhow::anyhow!("attachment data URI must contain ;base64,"))?;
-    let bytes = base64_decode(b64).context("invalid base64 in data URI")?;
-    Ok((mime, bytes))
 }
 
 /// Persist one inline `data:` URI into session attachment store. Returns the
 /// stable `cid:<sha256>` reference for transcript storage.
 pub fn write_attachment(dir: &Path, data_url: &str) -> Result<String> {
-    let cid = cid_for_data_url(data_url);
-    let (_, bytes) = parse_data_url(data_url)?;
-    let ext = extension_for_data_url(data_url);
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("Failed to create attachments dir {}", dir.display()))?;
-
-    let hash = cid.trim_start_matches(CID_PREFIX);
-    let path = dir.join(format!("{hash}.{ext}"));
-    if !path.exists() {
-        std::fs::write(&path, bytes)
-            .with_context(|| format!("Failed to write attachment {}", path.display()))?;
-    }
-    Ok(cid)
+    store_attachment_data_url(dir, data_url)
 }
 
 #[allow(dead_code)]
@@ -157,6 +132,11 @@ mod tests {
         assert_eq!(extension_for_data_url("data:image/png;base64,AA"), "png");
         assert_eq!(extension_for_data_url("data:image/jpeg;base64,AA"), "jpg");
         assert_eq!(
+            extension_for_data_url("data:application/pdf;base64,AA"),
+            "pdf"
+        );
+        assert_eq!(extension_for_data_url("data:text/plain;base64,AA"), "txt");
+        assert_eq!(
             extension_for_data_url("data:application/x;base64,AA"),
             "bin"
         );
@@ -172,8 +152,13 @@ mod tests {
         let cid = write_attachment(&dir, &data_url).unwrap();
         assert!(cid.starts_with(CID_PREFIX));
         let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
-        assert_eq!(entries.len(), 1, "exactly one attachment file written");
-        assert!(entries[0].file_name().to_string_lossy().ends_with(".png"));
+        assert_eq!(entries.len(), 2, "blob and MIME metadata are written");
+        assert!(entries
+            .iter()
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".png")));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".mime")));
 
         let encoder = Base64Encoder;
         let restored = encoder.expand(&dir, &cid).unwrap();
@@ -189,7 +174,7 @@ mod tests {
         let cid2 = write_attachment(&dir, &data_url).unwrap();
         assert_eq!(cid, cid2);
         let count = std::fs::read_dir(&dir).unwrap().flatten().count();
-        assert_eq!(count, 1, "duplicate blob does not create a second file");
+        assert_eq!(count, 2, "duplicate blob does not create extra files");
     }
 
     #[test]

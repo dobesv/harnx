@@ -27,7 +27,7 @@ use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::stream::StreamExt;
-use harnx_core::attachments::store_attachment_bytes;
+use harnx_core::attachments::store_attachment_bytes_async;
 use http::{Method, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
@@ -686,7 +686,7 @@ impl Server {
                     json!({"error":"attachment too large","max_bytes":MAX_UPLOAD_BYTES}),
                 );
             }
-            refs.push(store_attachment_bytes(&attachments_dir, &data, &mime)?);
+            refs.push(store_attachment_bytes_async(&attachments_dir, &data, &mime).await?);
         }
         if refs.is_empty() {
             return json_response_with_status(

@@ -8,24 +8,10 @@ use std::path::Path;
 
 pub(crate) fn attachments_dir(session: &Session) -> Option<std::path::PathBuf> {
     let agent_name = session.agent_name.as_deref()?;
-    let session_id = session.id();
-    if session_id.is_empty() {
-        return None;
-    }
-    if session_id.contains(['/', '\\']) {
-        return None;
-    }
-    if !Path::new(session_id)
-        .components()
-        .all(|component| matches!(component, std::path::Component::Normal(_)))
-    {
-        return None;
-    }
-    Some(
-        super::Config::agent_data_dir(agent_name)
-            .join("attachments")
-            .join(session_id),
-    )
+    super::Config::session_attachments_dir(super::SessionAttachmentPath {
+        agent_name,
+        session_id: session.id(),
+    })
 }
 
 fn externalize_message(

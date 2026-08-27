@@ -28,6 +28,30 @@ pub(super) struct PromptTaskContext {
     pub(super) event_tx: mpsc::UnboundedSender<TuiEvent>,
 }
 
+#[cfg(test)]
+fn test_tool_round_callback(ctx: &PromptTaskContext) -> harnx_runtime::OnToolRoundFn {
+    let event_tx = ctx.event_tx.clone();
+    let shared_pending = ctx.shared_pending_message.clone();
+    Arc::new(move |merged_input, _tool_results| {
+        let event_tx = event_tx.clone();
+        let shared_pending = shared_pending.clone();
+        Box::pin(async move {
+            let _ = event_tx.send(TuiEvent::ToolRoundComplete);
+            let mut guard = shared_pending.lock().await;
+            if let Some(pending) = guard.as_ref() {
+                let is_dot_command = pending.text.trim_start().starts_with('.');
+                let has_attachments = !pending.attachments.is_empty();
+                if !is_dot_command && !has_attachments {
+                    let pending = guard.take().unwrap();
+                    merged_input.set_injected_user_text(pending.text.clone());
+                    let _ = event_tx.send(TuiEvent::PendingMessageConsumed(pending));
+                }
+            }
+            Ok(())
+        })
+    })
+}
+
 impl Tui {
     pub(super) async fn finish_prompt_task(&mut self, task: AbortSignal, error: Option<String>) {
         let is_current = self
@@ -147,26 +171,7 @@ impl Tui {
             )
         };
 
-        let event_tx = ctx.event_tx.clone();
-        let shared_pending = ctx.shared_pending_message.clone();
-        let on_tool_round: harnx_runtime::OnToolRoundFn =
-            Arc::new(move |merged_input, _tool_results| {
-                let event_tx = event_tx.clone();
-                let shared_pending = shared_pending.clone();
-                Box::pin(async move {
-                    let _ = event_tx.send(TuiEvent::ToolRoundComplete);
-                    let mut guard = shared_pending.lock().await;
-                    if let Some(pending) = guard.as_ref() {
-                        let is_dot_command = pending.text.trim_start().starts_with('.');
-                        let has_attachments = !pending.attachments.is_empty();
-                        if !is_dot_command && !has_attachments {
-                            let pending = guard.take().unwrap();
-                            merged_input.set_injected_user_text(pending.text.clone());
-                            let _ = event_tx.send(TuiEvent::PendingMessageConsumed(pending));
-                        }
-                    }
-                })
-            });
+        let on_tool_round = test_tool_round_callback(&ctx);
 
         let event_tx = ctx.event_tx.clone();
         let on_text_response: harnx_runtime::OnTextResponseFn = Arc::new(
@@ -206,15 +211,27 @@ impl Tui {
         agent: String,
         cluster: String,
     ) -> Result<()> {
+        let input_res = if msg.attachments.is_empty() {
+            Ok(harnx_runtime::config::input::from_str(
+                &ctx.config,
+                &msg.text,
+                None,
+            ))
+        } else {
+            let paths = msg
+                .attachments
+                .iter()
+                .map(|attachment| attachment.path.to_string_lossy().to_string())
+                .collect();
+            harnx_runtime::config::input::from_files(&ctx.config, &msg.text, paths, None).await
+        };
         if let Some(dir) = msg.attachment_dir.clone() {
             let _ = tokio::task::spawn_blocking(move || {
                 crate::types::cleanup_attachment_dir(&dir);
             })
             .await;
         }
-        if !msg.attachments.is_empty() {
-            return Err(anyhow::anyhow!("Attachments are not yet supported"));
-        }
+        let input = input_res?;
 
         let activation_route = harnx_runtime::local_orchestrator::activation_route_for_cluster(
             &cluster,
@@ -247,8 +264,7 @@ impl Tui {
         .await
         .context("failed to create NATS session")?;
 
-        let input = harnx_runtime::config::input::from_str(&ctx.config, &msg.text, None);
-        let result = session.run_turn(&msg.text, sink, None).await?;
+        let result = session.run_turn_input(&input, None, sink, None).await?;
         harnx_runtime::commands::update_last_message_after_nats_turn(&ctx.config, input, &result);
         log::info!(
             "prompt completed: cluster={} session_id={} cancelled={}",

@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use harnx_core::attachments::{
-    expand_passthrough_reference, read_attachment, AttachmentRefCache, CachedRef,
+    expand_passthrough_reference, read_attachment_async, AttachmentRefCache, CachedRef,
     ExpandedAttachment, CID_PREFIX,
 };
 use harnx_core::crypto::base64_encode;
@@ -59,7 +59,7 @@ impl AnthropicAttachmentEncoder {
             return Ok(expand_passthrough_reference(reference));
         }
 
-        let (bytes, mime_type) = read_attachment(dir, reference)?;
+        let (bytes, mime_type) = read_attachment_async(dir, reference).await?;
 
         if let Some(cached) = self.cache.get_valid(reference, Utc::now()) {
             return Ok(ExpandedAttachment::RemoteRef {

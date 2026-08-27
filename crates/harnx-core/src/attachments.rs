@@ -14,6 +14,16 @@ use crate::message::{Message, MessageContent, MessageContentPart, MessageContent
 
 /// Prefix marking a content reference in `ImageUrl.url`.
 pub const CID_PREFIX: &str = "cid:";
+const MIME_METADATA_EXTENSION: &str = "mime";
+
+#[derive(Clone, Copy)]
+struct AttachmentHash<'a>(&'a str);
+
+struct AttachmentBlob<'a> {
+    cid: &'a str,
+    bytes: &'a [u8],
+    mime_type: &'a str,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpandedAttachment {
@@ -95,6 +105,73 @@ pub fn expand_passthrough_reference(reference: &str) -> ExpandedAttachment {
 }
 
 pub fn store_attachment_bytes(dir: &Path, bytes: &[u8], mime_type: &str) -> Result<String> {
+    let data = format!(
+        "data:{mime_type};base64,{}",
+        crate::crypto::base64_encode(bytes)
+    );
+    let cid = cid_for_data_url(&data);
+    store_attachment_blob(
+        dir,
+        AttachmentBlob {
+            cid: &cid,
+            bytes,
+            mime_type,
+        },
+    )?;
+    Ok(cid)
+}
+
+/// Persist attachment bytes without blocking the calling async runtime thread.
+pub async fn store_attachment_bytes_async(
+    dir: &Path,
+    bytes: &[u8],
+    mime_type: &str,
+) -> Result<String> {
+    let dir = dir.to_path_buf();
+    let bytes = bytes.to_vec();
+    let mime_type = mime_type.to_string();
+    tokio::task::spawn_blocking(move || store_attachment_bytes(&dir, &bytes, &mime_type))
+        .await
+        .context("join attachment storage task")?
+}
+
+/// Persist one base64 data URI without changing its content-derived ID.
+pub fn store_attachment_data_url(dir: &Path, data_url: impl AsRef<str>) -> Result<String> {
+    let data_url = data_url.as_ref();
+    let rest = data_url
+        .strip_prefix("data:")
+        .context("attachment must be a data: URI")?;
+    let (mime_type, encoded) = rest
+        .split_once(";base64,")
+        .context("attachment data URI must contain ;base64,")?;
+    let bytes = crate::crypto::base64_decode(encoded).context("invalid base64 in data URI")?;
+    let cid = cid_for_data_url(data_url);
+    store_attachment_blob(
+        dir,
+        AttachmentBlob {
+            cid: &cid,
+            bytes: &bytes,
+            mime_type,
+        },
+    )?;
+    Ok(cid)
+}
+
+/// Persist one base64 data URI without blocking the calling async runtime thread.
+pub async fn store_attachment_data_url_async(dir: &Path, data_url: &str) -> Result<String> {
+    let dir = dir.to_path_buf();
+    let data_url = data_url.to_string();
+    tokio::task::spawn_blocking(move || store_attachment_data_url(&dir, data_url))
+        .await
+        .context("join attachment data-URI storage task")?
+}
+
+fn store_attachment_blob(dir: &Path, attachment: AttachmentBlob<'_>) -> Result<()> {
+    let AttachmentBlob {
+        cid,
+        bytes,
+        mime_type,
+    } = attachment;
     let ext = mime_type
         .split(';')
         .next()
@@ -110,11 +187,6 @@ pub fn store_attachment_bytes(dir: &Path, bytes: &[u8], mime_type: &str) -> Resu
         "text/plain" => "txt",
         _ => "bin",
     };
-    let data = format!(
-        "data:{mime_type};base64,{}",
-        crate::crypto::base64_encode(bytes)
-    );
-    let cid = cid_for_data_url(&data);
     std::fs::create_dir_all(dir)
         .with_context(|| format!("Failed to create attachments dir {}", dir.display()))?;
     let hash = cid.trim_start_matches(CID_PREFIX);
@@ -123,37 +195,72 @@ pub fn store_attachment_bytes(dir: &Path, bytes: &[u8], mime_type: &str) -> Resu
         std::fs::write(&path, bytes)
             .with_context(|| format!("Failed to write attachment {}", path.display()))?;
     }
-    Ok(cid)
+    let mime_path = dir.join(format!("{hash}.{MIME_METADATA_EXTENSION}"));
+    std::fs::write(&mime_path, mime_type)
+        .with_context(|| format!("Failed to write attachment MIME {}", mime_path.display()))?;
+    Ok(())
 }
 
 pub fn read_attachment(dir: &Path, reference: &str) -> Result<(Vec<u8>, String)> {
-    let hash = reference.strip_prefix(CID_PREFIX).ok_or_else(|| {
+    let hash = AttachmentHash(reference.strip_prefix(CID_PREFIX).ok_or_else(|| {
         anyhow::anyhow!("attachment reference must start with {CID_PREFIX}: {reference}")
-    })?;
+    })?);
+    let path = find_attachment_path(dir, hash)?;
+    let data = std::fs::read(&path)
+        .with_context(|| format!("Failed to read attachment {}", path.display()))?;
+    let mime_type = read_attachment_mime(dir, hash, &path)?;
+    Ok((data, mime_type))
+}
 
-    let path = std::fs::read_dir(dir)
+/// Read a cached attachment without blocking the calling async runtime thread.
+pub async fn read_attachment_async(dir: &Path, reference: &str) -> Result<(Vec<u8>, String)> {
+    let dir = dir.to_path_buf();
+    let reference = reference.to_string();
+    tokio::task::spawn_blocking(move || read_attachment(&dir, &reference))
+        .await
+        .context("join attachment read task")?
+}
+
+fn find_attachment_path(dir: &Path, hash: AttachmentHash<'_>) -> Result<std::path::PathBuf> {
+    std::fs::read_dir(dir)
         .with_context(|| format!("Failed to read attachments dir {}", dir.display()))?
         .flatten()
         .find_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.path().extension().and_then(|ext| ext.to_str())
+                == Some(MIME_METADATA_EXTENSION)
+            {
+                return None;
+            }
             let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s);
-            (stem == hash).then_some(entry.path())
+            (stem == hash.0).then_some(entry.path())
         })
-        .ok_or_else(|| anyhow::anyhow!("Attachment blob not found for {reference}"))?;
+        .ok_or_else(|| anyhow::anyhow!("Attachment blob not found for {CID_PREFIX}{}", hash.0))
+}
 
-    let data = std::fs::read(&path)
-        .with_context(|| format!("Failed to read attachment {}", path.display()))?;
-
-    let mime_type = match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
+fn fallback_mime_type(path: &Path) -> String {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
         "gif" => "image/gif",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
         _ => "application/octet-stream",
     }
-    .to_string();
+    .to_string()
+}
 
-    Ok((data, mime_type))
+fn read_attachment_mime(dir: &Path, hash: AttachmentHash<'_>, blob_path: &Path) -> Result<String> {
+    let mime_path = dir.join(format!("{}.{MIME_METADATA_EXTENSION}", hash.0));
+    match std::fs::read_to_string(&mime_path) {
+        Ok(mime_type) => Ok(mime_type),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(fallback_mime_type(blob_path))
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("Failed to read attachment MIME {}", mime_path.display())),
+    }
 }
 
 pub fn cid_for_data_url(data_url: &str) -> String {
@@ -250,6 +357,18 @@ mod tests {
         let (bytes, mime_type) = read_attachment(tmp.path(), &cid).unwrap();
         assert_eq!(bytes, b"hello attachment");
         assert_eq!(mime_type, "image/png");
+    }
+
+    #[test]
+    fn attachment_storage_preserves_exact_mime_parameters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_url = "data:text/plain;charset=utf-8;base64,aGVsbG8=";
+        let cid = store_attachment_data_url(tmp.path(), data_url).unwrap();
+
+        assert_eq!(cid, cid_for_data_url(data_url));
+        let (bytes, mime_type) = read_attachment(tmp.path(), &cid).unwrap();
+        assert_eq!(bytes, b"hello");
+        assert_eq!(mime_type, "text/plain;charset=utf-8");
     }
     #[test]
     fn attachment_cache_missing_cid_is_none() {

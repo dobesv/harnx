@@ -20,6 +20,7 @@ use ag_ui_core::{
         message::Message as AgUiMessage,
     },
 };
+use anyhow::Context;
 use chrono::Utc;
 use dashmap::DashMap;
 use harnx_core::{
@@ -29,7 +30,7 @@ use harnx_core::{
     tool::{ToolCall, ToolResult},
 };
 use harnx_runtime::{
-    config::{self, Config, GlobalConfig, LOCAL_CLUSTER_KEY},
+    config::{self, Config, GlobalConfig, SessionAttachmentPath, LOCAL_CLUSTER_KEY},
     continue_agent_loop_from_tool_round,
     local_orchestrator::{activation_route_for_cluster, LocalWorkerSupervisor},
     AgentCallFn, AgentLoopContext, NatsSession, NatsSessionConfig, OnToolRoundFn,
@@ -177,21 +178,33 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
     .await?;
     let initializer = {
         let config = params.prompt_config.read();
-        harnx_runtime::SessionInitializer::named_from_config(params.agent, &config)
+        harnx_runtime::SessionInitializer::named_from_config(params.agent.clone(), &config)
     };
     let session = NatsSession::from_global_config(
         NatsSessionConfig {
             cluster: LOCAL_CLUSTER_KEY.to_string(),
             initializer,
-            session_id: Some(params.session_id),
+            session_id: Some(params.session_id.clone()),
             activation_route,
         },
         &params.prompt_config,
         params.abort_signal,
     )
     .await?;
+    let input = build_input(&params.prompt_config, &params.text, &params.attachment_refs)?;
+    let attachments_dir = if params.attachment_refs.is_empty() {
+        None
+    } else {
+        Some(
+            Config::session_attachments_dir(SessionAttachmentPath {
+                agent_name: &params.agent,
+                session_id: &params.session_id,
+            })
+            .context("invalid session ID for attachment lookup")?,
+        )
+    };
     session
-        .run_turn(&params.text, params.sink, None)
+        .run_turn_input(&input, attachments_dir.as_deref(), params.sink, None)
         .await
         .map(|_| harnx_runtime::LoopResult::Completed)
 }
@@ -934,6 +947,7 @@ fn build_loop_ctx(
                     value: serde_json::json!({ "text": text }),
                 }));
             }
+            Ok(())
         })
     });
     let context = harnx_session::build_context(

@@ -11,6 +11,7 @@ use super::daemon::{should_append_control_log_entry, SessionActivate};
 use super::daemon_runtime::WorkerRuntime;
 use super::daemon_turn_input::TurnInputCtx;
 use crate::nats_lease::NatsSessionLease;
+use crate::OnToolRoundFn;
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -106,8 +107,18 @@ impl WorkerRuntime {
                     activation_high_water = Some(activation_high_water.map_or(seed, |h| h.max(seed)));
                 }
 
-                let on_tool_round =
+                let injection =
                     build_mid_turn_injection_callback(backend.clone(), Arc::clone(&turn_cursor));
+                let attachment_sync = ToolRoundAttachmentSync {
+                    jetstream: self.jetstream.clone(),
+                    config: per_session.clone(),
+                    replicas: self.lease.replicas,
+                    session_id: activation.session_id.clone(),
+                };
+                let on_tool_round = build_durable_tool_round_callback(
+                    injection,
+                    attachment_sync,
+                );
 
                 let loop_outcome = run_agent_loop_with_nats_outcome(
                     RunAgentLoopArgs {
@@ -350,4 +361,32 @@ impl WorkerRuntime {
             }
         }
     }
+}
+
+#[derive(Clone)]
+struct ToolRoundAttachmentSync {
+    jetstream: async_nats::jetstream::Context,
+    config: crate::config::GlobalConfig,
+    replicas: usize,
+    session_id: String,
+}
+
+fn build_durable_tool_round_callback(
+    injection: OnToolRoundFn,
+    attachment_sync: ToolRoundAttachmentSync,
+) -> OnToolRoundFn {
+    Arc::new(move |merged_input, results| {
+        let injection = Arc::clone(&injection);
+        let attachment_sync = attachment_sync.clone();
+        Box::pin(async move {
+            injection(merged_input, results).await?;
+            crate::nats_attachments::sync_session_attachments(
+                &attachment_sync.jetstream,
+                &attachment_sync.config,
+                attachment_sync.replicas,
+                &attachment_sync.session_id,
+            )
+            .await
+        })
+    })
 }
