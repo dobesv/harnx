@@ -937,7 +937,7 @@ async fn ask(
     .context("failed to create NATS session for command")?;
     let sink = harnx_core::sink::current_agent_event_sink()
         .unwrap_or_else(|| Arc::new(harnx_core::event::NullSink));
-    let result = session.run_turn(&input.text(), sink, None).await?;
+    let result = session.run_turn_input(&input, None, sink, None).await?;
     update_last_message_after_nats_turn(config, input, &result);
     Ok(())
 }

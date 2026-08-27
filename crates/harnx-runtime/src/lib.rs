@@ -19,6 +19,7 @@ pub mod config;
 mod file_lock;
 pub mod local_orchestrator;
 pub mod nats_admin;
+pub mod nats_attachments;
 pub mod nats_event_sink;
 pub mod nats_hook_provider;
 pub mod nats_lease;

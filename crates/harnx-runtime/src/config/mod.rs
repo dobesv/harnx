@@ -16,7 +16,7 @@ pub mod remote_session_ops;
 mod servers_split;
 pub mod session;
 mod session_dump;
-mod session_externalize;
+pub(crate) mod session_externalize;
 pub mod session_meta;
 mod session_ops_compaction;
 mod session_ops_core;
@@ -29,6 +29,7 @@ mod tool_servers_split;
 pub use self::env_split::load_env_file;
 pub use self::macros_split::macro_execute;
 pub use self::nats_split::{resolve_local_nats_server_config, NatsServerConfig};
+pub use self::paths_split::SessionAttachmentPath;
 pub use self::tool_servers_split::ToolServerConfig;
 
 /// Reserved cluster identity for the auto-managed shared local NATS broker.

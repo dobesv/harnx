@@ -1,6 +1,26 @@
 //! Filesystem path/dir accessors extracted from config/mod.rs for code health.
 use super::*;
 
+/// Agent/session identity used to resolve one local attachment-cache directory.
+pub struct SessionAttachmentPath<'a> {
+    pub agent_name: &'a str,
+    pub session_id: &'a str,
+}
+
+impl SessionAttachmentPath<'_> {
+    fn has_safe_session_id(&self) -> bool {
+        if self.session_id.is_empty() {
+            return false;
+        }
+        if self.session_id.contains(['/', '\\']) {
+            return false;
+        }
+        Path::new(self.session_id)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    }
+}
+
 impl Config {
     pub fn config_dir() -> PathBuf {
         paths::config_dir()
@@ -158,6 +178,18 @@ impl Config {
         paths::agent_data_dir(name)
     }
 
+    /// Resolve a session attachment directory only for a safe session ID.
+    pub fn session_attachments_dir(location: SessionAttachmentPath<'_>) -> Option<PathBuf> {
+        if !location.has_safe_session_id() {
+            return None;
+        }
+        Some(
+            Self::agent_data_dir(location.agent_name)
+                .join("attachments")
+                .join(location.session_id),
+        )
+    }
+
     pub fn agent_rag_file(agent_name: &str, rag_name: &str) -> PathBuf {
         paths::agent_rag_file(agent_name, rag_name)
     }
@@ -174,5 +206,25 @@ impl Config {
 
     pub fn models_override_file() -> PathBuf {
         paths::models_override_file()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, SessionAttachmentPath};
+
+    #[test]
+    fn session_attachment_paths_reject_unsafe_ids() {
+        let path = |session_id| SessionAttachmentPath {
+            agent_name: "agent",
+            session_id,
+        };
+        assert!(Config::session_attachments_dir(path("session-1")).is_some());
+        for session_id in ["", ".", "..", "../escape", "/tmp/escape", "a/b", "a\\b"] {
+            assert!(
+                Config::session_attachments_dir(path(session_id)).is_none(),
+                "unsafe session ID should be rejected: {session_id}"
+            );
+        }
     }
 }

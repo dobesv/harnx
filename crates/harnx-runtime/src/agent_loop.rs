@@ -64,7 +64,10 @@ pub type AgentCallFn = Arc<
 /// - Inject pending user messages into the merged input
 /// - Emit `TuiEvent::PendingMessageConsumed`
 pub type OnToolRoundFn = Arc<
-    dyn for<'a> Fn(&'a mut Input, &'a [ToolResult]) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+    dyn for<'a> Fn(
+            &'a mut Input,
+            &'a [ToolResult],
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>
         + Send
         + Sync,
 >;
@@ -195,7 +198,7 @@ pub async fn continue_agent_loop_from_tool_round(
 
         // Invoke on_tool_round callback
         if let Some(ref cb) = ctx.on_tool_round {
-            cb(&mut merged_input, &tool_results).await;
+            cb(&mut merged_input, &tool_results).await?;
         }
 
         if switch_agent.is_some() {
@@ -693,7 +696,7 @@ async fn advance_tool_round(
     ctx: &AgentLoopContext,
     input: Input,
     round: ToolRoundOutput,
-) -> ToolRoundAdvance {
+) -> Result<ToolRoundAdvance> {
     let switch_agent = round
         .tool_results
         .iter()
@@ -701,17 +704,17 @@ async fn advance_tool_round(
     let mut merged_input =
         input.merge_tool_results(round.output, round.thought, round.tool_results.clone());
     if let Some(callback) = &ctx.on_tool_round {
-        callback(&mut merged_input, &round.tool_results).await;
+        callback(&mut merged_input, &round.tool_results).await?;
     }
     if let Some(switch) = switch_agent {
         emit_handoff_request(ctx, &switch);
-        return ToolRoundAdvance::Handoff(LoopResult::HandoffRequested {
+        return Ok(ToolRoundAdvance::Handoff(LoopResult::HandoffRequested {
             agent: switch.agent,
             session_id: switch.session_id,
             prompt: switch.prompt,
-        });
+        }));
     }
-    ToolRoundAdvance::Continue(Box::new(merged_input))
+    Ok(ToolRoundAdvance::Continue(Box::new(merged_input)))
 }
 
 fn emit_handoff_request(ctx: &AgentLoopContext, switch: &harnx_core::tool::SwitchAgentData) {
@@ -865,7 +868,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
                     tool_results,
                 },
             )
-            .await
+            .await?
             {
                 ToolRoundAdvance::Continue(next_input) => input = *next_input,
                 ToolRoundAdvance::Handoff(result) => return Ok(result),
@@ -1048,6 +1051,7 @@ mod tests {
                 if inj.fetch_add(1, Ordering::SeqCst) == 0 {
                     merged_input.set_injected_user_text("queued message".to_string());
                 }
+                Ok(())
             })
         });
 
@@ -1086,6 +1090,7 @@ mod tests {
                     .first()
                     .expect("handoff test should produce single tool result");
                 assert_eq!(result.call.name, "delegate-agent_session_handoff");
+                Ok(())
             })
         })
     }
@@ -1201,7 +1206,8 @@ user prompt"
             )
             .await
         })
-        .await;
+        .await
+        .unwrap();
 
         let ToolRoundAdvance::Handoff(LoopResult::HandoffRequested {
             agent,

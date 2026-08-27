@@ -3,13 +3,14 @@ mod common;
 use anyhow::{Context, Result};
 use common::spawn_nats_server;
 use harnx_core::{
-    message::{MessageContent, MessageRole},
+    message::{ImageUrl, MessageContent, MessageContentPart, MessageRole},
     require_nextest,
     session::SessionLogEntry,
 };
 use harnx_runtime::{
     config::Config,
     nats_admin::delete_remote_session,
+    nats_attachments::{externalize_message_attachments, AttachmentLocation},
     nats_lease::NatsLeaseConfig,
     nats_session_log::{stream_name_for_session, NatsSessionLog},
     nats_session_metadata::{
@@ -97,6 +98,36 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
     assert!(!deleted_again.stream_deleted);
     assert!(!deleted_again.lease_deleted);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_delete_removes_attachments_and_is_idempotent() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let config = local_nats_config(server.url());
+    let jetstream = config.nats_jetstream("local").await?;
+    let session_id = "delete-attachments";
+    let data_url = format!(
+        "data:image/png;base64,{}",
+        harnx_core::crypto::base64_encode(b"delete this attachment")
+    );
+    let mut content = MessageContent::Array(vec![MessageContentPart::ImageUrl {
+        image_url: ImageUrl { url: data_url },
+    }]);
+    externalize_message_attachments(
+        AttachmentLocation::new(&jetstream, 1, session_id),
+        &mut content,
+        None,
+    )
+    .await?;
+
+    let deleted = delete_remote_session(&config, "local", session_id).await?;
+    assert_eq!(deleted.attachments_deleted, 1);
+    let deleted_again = delete_remote_session(&config, "local", session_id).await?;
+    assert_eq!(deleted_again.attachments_deleted, 0);
     Ok(())
 }
 

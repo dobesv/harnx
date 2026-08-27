@@ -51,16 +51,26 @@ Harnx automatically manages the following JetStream resources:
 - **Streams**: `SESSION_<id>` (Subject: `sessions.{id}.log`) stores only the
   durable append-only conversation history. Agent identity, settings, rendered
   prompts, and titles do not belong in this stream.
+- **Object Store**: `harnx_attachments` stores binary attachment payloads under
+  session-scoped object names. Conversation entries contain only `cid:`
+  references; workers hydrate the matching blobs into their local
+  content-addressed cache before calling a model.
 - **Persistent activation streams**: `WORK_NOTIFY_<cluster>` captures
   `cluster.<cluster>.sessions.notify` with cluster-shared work-queue dispatch.
 - **Local activation stream**: `LOCAL_WORK_NOTIFY_V2` captures
   `session_scope.__local__.workers.*.sessions.notify` with interest retention
   and one exact durable consumer per frontend worker ID.
 
-All of the KV buckets above are created with the `replicas` count from the
-cluster's config (`None` means 1, no HA). Set it to 3 to match a 3-node
-cluster; a mismatch between the two is what leaves a bucket unable to
-tolerate a node loss.
+All of the KV buckets and the attachment object store above are created with
+the `replicas` count from the cluster's config (`None` means 1, no HA). Set it
+to 3 to match a 3-node cluster; a mismatch between the two is what leaves a
+bucket unable to tolerate a node loss.
+
+For NATS sessions, a local `cid:` file is only a cache entry. New local or
+inline payloads are uploaded before their `cid:` is appended to the transcript;
+a worker can backfill a legacy local-only blob, but fails the turn if the blob
+exists in neither place. HTTP(S) attachment URLs remain external references and
+are intentionally not copied into the object store.
 
 **A bucket that has never existed before is created, not reconciled**, so
 `replicas` above what the cluster can actually provide (e.g. a production
@@ -283,9 +293,10 @@ When a worker resumes an interrupted session:
 
 ## Cleanup
 
-Session logs, leases, and canonical metadata persist in JetStream until
-explicitly deleted. Deletion purges the transcript stream, lease, and every KV
-key under `sessions/{id}`.
+Session logs, leases, canonical metadata, and attachment blobs persist in
+JetStream until explicitly deleted. Deletion purges the transcript stream,
+lease, every KV key under `sessions/{id}`, and every attachment object owned by
+the session. The periodic remote-session cleanup uses the same deletion path.
 
 ```bash
 harnx session delete <session_id> --cluster local

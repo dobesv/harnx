@@ -271,6 +271,7 @@ pub struct NatsSession {
     client: async_nats::Client,
     abort_signal: AbortSignal,
     metadata_store: SessionMetadataStore,
+    attachment_replicas: usize,
 }
 
 /// Result of durably queueing one prompt for worker execution.
@@ -321,6 +322,7 @@ impl NatsSession {
             client,
             abort_signal,
             metadata_store,
+            attachment_replicas: 1,
         })
     }
 
@@ -332,13 +334,18 @@ impl NatsSession {
     ) -> Result<Self> {
         let cluster = config.cluster.clone();
         let config_snapshot = global_config.read().clone();
+        let attachment_replicas = config_snapshot
+            .resolve_nats_server(&cluster)
+            .await?
+            .resolved_replicas();
         let client = config_snapshot
             .nats_client(&cluster)
             .await
             .context("failed to connect to NATS cluster")?;
         let jetstream = async_nats::jetstream::new(client.clone());
 
-        let nats_session = Self::new(config, client, jetstream, abort_signal).await?;
+        let mut nats_session = Self::new(config, client, jetstream, abort_signal).await?;
+        nats_session.attachment_replicas = attachment_replicas;
 
         // Front-end dot commands mutate the active Config session synchronously.
         // Give that in-memory session a metadata-capable sink so `.model`,
@@ -371,13 +378,13 @@ impl NatsSession {
         &self.metadata_store
     }
 
-    async fn append_user_message(&self, user_message: &str) -> Result<AppendedPrompt> {
+    async fn append_user_content(&self, content: MessageContent) -> Result<AppendedPrompt> {
         let user_msg_id = new_client_message_id();
         let log = NatsSessionLog::new(self.jetstream.clone(), self.session_id.clone());
         let user_entry = SessionLogEntry::Message {
             id: Some(user_msg_id.clone()),
             role: MessageRole::User,
-            content: MessageContent::Text(user_message.to_string()),
+            content,
             timestamp: None,
             fence_token: None,
         };
@@ -389,7 +396,7 @@ impl NatsSession {
         log::info!(
             "nats session: appended user message session_id={} len={}",
             self.session_id,
-            user_message.len()
+            serde_json::to_string(&user_entry).map_or(0, |entry| entry.len())
         );
         Ok(AppendedPrompt {
             user_msg_id,
@@ -432,7 +439,9 @@ impl NatsSession {
     /// Durably append a prompt and publish the matching worker activation
     /// without waiting for the target turn to finish.
     pub(crate) async fn enqueue(&self, user_message: &str) -> Result<EnqueuedPrompt> {
-        let appended = self.append_user_message(user_message).await?;
+        let appended = self
+            .append_user_content(MessageContent::Text(user_message.to_string()))
+            .await?;
         self.publish_activation(appended.user_msg_seq).await?;
         Ok(EnqueuedPrompt {
             session_id: self.session_id.clone(),
@@ -458,9 +467,47 @@ impl NatsSession {
         event_sink: Arc<dyn AgentEventSink>,
         pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
     ) -> Result<NatsTurnResult> {
+        self.run_turn_content(
+            MessageContent::Text(user_message.to_string()),
+            event_sink,
+            pending_cancel,
+        )
+        .await
+    }
+
+    /// Run a turn from an already-composed input. Inline and local attachment
+    /// references are uploaded to JetStream before the user message is logged.
+    pub async fn run_turn_input(
+        &self,
+        input: &crate::config::Input,
+        source_dir: Option<&std::path::Path>,
+        event_sink: Arc<dyn AgentEventSink>,
+        pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
+    ) -> Result<NatsTurnResult> {
+        let mut content = input.message_content();
+        crate::nats_attachments::externalize_message_attachments(
+            crate::nats_attachments::AttachmentLocation::new(
+                &self.jetstream,
+                self.attachment_replicas,
+                &self.session_id,
+            ),
+            &mut content,
+            source_dir,
+        )
+        .await?;
+        self.run_turn_content(content, event_sink, pending_cancel)
+            .await
+    }
+
+    async fn run_turn_content(
+        &self,
+        content: MessageContent,
+        event_sink: Arc<dyn AgentEventSink>,
+        pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
+    ) -> Result<NatsTurnResult> {
         // Step 1: Append user message to durable log BEFORE activating.
         // The worker derives input from the last user message.
-        let appended = self.append_user_message(user_message).await?;
+        let appended = self.append_user_content(content).await?;
         let user_msg_id = appended.user_msg_id;
         let user_msg_seq = appended.user_msg_seq;
 

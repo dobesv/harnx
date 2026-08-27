@@ -17,11 +17,15 @@ pub struct SessionDeleteResult {
     pub stream_deleted: bool,
     pub lease_deleted: bool,
     pub metadata_keys_deleted: usize,
+    pub attachments_deleted: usize,
 }
 
 impl SessionDeleteResult {
     pub fn removed_anything(&self) -> bool {
-        self.stream_deleted || self.lease_deleted || self.metadata_keys_deleted > 0
+        self.stream_deleted
+            || self.lease_deleted
+            || self.metadata_keys_deleted > 0
+            || self.attachments_deleted > 0
     }
 }
 
@@ -35,11 +39,14 @@ pub async fn delete_remote_session(
     let stream_deleted = delete_session_stream(&jetstream, session_id).await?;
     let lease_deleted = delete_session_lease(lease_bucket, session_id).await?;
     let metadata_keys_deleted = purge_session_metadata(&jetstream, session_id).await?;
+    let attachments_deleted =
+        crate::nats_attachments::delete_session_attachments(&jetstream, session_id).await?;
 
     Ok(SessionDeleteResult {
         stream_deleted,
         lease_deleted,
         metadata_keys_deleted,
+        attachments_deleted,
     })
 }
 

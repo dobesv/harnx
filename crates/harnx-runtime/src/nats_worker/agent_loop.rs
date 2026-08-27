@@ -4,6 +4,7 @@ use super::backend::{FencedSessionLogSink, NatsSessionLogBackend};
 use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use crate::agent_loop::OnToolRoundFn;
 use crate::config::{resolve_local_nats_server_config, GlobalConfig, Input};
+use crate::nats_attachments::SessionAttachmentSync;
 use crate::nats_event_sink::NatsEventSink;
 use crate::nats_hook_provider::{
     dispatch_hook_event, HookDispatchMeta, HookEventDispatch, NatsHookProvider,
@@ -133,7 +134,7 @@ pub(crate) fn build_mid_turn_injection_callback(
                 Ok(entries) => entries,
                 Err(err) => {
                     log::warn!("failed to reload session log for mid-turn injection: {err}");
-                    return;
+                    return Ok(());
                 }
             };
             let current = match cursor.load(std::sync::atomic::Ordering::SeqCst) {
@@ -142,12 +143,13 @@ pub(crate) fn build_mid_turn_injection_callback(
             };
             let (messages, latest_seq) = fold_new_user_messages_since(&tail, current);
             if messages.is_empty() {
-                return;
+                return Ok(());
             }
             merged_input.set_injected_user_text(fold_user_messages(&messages));
             if let Some(seq) = latest_seq {
                 cursor.store(seq, std::sync::atomic::Ordering::SeqCst);
             }
+            Ok(())
         })
     })
 }
@@ -206,17 +208,18 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
         on_tool_round,
         working_dir,
     } = args;
-    let (jetstream_ctx, session_origin) = prepare_agent_session(PrepareAgentSessionParams {
-        cluster_key,
-        session_id,
-        config: &config,
-        instance_id: &instance_id,
-        abort_signal: &abort_signal,
-        lease: lease.as_ref(),
-        after_seq_observer,
-        session_metadata,
-    })
-    .await?;
+    let (jetstream_ctx, session_origin, attachment_sync) =
+        prepare_agent_session(PrepareAgentSessionParams {
+            cluster_key,
+            session_id,
+            config: &config,
+            instance_id: &instance_id,
+            abort_signal: &abort_signal,
+            lease: lease.as_ref(),
+            after_seq_observer,
+            session_metadata,
+        })
+        .await?;
 
     let hook_start_config =
         resolve_agent_hook_start_config(manage_servers, &config, &jetstream_ctx, &instance_id)
@@ -249,17 +252,17 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
     let result = run_agent_loop_segment(AgentLoopSegmentArgs {
         source_session_id: session_id,
         cluster_key,
-        config,
+        config: config.clone(),
         ctx,
         input: initial_input,
         abort_signal,
-        jetstream_ctx,
+        jetstream_ctx: jetstream_ctx.clone(),
         activation_route,
         event_sink,
     })
     .await;
     drop(hook_supervisor);
-    result
+    attachment_sync.finish(result).await
 }
 
 struct PrepareAgentSessionParams<'a> {
@@ -275,7 +278,7 @@ struct PrepareAgentSessionParams<'a> {
 
 async fn prepare_agent_session(
     params: PrepareAgentSessionParams<'_>,
-) -> Result<(jetstream::Context, SessionOrigin)> {
+) -> Result<(jetstream::Context, SessionOrigin, SessionAttachmentSync)> {
     let cfg_snapshot = params.config.read().clone();
     let jetstream = cfg_snapshot.nats_jetstream(params.cluster_key).await?;
     let mut backend = NatsSessionLogBackend::new(jetstream.clone(), params.session_id);
@@ -300,7 +303,14 @@ async fn prepare_agent_session(
         lease: params.lease,
         metadata: params.session_metadata,
     });
-    Ok((jetstream, origin))
+    let attachment_sync = SessionAttachmentSync::prepare(
+        jetstream.clone(),
+        params.config.clone(),
+        params.cluster_key,
+        params.session_id,
+    )
+    .await?;
+    Ok((jetstream, origin, attachment_sync))
 }
 
 struct AgentContextParams {
