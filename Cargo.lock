@@ -3563,6 +3563,7 @@ dependencies = [
  "harnx-hookset",
  "harnx-hookset-server",
  "libc",
+ "log",
  "serde_json",
  "tempfile",
  "tokio",

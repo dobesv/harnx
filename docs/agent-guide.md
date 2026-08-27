@@ -252,12 +252,12 @@ hooks:
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `command` | `string` | yes | — | Shell command to run as a hook server. For hooks that need event/matcher, use `harnx-claude-compatible-hook-server --event <E> --matcher <M> [--persistent] -- <child-command>`. |
+| `command` | `string` | yes | — | Shell command to run as a hook server. For hooks that need event/matcher, use `harnx-claude-compatible-hook-server --event <E> --matcher <M>` with either `--jaq <FILTER>` or `-- <child-command>`. |
 | `status_message` | `string` | no | none | Message to display while the hook runs |
 | `async` | `boolean` | no | none | Whether to run the hook asynchronously |
 
 The `command` field specifies a hook server binary. Options:
-- **Generic runner**: `harnx-claude-compatible-hook-server --event <EVENT> [--matcher <REGEX>] [--persistent] [--timeout <SECS>] [--priority <N>] [--fail-policy <closed|open>] -- <child-command>`. The `--persistent` flag keeps the child process alive across requests.
+- **Generic runner**: `harnx-claude-compatible-hook-server --event <EVENT> [--matcher <REGEX>] [--timeout <SECS>] [--priority <N>] [--fail-policy <closed|open>] (--jaq <FILTER> | [--persistent] -- <child-command>)`. `--jaq` uses Harnx's embedded jaq engine; `--persistent` keeps a child command alive across requests.
 - **Native hooks** (e.g., `harnx-proxy-auth`): Self-declare their event/matcher and need no runner flags.
 
 ### Top-level Hook Settings

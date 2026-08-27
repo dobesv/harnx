@@ -4,7 +4,8 @@ Tool confirmation allows you to inspect and approve tool calls before they execu
 
 ## 1. Quick Start
 
-The fastest way to enable manual confirmation for all tools is to add a hook entry to your `config.yaml`:
+The fastest way to enable manual confirmation for all tools is to add an
+embedded jaq hook to your `config.yaml`:
 
 ```yaml
 hooks:
@@ -12,11 +13,13 @@ hooks:
     - command: >-
         harnx-claude-compatible-hook-server
         --event PreToolUse
-        --
-        printf '%s\n' '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Manual approval required"}}'
+        --jaq
+        '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Manual approval required"}}'
 ```
 
 With this configuration, Harnx will pause and prompt you for every tool call.
+The expression uses jq syntax but is evaluated by Harnx's embedded jaq engine,
+so no `jq` or `jaq` executable is required.
 
 ## 2. How It Works
 
@@ -34,36 +37,24 @@ Harnx uses the **hooks system** to implement tool confirmation. When a `PreToolU
 
 You can configure confirmation hooks globally in `config.yaml` or per-agent in front-matter.
 
-### Method A: External Script
+### Method A: Selective Confirmation (Matcher)
 
-For more complex logic, move the hook to a script file:
-
-```yaml
-hooks:
-  entries:
-    - command: harnx-claude-compatible-hook-server --event PreToolUse -- /path/to/ask-confirm.sh
-```
-
-**ask-confirm.sh** (see `demos/config/ask-confirm-hook.sh` for a working example):
-```bash
-#!/usr/bin/env bash
-# Consume stdin (tool payload) even if not used
-cat > /dev/null
-# Request confirmation
-printf '%s\n' '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Manual approval required"}}'
-```
-
-### Method B: Selective Confirmation (Matcher)
-Use the `--matcher` flag to only require confirmation for specific tools:
+Use the `--matcher` flag to require confirmation only for specific tools:
 
 ```yaml
 hooks:
   entries:
-    - command: harnx-claude-compatible-hook-server --event PreToolUse --matcher "bash_exec|bash_spawn" -- /path/to/ask-confirm.sh
+    - command: >-
+        harnx-claude-compatible-hook-server
+        --event PreToolUse
+        --matcher '^(bash_exec|bash_spawn)$'
+        --jaq
+        '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Shell command requires approval"}}'
 ```
+
 *The matcher uses a regex against the tool name.*
 
-### Method C: Per-Agent Hooks
+### Method B: Per-Agent Hooks
 Enable confirmation only for specific agents by adding the hook to their Markdown front-matter:
 
 ```yaml
@@ -71,7 +62,11 @@ Enable confirmation only for specific agents by adding the hook to their Markdow
 model: openai:gpt-4o
 hooks:
   entries:
-    - command: harnx-claude-compatible-hook-server --event PreToolUse -- /path/to/ask-confirm.sh
+    - command: >-
+        harnx-claude-compatible-hook-server
+        --event PreToolUse
+        --jaq
+        '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Manual approval required"}}'
 ---
 
 You are a helpful assistant with manual tool oversight.
@@ -96,28 +91,44 @@ Allow this tool call? (y/N)
 
 ## 5. Advanced: Conditional Confirmation
 
-You can write "smart" hooks that only ask for confirmation when operations appear dangerous.
+Embedded jaq hooks receive the full event payload. This hook asks only when a
+shell command contains a potentially destructive command name:
 
-**smart-confirm.sh**:
-```bash
-#!/usr/bin/env bash
-input=$(cat)
-tool_name=$(echo "$input" | jq -r '.tool_name')
-command=$(echo "$input" | jq -r '.tool_input.command // empty')
-
-# Only inspect shell tools — let other tools proceed
-if [[ "$tool_name" != "bash_exec" && "$tool_name" != "bash_spawn" ]]; then
-  echo '{}'
-  exit 0
-fi
-
-# Ask for commands that modify files
-if echo "$command" | grep -qE '(rm|mv|cp|chmod|chown|dd|mkfs)'; then
-  printf '%s\n' "{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"Command uses potentially destructive operation\"}}"
-else
-  echo '{}'
-fi
+```yaml
+hooks:
+  entries:
+    - command: >-
+        harnx-claude-compatible-hook-server
+        --event PreToolUse
+        --matcher '^(bash_exec|bash_spawn)$'
+        --jaq
+        'if ((.tool_input.command // "") | test("\\b(rm|mv|cp|chmod|chown|dd|mkfs)\\b"))
+         then {"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Command uses a potentially destructive operation"}}
+         else {} end'
 ```
+
+The expression must return an object in the normal hook response shape. Return
+`{}` when no action is needed. Use an external command hook when the policy
+needs I/O or logic that is not practical in jaq.
+
+### Confirming an Agent Handoff
+
+Agent handoffs are tool calls, so an exact matcher can make a handoff require
+approval without affecting other tools. For example, this requires confirmation
+before Daedalus hands a session to Atlas:
+
+```yaml
+hooks:
+  entries:
+    - command: >-
+        harnx-claude-compatible-hook-server
+        --event PreToolUse
+        --matcher '^atlas_session_handoff$'
+        --jaq
+        '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Hand off this plan to Atlas for execution?"}}'
+```
+
+The bundled Pantheon `daedalus` agent includes this hook by default.
 
 ### Permission Decision Values
 Hooks can return these values in `hookSpecificOutput`:
@@ -129,7 +140,7 @@ Hooks can return these values in `hookSpecificOutput`:
 **Important Notes:**
 *   **Exit Code Shorthand**: A hook script can exit with code `2` to immediately deny a tool call (equivalent to `permissionDecision: "deny"`).
 *   **Timeouts**: The hook execution timeout defaults to 30 seconds.
-*   **Payload**: Hook scripts receive the full tool call payload as a JSON object on `stdin`.
+*   **Payload**: Jaq expressions receive the payload as input. External hook commands receive the same JSON object on `stdin`.
 *   **Chain of Command**: If multiple hooks are configured for the same event, any hook returning `"ask"` or `"deny"` will take precedence.
 
 ## 6. Demo
