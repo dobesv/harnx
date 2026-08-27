@@ -3,6 +3,14 @@
 #  - https://platform.openai.com/docs/api-reference/chat
 - provider: openai
   models:
+    - name: chat-latest
+      max_input_tokens: 400000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 30
+      supports_vision: true
+      supports_tool_use: true
+      endpoint: responses
     - name: chatgpt-4o-latest
       max_input_tokens: 128000
       max_output_tokens: 4096
@@ -10,6 +18,22 @@
       output_price: 15
       supports_vision: true
       supports_tool_use: true
+    - name: daybreak-blue-latest
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 4
+      output_price: 20
+      supports_vision: true
+      supports_tool_use: true
+      endpoint: responses
+    - name: daybreak-red-latest
+      max_input_tokens: 400000
+      max_output_tokens: 128000
+      input_price: 12.5
+      output_price: 75
+      supports_vision: true
+      supports_tool_use: true
+      endpoint: responses
     - name: ft:gpt-3.5-turbo
       max_input_tokens: 16385
       max_output_tokens: 4096
@@ -517,15 +541,23 @@
       supports_tool_use: true
       endpoint: responses
     - name: gpt-5.6
-      max_input_tokens: 1050000
+      max_input_tokens: 922000
       max_output_tokens: 128000
-      input_price: 5
-      output_price: 30
+      input_price: 4
+      output_price: 20
+      supports_vision: true
+      supports_tool_use: true
+      endpoint: responses
+    - name: gpt-5.6-cyber
+      max_input_tokens: 400000
+      max_output_tokens: 128000
+      input_price: 12.5
+      output_price: 75
       supports_vision: true
       supports_tool_use: true
       endpoint: responses
     - name: gpt-5.6-luna
-      max_input_tokens: 1050000
+      max_input_tokens: 922000
       max_output_tokens: 128000
       input_price: 0.2
       output_price: 1.2
@@ -533,10 +565,10 @@
       supports_tool_use: true
       endpoint: responses
     - name: gpt-5.6-sol
-      max_input_tokens: 1050000
+      max_input_tokens: 922000
       max_output_tokens: 128000
-      input_price: 5
-      output_price: 30
+      input_price: 4
+      output_price: 20
       supports_vision: true
       supports_tool_use: true
       patches:
@@ -544,10 +576,10 @@
       endpoint: responses
     - name: gpt-5.6-sol:high
       real_name: gpt-5.6-sol
-      max_input_tokens: 1050000
+      max_input_tokens: 922000
       max_output_tokens: 128000
-      input_price: 5
-      output_price: 30
+      input_price: 4
+      output_price: 20
       supports_vision: true
       supports_tool_use: true
       patches:
@@ -555,17 +587,17 @@
       endpoint: responses
     - name: gpt-5.6-sol:max
       real_name: gpt-5.6-sol
-      max_input_tokens: 1050000
+      max_input_tokens: 922000
       max_output_tokens: 128000
-      input_price: 5
-      output_price: 30
+      input_price: 4
+      output_price: 20
       supports_vision: true
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"max"}
       endpoint: responses
     - name: gpt-5.6-terra
-      max_input_tokens: 1050000
+      max_input_tokens: 922000
       max_output_tokens: 128000
       input_price: 2
       output_price: 12
@@ -574,10 +606,10 @@
       endpoint: responses
     - name: gpt-5.6-terra:high
       real_name: gpt-5.6-terra
-      max_input_tokens: 1050000
+      max_input_tokens: 922000
       max_output_tokens: 128000
-      input_price: 2.5
-      output_price: 15
+      input_price: 2
+      output_price: 12
       supports_vision: true
       supports_tool_use: true
       patches:
@@ -1269,7 +1301,7 @@
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
     - name: claude-sonnet-4-6
       max_input_tokens: 1000000
-      max_output_tokens: 64000
+      max_output_tokens: 128000
       require_max_tokens: true
       input_price: 3
       output_price: 15
@@ -1318,8 +1350,8 @@
       input_price: 1
       output_price: 3
     - name: codestral-2508
-      max_input_tokens: 256000
-      max_output_tokens: 256000
+      max_input_tokens: 128000
+      max_output_tokens: 128000
       input_price: 0.3
       output_price: 0.9
       supports_tool_use: true
@@ -1332,10 +1364,11 @@
       input_price: 0.15
       type: embedding
     - name: codestral-latest
-      max_input_tokens: 32000
-      max_output_tokens: 8191
-      input_price: 1
-      output_price: 3
+      max_input_tokens: 128000
+      max_output_tokens: 128000
+      input_price: 0.3
+      output_price: 0.9
+      supports_tool_use: true
     - name: codestral-mamba-latest
       max_input_tokens: 256000
       max_output_tokens: 256000
@@ -1382,6 +1415,12 @@
       max_output_tokens: 256000
       input_price: 0.1
       output_price: 0.3
+      supports_tool_use: true
+    - name: glm-5-2
+      max_input_tokens: 1048576
+      max_output_tokens: 131072
+      input_price: 1.4
+      output_price: 4.4
       supports_tool_use: true
     - name: labs-devstral-small-2512
       max_input_tokens: 256000
@@ -1584,6 +1623,7 @@
       max_output_tokens: 262144
       input_price: 0.15
       output_price: 0.6
+      supports_vision: true
       supports_tool_use: true
     - name: mistral-small-3-2-2506
       max_input_tokens: 131072
@@ -1593,10 +1633,10 @@
       supports_vision: true
       supports_tool_use: true
     - name: mistral-small-latest
-      max_input_tokens: 131072
-      max_output_tokens: 131072
-      input_price: 0.06
-      output_price: 0.18
+      max_input_tokens: 262144
+      max_output_tokens: 262144
+      input_price: 0.15
+      output_price: 0.6
       supports_vision: true
       supports_tool_use: true
     - name: mistral-tiny
@@ -1656,6 +1696,12 @@
       input_price: 2
       output_price: 6
       supports_vision: true
+      supports_tool_use: true
+    - name: zai-glm-5-2
+      max_input_tokens: 1048576
+      max_output_tokens: 131072
+      input_price: 1.4
+      output_price: 4.4
       supports_tool_use: true
 
 # Links:
@@ -1892,6 +1938,14 @@
       max_output_tokens: 4096
       input_price: 0
       output_price: 0.28
+    - name: pplx-embed-context-v1-0.6b
+      max_input_tokens: 32768
+      input_price: 0.008
+      type: embedding
+    - name: pplx-embed-context-v1-4b
+      max_input_tokens: 32768
+      input_price: 0.05
+      type: embedding
     - name: pplx-embed-v1-0.6b
       max_input_tokens: 32768
       input_price: 0.004
@@ -2795,8 +2849,8 @@
     - name: deepseek-ai/deepseek-v3.1-maas
       max_input_tokens: 163840
       max_output_tokens: 32768
-      input_price: 1.35
-      output_price: 5.4
+      input_price: 0.6
+      output_price: 1.7
       supports_tool_use: true
     - name: deepseek-ai/deepseek-v3.2-maas
       max_input_tokens: 163840
@@ -2898,8 +2952,8 @@
     - name: gemini-3.6-flash
       max_input_tokens: 1048576
       max_output_tokens: 65536
-      input_price: 1.5
-      output_price: 7.5
+      input_price: 0.75
+      output_price: 3.75
       supports_vision: true
       supports_tool_use: true
     - name: gemini-3.7-flash
@@ -3112,8 +3166,8 @@
     - name: openai/gpt-oss-120b-maas
       max_input_tokens: 131072
       max_output_tokens: 32768
-      input_price: 0.15
-      output_price: 0.6
+      input_price: 0.09
+      output_price: 0.36
     - name: openai/gpt-oss-20b-maas
       max_input_tokens: 131072
       max_output_tokens: 32768
@@ -3122,14 +3176,14 @@
     - name: qwen/qwen3-235b-a22b-instruct-2507-maas
       max_input_tokens: 262144
       max_output_tokens: 16384
-      input_price: 0.25
-      output_price: 1
+      input_price: 0.22
+      output_price: 0.88
       supports_tool_use: true
     - name: qwen/qwen3-coder-480b-a35b-instruct-maas
       max_input_tokens: 262144
       max_output_tokens: 32768
-      input_price: 1
-      output_price: 4
+      input_price: 0.22
+      output_price: 1.8
       supports_tool_use: true
     - name: qwen/qwen3-next-80b-a3b-instruct-maas
       max_input_tokens: 262144
@@ -3942,6 +3996,13 @@
       output_price: 4
       supports_vision: true
       supports_tool_use: true
+    - name: kimi-k3
+      max_input_tokens: 1048576
+      max_output_tokens: 1048576
+      input_price: 3
+      output_price: 15
+      supports_vision: true
+      supports_tool_use: true
     - name: kimi-latest
       max_input_tokens: 131072
       max_output_tokens: 131072
@@ -4084,15 +4145,15 @@
     - name: deepseek-v4-flash
       max_input_tokens: 1000000
       max_output_tokens: 393216
-      input_price: 0.14
-      output_price: 0.28
+      input_price: 0.44
+      output_price: 1.32
       supports_vision: false
       supports_tool_use: true
     - name: deepseek-v4-pro
       max_input_tokens: 1000000
       max_output_tokens: 393216
-      input_price: 0.435
-      output_price: 0.87
+      input_price: 1.32
+      output_price: 3.96
       supports_vision: false
       supports_tool_use: true
 
@@ -4305,6 +4366,13 @@
       output_price: 25
       supports_vision: true
       supports_tool_use: true
+    - name: anthropic/claude-opus-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_tool_use: true
     - name: anthropic/claude-sonnet-4
       max_input_tokens: 1000000
       max_output_tokens: 64000
@@ -4382,6 +4450,18 @@
       max_output_tokens: 163840
       input_price: 0.2
       output_price: 0.4
+      supports_tool_use: true
+    - name: deepseek/deepseek-v4-pro
+      max_input_tokens: 1048576
+      max_output_tokens: 384000
+      input_price: 1.32
+      output_price: 3.96
+      supports_tool_use: true
+    - name: deepseek/deepseek-v4-pro-0813
+      max_input_tokens: 1048576
+      max_output_tokens: 384000
+      input_price: 1.32
+      output_price: 3.96
       supports_tool_use: true
     - name: google/gemini-2.0-flash-001
       max_input_tokens: 1048576
@@ -5669,6 +5749,18 @@
       max_input_tokens: 32000
       input_price: 0.02
       type: embedding
+    - name: voyage-4
+      max_input_tokens: 32000
+      input_price: 0.06
+      type: embedding
+    - name: voyage-4-large
+      max_input_tokens: 32000
+      input_price: 0.12
+      type: embedding
+    - name: voyage-4-lite
+      max_input_tokens: 32000
+      input_price: 0.02
+      type: embedding
     - name: voyage-code-2
       max_input_tokens: 16000
       input_price: 0.12
@@ -5677,9 +5769,17 @@
       max_input_tokens: 32000
       input_price: 0.18
       type: embedding
+    - name: voyage-code-4
+      max_input_tokens: 32000
+      input_price: 0.12
+      type: embedding
     - name: voyage-context-3
       max_input_tokens: 120000
       input_price: 0.18
+      type: embedding
+    - name: voyage-context-4
+      max_input_tokens: 120000
+      input_price: 0.12
       type: embedding
     - name: voyage-finance-2
       max_input_tokens: 32000
@@ -5702,6 +5802,10 @@
       input_price: 0.1
       type: embedding
     - name: voyage-multimodal-3
+      max_input_tokens: 32000
+      input_price: 0.12
+      type: embedding
+    - name: voyage-multimodal-3.5
       max_input_tokens: 32000
       input_price: 0.12
       type: embedding
