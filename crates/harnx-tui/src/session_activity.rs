@@ -8,7 +8,20 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const DURABLE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 type SessionTarget = (String, String);
+
+enum SessionActivityInput {
+    Advisory(harnx_runtime::nats_event_sink::AdvisoryEnvelope),
+    RefreshDurableHistory,
+    SubscriptionClosed,
+}
+
+enum DurableRefreshOutcome {
+    Continue,
+    Reconnect,
+    Stop,
+}
 
 struct SessionEventForwarder<'a> {
     event_tx: &'a UnboundedSender<TuiEvent>,
@@ -275,15 +288,82 @@ async fn forward_session_activity(
     stream: &mut SessionEventStream,
     forwarder: &SessionEventForwarder<'_>,
 ) -> bool {
-    while let Some(envelope) = stream.next().await {
-        if !forwarder.should_forward(stream, &envelope) {
-            continue;
-        }
-        if !forwarder.send_agent_event(envelope.event) {
-            return false;
+    let mut active = forwarder.attached_during_turn;
+    loop {
+        match next_session_activity_input(stream, active).await {
+            SessionActivityInput::Advisory(envelope) => {
+                if !forward_advisory(stream, forwarder, envelope, &mut active) {
+                    return false;
+                }
+            }
+            SessionActivityInput::RefreshDurableHistory => {
+                match refresh_durable_activity(stream, forwarder, &mut active).await {
+                    DurableRefreshOutcome::Continue => {}
+                    DurableRefreshOutcome::Reconnect => return true,
+                    DurableRefreshOutcome::Stop => return false,
+                }
+            }
+            SessionActivityInput::SubscriptionClosed => return true,
         }
     }
-    true
+}
+
+async fn next_session_activity_input(
+    stream: &mut SessionEventStream,
+    active: bool,
+) -> SessionActivityInput {
+    if !active {
+        return stream.next().await.map_or(
+            SessionActivityInput::SubscriptionClosed,
+            SessionActivityInput::Advisory,
+        );
+    }
+    match tokio::time::timeout(DURABLE_REFRESH_INTERVAL, stream.next()).await {
+        Ok(Some(envelope)) => SessionActivityInput::Advisory(envelope),
+        Ok(None) => SessionActivityInput::SubscriptionClosed,
+        Err(_) => SessionActivityInput::RefreshDurableHistory,
+    }
+}
+
+fn forward_advisory(
+    stream: &SessionEventStream,
+    forwarder: &SessionEventForwarder<'_>,
+    envelope: harnx_runtime::nats_event_sink::AdvisoryEnvelope,
+    active: &mut bool,
+) -> bool {
+    if !forwarder.should_forward(stream, &envelope) {
+        return true;
+    }
+    let activity = event_activity(&envelope.event);
+    if let Some(next) = activity {
+        *active = next;
+    }
+    forwarder.send_agent_event(envelope.event)
+}
+
+async fn refresh_durable_activity(
+    stream: &mut SessionEventStream,
+    forwarder: &SessionEventForwarder<'_>,
+    active: &mut bool,
+) -> DurableRefreshOutcome {
+    if let Err(error) = stream.refresh_history().await {
+        log::debug!(
+            "failed to refresh durable session activity: session_id={} cluster={} error={error:#}",
+            forwarder.target.0,
+            forwarder.target.1,
+        );
+        return DurableRefreshOutcome::Reconnect;
+    }
+    let durable_activity = history_has_pending_turn(stream.history());
+    if durable_activity == *active {
+        return DurableRefreshOutcome::Continue;
+    }
+    *active = durable_activity;
+    if forwarder.send_activity(durable_activity) {
+        DurableRefreshOutcome::Continue
+    } else {
+        DurableRefreshOutcome::Stop
+    }
 }
 
 fn event_activity(event: &AgentEvent) -> Option<bool> {
