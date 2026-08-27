@@ -307,6 +307,32 @@ Use `--prompt` to create a temporary agent without a file:
 harnx prompt --prompt "You are a helpful translator" "translate hello to French"
 ```
 
+## Agent Handoffs
+
+An agent can permanently transfer a conversation to another assistant with a
+synthetic `{agent}_session_handoff` tool. A handoff is different from nested
+delegation: the source turn finishes immediately after the target prompt is
+durably queued, and the target runs as an ordinary top-level NATS session. The
+source does not wait for the target's response.
+
+The optional `session_id` follows the same rules as `{agent}_session_prompt`:
+
+- Omit it, or pass an empty/whitespace value, to generate a new target session.
+- Pass an unused ID to create that exact target session.
+- Pass an existing session owned by the target agent to continue its transcript.
+- Passing a session owned by another agent fails before the prompt is appended.
+
+Do not invent an ID when a generated session is desired. The committed target
+ID is reported only after the prompt is persisted and worker activation is
+published. Bare and package-qualified targets stay on the current cluster;
+explicit `agent@cluster` targets use that configured cluster.
+
+The source session keeps its agent configuration, history, hooks, persistence
+backend, and lease. The target's normal activation independently loads its
+metadata, acquires its lease, reconciles its hooks, and drains the queued turn.
+Web and TUI clients follow the confirmed target; one-shot CLI output reports the
+handoff without automatically following it.
+
 ## Sub-Agents & Agent Delegation
 
 Harnx supports agent delegation, allowing a parent agent to run nested sub-agents for specialized tasks (such as code analysis, research, or execution planning).
@@ -353,7 +379,12 @@ Because sub-agents run as standard NATS agent sessions, their execution events (
 sessions.{session_id}.events
 ```
 
-Client interfaces (TUI, web UI, CLI) can attach to a child session's stream to render activity live.
+Client interfaces can attach to a child session's stream to render activity
+live. The TUI does this automatically: it inserts a compact selectable child
+row, monitors the child independently, and opens its full transcript when the
+row receives focus. Nested rows can be used to drill into grandchildren. Press
+`Esc` to return one level. Automatic Web monitoring and inline child output are
+not currently provided.
 
 To allow interfaces to attach before the sub-agent prompt completes, an early advisory event is emitted on the parent session's stream (`sessions.{parent_session_id}.events`) immediately when delegation begins:
 

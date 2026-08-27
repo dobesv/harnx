@@ -7,6 +7,7 @@ use harnx_runtime::utils::AbortSignal;
 use crate::markdown_render::RenderedEntry;
 use chrono::{DateTime, Utc};
 use ratatui_textarea::TextArea;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +54,14 @@ pub struct Tui {
     /// Background subscription that lets this TUI react to turns submitted by
     /// another client attached to the same session.
     pub(super) session_activity_handle: Option<JoinHandle<()>>,
+    /// Root session whose nested sub-agent monitors belong to. Changing the
+    /// root aborts every child monitor and drops their retained views.
+    pub(super) subagent_monitor_root: Option<(String, String)>,
+    /// Independent live subscriptions for child sessions.
+    pub(super) subagent_monitor_handles: HashMap<MonitoredSessionKey, JoinHandle<()>>,
+    /// Set when a durable transcript rebuild may have introduced child rows.
+    /// The next monitor sync consumes it instead of rescanning every frame.
+    pub(super) subagent_rows_dirty: bool,
     #[allow(private_interfaces)]
     pub(crate) app: App,
     pub(crate) event_tx: mpsc::UnboundedSender<TuiEvent>,
@@ -131,16 +140,16 @@ pub(super) struct App {
     pub(super) pending_confirm_reply: Option<std::sync::mpsc::Sender<bool>>,
     pub(super) detail_view_scroll: ratatui_widget_scrolling::ScrollState,
     pub(super) detail_view_open: bool,
-    /// Raw YAML from the session log for the focused entry, populated when
-    /// detail_view_open is set.  None when no session is active or the item
-    /// has no sequence number.
-    pub(super) detail_view_raw_yaml: Option<String>,
     pub(super) detail_view_text: Option<String>,
+    /// Passive child-session entry shown in the shared detail surface.
+    /// Child transcripts are not editable, so this is kept separate from the
+    /// root transcript selection and its mutation actions.
+    pub(super) detail_view_entry: Option<TranscriptItem>,
     /// Title shown for a `detail_view_text` overlay (e.g. "Compacted session",
     /// "Agent Info", "Session Info"). None falls back to the generic "Detail".
     pub(super) detail_view_title: Option<String>,
     /// True when the user is browsing history in fullscreen mode.
-    /// Distinct from detail_view_open which shows raw YAML.
+    /// Distinct from detail_view_open, which shows a selected entry's details.
     pub(super) transcript_browsing: bool,
     /// Scroll state for the browsing view (used when transcript_browsing is true).
     /// Reset to follow=false, position=0 when focused item changes.
@@ -154,6 +163,59 @@ pub(super) struct App {
     /// Always false in production; set to true in tests so snapshot
     /// output is timezone-independent.
     pub(super) use_utc_timestamps: bool,
+    /// Child-session state is intentionally separate from the root transcript
+    /// so nested events cannot mutate root busy, input, or streaming state.
+    pub(super) monitored_sessions: HashMap<MonitoredSessionKey, MonitoredSessionState>,
+    /// Fullscreen child-session drilldown stack. The last key is displayed.
+    pub(super) subagent_view_stack: Vec<MonitoredSessionKey>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct MonitoredSessionKey {
+    pub cluster: String,
+    pub agent: String,
+    pub session_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SubAgentStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+impl SubAgentStatus {
+    pub(super) fn label(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "done",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+pub(super) struct MonitoredSessionState {
+    pub transcript: Vec<TranscriptItem>,
+    pub status: SubAgentStatus,
+    pub transcript_focus: Option<usize>,
+    pub scroll: ratatui_widget_scrolling::ScrollState,
+    pub scroll_to_focused_item: bool,
+    pub streaming_open: bool,
+}
+
+impl MonitoredSessionState {
+    pub(super) fn new(status: SubAgentStatus) -> Self {
+        let mut scroll = ratatui_widget_scrolling::ScrollState::new();
+        scroll.follow = true;
+        Self {
+            transcript: Vec::new(),
+            status,
+            transcript_focus: None,
+            scroll,
+            scroll_to_focused_item: false,
+            streaming_open: false,
+        }
+    }
 }
 
 /// Create a unique temporary attachment directory in the system temp area.
@@ -297,6 +359,11 @@ pub enum TranscriptItem {
     AttachmentItem(String),
     AttachmentPreviewLine(String),
     MutationNotice(String),
+    /// Compact, selectable link to a separately monitored child transcript.
+    SubAgentSession {
+        key: MonitoredSessionKey,
+        status: SubAgentStatus,
+    },
 }
 
 impl TranscriptItem {
@@ -323,6 +390,7 @@ impl TranscriptItem {
                 | TranscriptItem::AssistantText { .. }
                 | TranscriptItem::ToolCall { .. }
                 | TranscriptItem::CompactionMarker { .. }
+                | TranscriptItem::SubAgentSession { .. }
         )
     }
 }
@@ -355,6 +423,17 @@ pub(crate) enum TuiEvent {
     SessionAgent {
         session_id: String,
         cluster: String,
+        event: harnx_core::event::AgentEvent,
+    },
+    /// Durable child history loaded subscribe-first before live forwarding.
+    SubAgentSessionSnapshot {
+        key: MonitoredSessionKey,
+        transcript: Vec<TranscriptItem>,
+        status: SubAgentStatus,
+    },
+    /// Live advisory belonging exclusively to a monitored child session.
+    SubAgentSessionEvent {
+        key: MonitoredSessionKey,
         event: harnx_core::event::AgentEvent,
     },
     /// Intermediate tool round completed; retained for queued-message tests.

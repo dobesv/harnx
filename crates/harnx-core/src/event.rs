@@ -144,6 +144,12 @@ pub enum TurnEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionEvent {
+    /// Emitted after a handoff prompt has been durably appended to the target
+    /// session and its worker activation has been published.
+    HandoffCommitted {
+        agent: String,
+        session_id: String,
+    },
     Saved {
         path: PathBuf,
     },

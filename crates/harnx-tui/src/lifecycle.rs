@@ -90,6 +90,7 @@ fn transcript_footprint(items: &[TranscriptItem]) -> (usize, usize) {
                 ..
             } => text.len() + summary_text.len() + detail_text.len(),
             TranscriptItem::ToolCall { tool_name, .. } => tool_name.len(),
+            TranscriptItem::SubAgentSession { key, .. } => key.agent.len() + key.session_id.len(),
             TranscriptItem::Plan(_) | TranscriptItem::SourceHeading(_) => 0,
         })
         .sum();
@@ -141,8 +142,8 @@ fn build_initial_app(
             s
         },
         detail_view_open: false,
-        detail_view_raw_yaml: None,
         detail_view_text: None,
+        detail_view_entry: None,
         detail_view_title: None,
         transcript_browsing: false,
         browsing_view_scroll: {
@@ -153,6 +154,8 @@ fn build_initial_app(
         copy_notice_until: None,
         scroll_to_focused_item: false,
         use_utc_timestamps: false,
+        monitored_sessions: HashMap::new(),
+        subagent_view_stack: Vec::new(),
     })
 }
 
@@ -230,6 +233,9 @@ impl Tui {
             active_remote_session: None,
             session_activity_target: None,
             session_activity_handle: None,
+            subagent_monitor_root: None,
+            subagent_monitor_handles: HashMap::new(),
+            subagent_rows_dirty: true,
             needs_full_redraw: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             app,
             event_tx,
@@ -629,6 +635,14 @@ pub(crate) fn messages_to_transcript_items(
     messages: &[Message],
     decl_map: &HashMap<String, ToolDeclaration>,
 ) -> Vec<TranscriptItem> {
+    messages_to_transcript_items_for_cluster(messages, decl_map, None)
+}
+
+pub(crate) fn messages_to_transcript_items_for_cluster(
+    messages: &[Message],
+    decl_map: &HashMap<String, ToolDeclaration>,
+    cluster: Option<&str>,
+) -> Vec<TranscriptItem> {
     use harnx_core::message::{MessageContent, MessageRole};
     use serde_json::Value;
 
@@ -699,6 +713,15 @@ pub(crate) fn messages_to_transcript_items(
                             timestamp: msg.log_timestamp,
                             rendered_cache: None,
                         });
+                        if let Some(key) =
+                            cluster.and_then(|cluster| subagent_key_from_output(&r.output, cluster))
+                        {
+                            items.push(TranscriptItem::SubAgentSession {
+                                key,
+                                status: crate::types::SubAgentStatus::Completed,
+                            });
+                            continue;
+                        }
                         let raw_result_fallback = harnx_core::tool::extract_user_display_text(
                             &r.output,
                         )
@@ -726,6 +749,23 @@ pub(crate) fn messages_to_transcript_items(
         }
     }
     items
+}
+
+pub(crate) fn subagent_key_from_output(
+    output: &serde_json::Value,
+    cluster: &str,
+) -> Option<crate::types::MonitoredSessionKey> {
+    let marker = output.get("sub_agent")?;
+    let agent = marker.get("agent")?.as_str()?;
+    let session_id = marker.get("session_id")?.as_str()?;
+    if agent.trim().is_empty() || session_id.trim().is_empty() {
+        return None;
+    }
+    Some(crate::types::MonitoredSessionKey {
+        cluster: cluster.to_string(),
+        agent: agent.to_string(),
+        session_id: session_id.to_string(),
+    })
 }
 
 fn flatten_transcript_item_to_compaction_lines(item: &TranscriptItem, lines: &mut Vec<String>) {
@@ -765,6 +805,12 @@ fn flatten_transcript_item_to_compaction_lines(item: &TranscriptItem, lines: &mu
             lines.push(crate::render_helpers::source_heading(source));
         }
         TranscriptItem::CompactionMarker { text, .. } => lines.push(text.clone()),
+        TranscriptItem::SubAgentSession { key, status } => lines.push(format!(
+            "sub-agent {} [{}] {}",
+            key.agent,
+            key.session_id,
+            status.label()
+        )),
     }
 }
 
@@ -847,16 +893,40 @@ pub(crate) fn build_transcript_with_compaction(
     compaction_summary: Option<&str>,
     decl_map: &HashMap<String, ToolDeclaration>,
 ) -> Vec<TranscriptItem> {
+    build_transcript_with_compaction_for_cluster(
+        compressed_messages,
+        active_messages,
+        compaction_summary,
+        decl_map,
+        None,
+    )
+}
+
+pub(crate) fn build_transcript_with_compaction_for_cluster(
+    compressed_messages: &[Message],
+    active_messages: &[Message],
+    compaction_summary: Option<&str>,
+    decl_map: &HashMap<String, ToolDeclaration>,
+    cluster: Option<&str>,
+) -> Vec<TranscriptItem> {
     let mut items = Vec::new();
     if !compressed_messages.is_empty() {
-        items.extend(messages_to_transcript_items(compressed_messages, decl_map));
+        items.extend(messages_to_transcript_items_for_cluster(
+            compressed_messages,
+            decl_map,
+            cluster,
+        ));
         items.push(build_compaction_marker(
             compressed_messages,
             compaction_summary.unwrap_or_default().to_string(),
             decl_map,
         ));
     }
-    items.extend(messages_to_transcript_items(active_messages, decl_map));
+    items.extend(messages_to_transcript_items_for_cluster(
+        active_messages,
+        decl_map,
+        cluster,
+    ));
     items
 }
 
@@ -946,7 +1016,10 @@ pub(crate) async fn session_history_transcript_items(config: &GlobalConfig) -> V
             session_id,
         } => {
             let state = match crate::session_history_loader::load_remote_session_history(
-                config, agent, cluster, session_id,
+                config,
+                agent,
+                cluster.clone(),
+                session_id,
             )
             .await
             {
@@ -957,11 +1030,12 @@ pub(crate) async fn session_history_transcript_items(config: &GlobalConfig) -> V
                     ))];
                 }
             };
-            let mut transcript = build_transcript_with_compaction(
+            let mut transcript = build_transcript_with_compaction_for_cluster(
                 &state.compressed_messages,
                 &state.messages,
                 state.compaction_summary.as_deref(),
                 &context.declarations,
+                Some(&cluster),
             );
             transcript.extend(state.replay_warnings.into_iter().map(|warning| {
                 TranscriptItem::ErrorText(format!("Session history warning: {warning}"))
@@ -1106,5 +1180,50 @@ mod tests {
             }
             _ => panic!("wrong item type"),
         }
+    }
+
+    #[test]
+    fn durable_subagent_marker_becomes_completed_row_instead_of_result_body() {
+        let call = ToolCall::new(
+            "researcher_session_prompt".to_string(),
+            json!({"message": "investigate"}),
+            Some("call-child".to_string()),
+            None,
+        );
+        let result = ToolResult::new(
+            call,
+            json!({
+                "response": "child response",
+                "sub_agent": {
+                    "agent": "researcher",
+                    "session_id": "child-session"
+                }
+            }),
+        );
+        let messages = vec![Message {
+            role: MessageRole::Tool,
+            content: MessageContent::ToolCalls(MessageContentToolCalls::new(
+                vec![result],
+                String::new(),
+                None,
+            )),
+            id: None,
+            log_seq: Some(7),
+            log_timestamp: None,
+        }];
+
+        let items =
+            messages_to_transcript_items_for_cluster(&messages, &HashMap::new(), Some("remote"));
+        assert_eq!(items.len(), 2, "tool call plus compact child row only");
+        assert!(matches!(
+            &items[1],
+            TranscriptItem::SubAgentSession { key, status: crate::types::SubAgentStatus::Completed }
+                if key.cluster == "remote"
+                    && key.agent == "researcher"
+                    && key.session_id == "child-session"
+        ));
+        assert!(items
+            .iter()
+            .all(|item| !matches!(item, TranscriptItem::ToolResultMarkdown { .. })));
     }
 }

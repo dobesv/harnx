@@ -72,7 +72,9 @@ impl SessionRegistry {
     }
 
     pub fn has_session(&self, key: &SessionKey) -> bool {
-        self.map.contains_key(key)
+        self.map
+            .get(key)
+            .is_some_and(|handle| !handle.tx.is_closed())
     }
 
     pub fn get_or_spawn(&self, key: SessionKey) -> SessionHandle {

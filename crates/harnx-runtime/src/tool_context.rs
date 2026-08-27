@@ -136,6 +136,19 @@ pub async fn discover_nats_hook_provider_cached(
         return provider;
     }
 
+    discover_nats_hook_provider_fresh(config, instance_id).await
+}
+
+/// Refresh hook discovery immediately and replace the cached snapshot.
+///
+/// Worker activations call this after reconciling an agent's hook servers;
+/// using the prior activation's cached provider here would leave a newly
+/// selected agent's hooks invisible for the cache TTL.
+pub(crate) async fn discover_nats_hook_provider_fresh(
+    config: &Config,
+    instance_id: &ServerScope,
+) -> Option<Arc<NatsHookProvider>> {
+    let cache = NATS_HOOK_DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     // Don't hold the process-wide lock while connecting to NATS or scanning KV.
     let provider = NatsHookProvider::discover(config, instance_id.clone())
         .await

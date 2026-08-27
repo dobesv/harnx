@@ -13,11 +13,16 @@ pub mod render;
 pub mod render_helpers;
 mod session_activity;
 mod session_history_loader;
+mod subagent_monitor;
+mod subagent_render;
+mod subagent_sessions;
+mod subagent_transcript;
 pub mod terminal;
 pub mod test_utils;
 pub mod types;
 
 mod completion;
+mod detail_view;
 
 #[cfg(test)]
 mod tests;

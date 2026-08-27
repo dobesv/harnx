@@ -26,7 +26,8 @@ Hooks over NATS were incomplete: only PreToolUse/PostToolUse dispatched over NAT
 ## Symptoms
 
 - `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `Stop`, `StopFailure` events never reached NATS hooks
-- Mid-session agent handoff (`/agent` switch) kept old agent's hooks registered, new agent's hooks never started
+- The historical in-place agent handoff kept old agent hooks registered while
+  the target agent's hooks never started
 - PreToolUse hooks returning `additional_context` or `system_message` had those fields silently discarded
 - No tests caught the context-drop bug because tests bypassed the public `dispatch_event` entrypoint
 - `FailPolicy::Closed` hooks that crashed or failed to start were removed from registry, dispatch treated "no matching hooks" as Continue (fail-open for security hooks)
@@ -38,11 +39,13 @@ Hooks over NATS were incomplete: only PreToolUse/PostToolUse dispatched over NAT
 2. Found `HookServerSupervisor` mirrored `ToolServerSupervisor` correctly, but no code started it at the right lifecycle seams:
    - Global hooks needed startup in `run_worker_daemon`
    - Tool-server hooks needed co-launch with their parent tool server
-   - Agent hooks needed session bind and handoff reconciliation
+   - Agent hooks needed session-bind reconciliation; the historical in-place
+     handoff also needed an explicit swap
 
 3. Traced `dispatch_pre_tool_use_with` (the multi-hook sequential loop): Continue arm accumulated `mutated_tool_input` but ignored `additional_context`/`system_message`/`resume`. The helper `continue_outcome(mutated_tool_input)` returned a `HookOutcome` with all context fields defaulted to `None`.
 
-4. Verified `reconcile_agent_hooks` (handoff hook swap) had zero test coverage — no test ever produced a `HandoffRequested` result.
+4. Verified the historical `reconcile_agent_hooks` handoff swap had zero test
+   coverage — no test ever produced a `HandoffRequested` result.
 
 5. Confirmed that `pending_async_context` is a standalone `Arc<Mutex<Option<String>>>` owned by agent loop, NOT tied to `AsyncHookManager`. This independence is why NATS context injection works without the inline async manager.
 
@@ -54,9 +57,17 @@ Hooks over NATS were incomplete: only PreToolUse/PostToolUse dispatched over NAT
 - `run_worker_daemon` for global hooks (instance lifetime)
 - `ToolServerSupervisor::start_local` for tool-server hooks (co-launched, co-dropped)
 - `load_or_repair_session` / `attach_session_to_config` for agent hooks (session bind)
-- `prepare_nats_handoff` for agent swap (must explicitly reconcile)
+- ordinary target-session activation for handoffs (reconciles independently)
 
-**Handoff gap:** `prepare_nats_handoff` lacked a reconcile step, so a handed-off session retained old agent's hook registrations while new agent's hooks never started.
+Worker readiness is intentionally announced before the daemon's background
+services finish registering. That cannot extend to the first activation:
+`SessionStart` discovery is one-shot, so a cold worker that activates before
+global hook registration can permanently miss the event. Claimed activations
+therefore wait at `await_initial_background_services` for the bounded initial
+registration attempt before acknowledging and running the session. Later
+activations do not pay this startup barrier.
+
+**Historical handoff gap:** The original recursive handoff path lacked a reconcile step, so a handed-off session retained old agent registrations. Handoffs now activate an independent target session through the ordinary worker lifecycle, while the source hook lifecycle remains untouched.
 
 ## Solution
 
@@ -159,28 +170,26 @@ Block/Ask short-circuit unchanged (`return outcome` immediately).
 
 ### 4. Handoff Hook Reconciliation
 
-`prepare_nats_handoff` now calls `reconcile_agent_hooks` immediately before returning:
+The original implementation explicitly called a hook-reconciliation helper
+from `prepare_nats_handoff`. The current detached architecture removed that
+swap: the source supervisor remains scoped to the source activation, and the
+target's ordinary activation calls the private `reconcile_agent_hooks` adapter
+after loading the target agent. That adapter resolves the agent's current hooks
+and session scope before calling this lifecycle primitive:
 
 ```rust
-pub async fn reconcile_agent_hooks(
-    old_supervisor: Option<HookServerSupervisor>,
-    new_hooks: Vec<HookConfig>,
-    start_config: &HookServerStartConfig,
+#[doc(hidden)]
+pub async fn reconcile_hook_supervisor(
+    current: &mut Option<HookServerSupervisor>,
+    start: Option<&HookServerStartConfig>,
+    hooks: &HooksConfig,
     scope: &str,
-) -> Option<HookServerSupervisor> {
-    // Stop old supervisor, await registry deletion
-    if let Some(sup) = old_supervisor {
-        sup.shutdown().await;
-    }
-    // Start new supervisor with new agent's hooks
-    if new_hooks.is_empty() {
-        return None;
-    }
-    HookServerSupervisor::start_local(start_config, &new_hooks, scope).await.ok()
-}
+)
 ```
 
-Sequential stop-then-start prevents old/new overlap. Brief fail-open window exists between stop and start — acceptable for atomic swap semantics.
+The primitive mutates the owned supervisor in place. Sequential stop-then-start
+prevents old/new overlap. A brief fail-open window exists between stop and start
+and is acceptable for the swap semantics.
 
 ### 5. pending_async_context Architecture
 
@@ -216,13 +225,18 @@ Ask returns as `HookResultControl::Ask`. Engine's `confirm_tool_use_fn` converts
 
 **pending_async_context independence enables Phase 4:** Inline async manager removal won't break context flow because NATS writes directly to the Arc.
 
-**Handoff reconcile prevents stale registrations:** Old agent's hooks stop and unregister before new agent's start, preventing stale responses.
+**Detached handoff preserves hook ownership:** The source supervisor remains
+owned by the source activation. The independently activated target loads its
+own hook configuration and reconciles that session's supervisor before it runs
+the queued prompt.
 
 ## Accepted Behavior Changes / Known Gaps
 
 1. **~~FailPolicy::Closed fail-open on crash/startup failure~~ — RESOLVED (Phase 4):** Now uses `harnx_hook_expectations` KV manifest. Supervisor publishes required fail-closed hook specs before spawning; `NatsHookProvider::discover` merges any expected-but-unregistered hook into the discovery result. A missing or crashed hook configured with `FailPolicy::Closed` that the supervisor was asked to launch makes its matched PreToolUse dispatch fail closed (Block) rather than silently continuing. Genuine KV read failure (distinguished via JetStream `STREAM_NOT_FOUND` 10059) also installs a fail-closed guard instead of failing open.
 
-2. **Handoff stop-then-start window:** Brief gap where zero agent hooks registered. Sequential stop-then-start is atomic for swap semantics. Acceptable.
+2. **Target hook startup:** A handoff uses the normal target-session bind path,
+   including its existing hook reconciliation and failure-policy behavior. It
+   does not introduce a cross-session stop-then-start window.
 
 3. **Ask headless limitation:** Headless workers surface Ask via `ToolApprovalRequiredError` but cannot interactively prompt. Confirmation callback decides denial/surface.
 
@@ -235,16 +249,22 @@ Ask returns as `HookResultControl::Ask`. Engine's `confirm_tool_use_fn` converts
 **Test coverage:**
 - `dispatch_event_queues_aggregated_pre_tool_context_for_next_turn`: Drives public `dispatch_event` entrypoint with 2 hooks, asserts joined context/system fields and pending_async_context
 - `dispatch_event_runs_best_effort_session_start`: Drives `dispatch_event` for SessionStart, asserts dispatcher called
-- `reconcile_hook_supervisor_replaces_old_agent_registration`: Live NATS test of handoff reconcile — old gone, new present
+- `handoff_to_agent_with_hooks_starts_its_hook_enforcement`: Live NATS test that
+  detached target activation discovers and enforces the target agent's hooks
+- `new_remote_session_fires_session_start_hook_exactly_once`: Exercises the
+  cold-worker startup boundary and proves the one-shot event is neither missed
+  nor duplicated
 
 **Code patterns:**
 - Always aggregate across Continue outcomes — never hardcode `..HookResult::default()` on returned outcome
 - Test the public entrypoint, not just internal helpers
-- Launch seams are worker-side (daemon, tool supervisor, session bind, handoff), not frontend (`use_agent`)
+- Launch seams are worker-side (daemon, tool supervisor, and ordinary target
+  session bind), not frontend (`use_agent`)
 
 **Code review checklist:**
 - [ ] Does `dispatch_pre_tool_use_with` accumulate `additional_context`/`system_message`?
-- [ ] Does handoff path call `reconcile_agent_hooks`?
+- [ ] Does a handoff leave source hooks untouched and activate the target
+      through the ordinary session-bind reconciliation path?
 - [ ] Are agent hooks started at session bind, not frontend agent switch?
 - [ ] Is `pending_async_context` allocated before NATS dispatch called?
 - [ ] Do multi-hook tests assert on aggregated context, not just mutation?

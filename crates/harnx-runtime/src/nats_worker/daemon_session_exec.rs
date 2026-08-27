@@ -3,7 +3,8 @@
 //! that aborts promptly on failover.
 
 use super::agent_loop::{
-    build_mid_turn_injection_callback, run_agent_loop_with_nats_inner, RunAgentLoopArgs,
+    build_mid_turn_injection_callback, run_agent_loop_with_nats_outcome, NatsAgentLoopOutcome,
+    RunAgentLoopArgs,
 };
 use super::backend::NatsSessionLogBackend;
 use super::daemon::{should_append_control_log_entry, SessionActivate};
@@ -51,6 +52,7 @@ impl WorkerRuntime {
         .await;
         let after_seq_observer = event_sink.after_seq_handle();
         let event_sink = Arc::new(event_sink);
+        let event_sink_for_loop = Arc::clone(&event_sink);
 
         // Build the backend for control-plane operations and state reconstruction.
         // Share the `after_seq` high-water mark for event-sink fan-out advisories;
@@ -107,7 +109,7 @@ impl WorkerRuntime {
                 let on_tool_round =
                     build_mid_turn_injection_callback(backend.clone(), Arc::clone(&turn_cursor));
 
-                run_agent_loop_with_nats_inner(
+                let loop_outcome = run_agent_loop_with_nats_outcome(
                     RunAgentLoopArgs {
                         cluster_key: &self.cluster,
                         manage_servers: self.manage_servers,
@@ -118,7 +120,8 @@ impl WorkerRuntime {
                         abort_signal: abort_signal.clone(),
                         call_fn: self.call_fn.clone(),
                         lease: None,
-                        lease_config: self.lease.clone(),
+                        activation_route: self.activation_route.clone(),
+                        event_sink: Some(Arc::clone(&event_sink_for_loop)),
                         after_seq_observer: None,
                         session_metadata: Some(&self.session_metadata),
                         on_tool_round: Some(on_tool_round),
@@ -154,6 +157,14 @@ impl WorkerRuntime {
                 );
 
                 if !lease.is_held() {
+                    break Ok(());
+                }
+
+                // A handoff is a terminal source-turn outcome. Its target prompt
+                // is already durable and activated, so reconstructing the source
+                // tool result as an in-flight round would dispatch it a second
+                // time. New source prompts will publish their own activation.
+                if loop_outcome == NatsAgentLoopOutcome::HandoffDispatched {
                     break Ok(());
                 }
 
@@ -202,7 +213,8 @@ impl WorkerRuntime {
         // Record the failure durably BEFORE releasing the lease: attached
         // clients treat an `Error` entry as a terminal boundary, and a client that
         // reconnects later still sees why the turn produced nothing.
-        if let Err(error) = &result {
+        let turn_error = result.as_ref().err().filter(|_| !abort_signal.aborted());
+        if let Some(error) = turn_error {
             Self::record_session_error(&backend, &lease, error).await;
         }
 

@@ -8,10 +8,11 @@ use crate::nats_event_sink::NatsEventSink;
 use crate::nats_hook_provider::{
     dispatch_hook_event, HookDispatchMeta, HookEventDispatch, NatsHookProvider,
 };
-use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
+use crate::nats_lease::NatsSessionLease;
 use crate::nats_metrics;
+use crate::nats_session::{NatsSession, NatsSessionConfig};
 use crate::nats_session_metadata::SessionMetadataStore;
-use crate::tool_context::discover_nats_hook_provider_cached;
+use crate::tool_context::discover_nats_hook_provider_fresh;
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result};
 use async_nats::jetstream;
@@ -33,7 +34,12 @@ pub struct RunAgentLoopArgs<'a> {
     pub abort_signal: AbortSignal,
     pub call_fn: Option<crate::agent_loop::AgentCallFn>,
     pub lease: Option<Arc<NatsSessionLease>>,
-    pub lease_config: NatsLeaseConfig,
+    /// Route used by this worker. Same-cluster handoffs reuse it so local
+    /// frontend-affine workers stay targeted while persistent workers remain
+    /// cluster-shared.
+    pub activation_route: super::SessionActivationRoute,
+    /// Source-session sink used for ordered handoff control-event delivery.
+    pub event_sink: Option<Arc<NatsEventSink>>,
     pub after_seq_observer: Option<Arc<AtomicU64>>,
     pub session_metadata: Option<&'a SessionMetadataStore>,
     pub on_tool_round: Option<OnToolRoundFn>,
@@ -165,12 +171,24 @@ pub async fn run_agent_loop_with_nats(args: RunAgentLoopArgs<'_>) -> Result<()> 
     run_agent_loop_with_nats_inner(args).await
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NatsAgentLoopOutcome {
+    Completed,
+    HandoffDispatched,
+}
+
 /// Like [`run_agent_loop_with_nats`], but fence-guarded by the holding lease
 /// (P2.2). When `lease` is `Some`, every worker-originated append is gated on
 /// `lease.is_held()` and stamped with the lease fence, and the session resume
 /// is aborted if the persisted log tail already carries a fence GREATER than
 /// the lease revision this worker holds (a newer worker has taken over).
 pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Result<()> {
+    run_agent_loop_with_nats_outcome(args).await.map(drop)
+}
+
+pub(crate) async fn run_agent_loop_with_nats_outcome(
+    args: RunAgentLoopArgs<'_>,
+) -> Result<NatsAgentLoopOutcome> {
     let RunAgentLoopArgs {
         cluster_key,
         manage_servers,
@@ -181,7 +199,8 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         abort_signal,
         call_fn,
         lease,
-        lease_config,
+        activation_route,
+        event_sink,
         after_seq_observer,
         session_metadata,
         on_tool_round,
@@ -227,20 +246,20 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
 
     // Run unified agent loop
     // Persistence goes through shared Config.save_message entry construction; append_event routes sink
-    run_agent_loop_segment(AgentLoopSegmentArgs {
-        manage_servers,
+    let result = run_agent_loop_segment(AgentLoopSegmentArgs {
+        source_session_id: session_id,
+        cluster_key,
         config,
         ctx,
         input: initial_input,
         abort_signal,
         jetstream_ctx,
-        lease,
-        lease_config,
-        session_metadata: session_metadata.cloned(),
-        hook_start_config,
-        hook_supervisor,
+        activation_route,
+        event_sink,
     })
-    .await
+    .await;
+    drop(hook_supervisor);
+    result
 }
 
 struct PrepareAgentSessionParams<'a> {
@@ -298,7 +317,7 @@ async fn build_agent_loop_context(
 ) -> crate::agent_loop::AgentLoopContext {
     let config_snapshot = params.config.read().clone();
     let nats_hook_provider =
-        discover_nats_hook_provider_cached(&config_snapshot, &params.instance_id).await;
+        discover_nats_hook_provider_fresh(&config_snapshot, &params.instance_id).await;
     crate::agent_loop::AgentLoopContext {
         config: params.config,
         instance_id: params.instance_id,
@@ -388,22 +407,16 @@ async fn dispatch_session_start(params: SessionStartDispatch<'_>) {
     .await;
 }
 
-struct AgentLoopSegmentArgs {
-    /// Carried through handoffs so a handoff target's hooks can be
-    /// re-resolved with the same manage-vs-discover gate the activation used
-    /// (see `prepare_nats_handoff`); a worker that discovers independently
-    /// deployed servers must not start local supervisors at handoff either.
-    manage_servers: bool,
+struct AgentLoopSegmentArgs<'a> {
+    source_session_id: &'a str,
+    cluster_key: &'a str,
     config: GlobalConfig,
     ctx: crate::agent_loop::AgentLoopContext,
     input: Input,
     abort_signal: AbortSignal,
     jetstream_ctx: jetstream::Context,
-    lease: Option<Arc<NatsSessionLease>>,
-    lease_config: NatsLeaseConfig,
-    session_metadata: Option<SessionMetadataStore>,
-    hook_start_config: Option<HookServerStartConfig>,
-    hook_supervisor: Option<HookServerSupervisor>,
+    activation_route: super::SessionActivationRoute,
+    event_sink: Option<Arc<NatsEventSink>>,
 }
 
 /// Resolve the active agent's hooks and hand them to [`agent_hook_start_config`].
@@ -463,149 +476,166 @@ async fn agent_hook_start_config(
     }
 }
 
-fn run_agent_loop_segment(
-    args: AgentLoopSegmentArgs,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
-    Box::pin(async move {
-        let AgentLoopSegmentArgs {
-            manage_servers,
-            config,
-            ctx,
-            input,
-            abort_signal,
-            jetstream_ctx,
-            lease,
-            lease_config,
-            session_metadata,
-            hook_start_config,
-            hook_supervisor,
-        } = args;
-        let loop_result = crate::agent_loop::run_agent_loop(&ctx, input).await?;
-        match loop_result {
-            crate::agent_loop::LoopResult::Completed => Ok(()),
-            crate::agent_loop::LoopResult::HandoffRequested {
-                agent,
-                session_id,
-                prompt,
-            } => {
-                let handoff_input = crate::config::input::from_str(&config, &prompt, None);
-                let handoff_args = AgentLoopSegmentArgs {
-                    manage_servers,
-                    config,
-                    ctx,
-                    input: handoff_input,
-                    abort_signal,
-                    jetstream_ctx,
-                    lease,
-                    lease_config,
-                    session_metadata,
-                    hook_start_config,
-                    hook_supervisor,
-                };
-                let (handoff_args, new_event_sink) =
-                    prepare_nats_handoff(handoff_args, agent, session_id).await?;
-                harnx_core::sink::with_agent_event_sink(new_event_sink, async move {
-                    run_agent_loop_segment(handoff_args).await
-                })
-                .await
+async fn run_agent_loop_segment(args: AgentLoopSegmentArgs<'_>) -> Result<NatsAgentLoopOutcome> {
+    let args_ref = &args;
+    let result = crate::agent_loop::run_agent_loop_with_before_end(
+        &args.ctx,
+        args.input.clone(),
+        |result| {
+            let handoff = match result {
+                crate::agent_loop::LoopResult::Completed => None,
+                crate::agent_loop::LoopResult::HandoffRequested {
+                    agent,
+                    session_id,
+                    prompt,
+                } => Some((agent.clone(), session_id.clone(), prompt.clone())),
+            };
+            async move {
+                if let Some((agent, session_id, prompt)) = handoff {
+                    dispatch_nats_handoff(args_ref, agent, session_id, prompt).await?;
+                }
+                Ok(())
             }
+        },
+    )
+    .await?;
+    Ok(match result {
+        crate::agent_loop::LoopResult::Completed => NatsAgentLoopOutcome::Completed,
+        crate::agent_loop::LoopResult::HandoffRequested { .. } => {
+            NatsAgentLoopOutcome::HandoffDispatched
         }
     })
 }
 
-async fn prepare_nats_handoff(
-    mut args: AgentLoopSegmentArgs,
+async fn dispatch_nats_handoff(
+    args: &AgentLoopSegmentArgs<'_>,
     agent: String,
     session_id: Option<String>,
-) -> Result<(AgentLoopSegmentArgs, Arc<NatsEventSink>)> {
-    let previous_lease = args
-        .lease
-        .as_ref()
-        .context("NATS handoff requires active session lease")?;
-    args.config.write().exit_agent()?;
-    crate::config::Config::use_agent(
-        &args.config,
-        &agent,
-        session_id.as_deref(),
+    prompt: String,
+) -> Result<()> {
+    let requested_session_id = session_id.filter(|session_id| !session_id.trim().is_empty());
+    let destination = resolve_handoff_destination(args, &agent).await?;
+
+    let target_session = NatsSession::new(
+        NatsSessionConfig {
+            cluster: destination.cluster,
+            initializer: crate::SessionInitializer::named(
+                destination.agent,
+                harnx_core::agent_config::AgentVariables::default(),
+            ),
+            session_id: requested_session_id,
+            activation_route: destination.activation_route,
+        },
+        destination.client,
+        destination.jetstream,
         args.abort_signal.clone(),
     )
-    .await?;
-    let new_session_id = args
-        .config
-        .read()
-        .session
-        .as_ref()
-        .and_then(|session| session.session_id.clone())
-        .context("NATS handoff did not establish new session")?;
-    let new_lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
-        jetstream: args.jetstream_ctx.clone(),
-        session_id: &new_session_id,
-        worker_id: previous_lease.worker_id().to_string(),
-        generation: previous_lease.generation(),
-        config: args.lease_config.clone(),
-        session_metadata: args.session_metadata.clone(),
-    })
-    .await?
-    .with_context(|| {
-        format!("Failed to acquire NATS lease for handed-off session '{new_session_id}'")
-    })?;
-    let new_lease = Arc::new(new_lease);
-    let new_event_sink = Arc::new(
-        NatsEventSink::new(
-            args.jetstream_ctx.client().clone(),
-            args.jetstream_ctx.clone(),
-            new_session_id.clone(),
-        )
-        .await,
+    .await
+    .with_context(|| format!("create handoff target session for '{agent}'"))?;
+    let enqueued = target_session
+        .enqueue(&prompt)
+        .await
+        .with_context(|| format!("queue handoff prompt for '{agent}'"))?;
+    log::debug!(
+        "handoff queued: source_session_id={} target_agent={} target_session_id={} user_seq={}",
+        args.source_session_id,
+        agent,
+        enqueued.session_id,
+        enqueued.user_msg_seq
     );
-    let new_after_seq_observer = new_event_sink.after_seq_handle();
-    let mut new_backend = NatsSessionLogBackend::new(args.jetstream_ctx.clone(), &new_session_id);
-    new_backend = new_backend.with_after_seq_observer(Arc::clone(&new_after_seq_observer));
-    let new_session = args
-        .config
-        .read()
-        .session
-        .clone()
-        .context("NATS handoff missing session after activation")?;
-    attach_session_to_config(AttachSessionParams {
-        config: &args.config,
-        session: new_session,
-        backend: &new_backend,
-        lease: Some(&new_lease),
-        metadata: args.session_metadata.as_ref(),
-    });
-    args.lease = Some(new_lease);
-    reconcile_handoff_target_hooks(&mut args, &new_session_id).await;
-    Ok((args, new_event_sink))
+
+    emit_handoff_committed(
+        args,
+        &agent,
+        destination.committed_agent,
+        enqueued.session_id,
+    )
+    .await
 }
 
-/// Re-resolve `hook_start_config` against the handoff target's hooks, then
-/// reconcile the supervisor against it.
-///
-/// `hook_start_config` was resolved once at activation, from the activation
-/// agent's own hooks (or lack of them). Reusing it unchanged here means a
-/// handoff to an agent WITH hooks that the activation agent lacked never
-/// starts them: `reconcile_hook_supervisor` just no-ops on a `None` start.
-/// `use_agent` (above, in `prepare_nats_handoff`) has already switched
-/// `args.config` to the target agent by the time this runs, so re-resolving
-/// against it reflects the target's hooks instead. `resolve_agent_hook_start_config`
-/// still returns `None` without ever touching the broker when the target has
-/// no hooks either, so a hookless handoff costs nothing extra.
-async fn reconcile_handoff_target_hooks(args: &mut AgentLoopSegmentArgs, new_session_id: &str) {
-    args.hook_start_config = resolve_agent_hook_start_config(
-        args.manage_servers,
-        &args.config,
-        &args.jetstream_ctx,
-        &args.ctx.instance_id,
-    )
-    .await;
-    reconcile_agent_hooks(
-        &mut args.hook_supervisor,
-        args.hook_start_config.as_ref(),
-        &args.config,
-        new_session_id,
-    )
-    .await;
+struct HandoffDestination {
+    agent: String,
+    cluster: String,
+    activation_route: super::SessionActivationRoute,
+    committed_agent: String,
+    client: async_nats::Client,
+    jetstream: jetstream::Context,
+}
+
+async fn resolve_handoff_destination(
+    args: &AgentLoopSegmentArgs<'_>,
+    agent: &str,
+) -> Result<HandoffDestination> {
+    use harnx_core::agent_ref::AgentRef;
+
+    match AgentRef::parse(agent) {
+        AgentRef::Local(target_agent) => {
+            let target_agent = target_agent.into_owned();
+            let committed_agent = match args.activation_route {
+                super::SessionActivationRoute::ClusterShared => {
+                    format!("{target_agent}@{}", args.cluster_key)
+                }
+                super::SessionActivationRoute::WorkerTargeted { .. } => target_agent.clone(),
+            };
+            Ok(HandoffDestination {
+                agent: target_agent,
+                cluster: args.cluster_key.to_string(),
+                activation_route: args.activation_route.clone(),
+                committed_agent,
+                client: args.jetstream_ctx.client().clone(),
+                jetstream: args.jetstream_ctx.clone(),
+            })
+        }
+        AgentRef::Remote {
+            agent: target_agent,
+            cluster,
+        } => {
+            let target_cluster = cluster.into_owned();
+            let config = args.config.read().clone();
+            let client = config
+                .nats_client(&target_cluster)
+                .await
+                .with_context(|| format!("connect to handoff target cluster '{target_cluster}'"))?;
+            Ok(HandoffDestination {
+                agent: target_agent.into_owned(),
+                cluster: target_cluster,
+                activation_route: super::SessionActivationRoute::ClusterShared,
+                committed_agent: agent.to_string(),
+                jetstream: jetstream::new(client.clone()),
+                client,
+            })
+        }
+    }
+}
+
+async fn emit_handoff_committed(
+    args: &AgentLoopSegmentArgs<'_>,
+    requested_agent: &str,
+    committed_agent: String,
+    session_id: String,
+) -> Result<()> {
+    use harnx_core::event::{AgentEvent, SessionEvent};
+
+    let event_sink = match &args.event_sink {
+        Some(event_sink) => Arc::clone(event_sink),
+        None => Arc::new(
+            NatsEventSink::new(
+                args.jetstream_ctx.client().clone(),
+                args.jetstream_ctx.clone(),
+                args.source_session_id,
+            )
+            .await,
+        ),
+    };
+    event_sink.emit_required(AgentEvent::Session(SessionEvent::HandoffCommitted {
+        agent: committed_agent,
+        session_id: session_id.clone(),
+    }));
+    event_sink.flush().await.with_context(|| {
+        format!(
+            "handoff target '{requested_agent}' session '{session_id}' was activated, but confirmation delivery failed; open that session manually"
+        )
+    })
 }
 
 fn agent_resolved_hooks(config: &GlobalConfig) -> harnx_core::hooks::HooksConfig {

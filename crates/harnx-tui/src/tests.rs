@@ -20,6 +20,7 @@ use tokio::sync::Notify;
 mod command_completion;
 mod delegation_tests;
 mod shared_session_event_tests;
+mod subagent_session_tests;
 mod turn_activity_tests;
 
 fn yaml_to_json(yaml: &str) -> serde_json::Value {

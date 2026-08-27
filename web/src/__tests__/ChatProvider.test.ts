@@ -2,6 +2,10 @@ import { describe, it, expect, vi } from 'vitest';
 import { attachmentToMessageParts, toAgUiMessages } from '../ChatProvider';
 import type { Message } from '@ag-ui/client';
 
+async function dispatchAgentEvent(subscriber: any, event: any) {
+  await subscriber.onEvent({ event });
+}
+
 describe('attachmentToMessageParts', () => {
   it('should return image part', () => {
     const attachment = {
@@ -247,6 +251,29 @@ describe('toAgUiMessages', () => {
       });
       expect(onUsage).toHaveBeenCalledWith({ input: 1, output: 2 });
     });
+
+    it('should ignore malformed custom event payloads', async () => {
+      const onUsage = vi.fn();
+      const onToolSummary = vi.fn();
+      const { handleHarnxCustomEvent } = await import('../harnxCustomEvents');
+      const callbacks = {
+        onStatus: vi.fn(),
+        onRunFailed: vi.fn(),
+        onUsage,
+        onToolSummary,
+        isRunActive: true
+      };
+
+      handleHarnxCustomEvent('usage', { input: 'not-a-number', output: 2 }, callbacks);
+      handleHarnxCustomEvent(
+        'tool_summary',
+        { tool_call_id: 'call_2', markdown: 42 },
+        callbacks
+      );
+
+      expect(onUsage).not.toHaveBeenCalled();
+      expect(onToolSummary).not.toHaveBeenCalled();
+    });
     
     it('should route session_handoff custom event only if run is active', async () => {
       const onStatus = vi.fn();
@@ -274,60 +301,58 @@ describe('toAgUiMessages', () => {
       await agent.runAgent({});
 
       // Simulate onEvent CUSTOM session_handoff without RUN_STARTED
-      await subscriber.onEvent({
-        event: {
-          type: 'CUSTOM',
-          name: 'session_handoff',
-          value: { agent: 'targetAgent', session_id: '1234' }
-        }
+      await dispatchAgentEvent(subscriber, {
+        type: 'CUSTOM',
+        name: 'session_handoff',
+        value: { agent: 'targetAgent', session_id: '1234' }
       });
       expect(onHandoff).not.toHaveBeenCalled();
 
       // Simulate RUN_STARTED to set isRunActive true
-      await subscriber.onEvent({
-        event: {
-          type: 'RUN_STARTED',
-        }
-      });
+      await dispatchAgentEvent(subscriber, { type: 'RUN_STARTED' });
 
       // Now session_handoff should trigger the callback
-      await subscriber.onEvent({
-        event: {
-          type: 'CUSTOM',
-          name: 'session_handoff',
-          value: { agent: 'targetAgent', session_id: '1234' }
-        }
+      await dispatchAgentEvent(subscriber, {
+        type: 'CUSTOM',
+        name: 'session_handoff',
+        value: { agent: 'targetAgent', session_id: '1234' }
       });
       expect(onHandoff).toHaveBeenCalledWith('targetAgent', '1234');
 
       onHandoff.mockClear();
 
-      // Test session_handoff with null session_id
-      await subscriber.onEvent({
-        event: {
-          type: 'CUSTOM',
-          name: 'session_handoff',
-          value: { agent: 'targetAgent', session_id: null }
-        }
+      // Uncommitted/invalid payloads must never navigate.
+      await dispatchAgentEvent(subscriber, {
+        type: 'CUSTOM',
+        name: 'session_handoff',
+        value: { agent: 'targetAgent', session_id: null }
       });
-      expect(onHandoff).toHaveBeenCalledWith('targetAgent', null);
+      expect(onHandoff).not.toHaveBeenCalled();
+
+      await dispatchAgentEvent(subscriber, {
+        type: 'CUSTOM',
+        name: 'session_handoff',
+        value: { agent: 'targetAgent', session_id: '   ' }
+      });
+      expect(onHandoff).not.toHaveBeenCalled();
+
+      await dispatchAgentEvent(subscriber, {
+        type: 'CUSTOM',
+        name: 'turn_handoff_requested',
+        value: { agent: 'targetAgent', session_id: 'request-only' }
+      });
+      expect(onHandoff).not.toHaveBeenCalled();
 
       onHandoff.mockClear();
 
       // Simulate RUN_FINISHED to set isRunActive false
-      await subscriber.onEvent({
-        event: {
-          type: 'RUN_FINISHED',
-        }
-      });
+      await dispatchAgentEvent(subscriber, { type: 'RUN_FINISHED' });
 
       // session_handoff should not trigger callback again
-      await subscriber.onEvent({
-        event: {
-          type: 'CUSTOM',
-          name: 'session_handoff',
-          value: { agent: 'targetAgent', session_id: '1234' }
-        }
+      await dispatchAgentEvent(subscriber, {
+        type: 'CUSTOM',
+        name: 'session_handoff',
+        value: { agent: 'targetAgent', session_id: '1234' }
       });
       expect(onHandoff).not.toHaveBeenCalled();
     });

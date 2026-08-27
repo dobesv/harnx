@@ -241,7 +241,7 @@ pub async fn run_worker_daemon(
         config,
         instance_id,
         _background_services: services.background,
-        tools_attempted: services.tools_attempted,
+        background_services_attempted: services.background_services_attempted,
         server_reconciler: services.server_reconciler,
         cluster: daemon.connection_key().to_string(),
         activation_route: daemon.activation_route(),

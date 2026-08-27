@@ -36,7 +36,7 @@ mod transcript_render_tests;
 /// dir guard. Using a free port + per-run store dir avoids cross-run state
 /// bleed (JetStream KV/lease buckets) and port collisions that make tests flaky
 /// when run repeatedly or in parallel. Returns `None` if nats-server is absent.
-pub(super) async fn spawn_test_nats() -> Option<(String, std::process::Child, tempfile::TempDir)> {
+pub(crate) async fn spawn_test_nats() -> Option<(String, std::process::Child, tempfile::TempDir)> {
     if which::which("nats-server").is_err() {
         eprintln!("skipping: nats-server not available");
         return None;
@@ -363,7 +363,7 @@ pub(super) async fn run_remote_round_trip_with_session_id_and_sink(
     sink: Arc<dyn AgentEventSink>,
     cluster: &str,
 ) -> anyhow::Result<()> {
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    subagent_discovery_tests::wait_for_cluster_worker(&parent_config, cluster).await?;
 
     let mut parent_config = parent_config;
     let parent_session =
@@ -400,6 +400,7 @@ pub(super) async fn run_remote_round_trip_with_session_id_and_sink(
     );
     Ok(())
 }
+
 #[test]
 fn metrics_snapshot_tracks_counters() {
     crate::nats_metrics::reset_for_test();
@@ -1782,12 +1783,12 @@ async fn remote_session_renew_updates_activity_without_clobbering_metadata() {
         }
     );
 
-    daemon.abort();
-    let _ = daemon.await;
     round_trip
         .await
         .expect("round trip task join")
         .expect("remote round trip must succeed");
+    daemon.abort();
+    let _ = daemon.await;
     let _ = child.kill();
     let _ = child.wait();
 }

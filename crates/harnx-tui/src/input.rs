@@ -136,7 +136,7 @@ pub(crate) async fn render_attachment_preview(path: &Path) -> Option<String> {
 /// event's `markdown` and `input`. A non-empty rendered template `markdown`
 /// becomes `ToolCallBody::Markdown`; otherwise the raw input is YAML-
 /// formatted (or omitted entirely when input is `null`).
-fn tool_call_body(
+pub(super) fn tool_call_body(
     markdown: Option<&str>,
     input: &serde_json::Value,
 ) -> Option<crate::types::ToolCallBody> {
@@ -157,7 +157,7 @@ fn tool_call_body(
 /// `result_template`, and plain text alike. Strips ANSI escapes from
 /// string outputs before extraction so pre-dimmed test inputs render
 /// cleanly.
-fn tool_completed_to_transcript_items(
+pub(super) fn tool_completed_to_transcript_items(
     output: &serde_json::Value,
     markdown: Option<&str>,
 ) -> Vec<TranscriptItem> {
@@ -177,95 +177,6 @@ fn tool_completed_to_transcript_items(
 }
 
 impl Tui {
-    fn open_detail_view_for_focused_item(&mut self) {
-        self.app.detail_view_scroll = {
-            let mut s = ratatui_widget_scrolling::ScrollState::new();
-            s.follow = false;
-            s
-        };
-        let focused_item = self
-            .app
-            .transcript_focus
-            .and_then(|focus| self.app.transcript.get(focus));
-        match focused_item {
-            Some(TranscriptItem::CompactionMarker { detail_text, .. }) => {
-                // The detail view always renders detail_text for a compaction
-                // marker (see render_detail_view), so a raw-YAML lookup here
-                // would be computed but never displayed. Skip it.
-                self.app.detail_view_text = Some(detail_text.clone());
-                self.app.detail_view_title = Some("Compacted session".to_string());
-                self.app.detail_view_raw_yaml = None;
-            }
-            _ => {
-                self.app.detail_view_text = None;
-                self.app.detail_view_title = None;
-                self.app.detail_view_raw_yaml = None;
-            }
-        }
-        self.app.detail_view_open = true;
-    }
-
-    async fn handle_detail_view_key(&mut self, key: KeyEvent) -> Result<()> {
-        match (key.code, key.modifiers) {
-            (KeyCode::Esc, KeyModifiers::NONE) => {
-                self.app.detail_view_open = false;
-                // Return to browsing view (transcript_browsing stays true)
-            }
-            (KeyCode::Up, KeyModifiers::NONE) => {
-                self.app.detail_view_scroll.scroll_up();
-            }
-            (KeyCode::Down, KeyModifiers::NONE) => {
-                self.app.detail_view_scroll.scroll_down();
-            }
-            (KeyCode::PageUp, KeyModifiers::NONE) => {
-                for _ in 0..10 {
-                    self.app.detail_view_scroll.scroll_up();
-                }
-            }
-            (KeyCode::PageDown, KeyModifiers::NONE) => {
-                for _ in 0..10 {
-                    self.app.detail_view_scroll.scroll_down();
-                }
-            }
-            (KeyCode::Char('e'), KeyModifiers::NONE) => {
-                // Edit: close detail, run edit, then reopen detail with updated content.
-                // Save focus and browsing state before editing since handle_transcript_edit
-                // clears both.
-                let had_focus = self.app.transcript_focus;
-                let prior_browsing = self.app.transcript_browsing;
-                self.app.detail_view_open = false;
-                self.handle_transcript_edit().await?;
-                // After edit, if we had a valid focused item, try to reopen detail view.
-                // Note: transcript may have changed, so restore focus tentatively.
-                if let Some(focus_idx) = had_focus {
-                    // Check that the focus index still exists in the (possibly reloaded) transcript
-                    if focus_idx < self.app.transcript.len() {
-                        self.app.transcript_focus = Some(focus_idx);
-                        self.app.transcript_selection_anchor = None;
-                        self.app.transcript_browsing = prior_browsing;
-                        self.open_detail_view_for_focused_item();
-                    }
-                }
-            }
-            (KeyCode::Delete, KeyModifiers::NONE) | (KeyCode::Char('d'), KeyModifiers::NONE) => {
-                // Delete: show confirm modal ON TOP of detail view (do NOT close detail_view_open)
-                self.handle_transcript_delete();
-            }
-            (KeyCode::Char('r'), KeyModifiers::NONE) => {
-                // Rewind: show confirm modal ON TOP of detail view
-                self.handle_transcript_rewind();
-            }
-            (KeyCode::Char('c'), KeyModifiers::NONE) => {
-                self.handle_transcript_copy();
-                // Show clipboard notice for 2 seconds
-                self.app.copy_notice_until =
-                    Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
-            }
-            _ => {} // all other keys silently consumed
-        }
-        Ok(())
-    }
-
     async fn handle_browsing_key(&mut self, key: KeyEvent) -> Result<()> {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, KeyModifiers::NONE) => {
@@ -281,8 +192,7 @@ impl Tui {
                 self.handle_down_key(key);
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
-                // Open detail view for current focused item
-                self.open_detail_view_for_focused_item();
+                self.open_focused_root_item();
             }
             (KeyCode::Char('e'), KeyModifiers::NONE) => {
                 self.handle_transcript_edit().await?;
@@ -305,16 +215,8 @@ impl Tui {
     }
 
     pub(super) async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
-        // If a modal is open, intercept all keys and route to modal handler
-        if self.app.modal.is_some() {
-            return self.handle_modal_key(key).await;
-        }
-
-        // While the detail view is open, handle navigation + mutation keys.
-        // All other keys are silently consumed so they cannot bleed into the
-        // hidden background input field or trigger background actions.
-        if self.app.detail_view_open {
-            return self.handle_detail_view_key(key).await;
+        if let Some(result) = self.handle_exclusive_view_key(key).await {
+            return result;
         }
 
         // Browsing mode guard: when user is navigating history fullscreen
@@ -456,7 +358,7 @@ impl Tui {
                 self.handle_transcript_rewind();
             }
             (KeyCode::Enter, KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
-                self.open_detail_view_for_focused_item();
+                self.open_focused_root_item();
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 if self.try_handle_attach_command().await {
@@ -586,6 +488,20 @@ impl Tui {
         Ok(())
     }
 
+    async fn handle_exclusive_view_key(&mut self, key: KeyEvent) -> Option<Result<()>> {
+        if self.app.modal.is_some() {
+            return Some(self.handle_modal_key(key).await);
+        }
+        if self.app.detail_view_open {
+            Some(self.handle_detail_view_key(key).await)
+        } else if !self.app.subagent_view_stack.is_empty() {
+            self.handle_subagent_view_key(key);
+            Some(Ok(()))
+        } else {
+            None
+        }
+    }
+
     /// Ensure the attachment temp directory exists, creating it via mkdtemp if needed.
     async fn ensure_attachment_dir(&mut self) -> std::io::Result<std::path::PathBuf> {
         if let Some(ref dir) = self.app.attachment_dir {
@@ -700,7 +616,10 @@ impl Tui {
     pub(super) async fn handle_paste(&mut self, text: String) {
         // Ignore paste while the detail view or browsing view is open — same isolation
         // policy as handle_key: these overlays hide the input field.
-        if self.app.detail_view_open || self.app.transcript_browsing {
+        let overlay_depth = usize::from(self.app.detail_view_open)
+            + usize::from(self.app.transcript_browsing)
+            + self.app.subagent_view_stack.len();
+        if overlay_depth > 0 {
             return;
         }
         if let Some(pending) = self.app.pending_message.take() {
@@ -755,42 +674,26 @@ impl Tui {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
-        match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                if self.app.detail_view_open {
-                    for _ in 0..3 {
-                        self.app.detail_view_scroll.scroll_up();
-                    }
-                    return;
-                }
-                if self.app.transcript_browsing {
-                    for _ in 0..3 {
-                        self.app.browsing_view_scroll.scroll_up();
-                    }
-                    return;
-                }
-                for _ in 0..3 {
-                    self.app.scroll_state.scroll_up();
-                }
+        let up = match mouse.kind {
+            MouseEventKind::ScrollUp => true,
+            MouseEventKind::ScrollDown => false,
+            _ => return,
+        };
+        let state = if self.app.detail_view_open {
+            &mut self.app.detail_view_scroll
+        } else if self.scroll_open_subagent(up) {
+            return;
+        } else if self.app.transcript_browsing {
+            &mut self.app.browsing_view_scroll
+        } else {
+            &mut self.app.scroll_state
+        };
+        for _ in 0..3 {
+            if up {
+                state.scroll_up();
+            } else {
+                state.scroll_down();
             }
-            MouseEventKind::ScrollDown => {
-                if self.app.detail_view_open {
-                    for _ in 0..3 {
-                        self.app.detail_view_scroll.scroll_down();
-                    }
-                    return;
-                }
-                if self.app.transcript_browsing {
-                    for _ in 0..3 {
-                        self.app.browsing_view_scroll.scroll_down();
-                    }
-                    return;
-                }
-                for _ in 0..3 {
-                    self.app.scroll_state.scroll_down();
-                }
-            }
-            _ => {}
         }
     }
 
@@ -821,6 +724,16 @@ impl Tui {
             } => {
                 self.handle_shared_session_agent_event(session_id, cluster, event)
                     .await;
+            }
+            TuiEvent::SubAgentSessionSnapshot {
+                key,
+                transcript,
+                status,
+            } => {
+                self.handle_subagent_snapshot(key, transcript, status);
+            }
+            TuiEvent::SubAgentSessionEvent { key, event } => {
+                self.handle_subagent_session_event(key, event);
             }
             TuiEvent::ToolRoundComplete => {
                 // Intermediate tool round — prompt loop continues, don't clear llm_busy.
@@ -969,25 +882,6 @@ impl Tui {
         self.flush_pending_thought();
     }
 
-    #[cfg(not(test))]
-    async fn mirror_worker_handoff(&self, event: &AgentEvent) {
-        let AgentEvent::Turn(harnx_core::event::TurnEvent::HandoffRequested { agent, session_id }) =
-            event
-        else {
-            return;
-        };
-        if let Err(error) = harnx_runtime::config::Config::use_agent(
-            &self.config,
-            agent,
-            session_id.as_deref(),
-            harnx_runtime::utils::create_abort_signal(),
-        )
-        .await
-        {
-            log::warn!("failed to mirror worker handoff in TUI state: {error:#}");
-        }
-    }
-
     pub(super) async fn render_agent_event(&mut self, event: AgentEvent) {
         use harnx_core::event::{ModelEvent, NoticeEvent, SessionEvent, ToolEvent, UserEvent};
 
@@ -995,15 +889,13 @@ impl Tui {
             AgentEvent::SubAgent { source, event } => (Some(source), *event, true),
             event => (None, event, false),
         };
-        if self.handle_turn_activity(&event, is_sub_agent).await {
+        if self.handle_session_event(&event, is_sub_agent).await {
             return;
         }
         let is_thought = matches!(&event, AgentEvent::Model(ModelEvent::ThoughtChunk { .. }));
         let is_usage = matches!(&event, AgentEvent::Model(ModelEvent::Usage { .. }));
         // No streaming-run bookkeeping is needed here: any event that renders a
         // visible transcript item (tool call, tool result, notice, plan, …)
-        #[cfg(not(test))]
-        self.mirror_worker_handoff(&event).await;
         // becomes the trailing item, which ends the open streaming run on its
         // own — the next MessageChunk sees a non-AssistantText tail and starts
         // a fresh block. See `append_streaming_assistant_chunk`.
@@ -1129,11 +1021,7 @@ impl Tui {
                 vec![]
             }
             AgentEvent::Model(ModelEvent::ThoughtChunk { blocks }) => {
-                let text = concat_text_blocks(&blocks);
-                let clean = strip_ansi(&text)
-                    .trim_start_matches("<think>")
-                    .trim_end_matches("</think>")
-                    .to_string();
+                let clean = clean_thought_chunk(&concat_text_blocks(&blocks));
                 // Only skip genuinely empty chunks (e.g. a chunk that was just a
                 // `<think>` tag). Whitespace-only chunks (a lone "\n" between
                 // streamed thought lines) must be preserved so the accumulated
@@ -1231,6 +1119,7 @@ impl Tui {
             }
             AgentEvent::Session(SessionEvent::CompactingCompleted) => {
                 self.app.transcript = session_history_transcript_items(&self.config).await;
+                self.subagent_rows_dirty = true;
                 self.app.streaming_open = false;
                 // A compaction can land mid-turn after some assistant text has
                 // already streamed. The rebuild drops that streamed row, so the
@@ -2122,6 +2011,7 @@ impl Tui {
         // the rebuilt transcript is shorter than the previous one.
         self.app.scroll_state = ratatui_widget_scrolling::ScrollState::new();
         self.app.transcript = Self::build_initial_transcript(&self.config).await;
+        self.subagent_rows_dirty = true;
         self.pin_transcript_to_bottom();
     }
 
@@ -2228,8 +2118,8 @@ impl Tui {
             s
         };
         self.app.detail_view_text = Some(text);
+        self.app.detail_view_entry = None;
         self.app.detail_view_title = Some(title.to_string());
-        self.app.detail_view_raw_yaml = None;
         self.app.detail_view_open = true;
     }
 
@@ -2331,7 +2221,7 @@ impl Tui {
 /// Concatenate `ContentBlock::Text(..)` fragments into a single String.
 /// Non-Text blocks (Image, ResourceLink, Opaque) are skipped — the TUI
 /// transcript currently only renders text.
-fn concat_text_blocks(blocks: &[harnx_core::event::ContentBlock]) -> String {
+pub(super) fn concat_text_blocks(blocks: &[harnx_core::event::ContentBlock]) -> String {
     use harnx_core::event::ContentBlock;
     let mut out = String::new();
     for block in blocks {
@@ -2340,6 +2230,16 @@ fn concat_text_blocks(blocks: &[harnx_core::event::ContentBlock]) -> String {
         }
     }
     out
+}
+
+/// Normalize a streamed thought fragment before adding it to a transcript.
+/// Keep whitespace-only fragments because they preserve line breaks between
+/// adjacent streamed chunks.
+pub(super) fn clean_thought_chunk(text: &str) -> String {
+    strip_ansi(text)
+        .trim_start_matches("<think>")
+        .trim_end_matches("</think>")
+        .to_string()
 }
 
 /// Reproduce the textual representation of `CompletionTokenUsage` that the
@@ -2684,7 +2584,6 @@ impl Tui {
                     };
                     self.run_command(&cmd).await?;
                     self.app.detail_view_open = false;
-                    self.app.detail_view_raw_yaml = None;
                     self.app.detail_view_text = None;
                     self.app.detail_view_title = None;
                     self.app.transcript_browsing = false;
@@ -2710,7 +2609,6 @@ impl Tui {
                         }
                     }
                     self.app.detail_view_open = false;
-                    self.app.detail_view_raw_yaml = None;
                     self.app.detail_view_text = None;
                     self.app.detail_view_title = None;
                     self.app.transcript_browsing = false;
@@ -2776,7 +2674,7 @@ impl Tui {
     }
 
     /// Handle 'e' key: open edit command for selected item(s).
-    async fn handle_transcript_edit(&mut self) -> Result<()> {
+    pub(super) async fn handle_transcript_edit(&mut self) -> Result<()> {
         let Some((from, to)) = self.selected_seq_range() else {
             return Ok(());
         };
@@ -2794,7 +2692,7 @@ impl Tui {
     }
 
     /// Handle 'd' or Delete key: open delete confirmation modal.
-    fn handle_transcript_delete(&mut self) {
+    pub(super) fn handle_transcript_delete(&mut self) {
         let Some((from, to)) = self.selected_seq_range() else {
             return;
         };
@@ -2821,7 +2719,7 @@ impl Tui {
     }
 
     /// Handle 'c' key: copy item text to clipboard.
-    fn handle_transcript_copy(&mut self) {
+    pub(super) fn handle_transcript_copy(&mut self) {
         if let Some(text) = self
             .app
             .transcript_focus
@@ -2836,7 +2734,7 @@ impl Tui {
     ///
     /// Always rewinds to the *earliest* selected item regardless of selection
     /// direction, so Shift+selecting up vs down yields the same target.
-    fn handle_transcript_rewind(&mut self) {
+    pub(super) fn handle_transcript_rewind(&mut self) {
         let focus = self
             .app
             .transcript_focus

@@ -1,4 +1,5 @@
 use crate::markdown_render::{MarkdownBlockData, RenderedEntry};
+use crate::subagent_render::{render_subagent_detail, render_subagent_row};
 use crate::types::Tui;
 use crate::types::{
     App, ModalState, ToolCallBody, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT,
@@ -12,6 +13,21 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use syntect::highlighting::Theme;
+
+fn dim_style(color: Color) -> Style {
+    Style::default().fg(color).add_modifier(Modifier::DIM)
+}
+
+fn plan_detail_lines(plan: &[harnx_core::event::PlanEntry], label: Style) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled("── plan ──", label))];
+    lines.extend(plan.iter().enumerate().map(|(index, entry)| {
+        Line::from(vec![
+            Span::styled(format!("entry[{index}]: "), label),
+            Span::raw(format!("{} [{}]", entry.content, entry.status)),
+        ])
+    }));
+    lines
+}
 
 /// Options for `render_list_modal` — bundles the three metadata strings so the
 /// function stays within clippy's `too_many_arguments` limit.
@@ -151,9 +167,7 @@ impl Tui {
                 let lines = Self::render_text_entry(
                     "",
                     &crate::render_helpers::source_heading(source),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
+                    dim_style(Color::DarkGray),
                     false,
                 );
                 RenderedEntry::from_lines(lines, width)
@@ -173,34 +187,18 @@ impl Tui {
                     lines.extend(Self::render_text_entry(
                         "",
                         summary_text,
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM),
+                        dim_style(Color::DarkGray),
                         false,
                     ));
                 }
                 RenderedEntry::from_lines(lines, width)
             }
             TranscriptItem::SystemText(text) => {
-                let lines = Self::render_text_entry(
-                    "",
-                    text,
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                    false,
-                );
+                let lines = Self::render_text_entry("", text, dim_style(Color::DarkGray), false);
                 RenderedEntry::from_lines(lines, width)
             }
             TranscriptItem::MutationNotice(text) => {
-                let lines = Self::render_text_entry(
-                    "",
-                    text,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::DIM),
-                    false,
-                );
+                let lines = Self::render_text_entry("", text, dim_style(Color::Yellow), false);
                 RenderedEntry::from_lines(lines, width)
             }
             TranscriptItem::UserText {
@@ -395,6 +393,9 @@ impl Tui {
                     *rendered_cache = Some((width, show_seq, show_ts, use_utc, entry.clone()));
                 }
                 entry
+            }
+            TranscriptItem::SubAgentSession { key, status } => {
+                render_subagent_row(key, status, width)
             }
             TranscriptItem::AttachmentHeader(text) => {
                 let lines = Self::render_text_entry(
@@ -612,18 +613,7 @@ impl Tui {
             frame.render_widget(popup, popup_area);
         }
 
-        // Render detail view if open (exclusive — returns early)
-        if self.app.detail_view_open {
-            self.render_detail_view(frame, size);
-            // Render modal ON TOP of detail view if active (e.g. delete/rewind confirm)
-            if let Some(modal) = &self.app.modal.clone() {
-                self.render_modal(frame, size, modal);
-            }
-            return;
-        }
-
-        if self.app.transcript_browsing {
-            self.render_browsing_view(frame, size);
+        if self.render_exclusive_transcript(frame, size) {
             if let Some(modal) = &self.app.modal.clone() {
                 self.render_modal(frame, size, modal);
             }
@@ -705,6 +695,7 @@ impl Tui {
     #[cfg(test)]
     pub(crate) fn clear_transcript(&mut self) {
         self.app.transcript.clear();
+        self.subagent_rows_dirty = true;
         self.app.scroll_state = ratatui_widget_scrolling::ScrollState::new();
         self.app.streaming_open = false;
         self.app.main_streamed_text_idx = None;
@@ -1205,15 +1196,7 @@ impl Tui {
                 lines.push(Line::from(Span::styled("── usage ──", label_style)));
                 push_field!("usage", text);
             }
-            TranscriptItem::Plan(plan) => {
-                lines.push(Line::from(Span::styled("── plan ──", label_style)));
-                for (i, p) in plan.iter().enumerate() {
-                    push_field!(
-                        &format!("entry[{}]", i),
-                        &format!("{} [{}]", p.content, p.status)
-                    );
-                }
-            }
+            TranscriptItem::Plan(plan) => lines.extend(plan_detail_lines(plan, label_style)),
             TranscriptItem::AttachmentHeader(text) => {
                 lines.push(Line::from(Span::styled("── attachment ──", label_style)));
                 push_field!("text", text);
@@ -1236,6 +1219,9 @@ impl Tui {
                 lines.push(Line::from(Span::styled("── notice ──", label_style)));
                 push_field!("text", text);
             }
+            TranscriptItem::SubAgentSession { key, status } => {
+                lines.extend(render_subagent_detail(key, status));
+            }
         }
         lines
     }
@@ -1254,84 +1240,9 @@ impl Tui {
             .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(size);
 
-        // Build display content.
-        //
-        // Primary: raw session-log YAML (same text .edit message would open in
-        // the editor) — one Vec<Line> per YAML document, separated by a "---"
-        // divider line.
-        //
-        // Fallback: render_entry_detail() for items that have no seq number or
-        // when no session is active.
-        let (entries_as_vec, title): (Vec<Vec<Line<'static>>>, String) =
-            if let Some(text) = &self.app.detail_view_text {
-                let entries = vec![text
-                    .lines()
-                    .map(|line| Line::from(Span::raw(line.to_string())))
-                    .collect()];
-                // Use the overlay's own title (e.g. "Agent Info", "Session Info",
-                // "Compacted session"); fall back to a generic label if unset.
-                let title = self
-                    .app
-                    .detail_view_title
-                    .clone()
-                    .unwrap_or_else(|| "Detail".to_string());
-                (entries, title)
-            } else if let Some(yaml) = &self.app.detail_view_raw_yaml {
-                // Split on the same separator edit_message_range joins with.
-                let docs: Vec<&str> = yaml.split("\n---\n").collect();
-                let doc_count = docs.len();
-                let mut entries: Vec<Vec<Line<'static>>> = Vec::new();
-                for (i, doc) in docs.into_iter().enumerate() {
-                    let doc_lines: Vec<Line<'static>> = doc
-                        .lines()
-                        .map(|l| Line::from(Span::raw(l.to_string())))
-                        .collect();
-                    entries.push(doc_lines);
-                    if i + 1 < doc_count {
-                        // Visual separator between documents
-                        entries.push(vec![Line::from(Span::styled(
-                            "---",
-                            Style::default().fg(Color::DarkGray),
-                        ))]);
-                    }
-                }
-                let title = if doc_count == 1 {
-                    "Detail".to_string()
-                } else {
-                    format!("Detail ({doc_count} entries)")
-                };
-                (entries, title)
-            } else {
-                // Fallback: no session / no seq — render TUI fields verbatim
-                let (from, to) = self.app.selected_transcript_range();
-                let mut entries = Vec::new();
-                for i in from..=to {
-                    if i < self.app.transcript.len() {
-                        let entry = &self.app.transcript[i];
-                        entries.push(Self::render_entry_detail(entry));
-                        // When the selected range is a single ToolCall with no
-                        // adjacent result in the range, peek at the next item so
-                        // the fallback view includes the paired result.
-                        if matches!(entry, TranscriptItem::ToolCall { .. }) && i + 1 > to {
-                            if let Some(next) = self.app.transcript.get(i + 1) {
-                                if matches!(next, TranscriptItem::ToolResultMarkdown { .. }) {
-                                    entries.push(vec![Line::from("")]);
-                                    entries.push(Self::render_entry_detail(next));
-                                }
-                            }
-                        }
-                        if i < to {
-                            entries.push(vec![Line::from("")]);
-                        }
-                    }
-                }
-                let title = if from == to {
-                    "Detail".to_string()
-                } else {
-                    format!("Detail ({from}–{to})")
-                };
-                (entries, title)
-            };
+        // Build display content for the selected root or child transcript item,
+        // or for a textual information overlay.
+        let (entries_as_vec, title) = crate::detail_view::detail_view_content(&self.app);
 
         // Create block with horizontal (top + bottom) borders and a title.
         //
@@ -1368,16 +1279,7 @@ impl Tui {
             .min(self.app.detail_view_scroll.last_max_position);
 
         // Render footer
-        let footer_text = if self
-            .app
-            .copy_notice_until
-            .map(|t| std::time::Instant::now() < t)
-            .unwrap_or(false)
-        {
-            " ✓ Copied to clipboard".to_string()
-        } else {
-            " ↑↓/scroll  e/edit  d/delete  r/rewind  c/copy  ESC/back".to_string()
-        };
+        let footer_text = crate::detail_view::detail_view_footer_text(&self.app);
         let footer = Paragraph::new(footer_text).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(footer, chunks[1]);
     }
@@ -1438,33 +1340,7 @@ impl Tui {
                 );
                 if let Some(range) = selected_range {
                     if range.contains(&i) {
-                        for block in &mut rendered.blocks {
-                            match block {
-                                MarkdownBlockData::Paragraph { lines, .. } => {
-                                    for line in lines.iter_mut() {
-                                        line.style = line.style.add_modifier(Modifier::REVERSED);
-                                        for span in line.spans.iter_mut() {
-                                            span.style =
-                                                span.style.add_modifier(Modifier::REVERSED);
-                                        }
-                                    }
-                                }
-                                MarkdownBlockData::Table { rows, header, .. } => {
-                                    let rev = ratatui::style::Style::default()
-                                        .add_modifier(Modifier::REVERSED);
-                                    if let Some(hdr) = header.as_mut() {
-                                        for cell in hdr.iter_mut() {
-                                            *cell = cell.clone().style(rev);
-                                        }
-                                    }
-                                    for row in rows.iter_mut() {
-                                        for cell in row.iter_mut() {
-                                            *cell = cell.clone().style(rev);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        rendered.reverse_style();
                     }
                 }
                 rendered

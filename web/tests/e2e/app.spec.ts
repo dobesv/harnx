@@ -44,6 +44,23 @@ test('happy path: picker flow to chat with slash-named agent', async ({ page }) 
   await expect(page).toHaveScreenshot('happy-path.png');
 });
 
+test('committed handoff navigates and hydrates the durable target session', async ({ page }) => {
+  await page.goto('/agents/coding%2Fcoder/sessions/session-1?scenario=happy');
+  await expect(page.locator('.aui-assistant-message')).toContainText('Hello from mock session');
+
+  await page.locator('.aui-composer-input').fill('handoff now');
+  await page.locator('.aui-composer-send').click();
+
+  await expect(page).toHaveURL(/\/agents\/assistant\/sessions\/handoff-target/);
+  await expect(page.locator('.aui-user-message')).toContainText(
+    'Delegated work from coding/coder',
+  );
+  await expect(page.locator('.aui-assistant-message')).toContainText(
+    'Durable handoff target history',
+  );
+  await expect(page.locator('.aui-composer-send')).toHaveText('Send');
+});
+
 test('composer: no scrollbar until max-height, resets after send', async ({ page }) => {
   await page.goto('/?scenario=happy');
   await page.locator('.grid-item').filter({ hasText: 'coding/coder' }).click();

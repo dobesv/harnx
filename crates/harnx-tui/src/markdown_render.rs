@@ -66,6 +66,52 @@ impl RenderedEntry {
             total_height,
         }
     }
+
+    pub fn reverse_style(&mut self) {
+        let reverse = Style::default().add_modifier(Modifier::REVERSED);
+        for block in &mut self.blocks {
+            block.reverse_style(reverse);
+        }
+    }
+}
+
+impl MarkdownBlockData {
+    fn reverse_style(&mut self, reverse: Style) {
+        match self {
+            MarkdownBlockData::Paragraph { lines, .. } => reverse_lines(lines, reverse),
+            MarkdownBlockData::Table { rows, header, .. } => {
+                reverse_table(rows, header.as_mut(), reverse);
+            }
+        }
+    }
+}
+
+fn reverse_lines(lines: &mut [Line<'static>], reverse: Style) {
+    for line in lines {
+        line.style = line.style.patch(reverse);
+        for span in &mut line.spans {
+            span.style = span.style.patch(reverse);
+        }
+    }
+}
+
+fn reverse_table(
+    rows: &mut [Vec<Cell<'static>>],
+    header: Option<&mut Vec<Cell<'static>>>,
+    reverse: Style,
+) {
+    if let Some(header) = header {
+        reverse_cells(header, reverse);
+    }
+    for row in rows {
+        reverse_cells(row, reverse);
+    }
+}
+
+fn reverse_cells(cells: &mut [Cell<'static>], reverse: Style) {
+    for cell in cells {
+        *cell = cell.clone().style(reverse);
+    }
 }
 
 impl Widget for RenderedEntry {

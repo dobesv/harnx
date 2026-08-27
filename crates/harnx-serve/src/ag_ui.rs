@@ -473,12 +473,6 @@ impl AgUiSink {
         }));
     }
 
-    fn emit_handoff(&self, agent: String, session_id: Option<String>) {
-        let payload = json!({ "agent": agent, "session_id": session_id });
-        self.emit_custom("turn_handoff_requested", payload.clone());
-        self.emit_custom("session_handoff", payload);
-    }
-
     fn session_usage_context(&self) -> Option<UsageContextSnapshot> {
         self.session_context
             .as_ref()
@@ -649,9 +643,10 @@ impl AgUiSink {
             TurnEvent::ModelFallback { from, to } => {
                 self.emit_custom("turn_model_fallback", json!({ "from": from, "to": to }));
             }
-            TurnEvent::HandoffRequested { agent, session_id } => {
-                self.emit_handoff(agent, session_id);
-            }
+            TurnEvent::HandoffRequested { agent, session_id } => self.emit_custom(
+                "turn_handoff_requested",
+                json!({ "agent": agent, "session_id": session_id }),
+            ),
             TurnEvent::SubAgentStarted { agent, session_id } => self.emit_custom(
                 "sub_agent_started",
                 json!({ "agent": agent, "session_id": session_id }),
@@ -682,6 +677,10 @@ impl AgUiSink {
 
     fn emit_session_event(&self, event: SessionEvent) {
         match event {
+            SessionEvent::HandoffCommitted { agent, session_id } => self.emit_custom(
+                "session_handoff",
+                json!({ "agent": agent, "session_id": session_id }),
+            ),
             SessionEvent::CompactingStarted => {
                 self.emit_custom("session_compacting_started", json!({}));
             }
@@ -730,6 +729,7 @@ impl harnx_core::event::AgentEventSink for AgUiSink {
             AgentEvent::Model(event) => self.emit_model_event(event, is_sub_agent),
             AgentEvent::Tool(tool_event) => self.emit_tool_event(tool_event),
             AgentEvent::Turn(event) => self.emit_turn_event(event, is_sub_agent),
+            AgentEvent::Session(SessionEvent::HandoffCommitted { .. }) if is_sub_agent => {}
             AgentEvent::Session(event) => self.emit_session_event(event),
             AgentEvent::Notice(notice) => self.emit_notice(notice),
             AgentEvent::Plan { entries } => {
@@ -1492,12 +1492,6 @@ fn ag_ui_role_for_history(role: MessageRole) -> Role {
         MessageRole::User => Role::User,
         MessageRole::Tool => Role::Tool,
     }
-}
-
-fn as_new_msg(message: &AgUiMessage) -> Option<NewMsg> {
-    let role = client_role(message);
-    let content = client_content(message)?;
-    Some(NewMsg { role, content })
 }
 
 fn client_role(message: &AgUiMessage) -> Role {

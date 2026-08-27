@@ -20,18 +20,18 @@ plan_ref: "nats-subagent-migration"
 
 ## Problem
 
-Sub-agents historically ran as ACP stdio child processes via `AcpManager`. The migration to NATS required a different delegation model: sub-agents are now normal NATS agent sessions, but the parent must remain alive and leased while the child executes. Session handoff (the existing NATS agent-switching path) is unsuitable because it replaces and wipes the parent session.
+Sub-agents historically ran as ACP stdio child processes via `AcpManager`. The migration to NATS required a different delegation model: sub-agents are now normal NATS agent sessions, but the parent must remain alive and leased while the child executes. Session handoff is unsuitable because it finishes the source turn and detaches the target instead of waiting for a child response.
 
 ## Symptoms
 
 - Previous ACP path used `AcpManager::call_tool` which captured and re-entered `current_agent_event_sink()` for event forwarding
-- Handoff (`_session_handoff`) exits the parent agent and activates a new one — destructive for nested delegation
+- Handoff (`_session_handoff`) finishes the parent turn and activates a detached target — it cannot return a nested result to the parent
 - `ThinClientSession::run_turn` had no built-in idle or operation timeout handling
 - Toolset-server handlers run detached from the parent turn task's task-local `SCOPED_SINK`
 
 ## Investigation Steps
 
-1. **Handoff vs. nesting decision**: Traced `prepare_nats_handoff` in `nats_worker/agent_loop.rs` — it calls `exit_agent` and `use_agent`, mutating shared `Config` and destroying the parent session. Verified this is wrong for nested sub-agents which require the parent to persist.
+1. **Handoff vs. nesting decision**: The implementation at the time recursively mutated the source worker through `prepare_nats_handoff`; the current handoff architecture instead queues an independent target and finishes the source. Both models are wrong for nested sub-agents, which must keep the parent turn open and return the child's result.
 
 2. **ThinClientSession as the nesting primitive**: Confirmed `ThinClientSession::new` + `run_turn` provides a "initiate + await a nested NATS turn" abstraction without modifying the parent. The child turn routes through the WorkQueue (`SessionActivate` → `WORK_NOTIFY_<cluster>`) and executes on any eligible worker — no same-worker dependency.
 
@@ -45,7 +45,13 @@ Sub-agents historically ran as ACP stdio child processes via `AcpManager`. The m
 
 ## Root Cause
 
-Sub-agent delegation requires nested execution that preserves the parent session. Handoff replaces the parent — wrong abstraction. ThinClientSession provides the correct nesting primitive. The event-publishing path differs between in-engine tool calls (task-local sink inheritance) and worker toolset-server handlers (detached execution requiring explicit parent-session-id injection + direct publish to `sessions.{parent_id}.events`).
+Sub-agent delegation requires nested execution that preserves an active parent
+turn. Handoff finishes that turn and detaches the target — the wrong
+abstraction. `ThinClientSession` provides the correct nesting primitive. The
+event-publishing path differs between in-engine tool calls (task-local sink
+inheritance) and worker toolset-server handlers (detached execution requiring
+explicit parent-session-id injection + direct publish to
+`sessions.{parent_id}.events`).
 
 ## Solution
 
@@ -246,7 +252,7 @@ let result = prompt_call.await?;
 
 ### Architectural Rules
 
-1. **Handoff replaces parent**: `_session_handoff` → `exit_agent` + `use_agent` is for permanent agent switching, not nesting. ThinClientSession is for nested turns.
+1. **Handoff detaches the target**: `_session_handoff` durably queues an independent target session and finishes the source turn. `ThinClientSession` is the nesting primitive when the parent must await and consume a child result.
 
 2. **In-engine vs toolset-server event path**: In-engine tool calls inherit `SCOPED_SINK`. Toolset-server handlers are detached — use explicit publish with auto-injected `__harnx_parent_session_id`.
 

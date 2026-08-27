@@ -273,6 +273,17 @@ pub struct NatsSession {
     metadata_store: SessionMetadataStore,
 }
 
+/// Result of durably queueing one prompt for worker execution.
+pub(crate) struct EnqueuedPrompt {
+    pub session_id: String,
+    pub user_msg_seq: u64,
+}
+
+struct AppendedPrompt {
+    user_msg_id: String,
+    user_msg_seq: u64,
+}
+
 impl NatsSession {
     /// Create a new NATS session.
     ///
@@ -360,27 +371,7 @@ impl NatsSession {
         &self.metadata_store
     }
 
-    /// Run a turn: append user message, activate worker, stream events until completion.
-    ///
-    /// This is the main entry point for all frontends (CLI and TUI).
-    ///
-    /// # Arguments
-    /// * `user_message` - The user's prompt text.
-    /// * `event_sink` - Event sink to render events (AgentEventSink impl).
-    /// * `pending_cancel` - Optional channel to receive cancel requests.
-    ///
-    /// # Returns
-    /// The final assistant response text (if any), plus the sequence number of the
-    /// appended user message (for retract/edit), or an error.
-    pub async fn run_turn(
-        &self,
-        user_message: &str,
-        event_sink: Arc<dyn AgentEventSink>,
-        pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
-    ) -> Result<NatsTurnResult> {
-        // Step 1: Append user message to durable log BEFORE activating.
-        // The worker derives input from the last user message.
-        // Generate a client-side ID for retract/edit reference.
+    async fn append_user_message(&self, user_message: &str) -> Result<AppendedPrompt> {
         let user_msg_id = new_client_message_id();
         let log = NatsSessionLog::new(self.jetstream.clone(), self.session_id.clone());
         let user_entry = SessionLogEntry::Message {
@@ -400,34 +391,13 @@ impl NatsSession {
             self.session_id,
             user_message.len()
         );
+        Ok(AppendedPrompt {
+            user_msg_id,
+            user_msg_seq,
+        })
+    }
 
-        // Step 2: Attach to session event stream (subscribe-first, then history).
-        let event_stream = SessionEventStream::attach(
-            self.jetstream.clone(),
-            self.client.clone(),
-            &self.session_id,
-        )
-        .await
-        .context("failed to attach to session event stream")?;
-
-        // Render history to event sink (for resume/attach scenarios)
-        let history = event_stream.history();
-        // Apply mutations so retracted/edited entries are excluded from history render.
-        let _effective_history =
-            match harnx_core::session_reconstruct::apply_log_mutations_nats(history) {
-                Ok(history) => history,
-                Err(err) => {
-                    log::warn!(
-                        "failed to apply NATS log mutations while rendering session history: {err}"
-                    );
-                    history.to_vec()
-                }
-            };
-        // Front-ends render resumed history through their explicit transcript
-        // loading path. Replaying it on every newly-created per-turn session
-        // duplicates all prior messages in interactive and continued sessions.
-
-        // Step 3: Publish activation to wake a worker.
+    async fn publish_activation(&self, user_msg_seq: u64) -> Result<()> {
         match &self.config.activation_route {
             SessionActivationRoute::ClusterShared => {
                 let activation = SessionActivate::new(&self.session_id);
@@ -456,6 +426,72 @@ impl NatsSession {
             self.session_id,
             self.config.cluster
         );
+        Ok(())
+    }
+
+    /// Durably append a prompt and publish the matching worker activation
+    /// without waiting for the target turn to finish.
+    pub(crate) async fn enqueue(&self, user_message: &str) -> Result<EnqueuedPrompt> {
+        let appended = self.append_user_message(user_message).await?;
+        self.publish_activation(appended.user_msg_seq).await?;
+        Ok(EnqueuedPrompt {
+            session_id: self.session_id.clone(),
+            user_msg_seq: appended.user_msg_seq,
+        })
+    }
+
+    /// Run a turn: append user message, activate worker, stream events until completion.
+    ///
+    /// This is the main entry point for all frontends (CLI and TUI).
+    ///
+    /// # Arguments
+    /// * `user_message` - The user's prompt text.
+    /// * `event_sink` - Event sink to render events (AgentEventSink impl).
+    /// * `pending_cancel` - Optional channel to receive cancel requests.
+    ///
+    /// # Returns
+    /// The final assistant response text (if any), plus the sequence number of the
+    /// appended user message (for retract/edit), or an error.
+    pub async fn run_turn(
+        &self,
+        user_message: &str,
+        event_sink: Arc<dyn AgentEventSink>,
+        pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
+    ) -> Result<NatsTurnResult> {
+        // Step 1: Append user message to durable log BEFORE activating.
+        // The worker derives input from the last user message.
+        let appended = self.append_user_message(user_message).await?;
+        let user_msg_id = appended.user_msg_id;
+        let user_msg_seq = appended.user_msg_seq;
+
+        // Step 2: Attach to session event stream (subscribe-first, then history).
+        let event_stream = SessionEventStream::attach(
+            self.jetstream.clone(),
+            self.client.clone(),
+            &self.session_id,
+        )
+        .await
+        .context("failed to attach to session event stream")?;
+
+        // Render history to event sink (for resume/attach scenarios)
+        let history = event_stream.history();
+        // Apply mutations so retracted/edited entries are excluded from history render.
+        let _effective_history =
+            match harnx_core::session_reconstruct::apply_log_mutations_nats(history) {
+                Ok(history) => history,
+                Err(err) => {
+                    log::warn!(
+                        "failed to apply NATS log mutations while rendering session history: {err}"
+                    );
+                    history.to_vec()
+                }
+            };
+        // Front-ends render resumed history through their explicit transcript
+        // loading path. Replaying it on every newly-created per-turn session
+        // duplicates all prior messages in interactive and continued sessions.
+
+        // Step 3: Publish activation to wake a worker.
+        self.publish_activation(user_msg_seq).await?;
 
         // Step 4: Stream events and handle control until turn completion.
         let mut event_stream = event_stream;

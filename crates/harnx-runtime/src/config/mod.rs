@@ -224,7 +224,7 @@ pub(crate) fn selector_could_match_server(selector: &str, server_name: &str) -> 
 /// handoff text when `catalog_description` is `None`.
 fn handoff_description(agent_name: &str, catalog_description: Option<&str>) -> String {
     let fallback = format!(
-        "Exit the current agent session and hand off to the '{agent_name}' agent, which starts fresh. Prior conversation history is not carried over — it is intentionally cleared on handoff. Only the `prompt` argument provides context to the target agent, so include everything it needs there."
+        "Finish the current agent session and hand off to the '{agent_name}' agent. Omit `session_id` (or pass an empty value) to create a generated target session. Pass an unused ID to create that exact target session, or the exact ID of an existing session owned by this target to continue its transcript. Do not invent a session ID when you want a generated session. Include enough context in `prompt` for a new session."
     );
     // Keep handoff semantics first, then append catalog description verbatim.
     // Format: "<existing handoff sentence> — <catalog description>".
@@ -260,7 +260,7 @@ fn handoff_tool_declarations_for_agents(
                 crate::tool::JsonSchema {
                     type_value: Some("string".to_string()),
                     description: Some(
-                        "Optional target session ID selecting which session the target agent starts under. Handoff clears conversation history, so even when a session is reused its prior messages are not visible to the target agent. Do not rely on earlier context being available — pass everything the target needs in `prompt`.".to_string(),
+                        "Optional target session ID. Omit it (or pass an empty value) to create a generated session; pass an unused ID to create that exact session; or pass the exact ID of an existing session owned by the target agent to continue its transcript. Do not invent an ID when you want a generated session.".to_string(),
                     ),
                     ..Default::default()
                 },
@@ -1415,6 +1415,8 @@ where
 mod compaction_tests;
 #[cfg(test)]
 mod remote_agent_tests;
+#[cfg(test)]
+mod session_id_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]

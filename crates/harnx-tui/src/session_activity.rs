@@ -136,6 +136,7 @@ impl Tui {
         self.app.last_ui_output_source = None;
         self.app.transcript_focus = None;
         self.app.transcript_selection_anchor = None;
+        self.subagent_rows_dirty = true;
         self.pin_transcript_to_bottom();
     }
 
@@ -166,6 +167,8 @@ impl Tui {
     }
 
     pub(super) fn sync_session_activity_monitor(&mut self) {
+        self.sync_subagent_monitor_root();
+        self.sync_known_subagent_rows();
         let desired = self
             .current_prompt_abort
             .is_none()
@@ -188,7 +191,7 @@ impl Tui {
         }
     }
 
-    fn session_activity_destination(&self) -> Option<(String, String)> {
+    pub(super) fn session_activity_destination(&self) -> Option<(String, String)> {
         let config = self.config.read();
         let session_id = config.session.as_ref()?.id().to_string();
         let cluster = config
@@ -203,6 +206,7 @@ impl Tui {
 impl Drop for Tui {
     fn drop(&mut self) {
         self.stop_session_activity_monitor();
+        self.stop_subagent_monitors();
     }
 }
 
@@ -257,7 +261,7 @@ async fn monitor_session_connection(
     forward_session_activity(&mut stream, &forwarder).await
 }
 
-async fn attach_session_event_stream(
+pub(super) async fn attach_session_event_stream(
     config: &GlobalConfig,
     target: &SessionTarget,
 ) -> anyhow::Result<SessionEventStream> {
@@ -304,7 +308,7 @@ fn event_activity(event: &AgentEvent) -> Option<bool> {
     }
 }
 
-fn history_has_pending_turn(history: &[(u64, SessionLogEntry)]) -> bool {
+pub(super) fn history_has_pending_turn(history: &[(u64, SessionLogEntry)]) -> bool {
     let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(history)
         .unwrap_or_else(|_| history.to_vec());
     let Some(latest_user_seq) = effective.iter().rev().find_map(|(seq, entry)| {

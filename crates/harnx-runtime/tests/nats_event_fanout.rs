@@ -10,7 +10,7 @@ mod common;
 use anyhow::Result;
 use common::spawn_nats_server;
 use futures_util::StreamExt;
-use harnx_core::event::{AgentEvent, NoticeEvent};
+use harnx_core::event::{AgentEvent, AgentEventSink, NoticeEvent, SessionEvent};
 use harnx_core::message::{MessageContent, MessageRole};
 use harnx_core::session::SessionLogEntry;
 use harnx_runtime::nats_event_sink::{events_subject, AdvisoryEnvelope, SessionEventStream};
@@ -380,5 +380,50 @@ async fn multiple_events_maintain_ordering() -> Result<()> {
     let expected: Vec<String> = (0..5).map(|i| format!("event {}", i)).collect();
     assert_eq!(received, expected, "events should arrive in order");
 
+    Ok(())
+}
+
+/// A control-event flush is an ordered barrier over the non-blocking `emit`
+/// path: every earlier advisory and the control event itself are visible when
+/// it returns.
+#[tokio::test]
+async fn control_event_flush_preserves_fifo_delivery() -> Result<()> {
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: nats-server not found");
+        return Ok(());
+    };
+
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_id = format!("test-{}", uuid::Uuid::new_v4());
+    let mut sub = client.subscribe(events_subject(&session_id)).await?;
+    let sink =
+        harnx_runtime::nats_event_sink::NatsEventSink::new(client, jetstream, session_id).await;
+
+    sink.emit(AgentEvent::Notice(NoticeEvent::Info(
+        "before handoff".into(),
+    )));
+    sink.emit_required(AgentEvent::Session(SessionEvent::HandoffCommitted {
+        agent: "atlas".into(),
+        session_id: "atlas-session".into(),
+    }));
+    sink.flush().await?;
+
+    let mut received = Vec::new();
+    for _ in 0..2 {
+        let message = timeout(Duration::from_secs(2), sub.next())
+            .await?
+            .expect("event publisher should stay open");
+        received.push(AdvisoryEnvelope::from_bytes(&message.payload)?.event);
+    }
+    assert!(matches!(
+        &received[0],
+        AgentEvent::Notice(NoticeEvent::Info(message)) if message == "before handoff"
+    ));
+    assert!(matches!(
+        &received[1],
+        AgentEvent::Session(SessionEvent::HandoffCommitted { agent, session_id })
+            if agent == "atlas" && session_id == "atlas-session"
+    ));
     Ok(())
 }

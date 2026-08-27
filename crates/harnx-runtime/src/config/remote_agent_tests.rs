@@ -149,10 +149,10 @@ fn handoff_tool_declarations_append_catalog_description_for_local_and_remote_age
     );
     assert_eq!(
         descriptions["no-description_session_handoff"],
-        "Exit the current agent session and hand off to the 'no-description' agent, which starts fresh. Prior conversation history is not carried over — it is intentionally cleared on handoff. Only the `prompt` argument provides context to the target agent, so include everything it needs there."
+        "Finish the current agent session and hand off to the 'no-description' agent. Omit `session_id` (or pass an empty value) to create a generated target session. Pass an unused ID to create that exact target session, or the exact ID of an existing session owned by this target to continue its transcript. Do not invent a session ID when you want a generated session. Include enough context in `prompt` for a new session."
     );
     assert_eq!(
         descriptions["atlas__at__local_session_handoff"],
-        "Exit the current agent session and hand off to the 'atlas@local' agent, which starts fresh. Prior conversation history is not carried over — it is intentionally cleared on handoff. Only the `prompt` argument provides context to the target agent, so include everything it needs there."
+        "Finish the current agent session and hand off to the 'atlas@local' agent. Omit `session_id` (or pass an empty value) to create a generated target session. Pass an unused ID to create that exact target session, or the exact ID of an existing session owned by this target to continue its transcript. Do not invent a session ID when you want a generated session. Include enough context in `prompt` for a new session."
     );
 }
