@@ -138,6 +138,63 @@ async fn late_subscriber_gets_history_then_live() -> Result<()> {
     Ok(())
 }
 
+/// A durable turn boundary can land just after a client attaches, without a
+/// corresponding advisory event. The attached stream must be able to advance
+/// its durable cursor in place so activity monitors do not remain busy.
+#[tokio::test(flavor = "multi_thread")]
+async fn attached_stream_refreshes_delayed_turn_end() -> Result<()> {
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: nats-server not found");
+        return Ok(());
+    };
+
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_id = format!("test-{}", uuid::Uuid::new_v4());
+    let backend = NatsSessionLogBackend::new(jetstream.clone(), &session_id);
+
+    let user_seq = backend.append_event_blocking(&SessionLogEntry::Message {
+        id: None,
+        role: MessageRole::User,
+        content: MessageContent::Text("question".into()),
+        timestamp: None,
+        fence_token: None,
+    })?;
+    backend.append_event_blocking(&SessionLogEntry::Message {
+        id: None,
+        role: MessageRole::Assistant,
+        content: MessageContent::Text("answer".into()),
+        timestamp: None,
+        fence_token: None,
+    })?;
+
+    let mut stream = SessionEventStream::attach(jetstream, client, &session_id).await?;
+    let attached_seq = stream.last_applied_seq();
+    assert!(stream
+        .history()
+        .iter()
+        .all(|(_, entry)| !matches!(entry, SessionLogEntry::TurnEnd { .. })));
+
+    let turn_end_seq = backend.append_event_blocking(&SessionLogEntry::TurnEnd {
+        through_seq: user_seq,
+        fence_token: 1,
+        timestamp: None,
+    })?;
+
+    assert!(stream.refresh_history().await?);
+    assert_eq!(stream.last_applied_seq(), turn_end_seq);
+    assert!(stream.last_applied_seq() > attached_seq);
+    assert!(stream.history().iter().any(|(_, entry)| matches!(
+        entry,
+        SessionLogEntry::TurnEnd { through_seq, .. } if *through_seq == user_seq
+    )));
+    let history_len = stream.history().len();
+    assert!(!stream.refresh_history().await?);
+    assert_eq!(stream.history().len(), history_len);
+
+    Ok(())
+}
+
 /// Test: Advisory envelope after_seq enables dedup.
 /// Uses multi_thread flavor because it calls block_in_place via append_event_blocking.
 #[tokio::test(flavor = "multi_thread")]
