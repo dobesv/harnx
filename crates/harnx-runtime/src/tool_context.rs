@@ -7,7 +7,9 @@ use crate::tool::CompletionText;
 use crate::utils::AbortSignal;
 use harnx_core::instance::ServerScope;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -124,19 +126,29 @@ fn cache_discovery<K: Eq + std::hash::Hash, T>(
         );
 }
 
+async fn discover_cached<'a, K: Eq + std::hash::Hash, T>(
+    cache: &std::sync::Mutex<HashMap<K, CachedDiscovery<T>>>,
+    key: &K,
+    fresh_discovery: impl FnOnce() -> Pin<Box<dyn Future<Output = Option<Arc<T>>> + Send + 'a>>,
+) -> Option<Arc<T>> {
+    if let Some(provider) =
+        cached_discovery(cache, key, Instant::now(), REGISTRATION_REFRESH_INTERVAL)
+    {
+        return provider;
+    }
+    fresh_discovery().await
+}
+
 /// Discover NATS hooks at most once per instance during each refresh interval.
 pub async fn discover_nats_hook_provider_cached(
     config: &Config,
     instance_id: &ServerScope,
 ) -> Option<Arc<NatsHookProvider>> {
     let cache = NATS_HOOK_DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let now = Instant::now();
-    if let Some(provider) = cached_discovery(cache, instance_id, now, REGISTRATION_REFRESH_INTERVAL)
-    {
-        return provider;
-    }
-
-    discover_nats_hook_provider_fresh(config, instance_id).await
+    discover_cached(cache, instance_id, || {
+        Box::pin(discover_nats_hook_provider_fresh(config, instance_id))
+    })
+    .await
 }
 
 /// Refresh hook discovery immediately and replace the cached snapshot.
@@ -165,11 +177,28 @@ pub async fn discover_nats_tool_provider_cached(
 ) -> Option<Arc<NatsToolProvider>> {
     let cache = NATS_TOOL_DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let key = (instance_id.clone(), active_package.map(str::to_string));
-    let now = Instant::now();
-    if let Some(provider) = cached_discovery(cache, &key, now, REGISTRATION_REFRESH_INTERVAL) {
-        return provider;
-    }
+    discover_cached(cache, &key, || {
+        Box::pin(discover_nats_tool_provider_fresh(
+            config,
+            instance_id,
+            active_package,
+        ))
+    })
+    .await
+}
 
+/// Refresh tool discovery immediately and replace the cached snapshot.
+///
+/// Worker activations call this after reconciling an agent's tool servers;
+/// using a snapshot captured while those servers were still starting would
+/// leave their declarations invisible for the cache TTL.
+pub(crate) async fn discover_nats_tool_provider_fresh(
+    config: &Config,
+    instance_id: &ServerScope,
+    active_package: Option<&str>,
+) -> Option<Arc<NatsToolProvider>> {
+    let cache = NATS_TOOL_DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let key = (instance_id.clone(), active_package.map(str::to_string));
     // Don't hold the process-wide lock while connecting to NATS or scanning KV.
     let provider = match NatsToolProvider::discover(
         config,

@@ -13,7 +13,7 @@ use crate::nats_lease::NatsSessionLease;
 use crate::nats_metrics;
 use crate::nats_session::{NatsSession, NatsSessionConfig};
 use crate::nats_session_metadata::SessionMetadataStore;
-use crate::tool_context::discover_nats_hook_provider_fresh;
+use crate::tool_context::{discover_nats_hook_provider_fresh, discover_nats_tool_provider_fresh};
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result};
 use async_nats::jetstream;
@@ -326,6 +326,16 @@ async fn build_agent_loop_context(
     params: AgentContextParams,
 ) -> crate::agent_loop::AgentLoopContext {
     let config_snapshot = params.config.read().clone();
+    let active_package = config_snapshot.active_package();
+    // Activation has already waited for this session's on-demand tool
+    // servers to register. Replace any snapshot captured while startup was
+    // still in flight before the first model request reuses the tool cache.
+    discover_nats_tool_provider_fresh(
+        &config_snapshot,
+        &params.instance_id,
+        active_package.as_deref(),
+    )
+    .await;
     let nats_hook_provider =
         discover_nats_hook_provider_fresh(&config_snapshot, &params.instance_id).await;
     crate::agent_loop::AgentLoopContext {
