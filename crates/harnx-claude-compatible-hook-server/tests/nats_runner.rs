@@ -192,6 +192,7 @@ async fn command_hook_registers_and_answers_over_nats() -> Result<()> {
         timeout: Some(5),
         fail_policy: CliFailPolicy::Closed,
         persistent: false,
+        jaq: None,
         command: ["printf", "%s", r#"{"mutatedToolInput":{"overNats":true}}"#]
             .iter()
             .map(|word| word.to_string())

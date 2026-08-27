@@ -7,6 +7,27 @@ use serde_json::Value;
 
 type JsonFilter = jaq_core::Filter<data::JustLut<Val>>;
 
+/// A compiled jaq expression that can be reused across multiple JSON inputs.
+pub struct JaqFilter {
+    expression: String,
+    filter: JsonFilter,
+}
+
+impl JaqFilter {
+    /// Compile a jaq expression once for repeated evaluation.
+    pub fn compile(expression: impl Into<String>) -> Result<Self, String> {
+        let expression = expression.into();
+        let filter = compile_filter(&expression)
+            .map_err(|error| format!("jaq parse/compile failed for {expression:?}: {error}"))?;
+        Ok(Self { expression, filter })
+    }
+
+    /// Evaluate the compiled expression against one JSON value.
+    pub fn evaluate(&self, input: Value) -> Result<Value, String> {
+        run_filter(&self.filter, &self.expression, input)
+    }
+}
+
 fn compile_filter(expr: &str) -> Result<JsonFilter, String> {
     let arena = Arena::default();
     let defs = jaq_core::defs()
@@ -80,10 +101,7 @@ fn run_filter(filter: &JsonFilter, expr: &str, input: Value) -> Result<Value, St
 /// Compiles and runs a single jaq expression against `input`.
 /// Returns the failure message on parse/compile/runtime error.
 pub fn eval_filter_checked(expr: &str, input: Value) -> Result<Value, String> {
-    let filter = compile_filter(expr)
-        .map_err(|error| format!("jaq parse/compile failed for {expr:?}: {error}"))?;
-
-    run_filter(&filter, expr, input)
+    JaqFilter::compile(expr)?.evaluate(input)
 }
 
 /// Runs expressions in sequence — result of N is input to N+1.
@@ -97,7 +115,7 @@ pub fn eval_filters_strict(exprs: &[String], input: Value) -> anyhow::Result<Val
 
 #[cfg(test)]
 mod tests {
-    use super::{eval_filter_checked, eval_filters_strict, runtime_failure_message};
+    use super::{eval_filter_checked, eval_filters_strict, runtime_failure_message, JaqFilter};
     use serde_json::{json, Value};
 
     #[test]
@@ -118,6 +136,20 @@ mod tests {
     fn invalid_expression_returns_err() {
         let input = json!({"a": 1});
         assert!(eval_filter_checked(".a = ", input).is_err());
+    }
+
+    #[test]
+    fn compiled_filter_can_be_reused() {
+        let filter = JaqFilter::compile(".value += 1").expect("compile filter");
+
+        assert_eq!(
+            filter.evaluate(json!({"value": 1})),
+            Ok(json!({"value": 2}))
+        );
+        assert_eq!(
+            filter.evaluate(json!({"value": 4})),
+            Ok(json!({"value": 5}))
+        );
     }
 
     #[test]

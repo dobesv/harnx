@@ -35,7 +35,7 @@ Hook configuration uses a **command-only** model: a hook entry specifies only th
 
 There are two types of hook servers:
 
-1. **Generic runner** (`harnx-claude-compatible-hook-server`): Wraps a child command and exposes it as a NATS hook server. It declares the event/matcher/etc. via CLI flags:
+1. **Generic runner** (`harnx-claude-compatible-hook-server`): Runs a child command or an embedded jaq expression and exposes it as a NATS hook server. It declares the event/matcher/etc. via CLI flags:
    ```sh
    harnx-claude-compatible-hook-server
      --event <EVENT>              # Hook event (e.g., PreToolUse, PostToolUse)
@@ -44,11 +44,15 @@ There are two types of hook servers:
      --priority <N>               # Dispatch priority, lower runs first (default: 0)
      --timeout <SECS>             # Execution timeout in seconds (optional)
      --fail-policy <closed|open>  # Failure behavior (default: closed)
+     --jaq <FILTER>               # Embedded jaq expression (one handler option)
      -- <CHILD_COMMAND>           # The actual hook script/binary to run
    ```
    Everything after `--` is an argv, executed directly rather than through a
    shell. For pipes, redirection or variable expansion, ask for a shell:
    `-- sh -c 'cmd >> log 2>&1'`.
+   `--jaq` is an alternative to a child command. It compiles the expression at
+   startup and evaluates it against each hook payload without requiring an
+   external `jq`/`jaq` executable. It cannot be combined with `--persistent`.
 
 2. **Native hooks** (e.g., `harnx-proxy-auth`): Specialized binaries that implement the NATS hook protocol directly and self-declare their event/matcher via `Hook::hooks()`. They need no `--event`/`--matcher` flags:
    ```sh
@@ -93,6 +97,31 @@ The default one-shot hook type. Served over NATS using the generic `harnx-claude
     *   Exit code `0`: Continue execution.
     *   Exit code `2`: Block execution (equivalent to `permissionDecision: "deny"`).
     *   Other non-zero codes: Logged as errors, but execution usually continues.
+
+### Embedded Jaq Hooks (Generic Runner)
+
+Use `--jaq <FILTER>` for hooks that can be expressed as a JSON transformation:
+
+```yaml
+hooks:
+  entries:
+    - command: >-
+        harnx-claude-compatible-hook-server
+        --event PreToolUse
+        --matcher '^atlas_session_handoff$'
+        --jaq
+        '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Confirm agent handoff"}}'
+```
+
+*   **Input**: The same event payload documented above, as the jaq input value.
+*   **Output**: An object in the [response protocol](#5-response-protocol)
+    shape. Return `{}` to continue without changes.
+*   **Startup validation**: Parse and compile errors prevent the hook server
+    from registering.
+*   **Runtime failures**: The configured `--fail-policy` applies (`closed` by
+    default).
+*   **Process model**: Evaluation happens in the hook server, so `--persistent`
+    does not apply and no child process or jq installation is needed.
 
 ### Persistent Hooks (Generic Runner with `--persistent`)
 
@@ -350,8 +379,8 @@ Requires user approval before any tool runs. See the [Tool Confirmation Guide](t
 hooks:
   entries:
     - command: >-
-        harnx-claude-compatible-hook-server --event PreToolUse --
-        printf '%s\n' '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Manual approval required"}}'
+        harnx-claude-compatible-hook-server --event PreToolUse --jaq
+        '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Manual approval required"}}'
 ```
 
 When the agent calls a tool, Harnx pauses and shows a confirmation prompt:
@@ -370,7 +399,12 @@ The default is **No** (deny). Use `--matcher` to limit confirmation to specific 
 ```yaml
 hooks:
   entries:
-    - command: harnx-claude-compatible-hook-server --event PreToolUse --matcher "bash_exec|bash_spawn" -- /path/to/ask-confirm.sh
+    - command: >-
+        harnx-claude-compatible-hook-server
+        --event PreToolUse
+        --matcher '^(bash_exec|bash_spawn)$'
+        --jaq
+        '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Shell command requires approval"}}'
 ```
 
 ### 5. Audit Logger (Async PostToolUse)

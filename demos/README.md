@@ -21,7 +21,6 @@ demos/
 │   ├── config.yaml
 │   ├── dark.tmTheme            Theme used by the themes demo
 │   ├── light.tmTheme
-│   ├── ask-confirm-hook.sh     Hook returning "ask" for all tools
 │   ├── agents/                 Demo agent definitions (demo/code/tool-confirm)
 │   ├── clients/                openai-compatible client pointed at :3829
 │   │   └── mock.yaml
