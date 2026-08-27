@@ -360,6 +360,9 @@ impl AgentEventSink for NatsEventSink {
 /// }
 /// ```
 pub struct SessionEventStream {
+    /// Durable session log retained so a long-lived attachment can reconcile
+    /// authoritative entries that do not have a matching advisory event.
+    log: crate::nats_session_log::NatsSessionLog,
     /// History replayed from durable log (seq, entry pairs).
     history: Vec<(u64, harnx_core::session::SessionLogEntry)>,
     /// Last sequence number from durable history (for dedup).
@@ -402,6 +405,7 @@ impl SessionEventStream {
         let last_durable_seq = history.last().map(|(seq, _)| *seq).unwrap_or(0);
 
         Ok(Self {
+            log,
             history,
             last_durable_seq,
             subscriber,
@@ -416,6 +420,25 @@ impl SessionEventStream {
     /// Get the last applied durable sequence number.
     pub fn last_applied_seq(&self) -> u64 {
         self.last_durable_seq
+    }
+
+    /// Append durable entries written since this stream attached.
+    ///
+    /// Advisory delivery is intentionally lossy, and some authoritative
+    /// entries such as `TurnEnd` do not emit a corresponding advisory. Clients
+    /// that infer state from the durable history can call this after a quiet
+    /// interval to converge without reconnecting the subscription.
+    pub async fn refresh_history(&mut self) -> Result<bool> {
+        let entries = self
+            .log
+            .load_events_after_async(self.last_durable_seq)
+            .await?;
+        let Some((last_seq, _)) = entries.last() else {
+            return Ok(false);
+        };
+        self.last_durable_seq = *last_seq;
+        self.history.extend(entries);
+        Ok(true)
     }
 
     /// Receive the next advisory envelope.

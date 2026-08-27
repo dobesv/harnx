@@ -99,6 +99,15 @@ impl NatsSessionLog {
         self.read_all_from(1).await
     }
 
+    /// Load durable entries appended after `seq`, retaining their stream
+    /// sequence numbers so an attached client can advance its replay cursor.
+    pub async fn load_events_after_async(&self, seq: u64) -> Result<Vec<(u64, SessionLogEntry)>> {
+        let Some(start_sequence) = seq.checked_add(1) else {
+            return Ok(Vec::new());
+        };
+        self.read_all_from(start_sequence).await
+    }
+
     /// Like [`load_events_async`], but first waits (bounded) until the stream's
     /// `last_sequence` reaches `min_seq`, providing read-your-writes consistency.
     ///
@@ -131,16 +140,7 @@ impl NatsSessionLog {
     }
 
     pub async fn replay_from_async(&self, seq: u64) -> Result<Vec<SessionLogEntry>> {
-        self.ensure_stream().await?;
-        let start_sequence = if seq == 0 {
-            Some(1)
-        } else {
-            seq.checked_add(1)
-        };
-        let Some(start_sequence) = start_sequence else {
-            return Ok(Vec::new());
-        };
-        self.read_all_from(start_sequence)
+        self.load_events_after_async(seq)
             .await
             .map(|entries| entries.into_iter().map(|(_, entry)| entry).collect())
     }
