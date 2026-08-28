@@ -168,29 +168,40 @@ impl Tui {
                 "queued user message durably at sequence {} but activation failed; retrying at turn completion: {error:#}",
                 enqueued.user_msg_seq(),
             );
-            self.pending_remote_activation = Some(target);
+            self.retain_pending_remote_activation(target);
         }
         Ok(true)
     }
 
-    async fn retry_pending_remote_activation(&mut self) {
-        let Some((session_id, cluster)) = self.pending_remote_activation.take() else {
-            return;
-        };
+    /// Retain one durable session for a later activation-only retry.
+    pub(super) fn retain_pending_remote_activation(&mut self, target: (String, String)) {
+        self.pending_remote_activations.insert(target);
+    }
 
-        #[cfg(not(test))]
-        if let Err(error) = self
-            .activate_pending_session(session_id.clone(), cluster.clone())
-            .await
-        {
-            log::warn!(
-                "failed to retry activation for pending durable session {session_id}: {error:#}"
-            );
-            self.pending_remote_activation = Some((session_id, cluster));
+    /// Move every retained target into the next retry batch.
+    pub(super) fn take_pending_remote_activation_targets(
+        &mut self,
+    ) -> std::collections::HashSet<(String, String)> {
+        std::mem::take(&mut self.pending_remote_activations)
+    }
+
+    async fn retry_pending_remote_activations(&mut self) {
+        let targets = self.take_pending_remote_activation_targets();
+        for (session_id, cluster) in targets {
+            #[cfg(not(test))]
+            if let Err(error) = self
+                .activate_pending_session(session_id.clone(), cluster.clone())
+                .await
+            {
+                log::warn!(
+                    "failed to retry activation for pending durable session {session_id}: {error:#}"
+                );
+                self.retain_pending_remote_activation((session_id, cluster));
+            }
+
+            #[cfg(test)]
+            let _ = (session_id, cluster);
         }
-
-        #[cfg(test)]
-        let _ = (session_id, cluster);
     }
 
     pub(super) async fn finish_prompt_task(&mut self, task: AbortSignal, error: Option<String>) {
@@ -220,7 +231,7 @@ impl Tui {
         *self.shared_pending_message.lock().await = None;
         self.app.last_ui_output_source = None;
         self.refresh_input_chrome();
-        self.retry_pending_remote_activation().await;
+        self.retry_pending_remote_activations().await;
 
         if let Some(pending) = self.app.pending_message.take() {
             if let Err(err) = self.submit_pending_message(pending).await {
