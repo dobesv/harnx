@@ -300,6 +300,13 @@ every queued user already included in replay; a zero-sequence completion
 boundary is invalid. These invariants keep repair idempotent and prevent a
 completed session from reconstructing as perpetually busy.
 
+Appending a user row and publishing its worker activation are separate broker
+operations. Once the append succeeds, its log sequence is authoritative: an
+activation failure must be retried for the pending durable turn and must never
+fall back to appending the same frontend text again. Session reconstruction and
+the worker lease make repeated activation safe while preserving exactly one
+user row.
+
 ## Cleanup
 
 Session logs, leases, canonical metadata, and attachment blobs persist in

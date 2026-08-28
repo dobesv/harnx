@@ -49,6 +49,9 @@ pub struct Tui {
     /// The (session_id, cluster) of the remote agent currently running, if any.
     /// Set in `start_prompt` and cleared when the turn completes.
     pub(super) active_remote_session: Option<(String, String)>,
+    /// Durable text whose append succeeded but whose worker activation must be
+    /// retried without submitting the text as a second user message.
+    pub(super) pending_remote_activation: Option<(String, String)>,
     /// Session whose shared NATS turn activity is currently being observed.
     pub(super) session_activity_target: Option<(String, String)>,
     /// Background subscription that lets this TUI react to turns submitted by

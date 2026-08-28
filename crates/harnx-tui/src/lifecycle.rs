@@ -231,6 +231,7 @@ impl Tui {
             current_prompt_abort: None,
             current_prompt_handle: None,
             active_remote_session: None,
+            pending_remote_activation: None,
             session_activity_target: None,
             session_activity_handle: None,
             subagent_monitor_root: None,

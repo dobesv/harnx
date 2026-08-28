@@ -41,9 +41,15 @@ async fn mid_tool_round_user_message_is_injected_once_into_same_turn() -> Result
     .await?;
 
     let ready_fut = MID_ROUND_APPEND_READY.notified();
-    queue_session.enqueue_text("seed message").await?;
+    queue_session
+        .enqueue_text("seed message")
+        .await?
+        .into_activation_result()?;
     ready_fut.await;
-    queue_session.enqueue_text("late message").await?;
+    queue_session
+        .enqueue_text("late message")
+        .await?
+        .into_activation_result()?;
     MID_ROUND_APPEND_DONE.notify_one();
 
     wait_until(CI_SAFE_TIMEOUT, || {
