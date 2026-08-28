@@ -6,7 +6,8 @@
 #[allow(dead_code)]
 mod common;
 
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
+use harnx_core::event::{AgentEvent, AgentEventSink};
 use harnx_runtime::config::{
     Config, GlobalConfig, ToolServerConfig, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV,
     LOCAL_CLUSTER_KEY,
@@ -17,7 +18,7 @@ use harnx_runtime::nats_worker::{
     publish_session_activate, run_worker_daemon, SessionActivate, ToolServerStartConfig,
     WorkerDaemonConfig,
 };
-use harnx_runtime::SessionInitializer;
+use harnx_runtime::{NatsSession, NatsSessionConfig, SessionActivationRoute, SessionInitializer};
 use harnx_toolset::Registration;
 use harnx_toolset_server::TOOL_REGISTRY_BUCKET;
 use parking_lot::RwLock;
@@ -28,6 +29,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const E2E_TOKEN: &str = "tool-reconciler-e2e-token";
+
+struct NoopEventSink;
+
+impl AgentEventSink for NoopEventSink {
+    fn emit(&self, _event: AgentEvent) {}
+}
 
 struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
 
@@ -237,6 +244,115 @@ fn stub_call_fn() -> harnx_runtime::agent_loop::AgentCallFn {
     })
 }
 
+/// Capture the tools selected for each outbound model request. The first
+/// activation in the cache-race regression deliberately primes discovery
+/// before the second activation starts its tool server.
+fn capture_selected_tools(
+    calls: tokio::sync::mpsc::UnboundedSender<Vec<String>>,
+) -> harnx_runtime::agent_loop::AgentCallFn {
+    Arc::new(move |_input, config, _abort| {
+        let selected = {
+            let config = config.read();
+            let agent = config.agent.as_ref().expect("active test agent");
+            config
+                .select_tools(agent)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect()
+        };
+        let calls = calls.clone();
+        Box::pin(async move {
+            calls
+                .send(selected)
+                .map_err(|_| anyhow::anyhow!("selected-tool receiver closed"))?;
+            Ok((
+                "stub reply".to_string(),
+                None,
+                Vec::new(),
+                harnx_runtime::client::CompletionTokenUsage::default(),
+            ))
+        })
+    })
+}
+
+fn single_time_server_config(time_binary: PathBuf) -> GlobalConfig {
+    Arc::new(RwLock::new(Config {
+        tool_servers: vec![ToolServerConfig {
+            name: "time".to_string(),
+            command: time_binary.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            env: Default::default(),
+            enabled: true,
+            description: None,
+            package: None,
+            hooks: None,
+        }],
+        ..Config::default()
+    }))
+}
+
+async fn spawn_capturing_worker(
+    config: GlobalConfig,
+    nats_url: &str,
+) -> anyhow::Result<(
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+    async_nats::Client,
+    tokio::sync::mpsc::UnboundedReceiver<Vec<String>>,
+)> {
+    let client = async_nats::ConnectOptions::new()
+        .token(E2E_TOKEN.to_string())
+        .connect(nats_url)
+        .await?;
+    let mut readiness = client
+        .subscribe(harnx_runtime::nats_worker::worker_ready_subject(
+            LOCAL_CLUSTER_KEY,
+        ))
+        .await?;
+    client.flush().await?;
+    let (selected_tx, selected_rx) = tokio::sync::mpsc::unbounded_channel();
+    let daemon = WorkerDaemonConfig::managing(LOCAL_CLUSTER_KEY, "tool-cache-race-e2e");
+    let worker = tokio::spawn(async move {
+        run_worker_daemon(config, daemon, Some(capture_selected_tools(selected_tx))).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), readiness.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("worker readiness subscription closed"))?;
+    Ok((worker, client, selected_rx))
+}
+
+async fn run_agent_turn(
+    client: &async_nats::Client,
+    session_id: &str,
+    agent: &str,
+    prompt: &str,
+) -> anyhow::Result<()> {
+    let session = NatsSession::new(
+        NatsSessionConfig {
+            cluster: LOCAL_CLUSTER_KEY.to_string(),
+            initializer: SessionInitializer::named(agent, Default::default()),
+            session_id: Some(session_id.to_string()),
+            activation_route: SessionActivationRoute::ClusterShared,
+        },
+        client.clone(),
+        async_nats::jetstream::new(client.clone()),
+        harnx_core::abort::create_abort_signal(),
+    )
+    .await?;
+    session
+        .run_turn(prompt, Arc::new(NoopEventSink), None)
+        .await?;
+    Ok(())
+}
+
+async fn next_selected_tools(
+    calls: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<String>>,
+) -> anyhow::Result<Vec<String>> {
+    tokio::time::timeout(Duration::from_secs(20), calls.recv())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("selected-tool sender closed"))
+}
+
 async fn reserve_named_session(
     store: &SessionMetadataStore,
     session_id: &str,
@@ -332,6 +448,79 @@ async fn a_session_only_starts_the_servers_its_agent_uses() -> anyhow::Result<()
         "starting a second session must not disturb the first session's servers"
     );
 
+    Ok(())
+}
+
+/// A completed model request can cache discovery before a later activation
+/// starts an on-demand server. The later activation must replace that stale
+/// snapshot after registration, or its first request omits the new tools for
+/// the full registration refresh interval.
+#[tokio::test(flavor = "multi_thread")]
+async fn first_request_after_activation_sees_newly_started_server() -> anyhow::Result<()> {
+    harnx_core::require_nextest();
+    let Some(nats) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
+        auth_token: Some(E2E_TOKEN.to_string()),
+    })
+    .await?
+    else {
+        eprintln!("skipping: nats-server binary not available");
+        return Ok(());
+    };
+
+    const AGENT_WITHOUT_SERVER: AgentFixture = AgentFixture {
+        name: "agent-without-server",
+        use_tools: "missing_*",
+    };
+    const AGENT_TIME: AgentFixture = AgentFixture {
+        name: "agent-time-after-cache",
+        use_tools: "time_*",
+    };
+
+    let config_root = tempfile::tempdir()?;
+    let agents_dir = config_root.path().join("agents");
+    std::fs::create_dir_all(&agents_dir)?;
+    write_agent(&agents_dir, &AGENT_WITHOUT_SERVER)?;
+    write_agent(&agents_dir, &AGENT_TIME)?;
+    let _env = EnvGuard::install(&[
+        (HARNX_NATS_URL_ENV, nats.url()),
+        (HARNX_NATS_TOKEN_ENV, E2E_TOKEN),
+        ("HARNX_CONFIG_DIR", &config_root.path().to_string_lossy()),
+    ]);
+
+    let config = single_time_server_config(resolve_binary("harnx-time-server")?);
+    let (worker, client, mut selected_rx) = spawn_capturing_worker(config, nats.url()).await?;
+
+    run_agent_turn(
+        &client,
+        "prime-cache",
+        AGENT_WITHOUT_SERVER.name,
+        "prime discovery",
+    )
+    .await?;
+    let priming_tools = next_selected_tools(&mut selected_rx).await?;
+    assert!(
+        priming_tools.iter().all(|name| !name.starts_with("time_")),
+        "the priming request must precede time registration: {priming_tools:?}"
+    );
+
+    run_agent_turn(
+        &client,
+        "start-time",
+        AGENT_TIME.name,
+        "use the time server",
+    )
+    .await?;
+    let first_time_tools = next_selected_tools(&mut selected_rx).await?;
+    assert!(
+        first_time_tools
+            .iter()
+            .any(|name| name == "time_get_current_time"),
+        "the first request after activation omitted the newly registered time tools: \
+         {first_time_tools:?}"
+    );
+
+    worker.abort();
+    let _ = worker.await;
     Ok(())
 }
 
