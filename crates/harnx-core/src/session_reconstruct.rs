@@ -507,8 +507,14 @@ impl ReplayAccumulator {
             return;
         };
 
-        self.resumable_last_user = self.next_turn_messages.last().cloned();
-        self.next_turn_messages.clear();
+        // A later tool round usually has no newly queued user message: keep
+        // the user that initiated the in-flight turn in that case. When a
+        // user message was injected between rounds, promote its latest seq to
+        // the resume cursor and consume the queued block into this turn.
+        if let Some(last_user) = self.next_turn_messages.last().cloned() {
+            self.resumable_last_user = Some(last_user);
+            self.next_turn_messages.clear();
+        }
         self.resumable_last_assistant = Some(AssistantTurn::ToolCalls {
             text: text.clone(),
             thought: thought.clone(),
@@ -713,6 +719,39 @@ mod tests {
                 next_turn_messages: &["u2"],
             },
         );
+    }
+
+    fn assert_later_tool_round(
+        injected_user: Option<&str>,
+        queued_user: Option<&str>,
+        expected_last_user: &str,
+        expected_queued_users: &[&str],
+    ) {
+        let mut entries = vec![
+            final_assistant("done"),
+            user_message("u1"),
+            tool_calls_assistant(7),
+        ];
+        entries.extend(injected_user.map(user_message));
+        entries.extend([tool_results("tool-a"), tool_calls_assistant(8)]);
+        entries.extend(queued_user.map(user_message));
+        assert_case(
+            entries,
+            ExpectedState::Resumable {
+                fence_token: Some(8),
+                last_user: Some(expected_last_user),
+                assistant: ExpectedAssistant::ToolCalls,
+                pending_tool_results_len: 0,
+                next_turn_messages: expected_queued_users,
+            },
+        );
+    }
+
+    #[test]
+    fn later_tool_round_preserves_the_correct_user_position() {
+        assert_later_tool_round(None, None, "u1", &[]);
+        assert_later_tool_round(Some("injected"), None, "injected", &[]);
+        assert_later_tool_round(None, Some("queued"), "u1", &["queued"]);
     }
 
     #[test]

@@ -439,14 +439,50 @@ impl NatsSession {
     /// Durably append a prompt and publish the matching worker activation
     /// without waiting for the target turn to finish.
     pub(crate) async fn enqueue(&self, user_message: &str) -> Result<EnqueuedPrompt> {
+        let user_msg_seq = self.enqueue_text(user_message).await?;
+        Ok(EnqueuedPrompt {
+            session_id: self.session_id.clone(),
+            user_msg_seq,
+        })
+    }
+
+    /// Durably queue text for the active session without waiting for its turn
+    /// to finish. A running worker can inject it at the next tool-round seam;
+    /// the activation also guarantees delivery if the current turn wins the
+    /// race and becomes idle first.
+    pub async fn enqueue_text(&self, user_message: &str) -> Result<u64> {
         let appended = self
             .append_user_content(MessageContent::Text(user_message.to_string()))
             .await?;
         self.publish_activation(appended.user_msg_seq).await?;
-        Ok(EnqueuedPrompt {
-            session_id: self.session_id.clone(),
-            user_msg_seq: appended.user_msg_seq,
-        })
+        Ok(appended.user_msg_seq)
+    }
+
+    /// Re-publish activation for an existing pending durable turn without
+    /// appending another user message. This lets a newly attached frontend
+    /// recover a session whose previous worker disappeared after the prompt
+    /// was already stored.
+    pub async fn activate_pending_turn(&self) -> Result<Option<u64>> {
+        let log = NatsSessionLog::new(self.jetstream.clone(), self.session_id.clone());
+        let entries = log
+            .load_events_latest_async()
+            .await
+            .context("failed to inspect pending session before activation")?;
+        let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)?;
+        let Some(user_msg_seq) = effective.iter().rev().find_map(|(seq, entry)| {
+            matches!(
+                entry,
+                SessionLogEntry::Message { role, .. } if role.is_user()
+            )
+            .then_some(*seq)
+        }) else {
+            return Ok(None);
+        };
+        if requested_seq_status(&entries, user_msg_seq)? == RequestedSeqStatus::Covered {
+            return Ok(None);
+        }
+        self.publish_activation(user_msg_seq).await?;
+        Ok(Some(user_msg_seq))
     }
 
     /// Run a turn: append user message, activate worker, stream events until completion.

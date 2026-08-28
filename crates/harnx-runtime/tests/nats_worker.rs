@@ -3,6 +3,8 @@
 //! Validates end-to-end persistence of a full turn via NatsSessionLog.
 
 mod common;
+#[path = "nats_worker/multi_round_resume.rs"]
+mod multi_round_resume;
 #[path = "nats_worker/session_metadata.rs"]
 mod session_metadata;
 
@@ -832,67 +834,6 @@ async fn worker_turn_sends_the_prompt_to_the_model_once() -> Result<()> {
         WIRE_PROMPT_COPIES.load(Ordering::SeqCst),
         1,
         "the model must see the prompt exactly once"
-    );
-
-    daemon.abort();
-    let _ = daemon.await;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mid_tool_round_user_message_is_injected_once_into_same_turn() -> Result<()> {
-    reset_test_state();
-    require_nextest();
-    let Some(server) = spawn_nats_server().await? else {
-        eprintln!("Skipping test: nats-server not available");
-        return Ok(());
-    };
-
-    let config = local_nats_runtime_config(server.url());
-    let worker_config = WorkerDaemonConfig::managing("local", "worker-mid-round");
-    let daemon = tokio::spawn({
-        let cfg = config.clone();
-        async move { run_worker_daemon(cfg, worker_config, Some(mid_round_call_fn())).await }
-    });
-    // Give daemon time to initialize consumer
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let session_id = "mid-round-injection";
-    let log = NatsSessionLog::new(js.clone(), session_id);
-
-    // CRITICAL: Create the notified future BEFORE publishing the activate
-    // to avoid lost wakeup race between notify_one() and notified().await
-    let ready_fut = MID_ROUND_APPEND_READY.notified();
-
-    log.append_event_async(&append_user_message_entry("user-1", "seed message"))
-        .await?;
-    activate_session(&js, session_id).await?;
-
-    // Now await the ready signal - the permit was stored by notify_one()
-    ready_fut.await;
-
-    log.append_event_async(&append_user_message_entry("user-2", "late message"))
-        .await?;
-    // Use notify_one() to signal completion - matches the notify_one() in call_fn
-    MID_ROUND_APPEND_DONE.notify_one();
-
-    wait_until(CI_SAFE_TIMEOUT, || {
-        MID_ROUND_FINAL_CALLS.load(Ordering::SeqCst) >= 1
-    })
-    .await?;
-
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-
-    let entries = log.load_events_async().await?;
-    let assistants = final_assistant_texts(&entries);
-    assert!(assistants.iter().any(|text| text.contains("late message")));
-    assert_eq!(
-        assistants
-            .iter()
-            .filter(|text| text.contains("late message"))
-            .count(),
-        1
     );
 
     daemon.abort();

@@ -291,6 +291,15 @@ When a worker resumes an interrupted session:
 - **Idempotent Tools**: Tools marked with `idempotent_hint` or `read_only_hint` in MCP are re-run if their result was lost.
 - **Non-idempotent Tools**: If a result is missing for a non-idempotent tool, Harnx synthesizes an "interrupt-error" result to prevent accidental double-execution of side effects.
 
+User messages submitted while a tool is running are durable immediately, so
+their physical log entries may appear between the corresponding `ToolCalls`
+and `ToolResults`. Replay preserves the logical model order—tool call, tool
+result, then queued user—and orphan detection continues across those interleaved
+user entries. When the resumed turn completes, its `TurnEnd.through_seq` covers
+every queued user already included in replay; a zero-sequence completion
+boundary is invalid. These invariants keep repair idempotent and prevent a
+completed session from reconstructing as perpetually busy.
+
 ## Cleanup
 
 Session logs, leases, canonical metadata, and attachment blobs persist in

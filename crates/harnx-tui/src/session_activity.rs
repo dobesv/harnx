@@ -97,8 +97,22 @@ impl Tui {
         }
         if active {
             self.app.llm_busy = true;
-            self.active_remote_session = Some(target);
+            self.active_remote_session = Some(target.clone());
             self.refresh_input_chrome();
+            // Reopening a session can reveal a durable pending turn after its
+            // prior worker vanished. Re-activation is idempotent under the
+            // session lease and guarantees that "busy" has an owner that can
+            // either resume successfully or write a terminal Error.
+            #[cfg(not(test))]
+            if let Err(error) = self
+                .activate_pending_session(target.0.clone(), target.1.clone())
+                .await
+            {
+                log::warn!(
+                    "failed to reactivate pending attached session {}: {error:#}",
+                    target.0
+                );
+            }
         } else {
             // A reconnect may miss the lossy TurnEnded advisory. If this TUI
             // previously observed the foreign turn, converge from its durable

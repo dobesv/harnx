@@ -53,6 +53,118 @@ fn test_tool_round_callback(ctx: &PromptTaskContext) -> harnx_runtime::OnToolRou
 }
 
 impl Tui {
+    /// Queue input submitted while the current turn is busy. Plain text for a
+    /// durable session can reach the running worker's next tool-round seam;
+    /// other input retains the frontend-owned next-turn fallback.
+    pub(super) async fn queue_busy_input(&mut self, text: String) {
+        let pending = PendingMessage {
+            text,
+            attachments: self.app.attachments.clone(),
+            attachment_dir: self.app.attachment_dir.clone(),
+            paste_count: self.app.paste_count,
+        };
+        self.app.pending_message = Some(pending.clone());
+
+        match self.enqueue_pending_into_active_turn(&pending).await {
+            Ok(true) => self.finish_durable_pending_enqueue(pending).await,
+            Ok(false) => {
+                *self.shared_pending_message.lock().await = Some(pending);
+            }
+            Err(error) => {
+                log::warn!("failed to queue pending message into active turn: {error:#}");
+                *self.shared_pending_message.lock().await = Some(pending);
+            }
+        }
+        self.refresh_input_chrome();
+    }
+
+    async fn finish_durable_pending_enqueue(&mut self, pending: PendingMessage) {
+        // The worker can consume this at its next tool-round seam. Remove the
+        // local fallback so turn completion cannot submit it twice.
+        self.app.pending_message = None;
+        *self.shared_pending_message.lock().await = None;
+        self.app.input = Self::new_input();
+        self.app.transcript.push(TranscriptItem::UserText {
+            text: pending.text,
+            seq: None,
+            timestamp: Some(chrono::Utc::now()),
+        });
+        self.pin_transcript_to_bottom();
+    }
+
+    async fn nats_session_for_target(
+        &self,
+        session_id: String,
+        cluster: String,
+    ) -> Result<NatsSession> {
+        let abort_signal = harnx_runtime::utils::create_abort_signal();
+        let activation_route = harnx_runtime::local_orchestrator::activation_route_for_cluster(
+            &cluster,
+            &self.local_worker,
+            abort_signal.clone(),
+        )
+        .await?;
+        let initializer = {
+            let config = self.config.read();
+            let agent = config
+                .remote_agent
+                .as_ref()
+                .map(|(agent, _)| agent.clone())
+                .or_else(|| config.agent.as_ref().map(|agent| agent.name().to_string()))
+                .unwrap_or_default();
+            harnx_runtime::SessionInitializer::named_from_config(agent, &config)
+        };
+        NatsSession::from_global_config(
+            NatsSessionConfig {
+                cluster,
+                initializer,
+                session_id: Some(session_id),
+                activation_route,
+            },
+            &self.config,
+            abort_signal,
+        )
+        .await
+    }
+
+    #[cfg(not(test))]
+    pub(super) async fn activate_pending_session(
+        &self,
+        session_id: String,
+        cluster: String,
+    ) -> Result<()> {
+        self.nats_session_for_target(session_id, cluster)
+            .await?
+            .activate_pending_turn()
+            .await?;
+        Ok(())
+    }
+
+    /// Queue a plain-text follow-up directly into the durable session while
+    /// its current turn is still running. Dot commands and attachments retain
+    /// the existing next-turn path because they require frontend processing.
+    pub(super) async fn enqueue_pending_into_active_turn(
+        &self,
+        pending: &PendingMessage,
+    ) -> Result<bool> {
+        if pending.text.trim_start().starts_with('.') || !pending.attachments.is_empty() {
+            return Ok(false);
+        }
+        let Some((session_id, cluster)) = self.active_remote_session.clone() else {
+            return Ok(false);
+        };
+        // Unit tests for the in-process loop use the shared pending-message
+        // callback instead of a broker-backed local worker.
+        #[cfg(test)]
+        if cluster == harnx_runtime::config::LOCAL_CLUSTER_KEY {
+            return Ok(false);
+        }
+
+        let session = self.nats_session_for_target(session_id, cluster).await?;
+        session.enqueue_text(&pending.text).await?;
+        Ok(true)
+    }
+
     pub(super) async fn finish_prompt_task(&mut self, task: AbortSignal, error: Option<String>) {
         let is_current = self
             .current_prompt_abort
