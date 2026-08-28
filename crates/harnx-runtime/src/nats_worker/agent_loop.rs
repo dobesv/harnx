@@ -928,7 +928,10 @@ fn find_orphan_tool_calls(
 ) -> Vec<PendingToolCalls> {
     use harnx_core::session::SessionLogEntry;
 
-    // Find the last ToolCalls entry that lacks a matching ToolResults
+    // User messages may arrive while a tool is still running, so only a
+    // matching ToolResults entry or a subsequent ToolCalls batch closes the
+    // current candidate. In particular, a synthetic repair appended after a
+    // queued user must make a later scan idempotent.
     let mut orphans = Vec::new();
     let mut last_tool_calls: Option<PendingToolCalls> = None;
 
@@ -941,6 +944,9 @@ fn find_orphan_tool_calls(
                 timestamp,
                 ..
             } => {
+                if let Some(previous) = last_tool_calls.take() {
+                    orphans.push(previous);
+                }
                 last_tool_calls = Some(PendingToolCalls {
                     seq: *seq,
                     text: text.clone(),
@@ -952,12 +958,6 @@ fn find_orphan_tool_calls(
             SessionLogEntry::ToolResults { .. } => {
                 // ToolResults clears the pending ToolCalls
                 last_tool_calls = None;
-            }
-            SessionLogEntry::Message { role, .. } if role.is_user() => {
-                // A new user message ends the prior turn; any orphan ToolCalls above it is still an orphan
-                if let Some(tc) = last_tool_calls.take() {
-                    orphans.push(tc);
-                }
             }
             _ => {}
         }
@@ -1172,8 +1172,8 @@ fn rerun_failure_output(
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_resolved_hooks, dispatch_session_start, fold_new_user_messages_since, SessionOrigin,
-        SessionStartDispatch,
+        agent_resolved_hooks, dispatch_session_start, find_orphan_tool_calls,
+        fold_new_user_messages_since, SessionOrigin, SessionStartDispatch,
     };
     use crate::config::Config;
     use crate::nats_hook_provider::{DiscoveredHook, NatsHookProvider};
@@ -1265,6 +1265,72 @@ mod tests {
             timestamp: Some(timestamp),
             fence_token: None,
         }
+    }
+
+    fn tool_calls_entry(call_id: &str) -> SessionLogEntry {
+        SessionLogEntry::ToolCalls {
+            text: "working".to_string(),
+            thought: None,
+            calls: vec![harnx_core::tool::ToolCall::new(
+                "search".to_string(),
+                serde_json::json!({}),
+                Some(call_id.to_string()),
+                None,
+            )],
+            timestamp: None,
+            fence_token: Some(7),
+        }
+    }
+
+    fn tool_results_entry(call_id: &str) -> SessionLogEntry {
+        SessionLogEntry::ToolResults {
+            results: vec![harnx_core::session::ToolOutput {
+                id: Some(call_id.to_string()),
+                name: "search".to_string(),
+                output: serde_json::json!({"ok": true}),
+                markdown: None,
+                content: Vec::new(),
+                switch_agent: None,
+            }],
+            timestamp: None,
+        }
+    }
+
+    #[test]
+    fn orphan_repair_result_after_queued_user_is_idempotent() {
+        let entries = vec![
+            (1, tool_calls_entry("call-1")),
+            (
+                2,
+                user_entry(
+                    "queued",
+                    "queued correction",
+                    Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 2).unwrap(),
+                ),
+            ),
+            (3, tool_results_entry("call-1")),
+        ];
+
+        assert!(find_orphan_tool_calls(&entries).is_empty());
+    }
+
+    #[test]
+    fn tool_call_without_results_remains_orphaned_after_queued_user() {
+        let entries = vec![
+            (1, tool_calls_entry("call-1")),
+            (
+                2,
+                user_entry(
+                    "queued",
+                    "queued correction",
+                    Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 2).unwrap(),
+                ),
+            ),
+        ];
+
+        let orphans = find_orphan_tool_calls(&entries);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].seq, 1);
     }
 
     #[test]

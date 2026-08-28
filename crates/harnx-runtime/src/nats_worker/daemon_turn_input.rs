@@ -7,6 +7,7 @@ use super::daemon::SessionActivate;
 use super::daemon_runtime::WorkerRuntime;
 use crate::config::{GlobalConfig, Input};
 use crate::nats_lease::NatsSessionLease;
+use anyhow::{Context, Result};
 
 /// Shared, borrowed context for the `derive_*_turn_input` helpers. Groups the
 /// three references they all thread through so each helper stays within the
@@ -16,6 +17,11 @@ pub(super) struct TurnInputCtx<'a> {
     pub(super) activation: &'a SessionActivate,
     pub(super) per_session: &'a GlobalConfig,
     pub(super) backend: &'a NatsSessionLogBackend,
+}
+
+struct ResumableTurnState<'a> {
+    context: Option<&'a harnx_core::session_reconstruct::ResumableCtx>,
+    next_turn_messages: &'a [harnx_core::message::Message],
 }
 
 impl WorkerRuntime {
@@ -61,9 +67,9 @@ impl WorkerRuntime {
         ctx: TurnInputCtx<'_>,
         lease: &NatsSessionLease,
         high_water: Option<u64>,
-    ) -> (Input, Option<u64>) {
+    ) -> Result<(Input, Option<u64>)> {
         if let Some(continuation) = self.derive_continuation_turn_input(ctx, high_water).await {
-            return continuation;
+            return Ok(continuation);
         }
         let TurnInputCtx {
             activation,
@@ -89,9 +95,15 @@ impl WorkerRuntime {
                 );
                 (crate::config::input::from_str(per_session, "", None), None)
             }
-            harnx_core::session_reconstruct::TurnStatus::InFlightResumable => {
-                self.derive_resumable_turn_input(ctx, lease, reconstructed.resumable_ctx)
-            }
+            harnx_core::session_reconstruct::TurnStatus::InFlightResumable => self
+                .derive_resumable_turn_input(
+                    ctx,
+                    lease,
+                    ResumableTurnState {
+                        context: reconstructed.resumable_ctx.as_ref(),
+                        next_turn_messages: &reconstructed.next_turn_messages,
+                    },
+                )?,
             harnx_core::session_reconstruct::TurnStatus::Idle => {
                 let msg_count = reconstructed.next_turn_messages.len();
                 let result = self
@@ -123,7 +135,7 @@ impl WorkerRuntime {
         // reorders the assistant barrier past concurrently-arrived messages,
         // burying them so they are never folded into a continuation turn.
         input.skip_user_log_append = true;
-        (input, seed_cursor)
+        Ok((input, seed_cursor))
     }
 
     /// Resumable-turn input: resume from the last user message that kicked
@@ -133,8 +145,8 @@ impl WorkerRuntime {
         &self,
         ctx: TurnInputCtx<'_>,
         lease: &NatsSessionLease,
-        resumable_ctx: Option<harnx_core::session_reconstruct::ResumableCtx>,
-    ) -> (Input, Option<u64>) {
+        state: ResumableTurnState<'_>,
+    ) -> Result<(Input, Option<u64>)> {
         let TurnInputCtx {
             activation,
             per_session,
@@ -146,20 +158,23 @@ impl WorkerRuntime {
             lease.worker_id(),
             lease.fence_token()
         );
-        // Extract the last_user Message to get both its text (for Input) and log_seq (for cursor).
+        let resumable_ctx = state
+            .context
+            .context("refusing to resume an in-flight tool round without reconstructed context")?;
+        // A resumable tool round must retain the user that initiated it. Empty
+        // input is otherwise treated as a successful no-op by the shared agent
+        // loop, which leaves the same durable tool tail resumable forever.
         let last_user_msg = resumable_ctx
+            .last_user
             .as_ref()
-            .and_then(|ctx| ctx.last_user.as_ref());
-        let input = if let Some(last_user) = last_user_msg {
-            crate::config::input::from_str(per_session, &last_user.content.to_text(), None)
-        } else {
-            crate::config::input::from_str(per_session, "", None)
-        };
-        // Cursor: the log_seq of the last user message that kicked off this resumable turn.
-        // Any messages appended AFTER this (seq > cursor) will be folded mid-turn.
-        let seed_cursor =
-            last_user_msg.and_then(|msg| msg.log_seq.and_then(|seq| u64::try_from(seq).ok()));
-        (input, seed_cursor)
+            .context("refusing to resume an in-flight tool round without an initiating user")?;
+        let input =
+            crate::config::input::from_str(per_session, &last_user_msg.content.to_text(), None);
+        // Replay includes user messages queued behind the orphan tool call in
+        // the model history. The completion boundary must therefore cover the
+        // latest of those messages, not merely the initiating user.
+        let seed_cursor = resumable_seed_cursor(resumable_ctx, state.next_turn_messages)?;
+        Ok((input, Some(seed_cursor)))
     }
 
     /// Idle-state input: fold queued next-turn messages in log order.
@@ -182,5 +197,66 @@ impl WorkerRuntime {
             crate::config::input::from_str(per_session, &folded, None),
             seed_cursor,
         )
+    }
+}
+
+fn durable_user_seq(message: &harnx_core::message::Message) -> Result<u64> {
+    let seq = message
+        .log_seq
+        .context("reconstructed NATS user message has no durable sequence")?;
+    u64::try_from(seq).context("reconstructed NATS user sequence does not fit u64")
+}
+
+fn resumable_seed_cursor(
+    resumable_ctx: &harnx_core::session_reconstruct::ResumableCtx,
+    next_turn_messages: &[harnx_core::message::Message],
+) -> Result<u64> {
+    let last_user = resumable_ctx
+        .last_user
+        .as_ref()
+        .context("resumable tool round has no initiating user")?;
+    let mut cursor = durable_user_seq(last_user)?;
+    for message in next_turn_messages {
+        cursor = cursor.max(durable_user_seq(message)?);
+    }
+    Ok(cursor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resumable_seed_cursor;
+    use harnx_core::message::{Message, MessageContent, MessageRole};
+    use harnx_core::session_reconstruct::ResumableCtx;
+
+    fn user(text: &str, seq: usize) -> Message {
+        Message::new(MessageRole::User, MessageContent::Text(text.to_string())).with_log_seq(seq)
+    }
+
+    #[test]
+    fn resume_cursor_covers_users_queued_behind_the_tool_call() {
+        let context = ResumableCtx {
+            last_user: Some(user("original", 3)),
+            last_assistant: None,
+            pending_tool_results: Vec::new(),
+            fence_token: Some(7),
+        };
+
+        assert_eq!(
+            resumable_seed_cursor(&context, &[user("queued one", 8), user("queued two", 11)])
+                .unwrap(),
+            11
+        );
+    }
+
+    #[test]
+    fn resume_cursor_rejects_missing_initiating_user() {
+        let context = ResumableCtx {
+            last_user: None,
+            last_assistant: None,
+            pending_tool_results: Vec::new(),
+            fence_token: Some(7),
+        };
+
+        assert!(resumable_seed_cursor(&context, &[]).is_err());
     }
 }

@@ -23,7 +23,7 @@ use log::warn;
 use ratatui::Terminal;
 #[cfg(test)]
 use ratatui_textarea::Input as TextInput;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -231,6 +231,7 @@ impl Tui {
             current_prompt_abort: None,
             current_prompt_handle: None,
             active_remote_session: None,
+            pending_remote_activations: HashSet::new(),
             session_activity_target: None,
             session_activity_handle: None,
             subagent_monitor_root: None,

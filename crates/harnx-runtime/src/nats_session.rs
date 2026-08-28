@@ -280,6 +280,32 @@ pub(crate) struct EnqueuedPrompt {
     pub user_msg_seq: u64,
 }
 
+/// Result of durably appending text that may still need worker activation.
+pub struct DurableTextEnqueue {
+    user_msg_seq: u64,
+    activation_error: Option<anyhow::Error>,
+}
+
+impl DurableTextEnqueue {
+    /// Sequence assigned to the durable user message.
+    pub fn user_msg_seq(&self) -> u64 {
+        self.user_msg_seq
+    }
+
+    /// Publication failure that left the durable message pending activation.
+    pub fn activation_error(&self) -> Option<&anyhow::Error> {
+        self.activation_error.as_ref()
+    }
+
+    /// Convert the outcome into the durable sequence or publication error.
+    pub fn into_activation_result(self) -> Result<u64> {
+        if let Some(error) = self.activation_error {
+            return Err(error);
+        }
+        Ok(self.user_msg_seq)
+    }
+}
+
 struct AppendedPrompt {
     user_msg_id: String,
     user_msg_seq: u64,
@@ -439,14 +465,58 @@ impl NatsSession {
     /// Durably append a prompt and publish the matching worker activation
     /// without waiting for the target turn to finish.
     pub(crate) async fn enqueue(&self, user_message: &str) -> Result<EnqueuedPrompt> {
+        let user_msg_seq = self
+            .enqueue_text(user_message)
+            .await?
+            .into_activation_result()?;
+        Ok(EnqueuedPrompt {
+            session_id: self.session_id.clone(),
+            user_msg_seq,
+        })
+    }
+
+    /// Durably queue text for the active session without waiting for its turn
+    /// to finish. A running worker can inject it at the next tool-round seam;
+    /// the activation also guarantees delivery if the current turn wins the
+    /// race and becomes idle first. Once the append succeeds, the returned
+    /// sequence remains authoritative even if activation publication fails;
+    /// callers must retry activation instead of appending the text again.
+    pub async fn enqueue_text(&self, user_message: &str) -> Result<DurableTextEnqueue> {
         let appended = self
             .append_user_content(MessageContent::Text(user_message.to_string()))
             .await?;
-        self.publish_activation(appended.user_msg_seq).await?;
-        Ok(EnqueuedPrompt {
-            session_id: self.session_id.clone(),
+        let activation_error = self.publish_activation(appended.user_msg_seq).await.err();
+        Ok(DurableTextEnqueue {
             user_msg_seq: appended.user_msg_seq,
+            activation_error,
         })
+    }
+
+    /// Re-publish activation for an existing pending durable turn without
+    /// appending another user message. This lets a newly attached frontend
+    /// recover a session whose previous worker disappeared after the prompt
+    /// was already stored.
+    pub async fn activate_pending_turn(&self) -> Result<Option<u64>> {
+        let log = NatsSessionLog::new(self.jetstream.clone(), self.session_id.clone());
+        let entries = log
+            .load_events_latest_async()
+            .await
+            .context("failed to inspect pending session before activation")?;
+        let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)?;
+        let Some(user_msg_seq) = effective.iter().rev().find_map(|(seq, entry)| {
+            matches!(
+                entry,
+                SessionLogEntry::Message { role, .. } if role.is_user()
+            )
+            .then_some(*seq)
+        }) else {
+            return Ok(None);
+        };
+        if requested_seq_status(&entries, user_msg_seq)? == RequestedSeqStatus::Covered {
+            return Ok(None);
+        }
+        self.publish_activation(user_msg_seq).await?;
+        Ok(Some(user_msg_seq))
     }
 
     /// Run a turn: append user message, activate worker, stream events until completion.

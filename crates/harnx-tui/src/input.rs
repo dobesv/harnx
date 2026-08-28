@@ -372,22 +372,7 @@ impl Tui {
                     // Add to history (fix #4)
                     self.push_history(text.clone());
                     if self.app.llm_busy {
-                        // Queue the message to send when LLM finishes or
-                        // after the next tool round completes.
-                        // Keep the text in input so user can see/edit it.
-                        let pending_attachments = self.app.attachments.clone();
-                        let pending_attachment_dir = self.app.attachment_dir.clone();
-                        let pending = crate::types::PendingMessage {
-                            text,
-                            attachments: pending_attachments,
-                            attachment_dir: pending_attachment_dir,
-                            paste_count: self.app.paste_count,
-                        };
-                        self.app.pending_message = Some(pending.clone());
-                        // Publish to shared state so the prompt task can
-                        // pick it up between tool rounds.
-                        *self.shared_pending_message.lock().await = Some(pending);
-                        self.refresh_input_chrome();
+                        self.queue_busy_input(text).await;
                     } else if text.trim_start().starts_with('.') {
                         // Dot-command: route through command handler
                         let attachments_snapshot = self.app.attachments.clone();

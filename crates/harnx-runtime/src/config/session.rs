@@ -117,12 +117,12 @@ fn replay_log_entries_into_session(
 ) -> Result<Session> {
     let effective_entries = build_effective_log_entries(raw_entries, name);
 
-    // Pending ToolCalls entry awaiting a matching ToolResults entry.
-    // On any other entry (or EOF) while pending, we repair by
-    // synthesizing lost-response errors for each pending call — this
-    // only matters for the tail of the log (crash mid tool round);
-    // mid-log corruption would be an invariant violation.
+    // Pending ToolCalls entry awaiting a matching ToolResults entry. User
+    // messages may be appended while the tool is still running, so buffer
+    // them until the result arrives and replay the valid conversation order:
+    // assistant tool call -> tool result -> injected user message.
     let mut pending: Option<PendingToolCalls> = None;
+    let mut users_queued_during_tool = Vec::new();
 
     for (seq, entry) in effective_entries {
         match entry {
@@ -133,11 +133,6 @@ fn replay_log_entries_into_session(
                 timestamp,
                 ..
             } => {
-                if let Some(pending) = pending.take() {
-                    session
-                        .messages
-                        .push(repair_orphan_tool_calls(pending, name)?);
-                }
                 if role == MessageRole::Tool {
                     anyhow::bail!(
                         "Invalid log entry in session {name}: Tool-role Message entries are                          no longer supported; use tool_calls/tool_results entries"
@@ -154,6 +149,16 @@ fn replay_log_entries_into_session(
                 if let Some(timestamp) = timestamp {
                     message = message.with_log_timestamp(timestamp);
                 }
+                if role.is_user() && pending.is_some() {
+                    users_queued_during_tool.push(message);
+                    continue;
+                }
+                finish_orphaned_tool_round(
+                    &mut session,
+                    &mut pending,
+                    &mut users_queued_during_tool,
+                    name,
+                )?;
                 session.messages.push(message);
             }
             SessionLogEntry::ToolCalls {
@@ -163,11 +168,12 @@ fn replay_log_entries_into_session(
                 timestamp,
                 ..
             } => {
-                if let Some(pending) = pending.take() {
-                    session
-                        .messages
-                        .push(repair_orphan_tool_calls(pending, name)?);
-                }
+                finish_orphaned_tool_round(
+                    &mut session,
+                    &mut pending,
+                    &mut users_queued_during_tool,
+                    name,
+                )?;
                 pending = Some(PendingToolCalls {
                     seq,
                     text,
@@ -198,21 +204,24 @@ fn replay_log_entries_into_session(
                     message = message.with_log_timestamp(timestamp);
                 }
                 session.messages.push(message);
+                session.messages.append(&mut users_queued_during_tool);
             }
             SessionLogEntry::DataUrls { urls } => {
                 session.data_urls.extend(urls);
             }
             SessionLogEntry::Compress { prompt } => {
-                if let Some(pending) = pending.take() {
-                    session
-                        .messages
-                        .push(repair_orphan_tool_calls(pending, name)?);
-                }
+                finish_orphaned_tool_round(
+                    &mut session,
+                    &mut pending,
+                    &mut users_queued_during_tool,
+                    name,
+                )?;
                 session.compressed_messages.append(&mut session.messages);
                 session.compaction_summary = Some(prompt);
             }
             SessionLogEntry::Clear => {
                 pending = None;
+                users_queued_during_tool.clear();
                 session.messages.clear();
                 session.compressed_messages.clear();
                 session.data_urls.clear();
@@ -230,13 +239,29 @@ fn replay_log_entries_into_session(
         }
     }
 
+    finish_orphaned_tool_round(
+        &mut session,
+        &mut pending,
+        &mut users_queued_during_tool,
+        name,
+    )?;
+
+    Ok(session)
+}
+
+fn finish_orphaned_tool_round(
+    session: &mut Session,
+    pending: &mut Option<PendingToolCalls>,
+    users_queued_during_tool: &mut Vec<Message>,
+    name: &str,
+) -> Result<()> {
     if let Some(pending) = pending.take() {
         session
             .messages
             .push(repair_orphan_tool_calls(pending, name)?);
     }
-
-    Ok(session)
+    session.messages.append(users_queued_during_tool);
+    Ok(())
 }
 
 /// Test-only log parser — runs full load pipeline (including replay and
@@ -1496,6 +1521,53 @@ content: recovered reply
         assert_eq!(loaded.replay_warnings.len(), 1);
         assert!(loaded.replay_warnings[0].contains("orphan tool results"));
         assert!(loaded.replay_warnings[0].contains("log entry 2"));
+    }
+
+    #[test]
+    fn replay_pairs_tool_results_across_a_queued_user_message() {
+        let content = r#"---
+type: message
+role: user
+content: original request
+---
+type: tool_calls
+text: working
+calls:
+  - name: search
+    arguments: {}
+    id: call-1
+---
+type: message
+role: user
+content: queued correction
+---
+type: tool_results
+results:
+  - id: call-1
+    name: search
+    output:
+      answer: found
+"#;
+
+        let loaded = load_from_log_for_test(content);
+
+        assert_eq!(
+            loaded
+                .messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            vec![MessageRole::User, MessageRole::Tool, MessageRole::User],
+            "the tool result must precede input queued while that tool was running"
+        );
+        let MessageContent::ToolCalls(tool_calls) = &loaded.messages[1].content else {
+            panic!("expected reconstructed tool message");
+        };
+        assert_eq!(
+            tool_calls.tool_results[0].output,
+            serde_json::json!({"answer": "found"})
+        );
+        assert!(loaded.replay_warnings.is_empty());
     }
 
     #[test]

@@ -10,6 +10,22 @@ fn sub_agent_source() -> AgentSource {
     }
 }
 
+#[tokio::test]
+async fn failed_pending_activations_for_two_targets_remain_retryable() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let first = ("session-a".to_string(), "cluster-a".to_string());
+    let second = ("session-b".to_string(), "cluster-b".to_string());
+
+    tui.retain_pending_remote_activation(first.clone());
+    tui.retain_pending_remote_activation(second.clone());
+
+    let retryable = tui.take_pending_remote_activation_targets();
+    assert_eq!(retryable.len(), 2);
+    assert!(retryable.contains(&first));
+    assert!(retryable.contains(&second));
+}
+
 /// A nested sub-agent error must not end the parent prompt while its
 /// delegating tool call is still in flight.
 #[tokio::test]

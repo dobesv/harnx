@@ -90,7 +90,21 @@ impl WorkerRuntime {
                         &lease,
                         activation_high_water,
                     )
-                    .await;
+                    .await?;
+
+                if seed_cursor.is_none() && input.is_empty() {
+                    log::info!(
+                        "execute_session has no durable turn to run: session_id={}",
+                        activation.session_id,
+                    );
+                    break Ok(());
+                }
+                if input.is_empty() {
+                    anyhow::bail!("refusing to complete a durable worker turn with empty input");
+                }
+                if seed_cursor.is_none() {
+                    anyhow::bail!("refusing to run a worker turn without a durable user cursor");
+                }
 
                 log::info!(
                     "execute_session turn: session_id={} seed_cursor={:?}",
@@ -298,6 +312,9 @@ impl WorkerRuntime {
         lease: &NatsSessionLease,
         through_seq: u64,
     ) -> Result<()> {
+        if through_seq == 0 {
+            anyhow::bail!("refusing to persist a zero-sequence turn boundary");
+        }
         if !should_append_control_log_entry(lease) {
             return Ok(());
         }

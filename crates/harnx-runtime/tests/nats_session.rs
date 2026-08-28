@@ -217,6 +217,69 @@ async fn user_message_has_client_id() -> Result<()> {
     Ok(())
 }
 
+/// A failed activation occurs after the user row is already durable. Retrying
+/// must publish work for that sequence instead of appending the prompt again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enqueue_text_preserves_durable_sequence_after_activation_failure() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: nats-server not available");
+        return Ok(());
+    };
+
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_id = new_remote_session_id();
+    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let session = NatsSession::new(
+        resumed_session_config(session_id),
+        client,
+        jetstream.clone(),
+        harnx_runtime::utils::create_abort_signal(),
+    )
+    .await?;
+
+    // Occupy the expected activation stream name with an incompatible subject.
+    // The session log uses its own stream, so append succeeds while activation
+    // publication deterministically receives no matching JetStream response.
+    const NOTIFY_STREAM: &str = "WORK_NOTIFY_test";
+    jetstream
+        .create_stream(async_nats::jetstream::stream::Config {
+            name: NOTIFY_STREAM.to_string(),
+            subjects: vec!["test.incompatible.activation.subject".to_string()],
+            ..Default::default()
+        })
+        .await?;
+
+    let enqueued = session.enqueue_text("queued once").await?;
+    assert!(enqueued.activation_error().is_some());
+    let user_msg_seq = enqueued.user_msg_seq();
+    let entries_after_failure = log.load_events_async().await?;
+    assert_eq!(
+        entries_after_failure
+            .iter()
+            .filter(|(_, entry)| matches!(
+                entry,
+                SessionLogEntry::Message {
+                    role: MessageRole::User,
+                    content: MessageContent::Text(text),
+                    ..
+                } if text == "queued once"
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(entries_after_failure[0].0, user_msg_seq);
+
+    jetstream.delete_stream(NOTIFY_STREAM).await?;
+    assert_eq!(session.activate_pending_turn().await?, Some(user_msg_seq));
+    let entries_after_retry = log.load_events_async().await?;
+    assert_eq!(entries_after_retry.len(), entries_after_failure.len());
+    assert_eq!(entries_after_retry[0].0, user_msg_seq);
+
+    Ok(())
+}
+
 /// Test retract-before-consume appends correct EditEntries and removes the message
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retract_queued_user_message() -> Result<()> {
