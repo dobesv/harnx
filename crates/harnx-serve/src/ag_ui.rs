@@ -1548,6 +1548,26 @@ fn history_stable_base(message: &HistoryMsg, ordinal: usize) -> String {
     }
 }
 
+fn completed_history_tool_message(
+    result: &harnx_core::tool::ToolResult,
+    tool_call_id: ToolCallId,
+) -> Option<AgUiMessage> {
+    if harnx_runtime::config::session::is_pending_tool_result(result) {
+        return None;
+    }
+    let content = result
+        .markdown
+        .clone()
+        .or_else(|| result.output.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| result.output.to_string());
+    Some(AgUiMessage::Tool {
+        id: MessageId::random(),
+        content,
+        tool_call_id,
+        error: None,
+    })
+}
+
 pub(crate) fn history_messages_for_snapshot(history: &[HistoryMsg]) -> Vec<AgUiMessage> {
     let mut messages = Vec::with_capacity(history.len());
     for (ordinal, message) in history.iter().enumerate() {
@@ -1589,19 +1609,16 @@ pub(crate) fn history_messages_for_snapshot(history: &[HistoryMsg]) -> Vec<AgUiM
                     name: None,
                     tool_calls: Some(assistant_tool_calls.clone()),
                 });
-                for (index, tool_result) in tool_calls.tool_results.iter().enumerate() {
-                    let content = tool_result
-                        .markdown
-                        .clone()
-                        .or_else(|| tool_result.output.as_str().map(ToOwned::to_owned))
-                        .unwrap_or_else(|| tool_result.output.to_string());
-                    messages.push(AgUiMessage::Tool {
-                        id: MessageId::random(),
-                        content,
-                        tool_call_id: assistant_tool_calls[index].id.clone(),
-                        error: None,
-                    });
-                }
+                // In-flight tools have assistant calls but no result messages.
+                messages.extend(
+                    tool_calls
+                        .tool_results
+                        .iter()
+                        .zip(&assistant_tool_calls)
+                        .filter_map(|(result, call)| {
+                            completed_history_tool_message(result, call.id.clone())
+                        }),
+                );
             }
             // ag-ui-core's generic constructor intentionally creates assistant
             // messages with `content: None`; construct this variant explicitly

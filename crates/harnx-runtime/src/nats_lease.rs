@@ -331,6 +331,27 @@ pub async fn lease_holder_in(
         .with_context(|| format!("Failed to decode NATS lease record for session '{session_id}'"))
 }
 
+/// Check whether a worker currently holds the session lease without acquiring
+/// or mutating it. A missing lease bucket means no session can currently be
+/// leased on this cluster.
+pub async fn session_has_active_lease(
+    jetstream: &jetstream::Context,
+    session_id: &str,
+) -> Result<bool> {
+    let config = NatsLeaseConfig::default();
+    let bucket = match jetstream.get_key_value(&config.bucket).await {
+        Ok(bucket) => bucket,
+        Err(error) if crate::nats_admin::kv_bucket_missing(&error) => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to open NATS lease bucket '{}'", config.bucket));
+        }
+    };
+    Ok(lease_holder_in(&bucket, &config, session_id)
+        .await?
+        .is_some())
+}
+
 /// Open the lease bucket, creating it at `config.replicas` if it doesn't
 /// exist yet, or raising an existing bucket's replica count to match if an
 /// operator changed cluster config after the bucket was first created. This
