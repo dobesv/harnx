@@ -865,10 +865,7 @@ impl Tui {
                 let title = "Select Session";
                 let footer = "↑↓ navigate  Enter select  Esc cancel";
                 let mut items: Vec<String> = vec!["✦ New session".to_string()];
-                items.extend(sessions.iter().map(|session| match &session.title {
-                    Some(title) => format!("{}  {}", session.id, title),
-                    None => session.id.clone(),
-                }));
+                items.extend(sessions.iter().map(|session| session.picker_label()));
                 // Prepend error message if present (visible in picker)
                 if let Some(err) = error {
                     items.insert(0, format!("⚠ {}", err));

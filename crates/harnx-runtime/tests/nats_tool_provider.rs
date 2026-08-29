@@ -2,13 +2,22 @@
 mod common;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use harnx_core::abort::create_abort_signal;
+use harnx_core::execution_context::{
+    ExecutionContextObservation, GitRemoteObservation, GitRepositoryObservation,
+    EXECUTION_CONTEXT_NAMESPACE,
+};
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
-use harnx_core::tool::{ToolError, ToolProvider};
+use harnx_core::tool::{ToolCall, ToolError, ToolProvider, ToolResult};
 use harnx_runtime::config::{Config, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV};
+use harnx_runtime::nats_session_metadata::{
+    execution_contexts, SessionInitializer, SessionMetadata, SessionMetadataStore,
+};
 use harnx_runtime::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
+use harnx_runtime::nats_worker::NatsSessionLogBackend;
 use harnx_time_server::TimeToolset;
-use harnx_toolset::{server_identity_token, Registration, ToolSpec};
+use harnx_toolset::{server_identity_token, Registration, ToolInvokeError, ToolSpec, Toolset};
 use harnx_toolset_server::{
     registration_key, serve_over_nats, TOOL_PROTOCOL_VERSION, TOOL_REGISTRY_BUCKET,
     TOOL_SCHEMA_VERSION,
@@ -20,6 +29,44 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const TOKEN: &str = "nats-tool-provider-test-token";
+
+struct ExecutionContextToolset {
+    observation: ExecutionContextObservation,
+}
+
+#[async_trait]
+impl Toolset for ExecutionContextToolset {
+    fn name(&self) -> &str {
+        "context"
+    }
+
+    fn tools(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "observe_execution_context".to_string(),
+            description: "Return a test execution context".to_string(),
+            input_schema: json!({"type": "object"}),
+            idempotent_hint: true,
+            read_only_hint: true,
+            timeout_secs: None,
+            meta: None,
+        }]
+    }
+
+    async fn invoke(
+        &self,
+        tool: &str,
+        _args: serde_json::Value,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> std::result::Result<serde_json::Value, ToolInvokeError> {
+        assert_eq!(tool, "observe_execution_context");
+        Ok(json!({
+            "content": [{"type": "text", "text": "observed"}],
+            "_meta": {
+                EXECUTION_CONTEXT_NAMESPACE: self.observation
+            }
+        }))
+    }
+}
 
 struct EnvGuard {
     url: Option<OsString>,
@@ -62,13 +109,17 @@ impl Drop for EnvGuard {
     }
 }
 
-async fn wait_for_registry(client: &async_nats::Client, instance_id: &ServerScope) -> Result<()> {
+async fn wait_for_registry(
+    client: &async_nats::Client,
+    instance_id: &ServerScope,
+    identity: &str,
+) -> Result<()> {
     let jetstream = async_nats::jetstream::new(client.clone());
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(store) = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await {
             if store
-                .get(registration_key(instance_id, "____time"))
+                .get(registration_key(instance_id, identity))
                 .await?
                 .is_some()
             {
@@ -76,10 +127,36 @@ async fn wait_for_registry(client: &async_nats::Client, instance_id: &ServerScop
             }
         }
         if Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for time tool registration");
+            anyhow::bail!("timed out waiting for tool registration '{identity}'");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn spawn_execution_context_server(
+    instance_id: ServerScope,
+    server_url: String,
+    workspace: &std::path::Path,
+) -> tokio::task::JoinHandle<Result<()>> {
+    let mut observation = ExecutionContextObservation::observe(workspace, workspace);
+    observation.repository = Some(GitRepositoryObservation {
+        worktree_root: workspace.to_string_lossy().into_owned(),
+        branch: Some("feature".to_string()),
+        remotes: vec![GitRemoteObservation {
+            name: "origin".to_string(),
+            repository: "github.com/acme/context-repo".to_string(),
+            primary: true,
+        }],
+    });
+    tokio::spawn(async move {
+        serve_over_nats(
+            ExecutionContextToolset { observation },
+            instance_id,
+            &server_url,
+            TOKEN,
+        )
+        .await
+    })
 }
 
 async fn set_wait_timeout(
@@ -222,6 +299,72 @@ async fn assert_invocation_and_per_call_timeout(provider: &NatsToolProvider) -> 
     Ok(())
 }
 
+async fn assert_context_flows_from_tool_to_session_enumeration(
+    provider: &NatsToolProvider,
+    client: &async_nats::Client,
+) -> Result<()> {
+    let call = ToolCall::new(
+        "observe_execution_context".to_string(),
+        json!({}),
+        Some("context-call".to_string()),
+        None,
+    );
+    let provider_output = provider
+        .call_tool(&call.name, call.arguments.clone(), &create_abort_signal())
+        .await
+        .map_err(tool_error)?;
+    assert!(provider_output
+        .value
+        .get("_meta")
+        .and_then(|meta| meta.get(EXECUTION_CONTEXT_NAMESPACE))
+        .is_none());
+    let mut tool_result = ToolResult::new(call.clone(), provider_output.value);
+    tool_result.execution_context = provider_output.execution_context;
+
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let session_id = format!("tool-context-{}", uuid::Uuid::new_v4());
+    let metadata = SessionMetadata::new(
+        &session_id,
+        SessionInitializer::named("metis", Default::default()),
+    );
+    store.create(&metadata).await?;
+    let backend =
+        NatsSessionLogBackend::new(jetstream, &session_id).with_metadata_store(Some(store.clone()));
+    let mut session = metadata.base_session();
+    let sink = Arc::new(backend) as Arc<dyn harnx_runtime::config::session::SessionAppendSink>;
+    session.runtime = Some(Arc::new(sink));
+    let config = Arc::new(RwLock::new(Config::default()));
+    let input = harnx_runtime::config::input::from_str(
+        &config,
+        "inspect context",
+        Some(config.read().extract_agent()),
+    );
+    harnx_runtime::config::session::add_tool_calls(
+        &mut session,
+        &input,
+        "observing",
+        None,
+        std::slice::from_ref(&call),
+    )?;
+    harnx_runtime::config::session::add_tool_results(&mut session, &[tool_result])?;
+
+    let listed = store.list().await?;
+    let retained = listed
+        .iter()
+        .find(|listed| listed.metadata.session_id == session_id)
+        .map(|listed| execution_contexts(&listed.metadata))
+        .transpose()?
+        .expect("session appears in canonical enumeration");
+    assert_eq!(retained.len(), 1);
+    assert_eq!(
+        retained[0].primary_repository(),
+        Some("github.com/acme/context-repo")
+    );
+    assert_eq!(retained[0].branch(), Some("feature"));
+    Ok(())
+}
+
 async fn assert_per_call_timeout_enforced(provider: &NatsToolProvider) -> Result<()> {
     let started = Instant::now();
     let result = provider
@@ -346,11 +489,15 @@ async fn nats_tool_provider_end_to_end_declarations_cancel_and_precedence() -> R
     let server_task = tokio::spawn(async move {
         serve_over_nats(TimeToolset::new(), server_instance, &server_url, TOKEN).await
     });
+    let workspace = tempfile::tempdir()?;
+    let context_task =
+        spawn_execution_context_server(instance_id.clone(), server.url.clone(), workspace.path());
     let client = async_nats::ConnectOptions::new()
         .token(TOKEN.to_string())
         .connect(server.url())
         .await?;
-    wait_for_registry(&client, &instance_id).await?;
+    wait_for_registry(&client, &instance_id, "____time").await?;
+    wait_for_registry(&client, &instance_id, "____context").await?;
     set_wait_timeout(&client, &instance_id, 2).await?;
     add_collision_registration(&client, &instance_id).await?;
     add_duplicate_registrations(&client, &instance_id).await?;
@@ -364,6 +511,7 @@ async fn nats_tool_provider_end_to_end_declarations_cancel_and_precedence() -> R
 
     assert_declarations_and_collisions(&provider);
     assert_invocation_and_per_call_timeout(&provider).await?;
+    assert_context_flows_from_tool_to_session_enumeration(&provider, &client).await?;
 
     set_wait_timeout(&client, &instance_id, 1).await?;
     let short_timeout_provider = NatsToolProvider::discover(
@@ -377,7 +525,10 @@ async fn nats_tool_provider_end_to_end_declarations_cancel_and_precedence() -> R
 
     assert_context_declarations_and_precedence(&instance_id).await;
     assert_abort_and_supervisor_failure(&provider).await?;
-    assert_server_unavailable(&provider, server_task).await
+    let result = assert_server_unavailable(&provider, server_task).await;
+    context_task.abort();
+    let _ = context_task.await;
+    result
 }
 
 fn tool_error(error: ToolError) -> anyhow::Error {

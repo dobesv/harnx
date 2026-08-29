@@ -1,3 +1,6 @@
+use harnx_core::execution_context::{
+    ExecutionContextObservation, ToolObservationProvenance, EXECUTION_CONTEXT_NAMESPACE,
+};
 use harnx_core::safety::{format_size, sanitize_output_text, truncate_output, TruncateOpts};
 
 use fancy_regex::Regex;
@@ -100,6 +103,50 @@ fn call_template_meta(call_template: &str) -> MetaObject {
             .expect("object literal")
             .clone(),
     )
+}
+
+fn request_wants_execution_context(request: &CallToolRequestParams) -> bool {
+    request
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.0 .0.get(EXECUTION_CONTEXT_NAMESPACE))
+        .is_some()
+}
+
+fn finalize_direct_mcp_context(
+    mut result: CallToolResult,
+    enabled: bool,
+    tool_name: &str,
+    call_id: String,
+) -> CallToolResult {
+    let raw = result
+        .meta
+        .as_mut()
+        .and_then(|meta| meta.0.remove(EXECUTION_CONTEXT_NAMESPACE));
+    if result.meta.as_ref().is_some_and(|meta| meta.0.is_empty()) {
+        result.meta = None;
+    }
+    if !enabled {
+        return result;
+    }
+    let Some(raw) = raw else {
+        return result;
+    };
+    let Ok(mut observation) = serde_json::from_value::<ExecutionContextObservation>(raw) else {
+        log::warn!("stripping malformed bash execution-context metadata");
+        return result;
+    };
+    observation.provenance = Some(ToolObservationProvenance::new(
+        "mcp",
+        "harnx-bash-tools",
+        tool_name,
+        call_id,
+    ));
+    result.meta.get_or_insert_with(MetaObject::new).0.insert(
+        EXECUTION_CONTEXT_NAMESPACE.to_string(),
+        serde_json::to_value(observation).expect("execution context serializes"),
+    );
+    result
 }
 
 // Spawned process tracking

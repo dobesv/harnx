@@ -18,6 +18,15 @@ pub(super) fn validate_namespace(namespace: &str) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn validate_mutable_namespace(namespace: &str) -> Result<()> {
+    validate_namespace(namespace)?;
+    anyhow::ensure!(
+        namespace != harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE,
+        "extension namespace '{namespace}' is reserved for tool-observed execution context"
+    );
+    Ok(())
+}
+
 pub(in crate::nats_session_metadata) fn validate_extensions(
     extensions: &BTreeMap<String, Value>,
 ) -> Result<()> {

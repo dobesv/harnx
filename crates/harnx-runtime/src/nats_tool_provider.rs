@@ -4,15 +4,19 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
+use harnx_core::execution_context::{
+    take_result_execution_context, ExecutionContextObservation, ToolObservationProvenance,
+    EXECUTION_CONTEXT_NAMESPACE,
+};
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
-use harnx_core::tool::{JsonSchema, ToolDeclaration, ToolError, ToolProvider};
+use harnx_core::tool::{JsonSchema, ToolDeclaration, ToolError, ToolProvider, ToolProviderOutput};
 use harnx_toolset::{
     ControlKind, ControlMessage, Registration, ToolErrorPayload, ToolReply, ToolRequest, ToolSpec,
     HDR_CALL_ID, HDR_CONTENT_TYPE, HDR_IDEMPOTENCY_KEY, HDR_INSTANCE_ID,
 };
 use harnx_toolset_server::{registration_key, TOOL_REGISTRY_BUCKET};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use tokio::sync::{oneshot, Mutex};
@@ -54,6 +58,37 @@ pub struct NatsInFlightCalls {
 struct InFlightCall {
     server: String,
     failure: oneshot::Sender<InFlightFailure>,
+}
+
+fn extract_execution_context(
+    result: &mut Value,
+    provenance: ToolObservationProvenance,
+) -> Option<ExecutionContextObservation> {
+    let raw = take_result_execution_context(result)?;
+    let mut observation = match serde_json::from_value::<ExecutionContextObservation>(raw) {
+        Ok(observation) => observation,
+        Err(error) => {
+            let server_identity = &provenance.server_identity;
+            let tool_name = &provenance.tool_name;
+            let call_id = &provenance.call_id;
+            log::warn!(
+                "ignoring malformed tool execution context: server={server_identity} tool={tool_name} call_id={call_id} error={error}"
+            );
+            return None;
+        }
+    };
+    observation.provenance = Some(provenance);
+    if let Err(error) = observation.validate() {
+        let provenance = observation.provenance.as_ref().expect("provenance was set");
+        let server_identity = &provenance.server_identity;
+        let tool_name = &provenance.tool_name;
+        let call_id = &provenance.call_id;
+        log::warn!(
+            "ignoring malformed tool execution context: server={server_identity} tool={tool_name} call_id={call_id} error={error:#}"
+        );
+        return None;
+    }
+    Some(observation)
 }
 
 impl NatsInFlightCalls {
@@ -282,6 +317,7 @@ impl NatsToolProvider {
             tool: route.raw_name.clone(),
             args: arguments,
             parent_session_id: self.parent_session_id.clone(),
+            capabilities: BTreeSet::from([EXECUTION_CONTEXT_NAMESPACE.to_string()]),
         };
         let mut headers = async_nats::HeaderMap::new();
         headers.insert(HDR_IDEMPOTENCY_KEY, Uuid::new_v4().to_string());
@@ -479,7 +515,7 @@ impl ToolProvider for NatsToolProvider {
         tool_name: &str,
         arguments: Value,
         abort: &AbortSignal,
-    ) -> Result<Value, ToolError> {
+    ) -> Result<ToolProviderOutput, ToolError> {
         let Some(route) = self.resolve_route(tool_name) else {
             return Err(ToolError::Recoverable(anyhow!(
                 "NATS tool is not registered: {tool_name}"
@@ -497,7 +533,22 @@ impl ToolProvider for NatsToolProvider {
             )));
         }
         match reply.result {
-            Ok(value) => Ok(value),
+            Ok(mut value) => {
+                let execution_context = extract_execution_context(
+                    &mut value,
+                    ToolObservationProvenance {
+                        server_scope: self.instance_id.to_string(),
+                        server_identity: route.server.clone(),
+                        tool_name: route.raw_name.clone(),
+                        call_id: call_id.clone(),
+                        worker_received_at: chrono::Utc::now(),
+                    },
+                );
+                Ok(ToolProviderOutput {
+                    value,
+                    execution_context,
+                })
+            }
             Err(ToolErrorPayload::Recoverable(message)) => {
                 Err(ToolError::Recoverable(anyhow!(message)))
             }
@@ -622,8 +673,11 @@ pub async fn describe_discovery(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_registered_tools, NatsInFlightCalls, NatsToolProvider, RegisteredTool,
-        DEFAULT_REQUEST_TIMEOUT,
+        build_registered_tools, extract_execution_context, NatsInFlightCalls, NatsToolProvider,
+        RegisteredTool, DEFAULT_REQUEST_TIMEOUT,
+    };
+    use harnx_core::execution_context::{
+        ExecutionContextObservation, ToolObservationProvenance, EXECUTION_CONTEXT_NAMESPACE,
     };
     use harnx_core::instance::ServerScope;
     use harnx_toolset::{Registration, ToolSpec};
@@ -707,6 +761,56 @@ mod tests {
                 "traceparent {traceparent} did not carry trace ID {expected_trace_id}"
             );
         });
+    }
+
+    #[test]
+    fn extracts_private_context_and_replaces_untrusted_provenance() {
+        let private_path = "/private/tool-server/workspace";
+        let mut observation = ExecutionContextObservation::observe(
+            std::path::Path::new(private_path),
+            std::path::Path::new(private_path),
+        );
+        observation.workspace_root = private_path.to_string();
+        observation.working_directory = private_path.to_string();
+        let mut result = json!({
+            "content": [],
+            "_meta": {
+                EXECUTION_CONTEXT_NAMESPACE: observation,
+                "public": true
+            }
+        });
+        let context = extract_execution_context(
+            &mut result,
+            ToolObservationProvenance::new("attested-scope", "attested-server", "read", "call-1"),
+        )
+        .expect("valid observation");
+
+        let provenance = context.provenance.expect("worker provenance");
+        assert_eq!(provenance.server_scope, "attested-scope");
+        assert_eq!(provenance.server_identity, "attested-server");
+        assert_eq!(provenance.tool_name, "read");
+        assert_eq!(provenance.call_id, "call-1");
+        assert_eq!(result["_meta"], json!({"public": true}));
+        assert!(!result.to_string().contains(private_path));
+    }
+
+    #[test]
+    fn strips_malformed_private_context_without_failing_the_result() {
+        let mut result = json!({
+            "content": [{"type": "text", "text": "completed"}],
+            "_meta": { EXECUTION_CONTEXT_NAMESPACE: {"version": 999} }
+        });
+        assert!(extract_execution_context(
+            &mut result,
+            ToolObservationProvenance::new("scope", "server", "read", "call-1"),
+        )
+        .is_none());
+        assert_eq!(
+            result,
+            json!({
+                "content": [{"type": "text", "text": "completed"}]
+            })
+        );
     }
 
     #[test]

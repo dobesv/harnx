@@ -8,7 +8,6 @@ use harnx_tool_allow::ResolvedAllowlist;
 use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
 use rmcp::model::{CallToolResult, ErrorData, Tool};
 use rmcp::schemars::JsonSchema;
-use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -55,11 +54,6 @@ fn spec<T: JsonSchema + 'static>(
         meta: None,
     }
     .with_call_template(call_template)
-}
-
-fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T, ToolInvokeError> {
-    serde_json::from_value(args)
-        .map_err(|err| ToolInvokeError::Recoverable(format!("invalid tool arguments: {err}")))
 }
 
 fn map_result(result: Result<CallToolResult, ErrorData>) -> Result<Value, ToolInvokeError> {
@@ -142,22 +136,7 @@ impl Toolset for FsToolset {
         args: Value,
         _cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
-        let result = match tool {
-            "read" => self.server.read_file_impl(parse_args(args)?).await,
-            "write" => self.server.write_file_impl(parse_args(args)?).await,
-            "edit" => self.server.edit_file_impl(parse_args(args)?).await,
-            "insert" => self.server.insert_impl(parse_args(args)?).await,
-            "re_replace" => self.server.re_replace_impl(parse_args(args)?).await,
-            "ls" => self.server.list_directory_impl(parse_args(args)?).await,
-            "grep" => self.server.search_files_impl(parse_args(args)?).await,
-            "find" => self.server.find_files_impl(parse_args(args)?).await,
-            "rollback_file" => self.server.rollback_file_impl(parse_args(args)?).await,
-            _ => {
-                return Err(ToolInvokeError::Recoverable(format!(
-                    "unknown fs tool: {tool}"
-                )));
-            }
-        };
+        let result = self.server.invoke_tool_value(tool, args).await;
         map_result(result)
     }
 }
@@ -207,6 +186,10 @@ mod tests {
             .await
             .unwrap();
         assert_success_shape(&result);
+        assert!(result
+            .get("_meta")
+            .and_then(|meta| meta.get(harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE))
+            .is_some());
         result
     }
 

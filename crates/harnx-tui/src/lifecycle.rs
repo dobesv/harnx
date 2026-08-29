@@ -15,7 +15,10 @@ use crossterm::event::{
 use crossterm::terminal::{enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen};
 use crossterm::ExecutableCommand;
 use harnx_core::message::Message;
-use harnx_runtime::config::{list_assistant_agents, sort_sessions_for_picker};
+use harnx_runtime::config::{
+    list_assistant_agents, sort_sessions_for_picker_with_context, PickerMatchMode,
+    PickerQueryContext,
+};
 use harnx_runtime::config::{GlobalConfig, SessionMeta};
 use harnx_runtime::tool::ToolDeclaration;
 use harnx_runtime::utils::create_abort_signal;
@@ -258,14 +261,12 @@ impl Tui {
         }
         if config.read().session.is_none() {
             let (sessions, fetch_error) = Self::picker_sessions(config).await;
-
-            let sorted = sort_sessions_for_picker(sessions);
             // Always show picker when agent active but no session — even empty list
             // because picker now always has a "New session" first item
             let origin_agent = config.read().agent.as_ref().map(|a| a.name().to_string());
             let origin_session = config.read().session.as_ref().map(|s| s.id().to_string());
             return Some(ModalState::SessionPicker {
-                sessions: sorted,
+                sessions,
                 selected: 0,
                 origin_agent,
                 origin_session,
@@ -291,13 +292,22 @@ impl Tui {
             .or_else(|| cfg.agent.as_ref().map(|agent| agent.name()));
 
         match cfg.list_remote_sessions_with_meta(cluster).await {
-            Ok(sessions) => (
-                sessions
+            Ok(sessions) => {
+                let sessions = sessions
                     .into_iter()
                     .filter(|session| session.agent_name.as_deref() == agent_name)
-                    .collect(),
-                None,
-            ),
+                    .collect();
+                let mode = if cfg.remote_agent.is_some() {
+                    PickerMatchMode::Remote
+                } else {
+                    PickerMatchMode::Local
+                };
+                let query = PickerQueryContext::observe_current(mode);
+                (
+                    sort_sessions_for_picker_with_context(sessions, &query),
+                    None,
+                )
+            }
             Err(error) => {
                 log::warn!(
                     "Failed to list NATS sessions for cluster '{}': {:#}",

@@ -61,7 +61,7 @@ fn apply_typed_patch(metadata: &mut SessionMetadata, patch: &SessionMetadataPatc
 }
 
 #[derive(Clone, Copy, Default)]
-pub(super) struct PatchGuard<'a> {
+pub(in crate::nats_session_metadata) struct PatchGuard<'a> {
     expected_agent: Option<&'a str>,
     worker_fence_token: Option<u64>,
 }
@@ -74,7 +74,7 @@ impl<'a> PatchGuard<'a> {
         }
     }
 
-    fn for_worker(fence_token: u64) -> Self {
+    pub(in crate::nats_session_metadata) fn for_worker(fence_token: u64) -> Self {
         Self {
             worker_fence_token: Some(fence_token),
             ..Self::default()
@@ -136,10 +136,32 @@ impl SessionMetadataStore {
     where
         F: FnMut(&mut SessionMetadata) -> Result<()>,
     {
+        self.patch_guarded_if_changed(session_id, guard, |metadata| {
+            patch(metadata)?;
+            Ok(true)
+        })
+        .await
+    }
+
+    pub(in crate::nats_session_metadata) async fn patch_guarded_if_changed<F>(
+        &self,
+        session_id: &str,
+        guard: PatchGuard<'_>,
+        mut patch: F,
+    ) -> Result<MetadataRecord>
+    where
+        F: FnMut(&mut SessionMetadata) -> Result<bool>,
+    {
         for attempt in 0..CAS_RETRY_LIMIT {
             let mut record = self.record_for_patch(session_id, guard).await?;
             let immutable = immutable_identity(&record.metadata);
-            patch(&mut record.metadata)?;
+            let changed = patch(&mut record.metadata)?;
+            let fence_advanced = guard
+                .worker_fence_token
+                .is_some_and(|token| token > record.metadata.worker_fence_token);
+            if !changed && !fence_advanced {
+                return Ok(record);
+            }
             anyhow::ensure!(
                 immutable == immutable_identity(&record.metadata),
                 "session identity, agent source, schema version, and creation time are immutable"

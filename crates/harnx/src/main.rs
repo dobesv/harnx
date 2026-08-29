@@ -951,6 +951,17 @@ mod resume_tests {
 mod tests_list_sessions_routing {
     use super::*;
 
+    fn session_meta(id: &str) -> SessionMeta {
+        SessionMeta {
+            id: id.to_string(),
+            session_id: Some(id.to_string()),
+            agent_name: None,
+            title: None,
+            modified: None,
+            contexts: vec![],
+        }
+    }
+
     /// Routing decision: no remote agent → Local
     /// This test will fail if routing logic regresses to unconditionally use remote.
     #[test]
@@ -1001,22 +1012,7 @@ mod tests_list_sessions_routing {
     /// This test will fail if the formatting changes (e.g., comma-separated).
     #[test]
     fn test_output_format_one_id_per_line() {
-        let sessions = [
-            SessionMeta {
-                id: "session-1".to_string(),
-                session_id: Some("session-1".to_string()),
-                agent_name: None,
-                title: None,
-                modified: None,
-            },
-            SessionMeta {
-                id: "session-2".to_string(),
-                session_id: Some("session-2".to_string()),
-                agent_name: None,
-                title: None,
-                modified: None,
-            },
-        ];
+        let sessions = [session_meta("session-1"), session_meta("session-2")];
         let output = format_sessions_for_output(&sessions);
         assert_eq!(output, "session-1\nsession-2");
     }
@@ -1032,13 +1028,7 @@ mod tests_list_sessions_routing {
     /// Output formatting: single session → single line (no trailing newline)
     #[test]
     fn test_output_format_single_session() {
-        let sessions = [SessionMeta {
-            id: "only-session".to_string(),
-            session_id: Some("only-session".to_string()),
-            agent_name: None,
-            title: None,
-            modified: None,
-        }];
+        let sessions = [session_meta("only-session")];
         let output = format_sessions_for_output(&sessions);
         assert_eq!(output, "only-session");
     }
@@ -1055,22 +1045,7 @@ mod tests_list_sessions_routing {
     /// Remote list outcome: Ok with sessions → Print with one id per line
     #[test]
     fn test_remote_list_outcome_ok_with_sessions() {
-        let sessions = vec![
-            SessionMeta {
-                id: "sess-a".to_string(),
-                session_id: Some("sess-a".to_string()),
-                agent_name: None,
-                title: None,
-                modified: None,
-            },
-            SessionMeta {
-                id: "sess-b".to_string(),
-                session_id: Some("sess-b".to_string()),
-                agent_name: None,
-                title: None,
-                modified: None,
-            },
-        ];
+        let sessions = vec![session_meta("sess-a"), session_meta("sess-b")];
         let result: Result<Vec<SessionMeta>, anyhow::Error> = Ok(sessions);
         let outcome = remote_list_outcome(result);
         assert_eq!(

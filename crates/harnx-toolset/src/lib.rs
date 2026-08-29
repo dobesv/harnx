@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fmt;
 use tokio_util::sync::CancellationToken;
 
@@ -127,6 +128,10 @@ pub struct ToolRequest {
     pub args: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// Additive capabilities understood by the caller. An absent field means
+    /// private result metadata must not be returned.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub capabilities: BTreeSet<String>,
 }
 
 /// Raw tool name for creating a sub-agent session.
@@ -311,6 +316,7 @@ mod tests {
             tool: "time_now".to_string(),
             args: json!({ "timezone": "UTC" }),
             parent_session_id: Some("parent-session".to_string()),
+            capabilities: BTreeSet::new(),
         });
         assert_round_trip(ToolReply {
             call_id: "call-1".to_string(),

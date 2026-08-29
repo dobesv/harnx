@@ -8,7 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 use crossterm::ExecutableCommand;
 use harnx_core::event::{AgentEvent, AgentSource};
 use harnx_render::pretty_error_string;
-use harnx_runtime::config::{list_assistant_agents, sort_sessions_for_picker};
+use harnx_runtime::config::list_assistant_agents;
 use harnx_runtime::utils::pretty_yaml_block;
 use ratatui_textarea::{Input as TextInput, Key};
 use std::path::Path;
@@ -1908,8 +1908,6 @@ impl Tui {
 
     pub(crate) async fn open_session_picker(&mut self) {
         let (sessions, fetch_error) = Self::picker_sessions(&self.config).await;
-
-        let sessions = sort_sessions_for_picker(sessions);
         let origin_agent = self
             .config
             .read()
@@ -2370,7 +2368,6 @@ impl Tui {
                             }
 
                             let (sessions, fetch_error) = Self::picker_sessions(&self.config).await;
-                            let sessions = sort_sessions_for_picker(sessions);
                             // Always show SessionPicker so the user can pick "New session"
                             // (index 0) or an existing session. Carry the pre-activation
                             // origin state so reconcile_transcript_after_command sees the

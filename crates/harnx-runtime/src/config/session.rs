@@ -5,8 +5,8 @@ use super::session_externalize::{
 pub(crate) use super::session_persistence::attach_memory_log;
 use super::session_persistence::require_authoritative_appends;
 pub use super::session_persistence::{
-    append_event, persist_session_override, persist_session_overrides, record_title,
-    session_overrides, SessionAppendSink,
+    append_event, persist_execution_contexts, persist_session_override, persist_session_overrides,
+    record_title, session_overrides, SessionAppendSink,
 };
 use super::*;
 use crate::nats_session::new_client_message_id;
@@ -436,6 +436,7 @@ fn assemble_tool_message(
                     markdown: out.markdown,
                     content: out.content,
                     switch_agent: out.switch_agent,
+                    execution_context: None,
                 },
                 None => ToolResult::new(
                     call,
@@ -838,8 +839,32 @@ pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResul
     let all_appended = appended & record_externalized(session, cid_urls);
     session.dirty |= !all_appended;
     require_authoritative_appends(session, all_appended, "tool results")?;
+    persist_tool_execution_contexts(session, results, all_appended);
     session.update_tokens();
     Ok(())
+}
+
+fn persist_tool_execution_contexts(
+    session: &Session,
+    results: &[crate::tool::ToolResult],
+    tool_results_are_durable: bool,
+) {
+    if !tool_results_are_durable {
+        return;
+    }
+    let observations = results
+        .iter()
+        .filter_map(|result| result.execution_context.clone())
+        .collect::<Vec<_>>();
+    if observations.is_empty() {
+        return;
+    }
+    if let Err(error) = persist_execution_contexts(session, &observations) {
+        log::warn!(
+            "failed to persist tool-observed execution context: session_id={} error={error:#}",
+            session.id()
+        );
+    }
 }
 
 /// Returns `true` when `input` is a genuine tool-call continuation of
@@ -1159,6 +1184,34 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FailingContextMetadataSink {
+        next_seq: std::sync::atomic::AtomicU64,
+        context_writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SessionAppendSink for FailingContextMetadataSink {
+        fn append(&self, _entry: &SessionLogEntry) -> Result<u64> {
+            Ok(self
+                .next_seq
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1)
+        }
+
+        fn persist_execution_contexts(
+            &self,
+            _observations: &[harnx_core::execution_context::ExecutionContextObservation],
+        ) -> Result<()> {
+            self.context_writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("simulated execution-context metadata failure")
+        }
+
+        fn failure_is_fatal(&self) -> bool {
+            true
+        }
+    }
+
     fn test_session() -> Session {
         let mut session = new(&Config::default(), "test", None).unwrap();
         attach_memory_log(&mut session);
@@ -1193,6 +1246,53 @@ mod tests {
             .to_string()
             .contains("failed to durably persist assistant response"));
         assert!(session.dirty);
+    }
+
+    #[test]
+    fn context_metadata_failure_does_not_fail_durable_tool_result() {
+        let config = Config::default();
+        let global_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let input = crate::config::input::from_str(
+            &global_config,
+            "inspect repository",
+            Some(config.extract_agent()),
+        );
+        let sink = Arc::new(FailingContextMetadataSink::default());
+        let mut session = new(&config, "context-metadata-failure", None).unwrap();
+        session.runtime = Some(Arc::new(sink.clone() as Arc<dyn SessionAppendSink>));
+        let call = harnx_core::tool::ToolCall {
+            name: "fs_read".to_string(),
+            arguments: json!({"path": "/workspace/README.md"}),
+            id: Some("call-1".to_string()),
+            thought_signature: None,
+        };
+        super::add_tool_calls(
+            &mut session,
+            &input,
+            "reading",
+            None,
+            std::slice::from_ref(&call),
+        )
+        .unwrap();
+        let mut result = ToolResult::new(call, json!({"ok": true}));
+        let mut observation = harnx_core::execution_context::ExecutionContextObservation::observe(
+            std::path::Path::new("/workspace"),
+            std::path::Path::new("/workspace/README.md"),
+        );
+        observation.provenance = Some(
+            harnx_core::execution_context::ToolObservationProvenance::new(
+                "scope", "fs", "read", "call-1",
+            ),
+        );
+        result.execution_context = Some(observation);
+
+        super::add_tool_results(&mut session, &[result])
+            .expect("durable result must survive context metadata failure");
+        assert_eq!(
+            sink.context_writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[test]

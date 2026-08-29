@@ -7,6 +7,7 @@
 //! mutations.
 
 mod activity;
+mod execution_context;
 mod initializer;
 mod model;
 mod store;
@@ -19,6 +20,7 @@ pub const EXTENSIONS_TOTAL_MAX_BYTES: usize = 256 * 1024;
 const CAS_RETRY_LIMIT: usize = 8;
 
 pub use activity::SessionActivity;
+pub use execution_context::execution_contexts;
 pub use initializer::SessionInitializer;
 pub use model::{
     SessionAgentSource, SessionMetadata, SessionOverrideUpdate, SessionOverrides, SessionTitle,
@@ -28,8 +30,8 @@ pub use store::{
     SessionExtensionUpdate, SessionMetadataStore,
 };
 pub use view::{
-    ListedSession, MetadataRecord, RedactedAgentSource, RedactedSessionMetadata,
-    SessionMetadataPatch, SessionTitlePatch, VariableStatus,
+    ListedSession, MetadataRecord, RedactedAgentSource, RedactedRepositoryContext,
+    RedactedSessionMetadata, SessionMetadataPatch, SessionTitlePatch, VariableStatus,
 };
 
 #[cfg(test)]

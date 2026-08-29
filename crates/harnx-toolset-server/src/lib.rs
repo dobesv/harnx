@@ -11,6 +11,10 @@ use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv};
 use drain::InFlightRequests;
 use futures_util::StreamExt;
+use harnx_core::execution_context::{
+    put_result_execution_context, take_result_execution_context, ExecutionContextObservation,
+    ToolObservationProvenance, EXECUTION_CONTEXT_NAMESPACE,
+};
 use harnx_core::instance::ServerScope;
 use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{
@@ -71,6 +75,8 @@ struct ToolRequestContext {
     /// Tracks tool requests currently being processed, so shutdown can
     /// drain them before deregistering (see the `drain` module).
     active_requests: InFlightRequests,
+    server_scope: ServerScope,
+    server_identity: String,
 }
 
 struct ValidatedToolRequest {
@@ -264,6 +270,8 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
         in_flight: Arc::new(Mutex::new(HashMap::new())),
         reply_cache: Arc::new(Mutex::new(HashMap::new())),
         active_requests,
+        server_scope: instance_id.clone(),
+        server_identity: identity_token.clone(),
     };
     let mut refresh = tokio::time::interval(REGISTRATION_REFRESH_INTERVAL);
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -373,18 +381,20 @@ async fn process_tool_request(
     };
     let ValidatedToolRequest {
         reply_subject,
-        request,
+        mut request,
         idempotency_key,
         parent_cx,
     } = validated;
     let completion = match reserve_cache_entry(&context.reply_cache, &idempotency_key).await {
         CacheReservation::Complete(mut reply) => {
             reply.call_id.clone_from(&request.call_id);
+            finalize_execution_context(context, &request, &mut reply);
             return publish_reply(&context.client, reply_subject, &reply).await;
         }
         CacheReservation::Wait(reply) => {
             let mut reply = wait_for_cached_reply(reply).await?;
             reply.call_id.clone_from(&request.call_id);
+            finalize_execution_context(context, &request, &mut reply);
             return publish_reply(&context.client, reply_subject, &reply).await;
         }
         CacheReservation::Full => {
@@ -399,20 +409,12 @@ async fn process_tool_request(
         CacheReservation::Execute(completion) => completion,
     };
 
-    let cancel = CancellationToken::new();
-    context
-        .in_flight
-        .lock()
-        .await
-        .insert(request.call_id.clone(), cancel.clone());
-    let mut args = request.args;
-    add_parent_session_id_arg(&request.tool, request.parent_session_id, &mut args);
-    let result = context
-        .toolset
-        .invoke(&request.tool, args, cancel)
-        .instrument(tool_exec_span(&request.tool, parent_cx))
-        .await;
-    context.in_flight.lock().await.remove(&request.call_id);
+    let request_attestation = RequestAttestation {
+        call_id: request.call_id.clone(),
+        tool: request.tool.clone(),
+        capabilities: request.capabilities.clone(),
+    };
+    let result = invoke_uncached_tool(context, &mut request, parent_cx).await;
 
     let reply = ToolReply {
         call_id: request.call_id,
@@ -425,7 +427,98 @@ async fn process_tool_request(
         completion,
     )
     .await;
-    publish_reply(&context.client, reply_subject, &reply).await
+    let mut published_reply = reply;
+    finalize_execution_context_for_attestation(context, &request_attestation, &mut published_reply);
+    publish_reply(&context.client, reply_subject, &published_reply).await
+}
+
+async fn invoke_uncached_tool(
+    context: &ToolRequestContext,
+    request: &mut ToolRequest,
+    parent_cx: OtelContext,
+) -> Result<Value, ToolInvokeError> {
+    let cancel = CancellationToken::new();
+    context
+        .in_flight
+        .lock()
+        .await
+        .insert(request.call_id.clone(), cancel.clone());
+    let mut args = std::mem::take(&mut request.args);
+    add_parent_session_id_arg(&request.tool, request.parent_session_id.take(), &mut args);
+    let result = context
+        .toolset
+        .invoke(&request.tool, args, cancel)
+        .instrument(tool_exec_span(&request.tool, parent_cx))
+        .await;
+    context.in_flight.lock().await.remove(&request.call_id);
+    result
+}
+
+struct RequestAttestation {
+    call_id: String,
+    tool: String,
+    capabilities: std::collections::BTreeSet<String>,
+}
+
+fn finalize_execution_context(
+    context: &ToolRequestContext,
+    request: &ToolRequest,
+    reply: &mut ToolReply,
+) {
+    finalize_execution_context_for_attestation(
+        context,
+        &RequestAttestation {
+            call_id: request.call_id.clone(),
+            tool: request.tool.clone(),
+            capabilities: request.capabilities.clone(),
+        },
+        reply,
+    );
+}
+
+fn finalize_execution_context_for_attestation(
+    context: &ToolRequestContext,
+    request: &RequestAttestation,
+    reply: &mut ToolReply,
+) {
+    let Ok(result) = &mut reply.result else {
+        return;
+    };
+    let raw_context = take_result_execution_context(result);
+    if !request.capabilities.contains(EXECUTION_CONTEXT_NAMESPACE) {
+        return;
+    }
+    let Some(raw_context) = raw_context else {
+        return;
+    };
+    let mut observation = match serde_json::from_value::<ExecutionContextObservation>(raw_context) {
+        Ok(observation) => observation,
+        Err(error) => {
+            log::warn!(
+                "stripping malformed execution context from tool result: server={} tool={} error={error}",
+                context.server_identity,
+                request.tool
+            );
+            return;
+        }
+    };
+    observation.provenance = Some(ToolObservationProvenance::new(
+        context.server_scope.to_string(),
+        context.server_identity.clone(),
+        request.tool.clone(),
+        request.call_id.clone(),
+    ));
+    if let Err(error) = observation.validate() {
+        log::warn!(
+            "stripping invalid execution context from tool result: server={} tool={} error={error:#}",
+            context.server_identity,
+            request.tool
+        );
+        return;
+    }
+    if let Ok(value) = serde_json::to_value(observation) {
+        put_result_execution_context(result, value);
+    }
 }
 
 fn add_parent_session_id_arg(tool: &str, parent_session_id: Option<String>, args: &mut Value) {

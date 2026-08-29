@@ -89,6 +89,159 @@ reconcile lowered on request, one of those callers could silently downgrade
 an already-correctly-replicated bucket's fault tolerance. Genuinely scaling
 a bucket down requires recreating it.
 
+### Tool-observed session context
+
+Harnx records where its bash and filesystem tools actually ran. This lets the
+interactive session picker answer questions such as "which session was working
+on this repository and branch?" even when the session ran on a remote worker.
+The frontend's own current directory is used only to search the picker; it is
+never saved as evidence of where a session ran.
+
+#### What a tool server observes
+
+After a supported tool returns a result, the tool server records:
+
+- its configured workspace and an effective context directory;
+- the containing Git worktree and symbolic branch, when present;
+- every network Git remote, normalized to a credential-free identity such as
+  `github.com/acme/app`; and
+- the observation time.
+
+Credentials, URL query strings and fragments, trailing `.git`, and transport
+syntax are removed from remote identities. Local paths and `file://` remotes
+are not treated as portable repository identities. The tracking remote is
+primary when Git identifies one; otherwise `origin`, then the first remote in
+deterministic order, is primary.
+
+The protocol currently calls that context directory `working_directory`, but
+its exact meaning depends on the tool server:
+
+- For bash `exec` and `spawn`, it is the command's resolved per-call working
+  directory, which may differ from the bash server process's own directory.
+  `wait` and `terminate` reuse the directory recorded for the spawned process.
+- For a filesystem file target, it is the file's parent directory. For a
+  directory target, it is that directory. A search without an explicit path
+  uses the server's default search root. This is target context, not the
+  filesystem server process's actual working directory. Target-derived context
+  is what allows one filesystem server to report several repositories under a
+  shared workspace.
+
+Bash attaches an observation after `exec`, `spawn`, `wait`, `terminate`,
+`rollback_file`, and template calls; `read_exec_log` does not attach one.
+Filesystem `read`, `write`, `edit`, `insert`, `re_replace`, `ls`, `grep`,
+`find`, and `rollback_file` calls attach one. Observing after execution is
+important: a bash `exec` that checks out another branch reports the new branch.
+Repository and branch fields are present only if the effective target is in a
+Git worktree; a detached worktree has no symbolic branch.
+
+The observer checks only the effective target and its ancestors. It does not
+parse shell commands or scan arbitrary descendants. Therefore, `git clone
+child` run from a non-repository parent does not discover `child` immediately;
+a later tool call that targets `child` does.
+
+#### How the observation reaches the session record
+
+The observation uses the reserved, versioned namespace
+`dev.harnx.execution_context`. It moves through five steps:
+
+1. **The caller opts in for this tool call.** A direct MCP call includes the
+   namespace in request `_meta`:
+
+   ```json
+   { "_meta": { "dev.harnx.execution_context": true } }
+   ```
+
+   A NATS `ToolRequest` uses the equivalent additive capability:
+
+   ```json
+   { "capabilities": ["dev.harnx.execution_context"] }
+   ```
+
+   Harnx's NATS provider currently opts in on every tool call. A direct MCP
+   client chooses whether to opt in for each call.
+
+2. **The tool runs and the server observes its actual target.** The server
+   temporarily adds the observation to the successful tool result:
+
+   ```json
+   {
+     "_meta": {
+       "dev.harnx.execution_context": {
+         "version": 1,
+         "observed_at": "...",
+         "workspace_root": "...",
+         "working_directory": "...",
+         "repository": {
+           "worktree_root": "...",
+           "branch": "feature/picker",
+           "remotes": [
+             {
+               "name": "origin",
+               "repository": "github.com/acme/app",
+               "primary": true
+             }
+           ]
+         }
+       }
+     }
+   }
+   ```
+
+3. **The transport attests the source.** Harnx adds the server scope and
+   identity, tool name, call ID, and worker receipt time. For NATS, the
+   receiving provider uses the route and call it actually used instead of
+   trusting provenance supplied inside the result.
+
+4. **Harnx removes the private result metadata immediately.** The observation
+   is carried separately on an in-memory, non-serialized `ToolResult` field.
+   Post-tool hooks, model input, UI events, and the transcript see only the
+   ordinary tool result; they never receive the context `_meta` or worker
+   paths.
+
+5. **Harnx persists it after the ordinary tool result is durable.** First the
+   `ToolResults` entry is appended to the session transcript. Only after that
+   append succeeds does Harnx merge the observation into
+   `sessions/{id}/meta`, under the `dev.harnx.execution_context` extension. A
+   failed transcript append therefore cannot leave context claiming that a
+   tool result was recorded. An ordinary metadata merge failure produces a
+   warning without changing the already-completed tool call. HA worker writes
+   remain protected by the session lease fence.
+
+For example, suppose a remote bash server runs `git checkout feature/picker`
+in `/srv/work/app`. Its result temporarily carries `/srv/work/app`, branch
+`feature/picker`, and repository `github.com/acme/app`. Harnx strips that
+private metadata from the visible result, durably records the normal command
+result, and then updates the session extension. Later, opening the picker from
+the same repository and branch ranks that session highly and may display
+`github.com/acme/app @ feature/picker`; it never displays `/srv/work/app`.
+
+#### Retention, privacy, and mixed versions
+
+The extension contains at most 16 current execution locations per session; it
+is not a log of the last 16 tool calls. An exact repeat is a no-op session
+metadata write, but the current server still performs the observation and the
+opted-in response still carries it. This favors detecting branch changes and
+new target repositories without keeping caller-specific state in a shared tool
+server. A later observation replaces the retained entry for the same primary
+repository, or for the same canonical worktree within one tool-server scope.
+Non-Git observations from the same scope and workspace also replace one
+another. This updates branch and path state instead of accumulating stale
+entries. If a 17th unrelated location is added, the oldest distinct or changed
+observation is evicted.
+
+Raw workspace paths and transport provenance remain in the private canonical
+extension, but redacted HTTP session metadata removes them and exposes only an
+optional repository-and-branch view. Picker rows likewise display only safe
+repository identities and branches. Generic extension replace and delete APIs
+cannot modify this reserved namespace.
+
+Capability negotiation makes rolling upgrades safe. A new server strips the
+context from its response unless the caller opted in. A new caller accepts a
+response from an old server with no context. In either mixed-version case the
+tool call still succeeds; the picker simply falls back to its other retained
+contexts and normal recency ordering. Malformed observations are also stripped
+and logged instead of failing the tool call.
+
 ## Configuration
 
 Harnx looks for NATS cluster definitions in `nats_servers/<cluster_key>.yaml`. The filename (stem) is used as the cluster key.

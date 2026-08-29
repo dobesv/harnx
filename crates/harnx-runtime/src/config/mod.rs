@@ -73,7 +73,10 @@ pub use self::input::Input;
 pub(crate) use self::patches_split::server_display_name;
 use self::patches_split::{apply_client_patch, package_dir_name};
 use self::session::Session;
-pub use self::session_meta::{find_matching_session, sort_sessions_for_picker, SessionMeta};
+pub use self::session_meta::{
+    find_matching_session, sort_sessions_for_picker, sort_sessions_for_picker_with_context,
+    PickerMatchMode, PickerQueryContext, SessionMeta,
+};
 pub use harnx_core::attachments::{
     expand_passthrough_reference, read_attachment, AttachmentRefCache, CachedRef,
     ExpandedAttachment, CID_PREFIX,

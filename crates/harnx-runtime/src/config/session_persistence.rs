@@ -3,6 +3,7 @@
 use crate::nats_session_metadata::{SessionOverrideUpdate, SessionOverrides};
 use anyhow::{Context, Result};
 use harnx_core::agent_config::AgentVariables;
+use harnx_core::execution_context::ExecutionContextObservation;
 use harnx_core::session::{Session, SessionLogEntry};
 use std::any::Any;
 use std::sync::Arc;
@@ -41,6 +42,13 @@ pub trait SessionAppendSink: Send + Sync + Any {
     }
 
     fn persist_variables(&self, _variables: &AgentVariables) -> Result<()> {
+        Ok(())
+    }
+
+    fn persist_execution_contexts(
+        &self,
+        _observations: &[ExecutionContextObservation],
+    ) -> Result<()> {
         Ok(())
     }
 }
@@ -161,6 +169,16 @@ pub fn persist_session_overrides(session: &Session, overrides: &SessionOverrides
 pub fn persist_session_override(session: &Session, update: &SessionOverrideUpdate) -> Result<()> {
     if let Some(sink) = sink(session) {
         sink.persist_override(update)?;
+    }
+    Ok(())
+}
+
+pub fn persist_execution_contexts(
+    session: &Session,
+    observations: &[ExecutionContextObservation],
+) -> Result<()> {
+    if let Some(sink) = sink(session) {
+        sink.persist_execution_contexts(observations)?;
     }
     Ok(())
 }

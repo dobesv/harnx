@@ -424,6 +424,7 @@ summarize\n";
                         markdown: None,
                         content: vec![],
                         switch_agent: None,
+                        execution_context: None,
                     }],
                 }),
             ),

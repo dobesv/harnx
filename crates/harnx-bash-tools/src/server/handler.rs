@@ -76,9 +76,9 @@ impl ServerHandler for BashServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        self.dispatch_call_tool(request, _context)
+        self.dispatch_call_tool(request, context)
             .await
             .map(Into::into)
     }
@@ -96,41 +96,128 @@ impl BashServer {
     async fn dispatch_call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        match request.name.as_ref() {
+        let enabled = request_wants_execution_context(&request);
+        let tool_name = request.name.to_string();
+        let result = self
+            .invoke_tool_value(
+                request.name.as_ref(),
+                Value::Object(request.arguments.unwrap_or_default()),
+            )
+            .await?;
+        Ok(finalize_direct_mcp_context(
+            result,
+            enabled,
+            &tool_name,
+            format!("{:?}", context.id),
+        ))
+    }
+}
+
+impl BashServer {
+    pub(crate) async fn invoke_tool_value(
+        &self,
+        tool: &str,
+        args: Value,
+    ) -> Result<CallToolResult, ErrorData> {
+        let observation_args = args.clone();
+        let tracked_working_dir = self.tracked_working_dir(tool, &args).await;
+        let arguments = args.as_object().cloned();
+        let mut result = match tool {
             "exec" => {
-                let params = parse_arguments::<ExecCommandParams>(request.arguments)?;
+                let params = parse_arguments::<ExecCommandParams>(arguments)?;
                 self.exec_command_impl(params).await
             }
             "read_exec_log" => {
-                let params = parse_arguments::<ReadExecLogParams>(request.arguments)?;
+                let params = parse_arguments::<ReadExecLogParams>(arguments)?;
                 self.read_exec_log_impl(params).await
             }
             "spawn" => {
-                let params = parse_arguments::<SpawnCommandParams>(request.arguments)?;
+                let params = parse_arguments::<SpawnCommandParams>(arguments)?;
                 self.spawn_impl(params).await
             }
             "wait" => {
-                let params = parse_arguments::<WaitParams>(request.arguments)?;
+                let params = parse_arguments::<WaitParams>(arguments)?;
                 self.wait_impl(params).await
             }
             "terminate" => {
-                let params = parse_arguments::<TerminateParams>(request.arguments)?;
+                let params = parse_arguments::<TerminateParams>(arguments)?;
                 self.terminate_impl(params).await
             }
             "rollback_file" => {
-                let params = parse_arguments::<RollbackParams>(request.arguments)?;
+                let params = parse_arguments::<RollbackParams>(arguments)?;
                 self.rollback_file_impl(params).await
             }
             template if self.has_tool_template(template) => {
-                self.invoke_template(template, &request.arguments.unwrap_or_default())
+                self.invoke_template(template, &arguments.unwrap_or_default())
                     .await
             }
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),
                 None,
             )),
+        }?;
+        if let Some(target) = self
+            .execution_context_target(tool, &observation_args, tracked_working_dir)
+            .await
+        {
+            self.attach_execution_context(&mut result, &target);
         }
+        Ok(result)
+    }
+
+    async fn tracked_working_dir(&self, tool: &str, args: &Value) -> Option<PathBuf> {
+        if !matches!(tool, "wait" | "terminate") {
+            return None;
+        }
+        let execution_id = args.get("execution_id").and_then(Value::as_str)?;
+        self.inner
+            .spawned
+            .lock()
+            .await
+            .get(execution_id)
+            .map(|entry| entry.working_dir.clone())
+    }
+
+    async fn execution_context_target(
+        &self,
+        tool: &str,
+        args: &Value,
+        tracked_working_dir: Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        match tool {
+            "exec" | "spawn" => self
+                .resolve_working_dir(args.get("working_dir").and_then(Value::as_str))
+                .await
+                .ok(),
+            "wait" | "terminate" => tracked_working_dir,
+            "rollback_file" => args
+                .get("repo_path")
+                .and_then(Value::as_str)
+                .and_then(|path| validate_write_path(path, &self.inner.allowlist).ok()),
+            "read_exec_log" => None,
+            _ if self.has_tool_template(tool) => {
+                let current_dir = std::env::current_dir().ok();
+                self.inner
+                    .allowlist
+                    .default_read_directory(current_dir.as_deref())
+            }
+            _ => None,
+        }
+    }
+
+    fn attach_execution_context(&self, result: &mut CallToolResult, target: &Path) {
+        let current_dir = std::env::current_dir().ok();
+        let workspace = self
+            .inner
+            .allowlist
+            .default_read_directory(current_dir.as_deref())
+            .unwrap_or_else(|| target.to_path_buf());
+        let observation = ExecutionContextObservation::observe(&workspace, target);
+        result.meta.get_or_insert_with(MetaObject::new).0.insert(
+            EXECUTION_CONTEXT_NAMESPACE.to_string(),
+            serde_json::to_value(observation).expect("execution context serializes"),
+        );
     }
 }

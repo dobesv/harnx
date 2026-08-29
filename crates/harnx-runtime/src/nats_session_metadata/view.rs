@@ -35,10 +35,20 @@ pub struct RedactedSessionMetadata {
     pub overrides: SessionOverrides,
     pub variables: BTreeMap<String, VariableStatus>,
     pub activity: Option<SessionActivity>,
-    /// Namespaced client-visible state. Extension payloads are intentionally
-    /// returned verbatim; callers must not use this field for secrets.
+    /// Namespaced client-visible state. The private execution-context
+    /// namespace is always removed.
     pub extensions: BTreeMap<String, Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_contexts: Option<Vec<RedactedRepositoryContext>>,
     pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RedactedRepositoryContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +68,19 @@ impl RedactedSessionMetadata {
                 name: None,
             },
         };
+        let repository_contexts = super::execution_contexts(&record.metadata)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|context| {
+                let repository = context.primary_repository().map(str::to_string);
+                let branch = context.branch().map(str::to_string);
+                (repository.is_some() || branch.is_some())
+                    .then_some(RedactedRepositoryContext { repository, branch })
+            })
+            .collect::<Vec<_>>();
+        let repository_contexts = (!repository_contexts.is_empty()).then_some(repository_contexts);
+        let mut extensions = record.metadata.extensions;
+        extensions.remove(harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE);
         Self {
             schema_version: record.metadata.schema_version,
             session_id: record.metadata.session_id,
@@ -72,7 +95,8 @@ impl RedactedSessionMetadata {
                 .map(|name| (name, VariableStatus { set: true }))
                 .collect(),
             activity,
-            extensions: record.metadata.extensions,
+            extensions,
+            repository_contexts,
             revision: record.revision,
         }
     }
