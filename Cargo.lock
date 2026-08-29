@@ -3471,7 +3471,7 @@ dependencies = [
  "parking_lot",
  "path-absolutize",
  "pretty_assertions",
- "process-wrap",
+ "process-wrap 10.0.0",
  "rand 0.10.2",
  "ratatui",
  "ratatui-textarea",
@@ -3539,7 +3539,7 @@ dependencies = [
  "libc",
  "log",
  "minijinja",
- "process-wrap",
+ "process-wrap 10.0.0",
  "regex",
  "rmcp",
  "serde",
@@ -3820,7 +3820,7 @@ dependencies = [
  "log",
  "opentelemetry",
  "opentelemetry_sdk",
- "process-wrap",
+ "process-wrap 10.0.0",
  "rmcp",
  "serde_json",
  "shell-words",
@@ -6746,6 +6746,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "process-wrap"
+version = "10.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e3f4237d0e4741eb50bc5584db701f1299c85fa31ff0274dd6445e79dc42d12"
+dependencies = [
+ "futures",
+ "indexmap",
+ "nix 0.31.3",
+ "tokio",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "prodash"
 version = "31.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7315,7 +7329,7 @@ dependencies = [
  "indexmap",
  "pastey",
  "pin-project-lite",
- "process-wrap",
+ "process-wrap 9.1.0",
  "rand 0.10.2",
  "reqwest",
  "rmcp-macros",
