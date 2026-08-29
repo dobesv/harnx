@@ -1,6 +1,115 @@
 use super::*;
 use futures_util::StreamExt;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_load_uses_worker_lease_to_keep_tool_call_pending() {
+    harnx_core::require_nextest();
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent("plain", "Watch the active session.");
+    let config = sandbox.config();
+    let session_id = format!("serve-leased-history-{}", uuid::Uuid::new_v4());
+    let Some(lease) = seed_leased_pending_tool_call(&config, &session_id).await else {
+        return;
+    };
+
+    let active = crate::load_nats_session(&config, &session_id)
+        .await
+        .expect("load active session");
+    let active_tool = active.messages.last().expect("pending tool message");
+    let harnx_core::message::MessageContent::ToolCalls(active_calls) = &active_tool.content else {
+        panic!("expected pending tool-call content");
+    };
+    assert!(harnx_runtime::config::session::is_pending_tool_result(
+        &active_calls.tool_results[0]
+    ));
+    assert_eq!(
+        crate::ag_ui::history_messages_for_snapshot(&active.messages).len(),
+        2,
+        "active snapshot should contain user + assistant tool call, without a result"
+    );
+
+    lease.release().await.expect("release test lease");
+    let interrupted = crate::load_nats_session(&config, &session_id)
+        .await
+        .expect("load interrupted session");
+    let harnx_core::message::MessageContent::ToolCalls(interrupted_calls) = &interrupted
+        .messages
+        .last()
+        .expect("interrupted tool message")
+        .content
+    else {
+        panic!("expected interrupted tool-call content");
+    };
+    assert!(!harnx_runtime::config::session::is_pending_tool_result(
+        &interrupted_calls.tool_results[0]
+    ));
+    assert_eq!(
+        crate::ag_ui::history_messages_for_snapshot(&interrupted.messages).len(),
+        3,
+        "interrupted snapshot should include the synthetic lost result"
+    );
+}
+
+async fn seed_leased_pending_tool_call(
+    config: &Config,
+    session_id: &str,
+) -> Option<harnx_runtime::nats_lease::NatsSessionLease> {
+    let user = Message::new(
+        harnx_core::message::MessageRole::User,
+        harnx_core::message::MessageContent::Text("start work".to_string()),
+    );
+    if !crate::test_support::seed_nats_session(
+        config,
+        crate::test_support::NatsSessionSeed {
+            agent: "plain",
+            session_id,
+            messages: &[user],
+        },
+    )
+    .await
+    {
+        return None;
+    }
+
+    let jetstream = config
+        .nats_jetstream(LOCAL_CLUSTER_KEY)
+        .await
+        .expect("local JetStream");
+    let log = harnx_runtime::nats_session_log::NatsSessionLog::new(
+        jetstream.clone(),
+        session_id.to_string(),
+    );
+    log.append_event_async(&harnx_core::session::SessionLogEntry::ToolCalls {
+        text: "still working".to_string(),
+        thought: None,
+        calls: vec![ToolCall::new(
+            "long_running_tool".to_string(),
+            json!({"task": "work"}),
+            Some("call-pending".to_string()),
+            None,
+        )],
+        timestamp: None,
+        fence_token: Some(1),
+    })
+    .await
+    .expect("append pending tool call");
+    Some(
+        harnx_runtime::nats_lease::NatsSessionLease::acquire(
+            harnx_runtime::nats_lease::NatsLeaseAcquireParams {
+                jetstream,
+                session_id,
+                worker_id: "worker-history-test".to_string(),
+                generation: 1,
+                config: harnx_runtime::nats_lease::NatsLeaseConfig::default(),
+                session_metadata: None,
+            },
+        )
+        .await
+        .expect("acquire test lease")
+        .expect("test lease must be available"),
+    )
+}
+
 fn live_worker_binary() -> Option<std::path::PathBuf> {
     if std::process::Command::new(
         std::env::var_os("NATS_SERVER_BIN").unwrap_or_else(|| "nats-server".into()),

@@ -58,6 +58,10 @@ struct PendingToolCalls {
     timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+const LOST_TOOL_RESPONSE_ERROR: &str =
+    "tool response lost (session was interrupted before results were persisted)";
+const PENDING_TOOL_RESPONSE_ERROR: &str = "tool response pending (results not yet persisted)";
+
 pub(crate) fn collect_raw_log_entries(
     content: &str,
     name: &str,
@@ -84,7 +88,13 @@ pub fn replay_log_entries_for_external(
     raw_entries: &[(usize, SessionLogEntry)],
     name: &str,
 ) -> Result<Session> {
-    replay_log_entries_into_session(raw_entries, name, Session::default(), true)
+    replay_log_entries_into_session(
+        raw_entries,
+        name,
+        Session::default(),
+        true,
+        TrailingToolCallPolicy::Interrupted,
+    )
 }
 
 /// Replay conversation-only NATS entries into state initialized from canonical
@@ -96,6 +106,36 @@ pub fn replay_nats_entries_into_session(
     name: &str,
     session: Session,
 ) -> Result<Session> {
+    replay_nats_entries_into_session_with_policy(
+        raw_entries,
+        name,
+        session,
+        TrailingToolCallPolicy::Interrupted,
+    )
+}
+
+/// Replay a NATS transcript for a read-only observer while its worker lease is
+/// held. A trailing tool-call batch is still in flight in this case, so retain
+/// pending placeholders instead of fabricating interrupted results.
+pub fn replay_nats_entries_into_session_preserving_pending(
+    raw_entries: &[(usize, SessionLogEntry)],
+    name: &str,
+    session: Session,
+) -> Result<Session> {
+    replay_nats_entries_into_session_with_policy(
+        raw_entries,
+        name,
+        session,
+        TrailingToolCallPolicy::Pending,
+    )
+}
+
+fn replay_nats_entries_into_session_with_policy(
+    raw_entries: &[(usize, SessionLogEntry)],
+    name: &str,
+    session: Session,
+    trailing_tool_calls: TrailingToolCallPolicy,
+) -> Result<Session> {
     // `apply_log_mutations_with_name` intentionally ignores unknown rows for
     // tolerant local-file replay. Canonical NATS transcripts are a hard
     // protocol boundary, so reject legacy Header/Title rows (which deserialize
@@ -106,7 +146,13 @@ pub fn replay_nats_entries_into_session(
             .any(|(_, entry)| matches!(entry, SessionLogEntry::Unknown)),
         "unsupported or legacy entry found in canonical NATS transcript '{name}'"
     );
-    replay_log_entries_into_session(raw_entries, name, session, false)
+    replay_log_entries_into_session(raw_entries, name, session, false, trailing_tool_calls)
+}
+
+#[derive(Clone, Copy)]
+enum TrailingToolCallPolicy {
+    Interrupted,
+    Pending,
 }
 
 fn replay_log_entries_into_session(
@@ -114,6 +160,7 @@ fn replay_log_entries_into_session(
     name: &str,
     mut session: Session,
     allow_embedded_metadata: bool,
+    trailing_tool_calls: TrailingToolCallPolicy,
 ) -> Result<Session> {
     let effective_entries = build_effective_log_entries(raw_entries, name);
 
@@ -123,6 +170,7 @@ fn replay_log_entries_into_session(
     // assistant tool call -> tool result -> injected user message.
     let mut pending: Option<PendingToolCalls> = None;
     let mut users_queued_during_tool = Vec::new();
+    let mut completed_tool_call_ids = std::collections::HashSet::new();
 
     for (seq, entry) in effective_entries {
         match entry {
@@ -174,6 +222,14 @@ fn replay_log_entries_into_session(
                     &mut users_queued_during_tool,
                     name,
                 )?;
+                for call in &calls {
+                    if let Some(id) = &call.id {
+                        // Providers should issue unique IDs, but treating a
+                        // newly observed call as authoritative avoids hiding a
+                        // later result if an old ID is reused.
+                        completed_tool_call_ids.remove(id);
+                    }
+                }
                 pending = Some(PendingToolCalls {
                     seq,
                     text,
@@ -191,6 +247,19 @@ fn replay_log_entries_into_session(
                     timestamp,
                 }) = pending.take()
                 else {
+                    let duplicate = !results.is_empty()
+                        && results.iter().all(|result| {
+                            result
+                                .id
+                                .as_ref()
+                                .is_some_and(|id| completed_tool_call_ids.contains(id))
+                        });
+                    if duplicate {
+                        log::debug!(
+                            "Ignored duplicate tool results at log entry {seq} in session {name}"
+                        );
+                        continue;
+                    }
                     let warning = format!(
                         "Ignored orphan tool results at log entry {seq} in session {name}; the corresponding tool call was missing or interrupted"
                     );
@@ -198,6 +267,7 @@ fn replay_log_entries_into_session(
                     session.replay_warnings.push(warning);
                     continue;
                 };
+                completed_tool_call_ids.extend(calls.iter().filter_map(|call| call.id.clone()));
                 let mut message =
                     assemble_tool_message(text, thought, calls, results).with_log_seq(seq);
                 if let Some(timestamp) = timestamp {
@@ -222,6 +292,7 @@ fn replay_log_entries_into_session(
             SessionLogEntry::Clear => {
                 pending = None;
                 users_queued_during_tool.clear();
+                completed_tool_call_ids.clear();
                 session.messages.clear();
                 session.compressed_messages.clear();
                 session.data_urls.clear();
@@ -239,12 +310,14 @@ fn replay_log_entries_into_session(
         }
     }
 
-    finish_orphaned_tool_round(
-        &mut session,
-        &mut pending,
-        &mut users_queued_during_tool,
-        name,
-    )?;
+    if let Some(pending) = pending.take() {
+        let message = match trailing_tool_calls {
+            TrailingToolCallPolicy::Interrupted => repair_orphan_tool_calls(pending, name)?,
+            TrailingToolCallPolicy::Pending => preserve_pending_tool_calls(pending),
+        };
+        session.messages.push(message);
+    }
+    session.messages.append(&mut users_queued_during_tool);
 
     Ok(session)
 }
@@ -278,6 +351,17 @@ pub(crate) fn load_from_log_for_test(content: &str) -> Session {
 }
 
 fn repair_orphan_tool_calls(pending: PendingToolCalls, _name: &str) -> Result<Message> {
+    Ok(assemble_synthetic_tool_message(
+        pending,
+        LOST_TOOL_RESPONSE_ERROR,
+    ))
+}
+
+fn preserve_pending_tool_calls(pending: PendingToolCalls) -> Message {
+    assemble_synthetic_tool_message(pending, PENDING_TOOL_RESPONSE_ERROR)
+}
+
+fn assemble_synthetic_tool_message(pending: PendingToolCalls, error: &str) -> Message {
     let PendingToolCalls {
         seq,
         text,
@@ -288,9 +372,7 @@ fn repair_orphan_tool_calls(pending: PendingToolCalls, _name: &str) -> Result<Me
     let lost = harnx_core::session::ToolOutput {
         id: None,
         name: String::new(),
-        output: serde_json::json!({
-            "error": "tool response lost (session was interrupted before results were persisted)"
-        }),
+        output: serde_json::json!({ "error": error }),
         markdown: None,
         content: Vec::new(),
         switch_agent: None,
@@ -310,7 +392,17 @@ fn repair_orphan_tool_calls(pending: PendingToolCalls, _name: &str) -> Result<Me
     if let Some(timestamp) = timestamp {
         message = message.with_log_timestamp(timestamp);
     }
-    Ok(message)
+    message
+}
+
+/// Whether a reconstructed tool result is only the placeholder for a call
+/// that an active lease holder has not finished yet.
+pub fn is_pending_tool_result(result: &crate::tool::ToolResult) -> bool {
+    result.output.as_object().is_some_and(|output| {
+        output.len() == 1
+            && output.get("error").and_then(serde_json::Value::as_str)
+                == Some(PENDING_TOOL_RESPONSE_ERROR)
+    })
 }
 
 fn assemble_tool_message(
@@ -348,7 +440,7 @@ fn assemble_tool_message(
                 None => ToolResult::new(
                     call,
                     serde_json::json!({
-                        "error": "tool response lost (session was interrupted before results were persisted)"
+                        "error": LOST_TOOL_RESPONSE_ERROR
                     }),
                 ),
             };
@@ -648,7 +740,7 @@ pub fn add_tool_calls(
             crate::tool::ToolResult::new(
                 call,
                 serde_json::json!({
-                    "error": "tool response pending (results not yet persisted)"
+                    "error": PENDING_TOOL_RESPONSE_ERROR
                 }),
             )
         })
@@ -1567,6 +1659,110 @@ results:
             tool_calls.tool_results[0].output,
             serde_json::json!({"answer": "found"})
         );
+        assert!(loaded.replay_warnings.is_empty());
+    }
+
+    #[test]
+    fn replay_ignores_duplicate_results_for_a_completed_tool_call() {
+        let content = r#"---
+type: message
+role: user
+content: original request
+---
+type: tool_calls
+text: working
+calls:
+  - name: search
+    arguments: {}
+    id: call-1
+---
+type: message
+role: user
+content: queued correction
+---
+type: tool_results
+results:
+  - id: call-1
+    name: search
+    output:
+      error: tool response lost
+---
+type: turn_end
+through_seq: 3
+fence_token: 7
+---
+type: tool_results
+results:
+  - id: call-1
+    name: search
+    output:
+      error: tool response lost
+---
+type: turn_end
+through_seq: 3
+fence_token: 8
+---
+type: tool_results
+results:
+  - id: call-1
+    name: search
+    output:
+      error: tool response lost
+"#;
+
+        let loaded = load_from_log_for_test(content);
+
+        assert_eq!(
+            loaded
+                .messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            vec![MessageRole::User, MessageRole::Tool, MessageRole::User]
+        );
+        assert!(loaded.replay_warnings.is_empty());
+    }
+
+    #[test]
+    fn leased_observer_replay_preserves_a_trailing_tool_call_as_pending() {
+        let content = r#"---
+type: message
+role: user
+content: original request
+---
+type: tool_calls
+text: still working
+calls:
+  - name: search
+    arguments: {}
+    id: call-pending
+---
+type: message
+role: user
+content: queued correction
+"#;
+        let raw = collect_raw_log_entries(content, "leased-session").unwrap();
+
+        let loaded = replay_nats_entries_into_session_preserving_pending(
+            &raw,
+            "leased-session",
+            Session::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            loaded
+                .messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            vec![MessageRole::User, MessageRole::Tool, MessageRole::User]
+        );
+        let MessageContent::ToolCalls(tool_calls) = &loaded.messages[1].content else {
+            panic!("expected pending tool-call message");
+        };
+        assert_eq!(tool_calls.tool_results.len(), 1);
+        assert!(is_pending_tool_result(&tool_calls.tool_results[0]));
         assert!(loaded.replay_warnings.is_empty());
     }
 

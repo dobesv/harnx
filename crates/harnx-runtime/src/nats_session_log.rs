@@ -308,6 +308,26 @@ pub fn load_session_from_entries_with_metadata(
     name: &str,
     session: harnx_core::session::Session,
 ) -> Result<harnx_core::session::Session> {
+    load_session_from_entries_with_metadata_policy(entries, name, session, false)
+}
+
+/// Reconstruct a session snapshot for an observer while a worker still holds
+/// its lease. The durable log may legitimately end with tool calls whose
+/// results have not been appended yet.
+pub fn load_session_from_entries_with_metadata_preserving_pending(
+    entries: &[(u64, SessionLogEntry)],
+    name: &str,
+    session: harnx_core::session::Session,
+) -> Result<harnx_core::session::Session> {
+    load_session_from_entries_with_metadata_policy(entries, name, session, true)
+}
+
+fn load_session_from_entries_with_metadata_policy(
+    entries: &[(u64, SessionLogEntry)],
+    name: &str,
+    session: harnx_core::session::Session,
+    preserve_pending: bool,
+) -> Result<harnx_core::session::Session> {
     let raw_entries: Vec<(usize, SessionLogEntry)> = entries
         .iter()
         .map(|(seq, entry)| {
@@ -316,7 +336,15 @@ pub fn load_session_from_entries_with_metadata(
                 .context("session log sequence does not fit into usize")
         })
         .collect::<Result<_>>()?;
-    crate::config::session::replay_nats_entries_into_session(&raw_entries, name, session)
+    if preserve_pending {
+        crate::config::session::replay_nats_entries_into_session_preserving_pending(
+            &raw_entries,
+            name,
+            session,
+        )
+    } else {
+        crate::config::session::replay_nats_entries_into_session(&raw_entries, name, session)
+    }
 }
 
 pub fn load_session_from_yaml(content: &str, name: &str) -> Result<harnx_core::session::Session> {

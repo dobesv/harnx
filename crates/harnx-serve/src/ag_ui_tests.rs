@@ -2146,6 +2146,44 @@ fn history_messages_for_snapshot_keeps_tool_turn_prose_and_tool_entries() {
 }
 
 #[test]
+fn history_snapshot_leaves_pending_tool_call_running() {
+    let history = vec![HistoryMsg {
+        role: MessageRole::Tool,
+        content: MessageContent::ToolCalls(MessageContentToolCalls::new(
+            vec![harnx_core::tool::ToolResult::new(
+                ToolCall::new(
+                    "long_running_tool".to_string(),
+                    json!({"task": "work"}),
+                    Some("call-pending".to_string()),
+                    None,
+                ),
+                json!({
+                    "error": "tool response pending (results not yet persisted)"
+                }),
+            )],
+            "still working".to_string(),
+            None,
+        )),
+        id: Some(Uuid::new_v4().to_string()),
+        log_seq: Some(7),
+        log_timestamp: None,
+    }];
+
+    let snapshot = history_messages_for_snapshot(&history);
+
+    assert!(matches!(
+        snapshot.as_slice(),
+        [AgUiMessage::Assistant {
+            content: Some(content),
+            tool_calls: Some(tool_calls),
+            ..
+        }] if content == "still working"
+            && tool_calls.len() == 1
+            && tool_calls[0].function.name == "long_running_tool"
+    ));
+}
+
+#[test]
 fn history_messages_for_snapshot_keeps_plain_assistant_content() {
     let history = vec![HistoryMsg {
         role: MessageRole::Assistant,

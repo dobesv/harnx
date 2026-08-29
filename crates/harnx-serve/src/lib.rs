@@ -1309,16 +1309,46 @@ pub(crate) async fn load_nats_session(
         .await?
         .ok_or_else(|| anyhow!("Not Found"))?
         .metadata;
-    let log = harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, session.to_string());
+    // Sample the lease before taking the bounded log snapshot. If a worker is
+    // active, a trailing ToolCalls row is in flight rather than interrupted.
+    // Sampling first also avoids calling a just-finished turn interrupted when
+    // its result lands while the historical read is underway.
+    let lease_was_active = harnx_runtime::nats_lease::session_has_active_lease(&jetstream, session)
+        .await
+        .map_err(|err| anyhow!("Failed to inspect worker lease for session '{session}': {err}"))?;
+    let log = harnx_runtime::nats_session_log::NatsSessionLog::new(
+        jetstream.clone(),
+        session.to_string(),
+    );
     let entries = log
         .load_events_async()
         .await
         .map_err(|err| anyhow!("Failed to load session history for '{session}': {err}"))?;
-    let loaded = harnx_runtime::nats_session_log::load_session_from_entries_with_metadata(
-        &entries,
-        session,
-        metadata.base_session(),
-    )
+    // If there was no holder before the read, sample once more to cover a
+    // worker acquiring the lease and appending ToolCalls while the bounded
+    // snapshot was being taken.
+    let preserve_pending = if lease_was_active {
+        true
+    } else {
+        harnx_runtime::nats_lease::session_has_active_lease(&jetstream, session)
+            .await
+            .map_err(|err| {
+                anyhow!("Failed to inspect worker lease for session '{session}': {err}")
+            })?
+    };
+    let loaded = if preserve_pending {
+        harnx_runtime::nats_session_log::load_session_from_entries_with_metadata_preserving_pending(
+            &entries,
+            session,
+            metadata.base_session(),
+        )
+    } else {
+        harnx_runtime::nats_session_log::load_session_from_entries_with_metadata(
+            &entries,
+            session,
+            metadata.base_session(),
+        )
+    }
     .map_err(|err| anyhow!("Failed to reconstruct session history for '{session}': {err}"))?;
     Ok(loaded)
 }

@@ -276,6 +276,15 @@ Multiple clients can attach to a single session:
 
 Late-joining clients automatically converge to the same state by replaying the durable log.
 
+A bounded history snapshot can legitimately end at `ToolCalls` while the lease
+holder is still executing the tool. Read-only observers sample the session
+lease before loading history (and again afterward if it was initially free):
+while either sample is active, replay preserves that tail as pending and AG-UI
+emits the assistant tool call without a result. Only a lease-free replay turns
+a trailing call into an interrupted result. Replay also ignores redundant
+`ToolResults` for IDs that already completed, so old recovery artifacts do not
+appear as current orphan warnings.
+
 ## Failover & Safety
 
 ### Leases & Fencing
