@@ -247,6 +247,34 @@ async fn nats_local_server_owner_drop_preserves_jetstream_data() {
 }
 
 #[tokio::test]
+async fn local_session_listing_initializes_missing_metadata_bucket() {
+    require_nextest();
+    if skip_without_nats_server() {
+        return;
+    }
+    let (_directory, _guard) = isolated_data_dir();
+
+    let _server = ensure_shared_server()
+        .await
+        .expect("start fresh shared local NATS server");
+    let config = harnx_runtime::config::Config::default();
+    let sessions = config
+        .list_remote_sessions_with_meta(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+        .await
+        .expect("fresh local session listing should initialize canonical metadata");
+
+    assert!(sessions.is_empty());
+    let jetstream = config
+        .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+        .await
+        .expect("reconnect to local JetStream");
+    jetstream
+        .get_key_value(harnx_runtime::nats_session_metadata::SESSION_METADATA_BUCKET)
+        .await
+        .expect("session listing should create the canonical metadata bucket");
+}
+
+#[tokio::test]
 async fn local_cluster_jetstream_connects_to_shared_server_with_token() {
     require_nextest();
     if skip_without_nats_server() {
