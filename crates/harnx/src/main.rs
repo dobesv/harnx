@@ -97,10 +97,23 @@ async fn main() -> Result<()> {
     load_env_file()?;
     let cli = Cli::parse();
     setup_logger(LogSink::File)?;
+    let telemetry = harnx_telemetry::init_telemetry("harnx")?;
     harnx_core::alloc_guard::init_from_env();
+
+    let result = run_main(cli).await;
+    telemetry.shutdown().await;
+    if let Some(err) = result? {
+        render_error(err);
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+async fn run_main(cli: Cli) -> Result<Option<anyhow::Error>> {
     match &cli.command {
         Some(command @ (Commands::Info(_) | Commands::Session(_))) => {
-            return run_command(command).await;
+            run_command(command).await?;
+            return Ok(None);
         }
         Some(Commands::Prompt(_)) | None => {}
     }
@@ -112,11 +125,7 @@ async fn main() -> Result<()> {
     };
     let info_flag = legacy_info_flag(&cli);
     let config = Arc::new(RwLock::new(Config::init(working_mode, info_flag).await?));
-    if let Err(err) = run(config, cli, text).await {
-        render_error(err);
-        std::process::exit(1);
-    }
-    Ok(())
+    Ok(run(config, cli, text).await.err())
 }
 
 async fn run_command(command: &Commands) -> Result<()> {

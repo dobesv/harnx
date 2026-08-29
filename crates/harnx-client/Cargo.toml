@@ -19,6 +19,7 @@ chrono = { workspace = true }
 dirs = { workspace = true }
 futures-util = { workspace = true }
 harnx-core = { path = "../harnx-core" }
+harnx-telemetry = { workspace = true }
 hmac = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }

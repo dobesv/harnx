@@ -22,6 +22,14 @@ fn main() -> anyhow::Result<()> {
 
 async fn async_main() -> anyhow::Result<()> {
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
+    let telemetry = harnx_telemetry::init_telemetry("harnx-mcp-remote")?;
+
+    let result = run().await;
+    telemetry.shutdown().await;
+    result
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
     log::info!(
         "harnx-mcp-remote v{}: starting, proxying to {}",

@@ -17,6 +17,7 @@ harnx-hookset = { path = "../harnx-hookset" }
 harnx-hookset-server = { path = "../harnx-hookset-server" }
 log = { workspace = true }
 serde_json = { workspace = true }
+harnx-telemetry = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]

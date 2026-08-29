@@ -15,7 +15,14 @@ async fn main() -> Result<()> {
     // Logs go to stderr so they never interleave with the readiness lines or
     // JSONL responses on stdout.
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
+    let telemetry = harnx_telemetry::init_telemetry("harnx-proxy-auth")?;
 
+    let result = run().await;
+    telemetry.shutdown().await;
+    result
+}
+
+async fn run() -> Result<()> {
     let args = <cli::Args as Parser>::parse();
     let hook_name = args
         .name

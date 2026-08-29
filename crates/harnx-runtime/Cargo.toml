@@ -35,6 +35,7 @@ harnx-hooks = { path = "../harnx-hooks" }
 harnx-hookset = { path = "../harnx-hookset" }
 harnx-hookset-server = { path = "../harnx-hookset-server" }
 harnx-nats-common = { workspace = true }
+harnx-telemetry = { workspace = true, features = ["nats"] }
 harnx-toolset = { path = "../harnx-toolset" }
 harnx-toolset-server = { path = "../harnx-toolset-server" }
 harnx-rag = { path = "../harnx-rag" }
@@ -64,6 +65,7 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
+tracing = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 uuid = { workspace = true }
@@ -84,4 +86,9 @@ pretty_assertions = "1.4.0"
 tempfile = "3"
 tokio-test = "0.4"
 harnx-test-bins = { path = "../harnx-test-bins" }
+harnx-telemetry = { workspace = true, features = ["testing"] }
 harnx-time-server = { path = "../harnx-time-server" }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }

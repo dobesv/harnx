@@ -81,6 +81,7 @@ harnx-rag = { path = "../harnx-rag" }
 harnx-render = { path = "../harnx-render" }
 harnx-runtime = { path = "../harnx-runtime" }
 harnx-spinner = { path = "../harnx-spinner" }
+harnx-telemetry = { workspace = true }
 harnx-tui = { path = "../harnx-tui" }
 shellexpand = { workspace = true }
 schemars = { workspace = true }

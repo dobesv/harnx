@@ -9,6 +9,14 @@ async fn main() -> anyhow::Result<()> {
     // Before spawning the child: its stderr is forwarded to `log::debug!`, which
     // goes nowhere until a logger exists.
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
+    let telemetry = harnx_telemetry::init_telemetry("harnx-mcp-bridge")?;
+
+    let result = run().await;
+    telemetry.shutdown().await;
+    result
+}
+
+async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
 
     if args.list_tools {

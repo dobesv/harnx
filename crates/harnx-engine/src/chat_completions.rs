@@ -15,6 +15,32 @@ use harnx_core::sink::emit_agent_event;
 use harnx_core::text::{extract_code_block, strip_think_tag};
 use harnx_core::tool::ToolCall;
 use harnx_render::pretty_error_string;
+use tracing::Instrument;
+
+fn llm_request_span(client: &dyn Client) -> tracing::Span {
+    tracing::info_span!(
+        "llm_request",
+        otel.kind = "client",
+        gen_ai.system = client.name(),
+        gen_ai.request.model = client.model().name(),
+        gen_ai.usage.input_tokens = tracing::field::Empty,
+        gen_ai.usage.output_tokens = tracing::field::Empty,
+        harnx.gen_ai.usage.cached_tokens = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
+    )
+}
+
+fn record_token_count(span: &tracing::Span, field: &'static str, value: Option<u64>) {
+    if let Some(value) = value {
+        span.record(field, i64::try_from(value).unwrap_or(i64::MAX));
+    }
+}
+
+fn record_llm_error(span: &tracing::Span, error: &anyhow::Error) {
+    span.record("otel.status_code", "ERROR");
+    span.record("otel.status_description", error.to_string());
+}
 
 /// Orchestrate one streaming chat-completions call, honouring the caller's abort signal.
 ///
@@ -28,27 +54,40 @@ pub async fn chat_completions_streaming_with_data(
     ctx: &ClientCallContext<'_>,
 ) -> Result<()> {
     let abort_signal = handler.abort();
-    tokio::select! {
-        ret = async {
-            let reqwest_client = client.build_client(ctx)?;
-            client
-                .chat_completions_streaming_inner(&reqwest_client, handler, data)
-                .await
-        } => {
-            handler.done();
-            ret.with_context(|| {
-                format!(
-                    "Failed to call chat-completions api (client: {}, model: {})",
-                    client.name(),
-                    client.model().id()
-                )
-            })
-        }
-        _ = wait_abort_signal(&abort_signal) => {
-            handler.done();
-            Ok(())
+    let span = llm_request_span(client);
+    // `SseHandler` exposes usage only through `take(self)`, which the caller
+    // invokes after this borrowed handler returns and the span has closed.
+    let result = async {
+        tokio::select! {
+            ret = async {
+                let reqwest_client = client.build_client(ctx)?;
+                client
+                    .chat_completions_streaming_inner(&reqwest_client, handler, data)
+                    .await
+            } => {
+                handler.done();
+                ret.with_context(|| {
+                    format!(
+                        "Failed to call chat-completions api (client: {}, model: {})",
+                        client.name(),
+                        client.model().id()
+                    )
+                })
+            }
+            _ = wait_abort_signal(&abort_signal) => {
+                handler.done();
+                Ok(())
+            }
         }
     }
+    .instrument(span.clone())
+    .await;
+
+    if let Err(error) = &result {
+        record_llm_error(&span, error);
+    }
+
+    result
 }
 
 /// Orchestrate one non-streaming LLM call. Wraps `chat_completions_with_data`
@@ -171,17 +210,37 @@ pub async fn chat_completions_with_data(
     data: ChatCompletionsData,
     ctx: &ClientCallContext<'_>,
 ) -> Result<ChatCompletionsOutput> {
-    let reqwest_client = client.build_client(ctx)?;
-    client
-        .chat_completions_inner(&reqwest_client, data)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to call chat-completions api (client: {}, model: {})",
-                client.name(),
-                client.model().id()
-            )
-        })
+    let span = llm_request_span(client);
+    let result = async {
+        let reqwest_client = client.build_client(ctx)?;
+        client
+            .chat_completions_inner(&reqwest_client, data)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to call chat-completions api (client: {}, model: {})",
+                    client.name(),
+                    client.model().id()
+                )
+            })
+    }
+    .instrument(span.clone())
+    .await;
+
+    match &result {
+        Ok(output) => {
+            record_token_count(&span, "gen_ai.usage.input_tokens", output.input_tokens);
+            record_token_count(&span, "gen_ai.usage.output_tokens", output.output_tokens);
+            record_token_count(
+                &span,
+                "harnx.gen_ai.usage.cached_tokens",
+                output.cached_tokens,
+            );
+        }
+        Err(error) => record_llm_error(&span, error),
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -202,6 +261,18 @@ mod tests {
     /// mid-flight. Acquire this guard for the full setup/call/cleanup window.
     /// Mirrors `harnx-core`'s `sink` test module.
     static SINK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn llm_error_status_description_omits_wrapped_cause() {
+        harnx_core::require_nextest();
+        let error = anyhow::anyhow!("SECRET_TOKEN_BODY").context("chat completions request failed");
+
+        // `record_llm_error` records Display output. Unlike Debug or the full
+        // error chain, Display includes only this safe outer context.
+        let status_description = error.to_string();
+        assert!(status_description.contains("chat completions request failed"));
+        assert!(!status_description.contains("SECRET_TOKEN_BODY"));
+    }
 
     /// Ignore `PoisonError` so a panic in one test doesn't cascade-fail the
     /// rest of the sink tests in this module.

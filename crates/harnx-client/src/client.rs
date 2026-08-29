@@ -438,9 +438,19 @@ impl RequestData {
         debug!("Request {url} {body}");
         harnx_core::llm_trace::request(&url, &body);
 
+        let has_traceparent = headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("traceparent"));
         let mut builder = client.post(url);
         for (key, value) in headers {
             builder = builder.header(key, value);
+        }
+        if !has_traceparent {
+            let mut trace_headers = reqwest::header::HeaderMap::new();
+            harnx_telemetry::propagate::inject_current_into_http(&mut trace_headers);
+            for (name, value) in &trace_headers {
+                builder = builder.header(name, value);
+            }
         }
         builder = builder.json(&body);
         builder
@@ -547,6 +557,46 @@ mod request_data_tests {
     use harnx_core::provider_config::openai::OpenAIConfig;
     use indexmap::IndexMap;
     use serde_json::json;
+
+    #[test]
+    fn request_builder_keeps_app_headers_without_an_active_span() {
+        let mut request_data = RequestData::new("https://api.example.com/v1/chat", json!({}));
+        request_data.header("x-provider-header", "provider-value");
+
+        let request = request_data
+            .into_builder(&reqwest::Client::new())
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("x-provider-header")
+                .and_then(|value| value.to_str().ok()),
+            Some("provider-value")
+        );
+        assert!(!request.headers().contains_key("traceparent"));
+    }
+
+    #[test]
+    fn request_builder_preserves_caller_traceparent_case_insensitively() {
+        const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let mut request_data = RequestData::new("https://api.example.com/v1/chat", json!({}));
+        request_data.header("TrAcEpArEnT", TRACEPARENT);
+
+        let request = request_data
+            .into_builder(&reqwest::Client::new())
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("traceparent")
+                .and_then(|value| value.to_str().ok()),
+            Some(TRACEPARENT)
+        );
+    }
 
     #[test]
     fn request_data_to_json_value_round_trips() {

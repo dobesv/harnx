@@ -109,6 +109,19 @@ holds the descriptor open for the life of the process.
   message history the harness built is responsible. The file is appended,
   not truncated, so set a fresh path per session.
 
+## Tracing / OpenTelemetry Envs
+
+OpenTelemetry distributed tracing is off unless an OTLP endpoint environment variable (`OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) is set. When unset, tracing is fully inert and standard logging is unaffected. See [OpenTelemetry Tracing](tracing.md) for full operational documentation.
+
+- **OTEL_EXPORTER_OTLP_ENDPOINT**: Base URL of the OTLP HTTP collector (e.g. `http://localhost:4318`).
+- **OTEL_EXPORTER_OTLP_TRACES_ENDPOINT**: Traces-specific OTLP HTTP endpoint (e.g. `http://localhost:4318/v1/traces`). Takes precedence over `OTEL_EXPORTER_OTLP_ENDPOINT`.
+- **OTEL_EXPORTER_OTLP_PROTOCOL**: Not required or read. The exporter always uses `http/protobuf`; other values such as `grpc` are neither honored nor rejected.
+- **OTEL_SERVICE_NAME**: Service identifier for the root process (default `harnx`). Child tool servers name themselves independently (e.g. `harnx-fs-tools-server`).
+- **OTEL_RESOURCE_ATTRIBUTES**: Key-value resource attributes added to exported spans (e.g. `service.version=0.30.0`).
+- **OTEL_EXPORTER_OTLP_HEADERS**: Key-value header pairs for exporter authentication or routing.
+- **OTEL_TRACES_SAMPLER**: Sampling strategy (e.g. `always_on`, `always_off`, `traceidratio`, `parentbased_always_on`).
+- **OTEL_TRACES_SAMPLER_ARG**: Argument for the sampler (e.g. `0.1` for 10% sampling ratio).
+
 ## Tool filesystem allowlist envs
 
 `harnx-fs-tools` and `harnx-bash-tools` accept the same path lists and batch toggles. `harnx-sandbox-run` accepts the four explicit path lists but doesn't support batches.

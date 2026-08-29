@@ -19,7 +19,14 @@ async fn main() -> Result<()> {
     let mut settings = harnx_core::logging::settings(LogSink::Stderr);
     settings.level = settings.level.max(verbose_level(cli.verbose));
     let _ = harnx_core::logging::init_with(settings);
+    let telemetry = harnx_telemetry::init_telemetry("harnx-pkg")?;
 
+    let result = run(&cli).await;
+    telemetry.shutdown().await;
+    result
+}
+
+async fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
         Command::Add(args) => commands::add::run(args).await?,
         Command::Remove(args) => commands::remove::run(args).await?,

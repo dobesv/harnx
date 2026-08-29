@@ -13,14 +13,18 @@ async-nats = { workspace = true }
 futures-util = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 harnx-nats-common = { workspace = true }
+harnx-telemetry = { workspace = true, features = ["mcp", "nats"] }
 harnx-toolset = { path = "../harnx-toolset" }
 log = { workspace = true }
+opentelemetry = { workspace = true }
 rmcp = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+harnx-telemetry = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
 which = { workspace = true }

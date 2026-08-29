@@ -333,6 +333,9 @@ Harnx tracks internal counters (exported to logs and future metrics endpoints):
 - `fenced_writes_rejected`: Safety triggers.
 - `interrupt_errors_synthesized`: Data points on failover impact.
 
+### Tracing
+Workers participate in OpenTelemetry distributed tracing when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Trace context propagates across process boundaries over NATS message headers for sub-agent activations and tool executions. See [OpenTelemetry Tracing](tracing.md).
+
 ## TLS Support Note
 Harnx supports TLS and mTLS for NATS connections. While token authentication and config-based TLS have been verified, automated PKI-backed integration tests for live TLS handshakes are ongoing.
 

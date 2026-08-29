@@ -22,6 +22,7 @@ clap = { workspace = true }
 flate2 = "1"
 gix = { workspace = true, features = ["blocking-network-client"] }
 harnx-core = { path = "../harnx-core" }
+harnx-telemetry = { workspace = true }
 log = { workspace = true }
 oci-client = { workspace = true }
 semver = { workspace = true }

@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use tracing::Instrument;
 
 /// Callback invoked with a `&ToolCall` and the parsed arguments JSON.
 /// Used for both "tool is about to dispatch" and "tool returned a
@@ -367,6 +368,35 @@ fn detect_switch_agent(output: &Value) -> Option<SwitchAgentData> {
     })
 }
 
+async fn call_tool_with_tracing(
+    provider: &dyn ToolProvider,
+    tool_name: &str,
+    json_data: Value,
+    abort_signal: &AbortSignal,
+) -> Result<Value, ToolError> {
+    let span = tracing::info_span!(
+        "tool_call",
+        otel.kind = "client",
+        harnx.tool.name = tool_name,
+        harnx.tool.arguments_bytes = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+    );
+    if !span.is_disabled() {
+        let arguments_bytes = serde_json::to_vec(&json_data)
+            .map(|arguments| i64::try_from(arguments.len()).unwrap_or(i64::MAX))
+            .unwrap_or_default();
+        span.record("harnx.tool.arguments_bytes", arguments_bytes);
+    }
+    let result = provider
+        .call_tool(tool_name, json_data, abort_signal)
+        .instrument(span.clone())
+        .await;
+    if result.is_err() {
+        span.record("otel.status_code", "ERROR");
+    }
+    result
+}
+
 async fn dispatch_tool_call(
     call: ToolCall,
     json_data: Value,
@@ -429,10 +459,13 @@ async fn dispatch_tool_call(
             continue;
         }
         let tool_name = call.name.clone();
-        let result = provider
-            .call_tool(&tool_name, json_data.clone(), abort_signal)
-            .await?;
-        return Ok(result);
+        return call_tool_with_tracing(
+            provider.as_ref(),
+            &tool_name,
+            json_data.clone(),
+            abort_signal,
+        )
+        .await;
     }
 
     Err(ToolError::Recoverable(anyhow!(
