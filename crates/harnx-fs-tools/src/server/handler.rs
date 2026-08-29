@@ -150,7 +150,7 @@ impl FsServer {
                 None,
             )),
         }?;
-        if let Some(observation) = self.observation_for_args(tool, &observation_args) {
+        if let Some(observation) = self.observation_for_args(tool, &observation_args).await {
             result.meta.get_or_insert_with(MetaObject::new).0.insert(
                 EXECUTION_CONTEXT_NAMESPACE.to_string(),
                 serde_json::to_value(observation).expect("execution context serializes"),

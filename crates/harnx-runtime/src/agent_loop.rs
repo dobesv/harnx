@@ -12,7 +12,7 @@
 //! front-ends now delegate to.
 
 use crate::{
-    config::{Config, GlobalConfig, Input},
+    config::{Config, GlobalConfig, Input, SessionSaveRequest},
     nats_hook_provider::{dispatch_hook_event, HookDispatchMeta, HookEventDispatch},
     tool::{execute_tool_round, CompletionText, ToolResult},
     utils::dimmed_text,
@@ -524,10 +524,15 @@ async fn fail_model_turn(params: FailedModelTurn<'_>) -> Result<LoopResult> {
         resume_count,
     })
     .await;
-    let _ = ctx
-        .config
-        .write()
-        .after_chat_completion(input, "", None, &[], &Default::default());
+    let request = SessionSaveRequest::new(input, "", None);
+    let persistence = {
+        ctx.config
+            .write()
+            .prepare_after_chat_completion(&request, &[], &Default::default())
+    };
+    if let Ok(persistence) = persistence {
+        persistence.persist().await;
+    }
     Err(error)
 }
 
@@ -544,13 +549,13 @@ async fn complete_model_turn(
     completion: CompletionOutput<'_>,
 ) -> Result<Vec<ToolResult>> {
     if completion.tool_calls.is_empty() {
-        ctx.config.write().after_chat_completion(
-            input,
-            completion.output,
-            completion.thought,
-            &[],
-            completion.usage,
-        )?;
+        let request = SessionSaveRequest::new(input, completion.output, completion.thought);
+        let persistence = {
+            ctx.config
+                .write()
+                .prepare_after_chat_completion(&request, &[], completion.usage)?
+        };
+        persistence.persist().await;
         return Ok(Vec::new());
     }
     ctx.config.write().record_completion_usage(completion.usage);

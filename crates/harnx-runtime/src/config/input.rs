@@ -421,8 +421,8 @@ mod tests {
     /// grew round by round. The model, seeing a single assistant turn
     /// listing every prior tool call, generated narrations like
     /// "continue replayed all Edits in order".
-    #[test]
-    fn build_messages_does_not_duplicate_tool_calls_when_session_has_them() {
+    #[tokio::test]
+    async fn build_messages_does_not_duplicate_tool_calls_when_session_has_them() {
         let _tmp = TempDir::new().unwrap();
         let mut config = Config {
             data: ConfigData {
@@ -457,10 +457,13 @@ mod tests {
                 std::slice::from_ref(&call),
             )
             .unwrap();
-        global_config
-            .write()
-            .append_session_tool_results(std::slice::from_ref(&result))
-            .unwrap();
+        let persistence = {
+            global_config
+                .write()
+                .prepare_session_tool_results(std::slice::from_ref(&result))
+                .unwrap()
+        };
+        persistence.persist().await;
 
         let merged =
             input.merge_tool_results("thinking out loud".to_string(), None, vec![result.clone()]);

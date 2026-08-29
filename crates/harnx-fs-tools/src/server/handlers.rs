@@ -7,7 +7,7 @@ use super::*;
 type ReadLinesPage<'a> = (Vec<(usize, &'a str)>, usize, usize);
 
 impl FsServer {
-    pub(crate) fn observation_for_args(
+    pub(crate) async fn observation_for_args(
         &self,
         tool: &str,
         args: &Value,
@@ -31,7 +31,7 @@ impl FsServer {
             .allowlist
             .default_read_directory(current_dir.as_deref())
             .unwrap_or_else(|| path.clone());
-        Some(ExecutionContextObservation::observe(&workspace, &path))
+        Some(ExecutionContextObservation::observe_async(workspace, path).await)
     }
 
     pub fn new(allowlist: ResolvedAllowlist) -> Self {

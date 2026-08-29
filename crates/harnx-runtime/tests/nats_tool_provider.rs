@@ -347,7 +347,7 @@ async fn assert_context_flows_from_tool_to_session_enumeration(
         None,
         std::slice::from_ref(&call),
     )?;
-    harnx_runtime::config::session::add_tool_results(&mut session, &[tool_result])?;
+    harnx_runtime::config::session::add_tool_results(&mut session, &[tool_result]).await?;
 
     let listed = store.list().await?;
     let retained = listed

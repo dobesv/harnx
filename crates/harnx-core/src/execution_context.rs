@@ -126,6 +126,14 @@ impl ExecutionContextObservation {
         }
     }
 
+    /// Run filesystem canonicalization and Git subprocesses away from async
+    /// runtime workers.
+    pub async fn observe_async(workspace_root: PathBuf, target: PathBuf) -> Self {
+        tokio::task::spawn_blocking(move || Self::observe(&workspace_root, &target))
+            .await
+            .expect("execution-context observation task panicked")
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.version != EXECUTION_CONTEXT_VERSION {
             bail!("unsupported execution-context version {}", self.version);
@@ -251,8 +259,15 @@ impl ExecutionContextExtension {
         } else {
             self.contexts.push(observation);
         }
-        self.contexts
-            .sort_by_key(|context| std::cmp::Reverse(context.observed_at));
+        self.contexts.sort_by_key(|context| {
+            std::cmp::Reverse(
+                context
+                    .provenance
+                    .as_ref()
+                    .map(|provenance| provenance.worker_received_at)
+                    .unwrap_or(context.observed_at),
+            )
+        });
         self.contexts.truncate(EXECUTION_CONTEXT_MAX_RETAINED);
         true
     }
@@ -574,6 +589,7 @@ mod tests {
     #[test]
     fn merge_replaces_branch_state_and_caps_retention() {
         let mut extension = ExecutionContextExtension::default();
+        let received_at = Utc::now();
         for index in 0..=EXECUTION_CONTEXT_MAX_RETAINED {
             let mut observation = ExecutionContextObservation::observe(
                 Path::new("/workspace"),
@@ -581,13 +597,12 @@ mod tests {
             );
             observation.workspace_root = format!("/workspace-{index}");
             observation.working_directory = format!("/workspace-{index}");
-            observation.observed_at += chrono::Duration::seconds(index as i64);
-            observation.provenance = Some(ToolObservationProvenance::new(
-                "scope",
-                "fs",
-                "read",
-                index.to_string(),
-            ));
+            // A skewed server timestamp must not influence worker retention.
+            observation.observed_at += chrono::Duration::seconds(1_000 - index as i64);
+            let mut provenance =
+                ToolObservationProvenance::new("scope", "fs", "read", index.to_string());
+            provenance.worker_received_at = received_at + chrono::Duration::seconds(index as i64);
+            observation.provenance = Some(provenance);
             assert!(extension.merge(observation));
         }
         assert_eq!(extension.contexts.len(), EXECUTION_CONTEXT_MAX_RETAINED);

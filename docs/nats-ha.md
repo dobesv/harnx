@@ -160,8 +160,10 @@ The observation uses the reserved, versioned namespace
    Harnx's NATS provider currently opts in on every tool call. A direct MCP
    client chooses whether to opt in for each call.
 
-2. **The tool runs and the server observes its actual target.** The server
-   temporarily adds the observation to the successful tool result:
+2. **The tool runs and the server observes its actual target.** Filesystem
+   canonicalization and Git commands run on the async runtime's blocking pool,
+   so they do not stall request or picker workers. The server awaits that work
+   and temporarily adds the observation to the successful tool result:
 
    ```json
    {
@@ -203,9 +205,11 @@ The observation uses the reserved, versioned namespace
    append succeeds does Harnx merge the observation into
    `sessions/{id}/meta`, under the `dev.harnx.execution_context` extension. A
    failed transcript append therefore cannot leave context claiming that a
-   tool result was recorded. An ordinary metadata merge failure produces a
-   warning without changing the already-completed tool call. HA worker writes
-   remain protected by the session lease fence.
+   tool result was recorded. Unmatched or duplicate results that are excluded
+   from the durable entry are also excluded from the context merge. An
+   ordinary metadata merge failure produces a warning without changing the
+   already-completed tool call. HA worker writes remain protected by the
+   session lease fence.
 
 For example, suppose a remote bash server runs `git checkout feature/picker`
 in `/srv/work/app`. Its result temporarily carries `/srv/work/app`, branch
@@ -226,8 +230,9 @@ server. A later observation replaces the retained entry for the same primary
 repository, or for the same canonical worktree within one tool-server scope.
 Non-Git observations from the same scope and workspace also replace one
 another. This updates branch and path state instead of accumulating stale
-entries. If a 17th unrelated location is added, the oldest distinct or changed
-observation is evicted.
+entries. If a 17th unrelated location is added, the distinct or changed
+context with the oldest transport-attested worker receipt time is evicted; a
+skewed tool-server clock cannot control retention.
 
 Raw workspace paths and transport provenance remain in the private canonical
 extension, but redacted HTTP session metadata removes them and exposes only an

@@ -1,8 +1,15 @@
 //! Chat-completion persistence methods extracted from config/mod.rs for code health.
 use super::*;
 
+async fn await_context_persistence(
+    persistence: Result<session_persistence::PendingExecutionContextPersistence>,
+) -> Result<()> {
+    persistence?.persist().await;
+    Ok(())
+}
+
 impl Config {
-    pub fn after_chat_completion(
+    pub async fn after_chat_completion(
         &mut self,
         input: &Input,
         output: &str,
@@ -10,36 +17,47 @@ impl Config {
         tool_results: &[ToolResult],
         usage: &crate::client::CompletionTokenUsage,
     ) -> Result<()> {
+        let request = SessionSaveRequest::new(input, output, thought);
+        await_context_persistence(self.prepare_after_chat_completion(&request, tool_results, usage))
+            .await
+    }
+
+    pub(crate) fn prepare_after_chat_completion(
+        &mut self,
+        request: &SessionSaveRequest<'_>,
+        tool_results: &[ToolResult],
+        usage: &crate::client::CompletionTokenUsage,
+    ) -> Result<session_persistence::PendingExecutionContextPersistence> {
         self.record_completion_usage(usage);
-        self.update_last_message_after_completion(input, output, tool_results);
-        self.persist_chat_completion(input, output, thought, tool_results)
+        self.update_last_message_after_completion(request, tool_results);
+        self.prepare_chat_completion_persistence(request, tool_results)
     }
 
     fn update_last_message_after_completion(
         &mut self,
-        input: &Input,
-        output: &str,
+        request: &SessionSaveRequest<'_>,
         tool_results: &[ToolResult],
     ) {
         if !tool_results.is_empty() {
             return;
         }
 
-        self.last_message = Some(LastMessage::new(input.clone(), output.to_string()));
+        self.last_message = Some(LastMessage::new(
+            request.input.clone(),
+            request.output.to_string(),
+        ));
     }
 
-    fn persist_chat_completion(
+    fn prepare_chat_completion_persistence(
         &mut self,
-        input: &Input,
-        output: &str,
-        thought: Option<&str>,
+        request: &SessionSaveRequest<'_>,
         tool_results: &[ToolResult],
-    ) -> Result<()> {
+    ) -> Result<session_persistence::PendingExecutionContextPersistence> {
         if self.dry_run {
-            return Ok(());
+            return Ok(session_persistence::PendingExecutionContextPersistence::none(""));
         }
 
-        self.save_message(input, output, thought, tool_results)
+        self.prepare_save_message(request, tool_results)
     }
 
     /// Record an assistant tool-call request BEFORE the tools execute.
@@ -68,27 +86,90 @@ impl Config {
         )
     }
 
-    pub fn save_message(
+    /// Finalize the tool round opened by [`append_session_tool_calls`].
+    /// Writes a `ToolResults` entry to the session log and fills in
+    /// the pending outputs on the last in-memory message.
+    pub async fn append_session_tool_results(&mut self, results: &[ToolResult]) -> Result<()> {
+        let persistence = self.prepare_session_tool_results(results)?;
+        persistence.persist().await;
+        Ok(())
+    }
+
+    pub(crate) fn prepare_session_tool_results(
+        &mut self,
+        results: &[ToolResult],
+    ) -> Result<session_persistence::PendingExecutionContextPersistence> {
+        let Some(session) = self.session.as_mut() else {
+            return Ok(session_persistence::PendingExecutionContextPersistence::none(""));
+        };
+        crate::config::session::prepare_tool_results(session, results)
+    }
+
+    pub async fn save_message(
         &mut self,
         input: &Input,
         output: &str,
         thought: Option<&str>,
         tool_results: &[crate::tool::ToolResult],
     ) -> Result<()> {
-        let request = SessionSaveRequest::new(input, output, thought);
-        let Some(session) = self.session_for_save(&request) else {
-            return Ok(());
+        self.persist_message(
+            SessionSaveRequest::new(input, output, thought),
+            tool_results,
+        )
+        .await
+    }
+
+    async fn persist_message(
+        &mut self,
+        request: SessionSaveRequest<'_>,
+        tool_results: &[crate::tool::ToolResult],
+    ) -> Result<()> {
+        await_context_persistence(self.prepare_save_message(&request, tool_results)).await
+    }
+
+    fn prepare_save_message(
+        &mut self,
+        request: &SessionSaveRequest<'_>,
+        tool_results: &[crate::tool::ToolResult],
+    ) -> Result<session_persistence::PendingExecutionContextPersistence> {
+        let Some(session) = self.session_for_save(request) else {
+            return Ok(session_persistence::PendingExecutionContextPersistence::none(""));
         };
         if tool_results.is_empty() {
-            return crate::config::session::add_assistant_text(
+            crate::config::session::add_assistant_text(
                 session,
                 &request.input,
                 request.output,
                 request.thought,
-            );
+            )?;
+            return Ok(session_persistence::PendingExecutionContextPersistence::none(session.id()));
         }
 
-        Self::save_message_with_tool_results(session, &request, tool_results)
+        Self::save_message_with_tool_results(session, request, tool_results)
+    }
+
+    fn session_for_save<'a>(&'a mut self, request: &SessionSaveRequest) -> Option<&'a mut Session> {
+        if !request.input.with_session() {
+            return None;
+        }
+
+        self.session.as_mut()
+    }
+
+    fn save_message_with_tool_results(
+        session: &mut Session,
+        request: &SessionSaveRequest,
+        tool_results: &[crate::tool::ToolResult],
+    ) -> Result<session_persistence::PendingExecutionContextPersistence> {
+        let calls = collect_tool_calls(tool_results);
+        crate::config::session::add_tool_calls(
+            session,
+            &request.input,
+            request.output,
+            request.thought,
+            &calls,
+        )?;
+        crate::config::session::prepare_tool_results(session, tool_results)
     }
 }
 

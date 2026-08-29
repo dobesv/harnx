@@ -89,11 +89,14 @@ impl crate::config::session::SessionAppendSink for NatsSessionLogBackend {
         self.persist_metadata_blocking(MetadataReplacement::Variables(variables.clone()), None)
     }
 
-    fn persist_execution_contexts(
-        &self,
-        observations: &[ExecutionContextObservation],
-    ) -> Result<()> {
-        self.persist_execution_contexts_blocking(observations, None)
+    fn persist_execution_contexts<'a>(
+        &'a self,
+        observations: &'a [ExecutionContextObservation],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.persist_execution_contexts_async(observations, None)
+                .await
+        })
     }
 
     fn load_overrides(&self) -> Result<Option<crate::nats_session_metadata::SessionOverrides>> {
@@ -186,16 +189,19 @@ impl crate::config::session::SessionAppendSink for FencedSessionLogSink {
         self.persist_metadata(MetadataReplacement::Variables(variables.clone()))
     }
 
-    fn persist_execution_contexts(
-        &self,
-        observations: &[ExecutionContextObservation],
-    ) -> Result<()> {
-        anyhow::ensure!(
-            self.lease.is_held(),
-            "session lease lost before execution-context update"
-        );
-        self.backend
-            .persist_execution_contexts_blocking(observations, Some(self.lease.fence_token()))
+    fn persist_execution_contexts<'a>(
+        &'a self,
+        observations: &'a [ExecutionContextObservation],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            anyhow::ensure!(
+                self.lease.is_held(),
+                "session lease lost before execution-context update"
+            );
+            self.backend
+                .persist_execution_contexts_async(observations, Some(self.lease.fence_token()))
+                .await
+        })
     }
 
     fn load_overrides(&self) -> Result<Option<crate::nats_session_metadata::SessionOverrides>> {
@@ -298,31 +304,21 @@ impl NatsSessionLogBackend {
         Ok(Some(record.metadata.overrides))
     }
 
-    fn persist_execution_contexts_blocking(
+    async fn persist_execution_contexts_async(
         &self,
         observations: &[ExecutionContextObservation],
         fence_token: Option<u64>,
     ) -> Result<()> {
-        let store = self.metadata_store()?.clone();
-        let session_id = self.session_id.clone();
-        let observations = observations.to_vec();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                if let Some(fence_token) = fence_token {
-                    store
-                        .merge_execution_contexts_with_fence(
-                            &session_id,
-                            fence_token,
-                            &observations,
-                        )
-                        .await
-                } else {
-                    store
-                        .merge_execution_contexts(&session_id, &observations)
-                        .await
-                }
-            })
-        })?;
+        let store = self.metadata_store()?;
+        if let Some(fence_token) = fence_token {
+            store
+                .merge_execution_contexts_with_fence(&self.session_id, fence_token, observations)
+                .await?;
+        } else {
+            store
+                .merge_execution_contexts(&self.session_id, observations)
+                .await?;
+        }
         Ok(())
     }
 

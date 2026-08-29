@@ -141,6 +141,7 @@ mod tests {
     use harnx_tool_allow::ResolvedAllowlist;
     use serde_json::json;
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::process::Command;
     use std::sync::Arc;
 
@@ -176,6 +177,7 @@ mod tests {
         BashToolset::new(config, Vec::new()).await.unwrap()
     }
 
+    #[cfg(unix)]
     fn git(directory: &std::path::Path, args: &[&str]) {
         let output = Command::new("git")
             .arg("-C")
@@ -190,6 +192,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn observation(result: &Value) -> harnx_core::execution_context::ExecutionContextObservation {
         serde_json::from_value(
             result["_meta"][harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE].clone(),
@@ -197,6 +200,7 @@ mod tests {
         .expect("execution-context observation")
     }
 
+    #[cfg(unix)]
     fn content_field(result: &Value, field: &str) -> String {
         let text = result["content"][0]["text"].as_str().expect("text result");
         text.lines()

@@ -153,8 +153,8 @@ fn empty_session_keeps_messages_when_clear_cannot_be_persisted() {
 
 /// Verify that after_chat_completion persists intermediate rounds
 /// (non-empty tool_results) to the session, not just the final round.
-#[test]
-fn after_chat_completion_saves_intermediate_tool_rounds() {
+#[tokio::test]
+async fn after_chat_completion_saves_intermediate_tool_rounds() {
     use crate::tool::{ToolCall, ToolResult};
     use serde_json::json;
 
@@ -186,16 +186,14 @@ fn after_chat_completion_saves_intermediate_tool_rounds() {
 
     // Call after_chat_completion with non-empty tool_results.
     // Previously this returned early without saving; now it should persist.
-    global_config
-        .write()
-        .after_chat_completion(
-            &input,
-            "intermediate output",
-            None,
-            &tool_results,
-            &Default::default(),
-        )
-        .unwrap();
+    let request = SessionSaveRequest::new(&input, "intermediate output", None);
+    let persistence = {
+        global_config
+            .write()
+            .prepare_after_chat_completion(&request, &tool_results, &Default::default())
+            .unwrap()
+    };
+    persistence.persist().await;
 
     let config_guard = global_config.read();
     let session = config_guard.session.as_ref().unwrap();

@@ -1,13 +1,13 @@
-use super::session_externalize::{
-    externalize_content, externalize_tool_result_content, record_externalized,
-};
+use super::session_externalize::{externalize_content, record_externalized};
 #[cfg(test)]
 pub(crate) use super::session_persistence::attach_memory_log;
 use super::session_persistence::require_authoritative_appends;
 pub use super::session_persistence::{
-    append_event, persist_execution_contexts, persist_session_override, persist_session_overrides,
-    record_title, session_overrides, SessionAppendSink,
+    append_event, persist_session_override, persist_session_overrides, record_title,
+    session_overrides, SessionAppendSink,
 };
+pub use super::session_tool_results::add_tool_results;
+pub(crate) use super::session_tool_results::prepare_tool_results;
 use super::*;
 use crate::nats_session::new_client_message_id;
 
@@ -762,111 +762,6 @@ pub fn add_tool_calls(
     Ok(())
 }
 
-/// Finalize the tool round opened by [`add_tool_calls`] by filling in
-/// the in-memory outputs and writing a `ToolResults` log entry.
-/// Matches each result to its call by id (or by position when the id
-/// is absent).
-pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResult]) -> Result<()> {
-    // Resolve the attachments dir up front so we don't need to borrow `session`
-    // again while the `pending` mutable borrow below is live.
-    let attachments_dir = super::session_externalize::attachments_dir(session);
-    let mut cid_urls = std::collections::HashMap::new();
-
-    let Some(last) = session.messages.last_mut() else {
-        anyhow::bail!("add_tool_results called on empty session");
-    };
-    let MessageContent::ToolCalls(ref mut pending) = last.content else {
-        anyhow::bail!(
-            "add_tool_results called but the last session message is not a pending tool-call turn"
-        );
-    };
-    if last.role != MessageRole::Tool {
-        anyhow::bail!("add_tool_results called but the last session message is not role=Tool");
-    }
-
-    // Match results to the pending calls by id (fallback: position).
-    let mut by_id: std::collections::HashMap<String, crate::tool::ToolResult> = results
-        .iter()
-        .filter_map(|r| r.call.id.clone().map(|id| (id, r.clone())))
-        .collect();
-    let mut positional = results.iter().filter(|r| r.call.id.is_none()).cloned();
-    for slot in pending.tool_results.iter_mut() {
-        let replacement = slot
-            .call
-            .id
-            .as_ref()
-            .and_then(|id| by_id.remove(id))
-            .or_else(|| positional.next());
-        if let Some(replacement) = replacement {
-            slot.output = replacement.output;
-            slot.content = replacement.content;
-            slot.switch_agent = replacement.switch_agent;
-        }
-    }
-
-    // Externalize inline image data URIs in tool-result content to cid refs
-    // before persisting, freeing the in-memory base64 when an attachment store
-    // is configured;
-    // the cid -> filename map is logged as a DataUrls entry after the
-    // ToolResults entry (below) so the ToolCalls/ToolResults pairing on replay
-    // is not split.
-    externalize_tool_result_content(
-        attachments_dir.as_deref(),
-        &mut pending.tool_results,
-        &mut cid_urls,
-    );
-
-    let log_results: Vec<harnx_core::session::ToolOutput> = pending
-        .tool_results
-        .iter()
-        .map(|r| harnx_core::session::ToolOutput {
-            id: r.call.id.clone(),
-            name: r.call.name.clone(),
-            output: r.output.clone(),
-            markdown: r.markdown.clone(),
-            content: r.content.clone(),
-            switch_agent: r.switch_agent.clone(),
-        })
-        .collect();
-
-    let appended = append_event(
-        session,
-        &SessionLogEntry::ToolResults {
-            results: log_results,
-            timestamp: Some(Utc::now()),
-        },
-    );
-    let all_appended = appended & record_externalized(session, cid_urls);
-    session.dirty |= !all_appended;
-    require_authoritative_appends(session, all_appended, "tool results")?;
-    persist_tool_execution_contexts(session, results, all_appended);
-    session.update_tokens();
-    Ok(())
-}
-
-fn persist_tool_execution_contexts(
-    session: &Session,
-    results: &[crate::tool::ToolResult],
-    tool_results_are_durable: bool,
-) {
-    if !tool_results_are_durable {
-        return;
-    }
-    let observations = results
-        .iter()
-        .filter_map(|result| result.execution_context.clone())
-        .collect::<Vec<_>>();
-    if observations.is_empty() {
-        return;
-    }
-    if let Err(error) = persist_execution_contexts(session, &observations) {
-        log::warn!(
-            "failed to persist tool-observed execution context: session_id={} error={error:#}",
-            session.id()
-        );
-    }
-}
-
 /// Returns `true` when `input` is a genuine tool-call continuation of
 /// `session` — i.e. the session's last message is a `Tool` result AND
 /// the input carries accumulated tool-call results from `merge_tool_results`.
@@ -1184,38 +1079,16 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct FailingContextMetadataSink {
-        next_seq: std::sync::atomic::AtomicU64,
-        context_writes: std::sync::atomic::AtomicUsize,
-    }
-
-    impl SessionAppendSink for FailingContextMetadataSink {
-        fn append(&self, _entry: &SessionLogEntry) -> Result<u64> {
-            Ok(self
-                .next_seq
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                + 1)
-        }
-
-        fn persist_execution_contexts(
-            &self,
-            _observations: &[harnx_core::execution_context::ExecutionContextObservation],
-        ) -> Result<()> {
-            self.context_writes
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            anyhow::bail!("simulated execution-context metadata failure")
-        }
-
-        fn failure_is_fatal(&self) -> bool {
-            true
-        }
-    }
-
     fn test_session() -> Session {
         let mut session = new(&Config::default(), "test", None).unwrap();
         attach_memory_log(&mut session);
         session
+    }
+
+    async fn add_ok_tool_result(session: &mut Session, call: harnx_core::tool::ToolCall) {
+        super::add_tool_results(session, &[ToolResult::new(call, json!({"ok": true}))])
+            .await
+            .unwrap();
     }
 
     fn message_view(messages: &[Message]) -> Vec<(MessageRole, String)> {
@@ -1246,53 +1119,6 @@ mod tests {
             .to_string()
             .contains("failed to durably persist assistant response"));
         assert!(session.dirty);
-    }
-
-    #[test]
-    fn context_metadata_failure_does_not_fail_durable_tool_result() {
-        let config = Config::default();
-        let global_config = Arc::new(parking_lot::RwLock::new(config.clone()));
-        let input = crate::config::input::from_str(
-            &global_config,
-            "inspect repository",
-            Some(config.extract_agent()),
-        );
-        let sink = Arc::new(FailingContextMetadataSink::default());
-        let mut session = new(&config, "context-metadata-failure", None).unwrap();
-        session.runtime = Some(Arc::new(sink.clone() as Arc<dyn SessionAppendSink>));
-        let call = harnx_core::tool::ToolCall {
-            name: "fs_read".to_string(),
-            arguments: json!({"path": "/workspace/README.md"}),
-            id: Some("call-1".to_string()),
-            thought_signature: None,
-        };
-        super::add_tool_calls(
-            &mut session,
-            &input,
-            "reading",
-            None,
-            std::slice::from_ref(&call),
-        )
-        .unwrap();
-        let mut result = ToolResult::new(call, json!({"ok": true}));
-        let mut observation = harnx_core::execution_context::ExecutionContextObservation::observe(
-            std::path::Path::new("/workspace"),
-            std::path::Path::new("/workspace/README.md"),
-        );
-        observation.provenance = Some(
-            harnx_core::execution_context::ToolObservationProvenance::new(
-                "scope", "fs", "read", "call-1",
-            ),
-        );
-        result.execution_context = Some(observation);
-
-        super::add_tool_results(&mut session, &[result])
-            .expect("durable result must survive context metadata failure");
-        assert_eq!(
-            sink.context_writes
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
     }
 
     #[test]
@@ -1529,8 +1355,8 @@ prompt: summary
     /// user message entirely.
     ///
     /// Fixed: also requires `input.tool_calls.is_some()`.
-    #[test]
-    fn fresh_message_after_tool_tail_is_included_in_build_messages() {
+    #[tokio::test]
+    async fn fresh_message_after_tool_tail_is_included_in_build_messages() {
         use crate::tool::{ToolCall, ToolResult};
         use serde_json::json;
         use tempfile::TempDir;
@@ -1554,7 +1380,9 @@ prompt: summary
         };
         let result = ToolResult::new(call.clone(), json!({"stdout": "file1\n"}));
         super::add_tool_calls(&mut session, &input1, "running bash", None, &[call]).unwrap();
-        super::add_tool_results(&mut session, &[result]).unwrap();
+        super::add_tool_results(&mut session, &[result])
+            .await
+            .unwrap();
         assert_eq!(
             session.messages.last().unwrap().role,
             MessageRole::Tool,
@@ -1587,8 +1415,8 @@ prompt: summary
 
     /// Regression test for #390 (persistence side): `begin_turn` must
     /// persist a fresh user message even when the session tail is Tool.
-    #[test]
-    fn fresh_message_after_tool_tail_is_saved_by_begin_turn() {
+    #[tokio::test]
+    async fn fresh_message_after_tool_tail_is_saved_by_begin_turn() {
         use crate::tool::{ToolCall, ToolResult};
         use serde_json::json;
         use tempfile::TempDir;
@@ -1611,7 +1439,9 @@ prompt: summary
         };
         let result = ToolResult::new(call.clone(), json!({"stdout": "file1\n"}));
         super::add_tool_calls(&mut session, &input1, "running bash", None, &[call]).unwrap();
-        super::add_tool_results(&mut session, &[result]).unwrap();
+        super::add_tool_results(&mut session, &[result])
+            .await
+            .unwrap();
 
         // Fresh message (no tool_calls) — `add_assistant_text` calls
         // `begin_turn` internally.
@@ -2303,9 +2133,9 @@ replacements:
     /// agent loop is responsible for resetting `injected_user_text` between
     /// iterations; if it forgets, the same user message is appended on every
     /// tool round and the LLM sees N copies of one user message.
-    #[test]
-    fn injected_user_text_appended_once_per_begin_turn_call() {
-        use crate::tool::{ToolCall, ToolResult};
+    #[tokio::test]
+    async fn injected_user_text_appended_once_per_begin_turn_call() {
+        use crate::tool::ToolCall;
         use serde_json::json;
         use tempfile::TempDir;
 
@@ -2334,11 +2164,7 @@ replacements:
             std::slice::from_ref(&call_a),
         )
         .unwrap();
-        super::add_tool_results(
-            &mut session,
-            &[ToolResult::new(call_a, json!({"ok": true}))],
-        )
-        .unwrap();
+        add_ok_tool_result(&mut session, call_a).await;
 
         // Without the agent_loop clearing `injected_user_text` between rounds,
         // the SAME `input` reused for round 2 reapplies the injection.
@@ -2356,11 +2182,7 @@ replacements:
             std::slice::from_ref(&call_b),
         )
         .unwrap();
-        super::add_tool_results(
-            &mut session,
-            &[ToolResult::new(call_b, json!({"ok": true}))],
-        )
-        .unwrap();
+        add_ok_tool_result(&mut session, call_b).await;
 
         let injected_count = session
             .messages
@@ -2391,11 +2213,7 @@ replacements:
             std::slice::from_ref(&call_c),
         )
         .unwrap();
-        super::add_tool_results(
-            &mut session,
-            &[ToolResult::new(call_c, json!({"ok": true}))],
-        )
-        .unwrap();
+        add_ok_tool_result(&mut session, call_c).await;
 
         let injected_count_after_clear = session
             .messages
@@ -2422,8 +2240,8 @@ replacements:
     /// model treated each round as if the user had re-asked the same
     /// question and looped emitting "Let me look at the current state…"
     /// forever.
-    #[test]
-    fn build_messages_does_not_append_duplicate_user_during_tool_round() {
+    #[tokio::test]
+    async fn build_messages_does_not_append_duplicate_user_during_tool_round() {
         use crate::tool::{ToolCall, ToolResult};
         use serde_json::json;
         use tempfile::TempDir;
@@ -2457,6 +2275,7 @@ replacements:
             &mut session,
             &[ToolResult::new(call, json!({"content": "file body"}))],
         )
+        .await
         .unwrap();
 
         // session.messages now ends with a Tool message — that's the

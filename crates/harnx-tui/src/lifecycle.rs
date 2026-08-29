@@ -302,7 +302,7 @@ impl Tui {
                 } else {
                     PickerMatchMode::Local
                 };
-                let query = PickerQueryContext::observe_current(mode);
+                let query = PickerQueryContext::observe_current(mode).await;
                 (
                     sort_sessions_for_picker_with_context(sessions, &query),
                     None,

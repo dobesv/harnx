@@ -162,7 +162,7 @@ impl BashServer {
             .execution_context_target(tool, &observation_args, tracked_working_dir)
             .await
         {
-            self.attach_execution_context(&mut result, &target);
+            self.attach_execution_context(&mut result, target).await;
         }
         Ok(result)
     }
@@ -207,14 +207,14 @@ impl BashServer {
         }
     }
 
-    fn attach_execution_context(&self, result: &mut CallToolResult, target: &Path) {
+    async fn attach_execution_context(&self, result: &mut CallToolResult, target: PathBuf) {
         let current_dir = std::env::current_dir().ok();
         let workspace = self
             .inner
             .allowlist
             .default_read_directory(current_dir.as_deref())
-            .unwrap_or_else(|| target.to_path_buf());
-        let observation = ExecutionContextObservation::observe(&workspace, target);
+            .unwrap_or_else(|| target.clone());
+        let observation = ExecutionContextObservation::observe_async(workspace, target).await;
         result.meta.get_or_insert_with(MetaObject::new).0.insert(
             EXECUTION_CONTEXT_NAMESPACE.to_string(),
             serde_json::to_value(observation).expect("execution context serializes"),

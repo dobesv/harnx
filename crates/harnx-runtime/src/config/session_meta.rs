@@ -1,6 +1,5 @@
 use harnx_core::execution_context::ExecutionContextObservation;
 use std::collections::BTreeSet;
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,10 +25,14 @@ pub struct PickerQueryContext {
 }
 
 impl PickerQueryContext {
-    pub fn observe_current(mode: PickerMatchMode) -> Self {
+    pub async fn observe_current(mode: PickerMatchMode) -> Self {
         let current_dir = std::env::current_dir().unwrap_or_default();
         Self {
-            observation: ExecutionContextObservation::observe(&current_dir, &current_dir),
+            observation: ExecutionContextObservation::observe_async(
+                current_dir.clone(),
+                current_dir,
+            )
+            .await,
             mode,
         }
     }
@@ -131,20 +134,7 @@ fn local_directory_matches(
     query: &PickerQueryContext,
 ) -> bool {
     query.mode == PickerMatchMode::Local
-        && canonical_path_eq(
-            &context.working_directory,
-            &query.observation.working_directory,
-        )
-}
-
-fn canonical_path_eq(left: &str, right: &str) -> bool {
-    let left = Path::new(left)
-        .canonicalize()
-        .unwrap_or_else(|_| Path::new(left).to_path_buf());
-    let right = Path::new(right)
-        .canonicalize()
-        .unwrap_or_else(|_| Path::new(right).to_path_buf());
-    left == right
+        && context.working_directory == query.observation.working_directory
 }
 
 impl SessionMeta {
