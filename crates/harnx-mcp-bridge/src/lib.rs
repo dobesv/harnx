@@ -205,6 +205,7 @@ fn spawn_child(server_name: &str, program: &str, args: &[String]) -> anyhow::Res
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    harnx_telemetry::forward_otel_env_without_credentials(&mut command);
     configure_child_process(&mut command);
 
     // A separate process group prevents terminal SIGINT from reaching the child.
@@ -423,6 +424,18 @@ impl BridgeToolset {
     }
 }
 
+fn prepare_call_tool_params(
+    tool: &str,
+    arguments: Option<serde_json::Map<String, Value>>,
+) -> CallToolRequestParams {
+    let mut params = CallToolRequestParams::new(tool.to_owned());
+    if let Some(arguments) = arguments {
+        params = params.with_arguments(arguments);
+    }
+    harnx_telemetry::propagate::inject_current_into_mcp(&mut params);
+    params
+}
+
 #[async_trait]
 impl Toolset for BridgeToolset {
     fn name(&self) -> &str {
@@ -448,10 +461,7 @@ impl Toolset for BridgeToolset {
                 ));
             }
         };
-        let mut params = CallToolRequestParams::new(tool.to_owned());
-        if let Some(arguments) = arguments {
-            params = params.with_arguments(arguments);
-        }
+        let params = prepare_call_tool_params(tool, arguments);
 
         tokio::select! {
             biased;
@@ -544,7 +554,45 @@ mod tests {
     // unused elsewhere and `-D warnings` rejects the import.
     #[cfg(unix)]
     use super::report_tools;
-    use super::{map_tool, Args};
+    use super::{map_tool, prepare_call_tool_params, Args};
+    use opentelemetry::global;
+    use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+    use rmcp::model::RequestParamsMeta;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn call_tool_params_carry_active_trace_id() {
+        harnx_core::require_nextest();
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("mcp-bridge-propagation-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("mcp_bridge_propagation_test");
+            let _entered = span.enter();
+            let expected_trace_id = tracing::Span::current()
+                .context()
+                .span()
+                .span_context()
+                .trace_id();
+            assert_ne!(expected_trace_id, opentelemetry::trace::TraceId::INVALID);
+
+            let params = prepare_call_tool_params(
+                "test_tool",
+                serde_json::json!({ "value": 1 }).as_object().cloned(),
+            );
+            let traceparent = params.traceparent().expect("traceparent in MCP _meta");
+            assert!(
+                traceparent.starts_with(&format!("00-{expected_trace_id}-")),
+                "traceparent {traceparent} did not carry trace ID {expected_trace_id}"
+            );
+        });
+    }
 
     #[test]
     fn list_tools_parses_without_a_name_but_serving_still_needs_one() {

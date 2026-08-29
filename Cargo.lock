@@ -187,7 +187,7 @@ dependencies = [
  "objc2-foundation",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
  "wl-clipboard-rs",
  "x11rb",
 ]
@@ -1862,7 +1862,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2030,7 +2030,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2845,7 +2845,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a791e6620676a875f362f3156ed213e73ca099a09bf992c18812abe65cc37b1"
 dependencies = [
  "bstr",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -3449,6 +3449,7 @@ dependencies = [
  "harnx-render",
  "harnx-runtime",
  "harnx-spinner",
+ "harnx-telemetry",
  "harnx-tui",
  "hmac",
  "hnsw_rs",
@@ -3514,6 +3515,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "harnx-telemetry",
  "serde",
  "serde_json",
  "tokio",
@@ -3562,6 +3564,7 @@ dependencies = [
  "harnx-hooks",
  "harnx-hookset",
  "harnx-hookset-server",
+ "harnx-telemetry",
  "libc",
  "log",
  "serde_json",
@@ -3585,6 +3588,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "harnx-core",
+ "harnx-telemetry",
  "harnx-test-bins",
  "hmac",
  "http 1.5.0",
@@ -3659,6 +3663,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "tracing",
 ]
 
 [[package]]
@@ -3784,6 +3789,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "clap",
+ "harnx-telemetry",
  "k8s-openapi",
  "kube",
  "secrecy",
@@ -3807,10 +3813,13 @@ dependencies = [
  "harnx-core",
  "harnx-nats-common",
  "harnx-runtime",
+ "harnx-telemetry",
  "harnx-toolset",
  "harnx-toolset-server",
  "libc",
  "log",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "process-wrap",
  "rmcp",
  "serde_json",
@@ -3818,6 +3827,9 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
  "which",
 ]
 
@@ -3861,6 +3873,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "harnx-mcp-plans-core",
+ "harnx-telemetry",
  "http 1.5.0",
  "jiff",
  "jsonwebtoken 11.0.0",
@@ -3886,6 +3899,7 @@ dependencies = [
  "axum",
  "clap",
  "harnx-core",
+ "harnx-telemetry",
  "log",
  "parking_lot",
  "reqwest",
@@ -3907,6 +3921,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "harnx-core",
+ "harnx-telemetry",
  "iana-time-zone",
  "jiff",
  "log",
@@ -3950,6 +3965,7 @@ dependencies = [
  "gix",
  "harnx-core",
  "harnx-runtime",
+ "harnx-telemetry",
  "log",
  "mockall",
  "oci-client",
@@ -4005,6 +4021,7 @@ dependencies = [
  "harnx-hookset",
  "harnx-hookset-server",
  "harnx-runtime",
+ "harnx-telemetry",
  "http 1.5.0",
  "http-body-util",
  "hudsucker",
@@ -4102,6 +4119,7 @@ dependencies = [
  "harnx-rag",
  "harnx-render",
  "harnx-spinner",
+ "harnx-telemetry",
  "harnx-test-bins",
  "harnx-time-server",
  "harnx-toolset",
@@ -4114,6 +4132,8 @@ dependencies = [
  "libc",
  "log",
  "nu-ansi-term",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "os_info",
  "parking_lot",
  "path-absolutize",
@@ -4134,6 +4154,9 @@ dependencies = [
  "tokio-stream",
  "tokio-test",
  "tokio-util",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
  "unicode-segmentation",
  "unicode-width 0.2.2",
  "uuid",
@@ -4188,6 +4211,7 @@ dependencies = [
  "harnx-render",
  "harnx-runtime",
  "harnx-session",
+ "harnx-telemetry",
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
@@ -4226,6 +4250,35 @@ dependencies = [
  "crossterm",
  "harnx-core",
  "tokio",
+]
+
+[[package]]
+name = "harnx-telemetry"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "axum",
+ "harnx-client",
+ "harnx-core",
+ "harnx-engine",
+ "http 1.5.0",
+ "log",
+ "opentelemetry",
+ "opentelemetry-http",
+ "opentelemetry-otlp",
+ "opentelemetry-proto",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
+ "prost",
+ "reqwest",
+ "rmcp",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4293,13 +4346,16 @@ dependencies = [
  "futures-util",
  "harnx-core",
  "harnx-nats-common",
+ "harnx-telemetry",
  "harnx-toolset",
  "log",
+ "opentelemetry",
  "rmcp",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
+ "tracing",
  "which",
 ]
 
@@ -4352,6 +4408,7 @@ dependencies = [
  "clap",
  "harnx-core",
  "harnx-runtime",
+ "harnx-telemetry",
  "parking_lot",
  "tokio",
 ]
@@ -4951,7 +5008,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5769,7 +5826,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6112,6 +6169,84 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "opentelemetry"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0142c63252a9e054e68a4c61a5778f7b14f576274d593f8ce883d191a099682"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "opentelemetry-http"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5683015d09e2df236ef005b17f6f196f0d5f6313c4fa43a7b6a53b52776e4331"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http 1.5.0",
+ "opentelemetry",
+ "reqwest",
+]
+
+[[package]]
+name = "opentelemetry-otlp"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
+dependencies = [
+ "http 1.5.0",
+ "opentelemetry",
+ "opentelemetry-http",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "prost",
+ "reqwest",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "opentelemetry-proto"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost",
+]
+
+[[package]]
+name = "opentelemetry-semantic-conventions"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c913ac17a6c451661ee255f4625d143e51647ae78ebd969b75e41c4442f4fe47"
+
+[[package]]
+name = "opentelemetry_sdk"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b59f80e1ac4d5ff7a2db8fb6c80badb7f0f3f858211fba08dd9aaec750894f9"
+dependencies = [
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "opentelemetry",
+ "percent-encoding",
+ "portable-atomic",
+ "rand 0.9.4",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6157,7 +6292,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6622,6 +6757,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "pulldown-cmark"
 version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6702,7 +6860,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7244,7 +7402,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7312,7 +7470,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8162,10 +8320,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8641,6 +8799,22 @@ dependencies = [
  "log",
  "once_cell",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-opentelemetry"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adbc64cba7137545b8044cb1fe9814f7aacf3c6b5f9b45be8bb5db538befdb26"
+dependencies = [
+ "js-sys",
+ "opentelemetry",
+ "smallvec",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
+ "tracing-subscriber",
+ "web-time",
 ]
 
 [[package]]
@@ -9251,7 +9425,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

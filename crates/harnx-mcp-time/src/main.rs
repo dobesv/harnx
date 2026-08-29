@@ -17,6 +17,14 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
+    let telemetry = harnx_telemetry::init_telemetry("harnx-mcp-time")?;
+
+    let result = run().await;
+    telemetry.shutdown().await;
+    result
+}
+
+async fn run() -> anyhow::Result<()> {
     let args = parse_args()?;
 
     if args.http {

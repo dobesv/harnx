@@ -28,6 +28,7 @@ members = [
     "crates/harnx-rag",
     "crates/harnx-render",
     "crates/harnx-runtime",
+    "crates/harnx-telemetry",
     "crates/harnx-serve",
     "crates/harnx-spinner",
     "crates/harnx-test-bins",
@@ -125,6 +126,13 @@ async-recursion = "1.1.1"
 http = "1.1.0"
 http-body = "1"
 http-body-util = "0.1"
+opentelemetry = "0.32"
+opentelemetry-http = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false }
+opentelemetry-proto = { version = "0.32", default-features = false }
+opentelemetry-semantic-conventions = "0.32"
+opentelemetry_sdk = "0.32"
+prost = "0.14"
 multer = "3"
 hudsucker = { version = "0.25.0", features = ["rcgen-ca"] }
 hyper = { version = "1.0", features = ["full"] }
@@ -137,7 +145,8 @@ rustls-pemfile = "2"
 tokio-rustls = "0.26"
 time = { version = "0.3.36", features = ["macros"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.33"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter"] }
 jaq-all = { version = "0.3", features = ["formats"] }
 indexmap = { version = "2.2.6", features = ["serde"] }
 hmac = "0.13.0"
@@ -178,6 +187,7 @@ jiff = { version = "0.2.23", features = ["serde"] }
 jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs", "use_pem"] }
 reqwest = { version = "0.13.0", features = ["json", "multipart", "socks", "rustls", "stream"], default-features = false }
 harnx-nats-common = { path = "crates/harnx-nats-common" }
+harnx-telemetry = { path = "crates/harnx-telemetry" }
 syntect = { version = "5.0.0", features = ["parsing", "regex-onig", "plist-load"], default-features = false }
 arboard = { version = "3.3.0", default-features = false }
 harnx-session = { path = "crates/harnx-session" }

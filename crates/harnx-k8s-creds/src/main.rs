@@ -397,6 +397,14 @@ fn mutate_tool_input(tool_input: &Value, kubeconfig_path: KubeconfigPath<'_>) ->
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let telemetry = harnx_telemetry::init_telemetry("harnx-k8s-creds")?;
+
+    let result = run().await;
+    telemetry.shutdown().await;
+    result
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
     let state = build_app_state(&args).await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;

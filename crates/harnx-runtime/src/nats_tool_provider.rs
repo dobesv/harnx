@@ -288,6 +288,7 @@ impl NatsToolProvider {
         headers.insert(HDR_INSTANCE_ID, self.instance_id.as_str());
         headers.insert(HDR_CALL_ID, call_id.as_str());
         headers.insert(HDR_CONTENT_TYPE, JSON_CONTENT_TYPE);
+        harnx_telemetry::propagate::inject_current_into_nats(&mut headers);
         let payload = serde_json::to_vec(&request).map_err(|error| {
             ToolError::Fatal(anyhow!("failed to encode NATS tool request: {error}"))
         })?;
@@ -620,9 +621,93 @@ pub async fn describe_discovery(
 
 #[cfg(test)]
 mod tests {
-    use super::build_registered_tools;
+    use super::{
+        build_registered_tools, NatsInFlightCalls, NatsToolProvider, RegisteredTool,
+        DEFAULT_REQUEST_TIMEOUT,
+    };
+    use harnx_core::instance::ServerScope;
     use harnx_toolset::{Registration, ToolSpec};
+    use opentelemetry::global;
+    use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
     use serde_json::json;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[tokio::test]
+    async fn prepared_request_headers_carry_active_trace_id() {
+        harnx_core::require_nextest();
+        let Some(server) = spawn_nats_server_without_jetstream() else {
+            eprintln!(
+                "skipping prepared_request_headers_carry_active_trace_id: nats-server missing"
+            );
+            return;
+        };
+        let client = async_nats::connect(&server.url)
+            .await
+            .expect("connect to test NATS server");
+        let instance_id = ServerScope::new();
+        let control_subscription = client
+            .subscribe(instance_id.control_subject())
+            .await
+            .expect("subscribe to control subject");
+        let provider = NatsToolProvider {
+            client,
+            instance_id,
+            parent_session_id: None,
+            tools: HashMap::new(),
+            registrations: Vec::new(),
+            active_package: None,
+            declarations: Vec::new(),
+            _control_subscription: Mutex::new(control_subscription),
+            in_flight: NatsInFlightCalls::default(),
+        };
+        let route = RegisteredTool {
+            server: "test-server".to_string(),
+            selector_server: "test-server".to_string(),
+            raw_name: "test-tool".to_string(),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+        };
+
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        let tracer_provider = SdkTracerProvider::builder().build();
+        let tracer = tracer_provider.tracer("nats-tool-provider-propagation-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("nats_tool_provider_propagation_test");
+            let _entered = span.enter();
+            let expected_trace_id = tracing::Span::current()
+                .context()
+                .span()
+                .span_context()
+                .trace_id();
+            assert_ne!(expected_trace_id, opentelemetry::trace::TraceId::INVALID);
+
+            let pending = match provider.prepare_request(json!({ "value": 1 }), &route) {
+                Ok(pending) => pending,
+                Err(
+                    harnx_core::tool::ToolError::Recoverable(error)
+                    | harnx_core::tool::ToolError::Fatal(error),
+                ) => {
+                    panic!("prepare tool request: {error:#}")
+                }
+            };
+            let headers = pending.request.headers.expect("NATS request headers");
+            let traceparent = headers
+                .get("traceparent")
+                .expect("traceparent in NATS headers")
+                .as_str();
+            assert!(
+                traceparent.starts_with(&format!("00-{expected_trace_id}-")),
+                "traceparent {traceparent} did not carry trace ID {expected_trace_id}"
+            );
+        });
+    }
 
     #[test]
     fn prefixes_registered_tool_with_server_and_keeps_raw_route_name() {

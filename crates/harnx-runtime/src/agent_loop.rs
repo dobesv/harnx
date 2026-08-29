@@ -786,7 +786,45 @@ async fn pending_resume_action(
     }
 }
 
+fn record_agent_turn_attributes(ctx: &AgentLoopContext) {
+    let span = tracing::Span::current();
+    if !span.is_disabled() {
+        let config = ctx.config.read();
+        if let Some(session) = config.session.as_ref() {
+            span.record("harnx.session.id", session.id());
+        }
+        let agent_name = config.agent.as_ref().map(|agent| agent.name()).or_else(|| {
+            config
+                .session
+                .as_ref()
+                .and_then(|session| session.agent_name.as_deref())
+        });
+        if let Some(agent_name) = agent_name {
+            span.record("harnx.agent.name", agent_name);
+        }
+    }
+}
+
+fn finish_agent_loop(config: &GlobalConfig, abort_signal: &AbortSignal) -> Result<LoopResult> {
+    if abort_signal.aborted() {
+        bail!("interrupted by user");
+    }
+    Config::run_post_turn_maintenance(Arc::clone(config));
+    Ok(LoopResult::Completed)
+}
+
+#[tracing::instrument(
+    name = "agent_turn",
+    skip_all,
+    fields(
+        otel.kind = "internal",
+        harnx.session.id = tracing::field::Empty,
+        harnx.agent.name = tracing::field::Empty,
+    )
+)]
 async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> Result<LoopResult> {
+    record_agent_turn_attributes(ctx);
+
     let config = &ctx.config;
     let abort_signal = &ctx.abort_signal;
     let mut input = initial_input;
@@ -907,11 +945,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
         break;
     }
 
-    if abort_signal.aborted() {
-        bail!("interrupted by user");
-    }
-    Config::run_post_turn_maintenance(config.clone());
-    Ok(LoopResult::Completed)
+    finish_agent_loop(config, abort_signal)
 }
 
 #[cfg(test)]

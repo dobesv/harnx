@@ -19,5 +19,6 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 harnx-runtime = { path = "../harnx-runtime" }
+harnx-telemetry = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }

@@ -546,6 +546,7 @@ async fn spawn_tool_server(
             config.replicas.unwrap_or(1).to_string(),
         );
     apply_tls_env(&mut command, config);
+    harnx_telemetry::forward_otel_env(&mut command);
     command
         .stdin(Stdio::null())
         // Send output to the worker log instead of discarding it, so a tool

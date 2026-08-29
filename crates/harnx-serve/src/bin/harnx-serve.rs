@@ -42,7 +42,18 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     setup_logger(LogSink::Stderr)?;
+    let telemetry = harnx_telemetry::init_telemetry("harnx-serve")?;
 
+    let result = run(cli).await;
+    telemetry.shutdown().await;
+    if let Some(err) = result? {
+        render_error(err);
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+async fn run(cli: Cli) -> Result<Option<anyhow::Error>> {
     let config = Arc::new(RwLock::new(
         Config::init_headless(WorkingMode::Serve, false)
             .await
@@ -57,11 +68,9 @@ async fn main() -> Result<()> {
     }
     config.write().agent_variables = collect_agent_variables(&cli.agent_variable)?;
 
-    if let Err(err) = harnx_serve::run(config, cli.addr, cli.web_assets).await {
-        render_error(err);
-        std::process::exit(1);
-    }
-    Ok(())
+    Ok(harnx_serve::run(config, cli.addr, cli.web_assets)
+        .await
+        .err())
 }
 
 #[cfg(test)]

@@ -128,8 +128,15 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     cli.validate()?;
     setup_logger(LogSink::Stderr)?;
+    let telemetry = harnx_telemetry::init_telemetry("harnx-worker")?;
     harnx_core::alloc_guard::init_from_env();
 
+    let result = run(cli).await;
+    telemetry.shutdown().await;
+    result
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let config = Arc::new(RwLock::new(
         Config::init_headless(WorkingMode::Cmd, true).await?,
     ));

@@ -13,6 +13,7 @@ async-trait = { workspace = true }
 clap = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 harnx-nats-common = { workspace = true }
+harnx-telemetry = { workspace = true, features = ["mcp"] }
 harnx-toolset = { path = "../harnx-toolset" }
 harnx-toolset-server = { path = "../harnx-toolset-server" }
 libc = { workspace = true }
@@ -28,7 +29,12 @@ tokio-util = { workspace = true }
 [dev-dependencies]
 async-nats = { workspace = true }
 harnx-runtime = { path = "../harnx-runtime" }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 tempfile = { workspace = true }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
 which = { workspace = true }
 
 [[bin]]

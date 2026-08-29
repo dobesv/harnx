@@ -18,6 +18,7 @@ use harnx_toolset::{
     ToolInvokeError, ToolReply, ToolRequest, Toolset, HDR_CALL_ID, HDR_IDEMPOTENCY_KEY,
     SUBAGENT_SESSION_NEW_TOOL, SUBAGENT_SESSION_PROMPT_TOOL,
 };
+use opentelemetry::Context as OtelContext;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
     Implementation, ListToolsResult, MetaObject, PaginatedRequestParams, ServerCapabilities,
@@ -31,6 +32,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Mutex};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 pub const TOOL_REGISTRY_BUCKET: &str = "harnx_tool_registry";
 pub const TOOL_PROTOCOL_VERSION: u32 = 1;
@@ -75,6 +77,17 @@ struct ValidatedToolRequest {
     reply_subject: async_nats::Subject,
     request: ToolRequest,
     idempotency_key: String,
+    parent_cx: OtelContext,
+}
+
+fn tool_exec_span(tool_name: &str, parent_cx: OtelContext) -> tracing::Span {
+    let span = tracing::info_span!(
+        "tool_exec",
+        otel.kind = "server",
+        harnx.tool.name = tool_name,
+    );
+    harnx_telemetry::set_span_parent(&span, parent_cx);
+    span
 }
 
 struct ServeSettings {
@@ -362,6 +375,7 @@ async fn process_tool_request(
         reply_subject,
         request,
         idempotency_key,
+        parent_cx,
     } = validated;
     let completion = match reserve_cache_entry(&context.reply_cache, &idempotency_key).await {
         CacheReservation::Complete(mut reply) => {
@@ -392,17 +406,12 @@ async fn process_tool_request(
         .await
         .insert(request.call_id.clone(), cancel.clone());
     let mut args = request.args;
-    if accepts_parent_session_id(&request.tool) {
-        if let (Some(parent_session_id), Some(args)) =
-            (request.parent_session_id, args.as_object_mut())
-        {
-            args.insert(
-                "__harnx_parent_session_id".to_string(),
-                Value::String(parent_session_id),
-            );
-        }
-    }
-    let result = context.toolset.invoke(&request.tool, args, cancel).await;
+    add_parent_session_id_arg(&request.tool, request.parent_session_id, &mut args);
+    let result = context
+        .toolset
+        .invoke(&request.tool, args, cancel)
+        .instrument(tool_exec_span(&request.tool, parent_cx))
+        .await;
     context.in_flight.lock().await.remove(&request.call_id);
 
     let reply = ToolReply {
@@ -419,6 +428,17 @@ async fn process_tool_request(
     publish_reply(&context.client, reply_subject, &reply).await
 }
 
+fn add_parent_session_id_arg(tool: &str, parent_session_id: Option<String>, args: &mut Value) {
+    if accepts_parent_session_id(tool) {
+        if let (Some(parent_session_id), Some(args)) = (parent_session_id, args.as_object_mut()) {
+            args.insert(
+                "__harnx_parent_session_id".to_string(),
+                Value::String(parent_session_id),
+            );
+        }
+    }
+}
+
 fn accepts_parent_session_id(tool: &str) -> bool {
     // Sub-agent toolsets reserve these raw names for calls that start a child turn.
     matches!(
@@ -431,6 +451,11 @@ async fn validate_tool_request(
     context: &ToolRequestContext,
     message: async_nats::Message,
 ) -> Result<Option<ValidatedToolRequest>> {
+    let parent_cx = message
+        .headers
+        .as_ref()
+        .map(harnx_telemetry::propagate::extract_context_from_nats)
+        .unwrap_or_default();
     let reply_subject = message
         .reply
         .clone()
@@ -475,6 +500,7 @@ async fn validate_tool_request(
         reply_subject,
         request,
         idempotency_key,
+        parent_cx,
     }))
 }
 
@@ -650,27 +676,36 @@ where
     T: Toolset + 'static,
 {
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
-    let toolset: Arc<dyn Toolset> = Arc::new(toolset);
-    if std::env::args_os().any(|arg| arg == "--mcp-stdio") {
-        let service = McpToolsetAdapter { toolset }
-            .serve(rmcp::transport::stdio())
-            .await
-            .context("start MCP stdio server")?;
-        service.waiting().await.context("run MCP stdio server")?;
-        return Ok(());
-    }
+    let service_name = format!("harnx-{}-server", toolset.name());
+    let telemetry = harnx_telemetry::init_telemetry(&service_name)?;
 
-    let scope =
-        harnx_core::instance::scope_from_env(harnx_core::instance::StandaloneMode::McpStdio)?;
-    log::info!("serving under scope '{}'", scope.as_str());
-    let endpoint = harnx_nats_common::connect::NatsEndpoint::from_env()?;
-    let client = endpoint.connect().await?;
-    let connection = NatsConnection {
-        client,
-        replicas: endpoint.resolved_replicas(),
-    };
-    let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
-    serve_with_shutdown(toolset, scope, connection, shutdown).await
+    let result: Result<()> = async {
+        let toolset: Arc<dyn Toolset> = Arc::new(toolset);
+        if std::env::args_os().any(|arg| arg == "--mcp-stdio") {
+            let service = McpToolsetAdapter { toolset }
+                .serve(rmcp::transport::stdio())
+                .await
+                .context("start MCP stdio server")?;
+            service.waiting().await.context("run MCP stdio server")?;
+            return Ok(());
+        }
+
+        let scope =
+            harnx_core::instance::scope_from_env(harnx_core::instance::StandaloneMode::McpStdio)?;
+        log::info!("serving under scope '{}'", scope.as_str());
+        let endpoint = harnx_nats_common::connect::NatsEndpoint::from_env()?;
+        let client = endpoint.connect().await?;
+        let connection = NatsConnection {
+            client,
+            replicas: endpoint.resolved_replicas(),
+        };
+        let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
+        serve_with_shutdown(toolset, scope, connection, shutdown).await
+    }
+    .await;
+
+    telemetry.shutdown().await;
+    result
 }
 
 #[derive(Clone)]
@@ -717,9 +752,12 @@ impl ServerHandler for McpToolsetAdapter {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        self.dispatch_call_tool(request, _context)
+        let parent_cx = harnx_telemetry::propagate::extract_context_from_mcp_meta(&context.meta);
+        let span = tool_exec_span(&request.name, parent_cx);
+        self.dispatch_call_tool(request, context)
+            .instrument(span)
             .await
             .map(Into::into)
     }
@@ -757,7 +795,55 @@ impl McpToolsetAdapter {
 
 #[cfg(test)]
 mod tests {
+    use opentelemetry::trace::{SpanId, SpanKind, TraceId};
+    use rmcp::model::RequestParamsMeta;
+
     use super::*;
+
+    const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const PARENT_SPAN_ID: &str = "00f067aa0ba902b7";
+    const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    fn assert_tool_exec_parent(extract_parent: impl FnOnce() -> OtelContext) {
+        let spans = harnx_telemetry::collect_test_spans(|| {
+            drop(tool_exec_span("test_tool", extract_parent()));
+        });
+        assert_eq!(spans.len(), 1);
+        let span = &spans[0];
+        assert_eq!(span.name, "tool_exec");
+        assert_eq!(span.span_kind, SpanKind::Server);
+        assert!(span.attributes.contains(&opentelemetry::KeyValue::new(
+            "harnx.tool.name",
+            "test_tool"
+        )));
+        assert_eq!(
+            span.span_context.trace_id(),
+            TraceId::from_hex(TRACE_ID).expect("fixed trace ID")
+        );
+        assert_eq!(
+            span.parent_span_id,
+            SpanId::from_hex(PARENT_SPAN_ID).expect("fixed parent span ID")
+        );
+        assert!(span.parent_span_is_remote);
+    }
+
+    #[test]
+    fn nats_tool_exec_span_continues_extracted_parent() {
+        harnx_core::require_nextest();
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert("traceparent", TRACEPARENT);
+
+        assert_tool_exec_parent(|| harnx_telemetry::propagate::extract_context_from_nats(&headers));
+    }
+
+    #[test]
+    fn mcp_tool_exec_span_continues_extracted_parent() {
+        harnx_core::require_nextest();
+        let mut params = CallToolRequestParams::new("test_tool");
+        params.set_traceparent(TRACEPARENT);
+
+        assert_tool_exec_parent(|| harnx_telemetry::propagate::extract_context_from_mcp(&params));
+    }
 
     #[tokio::test]
     async fn idempotency_cache_rejects_growth_past_cap() {

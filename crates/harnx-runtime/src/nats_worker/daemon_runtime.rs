@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 /// Longest `handle_activation` waits for this session's own tool servers to
 /// start before giving up and continuing anyway.
@@ -52,11 +53,34 @@ struct ActivationAckCtx<'a> {
     abort_signal: &'a crate::utils::AbortSignal,
 }
 
+struct ClaimedActivation {
+    activation: SessionActivate,
+    lease: Arc<NatsSessionLease>,
+    span: tracing::Span,
+}
+
 struct PreparedActivation {
     activation: SessionActivate,
     lease: Arc<NatsSessionLease>,
     abort_signal: crate::utils::AbortSignal,
     control_task: JoinHandle<()>,
+    span: tracing::Span,
+}
+
+fn agent_activation_span(
+    headers: Option<&async_nats::HeaderMap>,
+    session_id: &str,
+) -> tracing::Span {
+    let parent_cx = headers
+        .map(harnx_telemetry::propagate::extract_context_from_nats)
+        .unwrap_or_default();
+    let span = tracing::info_span!(
+        "agent_activation",
+        otel.kind = "consumer",
+        harnx.session.id = session_id,
+    );
+    harnx_telemetry::set_span_parent(&span, parent_cx);
+    span
 }
 
 pub(super) struct WorkerRuntime {
@@ -374,10 +398,14 @@ impl WorkerRuntime {
 
     async fn prepare_claimed_activation(
         &self,
-        activation: SessionActivate,
+        claimed: ClaimedActivation,
         message: &async_nats::jetstream::Message,
-        lease: Arc<NatsSessionLease>,
     ) -> Result<PreparedActivation> {
+        let ClaimedActivation {
+            activation,
+            lease,
+            span,
+        } = claimed;
         self.start_session_tool_servers(&activation).await;
         super::daemon_background::await_initial_background_services(
             &self.background_services_attempted,
@@ -408,6 +436,7 @@ impl WorkerRuntime {
             lease,
             abort_signal,
             control_task,
+            span,
         })
     }
 
@@ -417,37 +446,41 @@ impl WorkerRuntime {
             lease,
             abort_signal,
             control_task,
+            span,
         } = prepared;
         let worker = Arc::clone(self);
         let session_id = activation.session_id.clone();
         let task_session_id = session_id.clone();
         nats_metrics::active_session_started();
-        let handle = tokio::spawn(async move {
-            let snapshot = nats_metrics::snapshot();
-            log::info!(
-                "active session started: session_id={} worker_id={} revision={} active_sessions_per_worker={}",
-                activation.session_id,
-                lease.worker_id(),
-                lease.fence_token(),
-                snapshot.active_sessions_per_worker
-            );
-            let result = worker
-                .execute_session(activation, Arc::clone(&lease), abort_signal, control_task)
-                .await;
-            worker.end_session_tool_servers(&task_session_id).await;
-            nats_metrics::active_session_finished();
-            let snapshot = nats_metrics::snapshot();
-            log::info!(
-                "active session finished: session_id={} worker_id={} revision={} active_sessions_per_worker={}",
-                task_session_id,
-                lease.worker_id(),
-                lease.fence_token(),
-                snapshot.active_sessions_per_worker
-            );
-            if let Err(error) = result {
-                log::warn!("worker session execution failed: {error:#}");
+        let handle = tokio::spawn(
+            async move {
+                let snapshot = nats_metrics::snapshot();
+                log::info!(
+                    "active session started: session_id={} worker_id={} revision={} active_sessions_per_worker={}",
+                    activation.session_id,
+                    lease.worker_id(),
+                    lease.fence_token(),
+                    snapshot.active_sessions_per_worker
+                );
+                let result = worker
+                    .execute_session(activation, Arc::clone(&lease), abort_signal, control_task)
+                    .await;
+                worker.end_session_tool_servers(&task_session_id).await;
+                nats_metrics::active_session_finished();
+                let snapshot = nats_metrics::snapshot();
+                log::info!(
+                    "active session finished: session_id={} worker_id={} revision={} active_sessions_per_worker={}",
+                    task_session_id,
+                    lease.worker_id(),
+                    lease.fence_token(),
+                    snapshot.active_sessions_per_worker
+                );
+                if let Err(error) = result {
+                    log::warn!("worker session execution failed: {error:#}");
+                }
             }
-        });
+            .instrument(span),
+        );
         self.active.lock().await.insert(session_id, handle);
     }
 
@@ -504,6 +537,7 @@ impl WorkerRuntime {
         let Some(activation) = self.decode_activation(&message).await? else {
             return Ok(());
         };
+        let span = agent_activation_span(message.headers.as_ref(), &activation.session_id);
         if !self
             .metadata_preflight_passes(&message, &activation)
             .await?
@@ -544,7 +578,14 @@ impl WorkerRuntime {
         // Core-NATS control is subscribed before this acknowledges the
         // activation. The spawned task owns cleanup of the session's servers.
         let prepared = self
-            .prepare_claimed_activation(activation, &message, lease)
+            .prepare_claimed_activation(
+                ClaimedActivation {
+                    activation,
+                    lease,
+                    span,
+                },
+                &message,
+            )
             .await?;
         self.spawn_session_task(prepared).await;
         Ok(())
@@ -597,5 +638,81 @@ impl WorkerRuntime {
                 }
             }
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use async_nats::header::NATS_MESSAGE_ID;
+    use opentelemetry::trace::{SpanId, SpanKind, TraceContextExt, TraceId};
+
+    use super::agent_activation_span;
+
+    const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    #[test]
+    fn activation_headers_continue_publisher_trace_at_consumer() {
+        harnx_core::require_nextest();
+        let spans = harnx_telemetry::collect_test_spans(|| {
+            let mut upstream_headers = async_nats::HeaderMap::new();
+            upstream_headers.insert("traceparent", TRACEPARENT);
+            let publisher_parent =
+                harnx_telemetry::propagate::extract_context_from_nats(&upstream_headers);
+            let publisher_span = tracing::info_span!("activation_publisher");
+            harnx_telemetry::set_span_parent(&publisher_span, publisher_parent);
+
+            let headers = {
+                let _entered = publisher_span.enter();
+                super::super::activation_transport::activation_headers(
+                    async_nats::header::HeaderValue::from("message-id"),
+                )
+            };
+            assert_eq!(
+                headers
+                    .get(NATS_MESSAGE_ID)
+                    .expect("activation message ID")
+                    .as_str(),
+                "message-id"
+            );
+
+            let extracted = harnx_telemetry::propagate::extract_context_from_nats(&headers);
+            assert_eq!(
+                extracted.span().span_context().trace_id(),
+                TraceId::from_hex(TRACE_ID).expect("fixed trace ID")
+            );
+            drop(agent_activation_span(Some(&headers), "session-id"));
+        });
+
+        let publisher = spans
+            .iter()
+            .find(|span| span.name == "activation_publisher")
+            .expect("publisher span");
+        let consumer = spans
+            .iter()
+            .find(|span| span.name == "agent_activation")
+            .expect("consumer span");
+        assert_eq!(consumer.span_kind, SpanKind::Consumer);
+        assert_eq!(
+            consumer.span_context.trace_id(),
+            publisher.span_context.trace_id()
+        );
+        assert_eq!(consumer.parent_span_id, publisher.span_context.span_id());
+    }
+
+    #[test]
+    fn activation_without_headers_starts_new_root() {
+        harnx_core::require_nextest();
+        let spans = harnx_telemetry::collect_test_spans(|| {
+            drop(agent_activation_span(None, "session-id"));
+        });
+
+        let consumer = spans
+            .iter()
+            .find(|span| span.name == "agent_activation")
+            .expect("consumer span");
+        assert_eq!(consumer.span_kind, SpanKind::Consumer);
+        assert_ne!(consumer.span_context.trace_id(), TraceId::INVALID);
+        assert_eq!(consumer.parent_span_id, SpanId::INVALID);
     }
 }

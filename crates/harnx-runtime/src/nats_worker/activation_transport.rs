@@ -241,8 +241,7 @@ async fn publish_activation(
     message_id: String,
 ) -> Result<u64> {
     let payload = serde_json::to_vec(activation).context("serialize SessionActivate")?;
-    let mut headers = async_nats::HeaderMap::new();
-    headers.insert(NATS_MESSAGE_ID, HeaderValue::from(message_id));
+    let headers = activation_headers(HeaderValue::from(message_id));
     let ack = jetstream
         .publish_with_headers(subject, headers, payload.into())
         .await
@@ -250,6 +249,13 @@ async fn publish_activation(
         .await
         .context("ack SessionActivate")?;
     Ok(ack.sequence)
+}
+
+pub(super) fn activation_headers(message_id: HeaderValue) -> async_nats::HeaderMap {
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert(NATS_MESSAGE_ID, message_id);
+    harnx_telemetry::propagate::inject_current_into_nats(&mut headers);
+    headers
 }
 
 pub(super) async fn ensure_activation_consumer(

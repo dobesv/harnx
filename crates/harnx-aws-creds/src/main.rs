@@ -219,6 +219,14 @@ fn mutate_tool_input(tool_input: &Value, state: &AppState, port: u16) -> Result<
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let telemetry = harnx_telemetry::init_telemetry("harnx-aws-creds")?;
+
+    let result = run().await;
+    telemetry.shutdown().await;
+    result
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
     let state = build_app_state(&args).await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
