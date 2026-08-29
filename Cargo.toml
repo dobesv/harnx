@@ -174,7 +174,7 @@ fuzzy-matcher = "0.3.7"
 terminal-colorsaurus = "1.0.3"
 duct = "1.0.0"
 rmcp = { version = "3.0", features = ["client", "server", "transport-child-process", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }
-process-wrap = { version = "9", features = ["tokio1"] }
+process-wrap = { version = "10", features = ["tokio1"] }
 libc = "0.2"
 async-nats = { version = "0.50", default-features = false, features = ["server_2_10", "server_2_11", "ring", "jetstream", "kv", "object-store"] }
 glob = "0.3"
