@@ -25,6 +25,51 @@ fn listed_session_to_meta(record: &ListedSession) -> SessionMeta {
     }
 }
 
+async fn session_metadata_store_for_listing(
+    jetstream: &async_nats::jetstream::Context,
+    cluster: &str,
+) -> Result<SessionMetadataStore> {
+    match jetstream.get_key_value(SESSION_METADATA_BUCKET).await {
+        Ok(store) => Ok(SessionMetadataStore::from_store(
+            store,
+            jetstream.client().clone(),
+        )),
+        Err(error) if kv_bucket_missing(&error) && cluster == LOCAL_CLUSTER_KEY => {
+            // The local worker is started lazily on the first activation, but the
+            // picker lists sessions before activation. The frontend owns this local
+            // topology, so initialize its prerequisite instead of reporting a
+            // transient error that only starting a new session would clear.
+            log::debug!(
+                "Session metadata bucket '{}' not found for local sessions; initializing it",
+                SESSION_METADATA_BUCKET
+            );
+            SessionMetadataStore::ensure(jetstream, 1)
+                .await
+                .context("Failed to initialize local session metadata")
+        }
+        Err(error) if kv_bucket_missing(&error) => {
+            // A missing bucket does not prove that there are no sessions: transcript
+            // streams may predate the hard protocol cut. Report discovery as
+            // unavailable so remote clients do not mislabel that state as an
+            // authoritative empty list.
+            log::debug!(
+                "Session metadata bucket '{}' not found for cluster '{}' (session discovery unavailable)",
+                SESSION_METADATA_BUCKET,
+                cluster
+            );
+            anyhow::bail!(
+                "Session discovery is not available yet because canonical metadata for cluster '{cluster}' has not been initialized; try again shortly"
+            );
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Failed to access session metadata bucket '{}' for cluster '{cluster}'",
+                SESSION_METADATA_BUCKET
+            )
+        }),
+    }
+}
+
 impl Config {
     pub fn use_session(&mut self, session_name: Option<&str>) -> Result<()> {
         let name =
@@ -146,7 +191,8 @@ impl Config {
     ///
     /// # Returns
     ///
-    /// - `Ok(vec![])` when the session metadata bucket exists but is empty.
+    /// - `Ok(vec![])` when the session metadata bucket exists but is empty. The reserved local
+    ///   cluster initializes a missing bucket because its worker starts only after selection.
     ///
     /// - `Err(...)` for actual fetch failures: connection refused, auth/permission denied,
     ///   network timeouts, or errors listing records from an existing bucket. The error
@@ -181,33 +227,7 @@ impl Config {
             }
         };
 
-        let store = match jetstream.get_key_value(SESSION_METADATA_BUCKET).await {
-            Ok(store) => store,
-            Err(e) => {
-                // A missing bucket does not prove that there are no sessions: transcript
-                // streams may predate the hard protocol cut. Report discovery as
-                // unavailable so clients do not mislabel that state as an authoritative
-                // empty list.
-                if kv_bucket_missing(&e) {
-                    log::debug!(
-                        "Session metadata bucket '{}' not found for cluster '{}' (session discovery unavailable)",
-                        SESSION_METADATA_BUCKET,
-                        cluster
-                    );
-                    anyhow::bail!(
-                        "Session discovery is not available yet because canonical metadata for cluster '{cluster}' has not been initialized; try again shortly"
-                    );
-                }
-                return Err(e).with_context(|| {
-                    format!(
-                        "Failed to access session metadata bucket '{}' for cluster '{cluster}'",
-                        SESSION_METADATA_BUCKET
-                    )
-                });
-            }
-        };
-
-        let metadata_store = SessionMetadataStore::from_store(store, jetstream.client().clone());
+        let metadata_store = session_metadata_store_for_listing(&jetstream, cluster).await?;
         let records = match metadata_store.list().await {
             Ok(records) => records,
             Err(e) => {
