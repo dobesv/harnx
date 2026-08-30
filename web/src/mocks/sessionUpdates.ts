@@ -35,6 +35,59 @@ function persistExchange(session: string, userText: string, reply: string) {
   channel?.postMessage({ session, messages: persisted });
 }
 
+interface SubAgentExchange {
+  session: string;
+  userText: string;
+  resultContent: string;
+  assistantMessageId: string;
+  toolCallId: string;
+  toolResultMessageId: string;
+  finalMessageId: string;
+}
+
+export function persistSubAgentExchange({
+  session,
+  userText,
+  resultContent,
+  assistantMessageId,
+  toolCallId,
+  toolResultMessageId,
+  finalMessageId,
+}: SubAgentExchange) {
+  const persisted = additionalSnapshot(session);
+  persisted.push(
+    { id: `mock-user-${messageId++}`, role: 'user', content: userText },
+    {
+      id: assistantMessageId,
+      role: 'assistant',
+      content: '',
+      toolCalls: [{
+        id: toolCallId,
+        type: 'function',
+        call_type: 'function',
+        function: {
+          name: 'researcher_session_prompt',
+          arguments: JSON.stringify({ message: 'Research this task' }),
+        },
+      }],
+    },
+    {
+      id: toolResultMessageId,
+      role: 'tool',
+      toolCallId,
+      content: resultContent,
+    },
+    {
+      id: finalMessageId,
+      role: 'assistant',
+      content: 'Delegation complete.',
+    },
+  );
+  snapshots.set(session, persisted);
+  notify(session);
+  channel?.postMessage({ session, messages: persisted });
+}
+
 export function isPromptlessRun(messages: any[], snapshot: readonly { id?: string }[]): boolean {
   const lastMessage = messages.at(-1);
   return lastMessage?.role !== 'user'

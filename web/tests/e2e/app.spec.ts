@@ -61,6 +61,41 @@ test('committed handoff navigates and hydrates the durable target session', asyn
   await expect(page.locator('.aui-composer-send')).toHaveText('Send');
 });
 
+test('sub-agent row transitions, opens the child, and browser Back returns to the parent', async ({ page }) => {
+  await page.goto('/agents/coding%2Fcoder/sessions/session-1?scenario=happy');
+  await expect(page.locator('.aui-assistant-message')).toContainText('Hello from mock session');
+  await expect(page.locator('.aui-composer-send')).toHaveText('Send');
+
+  await page.locator('.aui-composer-input').fill('delegate to researcher');
+  await page.locator('.aui-composer-send').click();
+
+  const childRows = page.getByRole('button', {
+    name: /Open researcher sub-agent session child-session-0001/,
+  });
+  const childRow = childRows.first();
+  await expect(childRow).toHaveAttribute('data-status', 'running');
+  await expect(childRow).toContainText('child-session-0001');
+  await expect(childRow).toHaveAttribute('data-status', 'done', { timeout: 10000 });
+
+  await page.locator('.aui-composer-input').fill('delegate to researcher');
+  await page.locator('.aui-composer-send').click();
+  await expect(childRows).toHaveCount(2);
+  await expect(childRows.last()).toHaveAttribute('data-status', 'running');
+  await expect(childRows.last()).toHaveAttribute('data-status', 'done', { timeout: 10000 });
+
+  await childRows.last().click();
+  await expect(page).toHaveURL(/\/agents\/researcher\/sessions\/child-session-0001/);
+  await expect(page.locator('.aui-user-message')).toContainText('Research this task');
+  await expect(page.locator('.aui-assistant-message')).toContainText('Child task complete.');
+
+  await page.goBack();
+  await expect(page).toHaveURL(/\/agents\/coding%2Fcoder\/sessions\/session-1/);
+  await expect(page.locator('.aui-user-message')).toHaveCount(2);
+  await expect(page.getByRole('button', {
+    name: /Open researcher sub-agent session child-session-0001 \(done\)/,
+  })).toHaveCount(2);
+});
+
 test('composer: no scrollbar until max-height, resets after send', async ({ page }) => {
   await page.goto('/?scenario=happy');
   await page.locator('.grid-item').filter({ hasText: 'coding/coder' }).click();

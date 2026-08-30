@@ -17,6 +17,8 @@ import { useAgUiInterrupts, useAgUiSubmitInterruptResponses } from '@assistant-u
 import { ChatProvider } from './ChatProvider';
 import { PendingContext } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
+import { SubAgentNotesContext } from './SubAgentNotesContext';
+import { SubAgentSessionNotes } from './SubAgentSessionNotes';
 import { cancel } from './api';
 import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
@@ -61,6 +63,7 @@ const MessageContent = () => (
 
 const MyMessage = () => {
   const role = useAuiState((s) => s.message.role);
+  const messageId = useAuiState((s) => s.message.id);
   // An assistant message with no parts still gets .aui-message padding, so it
   // shows up as a blank gap in the transcript. The promptless subscribe that
   // hydrates a session leaves one behind: assistant-ui creates the message
@@ -71,8 +74,12 @@ const MyMessage = () => {
     (s) => s.message.role === 'assistant' && s.message.content.length === 0,
   );
   const [systemExpanded, setSystemExpanded] = useState(false);
+  const { notes, openSession } = useContext(SubAgentNotesContext);
+  const messageNotes = role === 'assistant'
+    ? notes.filter((note) => note.parentMessageId === messageId)
+    : [];
 
-  if (isEmpty) return null;
+  if (isEmpty && messageNotes.length === 0) return null;
 
   if (role === 'system') {
     return (
@@ -95,6 +102,7 @@ const MyMessage = () => {
       <div className="aui-message-content">
         <MessageContent />
       </div>
+      <SubAgentSessionNotes notes={messageNotes} onOpen={openSession} />
     </MessagePrimitive.Root>
   );
 };
@@ -524,13 +532,13 @@ export default function App() {
     newChat,
     clearAgent,
     clearSession,
-    isFreshSession
+    isFreshSession,
+    navigateSession,
   } = useAgentSessions();
 
   const handleHandoff = useCallback((agent: string, sessionId: string) => {
-    selectAgent(agent);
-    selectSession(sessionId);
-  }, [selectAgent, selectSession]);
+    navigateSession(agent, sessionId);
+  }, [navigateSession]);
 
   return (
     <div className="app-container">
@@ -566,6 +574,7 @@ export default function App() {
               sessionId={selectedSessionId} 
               isFreshSession={isFreshSession}
               onHandoff={handleHandoff}
+              onOpenSubAgent={navigateSession}
             >
               <MyThread agentName={selectedAgent} sessionId={selectedSessionId} onRunFinish={refreshSessions} />
             </ChatProvider>

@@ -133,6 +133,19 @@ describe('useAgentSessions', () => {
     expect(result.current.selectedSessionId).toBe('');
   });
 
+  it('navigates directly to another agent session with one history entry', () => {
+    window.history.pushState({}, '', '/agents/parent/sessions/parent-session');
+    const initialHistoryLength = window.history.length;
+    const { result } = renderHook(() => useAgentSessions());
+
+    act(() => result.current.navigateSession('pkg/child', 'child session'));
+
+    expect(result.current.selectedAgent).toBe('pkg/child');
+    expect(result.current.selectedSessionId).toBe('child session');
+    expect(window.location.pathname).toBe('/agents/pkg%2Fchild/sessions/child%20session');
+    expect(window.history.length).toBe(initialHistoryLength + 1);
+  });
+
   it('freshSessionIds lifecycle: added on new chat, pruned when backend returns it', async () => {
     let mockSessions: any[] = [];
     vi.mocked(api.listSessions).mockImplementation(() => Promise.resolve(mockSessions));

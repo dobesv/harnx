@@ -4,7 +4,20 @@ import {
   createSessionEventsStream,
   finishExchange,
   isPromptlessRun,
+  persistSubAgentExchange,
 } from './sessionUpdates';
+
+const SUB_AGENT_SESSION_ID = 'child-session-0001';
+let subAgentExchangeId = 0;
+
+const SUB_AGENT_RESULT = JSON.stringify({
+  session_id: SUB_AGENT_SESSION_ID,
+  response: 'Child task complete.',
+  sub_agent: {
+    agent: 'researcher',
+    session_id: SUB_AGENT_SESSION_ID,
+  },
+});
 
 function isSseRequest(request: Request): boolean {
   return request.headers.get('accept')?.includes('text/event-stream') ?? false;
@@ -55,6 +68,12 @@ const HANDOFF_TARGET_SNAPSHOT = [
 
 function buildSnapshot(session: string) {
   if (session === 'handoff-target') return HANDOFF_TARGET_SNAPSHOT;
+  if (session === SUB_AGENT_SESSION_ID) {
+    return [
+      { id: 'child-user', role: 'user', content: 'Research this task' },
+      { id: 'child-assistant', role: 'assistant', content: 'Child task complete.' },
+    ];
+  }
   if (session === 'session-gallery') {
     return [
       {
@@ -154,6 +173,159 @@ function emitSnapshot(
   controller.close();
 }
 
+interface MockRun {
+  controller: ReadableStreamDefaultController<Uint8Array>;
+  threadId: string;
+  runId: string;
+}
+
+async function emitGalleryRun({ controller, threadId, runId }: MockRun) {
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  controller.enqueue(encodeSseEvent({
+    type: 'CUSTOM',
+    threadId,
+    runId,
+    name: 'usage',
+    value: {
+      input: 100,
+      output: 200,
+      cached: 50,
+      session_label: 'Mock Session',
+      context_tokens: 300,
+      max_context_tokens: 1000,
+      context_percent: 30
+    }
+  }));
+  controller.enqueue(encodeSseEvent({
+    type: 'TOOL_CALL_START',
+    toolCallId: 'call_123',
+    toolCallName: 'fetch_data',
+    parentMessageId: 'assistant-1'
+  }));
+  controller.enqueue(encodeSseEvent({
+    type: 'CUSTOM',
+    threadId,
+    runId,
+    name: 'tool_summary',
+    value: {
+      tool_call_id: 'call_123',
+      markdown: 'Fetched **data** from API.'
+    }
+  }));
+
+  // AG-UI's schemas require `delta` for args and a content frame between
+  // text-message start/end. Invalid field names abort the rest of the stream.
+  controller.enqueue(encodeSseEvent({
+    type: 'TOOL_CALL_ARGS',
+    toolCallId: 'call_123',
+    delta: '{"query": "example", "limit": 10}'
+  }));
+  controller.enqueue(encodeSseEvent({
+    type: 'TOOL_CALL_END',
+    toolCallId: 'call_123'
+  }));
+  controller.enqueue(encodeSseEvent({
+    type: 'TOOL_CALL_RESULT',
+    messageId: 'tool-result-123',
+    toolCallId: 'call_123',
+    content: '{"data": "mock_data", "status": 200}',
+    role: 'tool'
+  }));
+  controller.enqueue(encodeSseEvent({
+    type: 'TEXT_MESSAGE_START',
+    messageId: 'assistant-1',
+    role: 'assistant'
+  }));
+  controller.enqueue(encodeSseEvent({
+    type: 'TEXT_MESSAGE_CONTENT',
+    messageId: 'assistant-1',
+    delta: 'Here is a table:\n\n| Column 1 | Column 2 | Column 3 | Column 4 |\n|---|---|---|---|\n| A | B | C | D |\n\nAnd some code:\n\n```javascript\nconsole.log("hello");\n```\n'
+  }));
+  controller.enqueue(encodeSseEvent({
+    type: 'TEXT_MESSAGE_END',
+    messageId: 'assistant-1'
+  }));
+  controller.enqueue(encodeSseEvent({ type: 'RUN_FINISHED', threadId, runId }));
+  controller.close();
+}
+
+interface SubAgentRun extends MockRun {
+  session: string;
+  userText: string;
+}
+
+function nextSubAgentRunIds() {
+  const exchangeId = ++subAgentExchangeId;
+  return {
+    assistantMessageId: `assistant-delegation-${exchangeId}`,
+    toolCallId: `call-sub-agent-${exchangeId}`,
+    toolResultMessageId: `tool-result-sub-agent-${exchangeId}`,
+    finalMessageId: `assistant-final-${exchangeId}`,
+  };
+}
+
+async function emitSubAgentRun({
+  controller,
+  threadId,
+  runId,
+  session,
+  userText,
+}: SubAgentRun) {
+  const ids = nextSubAgentRunIds();
+  controller.enqueue(encodeSseEvent({
+    type: 'TOOL_CALL_START',
+    toolCallId: ids.toolCallId,
+    toolCallName: 'researcher_session_prompt',
+    parentMessageId: ids.assistantMessageId,
+  }));
+  controller.enqueue(encodeSseEvent({
+    type: 'TOOL_CALL_ARGS',
+    toolCallId: ids.toolCallId,
+    delta: JSON.stringify({ message: 'Research this task' }),
+  }));
+  controller.enqueue(encodeSseEvent({
+    type: 'CUSTOM',
+    threadId,
+    runId,
+    name: 'sub_agent_started',
+    value: { agent: 'researcher', session_id: SUB_AGENT_SESSION_ID },
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 750));
+  controller.enqueue(encodeSseEvent({
+    type: 'TOOL_CALL_END',
+    toolCallId: ids.toolCallId,
+  }));
+  controller.enqueue(encodeSseEvent({
+    type: 'TOOL_CALL_RESULT',
+    messageId: ids.toolResultMessageId,
+    toolCallId: ids.toolCallId,
+    content: SUB_AGENT_RESULT,
+    role: 'tool',
+  }));
+  controller.enqueue(encodeSseEvent({
+    type: 'TEXT_MESSAGE_START',
+    messageId: ids.finalMessageId,
+    role: 'assistant',
+  }));
+  controller.enqueue(encodeSseEvent({
+    type: 'TEXT_MESSAGE_CONTENT',
+    messageId: ids.finalMessageId,
+    delta: 'Delegation complete.',
+  }));
+  controller.enqueue(encodeSseEvent({
+    type: 'TEXT_MESSAGE_END',
+    messageId: ids.finalMessageId,
+  }));
+  controller.enqueue(encodeSseEvent({ type: 'RUN_FINISHED', threadId, runId }));
+  persistSubAgentExchange({
+    session,
+    userText,
+    resultContent: SUB_AGENT_RESULT,
+    ...ids,
+  });
+  controller.close();
+}
+
 function createAgUiStream({ session, body }: { session: string; body: any }) {
   const threadId = body?.threadId ?? `thread-${session}`;
   const runId = body?.runId ?? 'r-1';
@@ -238,92 +410,17 @@ function createAgUiStream({ session, body }: { session: string; body: any }) {
       }
 
       if (session === 'session-gallery') {
-        await new Promise((resolve) => setTimeout(resolve, 25));
-
-        controller.enqueue(encodeSseEvent({
-          type: 'CUSTOM',
-          threadId,
-          runId,
-          name: 'usage',
-          value: {
-            input: 100,
-            output: 200,
-            cached: 50,
-            session_label: 'Mock Session',
-            context_tokens: 300,
-            max_context_tokens: 1000,
-            context_percent: 30
-          }
-        }));
-
-        // Tool call round first (self-contained: start -> args -> end -> result).
-        controller.enqueue(encodeSseEvent({
-          type: 'TOOL_CALL_START',
-          toolCallId: 'call_123',
-          toolCallName: 'fetch_data',
-          parentMessageId: 'assistant-1'
-        }));
-
-        controller.enqueue(encodeSseEvent({
-          type: 'CUSTOM',
-          threadId,
-          runId,
-          name: 'tool_summary',
-          value: {
-            tool_call_id: 'call_123',
-            markdown: 'Fetched **data** from API.'
-          }
-        }));
-
-        // NOTE: AG-UI client (@ag-ui/core Zod schemas) require specific field
-        // names. TOOL_CALL_ARGS uses `delta` (NOT `argsText`) — a wrong field
-        // makes the client's EventSchemas.parse() throw and aborts the whole
-        // SSE stream before any later text renders.
-        controller.enqueue(encodeSseEvent({
-          type: 'TOOL_CALL_ARGS',
-          toolCallId: 'call_123',
-          delta: '{"query": "example", "limit": 10}'
-        }));
-        controller.enqueue(encodeSseEvent({
-          type: 'TOOL_CALL_END',
-          toolCallId: 'call_123'
-        }));
-        // TOOL_CALL_RESULT requires `messageId` + `content` (NOT `result`).
-        controller.enqueue(encodeSseEvent({
-          type: 'TOOL_CALL_RESULT',
-          messageId: 'tool-result-123',
-          toolCallId: 'call_123',
-          content: '{"data": "mock_data", "status": 200}',
-          role: 'tool'
-        }));
-        // Assistant text message MUST include TEXT_MESSAGE_CONTENT between
-        // START and END — omitting it produces an empty message that the AG-UI
-        // client rejects with a Zod "delta Required" validation error.
-        controller.enqueue(encodeSseEvent({
-          type: 'TEXT_MESSAGE_START',
-          messageId: 'assistant-1',
-          role: 'assistant'
-        }));
-        controller.enqueue(encodeSseEvent({
-          type: 'TEXT_MESSAGE_CONTENT',
-          messageId: 'assistant-1',
-          delta: 'Here is a table:\n\n| Column 1 | Column 2 | Column 3 | Column 4 |\n|---|---|---|---|\n| A | B | C | D |\n\nAnd some code:\n\n```javascript\nconsole.log("hello");\n```\n'
-        }));
-        controller.enqueue(encodeSseEvent({
-          type: 'TEXT_MESSAGE_END',
-          messageId: 'assistant-1'
-        }));
-        controller.enqueue(encodeSseEvent({
-          type: 'RUN_FINISHED',
-          threadId,
-          runId,
-        }));
-        controller.close();
+        await emitGalleryRun({ controller, threadId, runId });
         return;
       }
 
       if (userText === 'handoff now') {
         await emitHandoff(controller, threadId, runId);
+        return;
+      }
+
+      if (userText === 'delegate to researcher') {
+        await emitSubAgentRun({ controller, threadId, runId, session, userText });
         return;
       }
 
