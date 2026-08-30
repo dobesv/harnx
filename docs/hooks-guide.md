@@ -18,7 +18,7 @@ Hooks can be configured in three places depending on their intended scope:
 
 1. **Global Hooks** (`config.yaml` under `hooks:`): Apply across all sessions and agents for the lifetime of the Harnx worker daemon.
 2. **Tool-Server Hooks** (`tool_servers/*.yaml` under `hooks:`): Co-launched alongside a specific tool server and attached directly to tool calls handled by that server (e.g., attaching authentication proxies to `bash.yaml`).
-3. **Agent Hooks** (agent `.md` front-matter under `hooks:`): Session-scoped hooks managed dynamically by the worker. A handoff finishes the source session without mutating its hooks; the independently activated target session starts its own agent hooks through the normal worker lifecycle.
+3. **Agent Hooks** (agent `.md` front-matter under `hooks:`): Selected from the session's bound agent and launched for each active turn. A handoff finishes the source turn; the independently activated target session starts its own agent hooks through the normal worker lifecycle.
 
 ### Configuration Fields
 
@@ -63,7 +63,7 @@ There are two types of hook servers:
 
 *   **Global Hooks**: Apply to all agents and sessions across the Harnx instance.
 *   **Tool-Server Hooks**: Attached directly to tool-server configuration files and co-launched with the tool server.
-*   **Agent Hooks**: Defined in an agent's YAML front-matter and scoped to the active session.
+*   **Agent Hooks**: Defined in an agent's YAML front-matter, selected from the session's bound agent, and launched for each active turn.
 *   **Merging**: Agent hooks extend the global list. If an agent hook has the same `event` and `matcher` as a global hook, the agent hook **replaces** the global one.
 *   **max_resume**: If set in an agent's front-matter, it overrides the global `max_resume` value.
 *   **Declaration Order**: Within each scope (global, tool-server, agent), hooks dispatch in config declaration order when priorities are equal.
@@ -672,7 +672,7 @@ Hooks are scoped according to where they are configured:
 
 * **Global Hooks** (`config.yaml`): Instance-scoped lifetime, launched by the worker daemon during worker startup.
 * **Tool-Server Hooks** (`tool_servers/*.yaml`): Co-launched alongside the specific tool server by `ToolServerSupervisor` and bound to that tool server's lifecycle.
-* **Agent Hooks** (agent `.md` front-matter): Session-scoped, launched when an agent binds to a session. A handoff leaves the source session's hook lifecycle intact and activates an independent target session, whose worker reconciles and starts the target agent's hooks normally.
+* **Agent Hooks** (agent `.md` front-matter): Activation-scoped, launched when an agent binds to a session activation and explicitly shut down after that activation's turn finishes. A handoff activates an independent target session, whose worker reconciles and starts the target agent's hooks normally.
 
 ### Registry Discovery and Routing
 
