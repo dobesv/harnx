@@ -12,6 +12,7 @@ struct Args {
     http: bool,
     host: String,
     port: u16,
+    metrics_addr: Option<String>,
 }
 
 #[tokio::main]
@@ -26,6 +27,12 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run() -> anyhow::Result<()> {
     let args = parse_args()?;
+
+    // Init metrics recorder (idempotent via OnceLock)
+    let metrics_flags = harnx_metrics::MetricsFlags {
+        metrics_addr: args.metrics_addr.clone(),
+    };
+    harnx_metrics::init(&metrics_flags)?;
 
     if args.http {
         run_http(args).await
@@ -44,6 +51,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut http = false;
     let mut host = "0.0.0.0".to_string();
     let mut port = 3000;
+    let mut metrics_addr: Option<String> = std::env::var("HARNX_METRICS_ADDR").ok();
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -78,6 +86,13 @@ fn parse_args() -> anyhow::Result<Args> {
                     }
                 }
             }
+            "--metrics-addr" => {
+                if i + 1 >= args.len() {
+                    anyhow::bail!("harnx-mcp-time: --metrics-addr requires an address argument");
+                }
+                metrics_addr = Some(args[i + 1].clone());
+                i += 2;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -90,7 +105,12 @@ fn parse_args() -> anyhow::Result<Args> {
         }
     }
 
-    Ok(Args { http, host, port })
+    Ok(Args {
+        http,
+        host,
+        port,
+        metrics_addr,
+    })
 }
 
 fn print_help() {
@@ -102,6 +122,9 @@ fn print_help() {
     eprintln!("  --http              Serve MCP over Streamable HTTP at /mcp");
     eprintln!("  --host <addr>       Bind address for HTTP mode (default: 0.0.0.0)");
     eprintln!("  --port <N>          Bind port for HTTP mode (default: 3000)");
+    eprintln!(
+        "  --metrics-addr <addr>  Prometheus metrics endpoint address (env: HARNX_METRICS_ADDR)"
+    );
     eprintln!("  --help, -h          Show this help message");
 }
 
@@ -121,7 +144,12 @@ async fn run_http(args: Args) -> anyhow::Result<()> {
         Arc::new(NeverSessionManager::default()),
         config,
     );
-    let app = axum::Router::new().nest_service("/mcp", mcp_service);
+    let app =
+        axum::Router::new()
+            .nest_service("/mcp", mcp_service)
+            .layer(axum::middleware::from_fn(
+                harnx_metrics::http_metrics_middleware,
+            ));
     let listener = tokio::net::TcpListener::bind((host.as_str(), port))
         .await
         .with_context(|| format!("harnx-mcp-time: failed to bind {host}:{port}"))?;

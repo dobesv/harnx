@@ -20,10 +20,14 @@ async fn main() -> anyhow::Result<()> {
 fn parse_args() -> anyhow::Result<bool> {
     let mut help = false;
 
-    for arg in std::env::args().skip(1) {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => help = true,
             "--mcp-stdio" => {}
+            "--metrics-addr" => {
+                args.next();
+            }
             _ => anyhow::bail!("harnx-grep-tools: unknown argument: {arg}"),
         }
     }

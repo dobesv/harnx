@@ -26,6 +26,7 @@ pub struct AppConfig {
     pub http: bool,
     pub host: String,
     pub port: u16,
+    pub metrics_addr: Option<String>,
 }
 
 impl AppConfig {
@@ -62,6 +63,7 @@ impl AppConfig {
         let mut http = false;
         let mut host: Option<String> = None;
         let mut port: Option<u16> = None;
+        let mut metrics_addr: Option<String> = None;
 
         let args: Vec<String> = args.into_iter().map(Into::into).collect();
         let mut i = 0;
@@ -98,6 +100,9 @@ impl AppConfig {
                 }
                 "--port" => {
                     port = Some(parse_u16_flag(&args, &mut i, "--port")?);
+                }
+                "--metrics-addr" => {
+                    metrics_addr = Some(next_value(&args, &mut i, "--metrics-addr")?);
                 }
                 "--help" | "-h" => print_help_and_exit(),
                 other => {
@@ -161,6 +166,9 @@ impl AppConfig {
         let host = host.unwrap_or_else(|| DEFAULT_HOST.to_string());
         let port = port.unwrap_or(DEFAULT_PORT);
 
+        // Resolve metrics_addr: CLI flag > env var
+        let metrics_addr = first_non_empty(metrics_addr, env("HARNX_METRICS_ADDR"));
+
         Ok(Self {
             auth: AuthConfig {
                 base_url,
@@ -179,6 +187,7 @@ impl AppConfig {
             http,
             host,
             port,
+            metrics_addr,
         })
     }
 }
@@ -379,6 +388,7 @@ fn print_help_and_exit() -> ! {
     eprintln!("  --http                      Serve MCP over Streamable HTTP at /mcp");
     eprintln!("  --host <addr>               Bind address for HTTP mode (default: 127.0.0.1; set explicitly for wider exposure)");
     eprintln!("  --port <N>                  Bind port for HTTP mode (default: 3000)");
+    eprintln!("  --metrics-addr <addr>       Prometheus metrics endpoint address (env: HARNX_METRICS_ADDR)");
     eprintln!("  --help, -h                  Show this help message");
     eprintln!();
     eprintln!(

@@ -298,6 +298,21 @@ pub async fn publish_hook_registration(
 /// a chance to remove its own registration instead of leaving it for the TTL.
 pub async fn run_hookset_main<H: Hook + 'static>(hook: H) -> Result<()> {
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
+
+    // Initialize metrics if configured via --metrics-addr flag or HARNX_METRICS_ADDR env.
+    // Scan args for --metrics-addr <value>; env takes precedence for consistency with crate style.
+    let metrics_addr = std::env::var("HARNX_METRICS_ADDR").ok().or_else(|| {
+        let mut args = std::env::args();
+        while let Some(arg) = args.next() {
+            if arg == "--metrics-addr" {
+                return args.next();
+            }
+        }
+        None
+    });
+    let flags = harnx_metrics::MetricsFlags { metrics_addr };
+    harnx_metrics::init(&flags)?;
+
     let scope =
         harnx_core::instance::scope_from_env(harnx_core::instance::StandaloneMode::WorkerLaunched)?;
     log::info!("serving under scope '{}'", scope.as_str());

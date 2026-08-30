@@ -445,12 +445,16 @@ async fn invoke_uncached_tool(
         .insert(request.call_id.clone(), cancel.clone());
     let mut args = std::mem::take(&mut request.args);
     add_parent_session_id_arg(&request.tool, request.parent_session_id.take(), &mut args);
+    let start = Instant::now();
     let result = context
         .toolset
         .invoke(&request.tool, args, cancel)
         .instrument(tool_exec_span(&request.tool, parent_cx))
         .await;
     context.in_flight.lock().await.remove(&request.call_id);
+    let elapsed = start.elapsed();
+    let is_ok = result.is_ok();
+    harnx_metrics::record_tool_call(&request.tool, is_ok, elapsed);
     result
 }
 
@@ -769,6 +773,15 @@ where
     T: Toolset + 'static,
 {
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
+
+    let mut args = std::env::args_os();
+    let metrics_addr = args
+        .find(|arg| arg == "--metrics-addr")
+        .and_then(|_| args.next())
+        .map(|addr| addr.to_string_lossy().into_owned())
+        .or_else(|| std::env::var("HARNX_METRICS_ADDR").ok());
+    harnx_metrics::init(&harnx_metrics::MetricsFlags { metrics_addr })?;
+
     let service_name = format!("harnx-{}-server", toolset.name());
     let telemetry = harnx_telemetry::init_telemetry(&service_name)?;
 
@@ -863,17 +876,27 @@ impl McpToolsetAdapter {
     /// elicitation and long-running tasks that this server does not use.
     /// Dispatching separately keeps every arm returning a plain
     /// `CallToolResult`.
+    ///
+    /// Tool dispatch forks: `run_toolset_main` has two mutually exclusive paths:
+    /// NATS → `invoke_uncached_tool`, and MCP stdio → this method (calls
+    /// `toolset.invoke` directly). Any cross-cutting concern (metrics, tracing, auth)
+    /// added at one seam does NOT automatically cover the other. rmcp `--http` servers
+    /// use their own `ServerHandler::call_tool`, a third seam.
     async fn dispatch_call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let tool_name = request.name.clone();
         let args = Value::Object(request.arguments.unwrap_or_default());
-        match self
+        let started = Instant::now();
+        let result = self
             .toolset
-            .invoke(&request.name, args, CancellationToken::new())
-            .await
-        {
+            .invoke(&tool_name, args, CancellationToken::new())
+            .await;
+        harnx_metrics::record_tool_call(&tool_name, result.is_ok(), started.elapsed());
+
+        match result {
             Ok(value) => {
                 let text =
                     serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
@@ -966,5 +989,76 @@ mod tests {
         assert!(!accepts_parent_session_id("session_load"));
         assert!(!accepts_parent_session_id("prompt"));
         assert!(!accepts_parent_session_id("agent_session_prompt"));
+    }
+
+    #[test]
+    fn tool_call_metrics_recorded_on_success_and_error() {
+        harnx_core::require_nextest();
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use std::time::Duration;
+
+        // DebuggingRecorder captures metric values in a local recorder scope.
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            // Success case
+            harnx_metrics::record_tool_call("test_tool_ok", true, Duration::from_millis(100));
+            // Error case
+            harnx_metrics::record_tool_call("test_tool_err", false, Duration::from_millis(50));
+        });
+
+        let snapshot = snapshotter.snapshot();
+
+        // Iterate through metrics and validate counters and histograms
+        let mut ok_counter_found = false;
+        let mut err_counter_found = false;
+        let mut ok_hist_found = false;
+        let mut err_hist_found = false;
+
+        for (key, _unit, _desc, value) in snapshot.into_vec() {
+            let key_name = key.key().name();
+            let key_labels = key.key().labels();
+            match value {
+                DebugValue::Counter(c) if key_name == harnx_metrics::TOOL_CALLS_TOTAL => {
+                    let labels: Vec<_> = key_labels.collect();
+                    let tool_label = labels.iter().find(|l| l.key() == "tool");
+                    let status_label = labels.iter().find(|l| l.key() == "status");
+                    if let (Some(tool), Some(status)) = (tool_label, status_label) {
+                        if tool.value() == "test_tool_ok" && status.value() == "ok" {
+                            assert_eq!(c, 1, "ok counter incremented once");
+                            ok_counter_found = true;
+                        } else if tool.value() == "test_tool_err" && status.value() == "error" {
+                            assert_eq!(c, 1, "error counter incremented once");
+                            err_counter_found = true;
+                        }
+                    }
+                }
+                DebugValue::Histogram(samples)
+                    if key_name == harnx_metrics::TOOL_CALL_DURATION_SECONDS =>
+                {
+                    let labels: Vec<_> = key_labels.collect();
+                    let tool_label = labels.iter().find(|l| l.key() == "tool");
+                    if let Some(tool) = tool_label {
+                        // samples is Vec<OrderedFloat<f64>>
+                        // Just check that we have at least one sample to confirm recording happened
+                        assert!(
+                            !samples.is_empty(),
+                            "histogram should have recorded samples"
+                        );
+                        if tool.value() == "test_tool_ok" {
+                            ok_hist_found = true;
+                        } else if tool.value() == "test_tool_err" {
+                            err_hist_found = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(ok_counter_found, "ok counter should have been recorded");
+        assert!(err_counter_found, "error counter should have been recorded");
+        assert!(ok_hist_found, "ok histogram should have been recorded");
+        assert!(err_hist_found, "error histogram should have been recorded");
     }
 }

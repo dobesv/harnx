@@ -43,7 +43,7 @@ use std::{
     net::IpAddr,
     path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock},
-    time::SystemTime,
+    time::{Instant, SystemTime},
 };
 use tokio::{net::TcpListener, sync::oneshot};
 use tokio_graceful::Shutdown;
@@ -298,6 +298,7 @@ impl Server {
         self: Arc<Self>,
         req: hyper::Request<Incoming>,
     ) -> std::result::Result<AppResponse, hyper::Error> {
+        let started = Instant::now();
         let method = req.method().clone();
         let uri = req.uri().clone();
         let path = uri.path();
@@ -306,29 +307,46 @@ impl Server {
             let mut res = Response::default();
             *res.status_mut() = StatusCode::NO_CONTENT;
             set_cors_header(&mut res);
+            harnx_metrics::record_http_request(
+                method.as_str(),
+                "other",
+                res.status().as_u16(),
+                started.elapsed(),
+            );
             return Ok(res);
         }
 
         let mut status = StatusCode::OK;
+        let route;
         let res = if path == "/v1/embeddings" {
+            route = "/v1/embeddings";
             self.embeddings(req).await
         } else if path == "/v1/rerank" {
+            route = "/v1/rerank";
             self.rerank(req).await
         } else if path == "/v1/models" {
+            route = "/v1/models";
             self.list_models()
         } else if path == "/v1/agents" {
+            route = "/v1/agents";
             self.list_agents(req.uri().query()).await
         } else if is_session_attachments_path(path) {
+            route = "/v1/agents/*/sessions/*/attachments";
             self.upload_session_attachments(req).await
         } else if path.starts_with("/v1/agents/") {
+            route = "/v1/agents/*";
             self.handle_agent_tree(req).await
         } else if path == "/v1/rags" {
+            route = "/v1/rags";
             self.list_rags()
         } else if path == "/v1/rags/search" {
+            route = "/v1/rags/search";
             self.search_rag(req).await
         } else if method == Method::GET || method == Method::HEAD {
+            route = "other";
             self.serve_web_asset(&method, path, req.headers()).await
         } else {
+            route = "other";
             status = StatusCode::NOT_FOUND;
             Err(anyhow!("Not Found"))
         };
@@ -347,6 +365,12 @@ impl Server {
         };
         *res.status_mut() = status;
         set_cors_header(&mut res);
+        harnx_metrics::record_http_request(
+            method.as_str(),
+            route,
+            res.status().as_u16(),
+            started.elapsed(),
+        );
         Ok(res)
     }
 

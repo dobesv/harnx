@@ -237,6 +237,7 @@ fn parse_cli_args(
                 i += 2;
             }
             "--env" | "-e" => parse_env_option(args, &mut i, config),
+            "--metrics-addr" => i += 2,
             "--mcp-stdio" => i += 1,
             "--help" | "-h" => print_help_and_exit(),
             other => {

@@ -72,9 +72,13 @@ impl ServerHandler for PlansServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        self.dispatch_call_tool(request, _context)
-            .await
-            .map(Into::into)
+        let tool = request.name.clone();
+        let start = std::time::Instant::now();
+        let result = self.dispatch_call_tool(request, _context).await;
+        let elapsed = start.elapsed();
+        let is_ok = result.is_ok();
+        harnx_metrics::record_tool_call(&tool, is_ok, elapsed);
+        result.map(Into::into)
     }
 }
 

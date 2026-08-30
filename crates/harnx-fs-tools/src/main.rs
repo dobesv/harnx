@@ -96,6 +96,10 @@ fn parse_args_from(args: &[String], mut inputs: AllowInputs) -> Result<AllowInpu
                 inputs.all = true;
                 None
             }
+            "--metrics-addr" => {
+                i += 2;
+                continue;
+            }
             "--mcp-stdio" => None,
             "--help" | "-h" => print_help_and_exit(),
             other => {

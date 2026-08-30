@@ -196,7 +196,11 @@ async fn run_http(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()> 
         Arc::new(NeverSessionManager::default()),
         server_config,
     );
-    let app = Router::new().nest_service("/mcp", mcp_service);
+    let app = Router::new()
+        .nest_service("/mcp", mcp_service)
+        .layer(axum::middleware::from_fn(
+            harnx_metrics::http_metrics_middleware,
+        ));
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
         .await
         .with_context(|| {

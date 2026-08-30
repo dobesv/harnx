@@ -21,6 +21,7 @@ aws-credential-types = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+harnx-metrics = { workspace = true }
 harnx-telemetry = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

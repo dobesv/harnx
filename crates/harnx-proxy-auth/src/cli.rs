@@ -1,7 +1,10 @@
 use clap::Parser;
+use harnx_metrics::MetricsFlags;
 
 #[derive(Debug, Parser)]
 pub struct Args {
+    #[command(flatten)]
+    pub metrics: MetricsFlags,
     /// Hook server name assigned by the supervisor.
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,

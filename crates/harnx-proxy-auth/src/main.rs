@@ -24,6 +24,7 @@ async fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let args = <cli::Args as Parser>::parse();
+    harnx_metrics::init(&args.metrics)?;
     let hook_name = args
         .name
         .clone()

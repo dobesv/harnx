@@ -37,4 +37,9 @@ pub struct Cli {
         help = "Require stateful remote MCP sessions and disable stateless fallback"
     )]
     pub strict_session: bool,
+
+    /// Prometheus metrics endpoint address (e.g., "0.0.0.0:9090").
+    /// Also reads from HARNX_METRICS_ADDR env.
+    #[arg(long, env = "HARNX_METRICS_ADDR")]
+    pub metrics_addr: Option<String>,
 }

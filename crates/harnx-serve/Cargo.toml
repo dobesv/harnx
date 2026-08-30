@@ -25,6 +25,7 @@ futures = "0.3"
 futures-util = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 harnx-hooks = { path = "../harnx-hooks" }
+harnx-metrics = { workspace = true }
 harnx-rag = { path = "../harnx-rag" }
 harnx-render = { path = "../harnx-render" }
 harnx-runtime = { path = "../harnx-runtime" }

@@ -22,6 +22,7 @@ clap.workspace = true
 harnx-core = { path = "../harnx-core" }
 harnx-hookset = { path = "../harnx-hookset" }
 harnx-hookset-server = { path = "../harnx-hookset-server" }
+harnx-metrics = { workspace = true }
 harnx-telemetry = { workspace = true }
 hudsucker = { workspace = true, features = ["rustls-client"] }
 hyper.workspace = true

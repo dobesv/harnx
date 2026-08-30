@@ -1,0 +1,21 @@
+[package]
+name = "harnx-metrics"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Prometheus metrics initialization and names for harnx services"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true, features = ["matched-path"] }
+clap = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+metrics-util = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }

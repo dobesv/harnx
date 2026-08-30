@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use http::{header::HeaderName, HeaderValue, Response, StatusCode};
@@ -27,6 +28,12 @@ use crate::transform::TransformPipeline;
 struct AuthHandler {
     transforms: Arc<TransformPipeline>,
     log_file: Option<PathBuf>,
+    /// Request start time for metrics. Set in handle_request, read in
+    /// handle_response/handle_error. Not used for synthetic responses
+    /// (.respond/.block) which record immediately.
+    request_start: Option<Instant>,
+    /// HTTP method string for metrics. Captured in handle_request.
+    request_method: Option<String>,
 }
 
 impl HttpHandler for AuthHandler {
@@ -35,6 +42,14 @@ impl HttpHandler for AuthHandler {
         _ctx: &HttpContext,
         mut req: Request<Body>,
     ) -> RequestOrResponse {
+        // Capture timing state for metrics. Hudsucker guarantees handle_response
+        // or handle_error is called on the same handler instance for forwarded
+        // requests. Synthetic responses (.respond/.block) are recorded immediately.
+        let start = Instant::now();
+        let method = req.method().as_str().to_string();
+        self.request_start = Some(start);
+        self.request_method = Some(method.clone());
+
         let req_json = request_json(&req);
         let result = self.transforms.apply(req_json.clone()).await;
 
@@ -61,6 +76,10 @@ impl HttpHandler for AuthHandler {
             let response = response
                 .body(Body::from(Bytes::from(body)))
                 .unwrap_or_else(|_| Response::new(Body::empty()));
+            // Synthetic response: clear timing state and record immediately.
+            self.request_start = None;
+            self.request_method = None;
+            harnx_metrics::record_http_request(&method, "proxy", status.as_u16(), start.elapsed());
             return response.into();
         }
 
@@ -80,6 +99,15 @@ impl HttpHandler for AuthHandler {
                 .header("content-type", "text/plain")
                 .body(Body::from(Bytes::from(reason)))
                 .unwrap_or_else(|_| Response::new(Body::empty()));
+            // Synthetic response: clear timing state and record immediately.
+            self.request_start = None;
+            self.request_method = None;
+            harnx_metrics::record_http_request(
+                &method,
+                "proxy",
+                StatusCode::FORBIDDEN.as_u16(),
+                start.elapsed(),
+            );
             return response.into();
         }
 
@@ -107,6 +135,38 @@ impl HttpHandler for AuthHandler {
         }
 
         req.into()
+    }
+
+    async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
+        // Complete timing for forwarded requests. Hudsucker calls handle_response
+        // on the same handler instance that saw handle_request.
+        if let (Some(start), Some(method)) = (self.request_start.take(), self.request_method.take())
+        {
+            harnx_metrics::record_http_request(
+                &method,
+                "proxy",
+                res.status().as_u16(),
+                start.elapsed(),
+            );
+        }
+        res
+    }
+
+    async fn handle_error(
+        &mut self,
+        _ctx: &HttpContext,
+        _err: hyper_util::client::legacy::Error,
+    ) -> Response<Body> {
+        // Error during upstream request. Default response is 502 Bad Gateway.
+        // Complete timing with error status.
+        if let (Some(start), Some(method)) = (self.request_start.take(), self.request_method.take())
+        {
+            harnx_metrics::record_http_request(&method, "proxy", 502, start.elapsed());
+        }
+        Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::empty())
+            .unwrap_or_else(|_| Response::new(Body::empty()))
     }
 }
 
@@ -348,6 +408,8 @@ async fn start_proxy_inner(transforms: Arc<TransformPipeline>, config: ProxyConf
     let handler = AuthHandler {
         transforms,
         log_file,
+        request_start: None,
+        request_method: None,
     };
 
     if danger_accept_invalid_certs {
@@ -436,6 +498,8 @@ mod tests {
         let mut handler = AuthHandler {
             transforms: Arc::new(TransformPipeline::new(vec![Stage::Jaq { filter, vars }])),
             log_file: None,
+            request_start: None,
+            request_method: None,
         };
 
         let outcome = handler

@@ -17,6 +17,7 @@ members = [
     "crates/harnx-sandbox-run",
     "crates/harnx-fs-tools",
     "crates/harnx-mcp-time",
+    "crates/harnx-metrics",
     "crates/harnx-grep-tools",
     "crates/harnx-mcp-remote",
     "crates/harnx-plans-tools",
@@ -134,6 +135,9 @@ opentelemetry-semantic-conventions = "0.32"
 opentelemetry_sdk = "0.32"
 prost = "0.14"
 multer = "3"
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
+metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
 hudsucker = { version = "0.25.0", features = ["rcgen-ca"] }
 hyper = { version = "1.0", features = ["full"] }
 hyper-rustls = { version = "0.27", features = ["aws-lc-rs", "http1"] }
@@ -195,6 +199,7 @@ minijinja = { version = "2.21.0", default-features = false, features = ["builtin
 harnx-mcp-history = { path = "crates/harnx-mcp-history" }
 harnx-sandbox-common = { path = "crates/harnx-sandbox-common" }
 harnx-tool-allow = { path = "crates/harnx-tool-allow" }
+harnx-metrics = { path = "crates/harnx-metrics" }
 similar = "3"
 jaq-core = "3.0.0"
 jaq-std = "3.0.0"

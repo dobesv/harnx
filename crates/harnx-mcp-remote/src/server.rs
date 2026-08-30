@@ -7,6 +7,7 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RoleClient, RoleServer, RunningService};
 use rmcp::Peer;
+use std::time::Instant;
 
 use crate::cli::Cli;
 use crate::client_handler::RemoteClientHandler;
@@ -145,6 +146,10 @@ impl RemoteProxyServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let peer = self.peer()?;
-        peer.call_tool(request).await.map_err(proxy_error)
+        let tool_name = request.name.clone();
+        let started = Instant::now();
+        let result = peer.call_tool(request).await.map_err(proxy_error);
+        harnx_metrics::record_tool_call(&tool_name, result.is_ok(), started.elapsed());
+        result
     }
 }
