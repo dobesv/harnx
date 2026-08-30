@@ -9,7 +9,6 @@ use harnx_sandbox_common::SandboxConfig;
 use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
 use rmcp::model::{CallToolResult, ErrorCode, ErrorData, Tool};
 use rmcp::schemars::JsonSchema;
-use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -53,11 +52,6 @@ fn spec<T: JsonSchema + 'static>(name: &str, description: &str, call_template: &
         meta: None,
     }
     .with_call_template(call_template)
-}
-
-fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T, ToolInvokeError> {
-    serde_json::from_value(args)
-        .map_err(|err| ToolInvokeError::Recoverable(format!("invalid tool arguments: {err}")))
 }
 
 fn map_result(result: Result<CallToolResult, ErrorData>) -> Result<Value, ToolInvokeError> {
@@ -136,31 +130,7 @@ impl Toolset for BashToolset {
         args: Value,
         _cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
-        let result = match tool {
-            "exec" => self.server.exec_command_impl(parse_args(args)?).await,
-            "read_exec_log" => self.server.read_exec_log_impl(parse_args(args)?).await,
-            "spawn" => self.server.spawn_impl(parse_args(args)?).await,
-            "wait" => self.server.wait_impl(parse_args(args)?).await,
-            "terminate" => self.server.terminate_impl(parse_args(args)?).await,
-            "rollback_file" => self.server.rollback_file_impl(parse_args(args)?).await,
-            _ if self.server.has_tool_template(tool) => {
-                let arguments = match args {
-                    Value::Object(arguments) => arguments,
-                    Value::Null => Map::new(),
-                    _ => {
-                        return Err(ToolInvokeError::Recoverable(
-                            "invalid tool arguments: expected a JSON object".to_string(),
-                        ));
-                    }
-                };
-                self.server.invoke_template(tool, &arguments).await
-            }
-            _ => {
-                return Err(ToolInvokeError::Recoverable(format!(
-                    "unknown bash tool: {tool}"
-                )));
-            }
-        };
+        let result = self.server.invoke_tool_value(tool, args).await;
         map_result(result)
     }
 }
@@ -171,6 +141,8 @@ mod tests {
     use harnx_tool_allow::ResolvedAllowlist;
     use serde_json::json;
     use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::process::Command;
     use std::sync::Arc;
 
     #[test]
@@ -203,6 +175,38 @@ mod tests {
         }
         config.allowlist = Arc::new(allowlist);
         BashToolset::new(config, Vec::new()).await.unwrap()
+    }
+
+    #[cfg(unix)]
+    fn git(directory: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn observation(result: &Value) -> harnx_core::execution_context::ExecutionContextObservation {
+        serde_json::from_value(
+            result["_meta"][harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE].clone(),
+        )
+        .expect("execution-context observation")
+    }
+
+    #[cfg(unix)]
+    fn content_field(result: &Value, field: &str) -> String {
+        let text = result["content"][0]["text"].as_str().expect("text result");
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("{field}: ")))
+            .map(|value| value.trim_matches('\'').to_string())
+            .unwrap_or_else(|| panic!("missing {field} in {text}"))
     }
 
     #[tokio::test]
@@ -255,6 +259,71 @@ mod tests {
             .unwrap();
         assert_ne!(result.get("isError"), Some(&Value::Bool(true)));
         assert!(result.to_string().contains("native-toolset"));
+        assert_eq!(
+            observation(&result).working_directory,
+            root.path().canonicalize().unwrap().to_string_lossy()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn observes_post_checkout_branch_and_async_completion() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-b", "main"]);
+        git(
+            root.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/bash-context.git",
+            ],
+        );
+        let toolset = test_toolset(
+            vec![root.path().to_path_buf()],
+            sandbox_config(false),
+            false,
+        )
+        .await;
+        let checkout = toolset
+            .invoke(
+                "exec",
+                json!({
+                    "command": "git checkout -b feature",
+                    "working_dir": root.path().to_string_lossy()
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let checkout_context = observation(&checkout);
+        assert_eq!(checkout_context.branch(), Some("feature"));
+        assert_eq!(
+            checkout_context.primary_repository(),
+            Some("github.com/acme/bash-context")
+        );
+
+        let spawned = toolset
+            .invoke(
+                "spawn",
+                json!({
+                    "command": "printf completed",
+                    "working_dir": root.path().to_string_lossy()
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let execution_id = content_field(&spawned, "execution_id");
+        let waited = toolset
+            .invoke(
+                "wait",
+                json!({"execution_id": execution_id}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(observation(&waited).branch(), Some("feature"));
     }
 
     #[tokio::test]

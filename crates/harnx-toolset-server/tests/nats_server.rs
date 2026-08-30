@@ -2,10 +2,12 @@ mod common;
 
 use anyhow::{Context, Result};
 use common::{request_headers, wait_for_registration, TestHarness, TestToolset, TOKEN};
+use harnx_core::execution_context::{ExecutionContextObservation, EXECUTION_CONTEXT_NAMESPACE};
 use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{ControlKind, ControlMessage, ToolReply, ToolRequest};
 use harnx_toolset_server::{registration_key, serve_with_shutdown, TOOL_REGISTRY_BUCKET};
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,6 +29,7 @@ async fn assert_idempotent_replay(harness: &TestHarness) -> Result<()> {
         tool: "echo".to_string(),
         args: json!({ "value": 42 }),
         parent_session_id: None,
+        capabilities: Default::default(),
     };
     for _ in 0..2 {
         let message = harness
@@ -47,19 +50,76 @@ async fn assert_idempotent_replay(harness: &TestHarness) -> Result<()> {
     Ok(())
 }
 
+async fn assert_execution_context_capability_is_per_request(harness: &TestHarness) -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let observation = ExecutionContextObservation::observe(directory.path(), directory.path());
+    let args = json!({
+        "content": [],
+        "_meta": {
+            EXECUTION_CONTEXT_NAMESPACE: observation,
+        }
+    });
+    let opted_in = ToolRequest {
+        call_id: "call-context-enabled".to_string(),
+        tool: "echo".to_string(),
+        args: args.clone(),
+        parent_session_id: None,
+        capabilities: BTreeSet::from([EXECUTION_CONTEXT_NAMESPACE.to_string()]),
+    };
+    let message = harness
+        .client
+        .request_with_headers(
+            harness.echo_subject(),
+            request_headers(&opted_in.call_id, "logical-context"),
+            serde_json::to_vec(&opted_in)?.into(),
+        )
+        .await?;
+    let reply: ToolReply = serde_json::from_slice(&message.payload)?;
+    let enabled = reply.result.expect("context request succeeds");
+    let provenance = &enabled["_meta"][EXECUTION_CONTEXT_NAMESPACE]["provenance"];
+    assert_eq!(provenance["tool_name"], "echo");
+    assert_eq!(provenance["call_id"], opted_in.call_id);
+
+    let opted_out = ToolRequest {
+        call_id: "call-context-disabled".to_string(),
+        tool: "echo".to_string(),
+        args,
+        parent_session_id: None,
+        capabilities: BTreeSet::new(),
+    };
+    let message = harness
+        .client
+        .request_with_headers(
+            harness.echo_subject(),
+            request_headers(&opted_out.call_id, "logical-context"),
+            serde_json::to_vec(&opted_out)?.into(),
+        )
+        .await?;
+    let reply: ToolReply = serde_json::from_slice(&message.payload)?;
+    let disabled = reply.result.expect("legacy context request succeeds");
+    assert!(disabled
+        .get("_meta")
+        .and_then(|meta| meta.get(EXECUTION_CONTEXT_NAMESPACE))
+        .is_none());
+    Ok(())
+}
+
 async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
+    let invocations_before = harness.toolset.echo_invocations.load(Ordering::SeqCst);
     let args = json!({ "value": 43, "delay_ms": 100 });
     let first = ToolRequest {
         call_id: "call-concurrent-a".to_string(),
         tool: "echo".to_string(),
         args: args.clone(),
         parent_session_id: None,
+        capabilities: Default::default(),
     };
     let second = ToolRequest {
         call_id: "call-concurrent-b".to_string(),
         tool: "echo".to_string(),
         args: args.clone(),
         parent_session_id: None,
+        capabilities: Default::default(),
     };
     let first_call = harness.client.request_with_headers(
         harness.echo_subject(),
@@ -82,7 +142,7 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
     }
     assert_eq!(
         harness.toolset.echo_invocations.load(Ordering::SeqCst),
-        2,
+        invocations_before + 1,
         "concurrent duplicate must execute once"
     );
     Ok(())
@@ -127,6 +187,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
         tool: "echo".to_string(),
         args: json!({}),
         parent_session_id: None,
+        capabilities: Default::default(),
     };
     request_early_failure(
         harness,
@@ -140,6 +201,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
         tool: "echo".to_string(),
         args: json!({}),
         parent_session_id: None,
+        capabilities: Default::default(),
     };
     let mut headers = async_nats::HeaderMap::new();
     headers.insert(harnx_toolset::HDR_CALL_ID, missing_key.call_id.as_str());
@@ -158,6 +220,7 @@ async fn assert_cancellation(harness: &TestHarness) -> Result<()> {
         tool: "slow".to_string(),
         args: json!({}),
         parent_session_id: None,
+        capabilities: Default::default(),
     };
     let slow_request = harness.client.request_with_headers(
         harness.instance_id.tool_subject("____test", "slow"),
@@ -198,6 +261,7 @@ async fn registers_invokes_caches_and_cancels() -> Result<()> {
     };
     assert_registration(&harness).await?;
     assert_idempotent_replay(&harness).await?;
+    assert_execution_context_capability_is_per_request(&harness).await?;
     assert_concurrent_idempotency(&harness).await?;
     assert_early_failure_replies(&harness).await?;
     assert_cancellation(&harness).await
@@ -347,6 +411,7 @@ async fn shutdown_drains_in_flight_requests_before_deregistering() -> Result<()>
         tool: "echo".to_string(),
         args: json!({"delay_ms": 500}),
         parent_session_id: None,
+        capabilities: Default::default(),
     };
     let delayed_request = harness.client.request_with_headers(
         harness.instance_id.tool_subject("____test", "echo"),

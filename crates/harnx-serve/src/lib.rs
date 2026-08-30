@@ -1878,6 +1878,7 @@ mod tests {
                 agent_name: Some("plain".into()),
                 title: None,
                 modified: None,
+                contexts: vec![],
             },
             SessionMeta {
                 id: "local-2".into(),
@@ -1885,6 +1886,7 @@ mod tests {
                 agent_name: Some("other".into()),
                 title: None,
                 modified: None,
+                contexts: vec![],
             },
             SessionMeta {
                 id: "local-3".into(),
@@ -1892,6 +1894,7 @@ mod tests {
                 agent_name: None,
                 title: None,
                 modified: None,
+                contexts: vec![],
             },
         ];
 
@@ -1918,6 +1921,7 @@ mod tests {
             agent_name: Some("plain".into()),
             title: None,
             modified,
+            contexts: vec![],
         };
 
         let base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);

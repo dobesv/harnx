@@ -5,6 +5,7 @@
 //! crate that needs to speak the schema.
 
 use crate::abort::AbortSignal;
+use crate::execution_context::ExecutionContextObservation;
 use crate::message::MessageContentPart;
 use async_trait::async_trait;
 use indexmap::IndexMap;
@@ -23,6 +24,10 @@ pub struct ToolResult {
     pub content: Vec<MessageContentPart>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub switch_agent: Option<SwitchAgentData>,
+    /// Private execution observation removed from protocol result metadata
+    /// before hooks, rendering, model input, or transcript persistence.
+    #[serde(skip)]
+    pub execution_context: Option<ExecutionContextObservation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +46,7 @@ impl ToolResult {
             markdown: None,
             content: Vec::new(),
             switch_agent: None,
+            execution_context: None,
         }
     }
 
@@ -54,6 +60,45 @@ impl ToolResult {
         self.content
             .iter()
             .filter(|part| matches!(part, MessageContentPart::ImageUrl { .. }))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolProviderOutput {
+    pub value: Value,
+    pub execution_context: Option<ExecutionContextObservation>,
+}
+
+impl ToolProviderOutput {
+    pub fn new(value: Value) -> Self {
+        Self {
+            value,
+            execution_context: None,
+        }
+    }
+
+    pub fn into_parts(self) -> (Value, Option<ExecutionContextObservation>) {
+        (self.value, self.execution_context)
+    }
+}
+
+impl From<Value> for ToolProviderOutput {
+    fn from(value: Value) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::ops::Deref for ToolProviderOutput {
+    type Target = Value;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl std::fmt::Display for ToolProviderOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(formatter)
     }
 }
 
@@ -85,7 +130,7 @@ pub trait ToolProvider: Send + Sync {
         tool_name: &str,
         arguments: Value,
         abort: &AbortSignal,
-    ) -> Result<Value, ToolError>;
+    ) -> Result<ToolProviderOutput, ToolError>;
 }
 
 #[derive(Debug, Clone, Default)]

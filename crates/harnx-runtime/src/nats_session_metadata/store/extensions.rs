@@ -1,4 +1,4 @@
-use super::{extension_validation::validate_namespace, mutation::PatchGuard, *};
+use super::{extension_validation::validate_mutable_namespace, mutation::PatchGuard, *};
 use anyhow::Result;
 use serde_json::Value;
 
@@ -39,7 +39,7 @@ impl SessionMetadataStore {
         update: SessionExtensionUpdate<'_>,
     ) -> Result<MetadataRecord> {
         let SessionExtensionUpdate { namespace, value } = update;
-        validate_namespace(namespace)?;
+        validate_mutable_namespace(namespace)?;
         let namespace_size = serde_json::to_vec(&value)?.len();
         anyhow::ensure!(
             namespace_size <= EXTENSION_NAMESPACE_MAX_BYTES,
@@ -84,7 +84,7 @@ impl SessionMetadataStore {
         agent: Option<&str>,
         namespace: &str,
     ) -> Result<MetadataRecord> {
-        validate_namespace(namespace)?;
+        validate_mutable_namespace(namespace)?;
         self.patch_guarded(
             session_id,
             agent.map_or_else(PatchGuard::default, PatchGuard::for_agent),

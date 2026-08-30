@@ -939,7 +939,7 @@ async fn call_registered_agent(
                 panic!("registered agent prompt failed: {error:#}")
             }
         });
-    (result, child_session_id)
+    (result.value, child_session_id)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

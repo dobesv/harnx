@@ -4,6 +4,7 @@ use crate::nats_lease::NatsSessionLease;
 use crate::nats_metrics;
 use anyhow::{Context, Result};
 use async_nats::jetstream;
+use harnx_core::execution_context::ExecutionContextObservation;
 use std::sync::Arc;
 
 const APPEND_ATTEMPTS: usize = 3;
@@ -86,6 +87,16 @@ impl crate::config::session::SessionAppendSink for NatsSessionLogBackend {
         variables: &harnx_core::agent_config::AgentVariables,
     ) -> Result<()> {
         self.persist_metadata_blocking(MetadataReplacement::Variables(variables.clone()), None)
+    }
+
+    fn persist_execution_contexts<'a>(
+        &'a self,
+        observations: &'a [ExecutionContextObservation],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.persist_execution_contexts_async(observations, None)
+                .await
+        })
     }
 
     fn load_overrides(&self) -> Result<Option<crate::nats_session_metadata::SessionOverrides>> {
@@ -176,6 +187,21 @@ impl crate::config::session::SessionAppendSink for FencedSessionLogSink {
         variables: &harnx_core::agent_config::AgentVariables,
     ) -> Result<()> {
         self.persist_metadata(MetadataReplacement::Variables(variables.clone()))
+    }
+
+    fn persist_execution_contexts<'a>(
+        &'a self,
+        observations: &'a [ExecutionContextObservation],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            anyhow::ensure!(
+                self.lease.is_held(),
+                "session lease lost before execution-context update"
+            );
+            self.backend
+                .persist_execution_contexts_async(observations, Some(self.lease.fence_token()))
+                .await
+        })
     }
 
     fn load_overrides(&self) -> Result<Option<crate::nats_session_metadata::SessionOverrides>> {
@@ -276,6 +302,24 @@ impl NatsSessionLogBackend {
         })?
         .with_context(|| format!("canonical session metadata '{session_id}' not found"))?;
         Ok(Some(record.metadata.overrides))
+    }
+
+    async fn persist_execution_contexts_async(
+        &self,
+        observations: &[ExecutionContextObservation],
+        fence_token: Option<u64>,
+    ) -> Result<()> {
+        let store = self.metadata_store()?;
+        if let Some(fence_token) = fence_token {
+            store
+                .merge_execution_contexts_with_fence(&self.session_id, fence_token, observations)
+                .await?;
+        } else {
+            store
+                .merge_execution_contexts(&self.session_id, observations)
+                .await?;
+        }
+        Ok(())
     }
 
     pub fn session_id(&self) -> &str {

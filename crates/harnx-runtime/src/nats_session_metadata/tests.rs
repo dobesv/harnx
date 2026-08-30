@@ -55,6 +55,34 @@ fn redacted_view_hides_inline_instructions_and_variable_values() {
         ),
     );
     value.title.value = Some("Public title".to_string());
+    value.extensions.insert(
+        harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE.to_string(),
+        serde_json::json!({
+            "version": 1,
+            "contexts": [{
+                "version": 1,
+                "observed_at": "2026-08-28T00:00:00Z",
+                "workspace_root": "/private/workspace",
+                "working_directory": "/private/workspace/repo",
+                "repository": {
+                    "worktree_root": "/private/workspace/repo",
+                    "branch": "feature",
+                    "remotes": [{
+                        "name": "origin",
+                        "repository": "github.com/acme/repo",
+                        "primary": true
+                    }]
+                },
+                "provenance": {
+                    "server_scope": "private-scope",
+                    "server_identity": "private-server",
+                    "tool_name": "read",
+                    "call_id": "private-call",
+                    "worker_received_at": "2026-08-28T00:00:00Z"
+                }
+            }]
+        }),
+    );
     let redacted = RedactedSessionMetadata::new(
         MetadataRecord {
             metadata: value,
@@ -67,6 +95,11 @@ fn redacted_view_hides_inline_instructions_and_variable_values() {
     assert!(!json.contains("secret-value"));
     assert!(json.contains("TOKEN"));
     assert!(json.contains("Public title"));
+    assert!(json.contains("github.com/acme/repo"));
+    assert!(json.contains("feature"));
+    assert!(!json.contains("/private/workspace"));
+    assert!(!json.contains("private-scope"));
+    assert!(!json.contains(harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE));
     assert!(json.contains("\"revision\":11"));
 }
 

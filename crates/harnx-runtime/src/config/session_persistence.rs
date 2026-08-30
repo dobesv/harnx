@@ -3,8 +3,11 @@
 use crate::nats_session_metadata::{SessionOverrideUpdate, SessionOverrides};
 use anyhow::{Context, Result};
 use harnx_core::agent_config::AgentVariables;
+use harnx_core::execution_context::ExecutionContextObservation;
 use harnx_core::session::{Session, SessionLogEntry};
 use std::any::Any;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 pub trait SessionAppendSink: Send + Sync + Any {
@@ -43,6 +46,13 @@ pub trait SessionAppendSink: Send + Sync + Any {
     fn persist_variables(&self, _variables: &AgentVariables) -> Result<()> {
         Ok(())
     }
+
+    fn persist_execution_contexts<'a>(
+        &'a self,
+        _observations: &'a [ExecutionContextObservation],
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[cfg(test)]
@@ -72,6 +82,52 @@ fn sink(session: &Session) -> Option<&Arc<dyn SessionAppendSink>> {
         .runtime
         .as_ref()?
         .downcast_ref::<Arc<dyn SessionAppendSink>>()
+}
+
+#[must_use = "execution-context persistence must be awaited"]
+pub(crate) struct PendingExecutionContextPersistence {
+    sink: Option<Arc<dyn SessionAppendSink>>,
+    session_id: String,
+    observations: Vec<ExecutionContextObservation>,
+}
+
+impl PendingExecutionContextPersistence {
+    pub(crate) fn none(session_id: impl Into<String>) -> Self {
+        Self {
+            sink: None,
+            session_id: session_id.into(),
+            observations: Vec::new(),
+        }
+    }
+
+    pub(crate) fn for_session(
+        session: &Session,
+        observations: Vec<ExecutionContextObservation>,
+        tool_results_are_durable: bool,
+    ) -> Self {
+        Self {
+            sink: tool_results_are_durable
+                .then(|| sink(session).cloned())
+                .flatten(),
+            session_id: session.id().to_string(),
+            observations,
+        }
+    }
+
+    pub(crate) async fn persist(self) {
+        if self.observations.is_empty() {
+            return;
+        }
+        let Some(sink) = self.sink else {
+            return;
+        };
+        if let Err(error) = sink.persist_execution_contexts(&self.observations).await {
+            log::warn!(
+                "failed to persist tool-observed execution context: session_id={} error={error:#}",
+                self.session_id
+            );
+        }
+    }
 }
 
 /// Append a log entry through the session's runtime persistence sink.

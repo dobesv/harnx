@@ -7,6 +7,33 @@ use super::*;
 type ReadLinesPage<'a> = (Vec<(usize, &'a str)>, usize, usize);
 
 impl FsServer {
+    pub(crate) async fn observation_for_args(
+        &self,
+        tool: &str,
+        args: &Value,
+    ) -> Option<ExecutionContextObservation> {
+        let path = match tool {
+            "read" | "ls" => validate_path(args.get("path")?.as_str()?, &self.allowlist).ok()?,
+            "write" | "edit" | "insert" | "re_replace" => {
+                validate_write_path(args.get("path")?.as_str()?, &self.allowlist).ok()?
+            }
+            "grep" | "find" => match args.get("path").and_then(Value::as_str) {
+                Some(path) => validate_path(path, &self.allowlist).ok()?,
+                None => default_search_path(&self.allowlist).ok()?,
+            },
+            "rollback_file" => {
+                validate_write_path(args.get("repo_path")?.as_str()?, &self.allowlist).ok()?
+            }
+            _ => return None,
+        };
+        let current_dir = std::env::current_dir().ok();
+        let workspace = self
+            .allowlist
+            .default_read_directory(current_dir.as_deref())
+            .unwrap_or_else(|| path.clone());
+        Some(ExecutionContextObservation::observe_async(workspace, path).await)
+    }
+
     pub fn new(allowlist: ResolvedAllowlist) -> Self {
         Self {
             allowlist: Arc::new(allowlist),

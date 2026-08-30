@@ -494,7 +494,7 @@ async fn assert_distinct_time_routes(instance_id: &ServerScope) -> Result<()> {
             .map_err(|error| match error {
                 ToolError::Recoverable(error) | ToolError::Fatal(error) => error,
             })?;
-        assert_eq!(result["timezone"], "UTC");
+        assert_eq!(result.value["timezone"], "UTC");
     }
     Ok(())
 }

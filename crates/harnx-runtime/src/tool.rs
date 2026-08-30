@@ -129,19 +129,20 @@ pub async fn execute_tool_round_with_persistence(
                 return Err(err);
             }
             if !dry_run {
-                persist_failed_tool_results(config, tool_calls, &eval_ctx, &err)?;
+                persist_failed_tool_results(config, tool_calls, &eval_ctx, &err).await?;
             }
             return Err(err);
         }
     };
     let results = populate_result_markdown(results, &eval_ctx);
     if !dry_run {
-        config.write().append_session_tool_results(&results)?;
+        let persistence = { config.write().prepare_session_tool_results(&results)? };
+        persistence.persist().await;
     }
     Ok(results)
 }
 
-fn persist_failed_tool_results(
+async fn persist_failed_tool_results(
     config: &GlobalConfig,
     tool_calls: Vec<ToolCall>,
     eval_ctx: &ToolEvalContext,
@@ -159,14 +160,18 @@ fn persist_failed_tool_results(
         })
         .collect();
     let fallback = populate_result_markdown(fallback, eval_ctx);
-    config
-        .write()
-        .append_session_tool_results(&fallback)
-        .map_err(|persist_error| {
-            anyhow::anyhow!(
-                "{error:#}; additionally failed to persist fallback tool results: {persist_error:#}"
-            )
-        })
+    let persistence = {
+        config
+            .write()
+            .prepare_session_tool_results(&fallback)
+            .map_err(|persist_error| {
+                anyhow::anyhow!(
+                    "{error:#}; additionally failed to persist fallback tool results: {persist_error:#}"
+                )
+            })?
+    };
+    persistence.persist().await;
+    Ok(())
 }
 
 fn build_dispatch_hook_fn(

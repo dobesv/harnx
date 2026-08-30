@@ -22,6 +22,14 @@ fn listed_session_to_meta(record: &ListedSession) -> SessionMeta {
         agent_name: record.metadata.agent.name().map(str::to_string),
         title: record.metadata.title.value.clone(),
         modified: Some(modified.into()),
+        contexts: crate::nats_session_metadata::execution_contexts(&record.metadata)
+            .unwrap_or_else(|error| {
+                log::warn!(
+                    "ignoring invalid retained execution context: session_id={} error={error:#}",
+                    record.metadata.session_id
+                );
+                Vec::new()
+            }),
     }
 }
 

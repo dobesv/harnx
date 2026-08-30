@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use fancy_regex::Regex;
 use harnx_core::abort::AbortSignal;
 use harnx_core::session::SessionLogEntry;
-use harnx_core::tool::{JsonSchema, ToolDeclaration, ToolError, ToolProvider};
+use harnx_core::tool::{JsonSchema, ToolDeclaration, ToolError, ToolProvider, ToolProviderOutput};
 use serde_json::{json, Value};
 
 /// The tool name exposed to agents.
@@ -246,7 +246,7 @@ impl ToolProvider for SessionHistoryProvider {
         _tool_name: &str,
         arguments: Value,
         abort: &AbortSignal,
-    ) -> Result<Value, ToolError> {
+    ) -> Result<ToolProviderOutput, ToolError> {
         let (config, name, cluster) = {
             let guard = self.config.read();
             let session = guard
@@ -282,7 +282,7 @@ impl ToolProvider for SessionHistoryProvider {
             .map(|(seq, entry)| (seq as usize, entry))
             .collect();
         let rows = query_entries_with_jaq(&entries, &query).map_err(ToolError::Recoverable)?;
-        Ok(json!({ "content": [{ "type": "text", "text": rows.to_string() }] }))
+        Ok(json!({ "content": [{ "type": "text", "text": rows.to_string() }] }).into())
     }
 }
 

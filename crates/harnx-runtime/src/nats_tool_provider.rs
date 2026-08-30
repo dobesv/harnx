@@ -4,19 +4,24 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
+use harnx_core::execution_context::{ToolObservationProvenance, EXECUTION_CONTEXT_NAMESPACE};
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
-use harnx_core::tool::{JsonSchema, ToolDeclaration, ToolError, ToolProvider};
+use harnx_core::tool::{JsonSchema, ToolDeclaration, ToolError, ToolProvider, ToolProviderOutput};
 use harnx_toolset::{
     ControlKind, ControlMessage, Registration, ToolErrorPayload, ToolReply, ToolRequest, ToolSpec,
     HDR_CALL_ID, HDR_CONTENT_TYPE, HDR_IDEMPOTENCY_KEY, HDR_INSTANCE_ID,
 };
 use harnx_toolset_server::{registration_key, TOOL_REGISTRY_BUCKET};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
+
+mod execution_context;
+
+use execution_context::extract_execution_context;
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const JSON_CONTENT_TYPE: &str = "application/json";
@@ -282,6 +287,7 @@ impl NatsToolProvider {
             tool: route.raw_name.clone(),
             args: arguments,
             parent_session_id: self.parent_session_id.clone(),
+            capabilities: BTreeSet::from([EXECUTION_CONTEXT_NAMESPACE.to_string()]),
         };
         let mut headers = async_nats::HeaderMap::new();
         headers.insert(HDR_IDEMPOTENCY_KEY, Uuid::new_v4().to_string());
@@ -479,7 +485,7 @@ impl ToolProvider for NatsToolProvider {
         tool_name: &str,
         arguments: Value,
         abort: &AbortSignal,
-    ) -> Result<Value, ToolError> {
+    ) -> Result<ToolProviderOutput, ToolError> {
         let Some(route) = self.resolve_route(tool_name) else {
             return Err(ToolError::Recoverable(anyhow!(
                 "NATS tool is not registered: {tool_name}"
@@ -497,7 +503,21 @@ impl ToolProvider for NatsToolProvider {
             )));
         }
         match reply.result {
-            Ok(value) => Ok(value),
+            Ok(mut value) => {
+                let execution_context = extract_execution_context(
+                    &mut value,
+                    ToolObservationProvenance::new(
+                        self.instance_id.to_string(),
+                        route.server.clone(),
+                        route.raw_name.clone(),
+                        call_id.clone(),
+                    ),
+                );
+                Ok(ToolProviderOutput {
+                    value,
+                    execution_context,
+                })
+            }
             Err(ToolErrorPayload::Recoverable(message)) => {
                 Err(ToolError::Recoverable(anyhow!(message)))
             }

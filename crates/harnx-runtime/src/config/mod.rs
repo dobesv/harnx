@@ -23,6 +23,7 @@ mod session_ops_core;
 mod session_ops_split;
 pub mod session_ops_title;
 mod session_persistence;
+mod session_tool_results;
 mod settings_split;
 mod tool_servers_split;
 
@@ -60,7 +61,6 @@ pub const DEFAULT_BUCKET_REPLICAS: usize = 1;
 /// shared local cluster. Useful when the worker is not installed next to the
 /// front-end, and for tests that build both into a scratch directory.
 pub const HARNX_WORKER_BIN_ENV: &str = "HARNX_WORKER_BIN";
-pub(crate) use self::persistence_split::collect_tool_calls;
 pub use self::session_dump::{render_session_dump, render_session_dump_for_agent};
 
 pub use self::agent::TEMP_AGENT_NAME;
@@ -73,7 +73,10 @@ pub use self::input::Input;
 pub(crate) use self::patches_split::server_display_name;
 use self::patches_split::{apply_client_patch, package_dir_name};
 use self::session::Session;
-pub use self::session_meta::{find_matching_session, sort_sessions_for_picker, SessionMeta};
+pub use self::session_meta::{
+    find_matching_session, sort_sessions_for_picker, sort_sessions_for_picker_with_context,
+    PickerMatchMode, PickerQueryContext, SessionMeta,
+};
 pub use harnx_core::attachments::{
     expand_passthrough_reference, read_attachment, AttachmentRefCache, CachedRef,
     ExpandedAttachment, CID_PREFIX,
@@ -155,14 +158,14 @@ fn parse_toolsets_json(value: &str) -> serde_json::Result<IndexMap<String, Vec<S
         .collect())
 }
 
-struct SessionSaveRequest<'a> {
+pub(crate) struct SessionSaveRequest<'a> {
     input: Input,
     output: &'a str,
     thought: Option<&'a str>,
 }
 
 impl<'a> SessionSaveRequest<'a> {
-    fn new(input: &Input, output: &'a str, thought: Option<&'a str>) -> Self {
+    pub(crate) fn new(input: &Input, output: &'a str, thought: Option<&'a str>) -> Self {
         let mut input = input.clone();
         input.clear_patch();
         Self {
@@ -1082,44 +1085,10 @@ impl Config {
         }
     }
 
-    /// Finalize the tool round opened by [`append_session_tool_calls`].
-    /// Writes a `ToolResults` entry to the session log and fills in
-    /// the pending outputs on the last in-memory message.
-    pub fn append_session_tool_results(&mut self, results: &[ToolResult]) -> Result<()> {
-        let Some(session) = self.session.as_mut() else {
-            return Ok(());
-        };
-        crate::config::session::add_tool_results(session, results)
-    }
-
     fn discontinuous_last_message(&mut self) {
         if let Some(last_message) = self.last_message.as_mut() {
             last_message.continuous = false;
         }
-    }
-
-    fn session_for_save<'a>(&'a mut self, request: &SessionSaveRequest) -> Option<&'a mut Session> {
-        if !request.input.with_session() {
-            return None;
-        }
-
-        self.session.as_mut()
-    }
-
-    fn save_message_with_tool_results(
-        session: &mut Session,
-        request: &SessionSaveRequest,
-        tool_results: &[crate::tool::ToolResult],
-    ) -> Result<()> {
-        let calls = collect_tool_calls(tool_results);
-        crate::config::session::add_tool_calls(
-            session,
-            &request.input,
-            request.output,
-            request.thought,
-            &calls,
-        )?;
-        crate::config::session::add_tool_results(session, tool_results)
     }
 
     pub(crate) fn init_agent_shared_variables(&mut self) -> Result<()> {

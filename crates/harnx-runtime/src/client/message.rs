@@ -149,6 +149,7 @@ mod tests {
             markdown: None,
             content,
             switch_agent: None,
+            execution_context: None,
         }
     }
     use serde_json::json;

@@ -10,7 +10,9 @@ use anyhow::{anyhow, bail, Result};
 use futures_util::future::join_all;
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::hooks::{HookEvent, HookOutcome, HookResult, HookResultControl};
-use harnx_core::tool::{SwitchAgentData, ToolCall, ToolError, ToolProvider, ToolResult};
+use harnx_core::tool::{
+    SwitchAgentData, ToolCall, ToolError, ToolProvider, ToolProviderOutput, ToolResult,
+};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -256,60 +258,52 @@ pub async fn eval_tool_calls(
         async move { dispatch_tool_call(call, json_data, ctx, abort_signal).await }
     });
     let dispatch_results = join_all(dispatch_futures).await;
+    let (completed, dispatched_all_null, fatal_err) =
+        collect_dispatch_results(ctx, approved, dispatch_results).await;
+    output.extend(completed);
+    is_all_null &= dispatched_all_null;
+    if let Some(err) = fatal_err {
+        return Err(err);
+    }
+    if is_all_null {
+        output = vec![];
+    }
+    Ok(output)
+}
 
+async fn collect_dispatch_results(
+    ctx: &ToolEvalContext,
+    approved: Vec<ApprovedToolCall>,
+    dispatch_results: Vec<Result<ToolProviderOutput, ToolError>>,
+) -> (Vec<ToolResult>, bool, Option<anyhow::Error>) {
+    let mut output = Vec::new();
+    let mut all_null = true;
     let mut fatal_err = None;
     for (approved_call, result) in approved.into_iter().zip(dispatch_results) {
-        let ApprovedToolCall {
-            call,
-            tool_input,
-            tool_use_id,
-            ..
-        } = approved_call;
-
         match result {
-            Ok(mut result) => {
-                let post_event = HookEvent::PostToolUse {
-                    tool_name: call.name.clone(),
-                    tool_input: tool_input.clone(),
-                    tool_use_id: tool_use_id.clone(),
-                    tool_response: result.clone(),
-                };
-                let post_outcome = (ctx.dispatch_hook_fn)(post_event).await;
-                if let Some(mutated_response) = post_outcome.result.mutated_tool_response {
-                    result = mutated_response;
-                }
-                let images = crate::media::extract_image_parts(&result);
-                if !images.is_empty() {
-                    crate::media::redact_image_data(&mut result);
-                }
-                (ctx.emit_tool_result_fn)(&call, &result);
-                if !result.is_null() {
-                    is_all_null = false;
-                } else {
-                    result = json!("DONE");
-                }
-                let mut result_obj = ToolResult::new(call, result);
-                result_obj.content = images;
-                result_obj.switch_agent = detect_switch_agent(&result_obj.output);
-                output.push(result_obj);
+            Ok(provider_output) => {
+                let (completed, was_null) =
+                    complete_successful_tool_call(ctx, &approved_call, provider_output).await;
+                all_null &= was_null;
+                output.push(completed);
             }
             Err(ToolError::Recoverable(err)) => {
                 let error_display = format!("{err:#}");
                 let fail_event = HookEvent::PostToolUseFailure {
-                    tool_name: call.name.clone(),
-                    tool_input: tool_input.clone(),
-                    tool_use_id: tool_use_id.clone(),
+                    tool_name: approved_call.call.name.clone(),
+                    tool_input: approved_call.tool_input.clone(),
+                    tool_use_id: approved_call.tool_use_id.clone(),
                     error: error_display.clone(),
                 };
                 let _ = (ctx.dispatch_hook_fn)(fail_event).await;
 
-                is_all_null = false;
+                all_null = false;
                 let error_result = json!({
                     "is_error": true,
                     "error": error_display,
                 });
-                (ctx.emit_tool_result_fn)(&call, &error_result);
-                output.push(ToolResult::new(call, error_result));
+                (ctx.emit_tool_result_fn)(&approved_call.call, &error_result);
+                output.push(ToolResult::new(approved_call.call, error_result));
             }
             Err(ToolError::Fatal(err)) => {
                 if fatal_err.is_none() {
@@ -318,14 +312,38 @@ pub async fn eval_tool_calls(
             }
         }
     }
+    (output, all_null, fatal_err)
+}
 
-    if let Some(err) = fatal_err {
-        return Err(err);
+async fn complete_successful_tool_call(
+    ctx: &ToolEvalContext,
+    approved: &ApprovedToolCall,
+    provider_output: ToolProviderOutput,
+) -> (ToolResult, bool) {
+    let (mut value, execution_context) = provider_output.into_parts();
+    let post_event = HookEvent::PostToolUse {
+        tool_name: approved.call.name.clone(),
+        tool_input: approved.tool_input.clone(),
+        tool_use_id: approved.tool_use_id.clone(),
+        tool_response: value.clone(),
+    };
+    let post_outcome = (ctx.dispatch_hook_fn)(post_event).await;
+    if let Some(mutated_response) = post_outcome.result.mutated_tool_response {
+        value = mutated_response;
     }
-    if is_all_null {
-        output = vec![];
+    let images = crate::media::extract_image_parts(&value);
+    if !images.is_empty() {
+        crate::media::redact_image_data(&mut value);
     }
-    Ok(output)
+    (ctx.emit_tool_result_fn)(&approved.call, &value);
+    let was_null = value.is_null();
+    if was_null {
+        value = json!("DONE");
+    }
+    (
+        completed_tool_result(approved.call.clone(), value, images, execution_context),
+        was_null,
+    )
 }
 
 fn parse_call_arguments(call: &ToolCall) -> Result<Value, ToolError> {
@@ -348,6 +366,19 @@ fn parse_call_arguments(call: &ToolCall) -> Result<Value, ToolError> {
         call.name,
         call.arguments
     )))
+}
+
+fn completed_tool_result(
+    call: ToolCall,
+    output: Value,
+    content: Vec<harnx_core::message::MessageContentPart>,
+    execution_context: Option<harnx_core::execution_context::ExecutionContextObservation>,
+) -> ToolResult {
+    let mut result = ToolResult::new(call, output);
+    result.content = content;
+    result.switch_agent = detect_switch_agent(&result.output);
+    result.execution_context = execution_context;
+    result
 }
 
 fn detect_switch_agent(output: &Value) -> Option<SwitchAgentData> {
@@ -373,7 +404,7 @@ async fn call_tool_with_tracing(
     tool_name: &str,
     json_data: Value,
     abort_signal: &AbortSignal,
-) -> Result<Value, ToolError> {
+) -> Result<ToolProviderOutput, ToolError> {
     let span = tracing::info_span!(
         "tool_call",
         otel.kind = "client",
@@ -402,7 +433,7 @@ async fn dispatch_tool_call(
     json_data: Value,
     ctx: &ToolEvalContext,
     abort_signal: &AbortSignal,
-) -> Result<Value, ToolError> {
+) -> Result<ToolProviderOutput, ToolError> {
     let allowed_tool_names = &ctx.allowed_tool_names;
 
     if call.name.ends_with("_session_handoff") {
@@ -451,7 +482,8 @@ async fn dispatch_tool_call(
             "agent": agent,
             "prompt": prompt,
             "session_id": session_id,
-        }));
+        })
+        .into());
     }
 
     for provider in &ctx.providers {
@@ -556,7 +588,9 @@ mod tests {
             tool_name: &'life1 str,
             _arguments: Value,
             _abort: &'life2 AbortSignal,
-        ) -> Pin<Box<dyn Future<Output = Result<Value, ToolError>> + Send + 'async_trait>>
+        ) -> Pin<
+            Box<dyn Future<Output = Result<ToolProviderOutput, ToolError>> + Send + 'async_trait>,
+        >
         where
             'life0: 'async_trait,
             'life1: 'async_trait,
@@ -575,6 +609,7 @@ mod tests {
                     .await
                     .take()
                     .expect("mock tool called more than once")
+                    .map(Into::into)
             })
         }
     }
@@ -583,6 +618,42 @@ mod tests {
         tool_name: String,
         received_arguments: Arc<Mutex<Vec<Value>>>,
         result: Value,
+    }
+
+    struct PrivateContextProvider {
+        observation: harnx_core::execution_context::ExecutionContextObservation,
+    }
+
+    impl ToolProvider for PrivateContextProvider {
+        fn name(&self) -> &str {
+            "private-context"
+        }
+
+        fn has_tool(&self, tool_name: &str) -> bool {
+            tool_name == "context_tool"
+        }
+
+        fn call_tool<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            _tool_name: &'life1 str,
+            _arguments: Value,
+            _abort: &'life2 AbortSignal,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<ToolProviderOutput, ToolError>> + Send + 'async_trait>,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(ToolProviderOutput {
+                    value: json!({"content": [{"type": "text", "text": "visible"}]}),
+                    execution_context: Some(self.observation.clone()),
+                })
+            })
+        }
     }
 
     impl CapturingToolProvider {
@@ -609,7 +680,9 @@ mod tests {
             tool_name: &'life1 str,
             arguments: Value,
             _abort: &'life2 AbortSignal,
-        ) -> Pin<Box<dyn Future<Output = Result<Value, ToolError>> + Send + 'async_trait>>
+        ) -> Pin<
+            Box<dyn Future<Output = Result<ToolProviderOutput, ToolError>> + Send + 'async_trait>,
+        >
         where
             'life0: 'async_trait,
             'life1: 'async_trait,
@@ -619,7 +692,7 @@ mod tests {
             Box::pin(async move {
                 assert_eq!(tool_name, self.tool_name);
                 self.received_arguments.lock().await.push(arguments);
-                Ok(self.result.clone())
+                Ok(self.result.clone().into())
             })
         }
     }
@@ -629,6 +702,60 @@ mod tests {
             control: HookResultControl::Continue,
             result: HookResult::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn private_execution_context_never_reaches_hooks_ui_or_serialization() {
+        let private_path = "/private/worker/workspace";
+        let mut observation = harnx_core::execution_context::ExecutionContextObservation::observe(
+            std::path::Path::new(private_path),
+            std::path::Path::new(private_path),
+        );
+        observation.workspace_root = private_path.to_string();
+        observation.working_directory = private_path.to_string();
+        let hook_responses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook_capture = Arc::clone(&hook_responses);
+        let provider = Arc::new(PrivateContextProvider { observation });
+        let mut ctx = test_context(vec![provider], move |event| {
+            if let HookEvent::PostToolUse { tool_response, .. } = event {
+                hook_capture.lock().unwrap().push(tool_response);
+            }
+            continue_hook_outcome()
+        });
+        let ui_results = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ui_capture = Arc::clone(&ui_results);
+        ctx.emit_tool_result_fn = Arc::new(move |_call, value| {
+            ui_capture.lock().unwrap().push(value.clone());
+        });
+
+        let results = eval_tool_calls(
+            &ctx,
+            vec![test_call("context_tool")],
+            &create_abort_signal(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].output["content"][0]["text"], "visible");
+        assert_eq!(
+            results[0]
+                .execution_context
+                .as_ref()
+                .map(|context| context.workspace_root.as_str()),
+            Some(private_path)
+        );
+        for value in hook_responses
+            .lock()
+            .unwrap()
+            .iter()
+            .chain(ui_results.lock().unwrap().iter())
+        {
+            assert!(!value.to_string().contains(private_path));
+        }
+        assert!(!serde_json::to_string(&results[0])
+            .unwrap()
+            .contains(private_path));
     }
 
     fn test_context(
@@ -1149,7 +1276,7 @@ mod tests {
         let call = ToolCall::new(tool_name.to_string(), arguments.clone(), None, None);
         let abort_signal = create_abort_signal();
         match dispatch_tool_call(call, arguments, ctx, &abort_signal).await {
-            Ok(result) => result,
+            Ok(result) => result.value,
             Err(ToolError::Recoverable(err) | ToolError::Fatal(err)) => {
                 panic!("handoff dispatch should succeed: {err:#}")
             }

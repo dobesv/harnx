@@ -63,9 +63,9 @@ impl ServerHandler for FsServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        self.dispatch_call_tool(request, _context)
+        self.dispatch_call_tool(request, context)
             .await
             .map(Into::into)
     }
@@ -81,49 +81,81 @@ impl FsServer {
     async fn dispatch_call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        match request.name.as_ref() {
+        let enabled = request_wants_execution_context(&request);
+        let tool_name = request.name.to_string();
+        let result = self
+            .invoke_tool_value(
+                request.name.as_ref(),
+                Value::Object(request.arguments.unwrap_or_default()),
+            )
+            .await?;
+        Ok(finalize_direct_mcp_context(
+            result,
+            enabled,
+            &tool_name,
+            format!("{:?}", context.id),
+        ))
+    }
+}
+
+impl FsServer {
+    pub(crate) async fn invoke_tool_value(
+        &self,
+        tool: &str,
+        args: Value,
+    ) -> Result<CallToolResult, ErrorData> {
+        let observation_args = args.clone();
+        let arguments = args.as_object().cloned();
+        let mut result = match tool {
             "read" => {
-                let params = parse_arguments::<ReadFileParams>(request.arguments)?;
+                let params = parse_arguments::<ReadFileParams>(arguments)?;
                 self.read_file_impl(params).await
             }
             "write" => {
-                let params = parse_arguments::<WriteFileParams>(request.arguments)?;
+                let params = parse_arguments::<WriteFileParams>(arguments)?;
                 self.write_file_impl(params).await
             }
             "edit" => {
-                let params = parse_arguments::<EditFileParams>(request.arguments)?;
+                let params = parse_arguments::<EditFileParams>(arguments)?;
                 self.edit_file_impl(params).await
             }
             "insert" => {
-                let params = parse_arguments::<InsertParams>(request.arguments)?;
+                let params = parse_arguments::<InsertParams>(arguments)?;
                 self.insert_impl(params).await
             }
             "re_replace" => {
-                let params = parse_arguments::<ReReplaceParams>(request.arguments)?;
+                let params = parse_arguments::<ReReplaceParams>(arguments)?;
                 self.re_replace_impl(params).await
             }
             "ls" => {
-                let params = parse_arguments::<ListDirectoryParams>(request.arguments)?;
+                let params = parse_arguments::<ListDirectoryParams>(arguments)?;
                 self.list_directory_impl(params).await
             }
             "grep" => {
-                let params = parse_arguments::<SearchFilesParams>(request.arguments)?;
+                let params = parse_arguments::<SearchFilesParams>(arguments)?;
                 self.search_files_impl(params).await
             }
             "find" => {
-                let params = parse_arguments::<FindFilesParams>(request.arguments)?;
+                let params = parse_arguments::<FindFilesParams>(arguments)?;
                 self.find_files_impl(params).await
             }
             "rollback_file" => {
-                let params = parse_arguments::<RollbackParams>(request.arguments)?;
+                let params = parse_arguments::<RollbackParams>(arguments)?;
                 self.rollback_file_impl(params).await
             }
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),
                 None,
             )),
+        }?;
+        if let Some(observation) = self.observation_for_args(tool, &observation_args).await {
+            result.meta.get_or_insert_with(MetaObject::new).0.insert(
+                EXECUTION_CONTEXT_NAMESPACE.to_string(),
+                serde_json::to_value(observation).expect("execution context serializes"),
+            );
         }
+        Ok(result)
     }
 }

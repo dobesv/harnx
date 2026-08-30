@@ -2,11 +2,85 @@ mod common;
 
 use anyhow::Result;
 use common::spawn_nats_server;
+use harnx_core::execution_context::{
+    ExecutionContextObservation, GitRemoteObservation, GitRepositoryObservation,
+    ToolObservationProvenance, EXECUTION_CONTEXT_MAX_RETAINED, EXECUTION_CONTEXT_NAMESPACE,
+    EXECUTION_CONTEXT_VERSION,
+};
 use harnx_core::require_nextest;
 use harnx_runtime::nats_session_metadata::{
     read_cursor_key, SessionExtensionUpdate, SessionInitializer, SessionMetadata,
     SessionMetadataPatch, SessionMetadataStore, SessionOverrideUpdate,
 };
+use serde_json::json;
+
+fn execution_context(repository: &str, branch: &str, index: usize) -> ExecutionContextObservation {
+    ExecutionContextObservation {
+        version: EXECUTION_CONTEXT_VERSION,
+        observed_at: chrono::Utc::now() + chrono::Duration::seconds(index as i64),
+        workspace_root: format!("/workspace/{index}"),
+        working_directory: format!("/workspace/{index}"),
+        repository: Some(GitRepositoryObservation {
+            worktree_root: format!("/workspace/{index}"),
+            branch: Some(branch.to_string()),
+            remotes: vec![GitRemoteObservation {
+                name: "origin".to_string(),
+                repository: repository.to_string(),
+                primary: true,
+            }],
+        }),
+        provenance: Some(ToolObservationProvenance::new(
+            "scope",
+            "fs",
+            "read",
+            format!("call-{index}"),
+        )),
+    }
+}
+
+async fn run_concurrent_context_updates(
+    store: &SessionMetadataStore,
+    session_id: &str,
+) -> Result<()> {
+    let context_store = store.clone();
+    let context_session = session_id.to_string();
+    let context_update = tokio::spawn(async move {
+        for index in 0..=EXECUTION_CONTEXT_MAX_RETAINED {
+            context_store
+                .merge_execution_contexts(
+                    &context_session,
+                    &[execution_context(
+                        &format!("github.com/acme/repo-{index}"),
+                        "main",
+                        index,
+                    )],
+                )
+                .await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    let title_store = store.clone();
+    let title_session = session_id.to_string();
+    let title_update = tokio::spawn(async move {
+        title_store
+            .patch(&title_session, |metadata| {
+                metadata.title.value = Some("Concurrent title".to_string());
+                Ok(())
+            })
+            .await
+    });
+    let extension_store = store.clone();
+    let extension_session = session_id.to_string();
+    let extension_update = tokio::spawn(async move {
+        extension_store
+            .replace_extension(&extension_session, "client", json!({"ok": true}))
+            .await
+    });
+    context_update.await??;
+    title_update.await??;
+    extension_update.await??;
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metadata_and_activity_cas_updates_do_not_contend() -> Result<()> {
@@ -283,5 +357,120 @@ async fn agent_bound_mutations_hide_other_agents_sessions() -> Result<()> {
             },
         )
         .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn execution_context_merges_with_concurrent_metadata_and_evicts_oldest() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client);
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let session_id = format!("metadata-context-{}", uuid::Uuid::new_v4());
+    store
+        .create(&SessionMetadata::new(
+            &session_id,
+            SessionInitializer::named("metis", Default::default()),
+        ))
+        .await?;
+
+    run_concurrent_context_updates(&store, &session_id).await?;
+
+    let record = store.get(&session_id).await?.expect("metadata exists");
+    let contexts = harnx_runtime::nats_session_metadata::execution_contexts(&record.metadata)?;
+    assert_eq!(contexts.len(), EXECUTION_CONTEXT_MAX_RETAINED);
+    assert!(!contexts
+        .iter()
+        .any(|context| { context.primary_repository() == Some("github.com/acme/repo-0") }));
+    assert_eq!(
+        record.metadata.title.value.as_deref(),
+        Some("Concurrent title")
+    );
+    assert_eq!(record.metadata.extensions["client"], json!({"ok": true}));
+
+    let revision = record.revision;
+    let repeated = contexts[0].clone();
+    let record = store
+        .merge_execution_contexts(&session_id, &[repeated])
+        .await?;
+    assert_eq!(
+        record.revision, revision,
+        "exact repeats must be no-op writes"
+    );
+
+    let repository = contexts[0].primary_repository().unwrap().to_string();
+    store
+        .merge_execution_contexts(
+            &session_id,
+            &[execution_context(&repository, "feature", 99)],
+        )
+        .await?;
+    let record = store.get(&session_id).await?.unwrap();
+    let contexts = harnx_runtime::nats_session_metadata::execution_contexts(&record.metadata)?;
+    assert_eq!(
+        contexts
+            .iter()
+            .filter(|context| context.primary_repository() == Some(repository.as_str()))
+            .count(),
+        1
+    );
+    assert_eq!(
+        contexts
+            .iter()
+            .find(|context| context.primary_repository() == Some(repository.as_str()))
+            .and_then(ExecutionContextObservation::branch),
+        Some("feature")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn execution_context_namespace_is_reserved_and_fenced() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client);
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let session_id = format!("metadata-context-fence-{}", uuid::Uuid::new_v4());
+    store
+        .create(&SessionMetadata::new(
+            &session_id,
+            SessionInitializer::named("metis", Default::default()),
+        ))
+        .await?;
+    assert!(store
+        .replace_extension(&session_id, EXECUTION_CONTEXT_NAMESPACE, json!({}))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("reserved"));
+    assert!(store
+        .delete_extension(&session_id, EXECUTION_CONTEXT_NAMESPACE)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("reserved"));
+
+    store
+        .merge_execution_contexts_with_fence(
+            &session_id,
+            20,
+            &[execution_context("github.com/acme/repo", "main", 1)],
+        )
+        .await?;
+    let error = store
+        .merge_execution_contexts_with_fence(
+            &session_id,
+            19,
+            &[execution_context("github.com/acme/repo", "stale", 2)],
+        )
+        .await
+        .expect_err("stale context writer must be fenced");
+    assert!(error.to_string().contains("stale session metadata writer"));
     Ok(())
 }
