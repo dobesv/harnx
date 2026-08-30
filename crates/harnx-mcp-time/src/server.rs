@@ -30,6 +30,22 @@ use rmcp::ServerHandler;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
 
+fn metric_tool_name(tool: &str) -> &str {
+    if matches!(
+        tool,
+        "get_current_time" | "convert_time" | "wait" | "wait_until"
+    ) {
+        tool
+    } else {
+        "unknown"
+    }
+}
+
+fn tool_call_succeeded(result: &Result<CallToolResult, ErrorData>) -> bool {
+    result
+        .as_ref()
+        .is_ok_and(|result| result.is_error != Some(true))
+}
 #[derive(Clone)]
 pub struct TimeServer {
     local_tz: String,
@@ -424,11 +440,12 @@ impl ServerHandler for TimeServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let tool = request.name.clone();
+        let metric_tool = metric_tool_name(&tool);
         let start = std::time::Instant::now();
         let result = self.dispatch_call_tool(request, _context).await;
         let elapsed = start.elapsed();
-        let is_ok = result.is_ok();
-        harnx_metrics::record_tool_call(&tool, is_ok, elapsed);
+        let is_ok = tool_call_succeeded(&result);
+        harnx_metrics::record_tool_call(metric_tool, is_ok, elapsed);
         result.map(Into::into)
     }
 }
@@ -890,5 +907,13 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.message.contains("is in the past"));
+    }
+
+    #[test]
+    fn tool_level_error_is_not_successful() {
+        let result: Result<CallToolResult, ErrorData> =
+            Ok(CallToolResult::error(vec![ContentBlock::text("failed")]));
+
+        assert!(!tool_call_succeeded(&result));
     }
 }

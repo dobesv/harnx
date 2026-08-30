@@ -96,8 +96,14 @@ fn parse_args_from(args: &[String], mut inputs: AllowInputs) -> Result<AllowInpu
                 inputs.all = true;
                 None
             }
-            "--metrics-addr" => {
-                i += 2;
+            arg if arg.starts_with("--metrics-addr") => {
+                // Skip --metrics-addr (both forms) so the strict parser doesn't reject it.
+                // The shared helper in run_toolset_main handles actual parsing.
+                if arg == "--metrics-addr" {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
                 continue;
             }
             "--mcp-stdio" => None,
@@ -138,6 +144,9 @@ fn print_help_and_exit() -> ! {
     eprintln!("  --allow-repo-work         Allow detected project roots and current directory");
     eprintln!("  --allow-all               Allow all filesystem paths");
     eprintln!("  --mcp-stdio               Serve MCP over stdio instead of toolset mode");
+    eprintln!("  --metrics-addr <ADDR>     Serve Prometheus metrics at http://ADDR/metrics.");
+    eprintln!("                            Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
+    eprintln!("                            Also honors HARNX_METRICS_ADDR env.");
     eprintln!("  --help, -h                Show this help message");
     std::process::exit(0);
 }

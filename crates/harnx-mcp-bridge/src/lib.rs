@@ -36,7 +36,7 @@ type SpawnedChild = (
 );
 
 /// Command-line arguments for the MCP-to-NATS bridge.
-#[derive(Debug, PartialEq, Eq, Parser)]
+#[derive(Clone, Debug, PartialEq, Eq, Parser)]
 #[command(trailing_var_arg = true)]
 pub struct Args {
     /// Server name used for registration. Required when serving over NATS;

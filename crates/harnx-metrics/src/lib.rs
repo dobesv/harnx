@@ -1,3 +1,5 @@
+//! Opt-in Prometheus metrics facade for harnx services and tool servers.
+
 use std::{
     net::SocketAddr,
     sync::{Mutex, OnceLock},
@@ -13,11 +15,17 @@ use axum::{
 use clap::Args;
 use metrics_exporter_prometheus::PrometheusBuilder;
 
+/// Total chat-completion tokens by agent, client, model, and token type.
 pub const LLM_TOKENS_TOTAL: &str = "harnx_llm_tokens_total";
+/// Cumulative chat-completion cost in dollars by agent, client, and model.
 pub const LLM_COST_DOLLARS: &str = "harnx_llm_cost_dollars";
+/// Total HTTP requests by method, route, and status.
 pub const HTTP_REQUESTS_TOTAL: &str = "harnx_http_requests_total";
+/// HTTP request duration in seconds by method and route.
 pub const HTTP_REQUEST_DURATION_SECONDS: &str = "harnx_http_request_duration_seconds";
+/// Total tool calls by tool and status.
 pub const TOOL_CALLS_TOTAL: &str = "harnx_tool_calls_total";
+/// Tool-call duration in seconds by tool.
 pub const TOOL_CALL_DURATION_SECONDS: &str = "harnx_tool_call_duration_seconds";
 
 const HISTOGRAM_BUCKETS: [f64; 11] = [
@@ -27,7 +35,8 @@ const HISTOGRAM_BUCKETS: [f64; 11] = [
 static INIT: OnceLock<()> = OnceLock::new();
 static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
-#[derive(Args, Debug, PartialEq, Eq)]
+/// Command-line configuration for the optional Prometheus listener.
+#[derive(Args, Clone, Debug, PartialEq, Eq)]
 pub struct MetricsFlags {
     #[arg(
         long,
@@ -35,6 +44,25 @@ pub struct MetricsFlags {
         help = "Serve Prometheus metrics at http://ADDR/metrics. Blank host binds 0.0.0.0, e.g. :8456. Unset disables."
     )]
     pub metrics_addr: Option<String>,
+}
+
+/// Extract a metrics listener address from command-line arguments.
+///
+/// Accepts both `--metrics-addr ADDR` and `--metrics-addr=ADDR`.
+pub fn metrics_addr_from_args<I>(args: I) -> Option<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--metrics-addr" {
+            return args.next();
+        }
+        if let Some(addr) = arg.strip_prefix("--metrics-addr=") {
+            return Some(addr.to_owned());
+        }
+    }
+    None
 }
 
 /// Initialize the Prometheus metrics recorder and HTTP listener.
@@ -88,8 +116,18 @@ fn parse_addr(raw_addr: &str) -> anyhow::Result<SocketAddr> {
         .with_context(|| format!("invalid metrics address `{raw_addr}`; expected IP:PORT or :PORT"))
 }
 
+fn normalized_http_method(method: &str) -> &str {
+    match method {
+        "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "CONNECT" | "OPTIONS" | "TRACE" | "PATCH" => {
+            method
+        }
+        _ => "other",
+    }
+}
+
 /// Record request count and duration using a caller-supplied bounded route label.
 pub fn record_http_request(method: &str, route: &str, status: u16, elapsed: Duration) {
+    let method = normalized_http_method(method);
     metrics::counter!(
         HTTP_REQUESTS_TOTAL,
         "method" => method.to_owned(),
@@ -222,6 +260,41 @@ mod tests {
     }
 
     #[test]
+    fn http_method_labels_are_normalized() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            record_http_request("FROBNICATE", "/custom", 200, Duration::from_millis(1));
+            record_http_request("GET", "/standard", 200, Duration::from_millis(1));
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(snapshot.len(), 4);
+        for (method, route) in [("other", "/custom"), ("GET", "/standard")] {
+            assert!(snapshot.iter().any(|(key, _, _, value)| {
+                *key == metric_key(
+                    MetricKind::Counter,
+                    HTTP_REQUESTS_TOTAL,
+                    &[("method", method), ("route", route), ("status", "200")],
+                ) && *value == DebugValue::Counter(1)
+            }));
+            assert!(snapshot.iter().any(|(key, _, _, value)| {
+                *key == metric_key(
+                    MetricKind::Histogram,
+                    HTTP_REQUEST_DURATION_SECONDS,
+                    &[("method", method), ("route", route)],
+                ) && matches!(value, DebugValue::Histogram(samples) if samples.len() == 1)
+            }));
+        }
+        assert!(snapshot.iter().all(|(key, _, _, _)| {
+            key.key()
+                .labels()
+                .all(|label| label.value() != "FROBNICATE")
+        }));
+    }
+
+    #[test]
     fn http_middleware_uses_matched_route_template() {
         let app = Router::new()
             .route("/v1/models/{id}", get(|| async { StatusCode::CREATED }))
@@ -284,6 +357,25 @@ mod tests {
         assert_eq!(
             parse_addr(":8456").expect("blank-host address should parse"),
             "0.0.0.0:8456".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn metrics_addr_parses_separate_and_equals_forms() {
+        assert_eq!(
+            metrics_addr_from_args([
+                "harnx-tool".to_owned(),
+                "--metrics-addr".to_owned(),
+                ":8456".to_owned(),
+            ]),
+            Some(":8456".to_owned())
+        );
+        assert_eq!(
+            metrics_addr_from_args([
+                "harnx-tool".to_owned(),
+                "--metrics-addr=127.0.0.1:8456".to_owned(),
+            ]),
+            Some("127.0.0.1:8456".to_owned())
         );
     }
 

@@ -96,6 +96,14 @@ fn tool_exec_span(tool_name: &str, parent_cx: OtelContext) -> tracing::Span {
     span
 }
 
+fn metric_tool_name<'a>(toolset: &dyn Toolset, requested: &'a str) -> &'a str {
+    if toolset.tools().iter().any(|tool| tool.name == requested) {
+        requested
+    } else {
+        "unknown"
+    }
+}
+
 struct ServeSettings {
     instance_id: ServerScope,
     connection: NatsConnection,
@@ -445,6 +453,7 @@ async fn invoke_uncached_tool(
         .insert(request.call_id.clone(), cancel.clone());
     let mut args = std::mem::take(&mut request.args);
     add_parent_session_id_arg(&request.tool, request.parent_session_id.take(), &mut args);
+    let metric_tool = metric_tool_name(context.toolset.as_ref(), &request.tool);
     let start = Instant::now();
     let result = context
         .toolset
@@ -454,7 +463,7 @@ async fn invoke_uncached_tool(
     context.in_flight.lock().await.remove(&request.call_id);
     let elapsed = start.elapsed();
     let is_ok = result.is_ok();
-    harnx_metrics::record_tool_call(&request.tool, is_ok, elapsed);
+    harnx_metrics::record_tool_call(metric_tool, is_ok, elapsed);
     result
 }
 
@@ -774,12 +783,10 @@ where
 {
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
 
-    let mut args = std::env::args_os();
-    let metrics_addr = args
-        .find(|arg| arg == "--metrics-addr")
-        .and_then(|_| args.next())
-        .map(|addr| addr.to_string_lossy().into_owned())
-        .or_else(|| std::env::var("HARNX_METRICS_ADDR").ok());
+    let metrics_addr = harnx_metrics::metrics_addr_from_args(
+        std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()),
+    )
+    .or_else(|| std::env::var("HARNX_METRICS_ADDR").ok());
     harnx_metrics::init(&harnx_metrics::MetricsFlags { metrics_addr })?;
 
     let service_name = format!("harnx-{}-server", toolset.name());
@@ -889,12 +896,13 @@ impl McpToolsetAdapter {
     ) -> Result<CallToolResult, ErrorData> {
         let tool_name = request.name.clone();
         let args = Value::Object(request.arguments.unwrap_or_default());
+        let metric_tool = metric_tool_name(self.toolset.as_ref(), &tool_name);
         let started = Instant::now();
         let result = self
             .toolset
             .invoke(&tool_name, args, CancellationToken::new())
             .await;
-        harnx_metrics::record_tool_call(&tool_name, result.is_ok(), started.elapsed());
+        harnx_metrics::record_tool_call(metric_tool, result.is_ok(), started.elapsed());
 
         match result {
             Ok(value) => {
@@ -991,74 +999,147 @@ mod tests {
         assert!(!accepts_parent_session_id("agent_session_prompt"));
     }
 
-    #[test]
-    fn tool_call_metrics_recorded_on_success_and_error() {
-        harnx_core::require_nextest();
-        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-        use std::time::Duration;
+    struct MetricsTestToolset;
 
-        // DebuggingRecorder captures metric values in a local recorder scope.
+    #[async_trait::async_trait]
+    impl Toolset for MetricsTestToolset {
+        fn name(&self) -> &str {
+            "metrics-test"
+        }
+
+        fn tools(&self) -> Vec<harnx_toolset::ToolSpec> {
+            vec![harnx_toolset::ToolSpec {
+                name: "known".to_owned(),
+                description: "known test tool".to_owned(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                idempotent_hint: false,
+                read_only_hint: true,
+                timeout_secs: None,
+                meta: None,
+            }]
+        }
+
+        async fn invoke(
+            &self,
+            _tool: &str,
+            _args: Value,
+            _cancel: CancellationToken,
+        ) -> Result<Value, ToolInvokeError> {
+            unreachable!("metric label test does not invoke tools")
+        }
+    }
+
+    #[test]
+    fn distinct_unknown_tools_share_one_metric_series() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        harnx_core::require_nextest();
+        let toolset = MetricsTestToolset;
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
-            // Success case
-            harnx_metrics::record_tool_call("test_tool_ok", true, Duration::from_millis(100));
-            // Error case
-            harnx_metrics::record_tool_call("test_tool_err", false, Duration::from_millis(50));
+            for requested in ["attacker-tool-one", "attacker-tool-two"] {
+                harnx_metrics::record_tool_call(
+                    metric_tool_name(&toolset, requested),
+                    false,
+                    Duration::from_millis(1),
+                );
+            }
         });
 
-        let snapshot = snapshotter.snapshot();
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(snapshot.len(), 2, "unknown names must share both series");
+        assert!(snapshot.iter().all(|(key, _, _, _)| key
+            .key()
+            .labels()
+            .any(|label| label.key() == "tool" && label.value() == "unknown")));
+        assert!(snapshot.iter().any(|(key, _, _, value)| {
+            key.key().name() == harnx_metrics::TOOL_CALLS_TOTAL && *value == DebugValue::Counter(2)
+        }));
+        assert!(snapshot.iter().any(|(key, _, _, value)| {
+            key.key().name() == harnx_metrics::TOOL_CALL_DURATION_SECONDS
+                && matches!(value, DebugValue::Histogram(samples) if samples.len() == 2)
+        }));
+    }
 
-        // Iterate through metrics and validate counters and histograms
-        let mut ok_counter_found = false;
-        let mut err_counter_found = false;
-        let mut ok_hist_found = false;
-        let mut err_hist_found = false;
+    fn assert_success_and_error_tool_metric_snapshot() {
+        use metrics::{Key, Label};
+        use metrics_util::{
+            debugging::{DebugValue, DebuggingRecorder},
+            CompositeKey, MetricKind,
+        };
 
-        for (key, _unit, _desc, value) in snapshot.into_vec() {
-            let key_name = key.key().name();
-            let key_labels = key.key().labels();
-            match value {
-                DebugValue::Counter(c) if key_name == harnx_metrics::TOOL_CALLS_TOTAL => {
-                    let labels: Vec<_> = key_labels.collect();
-                    let tool_label = labels.iter().find(|l| l.key() == "tool");
-                    let status_label = labels.iter().find(|l| l.key() == "status");
-                    if let (Some(tool), Some(status)) = (tool_label, status_label) {
-                        if tool.value() == "test_tool_ok" && status.value() == "ok" {
-                            assert_eq!(c, 1, "ok counter incremented once");
-                            ok_counter_found = true;
-                        } else if tool.value() == "test_tool_err" && status.value() == "error" {
-                            assert_eq!(c, 1, "error counter incremented once");
-                            err_counter_found = true;
-                        }
-                    }
-                }
-                DebugValue::Histogram(samples)
-                    if key_name == harnx_metrics::TOOL_CALL_DURATION_SECONDS =>
-                {
-                    let labels: Vec<_> = key_labels.collect();
-                    let tool_label = labels.iter().find(|l| l.key() == "tool");
-                    if let Some(tool) = tool_label {
-                        // samples is Vec<OrderedFloat<f64>>
-                        // Just check that we have at least one sample to confirm recording happened
-                        assert!(
-                            !samples.is_empty(),
-                            "histogram should have recorded samples"
-                        );
-                        if tool.value() == "test_tool_ok" {
-                            ok_hist_found = true;
-                        } else if tool.value() == "test_tool_err" {
-                            err_hist_found = true;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let ok_elapsed = Duration::from_millis(100);
+        let error_elapsed = Duration::from_millis(50);
+        metrics::with_local_recorder(&recorder, || {
+            harnx_metrics::record_tool_call("test_tool_ok", true, ok_elapsed);
+            harnx_metrics::record_tool_call("test_tool_err", false, error_elapsed);
+        });
 
-        assert!(ok_counter_found, "ok counter should have been recorded");
-        assert!(err_counter_found, "error counter should have been recorded");
-        assert!(ok_hist_found, "ok histogram should have been recorded");
-        assert!(err_hist_found, "error histogram should have been recorded");
+        let key = |kind, name, labels: &[(&str, &str)]| {
+            CompositeKey::new(
+                kind,
+                Key::from_parts(
+                    name,
+                    labels
+                        .iter()
+                        .map(|(key, value)| Label::new((*key).to_owned(), (*value).to_owned()))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+        };
+        assert_eq!(
+            snapshotter.snapshot().into_vec(),
+            vec![
+                (
+                    key(
+                        MetricKind::Counter,
+                        harnx_metrics::TOOL_CALLS_TOTAL,
+                        &[("tool", "test_tool_ok"), ("status", "ok")],
+                    ),
+                    None,
+                    None,
+                    DebugValue::Counter(1),
+                ),
+                (
+                    key(
+                        MetricKind::Histogram,
+                        harnx_metrics::TOOL_CALL_DURATION_SECONDS,
+                        &[("tool", "test_tool_ok")],
+                    ),
+                    None,
+                    None,
+                    DebugValue::Histogram(vec![ok_elapsed.as_secs_f64().into()]),
+                ),
+                (
+                    key(
+                        MetricKind::Counter,
+                        harnx_metrics::TOOL_CALLS_TOTAL,
+                        &[("tool", "test_tool_err"), ("status", "error")],
+                    ),
+                    None,
+                    None,
+                    DebugValue::Counter(1),
+                ),
+                (
+                    key(
+                        MetricKind::Histogram,
+                        harnx_metrics::TOOL_CALL_DURATION_SECONDS,
+                        &[("tool", "test_tool_err")],
+                    ),
+                    None,
+                    None,
+                    DebugValue::Histogram(vec![error_elapsed.as_secs_f64().into()]),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_call_metrics_recorded_on_success_and_error() {
+        harnx_core::require_nextest();
+        assert_success_and_error_tool_metric_snapshot();
     }
 }

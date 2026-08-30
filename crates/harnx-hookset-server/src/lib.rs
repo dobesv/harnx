@@ -299,17 +299,8 @@ pub async fn publish_hook_registration(
 pub async fn run_hookset_main<H: Hook + 'static>(hook: H) -> Result<()> {
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
 
-    // Initialize metrics if configured via --metrics-addr flag or HARNX_METRICS_ADDR env.
-    // Scan args for --metrics-addr <value>; env takes precedence for consistency with crate style.
-    let metrics_addr = std::env::var("HARNX_METRICS_ADDR").ok().or_else(|| {
-        let mut args = std::env::args();
-        while let Some(arg) = args.next() {
-            if arg == "--metrics-addr" {
-                return args.next();
-            }
-        }
-        None
-    });
+    let metrics_addr = harnx_metrics::metrics_addr_from_args(std::env::args())
+        .or_else(|| std::env::var("HARNX_METRICS_ADDR").ok());
     let flags = harnx_metrics::MetricsFlags { metrics_addr };
     harnx_metrics::init(&flags)?;
 

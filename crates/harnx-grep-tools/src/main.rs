@@ -25,8 +25,12 @@ fn parse_args() -> anyhow::Result<bool> {
         match arg.as_str() {
             "--help" | "-h" => help = true,
             "--mcp-stdio" => {}
-            "--metrics-addr" => {
-                args.next();
+            arg if arg.starts_with("--metrics-addr") => {
+                // Skip --metrics-addr (both forms) so the strict parser doesn't reject it.
+                // The shared helper in run_toolset_main handles actual parsing.
+                if arg == "--metrics-addr" {
+                    args.next();
+                }
             }
             _ => anyhow::bail!("harnx-grep-tools: unknown argument: {arg}"),
         }
@@ -42,5 +46,8 @@ fn print_help() {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --mcp-stdio         Serve MCP over stdio instead of the default toolset mode");
+    eprintln!("  --metrics-addr <ADDR>   Serve Prometheus metrics at http://ADDR/metrics.");
+    eprintln!("                        Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
+    eprintln!("                        Also honors HARNX_METRICS_ADDR env.");
     eprintln!("  --help, -h          Show this help message");
 }

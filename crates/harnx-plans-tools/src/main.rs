@@ -102,7 +102,9 @@ fn print_help() {
     eprintln!("  --mcp-stdio                Serve MCP over stdio instead of native NATS mode");
     eprintln!("  --host <addr>              Bind address for HTTP mode (default: 0.0.0.0)");
     eprintln!("  --port <N>                 Bind port for HTTP mode (default: 3000)");
-    eprintln!("  --metrics-addr <addr>      Prometheus metrics endpoint address (env: HARNX_METRICS_ADDR)");
+    eprintln!("  --metrics-addr <ADDR>      Serve Prometheus metrics at http://ADDR/metrics.");
+    eprintln!("                             Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
+    eprintln!("                             Also honors HARNX_METRICS_ADDR env.");
     eprintln!("  --help, -h                 Show this help message");
     eprintln!();
     eprintln!("Env:");
@@ -117,7 +119,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut http = false;
     let mut host = None::<String>;
     let mut port = None::<u16>;
-    let mut metrics_addr: Option<String> = std::env::var("HARNX_METRICS_ADDR").ok();
+    let mut unknown_args: Vec<String> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -182,23 +184,27 @@ fn parse_args() -> anyhow::Result<Args> {
                     anyhow::bail!("harnx-plans-tools: --port requires a number argument");
                 }
             }
-            "--metrics-addr" => {
-                if i + 1 < args.len() {
-                    metrics_addr = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    anyhow::bail!("harnx-plans-tools: --metrics-addr requires an address argument");
-                }
-            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
             }
-            other => {
-                anyhow::bail!(
-                    "harnx-plans-tools: unknown argument: {other}\nTry: harnx-plans-tools --help"
-                );
+            unknown => {
+                unknown_args.push(unknown.to_string());
+                i += 1;
             }
+        }
+    }
+
+    // Use shared helper for metrics-addr (supports both --metrics-addr VAL and --metrics-addr=VAL)
+    let metrics_addr = harnx_metrics::metrics_addr_from_args(args.clone())
+        .or_else(|| std::env::var("HARNX_METRICS_ADDR").ok());
+
+    // Check for unrecognized arguments (excluding metrics-addr which was already consumed)
+    for arg in unknown_args {
+        if !arg.starts_with("--metrics-addr") {
+            anyhow::bail!(
+                "harnx-plans-tools: unknown argument: {arg}\nTry: harnx-plans-tools --help"
+            );
         }
     }
 

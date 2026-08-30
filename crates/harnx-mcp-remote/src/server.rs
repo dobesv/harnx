@@ -19,6 +19,12 @@ fn proxy_error(err: rmcp::service::ServiceError) -> ErrorData {
     ErrorData::internal_error(err.to_string(), None)
 }
 
+fn tool_call_succeeded(result: &Result<CallToolResult, ErrorData>) -> bool {
+    result
+        .as_ref()
+        .is_ok_and(|result| result.is_error != Some(true))
+}
+
 pub struct RemoteProxyServer {
     cli: Cli,
     peer: RwLock<Option<Peer<RoleClient>>>,
@@ -149,7 +155,12 @@ impl RemoteProxyServer {
         let tool_name = request.name.clone();
         let started = Instant::now();
         let result = peer.call_tool(request).await.map_err(proxy_error);
-        harnx_metrics::record_tool_call(&tool_name, result.is_ok(), started.elapsed());
+        // mcp-remote is stdio-only; without a cached list, labels follow the upstream tool namespace.
+        harnx_metrics::record_tool_call(
+            &tool_name,
+            tool_call_succeeded(&result),
+            started.elapsed(),
+        );
         result
     }
 }

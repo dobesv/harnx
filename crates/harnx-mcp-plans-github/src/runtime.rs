@@ -38,6 +38,13 @@ fn github_server_meta(default_repo: Option<RepoTarget>) -> ServerMeta {
 }
 
 pub async fn run(config: AppConfig) -> Result<()> {
+    // Initialize metrics recorder (idempotent)
+    if let Some(ref addr) = config.metrics_addr {
+        harnx_metrics::init(&harnx_metrics::MetricsFlags {
+            metrics_addr: Some(addr.clone()),
+        })?;
+    }
+
     let store = build_store(&config).await?;
 
     if config.http {
