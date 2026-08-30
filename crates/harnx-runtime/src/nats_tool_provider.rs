@@ -24,6 +24,7 @@ mod execution_context;
 use execution_context::extract_execution_context;
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REGISTRATION_LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const JSON_CONTENT_TYPE: &str = "application/json";
 
 #[derive(Clone, Debug)]
@@ -31,12 +32,13 @@ struct RegisteredTool {
     server: String,
     selector_server: String,
     raw_name: String,
-    request_timeout: Duration,
+    request_timeout: Option<Duration>,
 }
 
 struct PendingToolRequest {
     call_id: String,
     server: String,
+    registration_key: String,
     subject: String,
     request: async_nats::Request,
 }
@@ -124,6 +126,7 @@ pub struct NatsToolProvider {
     registrations: Vec<Registration>,
     active_package: Option<String>,
     declarations: Vec<ToolDeclaration>,
+    registry: Option<async_nats::jetstream::kv::Store>,
     // Owning this subscription establishes the progress/cancel channel before requests start.
     _control_subscription: Mutex<async_nats::Subscriber>,
     in_flight: NatsInFlightCalls,
@@ -142,9 +145,20 @@ impl NatsToolProvider {
         let control_subscription = client.subscribe(control_subject).await?;
         client.flush().await?;
 
-        let mut registrations = registration_snapshot(&client, &instance_id)
-            .await
-            .unwrap_or_else(|error| {
+        let jetstream = async_nats::jetstream::new(client.clone());
+        let (registry, mut registrations) = match open_registry_store(&jetstream).await {
+            Ok(Some(store)) => match registration_snapshot_in(&store, &instance_id).await {
+                Ok(registrations) => (Some(store), registrations),
+                Err(error) => {
+                    log::warn!(
+                        "tool registration discovery failed under scope '{}': {error:#}",
+                        instance_id.as_str()
+                    );
+                    (Some(store), Vec::new())
+                }
+            },
+            Ok(None) => (None, Vec::new()),
+            Err(error) => {
                 // Degrading to zero tools is intended when a scope has none
                 // registered; going silent about a KV scan that outright
                 // failed is not — it looked identical to "no tools configured"
@@ -153,8 +167,9 @@ impl NatsToolProvider {
                     "tool registration discovery failed under scope '{}': {error:#}",
                     instance_id.as_str()
                 );
-                Vec::new()
-            });
+                (None, Vec::new())
+            }
+        };
         registrations.sort_by_key(|registration| match registration.package.as_deref() {
             Some(package) if Some(package) == active_package => 0,
             None => usize::from(active_package.is_some()),
@@ -174,6 +189,7 @@ impl NatsToolProvider {
             registrations,
             active_package: active_package.map(str::to_string),
             declarations,
+            registry,
             _control_subscription: Mutex::new(control_subscription),
             in_flight,
         })
@@ -196,10 +212,7 @@ impl NatsToolProvider {
                 server: identity_token,
                 selector_server: registration.server.clone(),
                 raw_name,
-                request_timeout: spec
-                    .timeout_secs
-                    .map(Duration::from_secs)
-                    .unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+                request_timeout: request_timeout(spec.timeout_secs),
             });
         }
 
@@ -301,14 +314,40 @@ impl NatsToolProvider {
         Ok(PendingToolRequest {
             call_id,
             server: route.server.clone(),
+            registration_key: registration_key(&self.instance_id, &route.server),
             subject: self
                 .instance_id
                 .tool_subject(&route.server, &route.raw_name),
             request: async_nats::Request::new()
                 .headers(headers)
                 .payload(payload.into())
-                .timeout(Some(route.request_timeout)),
+                .timeout(route.request_timeout),
         })
+    }
+
+    async fn wait_for_registration_loss(&self, key: &str) -> String {
+        let Some(registry) = self.registry.as_ref() else {
+            std::future::pending::<()>().await;
+            unreachable!("a pending future cannot complete")
+        };
+        let mut checks = tokio::time::interval(REGISTRATION_LIVENESS_CHECK_INTERVAL);
+        checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            checks.tick().await;
+            match registry.get(key).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return format!(
+                        "tool server unavailable: registration '{key}' is no longer active"
+                    );
+                }
+                Err(error) => {
+                    // A registry read failure says nothing about server health.
+                    // The NATS request and later KV checks remain authoritative.
+                    log::debug!("tool registration liveness check failed for '{key}': {error:#}");
+                }
+            }
+        }
     }
 
     async fn await_response(
@@ -319,6 +358,7 @@ impl NatsToolProvider {
         let PendingToolRequest {
             call_id,
             server,
+            registration_key,
             subject,
             request,
         } = pending;
@@ -341,6 +381,10 @@ impl NatsToolProvider {
                     Ok(InFlightFailure::Unavailable(message)) => message,
                     Err(_) => "tool server unavailable".to_string(),
                 };
+                return Err(ToolError::Recoverable(anyhow!(message)));
+            }
+            message = self.wait_for_registration_loss(&registration_key) => {
+                self.in_flight.complete(&call_id).await;
                 return Err(ToolError::Recoverable(anyhow!(message)));
             }
             response = &mut request => response,
@@ -416,10 +460,7 @@ fn registered_tool(
         server: ServerIdentity::identity_token(registration),
         selector_server: registration.server.clone(),
         raw_name,
-        request_timeout: spec
-            .timeout_secs
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+        request_timeout: request_timeout(spec.timeout_secs),
     };
     let declaration = ToolDeclaration {
         name: name.clone(),
@@ -433,6 +474,14 @@ fn registered_tool(
         read_only_hint: Some(spec.read_only_hint),
     };
     Some((name, route, declaration))
+}
+
+fn request_timeout(timeout_secs: Option<u64>) -> Option<Duration> {
+    match timeout_secs {
+        Some(0) => None,
+        Some(seconds) => Some(Duration::from_secs(seconds)),
+        None => Some(DEFAULT_REQUEST_TIMEOUT),
+    }
 }
 fn build_registered_tools(
     active_package: Option<&str>,
@@ -571,6 +620,13 @@ async fn registration_snapshot(
     let Some(store) = open_registry_store(&jetstream).await? else {
         return Ok(Vec::new());
     };
+    registration_snapshot_in(&store, instance_id).await
+}
+
+async fn registration_snapshot_in(
+    store: &async_nats::jetstream::kv::Store,
+    instance_id: &ServerScope,
+) -> anyhow::Result<Vec<Registration>> {
     let mut keys = store.keys().await?;
     let prefix = format!("{instance_id}.");
     let mut registrations = Vec::new();
@@ -642,8 +698,8 @@ pub async fn describe_discovery(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_registered_tools, NatsInFlightCalls, NatsToolProvider, RegisteredTool,
-        DEFAULT_REQUEST_TIMEOUT,
+        build_registered_tools, request_timeout, NatsInFlightCalls, NatsToolProvider,
+        RegisteredTool, DEFAULT_REQUEST_TIMEOUT,
     };
     use harnx_core::instance::ServerScope;
     use harnx_toolset::{Registration, ToolSpec};
@@ -653,6 +709,7 @@ mod tests {
     use opentelemetry_sdk::trace::SdkTracerProvider;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::time::Duration;
     use tokio::sync::Mutex;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
     use tracing_subscriber::layer::SubscriberExt;
@@ -682,6 +739,7 @@ mod tests {
             registrations: Vec::new(),
             active_package: None,
             declarations: Vec::new(),
+            registry: None,
             _control_subscription: Mutex::new(control_subscription),
             in_flight: NatsInFlightCalls::default(),
         };
@@ -689,7 +747,7 @@ mod tests {
             server: "test-server".to_string(),
             selector_server: "test-server".to_string(),
             raw_name: "test-tool".to_string(),
-            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
         };
 
         global::set_text_map_propagator(TraceContextPropagator::new());
@@ -764,6 +822,15 @@ mod tests {
             Some("integer")
         );
         assert_eq!(tools["fs_read"].raw_name, "read");
+    }
+
+    #[test]
+    fn resolves_explicit_zero_as_no_transport_deadline() {
+        harnx_core::require_nextest();
+
+        assert_eq!(request_timeout(Some(0)), None);
+        assert_eq!(request_timeout(Some(7)), Some(Duration::from_secs(7)));
+        assert_eq!(request_timeout(None), Some(DEFAULT_REQUEST_TIMEOUT));
     }
 
     /// Native toolsets ship their display templates in `ToolSpec.meta`; if that

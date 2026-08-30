@@ -302,10 +302,10 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
     )
     .await;
 
-    // Give callers already waiting on a reply a chance to get one instead of
-    // blocking on their own 60s timeout: wait for in-flight requests to
-    // finish before deregistering, bounded so a stuck invocation can't stall
-    // shutdown forever.
+    // Give callers already waiting on a reply a chance to get one: wait for
+    // in-flight requests to finish before deregistering, bounded so a stuck
+    // invocation can't stall shutdown forever. Once the registration is
+    // removed, NATS providers fail any calls that are still waiting.
     drain::drain(active_requests_rx).await;
 
     // Best-effort: the TTL is the backstop when this cannot run.

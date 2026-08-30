@@ -136,6 +136,13 @@ fn spec<T: JsonSchema + 'static>(
 }
 ```
 
+`timeout_secs: None` preserves the NATS client's legacy default request
+backstop. Use a positive value for a tool-specific transport deadline. For a
+legitimately unbounded operation, call `ToolSpec::without_request_timeout()`;
+this serializes an explicit zero and makes the provider rely on caller
+cancellation and TTL-backed tool-registration liveness instead. Do not disable
+the deadline on a transport that cannot independently surface server loss.
+
 Don't skip the `call_template` argument. `ToolSpec.meta` is the only place a
 client reads `call_template`/`result_template` from, so a spec built with
 `meta: None` renders as a raw YAML dump of the arguments. The original fs, bash,

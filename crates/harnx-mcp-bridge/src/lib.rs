@@ -121,14 +121,20 @@ pub fn report_tools(bridge: &BridgeToolset) -> String {
         if !hints.is_empty() {
             out.push_str(&format!("    [{}]\n", hints.join(", ")));
         }
-        if let Some(seconds) = tool.timeout_secs {
-            out.push_str(&format!("    timeout: {seconds}s\n"));
-        }
+        append_timeout_report(&mut out, tool.timeout_secs);
     }
     if tools.is_empty() {
         out.push_str("\n  (the server completed its handshake but advertises no tools)\n");
     }
     out
+}
+
+fn append_timeout_report(out: &mut String, timeout_secs: Option<u64>) {
+    match timeout_secs {
+        Some(0) => out.push_str("    timeout: none\n"),
+        Some(seconds) => out.push_str(&format!("    timeout: {seconds}s\n")),
+        None => {}
+    }
 }
 
 /// Summarise the inherited settings that decide whether a wrapped server can
@@ -558,7 +564,7 @@ mod tests {
     // unused elsewhere and `-D warnings` rejects the import.
     #[cfg(unix)]
     use super::report_tools;
-    use super::{map_tool, prepare_call_tool_params, Args};
+    use super::{append_timeout_report, map_tool, prepare_call_tool_params, Args};
     use opentelemetry::global;
     use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
     use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -608,6 +614,17 @@ mod tests {
         let serving = Args::parse_from(["bridge", "--name", "exa", "--", "npx", "-y", "srv"]);
         assert!(!serving.list_tools);
         assert_eq!(serving.name.as_deref(), Some("exa"));
+    }
+
+    #[test]
+    fn timeout_report_distinguishes_disabled_explicit_and_default_timeouts() {
+        let mut report = String::new();
+
+        append_timeout_report(&mut report, Some(0));
+        append_timeout_report(&mut report, Some(45));
+        append_timeout_report(&mut report, None);
+
+        assert_eq!(report, "    timeout: none\n    timeout: 45s\n");
     }
 
     #[cfg(unix)]
