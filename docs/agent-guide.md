@@ -352,7 +352,12 @@ Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP
   any available worker. A frontend-owned local worker targets nested
   activations back to its own worker ID. Distributed `harnx_leases` still
   ensure exactly one active holder per session in either topology.
-- **Timeout protection**: Sub-agent tool calls run synchronously from the parent agent's perspective. Turn execution is bounded by idle and operation timeouts (`HARNX_SUBAGENT_IDLE_TIMEOUT_SECS` defaulting to 300s, `HARNX_SUBAGENT_OPERATION_TIMEOUT_SECS` defaulting to 3600s).
+- **Lease-backed liveness**: Sub-agent tool calls run synchronously from the
+  parent agent's perspective without an implicit idle or elapsed-time deadline.
+  The child worker renews its session lease independently of model and tool
+  activity; if that worker disappears without writing a durable result, the
+  waiting session detects the expired lease and returns an error. Parent aborts
+  and explicit `session_cancel` calls still cancel the child turn.
 
 ### Sub-Agent Tool Result Marker
 

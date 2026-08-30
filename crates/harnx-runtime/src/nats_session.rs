@@ -857,10 +857,8 @@ impl NatsSession {
         // case — it's the only explanation a user gets for a fallback.
         //
         // No waiting on the subscription: an earlier version of this spent up to
-        // 250ms hoping in-flight advisories would land, which delayed turn
-        // completion enough to trip the sub-agent idle-timeout watchdog
-        // (`subagent_idle_timeout_resets_on_child_activity` failed 5/5). Flushing
-        // what has already been received costs nothing and never delays a turn.
+        // 250ms hoping in-flight advisories would land. Flushing what has already
+        // been received costs nothing and never delays a completed turn.
         flush_pending_advisories(
             &mut pending_advisories,
             cached_effective.as_deref(),

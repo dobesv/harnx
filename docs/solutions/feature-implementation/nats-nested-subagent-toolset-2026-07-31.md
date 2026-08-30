@@ -1,20 +1,20 @@
 ---
-title: "NATS nested sub-agent toolset: ThinClientSession delegation and parent-stream event publishing"
+title: "NATS nested sub-agent toolset: NatsSession delegation and parent-stream event publishing"
 date: 2026-07-31
 category: "feature-implementation"
 problem_type: integration_issue
 component: "nats-worker, subagent_toolset"
-root_cause: "ACP stdio sub-agents replaced with NATS agent sessions; ThinClientSession for nesting, explicit parent-event publishing for detached toolset handlers"
+root_cause: "ACP stdio sub-agents replaced with NATS agent sessions; NatsSession for nesting, explicit parent-event publishing for detached toolset handlers"
 resolution_type: code_fix
 severity: high
 tags:
   - sub-agent
   - nats-worker
-  - ThinClientSession
+  - NatsSession
   - event-sink
   - handoff-vs-nesting
   - parent-session-publishing
-  - idle-timeout
+  - lease-liveness
 plan_ref: "nats-subagent-migration"
 ---
 
@@ -26,14 +26,15 @@ Sub-agents historically ran as ACP stdio child processes via `AcpManager`. The m
 
 - Previous ACP path used `AcpManager::call_tool` which captured and re-entered `current_agent_event_sink()` for event forwarding
 - Handoff (`_session_handoff`) finishes the parent turn and activates a detached target — it cannot return a nested result to the parent
-- `ThinClientSession::run_turn` had no built-in idle or operation timeout handling
+- Long-running child turns must distinguish silence from worker failure without
+  treating model or nested-tool inactivity as a health signal
 - Toolset-server handlers run detached from the parent turn task's task-local `SCOPED_SINK`
 
 ## Investigation Steps
 
 1. **Handoff vs. nesting decision**: The implementation at the time recursively mutated the source worker through `prepare_nats_handoff`; the current handoff architecture instead queues an independent target and finishes the source. Both models are wrong for nested sub-agents, which must keep the parent turn open and return the child's result.
 
-2. **ThinClientSession as the nesting primitive**: Confirmed `ThinClientSession::new` + `run_turn` provides a "initiate + await a nested NATS turn" abstraction without modifying the parent. The child turn routes through the WorkQueue (`SessionActivate` → `WORK_NOTIFY_<cluster>`) and executes on any eligible worker — no same-worker dependency.
+2. **NatsSession as the nesting primitive**: Confirmed `NatsSession::new` + `run_turn` provides a "initiate + await a nested NATS turn" abstraction without modifying the parent. The child turn routes through the WorkQueue (`SessionActivate` → `WORK_NOTIFY_<cluster>`) and executes on any eligible worker — no same-worker dependency.
 
 3. **Self-loop deadlock check**: Verified tool calls run via `join_all(...)` in `crates/harnx-engine/src/tool.rs` (not detached `tokio::spawn`), and execution dispatches through the WorkQueue. The in-process send and serve run on independent tokio tasks — deadlock-free.
 
@@ -41,13 +42,19 @@ Sub-agents historically ran as ACP stdio child processes via `AcpManager`. The m
 
 5. **Parent-session-id injection path**: Traced `NatsToolProvider` → `harnx_toolset_server::serve_with_client`. The toolset-server plumbing auto-injects `__harnx_parent_session_id` from `config.session` into the `InvocationRequest`. The handler deserializes it via `#[serde(rename = "__harnx_parent_session_id")]` in `NewSessionArgs` / `PromptArgs`.
 
-6. **Timeout implementation**: `ThinClientSession` lacks native timeouts. Built idle (300s) + operation (3600s) timeout wrapping around `run_turn` with env overrides (`HARNX_SUBAGENT_IDLE_TIMEOUT_SECS`, `HARNX_SUBAGENT_OPERATION_TIMEOUT_SECS`). `ActivitySink` resets idle deadline on every child `AgentEvent`.
+6. **Liveness implementation**: `NatsSession::run_turn` observes the child
+   session lease independently of advisory activity. A worker renews that
+   lease on a timer while it owns the session; after an observed lease expires
+   without a durable turn result, the orphan watchdog returns a worker-loss
+   error. The outer NATS tool request has no elapsed-time deadline, and the
+   provider also checks the tool server's TTL-backed registry entry while the
+   request is in flight.
 
 ## Root Cause
 
 Sub-agent delegation requires nested execution that preserves an active parent
 turn. Handoff finishes that turn and detaches the target — the wrong
-abstraction. `ThinClientSession` provides the correct nesting primitive. The
+abstraction. `NatsSession` provides the correct nesting primitive. The
 event-publishing path differs between in-engine tool calls (task-local sink
 inheritance) and worker toolset-server handlers (detached execution requiring
 explicit parent-session-id injection + direct publish to
@@ -55,9 +62,9 @@ explicit parent-session-id injection + direct publish to
 
 ## Solution
 
-### ThinClientSession for Nesting
+### NatsSession for Nesting
 
-`SubagentToolset::run_prompt` creates a `ThinClientSession`, optionally emits an early `SubAgentStarted` event, then awaits the child turn with timeout wrappers:
+`SubagentToolset::run_prompt` creates a `NatsSession`, optionally emits an early `SubAgentStarted` event, then awaits durable child completion or explicit cancellation:
 
 ```rust
 // crates/harnx-runtime/src/nats_worker/subagent_toolset.rs:131-195
@@ -67,13 +74,14 @@ async fn run_prompt(
     session_id: Option<String>,
     parent_session_id: Option<String>,
     cancel: CancellationToken,
-) -> Result<ThinClientTurnResult, ToolInvokeError> {
+) -> Result<NatsTurnResult, ToolInvokeError> {
     let session = self.create_session(session_id).await?;
     let child_session_id = session.session_id().to_string();
     if let Some(parent_session_id) = parent_session_id {
         self.emit_parent_subagent_started(&parent_session_id, &child_session_id).await?;
     }
-    // ActivitySink for idle reset, timeout loops, cancel propagation...
+    let run_turn = session.run_turn(message, Arc::new(NullSink), Some(cancel_rx));
+    // Select between durable completion and parent cancellation.
 }
 ```
 
@@ -169,7 +177,7 @@ Results carry a structured `sub_agent` marker reusing `AgentSource`:
 
 ```rust
 // crates/harnx-runtime/src/nats_worker/subagent_toolset.rs:303-315
-fn turn_result_value(&self, result: &ThinClientTurnResult) -> Result<Value, ToolInvokeError> {
+fn turn_result_value(&self, result: &NatsTurnResult) -> Result<Value, ToolInvokeError> {
     let response = require_response(result)?;
     let source = AgentSource {
         agent: self.agent.clone(),
@@ -184,41 +192,41 @@ fn turn_result_value(&self, result: &ThinClientTurnResult) -> Result<Value, Tool
 }
 ```
 
-### Timeout + Cancel Plumbing
+### Lease Liveness + Cancel Plumbing
 
-Built-in idle and operation timeouts with activity-based idle reset:
+The sub-agent adapter does not infer failure from silence and does not impose
+an elapsed-time cap. It waits for `NatsSession`, whose worker lease watchdog
+distinguishes an active worker from one that vanished, while retaining explicit
+parent cancellation:
 
 ```rust
 // crates/harnx-runtime/src/nats_worker/subagent_toolset.rs:154-194
-loop {
-    tokio::select! {
-        result = &mut run_turn => { /* return result */ }
-        _ = cancel.cancelled() => {
-            let _ = cancel_tx.send(()).await;
-            return Err(ToolInvokeError::Fatal("sub-agent tool call aborted".into()));
-        }
-        _ = &mut operation_timeout => {
-            self.cancel_child(&child_session_id).await;
-            return Err(ToolInvokeError::Recoverable("timed out (operation)".into()));
-        }
-        _ = &mut idle_timeout => {
-            self.cancel_child(&child_session_id).await;
-            return Err(ToolInvokeError::Recoverable("timed out (idle)".into()));
-        }
-        activity = activity_rx.changed() => {
-            if activity.is_ok() {
-                idle_timeout.as_mut().reset(tokio::time::Instant::now() + self.timeouts.idle);
-            }
-        }
+tokio::select! {
+    result = &mut run_turn => { /* return durable result */ }
+    _ = cancel.cancelled() => {
+        let _ = cancel_tx.send(()).await;
+        let _ = (&mut run_turn).await;
+        Err(ToolInvokeError::Fatal("sub-agent tool call aborted".into()))
     }
 }
 ```
 
-`ActivitySink` resets on every child event, avoiding the false-negative idle-timeout-during-active-turn bug from prior ACP implementation.
+The `session_new` and `session_prompt` registrations advertise an explicit zero
+request timeout, which means the NATS provider disables its elapsed-time
+deadline. While waiting, the provider checks the server's TTL-backed KV
+registration. Registry-read errors are treated as unknown health rather than a
+death signal; a confirmed missing registration returns a recoverable
+"tool server unavailable" error.
+
+The child session has the more specific worker-health signal. Once
+`NatsSession` has observed a session lease, repeated confirmed absence without
+a durable assistant or error barrier ends the turn as orphaned. Lease renewal
+runs independently of model output and nested tool results, so a quiet but
+healthy worker remains active.
 
 ## Why This Works
 
-1. **ThinClientSession preserves parent**: Unlike handoff, `ThinClientSession::run_turn` runs a child turn without touching the parent agent's session state. The parent remains leased and alive.
+1. **NatsSession preserves parent**: Unlike handoff, `NatsSession::run_turn` runs a child turn without touching the parent agent's session state. The parent remains leased and alive.
 
 2. **Worker-agnostic dispatch**: The child turn publishes `SessionActivate` to the WorkQueue, any worker claims the lease and executes — no same-process constraint.
 
@@ -226,16 +234,19 @@ loop {
 
 4. **Additive event + marker reuse**: `TurnEvent::SubAgentStarted` is one new enum variant. Result marker reuses `AgentSource`. No new session-log types, no new subjects — UIs attach to existing `sessions.{id}.events`.
 
-5. **Activity-aware timeouts**: `ActivitySink` watching child events resets idle deadline, correctly detecting inactivity without false positives during active child turns.
+5. **Health-aware waiting**: Session leases and tool registry TTLs identify
+   vanished workers and servers without equating a quiet model or tool call
+   with failure.
 
 ## Prevention Strategies
 
 ### Code Review Checklist
 
-- [ ] Does nested agent delegation use `ThinClientSession`, not `_session_handoff`?
+- [ ] Does nested agent delegation use `NatsSession`, not `_session_handoff`?
 - [ ] For detached toolset handlers, does parent-event publishing use explicit `events_subject(parent_id)` rather than `current_agent_event_sink()`?
 - [ ] Is `__harnx_parent_session_id` auto-injected for tools that need parent context?
-- [ ] Are idle/operation timeouts wrapped around `run_turn` with activity-based reset?
+- [ ] Do long-running prompt tools disable elapsed-time request deadlines only
+      when lease or registry liveness can surface worker/server loss?
 - [ ] Does parent-abort cancellation propagate to child via `CancellationToken` → `cancel_rx` → `ControlCommand::Cancel`?
 
 ### Test Patterns
@@ -252,13 +263,15 @@ let result = prompt_call.await?;
 
 ### Architectural Rules
 
-1. **Handoff detaches the target**: `_session_handoff` durably queues an independent target session and finishes the source turn. `ThinClientSession` is the nesting primitive when the parent must await and consume a child result.
+1. **Handoff detaches the target**: `_session_handoff` durably queues an independent target session and finishes the source turn. `NatsSession` is the nesting primitive when the parent must await and consume a child result.
 
 2. **In-engine vs toolset-server event path**: In-engine tool calls inherit `SCOPED_SINK`. Toolset-server handlers are detached — use explicit publish with auto-injected `__harnx_parent_session_id`.
 
 3. **Worker-agnostic composition**: Child session activation + WorkQueue dispatch ensures any eligible worker can run the sub-agent turn.
 
-4. **Idle timeout must be activity-aware**: Static timeouts produce false negatives when the child is active but slow. `ActivitySink` resets on child events.
+4. **Silence is not a health signal**: Session workers renew leases on an
+   independent timer. Use lease expiration and durable turn barriers to detect
+   worker loss; do not infer it from the cadence of model or tool events.
 
 ## Known Follow-ups
 
@@ -270,5 +283,5 @@ let result = prompt_call.await?;
 
 - **GitHub:** [Issue #1224](https://github.com/dobesv/harnx/issues/1224)
 - **Handoff architecture:** [feature-implementation/agent-handoff-architecture-2026-07-19.md](./agent-handoff-architecture-2026-07-19.md) — return-vs-continue pattern, session-id mapping
-- **Idle timeout bug:** [async-patterns/acp-idle-timeout-false-negative-2026-06-18.md](../async-patterns/acp-idle-timeout-false-negative-2026-06-18.md) — prior timeout handling patterns
+- **Prior idle-timeout bug:** [async-patterns/acp-idle-timeout-false-negative-2026-06-18.md](../async-patterns/acp-idle-timeout-false-negative-2026-06-18.md) — historical example of why activity cadence is not a health signal
 - **Scoped subscriptions:** [logic-errors/scoped-subscription-parallel-subagents-2026-05-01.md](../logic-errors/scoped-subscription-parallel-subagents-2026-05-01.md) — parallel sub-agent event streams

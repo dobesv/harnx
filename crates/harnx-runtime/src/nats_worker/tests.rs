@@ -616,14 +616,11 @@ fn echoing_call_fn(captured: Arc<AsyncMutex<Vec<String>>>) -> crate::agent_loop:
     })
 }
 
-async fn test_subagent_toolset(
-    url: &str,
-    timeouts: super::subagent_toolset::SubagentTimeouts,
-) -> Arc<super::subagent_toolset::SubagentToolset> {
+async fn test_subagent_toolset(url: &str) -> Arc<super::subagent_toolset::SubagentToolset> {
     let client = async_nats::connect(url)
         .await
         .expect("connect sub-agent toolset to test nats");
-    Arc::new(super::subagent_toolset::SubagentToolset::with_timeouts(
+    Arc::new(super::subagent_toolset::SubagentToolset::new(
         "metis",
         super::subagent_toolset::SubagentSessionRoute::new(
             "local",
@@ -631,7 +628,6 @@ async fn test_subagent_toolset(
         ),
         client.clone(),
         async_nats::jetstream::new(client),
-        timeouts,
     ))
 }
 
@@ -1021,14 +1017,7 @@ async fn subagent_new_and_prompt_results_include_agent_source_marker() {
     let seeded = seed_remote_config(&url);
     let _env = subagent_test_env(&url, &seeded);
     let daemon = spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("marker response"));
-    let toolset = test_subagent_toolset(
-        &url,
-        super::subagent_toolset::SubagentTimeouts::new(
-            Duration::from_secs(2),
-            Duration::from_secs(10),
-        ),
-    )
-    .await;
+    let toolset = test_subagent_toolset(&url).await;
 
     let created = toolset
         .invoke("session_new", json!({}), CancellationToken::new())
@@ -1127,14 +1116,7 @@ async fn subagent_new_prompt_reuse_and_load_share_one_session_log() {
     let _env = subagent_test_env(&url, &seeded);
     let captured = Arc::new(AsyncMutex::new(Vec::new()));
     let daemon = spawn_metis_worker_with_call_fn(&url, echoing_call_fn(Arc::clone(&captured)));
-    let toolset = test_subagent_toolset(
-        &url,
-        super::subagent_toolset::SubagentTimeouts::new(
-            Duration::from_secs(2),
-            Duration::from_secs(10),
-        ),
-    )
-    .await;
+    let toolset = test_subagent_toolset(&url).await;
 
     let created = toolset
         .invoke("session_new", json!({}), CancellationToken::new())
@@ -1240,14 +1222,7 @@ async fn run_subagent_cancel_case(parent_abort: bool) {
         })
     });
     let daemon = spawn_metis_worker_with_call_fn(&url, call_fn);
-    let toolset = test_subagent_toolset(
-        &url,
-        super::subagent_toolset::SubagentTimeouts::new(
-            Duration::from_secs(5),
-            Duration::from_secs(10),
-        ),
-    )
-    .await;
+    let toolset = test_subagent_toolset(&url).await;
     let session_id = crate::nats_worker::new_remote_session_id();
     let parent_cancel = CancellationToken::new();
     let prompt = tokio::spawn({
@@ -1319,136 +1294,32 @@ async fn run_subagent_cancel_case(parent_abort: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subagent_operation_timeout_returns_error_and_cancels_child() {
+async fn subagent_silent_turn_waits_for_lease_backed_completion() {
     let _env_guard = env_lock().await;
     let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
         return;
     };
     let seeded = seed_remote_config(&url);
     let _env = subagent_test_env(&url, &seeded);
-    let call_fn = slow_prompt_call_fn("too late", Duration::from_secs(30));
-    let daemon = spawn_metis_worker_with_call_fn(&url, call_fn);
-    let toolset = test_subagent_toolset(
-        &url,
-        super::subagent_toolset::SubagentTimeouts::new(
-            Duration::from_secs(5),
-            Duration::from_millis(150),
+    // A model or nested tool can legitimately stay silent while the worker's
+    // session lease continues to renew. Silence must not be interpreted as
+    // failure; NatsSession's lease watchdog handles actual worker loss.
+    let call_fn = slow_prompt_call_fn("silent child completed", Duration::from_millis(1200));
+    let daemon = spawn_metis_worker_with_fast_renew(&url, call_fn);
+    let toolset = test_subagent_toolset(&url).await;
+    let session_id = crate::nats_worker::new_remote_session_id();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        toolset.invoke(
+            "session_prompt",
+            json!({ "message": "wait silently", "session_id": session_id }),
+            CancellationToken::new(),
         ),
     )
-    .await;
-    let session_id = crate::nats_worker::new_remote_session_id();
-    let error = toolset
-        .invoke(
-            "session_prompt",
-            json!({ "message": "time out", "session_id": session_id }),
-            CancellationToken::new(),
-        )
-        .await
-        .expect_err("operation timeout must return an error");
-    assert!(error.to_string().contains("overall timeout"));
-    let log = NatsSessionLog::new(
-        seeded
-            .parent_config
-            .nats_jetstream("local")
-            .await
-            .expect("timeout log jetstream"),
-        session_id,
-    );
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let entries = log.load_events_async().await.expect("load timeout entries");
-            if entries
-                .iter()
-                .any(|(_, entry)| matches!(entry, SessionLogEntry::Cancel { .. }))
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
     .await
-    .expect("operation timeout did not cancel child");
-
-    daemon.abort();
-    let _ = daemon.await;
-    let _ = nats.kill();
-    let _ = nats.wait();
-}
-
-async fn spawn_child_activity_heartbeat(
-    url: &str,
-    session_id: &str,
-) -> (CancellationToken, tokio::task::JoinHandle<()>) {
-    let client = async_nats::connect(url)
-        .await
-        .expect("connect activity publisher");
-    let subject = crate::nats_event_sink::events_subject(session_id);
-    let payload = crate::nats_event_sink::AdvisoryEnvelope::new(
-        u64::MAX,
-        AgentEvent::Turn(harnx_core::event::TurnEvent::Started),
-    )
-    .to_bytes()
-    .expect("encode activity");
-    let stop = CancellationToken::new();
-    let task_stop = stop.clone();
-    let task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                () = task_stop.cancelled() => break,
-                () = tokio::time::sleep(Duration::from_millis(40)) => {}
-            }
-            client
-                .publish(subject.clone(), payload.clone().into())
-                .await
-                .expect("publish child activity");
-            client.flush().await.expect("flush child activity");
-        }
-    });
-    (stop, task)
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subagent_idle_timeout_resets_on_child_activity() {
-    let _env_guard = env_lock().await;
-    let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
-        return;
-    };
-    let seeded = seed_remote_config(&url);
-    let _env = subagent_test_env(&url, &seeded);
-    let call_fn: crate::agent_loop::AgentCallFn = Arc::new(move |_input, _config, _abort| {
-        Box::pin(async move {
-            tokio::time::sleep(Duration::from_millis(225)).await;
-            Ok((
-                "active child completed".to_string(),
-                None,
-                vec![],
-                crate::client::CompletionTokenUsage::default(),
-            ))
-        })
-    });
-    let daemon = spawn_metis_worker_with_call_fn(&url, call_fn);
-    let toolset = test_subagent_toolset(
-        &url,
-        super::subagent_toolset::SubagentTimeouts::new(
-            Duration::from_millis(75),
-            Duration::from_secs(10),
-        ),
-    )
-    .await;
-    let session_id = crate::nats_worker::new_remote_session_id();
-    let (activity_stop, activity_publisher) =
-        spawn_child_activity_heartbeat(&url, &session_id).await;
-    let result = toolset
-        .invoke(
-            "session_prompt",
-            json!({ "message": "stay active", "session_id": session_id }),
-            CancellationToken::new(),
-        )
-        .await;
-    activity_stop.cancel();
-    activity_publisher.await.expect("join activity publisher");
-    let result = result.expect("activity must keep idle timeout from false-firing");
-    assert_eq!(result["response"], "active child completed");
+    .expect("leased child turn did not finish")
+    .expect("silent leased child turn must not be timed out");
+    assert_eq!(result["response"], "silent child completed");
 
     daemon.abort();
     let _ = daemon.await;

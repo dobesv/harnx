@@ -35,7 +35,9 @@ pub struct ToolSpec {
     pub idempotent_hint: bool,
     pub read_only_hint: bool,
     /// Request/reply timeout advertised to transport clients, in seconds.
-    /// Missing values use the client's default backstop for older registrations.
+    /// Missing values use the client's default backstop for older registrations;
+    /// zero disables the elapsed-time deadline so clients rely on cancellation
+    /// and server-liveness detection instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     /// Tool `_meta` as in-house JSON, including optional display templates.
@@ -69,6 +71,16 @@ impl TemplateKey {
 }
 
 impl ToolSpec {
+    /// Disable the transport's elapsed-time request deadline for this tool.
+    ///
+    /// Long-running tools should use this only when their transport can detect
+    /// server loss independently, so a vanished server does not strand callers.
+    #[must_use]
+    pub fn without_request_timeout(mut self) -> Self {
+        self.timeout_secs = Some(0);
+        self
+    }
+
     /// Attach the template the client uses to render the tool call header.
     #[must_use]
     pub fn with_call_template(self, template: &str) -> Self {
@@ -283,6 +295,17 @@ mod tests {
         assert_eq!(
             meta["result_template"],
             json!("{{ result.content[0].text }}")
+        );
+    }
+
+    #[test]
+    fn zero_timeout_explicitly_disables_the_request_deadline() {
+        let spec = tool_spec().without_request_timeout();
+
+        assert_eq!(spec.timeout_secs, Some(0));
+        assert_eq!(
+            serde_json::to_value(spec).expect("encode tool spec")["timeout_secs"],
+            json!(0)
         );
     }
 

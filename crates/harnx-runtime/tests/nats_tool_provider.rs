@@ -1,7 +1,7 @@
 #[allow(dead_code)]
 mod common;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use harnx_core::abort::create_abort_signal;
 use harnx_core::execution_context::{
@@ -450,6 +450,48 @@ async fn assert_abort_and_supervisor_failure(provider: &NatsToolProvider) -> Res
     Ok(())
 }
 
+async fn assert_registry_loss_ends_unbounded_call(
+    provider: &NatsToolProvider,
+    client: &async_nats::Client,
+    instance_id: &ServerScope,
+) -> Result<()> {
+    let key = registration_key(instance_id, "____time");
+    let registry = async_nats::jetstream::new(client.clone())
+        .get_key_value(TOOL_REGISTRY_BUCKET)
+        .await?;
+    let abort = create_abort_signal();
+    let started = Instant::now();
+    let (result, delete_result) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            provider.call_tool("wait", json!({ "seconds": 30.0 }), &abort),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                registry.delete(&key).await
+            }
+        )
+    })
+    .await
+    .context("unbounded call did not notice its tool registration disappeared")?;
+    delete_result?;
+
+    match result {
+        Err(ToolError::Recoverable(error)) => {
+            let message = error.to_string();
+            assert!(message.contains("tool server unavailable"), "{message}");
+            assert!(message.contains(&key), "{message}");
+        }
+        Err(ToolError::Fatal(error)) => {
+            anyhow::bail!("registration loss returned a fatal error: {error:#}")
+        }
+        Ok(value) => anyhow::bail!("call survived registration loss unexpectedly: {value}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "registration-loss detection took too long"
+    );
+    Ok(())
+}
+
 async fn assert_server_unavailable(
     provider: &NatsToolProvider,
     server_task: tokio::task::JoinHandle<Result<()>>,
@@ -525,6 +567,17 @@ async fn nats_tool_provider_end_to_end_declarations_cancel_and_precedence() -> R
 
     assert_context_declarations_and_precedence(&instance_id).await;
     assert_abort_and_supervisor_failure(&provider).await?;
+
+    set_wait_timeout(&client, &instance_id, 0).await?;
+    let unbounded_provider = NatsToolProvider::discover(
+        &Config::default(),
+        instance_id.clone(),
+        NatsInFlightCalls::for_instance(&instance_id),
+        None,
+    )
+    .await?;
+    assert_registry_loss_ends_unbounded_call(&unbounded_provider, &client, &instance_id).await?;
+
     let result = assert_server_unavailable(&provider, server_task).await;
     context_task.abort();
     let _ = context_task.await;
