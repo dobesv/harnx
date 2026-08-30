@@ -261,8 +261,15 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
         event_sink,
     })
     .await;
-    drop(hook_supervisor);
+    shutdown_agent_hooks(hook_supervisor).await;
     attachment_sync.finish(result).await
+}
+
+/// Shut down activation-scoped hooks on both successful and failed turns.
+async fn shutdown_agent_hooks(mut supervisor: Option<HookServerSupervisor>) {
+    if let Some(supervisor) = supervisor.as_mut() {
+        supervisor.shutdown().await;
+    }
 }
 
 struct PrepareAgentSessionParams<'a> {

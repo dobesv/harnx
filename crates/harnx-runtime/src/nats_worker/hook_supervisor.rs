@@ -156,9 +156,15 @@ impl HookServerSupervisor {
     }
 
     /// Stop all children and remove their registry entries before returning.
+    ///
+    /// Waiting for the aborted monitors before cleanup prevents them from
+    /// observing a deliberate child exit and republishing a fail-closed route.
     pub async fn shutdown(&mut self) {
         for task in &self.tasks {
             task.abort();
+        }
+        for task in std::mem::take(&mut self.tasks) {
+            let _ = task.await;
         }
         for server in std::mem::take(&mut self.registrations) {
             remove_registration_and_expectation(&self.client, &self.instance_id, &server).await;
