@@ -388,8 +388,11 @@ Client interfaces can attach to a child session's stream to render activity
 live. The TUI does this automatically: it inserts a compact selectable child
 row, monitors the child independently, and opens its full transcript when the
 row receives focus. Nested rows can be used to drill into grandchildren. Press
-`Esc` to return one level. Automatic Web monitoring and inline child output are
-not currently provided.
+`Esc` to return one level. The Web UI inserts a compact child-session row under
+the parent assistant message, updates it when the parent receives the durable
+tool result, and restores completed rows from session history. Select a row to
+open the child session; browser Back returns to the parent. Child output remains
+in the child transcript rather than being rendered inline in the parent.
 
 To allow interfaces to attach before the sub-agent prompt completes, an early advisory event is emitted on the parent session's stream (`sessions.{parent_session_id}.events`) immediately when delegation begins:
 

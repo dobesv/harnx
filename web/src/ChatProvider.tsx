@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useReducer, useState } from 'react';
 import { AssistantRuntimeProvider } from '@assistant-ui/react';
 import type { AttachmentAdapter } from '@assistant-ui/react';
 import { useAgUiRuntime } from '@assistant-ui/react-ag-ui';
@@ -9,12 +9,15 @@ import { UsageContext, type UsageData } from './UsageContext';
 import { uploadAttachment } from './api';
 import { RuntimeSessionSubscriber } from './RuntimeSessionSubscriber';
 import { handleHarnxCustomEvent } from './harnxCustomEvents';
+import { SubAgentNotesContext } from './SubAgentNotesContext';
+import { INITIAL_SUB_AGENT_NOTES_STATE, reduceSubAgentNotes } from './subAgentNotes';
 
 export interface ChatProviderProps {
   agentName: string;
   sessionId: string;
   isFreshSession: boolean;
   onHandoff?: (agent: string, sessionId: string) => void;
+  onOpenSubAgent: (agent: string, sessionId: string) => void;
   children: React.ReactNode;
 }
 
@@ -87,6 +90,7 @@ export interface HarnxHttpAgentOptions {
   onUsage: (usage: UsageData) => void;
   onToolSummary: (id: string, summary: string) => void;
   onHandoff?: (agent: string, sessionId: string) => void;
+  onSubAgentEvent: (event: unknown) => void;
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
@@ -96,6 +100,7 @@ export class HarnxHttpAgent extends HttpAgent {
   private readonly onUsageCb: (usage: UsageData) => void;
   private readonly onToolSummaryCb: (id: string, summary: string) => void;
   private readonly onHandoff?: (agent: string, sessionId: string) => void;
+  private readonly onSubAgentEvent: (event: unknown) => void;
   private isRunActive = false;
 
   constructor(options: HarnxHttpAgentOptions) {
@@ -105,6 +110,7 @@ export class HarnxHttpAgent extends HttpAgent {
     this.onUsageCb = options.onUsage;
     this.onToolSummaryCb = options.onToolSummary;
     this.onHandoff = options.onHandoff;
+    this.onSubAgentEvent = options.onSubAgentEvent;
   }
 
   private handleCustomEvent(name: string, value: unknown) {
@@ -118,30 +124,52 @@ export class HarnxHttpAgent extends HttpAgent {
     });
   }
 
-  override async runAgent(params: any, subscriber?: AgentSubscriber) {
-    const wrappedSubscriber: AgentSubscriber = {
+  private handleAgentEvent(event: any) {
+    this.onSubAgentEvent(event);
+    switch (event?.type) {
+      case 'RUN_STARTED':
+        this.isRunActive = true;
+        break;
+      case 'RUN_FINISHED':
+      case 'RUN_ERROR':
+        this.isRunActive = false;
+        break;
+      case 'CUSTOM':
+        this.handleCustomEvent(event.name, event.value);
+        break;
+    }
+  }
+
+  private handleCustomSubscriberEvent(event: any) {
+    this.onSubAgentEvent({ type: 'CUSTOM', name: event?.name, value: event?.value });
+    this.handleCustomEvent(event?.name, event?.value);
+  }
+
+  private handleRunFailure(message: string) {
+    this.onSubAgentEvent({ type: 'RUN_ERROR' });
+    this.onRunFailedCb(message || 'Failed to send message');
+  }
+
+  private wrapSubscriber(subscriber?: AgentSubscriber): AgentSubscriber {
+    return {
       ...subscriber,
       onEvent: async (payload) => {
-        const event = payload.event as any;
-        if (event?.type === 'RUN_STARTED') {
-          this.isRunActive = true;
-        } else if (event?.type === 'RUN_FINISHED' || event?.type === 'RUN_ERROR') {
-          this.isRunActive = false;
-        } else if (event?.type === 'CUSTOM') {
-          this.handleCustomEvent(event.name, event.value);
-        }
+        this.handleAgentEvent(payload.event);
         return subscriber?.onEvent?.(payload as any);
       },
       onCustomEvent: async (payload) => {
-        const event = payload.event as any;
-        this.handleCustomEvent(event?.name, event?.value);
+        this.handleCustomSubscriberEvent(payload.event);
         return subscriber?.onCustomEvent?.(payload as any);
       },
       onRunFailed: async (payload) => {
-        this.onRunFailedCb(payload.error.message || 'Failed to send message');
+        this.handleRunFailure(payload.error.message);
         return subscriber?.onRunFailed?.(payload as any);
       },
     };
+  }
+
+  override async runAgent(params: any, subscriber?: AgentSubscriber) {
+    const wrappedSubscriber = this.wrapSubscriber(subscriber);
 
     const nextParams = {
       ...params,
@@ -152,17 +180,28 @@ export class HarnxHttpAgent extends HttpAgent {
     try {
       return await super.runAgent(nextParams, wrappedSubscriber);
     } catch (err: any) {
-      this.onRunFailedCb(err.message || 'Failed to send message');
+      this.handleRunFailure(err.message);
       throw err;
     }
   }
 }
 
-export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId, isFreshSession, onHandoff, children }) => {
+export const ChatProvider: React.FC<ChatProviderProps> = ({
+  agentName,
+  sessionId,
+  isFreshSession,
+  onHandoff,
+  onOpenSubAgent,
+  children,
+}) => {
   const [statusText, setStatusText] = useState<string | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [usage, setUsage] = useState<UsageData | null>(null);
   const [toolSummaries, setToolSummaries] = useState<Map<string, string>>(new Map());
+  const [subAgentState, dispatchSubAgentEvent] = useReducer(
+    reduceSubAgentNotes,
+    INITIAL_SUB_AGENT_NOTES_STATE,
+  );
 
   const attachments: AttachmentAdapter = useMemo(() => ({
     accept: 'image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain',
@@ -221,6 +260,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId
       }
     },
     onHandoff,
+    onSubAgentEvent: dispatchSubAgentEvent,
   }), [agentName, sessionId, onHandoff]);
 
   const runtime = useAgUiRuntime({
@@ -233,19 +273,27 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId
   useEffect(() => {
     setStatusText(null);
     setErrorText(null);
+    dispatchSubAgentEvent({ type: 'RESET' });
   }, [agentName, sessionId]);
 
+  const subAgentContext = useMemo(() => ({
+    notes: subAgentState.notes,
+    openSession: onOpenSubAgent,
+  }), [onOpenSubAgent, subAgentState.notes]);
+
   return (
-    <PendingContext.Provider value={{ statusText, setStatusText, errorText, setErrorText }}>
-      <UsageContext.Provider value={{ usage, toolSummaries }}>
-        <AssistantRuntimeProvider key={`${agentName}:${sessionId}`} runtime={runtime}>
-          <RuntimeSessionSubscriber
-            enabled={!isFreshSession}
-            eventsUrl={`/v1/agents/${encodeURIComponent(agentName)}/sessions/${encodeURIComponent(sessionId)}/events`}
-          />
-          {children}
-        </AssistantRuntimeProvider>
-      </UsageContext.Provider>
-    </PendingContext.Provider>
+    <SubAgentNotesContext.Provider value={subAgentContext}>
+      <PendingContext.Provider value={{ statusText, setStatusText, errorText, setErrorText }}>
+        <UsageContext.Provider value={{ usage, toolSummaries }}>
+          <AssistantRuntimeProvider key={`${agentName}:${sessionId}`} runtime={runtime}>
+            <RuntimeSessionSubscriber
+              enabled={!isFreshSession}
+              eventsUrl={`/v1/agents/${encodeURIComponent(agentName)}/sessions/${encodeURIComponent(sessionId)}/events`}
+            />
+            {children}
+          </AssistantRuntimeProvider>
+        </UsageContext.Provider>
+      </PendingContext.Provider>
+    </SubAgentNotesContext.Provider>
   );
 };

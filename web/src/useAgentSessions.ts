@@ -1,35 +1,33 @@
 import { useState, useEffect, useCallback } from 'react';
+import type { Dispatch, SetStateAction } from 'react';
 import { listAgents } from './api';
 import type { Agent } from './types';
 import { setDocumentTitle } from './sessionTitle';
 import { useSessionDiscovery } from './useSessionDiscovery';
 
-export function useAgentSessions() {
-  const getInitialState = () => {
-    if (typeof window === 'undefined') return { agent: '', session: '' };
-    const path = window.location.pathname;
-    const sessionMatch = path.match(/^\/agents\/([^/]+)\/sessions\/([^/]+)/);
-    const agentMatch = path.match(/^\/agents\/([^/]+)$/);
-    if (sessionMatch) {
-      return { agent: decodeURIComponent(sessionMatch[1]), session: decodeURIComponent(sessionMatch[2]) };
-    } else if (agentMatch) {
-      return { agent: decodeURIComponent(agentMatch[1]), session: '' };
-    }
-    return { agent: '', session: '' };
-  };
+function selectionFromLocation() {
+  if (typeof window === 'undefined') return { agent: '', session: '' };
+  const path = window.location.pathname;
+  const sessionMatch = path.match(/^\/agents\/([^/]+)\/sessions\/([^/]+)/);
+  const agentMatch = path.match(/^\/agents\/([^/]+)$/);
+  if (sessionMatch) {
+    return {
+      agent: decodeURIComponent(sessionMatch[1]),
+      session: decodeURIComponent(sessionMatch[2]),
+    };
+  }
+  if (agentMatch) {
+    return { agent: decodeURIComponent(agentMatch[1]), session: '' };
+  }
+  return { agent: '', session: '' };
+}
 
-  const initial = getInitialState();
-
-  const [agents, setAgents] = useState<Agent[]>([]);
-  const [agentsError, setAgentsError] = useState<string | null>(null);
-  const [selectedAgent, setSelectedAgent] = useState<string>(initial.agent);
-  const [selectedSessionId, setSelectedSessionId] = useState<string>(initial.session);
-  const discovery = useSessionDiscovery({
-    selectedAgent,
-    selectedSessionId,
-    setSelectedSessionId,
-  });
-
+function useRouteSynchronization(
+  selectedAgent: string,
+  selectedSessionId: string,
+  setSelectedAgent: Dispatch<SetStateAction<string>>,
+  setSelectedSessionId: Dispatch<SetStateAction<string>>,
+) {
   useEffect(() => {
     let newPath = '/';
     if (selectedAgent && selectedSessionId) {
@@ -46,13 +44,34 @@ export function useAgentSessions() {
 
   useEffect(() => {
     const onPopState = () => {
-      const state = getInitialState();
+      const state = selectionFromLocation();
       setSelectedAgent(state.agent);
       setSelectedSessionId(state.session);
     };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
-  }, []);
+  }, [setSelectedAgent, setSelectedSessionId]);
+}
+
+export function useAgentSessions() {
+  const initial = selectionFromLocation();
+
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [agentsError, setAgentsError] = useState<string | null>(null);
+  const [selectedAgent, setSelectedAgent] = useState<string>(initial.agent);
+  const [selectedSessionId, setSelectedSessionId] = useState<string>(initial.session);
+  const discovery = useSessionDiscovery({
+    selectedAgent,
+    selectedSessionId,
+    setSelectedSessionId,
+  });
+  const selectSession = discovery.selectSession;
+  useRouteSynchronization(
+    selectedAgent,
+    selectedSessionId,
+    setSelectedAgent,
+    setSelectedSessionId,
+  );
 
   useEffect(() => {
     setAgentsError(null);
@@ -73,6 +92,15 @@ export function useAgentSessions() {
     setSelectedSessionId('');
   }, []);
 
+  const selectAgent = useCallback((agent: string) => {
+    setSelectedAgent(agent);
+    setSelectedSessionId('');
+  }, []);
+
+  const navigateSession = useCallback((agent: string, sessionId: string) => {
+    setSelectedAgent(agent);
+    selectSession(sessionId);
+  }, [selectSession]);
 
   useEffect(() => {
     const session = selectedSessionId
@@ -90,11 +118,9 @@ export function useAgentSessions() {
     selectedSessionId,
     isFreshSession: discovery.isFreshSession,
     refreshSessions: discovery.refreshSessions,
-    selectAgent: (agent: string) => {
-      setSelectedAgent(agent);
-      setSelectedSessionId('');
-    },
-    selectSession: discovery.selectSession,
+    selectAgent,
+    selectSession,
+    navigateSession,
     newChat: discovery.newChat,
     clearSession,
     clearAgent

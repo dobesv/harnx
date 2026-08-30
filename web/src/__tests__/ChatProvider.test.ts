@@ -182,7 +182,8 @@ describe('toAgUiMessages', () => {
         onStatus,
         onRunFailed,
         onUsage,
-        onToolSummary
+        onToolSummary,
+        onSubAgentEvent: vi.fn(),
       });
 
       const subscriber: any = {};
@@ -289,7 +290,8 @@ describe('toAgUiMessages', () => {
         onRunFailed,
         onUsage,
         onToolSummary,
-        onHandoff
+        onHandoff,
+        onSubAgentEvent: vi.fn(),
       });
 
       const subscriber: any = {};
