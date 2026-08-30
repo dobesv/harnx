@@ -122,6 +122,12 @@ OpenTelemetry distributed tracing is off unless an OTLP endpoint environment var
 - **OTEL_TRACES_SAMPLER**: Sampling strategy (e.g. `always_on`, `always_off`, `traceidratio`, `parentbased_always_on`).
 - **OTEL_TRACES_SAMPLER_ARG**: Argument for the sampler (e.g. `0.1` for 10% sampling ratio).
 
+## Prometheus Metrics Envs
+
+Prometheus metrics serving is off unless `--metrics-addr` or `HARNX_METRICS_ADDR` is set. See [Prometheus Metrics](metrics.md) for full documentation.
+
+- **HARNX_METRICS_ADDR**: Environment variable fallback for `--metrics-addr` on shared-entrypoint binaries (`harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-time-server`, `harnx-plans-tools`, `harnx-claude-compatible-hook-server`, `harnx-mcp-remote`, `harnx-mcp-bridge`, `harnx-mcp-time`, `harnx-mcp-plans-github`). Address format is `IP:PORT` or `:PORT` (blank host binds `0.0.0.0`).
+
 ## Tool filesystem allowlist envs
 
 `harnx-fs-tools` and `harnx-bash-tools` accept the same path lists and batch toggles. `harnx-sandbox-run` accepts the four explicit path lists but doesn't support batches.

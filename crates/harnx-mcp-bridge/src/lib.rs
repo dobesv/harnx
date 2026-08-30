@@ -36,7 +36,7 @@ type SpawnedChild = (
 );
 
 /// Command-line arguments for the MCP-to-NATS bridge.
-#[derive(Debug, Clone, PartialEq, Eq, Parser)]
+#[derive(Clone, Debug, PartialEq, Eq, Parser)]
 #[command(trailing_var_arg = true)]
 pub struct Args {
     /// Server name used for registration. Required when serving over NATS;
@@ -57,6 +57,10 @@ pub struct Args {
     /// Wrapped MCP command followed by its arguments.
     #[arg(required = true, allow_hyphen_values = true)]
     pub child: Vec<String>,
+
+    /// Prometheus metrics endpoint configuration.
+    #[command(flatten)]
+    pub metrics: harnx_metrics::MetricsFlags,
 }
 
 impl Args {

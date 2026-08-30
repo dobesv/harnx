@@ -19,6 +19,8 @@ async fn main() -> anyhow::Result<()> {
 async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    harnx_metrics::init(&args.metrics)?;
+
     if args.list_tools {
         let name = args.name.unwrap_or_else(|| "mcp-diagnostic".to_string());
         let bridge = BridgeToolset::new(name, args.child).await?;

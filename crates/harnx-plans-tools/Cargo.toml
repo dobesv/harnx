@@ -13,6 +13,7 @@ async-trait = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
 harnx-core = { path = "../harnx-core" }
+harnx-metrics = { workspace = true }
 log = { workspace = true }
 harnx-toolset = { path = "../harnx-toolset" }
 harnx-toolset-server = { path = "../harnx-toolset-server" }

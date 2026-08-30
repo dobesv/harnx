@@ -1,6 +1,37 @@
 // Auto-split from server.rs for cohesion. See server/mod.rs.
 use super::*;
 
+fn metric_tool_name(tool: &str) -> &str {
+    if matches!(
+        tool,
+        "list_plans"
+            | "add_plan"
+            | "get_plan"
+            | "update_plan"
+            | "delete_plan"
+            | "list_tasks"
+            | "add_task"
+            | "get_task"
+            | "update_task"
+            | "delete_task"
+            | "list_notes"
+            | "add_note"
+            | "get_note"
+            | "update_note"
+            | "delete_note"
+    ) {
+        tool
+    } else {
+        "unknown"
+    }
+}
+
+fn tool_call_succeeded(result: &Result<CallToolResult, ErrorData>) -> bool {
+    result
+        .as_ref()
+        .is_ok_and(|result| result.is_error != Some(true))
+}
+
 impl ServerHandler for PlansServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -72,9 +103,14 @@ impl ServerHandler for PlansServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        self.dispatch_call_tool(request, _context)
-            .await
-            .map(Into::into)
+        let tool = request.name.clone();
+        let metric_tool = metric_tool_name(&tool);
+        let start = std::time::Instant::now();
+        let result = self.dispatch_call_tool(request, _context).await;
+        let elapsed = start.elapsed();
+        let is_ok = tool_call_succeeded(&result);
+        harnx_metrics::record_tool_call(metric_tool, is_ok, elapsed);
+        result.map(Into::into)
     }
 }
 

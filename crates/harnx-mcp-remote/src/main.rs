@@ -31,6 +31,13 @@ async fn async_main() -> anyhow::Result<()> {
 
 async fn run() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
+
+    // Initialize metrics if configured via --metrics-addr or HARNX_METRICS_ADDR env.
+    let flags = harnx_metrics::MetricsFlags {
+        metrics_addr: cli.metrics_addr.clone(),
+    };
+    harnx_metrics::init(&flags)?;
+
     log::info!(
         "harnx-mcp-remote v{}: starting, proxying to {}",
         env!("CARGO_PKG_VERSION"),

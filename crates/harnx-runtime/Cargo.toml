@@ -34,6 +34,7 @@ harnx-fetch = { path = "../harnx-fetch" }
 harnx-hooks = { path = "../harnx-hooks" }
 harnx-hookset = { path = "../harnx-hookset" }
 harnx-hookset-server = { path = "../harnx-hookset-server" }
+harnx-metrics = { path = "../harnx-metrics" }
 harnx-nats-common = { workspace = true }
 harnx-telemetry = { workspace = true, features = ["nats"] }
 harnx-toolset = { path = "../harnx-toolset" }
@@ -46,6 +47,7 @@ indexmap = { workspace = true }
 inquire = { workspace = true }
 is-terminal = { workspace = true }
 log = { workspace = true }
+metrics = { workspace = true }
 nu-ansi-term = { workspace = true }
 os_info = { workspace = true }
 parking_lot = { workspace = true }
@@ -88,6 +90,7 @@ tokio-test = "0.4"
 harnx-test-bins = { path = "../harnx-test-bins" }
 harnx-telemetry = { workspace = true, features = ["testing"] }
 harnx-time-server = { path = "../harnx-time-server" }
+metrics-util = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }

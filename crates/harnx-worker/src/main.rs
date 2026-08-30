@@ -51,6 +51,10 @@ struct Cli {
     /// deployments leave it off and supply HARNX_SERVER_SCOPE.
     #[arg(long)]
     manage_servers: bool,
+    /// Prometheus metrics endpoint address (e.g., "127.0.0.1:9109" or ":0" for
+    /// any free port). If omitted, no metrics listener is started.
+    #[command(flatten)]
+    metrics: harnx_metrics::MetricsFlags,
 }
 
 impl Cli {
@@ -137,6 +141,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    harnx_metrics::init(&cli.metrics)?;
     let config = Arc::new(RwLock::new(
         Config::init_headless(WorkingMode::Cmd, true).await?,
     ));

@@ -956,14 +956,68 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::MessageRole;
+    use crate::client::{ChatCompletionsOutput, MessageRole, Model, ModelData, TestStateGuard};
+    use crate::test_utils::{MockClient, MockTurn, MockTurnBuilder};
     use crate::utils::create_abort_signal;
     use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, NoticeEvent, TurnEvent};
+    use metrics::{Key, Label};
+    use metrics_util::{
+        debugging::{DebugValue, DebuggingRecorder},
+        CompositeKey, MetricKind,
+    };
     use parking_lot::RwLock;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     static SINK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    type DebugMetric = (
+        CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        DebugValue,
+    );
+
+    fn metric_key(kind: MetricKind, name: &'static str, labels: &[(&str, &str)]) -> CompositeKey {
+        CompositeKey::new(
+            kind,
+            Key::from_parts(
+                name,
+                labels
+                    .iter()
+                    .map(|(key, value)| Label::new((*key).to_owned(), (*value).to_owned()))
+                    .collect::<Vec<_>>(),
+            ),
+        )
+    }
+
+    fn metric_value<'a>(
+        snapshot: &'a [DebugMetric],
+        kind: MetricKind,
+        name: &'static str,
+        labels: &[(&str, &str)],
+    ) -> &'a DebugValue {
+        let expected_key = metric_key(kind, name, labels);
+        snapshot
+            .iter()
+            .find(|(key, _, _, _)| key == &expected_key)
+            .map(|(_, _, _, value)| value)
+            .unwrap_or_else(|| panic!("metric not found: {expected_key:?}"))
+    }
+
+    fn token_metric_value<'a>(snapshot: &'a [DebugMetric], usage_type: &str) -> &'a DebugValue {
+        metric_value(
+            snapshot,
+            MetricKind::Counter,
+            harnx_metrics::LLM_TOKENS_TOTAL,
+            &[
+                ("agent", "metrics-agent"),
+                ("client", "mypkg/openai"),
+                ("model", "metrics-model"),
+                ("type", usage_type),
+            ],
+        )
+    }
 
     #[derive(Default)]
     struct CollectingSink {
@@ -1119,6 +1173,146 @@ mod tests {
             "injected_user_text must be appended once per injection, not \
              replayed on every subsequent loop iteration. Got {count} copies \
              in session.messages."
+        );
+    }
+
+    fn priced_metrics_model() -> Model {
+        let mut model_data = ModelData::new("metrics-model");
+        model_data.input_price = Some(3.0);
+        model_data.output_price = Some(15.0);
+        Model::from_config("mypkg/openai", &[model_data])
+            .into_iter()
+            .next()
+            .expect("priced model should exist")
+    }
+
+    fn metrics_mock_turn(
+        text: &str,
+        tool_call_id: Option<&str>,
+        usage: (u64, u64, u64),
+    ) -> MockTurn {
+        let (input_tokens, output_tokens, cached_tokens) = usage;
+        let tool_calls = tool_call_id
+            .map(|id| ToolCall::new("noop".to_owned(), json!({}), Some(id.to_owned()), None))
+            .into_iter()
+            .collect();
+        MockTurnBuilder::new()
+            .output(ChatCompletionsOutput {
+                text: text.to_owned(),
+                tool_calls,
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(output_tokens),
+                cached_tokens: Some(cached_tokens),
+                ..Default::default()
+            })
+            .build()
+    }
+
+    fn metrics_mock_client(model: &Model) -> Arc<MockClient> {
+        Arc::new(
+            MockClient::builder()
+                .model(model.clone())
+                .add_turn(metrics_mock_turn("first tool", Some("call-1"), (10, 5, 2)))
+                .add_turn(metrics_mock_turn("second tool", Some("call-2"), (20, 7, 4)))
+                .add_turn(metrics_mock_turn("all done", None, (30, 11, 8)))
+                .build(),
+        )
+    }
+
+    fn metrics_loop_context(config: GlobalConfig) -> AgentLoopContext {
+        AgentLoopContext {
+            config,
+            instance_id: harnx_core::instance::ServerScope::new(),
+            abort_signal: create_abort_signal(),
+            call_fn: None,
+            on_tool_round: None,
+            on_text_response: None,
+            initial_with_embeddings: false,
+            initial_resume_count: 0,
+            max_resume: Some(0),
+            nats_hook_provider: None,
+            pending_async_context: None,
+            working_dir: None,
+        }
+    }
+
+    fn run_metrics_tool_loop(model: &Model, mock: Arc<MockClient>) -> Vec<DebugMetric> {
+        let global_config = Arc::new(RwLock::new(Config {
+            data: harnx_core::config_data::ConfigData {
+                stream: false,
+                ..Default::default()
+            },
+            model: model.clone(),
+            ..Default::default()
+        }));
+        let mut input = crate::config::input::from_str(&global_config, "do work", None);
+        input.agent_mut().set_name("metrics-agent");
+        input.agent_mut().set_model(model.clone());
+        let ctx = metrics_loop_context(global_config);
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime should build")
+                .block_on(async {
+                    let _guard = TestStateGuard::new(Some(mock.clone())).await;
+                    let result = run_agent_loop(&ctx, input)
+                        .await
+                        .expect("tool loop should complete");
+                    assert!(matches!(result, LoopResult::Completed));
+                });
+        });
+        snapshotter.snapshot().into_vec()
+    }
+
+    #[test]
+    fn three_call_tool_loop_records_llm_metrics_once_per_call() {
+        harnx_core::require_nextest();
+        let model = priced_metrics_model();
+        let mock = metrics_mock_client(&model);
+        let snapshot = run_metrics_tool_loop(&model, mock.clone());
+        assert_eq!(
+            mock.conversation_history().conversation_history.len(),
+            3,
+            "mock should receive three model calls"
+        );
+
+        assert_eq!(
+            token_metric_value(&snapshot, "input"),
+            &DebugValue::Counter(60),
+            "10 + 20 + 30 must be recorded once; event duplication would produce 120 and final duplication would produce 90"
+        );
+        assert_eq!(
+            token_metric_value(&snapshot, "output"),
+            &DebugValue::Counter(23)
+        );
+        assert_eq!(
+            token_metric_value(&snapshot, "cached"),
+            &DebugValue::Counter(14)
+        );
+
+        let cost_value = metric_value(
+            &snapshot,
+            MetricKind::Gauge,
+            harnx_metrics::LLM_COST_DOLLARS,
+            &[
+                ("agent", "metrics-agent"),
+                ("client", "mypkg/openai"),
+                ("model", "metrics-model"),
+            ],
+        );
+        let DebugValue::Gauge(actual_cost) = cost_value else {
+            panic!("cost should be a floating-point cumulative gauge, got {cost_value:?}");
+        };
+        let expected_cost = model
+            .cost_usd(60, 23)
+            .expect("test model has input and output prices");
+        assert!(
+            (actual_cost.into_inner() - expected_cost).abs() < 1e-12,
+            "cost should equal sum of three calls"
         );
     }
 

@@ -169,6 +169,17 @@ impl Model {
         self.data.output_price
     }
 
+    /// Dollar cost for a call given token counts, or None if pricing is unknown.
+    /// cost = input*input_price/1e6 + output*output_price/1e6
+    /// Cached tokens are NOT charged separately here (see #1568).
+    pub fn cost_usd(&self, input_tokens: u64, output_tokens: u64) -> Option<f64> {
+        let input_price = self.input_price()?;
+        let output_price = self.output_price()?;
+        let cost = input_tokens as f64 * input_price / 1_000_000.0
+            + output_tokens as f64 * output_price / 1_000_000.0;
+        Some(cost)
+    }
+
     pub fn system_prompt_prefix(&self) -> Option<&[String]> {
         self.data.system_prompt_prefix.as_deref()
     }
@@ -528,5 +539,45 @@ mod tests {
                 .map(Vec::as_slice),
             Some([".body.rerank = true".to_string()].as_slice())
         );
+    }
+
+    #[test]
+    fn cost_usd_computes_correctly_when_both_prices_present() {
+        // 1_000_000 input @ $3/M + 1_000_000 output @ $15/M == $18.0
+        let mut data = ModelData::new("test-model");
+        data.input_price = Some(3.0);
+        data.output_price = Some(15.0);
+        let model = Model::from_config("test", &[data])
+            .into_iter()
+            .next()
+            .unwrap();
+        let cost = model.cost_usd(1_000_000, 1_000_000);
+        assert_eq!(cost, Some(18.0));
+    }
+
+    #[test]
+    fn cost_usd_returns_none_when_input_price_missing() {
+        let mut data = ModelData::new("test-model");
+        data.input_price = None;
+        data.output_price = Some(15.0);
+        let model = Model::from_config("test", &[data])
+            .into_iter()
+            .next()
+            .unwrap();
+        let cost = model.cost_usd(1_000_000, 1_000_000);
+        assert_eq!(cost, None);
+    }
+
+    #[test]
+    fn cost_usd_returns_none_when_output_price_missing() {
+        let mut data = ModelData::new("test-model");
+        data.input_price = Some(3.0);
+        data.output_price = None;
+        let model = Model::from_config("test", &[data])
+            .into_iter()
+            .next()
+            .unwrap();
+        let cost = model.cost_usd(1_000_000, 1_000_000);
+        assert_eq!(cost, None);
     }
 }

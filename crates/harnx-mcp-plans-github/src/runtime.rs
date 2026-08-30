@@ -38,6 +38,13 @@ fn github_server_meta(default_repo: Option<RepoTarget>) -> ServerMeta {
 }
 
 pub async fn run(config: AppConfig) -> Result<()> {
+    // Initialize metrics recorder (idempotent)
+    if let Some(ref addr) = config.metrics_addr {
+        harnx_metrics::init(&harnx_metrics::MetricsFlags {
+            metrics_addr: Some(addr.clone()),
+        })?;
+    }
+
     let store = build_store(&config).await?;
 
     if config.http {
@@ -196,7 +203,11 @@ async fn run_http(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()> 
         Arc::new(NeverSessionManager::default()),
         server_config,
     );
-    let app = Router::new().nest_service("/mcp", mcp_service);
+    let app = Router::new()
+        .nest_service("/mcp", mcp_service)
+        .layer(axum::middleware::from_fn(
+            harnx_metrics::http_metrics_middleware,
+        ));
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
         .await
         .with_context(|| {

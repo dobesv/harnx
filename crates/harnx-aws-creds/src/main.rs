@@ -26,6 +26,9 @@ struct AppState {
 struct Args {
     #[arg(long)]
     profile: Option<String>,
+
+    #[command(flatten)]
+    metrics: harnx_metrics::MetricsFlags,
 }
 
 #[derive(Serialize)]
@@ -103,6 +106,9 @@ async fn start_server(state: Arc<AppState>, listener: TcpListener) -> Result<u16
     let port = listener.local_addr()?.port();
     let router = Router::new()
         .route("/creds", get(creds_handler))
+        .layer(axum::middleware::from_fn(
+            harnx_metrics::http_metrics_middleware,
+        ))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -228,6 +234,7 @@ async fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let args = Args::parse();
+    harnx_metrics::init(&args.metrics)?;
     let state = build_app_state(&args).await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = start_server(Arc::clone(&state), listener).await?;

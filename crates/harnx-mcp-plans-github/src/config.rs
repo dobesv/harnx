@@ -26,6 +26,7 @@ pub struct AppConfig {
     pub http: bool,
     pub host: String,
     pub port: u16,
+    pub metrics_addr: Option<String>,
 }
 
 impl AppConfig {
@@ -62,6 +63,7 @@ impl AppConfig {
         let mut http = false;
         let mut host: Option<String> = None;
         let mut port: Option<u16> = None;
+        let mut unknown_args: Vec<String> = Vec::new();
 
         let args: Vec<String> = args.into_iter().map(Into::into).collect();
         let mut i = 0;
@@ -100,9 +102,21 @@ impl AppConfig {
                     port = Some(parse_u16_flag(&args, &mut i, "--port")?);
                 }
                 "--help" | "-h" => print_help_and_exit(),
-                other => {
-                    bail!("harnx-mcp-plans-github: unknown argument: {other}");
+                unknown => {
+                    unknown_args.push(unknown.to_string());
+                    i += 1;
                 }
+            }
+        }
+
+        // Use shared helper for metrics-addr (supports both --metrics-addr VAL and --metrics-addr=VAL)
+        let metrics_addr = harnx_metrics::metrics_addr_from_args(args.clone())
+            .or_else(|| env("HARNX_METRICS_ADDR"));
+
+        // Check for unrecognized arguments (excluding metrics-addr which was already consumed)
+        for arg in unknown_args {
+            if !arg.starts_with("--metrics-addr") {
+                bail!("harnx-mcp-plans-github: unknown argument: {arg}");
             }
         }
 
@@ -179,6 +193,7 @@ impl AppConfig {
             http,
             host,
             port,
+            metrics_addr,
         })
     }
 }
@@ -379,6 +394,11 @@ fn print_help_and_exit() -> ! {
     eprintln!("  --http                      Serve MCP over Streamable HTTP at /mcp");
     eprintln!("  --host <addr>               Bind address for HTTP mode (default: 127.0.0.1; set explicitly for wider exposure)");
     eprintln!("  --port <N>                  Bind port for HTTP mode (default: 3000)");
+    eprintln!("  --metrics-addr <ADDR>       Serve Prometheus metrics at http://ADDR/metrics.");
+    eprintln!(
+        "                              Blank host binds 0.0.0.0, e.g. :8456. Unset disables."
+    );
+    eprintln!("                              Also honors HARNX_METRICS_ADDR env.");
     eprintln!("  --help, -h                  Show this help message");
     eprintln!();
     eprintln!(

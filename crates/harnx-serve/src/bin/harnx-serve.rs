@@ -34,6 +34,8 @@ struct Cli {
     /// Set agent variable pairs (format: --agent-variable key value or -x key value); can be repeated
     #[clap(short = 'x', long, value_names = ["KEY", "VALUE"], num_args = 2, action = clap::ArgAction::Append)]
     pub agent_variable: Vec<String>,
+    #[command(flatten)]
+    metrics: harnx_metrics::MetricsFlags,
 }
 
 #[tokio::main]
@@ -54,6 +56,8 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<Option<anyhow::Error>> {
+    harnx_metrics::init(&cli.metrics)?;
+
     let config = Arc::new(RwLock::new(
         Config::init_headless(WorkingMode::Serve, false)
             .await

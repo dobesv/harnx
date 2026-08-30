@@ -7,6 +7,7 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RoleClient, RoleServer, RunningService};
 use rmcp::Peer;
+use std::time::Instant;
 
 use crate::cli::Cli;
 use crate::client_handler::RemoteClientHandler;
@@ -16,6 +17,12 @@ fn proxy_error(err: rmcp::service::ServiceError) -> ErrorData {
     // rmcp ServiceError in 2.2.0 does not expose structured remote ErrorData
     // here, so fall back to internal_error while preserving message text.
     ErrorData::internal_error(err.to_string(), None)
+}
+
+fn tool_call_succeeded(result: &Result<CallToolResult, ErrorData>) -> bool {
+    result
+        .as_ref()
+        .is_ok_and(|result| result.is_error != Some(true))
 }
 
 pub struct RemoteProxyServer {
@@ -145,6 +152,15 @@ impl RemoteProxyServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let peer = self.peer()?;
-        peer.call_tool(request).await.map_err(proxy_error)
+        let tool_name = request.name.clone();
+        let started = Instant::now();
+        let result = peer.call_tool(request).await.map_err(proxy_error);
+        // mcp-remote is stdio-only; without a cached list, labels follow the upstream tool namespace.
+        harnx_metrics::record_tool_call(
+            &tool_name,
+            tool_call_succeeded(&result),
+            started.elapsed(),
+        );
+        result
     }
 }

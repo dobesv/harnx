@@ -72,7 +72,7 @@ Tracing support across workspace binaries falls into four tiers:
 
 ## Non-Goals & Limitations
 
-- **No cost attribution**: Token usage numbers are recorded, but Harnx has no pricing model and does not calculate financial cost.
+- **No cost attribution**: Token usage numbers are recorded on LLM request spans, but tracing itself does not attach financial cost to spans. Cumulative token usage and dollar cost metrics are available via the Prometheus endpoint (see [Prometheus Metrics](metrics.md)). `harnx_llm_cost_dollars` is emitted by `harnx-worker` only, and only when the model has both input and output prices configured.
 - **Third-party MCP servers**: External MCP servers that do not process rmcp `_meta` context will complete tool requests normally, but will not attach downstream child spans. The trace degrades gracefully by ending at the `harnx-mcp-bridge` boundary.
 
 ## Runnable Example

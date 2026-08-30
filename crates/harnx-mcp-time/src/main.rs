@@ -12,6 +12,7 @@ struct Args {
     http: bool,
     host: String,
     port: u16,
+    metrics_addr: Option<String>,
 }
 
 #[tokio::main]
@@ -26,6 +27,12 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run() -> anyhow::Result<()> {
     let args = parse_args()?;
+
+    // Init metrics recorder (idempotent via OnceLock)
+    let metrics_flags = harnx_metrics::MetricsFlags {
+        metrics_addr: args.metrics_addr.clone(),
+    };
+    harnx_metrics::init(&metrics_flags)?;
 
     if args.http {
         run_http(args).await
@@ -44,6 +51,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut http = false;
     let mut host = "0.0.0.0".to_string();
     let mut port = 3000;
+    let mut unknown_args: Vec<String> = Vec::new();
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -82,15 +90,30 @@ fn parse_args() -> anyhow::Result<Args> {
                 print_help();
                 std::process::exit(0);
             }
-            other => {
-                anyhow::bail!(
-                    "harnx-mcp-time: unknown argument: {other}\nTry: harnx-mcp-time --help"
-                );
+            unknown => {
+                unknown_args.push(unknown.to_string());
+                i += 1;
             }
         }
     }
 
-    Ok(Args { http, host, port })
+    // Use shared helper for metrics-addr (supports both --metrics-addr VAL and --metrics-addr=VAL)
+    let metrics_addr = harnx_metrics::metrics_addr_from_args(args.clone())
+        .or_else(|| std::env::var("HARNX_METRICS_ADDR").ok());
+
+    // Check for unrecognized arguments (excluding metrics-addr which was already consumed)
+    for arg in unknown_args {
+        if !arg.starts_with("--metrics-addr") {
+            anyhow::bail!("harnx-mcp-time: unknown argument: {arg}\nTry: harnx-mcp-time --help");
+        }
+    }
+
+    Ok(Args {
+        http,
+        host,
+        port,
+        metrics_addr,
+    })
 }
 
 fn print_help() {
@@ -102,6 +125,9 @@ fn print_help() {
     eprintln!("  --http              Serve MCP over Streamable HTTP at /mcp");
     eprintln!("  --host <addr>       Bind address for HTTP mode (default: 0.0.0.0)");
     eprintln!("  --port <N>          Bind port for HTTP mode (default: 3000)");
+    eprintln!("  --metrics-addr <ADDR>   Serve Prometheus metrics at http://ADDR/metrics.");
+    eprintln!("                        Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
+    eprintln!("                        Also honors HARNX_METRICS_ADDR env.");
     eprintln!("  --help, -h          Show this help message");
 }
 
@@ -121,7 +147,12 @@ async fn run_http(args: Args) -> anyhow::Result<()> {
         Arc::new(NeverSessionManager::default()),
         config,
     );
-    let app = axum::Router::new().nest_service("/mcp", mcp_service);
+    let app =
+        axum::Router::new()
+            .nest_service("/mcp", mcp_service)
+            .layer(axum::middleware::from_fn(
+                harnx_metrics::http_metrics_middleware,
+            ));
     let listener = tokio::net::TcpListener::bind((host.as_str(), port))
         .await
         .with_context(|| format!("harnx-mcp-time: failed to bind {host}:{port}"))?;

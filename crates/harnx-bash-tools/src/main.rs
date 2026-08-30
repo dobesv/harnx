@@ -146,6 +146,9 @@ fn print_help_and_exit() -> ! {
     eprintln!("  --env, -e <VAR>           Pass VAR from host env to child (repeatable)");
     eprintln!("  --env, -e <VAR=VALUE>     Set VAR=VALUE in child env (repeatable)");
     eprintln!("  --mcp-stdio               Use MCP stdio transport instead of NATS");
+    eprintln!("  --metrics-addr <ADDR>     Serve Prometheus metrics at http://ADDR/metrics.");
+    eprintln!("                            Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
+    eprintln!("                            Also honors HARNX_METRICS_ADDR env.");
     eprintln!("  --help, -h                Show this help message");
     eprintln!();
     eprintln!("Environment:");
@@ -237,6 +240,15 @@ fn parse_cli_args(
                 i += 2;
             }
             "--env" | "-e" => parse_env_option(args, &mut i, config),
+            arg if arg.starts_with("--metrics-addr") => {
+                // Skip --metrics-addr (both forms) so the strict parser doesn't reject it.
+                // The shared helper in run_toolset_main handles actual parsing.
+                if arg == "--metrics-addr" {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
             "--mcp-stdio" => i += 1,
             "--help" | "-h" => print_help_and_exit(),
             other => {
