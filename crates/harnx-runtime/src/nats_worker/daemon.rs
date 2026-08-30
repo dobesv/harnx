@@ -7,11 +7,16 @@ use crate::nats_lease::NatsSessionLease;
 use crate::nats_session_metadata::SessionMetadataStore;
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, consumer::pull};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use std::collections::HashMap;
+use std::fmt::Display;
+use std::future::Future;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
+
+const ACTIVATION_STREAM_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 pub use super::activation::{
     new_remote_session_id, new_worker_id, SessionActivate, SessionActivationRoute,
@@ -258,16 +263,135 @@ pub async fn run_worker_daemon(
         active: Mutex::new(HashMap::new()),
     });
 
-    let mut messages = startup
-        .consumer
-        .messages()
-        .await
-        .context("worker notify message stream")?;
-    while let Some(message) = messages.next().await {
-        let message = message.context("receive activation")?;
-        if let Err(error) = runtime.handle_activation(message).await {
-            log::warn!("worker activation handling failed: {error:#}");
-        }
-    }
+    let consumer = startup.consumer;
+    reconnect_activation_stream(
+        move || {
+            let consumer = consumer.clone();
+            async move { consumer.messages().await }
+        },
+        move |message| {
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.handle_activation(message).await }
+        },
+        ACTIVATION_STREAM_RETRY_DELAY,
+    )
+    .await;
     Ok(())
+}
+
+/// Keep the daemon's pull subscription alive across transient broker stalls.
+///
+/// `async-nats` reports a missed idle heartbeat as an item error. The stream
+/// may become usable again, but recreating it issues a fresh pull request and
+/// also handles streams that closed while the client reconnected. An active
+/// turn is independently protected by its lease; losing the activation stream
+/// must not terminate the worker process and strand later reactivations.
+async fn reconnect_activation_stream<
+    Open,
+    OpenFuture,
+    Messages,
+    Message,
+    OpenError,
+    MessageError,
+    Handle,
+    HandleFuture,
+    HandleError,
+>(
+    mut open: Open,
+    mut handle: Handle,
+    retry_delay: Duration,
+) where
+    Open: FnMut() -> OpenFuture,
+    OpenFuture: Future<Output = std::result::Result<Messages, OpenError>>,
+    Messages: Stream<Item = std::result::Result<Message, MessageError>> + Unpin,
+    OpenError: Display,
+    MessageError: Display,
+    Handle: FnMut(Message) -> HandleFuture,
+    HandleFuture: Future<Output = std::result::Result<(), HandleError>>,
+    HandleError: Display,
+{
+    loop {
+        match open().await {
+            Ok(mut messages) => {
+                while let Some(message) = messages.next().await {
+                    let message = match message {
+                        Ok(message) => message,
+                        Err(error) => {
+                            log::warn!("worker activation stream failed; reopening: {error}");
+                            break;
+                        }
+                    };
+                    if let Err(error) = handle(message).await {
+                        log::warn!("worker activation handling failed: {error}");
+                    }
+                }
+            }
+            Err(error) => {
+                log::warn!("failed to open worker activation stream; retrying: {error}");
+            }
+        }
+        tokio::time::sleep(retry_delay).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reconnect_activation_stream;
+    use futures_util::stream::{self, BoxStream};
+    use futures_util::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn activation_stream_reopens_after_open_and_item_failures() {
+        harnx_core::require_nextest();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (handled_tx, handled_rx) = tokio::sync::oneshot::channel();
+        let mut handled_tx = Some(handled_tx);
+
+        let task = tokio::spawn(reconnect_activation_stream(
+            {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let messages: BoxStream<'static, std::result::Result<u32, &'static str>> =
+                            match attempt {
+                                1 => stream::iter([Err("missed idle heartbeat")]).boxed(),
+                                _ => stream::once(async { Ok(42) })
+                                    .chain(stream::pending())
+                                    .boxed(),
+                            };
+                        if attempt == 0 {
+                            Err("broker unavailable")
+                        } else {
+                            Ok(messages)
+                        }
+                    }
+                }
+            },
+            move |message| {
+                let tx = handled_tx.take();
+                async move {
+                    if let Some(tx) = tx {
+                        let _ = tx.send(message);
+                    }
+                    Ok::<(), &'static str>(())
+                }
+            },
+            Duration::from_millis(1),
+        ));
+
+        let message = tokio::time::timeout(Duration::from_secs(1), handled_rx)
+            .await
+            .expect("activation stream did not recover")
+            .expect("activation handler disappeared");
+        assert_eq!(message, 42);
+        assert!(attempts.load(Ordering::SeqCst) >= 3);
+        assert!(!task.is_finished(), "recovered daemon loop must stay alive");
+
+        task.abort();
+        let _ = task.await;
+    }
 }
