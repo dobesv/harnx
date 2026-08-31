@@ -6,7 +6,7 @@ parameters:
 env: { GH_PAGER: "" }
 sandbox:
   read: ["~/.config/gh"]
-  env:  ["GH_TOKEN"]
+  env:  ["GH_TOKEN", "GITHUB_TOKEN"]
 template: false
 script: |
   set -euo pipefail

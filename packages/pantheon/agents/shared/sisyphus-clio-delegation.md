@@ -32,6 +32,29 @@ commit.  **Do NOT provide a pre-composed commit message.**
 If an issue tracker reference is known (JIRA or GitHub), pass it explicitly (e.g. 
 `Issue: FDEV-1234` or `Issue: #123`) so Clio includes it in the commit body.
 
-Clio will return a link — either an existing pull request's link and status or, 
-when none is open, a compare link for opening one. Pass Clio's result back to 
-the user. Clio does NOT create pull requests.
+Clio will return structured delivery metadata with either an existing pull request's
+link and status or, when none is open, a compare link for opening one. Clio does NOT
+create pull requests.
+
+## Wait for Pull Request Stability
+
+Every final PR delivery must remain active while the pull request is opened and settles:
+
+1. Stream Clio's clickable `delivery_url` and status to the user immediately. Do not end
+   the response after printing the link.
+2. In that same response, call `bash_wait_for_pr_stable`. Pass `pr_url` for an existing
+   pull request. For a compare link, pass Clio's `repository` value as `repo`, plus its
+   `branch` and `head_owner`, so the tool can wait for the user to open the PR. Use the
+   default 24-hour timeout unless
+   the task calls for another limit; `timeout_secs: 0` means no deadline.
+3. Let the tool do its own GitHub polling. Do not repeatedly wake the model to check whether
+   a PR exists or whether checks have changed.
+4. When the tool returns, inspect the current checks, reviews, and comments. Failed checks or
+   actionable feedback resume the implementation, verification, Clio delivery, and stability
+   wait cycle. If everything is clear, report the stable PR status. If the wait timed out,
+   was cancelled, or returned `activity_stalled`, report the remaining blocker precisely.
+
+The waiter returns only after all checks are terminal and activity has been quiet for five
+minutes, or after the head and checks have been unchanged for 15 minutes followed by five
+quiet minutes. Terminal includes passing, failing, skipped, and cancelled checks; the agent,
+not the waiter, decides what action the result requires.

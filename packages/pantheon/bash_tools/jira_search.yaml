@@ -4,6 +4,8 @@ parameters:
   query: { type: string, required: true, description: "Text to search" }
   limit: { type: integer, required: false, min: 1, max: 100, description: "Max results" }
 template: false
+# jira needs keychain access so we will run it outside the sandbox for now
+sandbox: { enabled: false }
 script: |
   set -euo pipefail
   acli jira workitem search --jql "text ~ \"$QUERY\"" ${LIMIT:+--limit "$LIMIT"}

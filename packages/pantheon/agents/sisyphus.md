@@ -10,6 +10,7 @@ use_tools:
 - bash_spawn
 - bash_wait
 - bash_terminate
+- bash_wait_for_pr_stable
 - fs_read
 - fs_ls
 - fs_grep

@@ -466,7 +466,7 @@ async fn tool_template_sandbox_grants_control_real_file_access() {
         "unsandboxed template did not read marker:\n{unsandboxed_text}"
     );
 
-    let _ = toolset.cleanup_log_dir();
+    let _ = toolset.cleanup_log_dir().await;
 }
 
 #[cfg(unix)]
@@ -1444,8 +1444,8 @@ async fn test_cleanup_log_dir_removes_temp_logs() {
     let log_dir = stdout_log_path.parent().unwrap().to_path_buf();
     assert!(log_dir.exists());
 
-    server.cleanup_log_dir().unwrap();
-    assert!(!log_dir.exists());
+    server.cleanup_log_dir().await.unwrap();
+    assert!(!tokio::fs::try_exists(&log_dir).await.unwrap());
 }
 
 #[tokio::test]

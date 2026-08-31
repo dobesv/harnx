@@ -10,11 +10,12 @@ impl BashServer {
         &self,
         params: ExecCommandParams,
     ) -> Result<CallToolResult, ErrorData> {
+        let timeout_secs = resolve_command_timeout(params.timeout_secs);
         self.exec_pipeline(ExecPipelineParams {
             command: &params.command,
             working_dir: params.working_dir.as_deref(),
             extra_env: params.env.as_ref(),
-            timeout_secs: params.timeout_secs.unwrap_or(120),
+            timeout_secs,
             truncate_opts: Self::truncate_opts_from(
                 params.head_lines,
                 params.tail_lines,
@@ -33,9 +34,12 @@ impl BashServer {
         let registered = self.inner.templates.get(name).ok_or_else(|| {
             ErrorData::invalid_params(format!("unknown tool template: {name}"), None)
         })?;
+        let mut script_args = args.clone();
+        let requested_timeout = parse_template_timeout(script_args.remove(COMMAND_TIMEOUT_ARG))
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         let bound = registered
             .template
-            .validate_and_bind(args)
+            .validate_and_bind(&script_args)
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         let command = registered
             .template
@@ -56,7 +60,7 @@ impl BashServer {
             command: &command,
             working_dir: None,
             extra_env: Some(&extra_env),
-            timeout_secs: 120,
+            timeout_secs: resolve_command_timeout(requested_timeout),
             truncate_opts: Self::truncate_opts_from(None, None, None),
             template_sandbox: Some(TemplateSandbox {
                 enabled: registered.sandbox_enabled,
@@ -140,41 +144,38 @@ impl BashServer {
         let total_lines = stdout_lines + stderr_lines;
         let total_bytes = stdout_bytes_len + stderr_bytes_len;
 
-        match (status, timed_out) {
-            (Some(status), false) => {
-                self.build_exec_success_result(ExitResultCtx {
-                    execution_id: &execution_id,
-                    command: params.command,
-                    working_dir: &working_dir,
-                    stdout_log_path: &stdout_log_path,
-                    stderr_log_path: &stderr_log_path,
-                    total_lines,
-                    total_bytes,
-                    exit_code: status.code().unwrap_or(-1),
-                    streams_block,
-                    before_snaps: &before_snaps,
-                    snapshot_decision: &snapshot_decision,
-                })
-                .await
-            }
-            (Some(status), true) => {
-                let _ = status;
-                self.build_timeout_result(TimeoutResultCtx {
-                    command: params.command,
-                    working_dir: &working_dir,
-                    execution_id: &execution_id,
-                    timeout_secs: params.timeout_secs,
-                    total_lines,
-                    total_bytes,
-                    stdout: &stdout_str,
-                    stderr: &stderr_str,
-                    truncate_opts: &params.truncate_opts,
-                    stdout_log_path: &stdout_log_path,
-                    stderr_log_path: &stderr_log_path,
-                })
-            }
-            (None, _) => tool_error("process exited without status".to_string()),
+        if timed_out {
+            return self.build_timeout_result(TimeoutResultCtx {
+                command: params.command,
+                working_dir: &working_dir,
+                execution_id: &execution_id,
+                timeout_secs: params
+                    .timeout_secs
+                    .expect("timed-out commands always have a deadline"),
+                total_lines,
+                total_bytes,
+                stdout: &stdout_str,
+                stderr: &stderr_str,
+                truncate_opts: &params.truncate_opts,
+                stdout_log_path: &stdout_log_path,
+                stderr_log_path: &stderr_log_path,
+            });
         }
+
+        self.build_exec_success_result(ExitResultCtx {
+            execution_id: &execution_id,
+            command: params.command,
+            working_dir: &working_dir,
+            stdout_log_path: &stdout_log_path,
+            stderr_log_path: &stderr_log_path,
+            total_lines,
+            total_bytes,
+            exit_code: status.code().unwrap_or(-1),
+            streams_block,
+            before_snaps: &before_snaps,
+            snapshot_decision: &snapshot_decision,
+        })
+        .await
     }
 
     // -----------------------------------------------------------------------
@@ -390,5 +391,51 @@ impl BashServer {
             contents.push(ContentBlock::text(diff));
         }
         CallToolResult::success(contents)
+    }
+}
+
+fn resolve_command_timeout(requested: Option<u64>) -> Option<u64> {
+    match requested {
+        None => Some(DEFAULT_COMMAND_TIMEOUT_SECS),
+        Some(0) => None,
+        Some(seconds) => Some(seconds),
+    }
+}
+
+fn parse_template_timeout(value: Option<Value>) -> anyhow::Result<Option<u64>> {
+    match value {
+        None => Ok(None),
+        Some(Value::Number(number)) => match number.as_u64() {
+            Some(number) => Ok(Some(number)),
+            None => anyhow::bail!("timeout_secs must be a non-negative integer"),
+        },
+        Some(_) => anyhow::bail!("timeout_secs must be a non-negative integer"),
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::{parse_template_timeout, resolve_command_timeout};
+    use crate::server::DEFAULT_COMMAND_TIMEOUT_SECS;
+    use serde_json::json;
+
+    #[test]
+    fn resolves_default_override_and_unlimited_timeouts() {
+        assert_eq!(
+            resolve_command_timeout(None),
+            Some(DEFAULT_COMMAND_TIMEOUT_SECS)
+        );
+        assert_eq!(resolve_command_timeout(Some(17)), Some(17));
+        assert_eq!(resolve_command_timeout(Some(0)), None);
+    }
+
+    #[test]
+    fn template_timeout_accepts_non_negative_integers_only() {
+        assert_eq!(parse_template_timeout(None).unwrap(), None);
+        assert_eq!(parse_template_timeout(Some(json!(0))).unwrap(), Some(0));
+        assert_eq!(parse_template_timeout(Some(json!(17))).unwrap(), Some(17));
+        assert!(parse_template_timeout(Some(json!(-1))).is_err());
+        assert!(parse_template_timeout(Some(json!(1.5))).is_err());
+        assert!(parse_template_timeout(Some(json!("17"))).is_err());
     }
 }
