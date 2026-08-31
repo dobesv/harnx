@@ -81,6 +81,41 @@ async fn test_header_injection_through_proxy() {
 }
 
 #[tokio::test]
+async fn ca_cert_file_persists_while_proxy_runs() {
+    timeout(Duration::from_secs(15), async {
+        let mut proxy = spawn_proxy("localhost").await.expect("spawn proxy");
+
+        let test_result = async {
+            let readiness = read_proxy_readiness(&mut proxy).await?;
+            sleep(Duration::from_millis(200)).await;
+
+            // Regression test for #1622: the CA temp dir must outlive build_runtime.
+            let cert_pem = std::fs::read_to_string(&readiness.ca_cert_path).with_context(|| {
+                format!(
+                    "read CA certificate at {} while proxy is running",
+                    readiness.ca_cert_path.display()
+                )
+            })?;
+            if cert_pem.is_empty() {
+                return Err(anyhow!("CA certificate file is empty"));
+            }
+            if !cert_pem.contains("-----BEGIN CERTIFICATE-----") {
+                return Err(anyhow!(
+                    "CA certificate file does not contain a PEM certificate"
+                ));
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        shutdown_proxy(&mut proxy).await;
+        test_result.expect("CA certificate should persist for proxy lifetime");
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
 async fn persistent_jsonl_mode_has_no_readiness_preamble() {
     timeout(Duration::from_secs(15), async {
         let mut proxy = Command::new(proxy_binary_path())
@@ -129,6 +164,7 @@ async fn persistent_jsonl_mode_has_no_readiness_preamble() {
 
 struct ProxyReadiness {
     proxy_port: u16,
+    ca_cert_path: PathBuf,
     // CA cert PEM (decoded from CA_CERT_PEM_B64 readiness line).
     // Available for HTTPS tests; unused in the plain-HTTP test.
     #[allow(dead_code)]
@@ -165,12 +201,13 @@ async fn spawn_proxy(host_matcher: &str) -> Result<Child> {
     Ok(child)
 }
 
-/// Read lines from the proxy stdout until both `PROXY_PORT` and `CA_CERT_PEM_B64` are found.
+/// Read lines from the proxy stdout until all readiness values are found.
 /// Separated from `read_proxy_readiness` to keep cyclomatic complexity below threshold.
 async fn collect_readiness_lines(
     lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-) -> Result<(u16, String)> {
+) -> Result<(u16, PathBuf, String)> {
     let mut proxy_port = None;
+    let mut ca_cert_path = None;
     let mut ca_cert_pem_b64 = None;
 
     for _ in 0..10 {
@@ -180,14 +217,16 @@ async fn collect_readiness_lines(
             .ok_or_else(|| anyhow!("proxy exited before readiness output"))?;
 
         parse_readiness_line(&line, &mut proxy_port, &mut ca_cert_pem_b64)?;
+        parse_ca_cert_path(&line, &mut ca_cert_path);
 
-        if proxy_port.is_some() && ca_cert_pem_b64.is_some() {
+        if readiness_is_complete(&proxy_port, &ca_cert_path, &ca_cert_pem_b64) {
             break;
         }
     }
 
     Ok((
         proxy_port.ok_or_else(|| anyhow!("missing PROXY_PORT output"))?,
+        ca_cert_path.ok_or_else(|| anyhow!("missing CA_CERT_PATH output"))?,
         ca_cert_pem_b64.ok_or_else(|| anyhow!("missing CA_CERT_PEM_B64 output"))?,
     ))
 }
@@ -202,8 +241,24 @@ fn parse_readiness_line(
     } else if let Some(b64) = line.strip_prefix("CA_CERT_PEM_B64=") {
         *ca_cert_pem_b64 = Some(b64.to_string());
     }
-    // CA_CERT_PATH line is also emitted; not needed here.
     Ok(())
+}
+
+fn parse_ca_cert_path(line: &str, ca_cert_path: &mut Option<PathBuf>) {
+    if let Some(path) = line.strip_prefix("CA_CERT_PATH=") {
+        *ca_cert_path = Some(PathBuf::from(path));
+    }
+}
+
+fn readiness_is_complete(
+    proxy_port: &Option<u16>,
+    ca_cert_path: &Option<PathBuf>,
+    ca_cert_pem_b64: &Option<String>,
+) -> bool {
+    matches!(
+        (proxy_port, ca_cert_path, ca_cert_pem_b64),
+        (Some(_), Some(_), Some(_))
+    )
 }
 
 async fn read_proxy_readiness(proxy: &mut Child) -> Result<ProxyReadiness> {
@@ -213,12 +268,13 @@ async fn read_proxy_readiness(proxy: &mut Child) -> Result<ProxyReadiness> {
         .ok_or_else(|| anyhow!("proxy stdout not captured"))?;
     let mut lines = BufReader::new(stdout).lines();
 
-    let (proxy_port, ca_cert_b64) = collect_readiness_lines(&mut lines).await?;
+    let (proxy_port, ca_cert_path, ca_cert_b64) = collect_readiness_lines(&mut lines).await?;
     let ca_cert_pem = harnx_proxy_auth::base64_decode(&ca_cert_b64)
         .context("decode CA_CERT_PEM_B64 readiness line")?;
 
     Ok(ProxyReadiness {
         proxy_port,
+        ca_cert_path,
         ca_cert_pem,
     })
 }

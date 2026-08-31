@@ -69,7 +69,7 @@ async fn build_runtime(args: &cli::Args) -> Result<DispatchRuntime> {
     let pipeline = Arc::new(TransformPipeline::new(stages));
     fs_gen::eval_and_write_files(&args.fs, &jaq_vars, &temp_file_root)?;
 
-    let (ca_setup, _ca_temp_dir) = ca::setup()?;
+    let (ca_setup, ca_temp_dir) = ca::setup()?;
     let ca_cert_path = ca_setup.cert_pem_path.clone();
     let ca_cert_pem = std::fs::read_to_string(&ca_cert_path)?;
     let port =
@@ -110,6 +110,7 @@ async fn build_runtime(args: &cli::Args) -> Result<DispatchRuntime> {
         extra_env,
         notice_rx,
         fs_temp_dir,
+        ca_temp_dir,
     })
 }
 
@@ -166,6 +167,13 @@ struct DispatchRuntime {
     extra_env: serde_json::Map<String, serde_json::Value>,
     notice_rx: notice::HookNoticeReceiver,
     fs_temp_dir: Option<tempfile::TempDir>,
+    // Owns the on-disk CA bundle (ca.pem). The exported SSL_CERT_FILE /
+    // CURL_CA_BUNDLE / NODE_EXTRA_CA_CERTS / REQUESTS_CA_BUNDLE / GIT_SSL_CAINFO
+    // env vars point at this file, so it MUST stay alive for the whole server
+    // lifetime, not just build_runtime(). Dropping it early deletes ca.pem while
+    // the proxy keeps running (the proxy holds the CA in memory), leaving every
+    // TLS client pointed at a missing file. See issue #1622.
+    ca_temp_dir: tempfile::TempDir,
 }
 
 async fn run_dispatch_mode(
@@ -180,10 +188,12 @@ async fn run_dispatch_mode(
         extra_env,
         notice_rx,
         fs_temp_dir,
+        ca_temp_dir,
     } = runtime;
     if nats_mode {
         // Keep generated credentials and notice channel alive for hook-server lifetime.
         let _temp_dir_guard = fs_temp_dir;
+        let _ca_temp_dir_guard = ca_temp_dir;
         let _notice_rx_guard = notice_rx;
         return harnx_hookset_server::run_hookset_main_with_readiness(
             hook::ProxyAuthHook::new(name, port, ca_cert_path, extra_env),
@@ -191,6 +201,10 @@ async fn run_dispatch_mode(
         )
         .await;
     }
+    // Hold the CA bundle for the whole jsonl loop (both branches below). Bound
+    // after the nats_mode early return so the value is moved into exactly one
+    // path. See the field comment on DispatchRuntime and issue #1622.
+    let _ca_temp_dir_guard = ca_temp_dir;
     if let Some(temp_dir) = fs_temp_dir {
         return tokio::select! {
             result = hook::run_jsonl_loop(port, ca_cert_path, extra_env, notice_rx) => result,
