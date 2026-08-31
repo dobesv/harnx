@@ -225,6 +225,11 @@ async fn template_tool_validates_then_runs_through_exec_pipeline() {
         echo.input_schema["properties"]["number"]["type"],
         json!("integer")
     );
+    assert_eq!(
+        echo.input_schema["properties"]["timeout_secs"]["minimum"],
+        json!(0)
+    );
+    assert_eq!(echo.timeout_secs, Some(0));
 
     let result = toolset
         .invoke("echo_num", json!({ "number": 7 }), CancellationToken::new())
@@ -251,6 +256,53 @@ async fn template_tool_validates_then_runs_through_exec_pipeline() {
         "unexpected error: {error}"
     );
     assert!(!marker.exists(), "validation failure executed script");
+    let _ = toolset.cleanup_log_dir();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn template_timeout_is_adjustable_and_zero_is_unlimited() {
+    let directory = tempfile::tempdir().expect("template directory");
+    let template_path = directory.path().join("slow.yaml");
+    write_template(
+        &template_path,
+        "slow",
+        "",
+        "sleep \"$DELAY\"; printf finished",
+    );
+    let yaml = std::fs::read_to_string(&template_path).expect("read generated template");
+    let yaml = yaml.replace(
+        "description: Test slow\n",
+        "description: Test slow\nparameters:\n  delay: { type: number, required: true }\n",
+    );
+    std::fs::write(&template_path, yaml).expect("add delay parameter");
+    let templates =
+        discover_tool_templates(None, &[template_path], &[]).expect("discover command template");
+    let toolset = BashToolset::new(sandbox_config_for(directory.path()), templates)
+        .await
+        .expect("build toolset");
+
+    let timed_out = toolset
+        .invoke(
+            "slow",
+            json!({ "delay": 30, "timeout_secs": 1 }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("timeouts are returned as tool results");
+    assert_eq!(timed_out["isError"], json!(true));
+    assert!(timed_out.to_string().contains("timed out after 1s"));
+
+    let unlimited = toolset
+        .invoke(
+            "slow",
+            json!({ "delay": 0, "timeout_secs": 0 }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("zero timeout should disable the deadline");
+    assert_ne!(unlimited["isError"], json!(true));
+    assert!(unlimited.to_string().contains("finished"));
     let _ = toolset.cleanup_log_dir();
 }
 

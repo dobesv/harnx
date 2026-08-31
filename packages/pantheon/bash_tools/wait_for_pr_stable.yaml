@@ -1,0 +1,31 @@
+name: wait_for_pr_stable
+description: Wait for a GitHub pull request to appear and become stable without agent polling
+parameters:
+  pr_url:
+    type: string
+    description: Existing GitHub pull request URL; omit while waiting for a new PR
+    pattern: "^https://[^/]+/[^/]+/[^/]+/pull/[0-9]+/?$"
+  repo:
+    type: string
+    description: Repository as owner/name; inferred from the working tree when omitted
+    pattern: "^[\\w.-]+/[\\w.-]+$"
+  branch:
+    type: string
+    description: Head branch to watch when pr_url is omitted; inferred from the working tree when omitted
+    pattern: "^[A-Za-z0-9._/-]+$"
+    min: 1
+    max: 255
+  head_owner:
+    type: string
+    description: Optional fork owner used to disambiguate branches with the same name
+    pattern: "^[A-Za-z0-9-]+$"
+env: { GH_PAGER: "" }
+sandbox:
+  read:
+    - "~/.config/gh"
+    - "$HARNX_PACKAGE_DIR/scripts/wait-for-pr-stable.sh"
+  env: ["GH_TOKEN", "GITHUB_TOKEN", "HARNX_PACKAGE_DIR"]
+template: false
+script: |
+  set -euo pipefail
+  exec bash "$HARNX_PACKAGE_DIR/scripts/wait-for-pr-stable.sh"

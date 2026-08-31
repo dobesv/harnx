@@ -5,7 +5,7 @@ pub(crate) struct ExecPipelineParams<'a> {
     pub(crate) command: &'a str,
     pub(crate) working_dir: Option<&'a str>,
     pub(crate) extra_env: Option<&'a HashMap<String, String>>,
-    pub(crate) timeout_secs: u64,
+    pub(crate) timeout_secs: Option<u64>,
     pub(crate) truncate_opts: TruncateOpts,
     pub(crate) template_sandbox: Option<TemplateSandbox<'a>>,
 }
@@ -66,7 +66,7 @@ pub(crate) struct LogTargets<'a> {
 
 /// Result of running a command to completion (exec path).
 pub(crate) struct RunOutcome {
-    pub(crate) status: Option<std::process::ExitStatus>,
+    pub(crate) status: std::process::ExitStatus,
     pub(crate) timed_out: bool,
     pub(crate) stdout_str: String,
     pub(crate) stderr_str: String,

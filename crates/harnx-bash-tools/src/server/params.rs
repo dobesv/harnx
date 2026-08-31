@@ -36,7 +36,7 @@ impl JsonSchema for ExecCommandParams {
             vec![
                 ("command", "Bash command to execute. Avoid shell pipes like | head, | tail, | grep — use head_lines, tail_lines, max_output_bytes instead. For multi-line Python/Node/Ruby/etc. scripts, start the command with a shebang line (e.g. #!/usr/bin/env python3) and write the script body on subsequent lines — the correct interpreter will be used automatically.", command),
                 ("working_dir", "Working directory for the command. Defaults to the project root.", working_dir),
-                ("timeout_secs", "Kill the command after this many seconds. Default: no timeout.", timeout_secs),
+                ("timeout_secs", "Kill the command after this many seconds. Defaults to 86400 (24 hours); use 0 for no deadline.", timeout_secs),
                 ("head_lines", "Return only the first N lines of combined output. Prefer this over `| head -N` in the command.", head_lines),
                 ("tail_lines", "Return only the last N lines of combined output. Prefer this over `| tail -N` in the command.", tail_lines),
                 ("max_output_bytes", "Truncate output to this many bytes. Prefer this over `| head -c N` in the command.", max_output_bytes),

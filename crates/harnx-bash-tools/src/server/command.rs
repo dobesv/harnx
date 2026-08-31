@@ -315,7 +315,7 @@ impl BashServer {
     /// whether it timed out, and the captured stdout/stderr as lossy UTF-8.
     pub(crate) async fn run_to_completion(
         mut command: CommandWrap,
-        timeout_secs: u64,
+        timeout_secs: Option<u64>,
         targets: LogTargets<'_>,
     ) -> Result<RunOutcome, ErrorData> {
         let LogTargets {
@@ -346,26 +346,7 @@ impl BashServer {
         let stdout_task = tokio::spawn(read_pipe_to_file(stdout, stdout_file));
         let stderr_task = tokio::spawn(read_pipe_to_file(stderr, stderr_file));
 
-        let timeout = Duration::from_secs(timeout_secs);
-        let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(Ok(status)) => (Some(status), false),
-            Ok(Err(err)) => {
-                return Err(internal_error(format!("failed waiting for command: {err}")));
-            }
-            Err(_) => {
-                child.start_kill().map_err(|err| {
-                    internal_error(format!("failed to kill command after timeout: {err}"))
-                })?;
-                match child.wait().await {
-                    Ok(status) => (Some(status), true),
-                    Err(err) => {
-                        return Err(internal_error(format!(
-                            "failed waiting for killed command: {err}"
-                        )));
-                    }
-                }
-            }
-        };
+        let (status, timed_out) = wait_for_child(child.as_mut(), timeout_secs).await?;
 
         let stdout_bytes = join_pipe(stdout_task, "stdout").await?;
         let stderr_bytes = join_pipe(stderr_task, "stderr").await?;
@@ -384,6 +365,35 @@ impl BashServer {
             stdout_str: String::from_utf8_lossy(&stdout_bytes).into_owned(),
             stderr_str: String::from_utf8_lossy(&stderr_bytes).into_owned(),
         })
+    }
+}
+
+async fn wait_for_child(
+    child: &mut dyn ChildWrapper,
+    timeout_secs: Option<u64>,
+) -> Result<(std::process::ExitStatus, bool), ErrorData> {
+    let Some(timeout_secs) = timeout_secs else {
+        return child
+            .wait()
+            .await
+            .map(|status| (status, false))
+            .map_err(|err| internal_error(format!("failed waiting for command: {err}")));
+    };
+
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+        Ok(result) => result
+            .map(|status| (status, false))
+            .map_err(|err| internal_error(format!("failed waiting for command: {err}"))),
+        Err(_) => {
+            child.start_kill().map_err(|err| {
+                internal_error(format!("failed to kill command after timeout: {err}"))
+            })?;
+            child
+                .wait()
+                .await
+                .map(|status| (status, true))
+                .map_err(|err| internal_error(format!("failed waiting for killed command: {err}")))
+        }
     }
 }
 

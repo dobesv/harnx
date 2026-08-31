@@ -190,7 +190,7 @@ The package includes ready-to-use tool server configs in `tool_servers/`. Bundle
 
 | Server | Namespace | Requires | Notes |
 |--------|-----------|----------|-------|
-| `bash.yaml` | `bash_*` | None (bundled binary) | Shell execution. Opts into common system, development-tool, and repository allow batches plus explicit app paths. Includes a native PreToolUse hook (`harnx-proxy-auth`) for GitHub/Atlassian credential injection. |
+| `bash.yaml` | `bash_*` | None (bundled binary) | Shell execution and the PR-stability waiter used after delivery. Opts into common system, development-tool, and repository allow batches plus explicit app paths. Includes a native PreToolUse hook (`harnx-proxy-auth`) for GitHub/Atlassian credential injection. |
 | `fs.yaml` | `fs_*` | None (bundled binary) | Filesystem read/write. Opts into repository and development-tool allow batches. |
 | `plans.yaml` | `plans_*` | None (bundled binary) | Plan/task/note management, stored in `.agent/plans/` relative to the working directory. |
 | `time.yaml` | `time_*` | None (bundled binary) | Current time and wait/sleep utilities. |
@@ -232,4 +232,3 @@ Available fields you can set per server with jq:
 | `.args` | Replace the args list entirely |
 | `.args += [...]` | Append args after the existing args |
 | `.env.KEY = "value"` | Set an environment variable on the server process |
-

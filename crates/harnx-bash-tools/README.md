@@ -44,6 +44,16 @@ Batch toggles accept `1`, `true`, `yes`, or `on`:
 `HARNX_BASH_ENV_PASSTHROUGH` remains a comma-separated list of extra child environment variable names.
 `HARNX_PACKAGE_DIR` sets the package directory for auto-discovering templates under `$HARNX_PACKAGE_DIR/bash_tools/`.
 
+## Command deadlines
+
+Foreground `exec` calls and command templates run for up to 86,400 seconds (24 hours) by
+default. Each call accepts `timeout_secs` to choose a shorter or longer deadline; use
+`timeout_secs: 0` to run without a deadline. Cancelling the tool call still terminates the
+foreground command and its process group.
+
+`timeout_secs` is reserved execution metadata for command templates. It is injected into every
+template's input schema automatically and must not be declared under the YAML `parameters` map.
+
 ## Shell command templates
 
 Command templates allow defining custom fixed shell command shapes in YAML files. Each template registers as a distinct MCP tool with a strongly typed input schema. Instead of giving an agent arbitrary shell execution privileges, templates restrict execution to a fixed script where agent-provided parameters are validated against a schema and passed to the script as environment variables.
@@ -119,14 +129,14 @@ description: View a GitHub issue as JSON
 parameters:
   number: { type: integer, required: true, description: Issue number }
   repo:   { type: string,  required: true, pattern: "^[\\w.-]+/[\\w.-]+$" }
-env: { GH_PAGER: "" }               # top-level env: a MAP that INJECTS key=value env vars
-sandbox:                            # omit entirely => server default allowlist
-  read:  ["~/.config/gh"]           # additive read-path grants (~ and $VAR expanded)
-  write: ["/tmp/out"]               # additive write-path grants
-  env:   ["GH_TOKEN"]               # sandbox.env: a LIST that ALLOWS THROUGH ambient env vars
-  # enabled: true  (default)        # false bypasses sandbox (logged at WARN) — last resort
-  # network: true  (default)        # false blocks network
-template: false                     # true renders script via minijinja first; default false
+env: { GH_PAGER: "" }                  # top-level env: a MAP that INJECTS key=value env vars
+sandbox:                               # omit entirely => server default allowlist
+  read:  ["~/.config/gh"]              # additive read-path grants (~ and $VAR expanded)
+  write: ["/tmp/out"]                  # additive write-path grants
+  env:   ["GH_TOKEN", "GITHUB_TOKEN"]  # sandbox.env: a LIST that ALLOWS THROUGH ambient env vars
+  # enabled: true  (default)           # false bypasses sandbox (logged at WARN) — last resort
+  # network: true  (default)           # false blocks network
+template: false                        # true renders script via minijinja first; default false
 script: |
   set -euo pipefail
   gh issue view "$NUMBER" --repo "$REPO" --json title,body,comments

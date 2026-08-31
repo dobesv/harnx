@@ -13,7 +13,7 @@ use minijinja::{Environment, UndefinedBehavior};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::server::BUILTIN_TOOL_NAMES;
+use crate::server::{BUILTIN_TOOL_NAMES, COMMAND_TIMEOUT_ARG, DEFAULT_COMMAND_TIMEOUT_SECS};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ToolTemplate {
@@ -42,6 +42,16 @@ impl ToolTemplate {
                 Value::Object(schema_for_parameter(name, parameter)?),
             );
         }
+        properties.insert(
+            COMMAND_TIMEOUT_ARG.to_string(),
+            json!({
+                "type": "integer",
+                "minimum": 0,
+                "description": format!(
+                    "Kill the command after this many seconds. Defaults to {DEFAULT_COMMAND_TIMEOUT_SECS} (24 hours); use 0 for no deadline."
+                )
+            }),
+        );
 
         Ok(json!({
             "type": "object",
@@ -363,6 +373,7 @@ fn default_true() -> bool {
 /// - `BASH_XTRACEFD`: redirect trace output
 /// - `CDPATH`, `GLOBIGNORE`: path/glob behavior
 /// - `BASHOPTS`: shell options
+/// - `TIMEOUT_SECS`: harnx-owned command execution metadata
 ///
 /// Anyone extending or relaxing this list must treat it as a security boundary,
 /// not an ergonomic convenience. A new entry should only be added after confirming
@@ -398,6 +409,7 @@ pub(crate) fn param_to_env_name(param: &str) -> Result<String> {
         "CDPATH",
         "GLOBIGNORE",
         "BASHOPTS",
+        "TIMEOUT_SECS",
     ];
     if CRITICAL_ENV_VARS.contains(&env_name.as_str()) {
         anyhow::bail!(
@@ -586,8 +598,6 @@ fn load_template_file(path: &Path) -> Result<ToolTemplate> {
     let template = parse_template_str(&yaml, path)?;
     validate_tool_name(&template.name)
         .with_context(|| format!("failed to load tool template {}", path.display()))?;
-    validate_env_name_uniqueness(&template)
-        .with_context(|| format!("failed to load tool template {}", path.display()))?;
     Ok(template)
 }
 
@@ -641,6 +651,8 @@ pub(crate) fn parse_template_str(yaml: &str, source: &Path) -> Result<ToolTempla
     template
         .compiled_patterns()
         .with_context(|| format!("failed to load tool template {}", source.display()))?;
+    validate_env_name_uniqueness(&template)
+        .with_context(|| format!("failed to load tool template {}", source.display()))?;
     template
         .input_schema()
         .with_context(|| format!("failed to load tool template {}", source.display()))?;
@@ -685,6 +697,31 @@ script: echo ok
     fn write_template(path: &Path, name: &str, script: &str) {
         fs::write(path, format!("name: {name}\nscript: {script}\n"))
             .expect("template should be written");
+    }
+
+    #[test]
+    fn command_templates_expose_reserved_timeout_control() {
+        let template = parse_template_str(CANONICAL_YAML, Path::new("gh_issue_view.yaml"))
+            .expect("canonical template should parse");
+        let schema = template.input_schema().expect("schema should build");
+        let timeout = &schema["properties"]["timeout_secs"];
+
+        assert_eq!(timeout["type"], json!("integer"));
+        assert_eq!(timeout["minimum"], json!(0));
+        assert!(timeout["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("86400")));
+    }
+
+    #[test]
+    fn command_templates_reject_timeout_parameter_collision() {
+        let error = parse_template_str(
+            "name: collision\nparameters:\n  timeout_secs: { type: integer }\nscript: true\n",
+            Path::new("collision.yaml"),
+        )
+        .expect_err("timeout_secs is reserved for execution control");
+
+        assert!(format!("{error:#}").contains("TIMEOUT_SECS"), "{error:#}");
     }
 
     #[test]
@@ -1272,6 +1309,11 @@ script: echo ok
                         "type": "string",
                         "pattern": r"^[\w.-]+/[\w.-]+$",
                     },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Kill the command after this many seconds. Defaults to 86400 (24 hours); use 0 for no deadline.",
+                    },
                 },
                 "required": ["number", "repo"],
                 "additionalProperties": false,
@@ -1342,6 +1384,11 @@ script: echo ok
                         "type": "number",
                         "minimum": 0.25,
                         "maximum": 1.5,
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Kill the command after this many seconds. Defaults to 86400 (24 hours); use 0 for no deadline.",
                     },
                 },
                 "required": ["attempts", "branch"],

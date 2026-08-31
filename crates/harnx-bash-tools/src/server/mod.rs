@@ -71,6 +71,12 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "rollback_file",
 ];
 
+/// Default execution deadline for foreground commands and command templates.
+pub(crate) const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+/// Reserved per-call execution control automatically exposed by command templates.
+pub(crate) const COMMAND_TIMEOUT_ARG: &str = "timeout_secs";
+
 #[derive(Clone)]
 pub(crate) struct RegisteredToolTemplate {
     pub(crate) template: ToolTemplate,
