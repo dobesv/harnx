@@ -69,6 +69,8 @@ struct Args {
 
     #[command(flatten)]
     metrics: harnx_metrics::MetricsFlags,
+    #[command(flatten)]
+    healthz: harnx_healthz::HealthzFlags,
 }
 
 async fn build_app_state(args: &Args) -> Result<Arc<AppState>> {
@@ -413,9 +415,13 @@ async fn main() -> Result<()> {
 async fn run() -> Result<()> {
     let args = Args::parse();
     harnx_metrics::init(&args.metrics)?;
+    let readiness = harnx_healthz::init(&args.healthz).await?;
     let state = build_app_state(&args).await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = start_server(Arc::clone(&state), listener).await?;
+    if let Some(r) = &readiness {
+        r.ready();
+    }
     let temp_path = write_synthetic_kubeconfig(&state, port)?;
 
     eprintln!(

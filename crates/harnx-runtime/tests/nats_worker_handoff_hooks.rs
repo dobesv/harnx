@@ -394,7 +394,7 @@ async fn handoff_to_agent_with_hooks_starts_its_hook_enforcement() -> Result<()>
     let daemon_config = WorkerDaemonConfig::managing("local", "worker-handoff-hooks");
     let daemon = tokio::spawn({
         let config = config.clone();
-        async move { run_worker_daemon(config, daemon_config, Some(call_fn)).await }
+        async move { run_worker_daemon(config, daemon_config, Some(call_fn), None).await }
     });
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -465,6 +465,7 @@ async fn completed_agent_turn_cleans_hook_routes_before_next_handoff() -> Result
                 config,
                 daemon_config,
                 Some(make_repeated_activation_call_fn()),
+                None,
             )
             .await
         }
@@ -517,7 +518,7 @@ async fn cancelled_agent_turn_cleans_hook_routes() -> Result<()> {
     let daemon = tokio::spawn({
         let config = config.clone();
         let call_fn = make_cancellable_call_fn(Arc::clone(&model_started));
-        async move { run_worker_daemon(config, daemon_config, Some(call_fn)).await }
+        async move { run_worker_daemon(config, daemon_config, Some(call_fn), None).await }
     });
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 

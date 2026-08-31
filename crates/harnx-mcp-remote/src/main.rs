@@ -38,6 +38,12 @@ async fn run() -> anyhow::Result<()> {
     };
     harnx_metrics::init(&flags)?;
 
+    // Initialize healthz if configured via --healthz-addr or HARNX_HEALTHZ_ADDR env.
+    let healthz_flags = harnx_healthz::HealthzFlags {
+        healthz_addr: cli.healthz_addr.clone(),
+    };
+    let readiness = harnx_healthz::init(&healthz_flags).await?;
+
     log::info!(
         "harnx-mcp-remote v{}: starting, proxying to {}",
         env!("CARGO_PKG_VERSION"),
@@ -53,16 +59,27 @@ async fn run() -> anyhow::Result<()> {
     let transport = rmcp::transport::stdio();
     let serve_ct = CancellationToken::new();
 
+    // Signal readiness when stdio transport starts serving.
+    if let Some(ref r) = readiness {
+        r.ready();
+    }
+
     tokio::select! {
         service = server.serve_with_ct(transport, serve_ct.clone()) => {
             let service = service?;
             wait_for_shutdown(&mut sigterm).await;
+            if let Some(ref r) = readiness {
+                r.not_ready();
+            }
             service.service().shutdown_remote().await?;
             service.cancel().await?;
         }
         _ = wait_for_shutdown(&mut sigterm) => {
             // SIGTERM/SIGINT before initialize completes: cancel the in-progress
             // rmcp initialize wait and exit cleanly.
+            if let Some(ref r) = readiness {
+                r.not_ready();
+            }
             serve_ct.cancel();
         }
     }

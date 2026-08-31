@@ -341,7 +341,9 @@ async fn spawn_worker_daemon_with_call_fn(
 ) -> tokio::task::JoinHandle<Result<()>> {
     let worker_config = WorkerDaemonConfig::managing("local", worker_id);
     let daemon =
-        tokio::spawn(async move { run_worker_daemon(config, worker_config, Some(call_fn)).await });
+        tokio::spawn(
+            async move { run_worker_daemon(config, worker_config, Some(call_fn), None).await },
+        );
     tokio::time::sleep(Duration::from_millis(500)).await;
     daemon
 }
@@ -858,7 +860,7 @@ async fn end_of_turn_reread_runs_continuation_turn_with_same_activation() -> Res
     let worker_config = WorkerDaemonConfig::managing("local", "worker-reread");
     let daemon = tokio::spawn({
         let cfg = config.clone();
-        async move { run_worker_daemon(cfg, worker_config, Some(end_turn_call_fn())).await }
+        async move { run_worker_daemon(cfg, worker_config, Some(end_turn_call_fn()), None).await }
     });
     // Give daemon time to initialize consumer
     tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -968,6 +970,7 @@ async fn idle_concurrent_messages_fold_in_seq_order_into_single_turn() -> Result
                 cfg,
                 worker_config,
                 Some(fold_capture_call_fn(calls, prompts)),
+                None,
             )
             .await
         }
@@ -1189,12 +1192,12 @@ async fn dispatch_runs_exactly_one_worker_per_activation_and_reactivation_is_noo
     let h1 = tokio::spawn({
         let c = config_one.clone();
         let call = counting_stub_call_fn(counter_one.clone());
-        async move { run_worker_daemon(c, cfg_one, Some(call)).await }
+        async move { run_worker_daemon(c, cfg_one, Some(call), None).await }
     });
     let h2 = tokio::spawn({
         let c = config_two.clone();
         let call = counting_stub_call_fn(counter_two.clone());
-        async move { run_worker_daemon(c, cfg_two, Some(call)).await }
+        async move { run_worker_daemon(c, cfg_two, Some(call), None).await }
     });
 
     // Give the daemons a moment to subscribe.
@@ -1858,6 +1861,7 @@ async fn retracted_user_message_is_not_executed_by_worker() -> Result<()> {
                 cfg,
                 worker_config,
                 Some(fold_capture_call_fn(calls, captured_prompts)),
+                None,
             )
             .await
         }

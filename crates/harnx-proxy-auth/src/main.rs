@@ -25,6 +25,20 @@ async fn main() -> Result<()> {
 async fn run() -> Result<()> {
     let args = <cli::Args as Parser>::parse();
     harnx_metrics::init(&args.metrics)?;
+    let readiness = harnx_healthz::init(&args.healthz).await?;
+    let nats_mode = nats_mode_enabled();
+    let runtime = build_runtime(&args).await?;
+    if !nats_mode {
+        if let Some(r) = &readiness {
+            r.ready();
+        }
+    }
+    run_dispatch_mode(runtime, readiness, nats_mode).await
+}
+
+/// Assembles the dispatch runtime from CLI args: loads variables, generates
+/// files, starts the proxy, and runs startup hooks to populate extra_env.
+async fn build_runtime(args: &cli::Args) -> Result<DispatchRuntime> {
     let hook_name = args
         .name
         .clone()
@@ -34,7 +48,7 @@ async fn run() -> Result<()> {
     // surface structured notices that the JSONL loop drains to stdout.
     let notice_rx = notice::init_channel();
     let sentinels = Arc::new(sentinel::Sentinels::generate());
-    let loaded_vars = load_variables(&args)?;
+    let loaded_vars = load_variables(args)?;
     let fs_temp_dir = if args.fs.is_empty() {
         None
     } else {
@@ -58,7 +72,8 @@ async fn run() -> Result<()> {
     let (ca_setup, _ca_temp_dir) = ca::setup()?;
     let ca_cert_path = ca_setup.cert_pem_path.clone();
     let ca_cert_pem = std::fs::read_to_string(&ca_cert_path)?;
-    let port = proxy::start_proxy_with_log(pipeline.clone(), ca_setup, args.log_file).await?;
+    let port =
+        proxy::start_proxy_with_log(pipeline.clone(), ca_setup, args.log_file.clone()).await?;
     let env_vars = filter::JaqVars::new_from_values(
         &sentinels,
         temp_file_root.clone(),
@@ -86,21 +101,16 @@ async fn run() -> Result<()> {
         extra_env.insert(key, value);
     }
 
-    let nats_mode = nats_mode_enabled();
-    write_readiness_for_mode(nats_mode, port, &ca_cert_path, &ca_cert_pem)?;
+    write_readiness_for_mode(nats_mode_enabled(), port, &ca_cert_path, &ca_cert_pem)?;
 
-    run_dispatch_mode(
-        DispatchRuntime {
-            name: hook_name,
-            port,
-            ca_cert_path,
-            extra_env,
-            notice_rx,
-            fs_temp_dir,
-        },
-        nats_mode,
-    )
-    .await
+    Ok(DispatchRuntime {
+        name: hook_name,
+        port,
+        ca_cert_path,
+        extra_env,
+        notice_rx,
+        fs_temp_dir,
+    })
 }
 
 fn load_variables(args: &cli::Args) -> Result<Vec<(String, serde_json::Value)>> {
@@ -158,7 +168,11 @@ struct DispatchRuntime {
     fs_temp_dir: Option<tempfile::TempDir>,
 }
 
-async fn run_dispatch_mode(runtime: DispatchRuntime, nats_mode: bool) -> Result<()> {
+async fn run_dispatch_mode(
+    runtime: DispatchRuntime,
+    readiness: Option<harnx_healthz::Readiness>,
+    nats_mode: bool,
+) -> Result<()> {
     let DispatchRuntime {
         name,
         port,
@@ -171,24 +185,29 @@ async fn run_dispatch_mode(runtime: DispatchRuntime, nats_mode: bool) -> Result<
         // Keep generated credentials and notice channel alive for hook-server lifetime.
         let _temp_dir_guard = fs_temp_dir;
         let _notice_rx_guard = notice_rx;
-        return harnx_hookset_server::run_hookset_main(hook::ProxyAuthHook::new(
-            name,
-            port,
-            ca_cert_path,
-            extra_env,
-        ))
+        return harnx_hookset_server::run_hookset_main_with_readiness(
+            hook::ProxyAuthHook::new(name, port, ca_cert_path, extra_env),
+            readiness,
+        )
         .await;
     }
     if let Some(temp_dir) = fs_temp_dir {
         return tokio::select! {
             result = hook::run_jsonl_loop(port, ca_cert_path, extra_env, notice_rx) => result,
             _ = shutdown_signal() => {
+                if let Some(r) = &readiness { r.not_ready(); }
                 drop(temp_dir);
                 Ok(())
             }
         };
     }
-    hook::run_jsonl_loop(port, ca_cert_path, extra_env, notice_rx).await
+    tokio::select! {
+        result = hook::run_jsonl_loop(port, ca_cert_path, extra_env, notice_rx) => result,
+        _ = shutdown_signal() => {
+            if let Some(r) = &readiness { r.not_ready(); }
+            Ok(())
+        }
+    }
 }
 
 fn should_write_readiness(nats_mode: bool, hook_protocol: Option<&str>) -> bool {

@@ -61,6 +61,10 @@ pub struct Args {
     /// Prometheus metrics endpoint configuration.
     #[command(flatten)]
     pub metrics: harnx_metrics::MetricsFlags,
+
+    /// Healthz readiness endpoint configuration.
+    #[command(flatten)]
+    pub healthz: harnx_healthz::HealthzFlags,
 }
 
 impl Args {

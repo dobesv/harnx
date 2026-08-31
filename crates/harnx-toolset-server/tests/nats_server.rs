@@ -5,7 +5,9 @@ use common::{request_headers, wait_for_registration, TestHarness, TestToolset, T
 use harnx_core::execution_context::{ExecutionContextObservation, EXECUTION_CONTEXT_NAMESPACE};
 use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{ControlKind, ControlMessage, ToolReply, ToolRequest};
-use harnx_toolset_server::{registration_key, serve_with_shutdown, TOOL_REGISTRY_BUCKET};
+use harnx_toolset_server::{
+    registration_key, serve_with_shutdown, ServeLifecycle, TOOL_REGISTRY_BUCKET,
+};
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
@@ -326,7 +328,7 @@ async fn old_instances_shutdown_does_not_delete_a_replacements_registration() ->
                     client: new_client,
                     replicas: 1,
                 },
-                shutdown,
+                ServeLifecycle::new(shutdown, None),
             )
             .await
         })
@@ -373,6 +375,10 @@ async fn graceful_shutdown_removes_the_registration() -> Result<()> {
         return Ok(());
     };
     assert_registration(&harness).await?;
+    assert!(
+        harness.readiness.is_ready(),
+        "server should be ready after subscriptions flush"
+    );
 
     let jetstream = async_nats::jetstream::new(harness.client.clone());
     let registry = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await?;
@@ -380,6 +386,10 @@ async fn graceful_shutdown_removes_the_registration() -> Result<()> {
     assert!(registry.get(&key).await?.is_some());
 
     harness.shutdown().await;
+    assert!(
+        !harness.readiness.is_ready(),
+        "server should become not ready before shutdown completes"
+    );
 
     assert!(
         registry.get(&key).await?.is_none(),

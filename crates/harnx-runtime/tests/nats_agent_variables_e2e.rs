@@ -256,6 +256,7 @@ impl TestEnv {
                 config,
                 WorkerDaemonConfig::managing("local", worker_id),
                 Some(call_fn),
+                None,
             )
             .await;
         });

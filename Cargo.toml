@@ -18,6 +18,7 @@ members = [
     "crates/harnx-fs-tools",
     "crates/harnx-mcp-time",
     "crates/harnx-metrics",
+    "crates/harnx-healthz",
     "crates/harnx-grep-tools",
     "crates/harnx-mcp-remote",
     "crates/harnx-plans-tools",
@@ -200,6 +201,7 @@ harnx-mcp-history = { path = "crates/harnx-mcp-history" }
 harnx-sandbox-common = { path = "crates/harnx-sandbox-common" }
 harnx-tool-allow = { path = "crates/harnx-tool-allow" }
 harnx-metrics = { path = "crates/harnx-metrics" }
+harnx-healthz = { path = "crates/harnx-healthz" }
 similar = "3"
 jaq-core = "3.0.0"
 jaq-std = "3.0.0"

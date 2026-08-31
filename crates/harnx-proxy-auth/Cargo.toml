@@ -15,6 +15,7 @@ name = "harnx-proxy-auth"
 path = "src/main.rs"
 
 [dependencies]
+harnx-healthz = { workspace = true }
 anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true

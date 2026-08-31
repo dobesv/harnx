@@ -1,0 +1,18 @@
+[package]
+name = "harnx-healthz"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Opt-in readiness endpoint for harnx services"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use harnx_core::instance::ServerScope;
 use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset, HDR_CALL_ID, HDR_IDEMPOTENCY_KEY};
-use harnx_toolset_server::serve_with_shutdown;
+use harnx_toolset_server::{serve_with_shutdown, ServeLifecycle};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -220,6 +220,7 @@ pub(crate) struct TestHarness {
     pub(crate) client: async_nats::Client,
     pub(crate) instance_id: ServerScope,
     pub(crate) toolset: TestToolset,
+    pub(crate) readiness: harnx_healthz::Readiness,
 }
 
 impl TestHarness {
@@ -230,6 +231,7 @@ impl TestHarness {
         let instance_id = ServerScope::new();
         let toolset = TestToolset::default();
         let shutdown = CancellationToken::new();
+        let readiness = harnx_healthz::Readiness::default();
         let server_client = async_nats::ConnectOptions::new()
             .token(TOKEN.to_string())
             .connect(&server.url)
@@ -237,6 +239,7 @@ impl TestHarness {
         let server_toolset = toolset.clone();
         let server_instance_id = instance_id.clone();
         let server_shutdown = shutdown.clone();
+        let server_readiness = readiness.clone();
         let server_task = tokio::spawn(async move {
             serve_with_shutdown(
                 Arc::new(server_toolset),
@@ -245,7 +248,7 @@ impl TestHarness {
                     client: server_client,
                     replicas: 1,
                 },
-                server_shutdown,
+                ServeLifecycle::new(server_shutdown, Some(server_readiness)),
             )
             .await
         });
@@ -260,6 +263,7 @@ impl TestHarness {
             client,
             instance_id,
             toolset,
+            readiness,
         }))
     }
 

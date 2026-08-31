@@ -149,6 +149,9 @@ fn print_help_and_exit() -> ! {
     eprintln!("  --metrics-addr <ADDR>     Serve Prometheus metrics at http://ADDR/metrics.");
     eprintln!("                            Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
     eprintln!("                            Also honors HARNX_METRICS_ADDR env.");
+    eprintln!("  --healthz-addr <ADDR>     Serve readiness checks at http://ADDR/healthz.");
+    eprintln!("                            Blank host binds 0.0.0.0, e.g. :8457. Unset disables.");
+    eprintln!("                            Also honors HARNX_HEALTHZ_ADDR env.");
     eprintln!("  --help, -h                Show this help message");
     eprintln!();
     eprintln!("Environment:");
@@ -179,6 +182,37 @@ fn initial_sandbox_config() -> SandboxConfig {
     }
 }
 
+const PASSTHROUGH_FLAGS: [(&str, &str); 2] = [
+    ("--metrics-addr", "--metrics-addr="),
+    ("--healthz-addr", "--healthz-addr="),
+];
+
+struct ParseState<'a> {
+    args: &'a [String],
+    index: usize,
+}
+
+impl ParseState<'_> {
+    fn current(&self) -> &str {
+        self.args[self.index].as_str()
+    }
+
+    fn consume_passthrough(&mut self) -> bool {
+        let arg = self.current();
+        for (flag, assignment) in PASSTHROUGH_FLAGS {
+            if arg == flag {
+                self.index += 2;
+                return true;
+            }
+            if arg.starts_with(assignment) {
+                self.index += 1;
+                return true;
+            }
+        }
+        false
+    }
+}
+
 fn parse_cli_args(
     args: &[String],
     inputs: &mut AllowInputs,
@@ -187,69 +221,63 @@ fn parse_cli_args(
     cli_dirs: &mut Vec<PathBuf>,
 ) -> Result<Option<PathBuf>, String> {
     let mut sandbox_run_override = None;
-    let mut i = 1;
+    let mut state = ParseState { args, index: 1 };
 
-    while i < args.len() {
-        match args[i].as_str() {
+    while state.index < args.len() {
+        if state.consume_passthrough() {
+            continue;
+        }
+        match state.current() {
             "--allow-read" => {
-                inputs.read.push(required_path(args, i));
-                i += 2;
+                inputs.read.push(required_path(args, state.index));
+                state.index += 2;
             }
             "--allow-write" => {
-                inputs.write.push(required_path(args, i));
-                i += 2;
+                inputs.write.push(required_path(args, state.index));
+                state.index += 2;
             }
             "--allow-exec" => {
-                inputs.exec.push(required_path(args, i));
-                i += 2;
+                inputs.exec.push(required_path(args, state.index));
+                state.index += 2;
             }
             "--allow-rwx" => {
-                inputs.rwx.push(required_path(args, i));
-                i += 2;
+                inputs.rwx.push(required_path(args, state.index));
+                state.index += 2;
             }
             "--allow-common-default" => {
                 inputs.common_default = true;
-                i += 1;
+                state.index += 1;
             }
             "--allow-dev-tools" => {
                 inputs.dev_tools = true;
-                i += 1;
+                state.index += 1;
             }
             "--allow-repo-work" => {
                 inputs.repo_work = true;
-                i += 1;
+                state.index += 1;
             }
             "--allow-all" => {
                 inputs.all = true;
-                i += 1;
+                state.index += 1;
             }
             "--no-sandbox" => {
                 config.enabled = false;
-                i += 1;
+                state.index += 1;
             }
             "--sandbox-run" => {
-                sandbox_run_override = Some(required_path(args, i));
-                i += 2;
+                sandbox_run_override = Some(required_path(args, state.index));
+                state.index += 2;
             }
             "--tool" => {
-                cli_files.push(required_path(args, i));
-                i += 2;
+                cli_files.push(required_path(args, state.index));
+                state.index += 2;
             }
             "--tools-dir" => {
-                cli_dirs.push(required_path(args, i));
-                i += 2;
+                cli_dirs.push(required_path(args, state.index));
+                state.index += 2;
             }
-            "--env" | "-e" => parse_env_option(args, &mut i, config),
-            arg if arg.starts_with("--metrics-addr") => {
-                // Skip --metrics-addr (both forms) so the strict parser doesn't reject it.
-                // The shared helper in run_toolset_main handles actual parsing.
-                if arg == "--metrics-addr" {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            "--mcp-stdio" => i += 1,
+            "--env" | "-e" => parse_env_option(args, &mut state.index, config),
+            "--mcp-stdio" => state.index += 1,
             "--help" | "-h" => print_help_and_exit(),
             other => {
                 return Err(format!(

@@ -1,7 +1,7 @@
 use anyhow::Context;
 use harnx_mcp_bridge::{report_tools, Args, BridgeToolset};
 use harnx_nats_common::connect::{NatsConnection, NatsEndpoint};
-use harnx_toolset_server::serve_with_shutdown;
+use harnx_toolset_server::{serve_with_shutdown, ServeLifecycle};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -20,6 +20,7 @@ async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
 
     harnx_metrics::init(&args.metrics)?;
+    let readiness = harnx_healthz::init(&args.healthz).await?;
 
     if args.list_tools {
         let name = args.name.unwrap_or_else(|| "mcp-diagnostic".to_string());
@@ -51,7 +52,13 @@ async fn run() -> anyhow::Result<()> {
             client,
             replicas: endpoint.resolved_replicas(),
         };
-        serve_with_shutdown(Arc::new(bridge), scope, connection, shutdown).await
+        serve_with_shutdown(
+            Arc::new(bridge),
+            scope,
+            connection,
+            ServeLifecycle::new(shutdown, readiness),
+        )
+        .await
     };
 
     tokio::select! {

@@ -29,6 +29,8 @@ struct Args {
 
     #[command(flatten)]
     metrics: harnx_metrics::MetricsFlags,
+    #[command(flatten)]
+    healthz: harnx_healthz::HealthzFlags,
 }
 
 #[derive(Serialize)]
@@ -235,9 +237,13 @@ async fn main() -> Result<()> {
 async fn run() -> Result<()> {
     let args = Args::parse();
     harnx_metrics::init(&args.metrics)?;
+    let readiness = harnx_healthz::init(&args.healthz).await?;
     let state = build_app_state(&args).await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = start_server(Arc::clone(&state), listener).await?;
+    if let Some(r) = &readiness {
+        r.ready();
+    }
 
     run_hook_loop(&state, port).await
 }

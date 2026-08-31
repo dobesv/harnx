@@ -16,6 +16,74 @@ const DEFAULT_PLAN_LABEL: &str = "harnx-plan";
 pub const GITHUB_HOST: &str = "github.com";
 const GIT_DETECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Copy)]
+struct Flag(&'static str);
+
+impl std::fmt::Display for Flag {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+const TOKEN: Flag = Flag("--token");
+const API_URL: Flag = Flag("--api-url");
+const MAX_WAIT_SECS: Flag = Flag("--max-wait-secs");
+const RETENTION_DAYS: Flag = Flag("--retention-days");
+const PLAN_LABEL: Flag = Flag("--plan-label");
+const DELETE_BEHAVIOR: Flag = Flag("--delete-behavior");
+const HOST: Flag = Flag("--host");
+const PORT: Flag = Flag("--port");
+const PASSTHROUGH_FLAGS: [(&str, &str); 2] = [
+    ("--metrics-addr", "--metrics-addr="),
+    ("--healthz-addr", "--healthz-addr="),
+];
+
+struct ParseState<'a> {
+    args: &'a [String],
+    index: usize,
+}
+
+impl ParseState<'_> {
+    fn current(&self) -> &str {
+        self.args[self.index].as_str()
+    }
+
+    fn next_value(&mut self, flag: Flag) -> Result<String> {
+        let Some(value) = self.args.get(self.index + 1) else {
+            bail!("harnx-mcp-plans-github: {flag} requires a value");
+        };
+        self.index += 2;
+        Ok(value.clone())
+    }
+
+    fn parse_u64(&mut self, flag: Flag) -> Result<u64> {
+        let value = self.next_value(flag)?;
+        parse_u64_value(flag.0, &value)
+    }
+
+    fn parse_u16(&mut self, flag: Flag) -> Result<u16> {
+        let value = self.next_value(flag)?;
+        value.parse::<u16>().with_context(|| {
+            format!("harnx-mcp-plans-github: {flag} requires a valid port number (got: {value})")
+        })
+    }
+
+    fn consume_passthrough(&mut self) -> bool {
+        let arg = self.current();
+        for (flag, assignment) in PASSTHROUGH_FLAGS {
+            if arg == flag {
+                self.index += 2;
+                return true;
+            }
+            if arg.starts_with(assignment) {
+                self.index += 1;
+                return true;
+            }
+        }
+        false
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub auth: AuthConfig,
@@ -27,6 +95,7 @@ pub struct AppConfig {
     pub host: String,
     pub port: u16,
     pub metrics_addr: Option<String>,
+    pub healthz_addr: Option<String>,
 }
 
 impl AppConfig {
@@ -63,48 +132,48 @@ impl AppConfig {
         let mut http = false;
         let mut host: Option<String> = None;
         let mut port: Option<u16> = None;
-        let mut unknown_args: Vec<String> = Vec::new();
-
         let args: Vec<String> = args.into_iter().map(Into::into).collect();
-        let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
+        let mut state = ParseState {
+            args: &args,
+            index: 0,
+        };
+        while state.index < args.len() {
+            if state.consume_passthrough() {
+                continue;
+            }
+            match state.current() {
                 "--token" => {
-                    token_arg = Some(next_value(&args, &mut i, "--token")?);
+                    token_arg = Some(state.next_value(TOKEN)?);
                 }
                 "--api-url" => {
-                    base_url_arg = Some(next_value(&args, &mut i, "--api-url")?);
+                    base_url_arg = Some(state.next_value(API_URL)?);
                 }
                 "--max-wait-secs" => {
-                    max_wait_secs_arg = Some(parse_u64_flag(&args, &mut i, "--max-wait-secs")?);
+                    max_wait_secs_arg = Some(state.parse_u64(MAX_WAIT_SECS)?);
                 }
                 "--retention-days" | "-r" => {
-                    retention_days_arg = Some(parse_u64_flag(&args, &mut i, "--retention-days")?);
+                    retention_days_arg = Some(state.parse_u64(RETENTION_DAYS)?);
                 }
                 "--plan-label" => {
-                    plan_label_arg = Some(next_value(&args, &mut i, "--plan-label")?);
+                    plan_label_arg = Some(state.next_value(PLAN_LABEL)?);
                 }
                 "--delete-behavior" => {
-                    delete_behavior_arg = Some(parse_delete_behavior(&next_value(
-                        &args,
-                        &mut i,
-                        "--delete-behavior",
-                    )?)?);
+                    delete_behavior_arg =
+                        Some(parse_delete_behavior(&state.next_value(DELETE_BEHAVIOR)?)?);
                 }
                 "--http" => {
                     http = true;
-                    i += 1;
+                    state.index += 1;
                 }
                 "--host" => {
-                    host = Some(next_value(&args, &mut i, "--host")?);
+                    host = Some(state.next_value(HOST)?);
                 }
                 "--port" => {
-                    port = Some(parse_u16_flag(&args, &mut i, "--port")?);
+                    port = Some(state.parse_u16(PORT)?);
                 }
                 "--help" | "-h" => print_help_and_exit(),
                 unknown => {
-                    unknown_args.push(unknown.to_string());
-                    i += 1;
+                    bail!("harnx-mcp-plans-github: unknown argument: {unknown}")
                 }
             }
         }
@@ -113,12 +182,8 @@ impl AppConfig {
         let metrics_addr = harnx_metrics::metrics_addr_from_args(args.clone())
             .or_else(|| env("HARNX_METRICS_ADDR"));
 
-        // Check for unrecognized arguments (excluding metrics-addr which was already consumed)
-        for arg in unknown_args {
-            if !arg.starts_with("--metrics-addr") {
-                bail!("harnx-mcp-plans-github: unknown argument: {arg}");
-            }
-        }
+        let healthz_addr = harnx_healthz::healthz_addr_from_args(args.clone())
+            .or_else(|| env("HARNX_HEALTHZ_ADDR"));
 
         let default_repo = match origin_provider().and_then(|origin| parse_github_origin(&origin)) {
             Ok(repo) => Some(repo),
@@ -194,6 +259,7 @@ impl AppConfig {
             host,
             port,
             metrics_addr,
+            healthz_addr,
         })
     }
 }
@@ -338,27 +404,6 @@ fn first_non_empty(a: Option<String>, b: Option<String>) -> Option<String> {
         .find(|value| !value.is_empty())
 }
 
-fn next_value(args: &[String], index: &mut usize, flag: &str) -> Result<String> {
-    if *index + 1 >= args.len() {
-        bail!("harnx-mcp-plans-github: {flag} requires a value");
-    }
-    let value = args[*index + 1].clone();
-    *index += 2;
-    Ok(value)
-}
-
-fn parse_u64_flag(args: &[String], index: &mut usize, flag: &str) -> Result<u64> {
-    let value = next_value(args, index, flag)?;
-    parse_u64_value(flag, &value)
-}
-
-fn parse_u16_flag(args: &[String], index: &mut usize, flag: &str) -> Result<u16> {
-    let value = next_value(args, index, flag)?;
-    value.parse::<u16>().with_context(|| {
-        format!("harnx-mcp-plans-github: {flag} requires a valid port number (got: {value})")
-    })
-}
-
 fn parse_u64_env(name: &str, value: &str) -> Result<u64> {
     parse_u64_value(name, value)
 }
@@ -394,11 +439,16 @@ fn print_help_and_exit() -> ! {
     eprintln!("  --http                      Serve MCP over Streamable HTTP at /mcp");
     eprintln!("  --host <addr>               Bind address for HTTP mode (default: 127.0.0.1; set explicitly for wider exposure)");
     eprintln!("  --port <N>                  Bind port for HTTP mode (default: 3000)");
-    eprintln!("  --metrics-addr <ADDR>       Serve Prometheus metrics at http://ADDR/metrics.");
+    eprintln!("  --metrics-addr <ADDR>        Serve Prometheus metrics at http://ADDR/metrics.");
     eprintln!(
         "                              Blank host binds 0.0.0.0, e.g. :8456. Unset disables."
     );
     eprintln!("                              Also honors HARNX_METRICS_ADDR env.");
+    eprintln!("  --healthz-addr <ADDR>       Serve readiness probe at http://ADDR/healthz.");
+    eprintln!(
+        "                              Blank host binds 0.0.0.0, e.g. :8457. Unset disables."
+    );
+    eprintln!("                              Also honors HARNX_HEALTHZ_ADDR env.");
     eprintln!("  --help, -h                  Show this help message");
     eprintln!();
     eprintln!(

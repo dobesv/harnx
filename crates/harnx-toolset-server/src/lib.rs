@@ -2,9 +2,12 @@
 
 pub mod content;
 mod drain;
+mod lifecycle;
 mod registration_identity;
 pub mod schema;
+mod subscriptions;
 
+pub use lifecycle::ServeLifecycle;
 pub use registration_identity::RegistrationIdentity;
 
 use anyhow::{Context, Result};
@@ -107,7 +110,7 @@ fn metric_tool_name<'a>(toolset: &dyn Toolset, requested: &'a str) -> &'a str {
 struct ServeSettings {
     instance_id: ServerScope,
     connection: NatsConnection,
-    shutdown: CancellationToken,
+    lifecycle: ServeLifecycle,
     identity: RegistrationIdentity,
 }
 
@@ -205,7 +208,7 @@ pub async fn serve_with_client_and_identity(
         ServeSettings {
             instance_id,
             connection,
-            shutdown: CancellationToken::new(),
+            lifecycle: ServeLifecycle::new(CancellationToken::new(), None),
             identity,
         },
     )
@@ -213,51 +216,50 @@ pub async fn serve_with_client_and_identity(
 }
 
 /// Serve a toolset using an existing NATS connection, exiting cleanly (and
-/// running exit cleanup while the connection is still usable) when
-/// `shutdown` is cancelled, in addition to the usual failure exits.
+/// running exit cleanup while the connection is still usable) when the
+/// lifecycle's shutdown token is cancelled, in addition to the usual failure exits.
 pub async fn serve_with_shutdown(
     toolset: Arc<dyn Toolset>,
     instance_id: ServerScope,
     connection: NatsConnection,
-    shutdown: CancellationToken,
+    lifecycle: ServeLifecycle,
 ) -> Result<()> {
     serve_configured(
         toolset,
         ServeSettings {
             instance_id,
             connection,
-            shutdown,
+            lifecycle,
             identity: RegistrationIdentity::from_env(),
         },
     )
     .await
 }
 
+/// Serve a toolset with an existing NATS connection and configured lifecycle.
+///
+/// **Avoiding double-init (EADDRINUSE):** Callers that have already initialized healthz
+/// (via `harnx_healthz::init()`) should put the resulting `Readiness` in the lifecycle.
+/// `None` is appropriate only for entry points that do not pre-initialize healthz.
 async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) -> Result<()> {
     let ServeSettings {
         instance_id,
         connection,
-        shutdown,
+        lifecycle,
         identity,
     } = settings;
+    let (shutdown, readiness) = lifecycle.into_parts();
     let NatsConnection { client, replicas } = connection;
     let server_name = toolset.name().to_owned();
     let RegistrationIdentity { package, config } = identity;
     let identity_token = server_identity_token(package.as_deref(), &config, &server_name);
-    let tool_subject = instance_id.tool_subject(&identity_token, ">");
-    let control_subject = instance_id.control_subject();
-
-    let mut tool_requests = client
-        .queue_subscribe(tool_subject.clone(), identity_token.clone())
-        .await
-        .with_context(|| format!("subscribe to tool requests on {tool_subject}"))?;
-    let mut controls = client
-        .subscribe(control_subject.clone())
-        .await
-        .with_context(|| format!("subscribe to controls on {control_subject}"))?;
-
-    // Both subscriptions must be active before registration makes this server discoverable.
-    client.flush().await.context("flush tool subscriptions")?;
+    let (mut tool_requests, mut controls) = subscriptions::subscribe_to_requests(
+        &client,
+        &instance_id,
+        &identity_token,
+        readiness.as_ref(),
+    )
+    .await?;
 
     let registration = Registration {
         package,
@@ -301,6 +303,10 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
         },
     )
     .await;
+
+    if let Some(readiness) = readiness.as_ref() {
+        readiness.not_ready();
+    }
 
     // Give callers already waiting on a reply a chance to get one: wait for
     // in-flight requests to finish before deregistering, bounded so a stuck
@@ -771,23 +777,51 @@ async fn publish_registration(
         .with_context(|| format!("publish tool registration '{key}'"))
 }
 
+fn print_toolset_help() {
+    eprintln!("Options:");
+    eprintln!("  --mcp-stdio               Use MCP stdio transport instead of NATS");
+    eprintln!("  --metrics-addr <ADDR>     Serve Prometheus metrics at http://ADDR/metrics.");
+    eprintln!("                            Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
+    eprintln!("                            Also honors HARNX_METRICS_ADDR env.");
+    eprintln!("  --healthz-addr <ADDR>     Serve readiness checks at http://ADDR/healthz.");
+    eprintln!("                            Blank host binds 0.0.0.0, e.g. :8457. Unset disables.");
+    eprintln!("                            Also honors HARNX_HEALTHZ_ADDR env.");
+    eprintln!("  --help, -h                Show this help message");
+}
+
 /// Run a toolset in MCP stdio mode when `--mcp-stdio` is present, otherwise
 /// NATS mode.
 ///
 /// In NATS mode, wires SIGTERM/Ctrl+C to a graceful stop so a pod killed by
 /// Kubernetes gets a chance to remove its own registration instead of
 /// leaving it for the TTL.
+///
+/// **Strict front-parser binaries:** `harnx-{bash,fs,grep}-tools` have their own argument
+/// parsers that reject unknown flags BEFORE delegating here. When adding any new
+/// cross-cutting CLI flag to this shared entry point, update EACH front parser to
+/// recognize and skip both `--flag VALUE` (separate) and `--flag=VALUE` (equals) forms.
+/// Use EXACT match (`arg == "--flag"` or `arg.strip_prefix("--flag=")`), not
+/// `starts_with("--flag")`, to reject near-prefix typos like `--flag-typo`.
 pub async fn run_toolset_main<T>(toolset: T) -> Result<()>
 where
     T: Toolset + 'static,
 {
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
 
+    if std::env::args_os().any(|arg| arg == "--help" || arg == "-h") {
+        print_toolset_help();
+        return Ok(());
+    }
+
     let metrics_addr = harnx_metrics::metrics_addr_from_args(
         std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()),
     )
     .or_else(|| std::env::var("HARNX_METRICS_ADDR").ok());
     harnx_metrics::init(&harnx_metrics::MetricsFlags { metrics_addr })?;
+
+    let healthz_addr = harnx_healthz::healthz_addr_from_args(std::env::args())
+        .or_else(|| std::env::var("HARNX_HEALTHZ_ADDR").ok());
+    let readiness = harnx_healthz::init(&harnx_healthz::HealthzFlags { healthz_addr }).await?;
 
     let service_name = format!("harnx-{}-server", toolset.name());
     let telemetry = harnx_telemetry::init_telemetry(&service_name)?;
@@ -799,7 +833,14 @@ where
                 .serve(rmcp::transport::stdio())
                 .await
                 .context("start MCP stdio server")?;
-            service.waiting().await.context("run MCP stdio server")?;
+            if let Some(readiness) = readiness.as_ref() {
+                readiness.ready();
+            }
+            let outcome = service.waiting().await.context("run MCP stdio server");
+            if let Some(readiness) = readiness.as_ref() {
+                readiness.not_ready();
+            }
+            outcome?;
             return Ok(());
         }
 
@@ -813,7 +854,13 @@ where
             replicas: endpoint.resolved_replicas(),
         };
         let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
-        serve_with_shutdown(toolset, scope, connection, shutdown).await
+        serve_with_shutdown(
+            toolset,
+            scope,
+            connection,
+            ServeLifecycle::new(shutdown, readiness),
+        )
+        .await
     }
     .await;
 

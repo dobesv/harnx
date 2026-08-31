@@ -13,6 +13,8 @@ async fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
-    let hook = ClaudeCompatibleHook::try_from(Args::parse())?;
-    harnx_hookset_server::run_hookset_main(hook).await
+    let args = Args::parse();
+    let readiness = harnx_healthz::init(&args.healthz).await?;
+    let hook = ClaudeCompatibleHook::try_from(args)?;
+    harnx_hookset_server::run_hookset_main_with_readiness(hook, readiness).await
 }

@@ -12,6 +12,7 @@ anyhow = { workspace = true }
 async-nats = { workspace = true }
 futures-util = { workspace = true }
 harnx-core = { path = "../harnx-core" }
+harnx-healthz = { workspace = true }
 harnx-metrics = { workspace = true }
 harnx-nats-common = { workspace = true }
 harnx-telemetry = { workspace = true, features = ["mcp", "nats"] }

@@ -9,6 +9,7 @@ description = "stdio MCP proxy that forwards to remote HTTP MCP servers"
 
 [dependencies]
 harnx-core = { path = "../harnx-core" }
+harnx-healthz = { workspace = true }
 harnx-metrics = { workspace = true }
 harnx-telemetry = { workspace = true }
 log = { workspace = true }

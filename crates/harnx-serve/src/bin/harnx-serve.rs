@@ -36,6 +36,8 @@ struct Cli {
     pub agent_variable: Vec<String>,
     #[command(flatten)]
     metrics: harnx_metrics::MetricsFlags,
+    #[command(flatten)]
+    healthz: harnx_healthz::HealthzFlags,
 }
 
 #[tokio::main]
@@ -58,6 +60,7 @@ async fn main() -> Result<()> {
 async fn run(cli: Cli) -> Result<Option<anyhow::Error>> {
     harnx_metrics::init(&cli.metrics)?;
 
+    let readiness = harnx_healthz::init(&cli.healthz).await?;
     let config = Arc::new(RwLock::new(
         Config::init_headless(WorkingMode::Serve, false)
             .await
@@ -72,9 +75,11 @@ async fn run(cli: Cli) -> Result<Option<anyhow::Error>> {
     }
     config.write().agent_variables = collect_agent_variables(&cli.agent_variable)?;
 
-    Ok(harnx_serve::run(config, cli.addr, cli.web_assets)
-        .await
-        .err())
+    Ok(
+        harnx_serve::run(config, cli.addr, cli.web_assets, readiness)
+            .await
+            .err(),
+    )
 }
 
 #[cfg(test)]

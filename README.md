@@ -244,6 +244,7 @@ Harnx supports custom dark and light themes, which highlight response text and c
 - [NATS HA Deployment Guide](docs/nats-ha.md)
 - [OpenTelemetry Tracing](docs/tracing.md)
 - [Prometheus Metrics](docs/metrics.md)
+- [Health & Readiness Endpoint](docs/healthz.md)
 - [Configuration Guide](docs/configuration-guide.md)
 - [Tool Confirmation Guide](docs/tool-confirmation-guide.md)
 - [Custom Theme](docs/custom-theme.md)

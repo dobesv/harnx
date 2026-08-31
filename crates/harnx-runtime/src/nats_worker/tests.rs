@@ -320,7 +320,7 @@ pub(super) fn spawn_metis_worker_with_hooks(
     let worker_config = Arc::new(parking_lot::RwLock::new(worker_config));
     tokio::spawn({
         let worker_config = Arc::clone(&worker_config);
-        async move { run_worker_daemon(worker_config, daemon, Some(call_fn)).await }
+        async move { run_worker_daemon(worker_config, daemon, Some(call_fn), None).await }
     })
 }
 
