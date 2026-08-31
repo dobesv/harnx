@@ -15,6 +15,7 @@ name = "harnx-serve"
 path = "src/bin/harnx-serve.rs"
 
 [dependencies]
+harnx-healthz = { workspace = true }
 ag-ui-core = "=0.1.0"
 anyhow = { workspace = true }
 bytes = { workspace = true }

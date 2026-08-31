@@ -1,5 +1,9 @@
 //! Server-side adapter for hosting a [`harnx_hookset::Hook`] over Core NATS.
 
+mod lifecycle;
+
+pub use lifecycle::ServeLifecycle;
+
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv};
 use futures_util::{stream::select_all, StreamExt};
@@ -60,18 +64,25 @@ pub async fn serve_with_client(
 ) -> Result<()> {
     // Never cancelled: this entry point has no shutdown signal of its own, so
     // it only ever exits through `serve_requests`' bail! conditions.
-    serve_with_shutdown(hook, instance_id, connection, CancellationToken::new()).await
+    serve_with_shutdown(
+        hook,
+        instance_id,
+        connection,
+        ServeLifecycle::new(CancellationToken::new(), None),
+    )
+    .await
 }
 
 /// Serve a hook using an existing NATS connection, exiting cleanly (and
-/// running exit cleanup while the connection is still usable) when
-/// `shutdown` is cancelled, in addition to the usual failure exits.
+/// running exit cleanup while the connection is still usable) when the
+/// lifecycle's shutdown token is cancelled, in addition to the usual failure exits.
 pub async fn serve_with_shutdown(
     hook: Arc<dyn Hook>,
     instance_id: ServerScope,
     connection: NatsConnection,
-    shutdown: CancellationToken,
+    lifecycle: ServeLifecycle,
 ) -> Result<()> {
+    let (shutdown, readiness) = lifecycle.into_parts();
     let NatsConnection { client, replicas } = connection;
     let server = hook.name().to_owned();
     let hooks = hook.hooks();
@@ -93,6 +104,11 @@ pub async fn serve_with_shutdown(
 
     // Subscriptions must be active before registration makes this server discoverable.
     client.flush().await.context("flush hook subscriptions")?;
+
+    // Ready to receive hook requests; signal readiness before publishing registration.
+    if let Some(ref r) = readiness {
+        r.ready();
+    }
 
     let registration = HookRegistration {
         server: server.clone(),
@@ -125,6 +141,11 @@ pub async fn serve_with_shutdown(
         },
     )
     .await;
+
+    // No longer ready to serve; stop accepting new requests before cleaning up.
+    if let Some(ref r) = readiness {
+        r.not_ready();
+    }
 
     // Best-effort: the TTL is the backstop when this cannot run.
     let key = hook_registration_key(&instance_id, &server);
@@ -297,12 +318,39 @@ pub async fn publish_hook_registration(
 /// Wires SIGTERM/Ctrl+C to a graceful stop so a pod killed by Kubernetes gets
 /// a chance to remove its own registration instead of leaving it for the TTL.
 pub async fn run_hookset_main<H: Hook + 'static>(hook: H) -> Result<()> {
+    run_hookset_main_with_readiness(hook, None).await
+}
+
+/// Read hook server settings from the environment and serve over NATS with
+/// an explicitly provided readiness handle.
+///
+/// When `readiness` is `None`, parses `--healthz-addr` from args and `HARNX_HEALTHZ_ADDR`
+/// from the environment, matching the manual/env parse style used for metrics.
+///
+/// **Avoiding double-init (EADDRINUSE):** If the caller has already called
+/// `harnx_healthz::init()` and obtained a `Readiness`, pass it via the `readiness`
+/// parameter. Passing `None` causes this function to parse and init healthz again,
+/// which will fail with `EADDRINUSE` if the caller already bound the listener.
+pub async fn run_hookset_main_with_readiness<H: Hook + 'static>(
+    hook: H,
+    readiness: Option<harnx_healthz::Readiness>,
+) -> Result<()> {
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
 
     let metrics_addr = harnx_metrics::metrics_addr_from_args(std::env::args())
         .or_else(|| std::env::var("HARNX_METRICS_ADDR").ok());
     let flags = harnx_metrics::MetricsFlags { metrics_addr };
     harnx_metrics::init(&flags)?;
+
+    let readiness = match readiness {
+        Some(r) => Some(r),
+        None => {
+            let healthz_addr = harnx_healthz::healthz_addr_from_args(std::env::args())
+                .or_else(|| std::env::var("HARNX_HEALTHZ_ADDR").ok());
+            let healthz_flags = harnx_healthz::HealthzFlags { healthz_addr };
+            harnx_healthz::init(&healthz_flags).await?
+        }
+    };
 
     let scope =
         harnx_core::instance::scope_from_env(harnx_core::instance::StandaloneMode::WorkerLaunched)?;
@@ -314,5 +362,11 @@ pub async fn run_hookset_main<H: Hook + 'static>(hook: H) -> Result<()> {
         replicas: endpoint.resolved_replicas(),
     };
     let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();
-    serve_with_shutdown(Arc::new(hook), scope, connection, shutdown).await
+    serve_with_shutdown(
+        Arc::new(hook),
+        scope,
+        connection,
+        ServeLifecycle::new(shutdown, readiness),
+    )
+    .await
 }

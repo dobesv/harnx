@@ -14,7 +14,7 @@ Prometheus metrics operate independently from OpenTelemetry distributed tracing 
 
 You can enable metrics using either the CLI flag or an environment variable fallback:
 
-- `--metrics-addr <ADDR>`: Available on all 15 in-scope binaries. Accepts `IP:PORT` or `:PORT`. Passing a blank host (e.g. `--metrics-addr :8456`) binds `0.0.0.0`, allowing scrapers from other containers or Kubernetes pods to reach the endpoint. Passing `127.0.0.1:9109` restricts the listener to loopback.
+- `--metrics-addr <ADDR>`: CLI flag available on most binaries. **Caveat:** `harnx-claude-compatible-hook-server` rejects `--metrics-addr` as an unknown argument due to its strict clap parser. Use `HARNX_METRICS_ADDR` instead. Accepts `IP:PORT` or `:PORT`. Passing a blank host (e.g. `--metrics-addr :8456`) binds `0.0.0.0`, allowing scrapers from other containers or Kubernetes pods to reach the endpoint. Passing `127.0.0.1:9109` restricts the listener to loopback.
 - `HARNX_METRICS_ADDR`: Environment variable fallback honored by shared-entrypoint binaries: `harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-time-server`, `harnx-plans-tools` (non-HTTP mode), `harnx-claude-compatible-hook-server`, `harnx-mcp-remote`, `harnx-mcp-bridge`, `harnx-mcp-time`, and `harnx-mcp-plans-github`. If both the CLI flag and environment variable are set, the CLI flag takes precedence.
 
 ## Binary Coverage

@@ -275,7 +275,13 @@ fn spawn_targeted_daemon(
 ) -> tokio::task::JoinHandle<Result<()>> {
     let config = Arc::new(RwLock::new(Config::default()));
     tokio::spawn(async move {
-        run_worker_daemon(config, WorkerDaemonConfig::local(worker_id)?, Some(call_fn)).await
+        run_worker_daemon(
+            config,
+            WorkerDaemonConfig::local(worker_id)?,
+            Some(call_fn),
+            None,
+        )
+        .await
     })
 }
 

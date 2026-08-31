@@ -1,6 +1,7 @@
 mod server;
 
 use anyhow::Context;
+use harnx_healthz::Readiness;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::ServiceExt;
@@ -8,11 +9,43 @@ use server::TimeServer;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+const PASSTHROUGH_FLAGS: [(&str, &str); 2] = [
+    ("--metrics-addr", "--metrics-addr="),
+    ("--healthz-addr", "--healthz-addr="),
+];
+
+struct ParseState<'a> {
+    args: &'a [String],
+    index: usize,
+}
+
+impl ParseState<'_> {
+    fn current(&self) -> &str {
+        self.args[self.index].as_str()
+    }
+
+    fn consume_passthrough(&mut self) -> bool {
+        let arg = self.current();
+        for (flag, assignment) in PASSTHROUGH_FLAGS {
+            if arg == flag {
+                self.index += 2;
+                return true;
+            }
+            if arg.starts_with(assignment) {
+                self.index += 1;
+                return true;
+            }
+        }
+        false
+    }
+}
+
 struct Args {
     http: bool,
     host: String,
     port: u16,
     metrics_addr: Option<String>,
+    healthz_addr: Option<String>,
 }
 
 #[tokio::main]
@@ -34,13 +67,21 @@ async fn run() -> anyhow::Result<()> {
     };
     harnx_metrics::init(&metrics_flags)?;
 
+    let readiness = harnx_healthz::init(&harnx_healthz::HealthzFlags {
+        healthz_addr: args.healthz_addr.clone(),
+    })
+    .await?;
+
     if args.http {
-        run_http(args).await
+        run_http(args, readiness).await
     } else {
         log::info!("harnx-mcp-time v{}: starting", env!("CARGO_PKG_VERSION"));
 
         let server = TimeServer::new();
         let service = server.serve(rmcp::transport::stdio()).await?;
+        if let Some(readiness) = &readiness {
+            readiness.ready();
+        }
         service.waiting().await?;
 
         Ok(())
@@ -51,37 +92,41 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut http = false;
     let mut host = "0.0.0.0".to_string();
     let mut port = 3000;
-    let mut unknown_args: Vec<String> = Vec::new();
-
     let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
+    let mut state = ParseState {
+        args: &args,
+        index: 1,
+    };
 
-    while i < args.len() {
-        match args[i].as_str() {
+    while state.index < args.len() {
+        if state.consume_passthrough() {
+            continue;
+        }
+        match state.current() {
             "--http" => {
                 http = true;
-                i += 1;
+                state.index += 1;
             }
             "--host" => {
-                if i + 1 >= args.len() {
+                if state.index + 1 >= args.len() {
                     anyhow::bail!("harnx-mcp-time: --host requires an address argument");
                 }
-                host = args[i + 1].clone();
-                i += 2;
+                host = args[state.index + 1].clone();
+                state.index += 2;
             }
             "--port" => {
-                if i + 1 >= args.len() {
+                if state.index + 1 >= args.len() {
                     anyhow::bail!("harnx-mcp-time: --port requires a number argument");
                 }
-                match args[i + 1].parse::<u16>() {
+                match args[state.index + 1].parse::<u16>() {
                     Ok(value) => {
                         port = value;
-                        i += 2;
+                        state.index += 2;
                     }
                     Err(_) => {
                         anyhow::bail!(
                             "harnx-mcp-time: --port requires a valid u16 port (got: {})",
-                            args[i + 1]
+                            args[state.index + 1]
                         );
                     }
                 }
@@ -90,29 +135,24 @@ fn parse_args() -> anyhow::Result<Args> {
                 print_help();
                 std::process::exit(0);
             }
-            unknown => {
-                unknown_args.push(unknown.to_string());
-                i += 1;
-            }
+            unknown => anyhow::bail!(
+                "harnx-mcp-time: unknown argument: {unknown}\nTry: harnx-mcp-time --help"
+            ),
         }
     }
 
     // Use shared helper for metrics-addr (supports both --metrics-addr VAL and --metrics-addr=VAL)
     let metrics_addr = harnx_metrics::metrics_addr_from_args(args.clone())
         .or_else(|| std::env::var("HARNX_METRICS_ADDR").ok());
-
-    // Check for unrecognized arguments (excluding metrics-addr which was already consumed)
-    for arg in unknown_args {
-        if !arg.starts_with("--metrics-addr") {
-            anyhow::bail!("harnx-mcp-time: unknown argument: {arg}\nTry: harnx-mcp-time --help");
-        }
-    }
+    let healthz_addr = harnx_healthz::healthz_addr_from_args(args.clone())
+        .or_else(|| std::env::var("HARNX_HEALTHZ_ADDR").ok());
 
     Ok(Args {
         http,
         host,
         port,
         metrics_addr,
+        healthz_addr,
     })
 }
 
@@ -128,10 +168,13 @@ fn print_help() {
     eprintln!("  --metrics-addr <ADDR>   Serve Prometheus metrics at http://ADDR/metrics.");
     eprintln!("                        Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
     eprintln!("                        Also honors HARNX_METRICS_ADDR env.");
+    eprintln!("  --healthz-addr <ADDR>   Serve readiness checks at http://ADDR/healthz.");
+    eprintln!("                        Blank host binds 0.0.0.0, e.g. :8457. Unset disables.");
+    eprintln!("                        Also honors HARNX_HEALTHZ_ADDR env.");
     eprintln!("  --help, -h          Show this help message");
 }
 
-async fn run_http(args: Args) -> anyhow::Result<()> {
+async fn run_http(args: Args, readiness: Option<Readiness>) -> anyhow::Result<()> {
     let Args { host, port, .. } = args;
     let ct = CancellationToken::new();
     let config = StreamableHttpServerConfig::default()
@@ -156,8 +199,11 @@ async fn run_http(args: Args) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind((host.as_str(), port))
         .await
         .with_context(|| format!("harnx-mcp-time: failed to bind {host}:{port}"))?;
+    if let Some(readiness) = &readiness {
+        readiness.ready();
+    }
 
-    spawn_shutdown_handler(ct.clone());
+    spawn_shutdown_handler(ct.clone(), readiness);
 
     eprintln!(
         "harnx-mcp-time v{}: listening on http://{}:{}/mcp",
@@ -175,7 +221,7 @@ async fn run_http(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn spawn_shutdown_handler(ct: CancellationToken) {
+fn spawn_shutdown_handler(ct: CancellationToken, readiness: Option<Readiness>) {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -201,6 +247,9 @@ fn spawn_shutdown_handler(ct: CancellationToken) {
             let _ = tokio::signal::ctrl_c().await;
         }
 
+        if let Some(readiness) = &readiness {
+            readiness.not_ready();
+        }
         ct.cancel();
     });
 }

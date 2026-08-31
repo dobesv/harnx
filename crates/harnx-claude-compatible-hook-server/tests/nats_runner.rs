@@ -198,6 +198,7 @@ async fn command_hook_registers_and_answers_over_nats() -> Result<()> {
             .map(|word| word.to_string())
             .collect(),
         package_dir: None,
+        healthz: Default::default(),
     })?;
     let instance_id = ServerScope::new();
     let server_instance_id = instance_id.clone();

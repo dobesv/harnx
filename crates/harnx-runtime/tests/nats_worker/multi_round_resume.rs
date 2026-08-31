@@ -16,7 +16,7 @@ async fn mid_tool_round_user_message_is_injected_once_into_same_turn() -> Result
     let worker_config = WorkerDaemonConfig::managing("local", "worker-mid-round");
     let daemon = tokio::spawn({
         let cfg = config.clone();
-        async move { run_worker_daemon(cfg, worker_config, Some(mid_round_call_fn())).await }
+        async move { run_worker_daemon(cfg, worker_config, Some(mid_round_call_fn()), None).await }
     });
     tokio::time::sleep(Duration::from_millis(1000)).await;
 

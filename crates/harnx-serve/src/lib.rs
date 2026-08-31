@@ -151,6 +151,7 @@ pub async fn run(
     config: GlobalConfig,
     addr: Option<String>,
     web_assets: Option<PathBuf>,
+    readiness: Option<harnx_healthz::Readiness>,
 ) -> Result<()> {
     log_startup_environment_diagnostics();
 
@@ -170,10 +171,16 @@ pub async fn run(
         web_assets.unwrap_or_else(|| harnx_core::config_paths::data_dir().join("web-assets"));
     let server = Arc::new(Server::new(&config, web_assets));
     let listener = TcpListener::bind(&addr).await?;
+    if let Some(r) = &readiness {
+        r.ready();
+    }
     let stop_server = server.run(listener).await?;
     println!("Embeddings API:       http://{addr}/v1/embeddings");
     println!("Rerank API:           http://{addr}/v1/rerank");
     shutdown_signal().await;
+    if let Some(r) = &readiness {
+        r.not_ready();
+    }
     let _ = stop_server.send(());
     Ok(())
 }

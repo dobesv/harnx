@@ -97,7 +97,7 @@ impl HandoffFixture {
         let worker_config = WorkerDaemonConfig::managing("local", "worker-handoff");
         let worker_runtime = Arc::clone(&config);
         let daemon = tokio::spawn(async move {
-            run_worker_daemon(worker_runtime, worker_config, Some(handoff_call_fn())).await
+            run_worker_daemon(worker_runtime, worker_config, Some(handoff_call_fn()), None).await
         });
         tokio::time::sleep(Duration::from_millis(500)).await;
 

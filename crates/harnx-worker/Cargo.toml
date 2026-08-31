@@ -18,6 +18,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 harnx-core = { path = "../harnx-core" }
+harnx-healthz = { workspace = true }
 harnx-metrics = { workspace = true }
 harnx-runtime = { path = "../harnx-runtime" }
 harnx-telemetry = { workspace = true }

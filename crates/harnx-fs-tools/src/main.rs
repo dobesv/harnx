@@ -71,11 +71,45 @@ fn initial_allow_inputs() -> AllowInputs {
     }
 }
 
-fn parse_args_from(args: &[String], mut inputs: AllowInputs) -> Result<AllowInputs, String> {
-    let mut i = 1;
+const PASSTHROUGH_FLAGS: [(&str, &str); 2] = [
+    ("--metrics-addr", "--metrics-addr="),
+    ("--healthz-addr", "--healthz-addr="),
+];
 
-    while i < args.len() {
-        let target = match args[i].as_str() {
+struct ParseState<'a> {
+    args: &'a [String],
+    index: usize,
+}
+
+impl ParseState<'_> {
+    fn current(&self) -> &str {
+        self.args[self.index].as_str()
+    }
+
+    fn consume_passthrough(&mut self) -> bool {
+        let arg = self.current();
+        for (flag, assignment) in PASSTHROUGH_FLAGS {
+            if arg == flag {
+                self.index += 2;
+                return true;
+            }
+            if arg.starts_with(assignment) {
+                self.index += 1;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn parse_args_from(args: &[String], mut inputs: AllowInputs) -> Result<AllowInputs, String> {
+    let mut state = ParseState { args, index: 1 };
+
+    while state.index < args.len() {
+        if state.consume_passthrough() {
+            continue;
+        }
+        let target = match state.current() {
             "--allow-read" => Some(&mut inputs.read),
             "--allow-write" => Some(&mut inputs.write),
             "--allow-exec" => Some(&mut inputs.exec),
@@ -96,16 +130,6 @@ fn parse_args_from(args: &[String], mut inputs: AllowInputs) -> Result<AllowInpu
                 inputs.all = true;
                 None
             }
-            arg if arg.starts_with("--metrics-addr") => {
-                // Skip --metrics-addr (both forms) so the strict parser doesn't reject it.
-                // The shared helper in run_toolset_main handles actual parsing.
-                if arg == "--metrics-addr" {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-                continue;
-            }
             "--mcp-stdio" => None,
             "--help" | "-h" => print_help_and_exit(),
             other => {
@@ -116,13 +140,16 @@ fn parse_args_from(args: &[String], mut inputs: AllowInputs) -> Result<AllowInpu
         };
 
         if let Some(paths) = target {
-            let path = args
-                .get(i + 1)
-                .ok_or_else(|| format!("harnx-fs-tools: {} requires a path argument", args[i]))?;
+            let path = args.get(state.index + 1).ok_or_else(|| {
+                format!(
+                    "harnx-fs-tools: {} requires a path argument",
+                    args[state.index]
+                )
+            })?;
             paths.push(PathBuf::from(path));
-            i += 2;
+            state.index += 2;
         } else {
-            i += 1;
+            state.index += 1;
         }
     }
 
@@ -147,6 +174,9 @@ fn print_help_and_exit() -> ! {
     eprintln!("  --metrics-addr <ADDR>     Serve Prometheus metrics at http://ADDR/metrics.");
     eprintln!("                            Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
     eprintln!("                            Also honors HARNX_METRICS_ADDR env.");
+    eprintln!("  --healthz-addr <ADDR>     Serve readiness checks at http://ADDR/healthz.");
+    eprintln!("                            Blank host binds 0.0.0.0, e.g. :8457. Unset disables.");
+    eprintln!("                            Also honors HARNX_HEALTHZ_ADDR env.");
     eprintln!("  --help, -h                Show this help message");
     std::process::exit(0);
 }

@@ -32,6 +32,16 @@ fn parse_args() -> anyhow::Result<bool> {
                     args.next();
                 }
             }
+            arg if arg == "--healthz-addr" || arg.strip_prefix("--healthz-addr=").is_some() => {
+                // Skip --healthz-addr (both forms) so the strict parser doesn't reject it.
+                // The shared helper in run_toolset_main handles actual parsing.
+                // NOTE: Must match exact flag, not starts_with("--healthz-addr"). A loose prefix
+                // match would silently swallow typos like --healthz-address, leaving the real flag
+                // unparsed and the healthz listener never binding.
+                if arg == "--healthz-addr" {
+                    args.next();
+                }
+            }
             _ => anyhow::bail!("harnx-grep-tools: unknown argument: {arg}"),
         }
     }
@@ -49,5 +59,8 @@ fn print_help() {
     eprintln!("  --metrics-addr <ADDR>   Serve Prometheus metrics at http://ADDR/metrics.");
     eprintln!("                        Blank host binds 0.0.0.0, e.g. :8456. Unset disables.");
     eprintln!("                        Also honors HARNX_METRICS_ADDR env.");
+    eprintln!("  --healthz-addr <ADDR>   Serve readiness checks at http://ADDR/healthz.");
+    eprintln!("                        Blank host binds 0.0.0.0, e.g. :8457. Unset disables.");
+    eprintln!("                        Also honors HARNX_HEALTHZ_ADDR env.");
     eprintln!("  --help, -h          Show this help message");
 }

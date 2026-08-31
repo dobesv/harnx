@@ -6,7 +6,8 @@ use harnx_hookset::{
     FailPolicy, Hook, HookRegistration, HookSpec, HOOK_PROTOCOL_VERSION, HOOK_SCHEMA_VERSION,
 };
 use harnx_hookset_server::{
-    hook_registration_key, serve_over_nats, serve_with_shutdown, HOOK_REGISTRY_BUCKET,
+    hook_registration_key, serve_over_nats, serve_with_shutdown, ServeLifecycle,
+    HOOK_REGISTRY_BUCKET,
 };
 use harnx_nats_common::connect::NatsConnection;
 use serde_json::json;
@@ -274,6 +275,26 @@ async fn connect_test_client(url: &str) -> Result<async_nats::Client> {
         .context("connect test NATS client")
 }
 
+async fn spawn_echo_hook_server(
+    url: &str,
+    instance_id: ServerScope,
+    shutdown: CancellationToken,
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
+    let connection = NatsConnection {
+        client: connect_test_client(url).await?,
+        replicas: 1,
+    };
+    Ok(tokio::spawn(async move {
+        serve_with_shutdown(
+            Arc::new(EchoHook),
+            instance_id,
+            connection,
+            ServeLifecycle::new(shutdown, None),
+        )
+        .await
+    }))
+}
+
 /// A rolling deploy publishes the replacement's registration under the same
 /// `{scope}.{server}` key before the old instance finishes shutting down
 /// (new pod ready before old pod terminates is Kubernetes' normal sequence).
@@ -290,33 +311,15 @@ async fn old_instances_shutdown_does_not_delete_a_replacements_registration() ->
     let client = connect_test_client(&server.url).await?;
 
     let old_shutdown = CancellationToken::new();
-    let old_connection = NatsConnection {
-        client: connect_test_client(&server.url).await?,
-        replicas: 1,
-    };
-    let old_task = {
-        let instance_id = instance_id.clone();
-        let shutdown = old_shutdown.clone();
-        tokio::spawn(async move {
-            serve_with_shutdown(Arc::new(EchoHook), instance_id, old_connection, shutdown).await
-        })
-    };
+    let old_task =
+        spawn_echo_hook_server(&server.url, instance_id.clone(), old_shutdown.clone()).await?;
     let old_revision = wait_for_revision_beyond(&client, &key, 0).await?;
 
     // Start the replacement under the SAME scope while the old instance is
     // still running, publishing over the same key with a newer revision.
     let new_shutdown = CancellationToken::new();
-    let new_connection = NatsConnection {
-        client: connect_test_client(&server.url).await?,
-        replicas: 1,
-    };
-    let new_task = {
-        let instance_id = instance_id.clone();
-        let shutdown = new_shutdown.clone();
-        tokio::spawn(async move {
-            serve_with_shutdown(Arc::new(EchoHook), instance_id, new_connection, shutdown).await
-        })
-    };
+    let new_task =
+        spawn_echo_hook_server(&server.url, instance_id.clone(), new_shutdown.clone()).await?;
     let new_revision = wait_for_revision_beyond(&client, &key, old_revision).await?;
     assert!(new_revision > old_revision);
 

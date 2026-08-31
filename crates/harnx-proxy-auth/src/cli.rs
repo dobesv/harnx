@@ -5,6 +5,8 @@ use harnx_metrics::MetricsFlags;
 pub struct Args {
     #[command(flatten)]
     pub metrics: MetricsFlags,
+    #[command(flatten)]
+    pub healthz: harnx_healthz::HealthzFlags,
     /// Hook server name assigned by the supervisor.
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,

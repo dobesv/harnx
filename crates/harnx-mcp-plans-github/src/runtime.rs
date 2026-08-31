@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::Router;
+use harnx_healthz::Readiness;
 use harnx_mcp_plans_core::server::{PlansServer, ServerMeta, TargetPolicy};
 use harnx_mcp_plans_core::{PageToken, Plan, PlanStore, RepoTarget, Target};
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
@@ -19,6 +20,16 @@ use crate::store_github::GitHubPlanStore;
 const RETENTION_SCAN_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const BASE_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+struct HttpServerLoop {
+    store: Arc<GitHubPlanStore>,
+    default_repo: Option<RepoTarget>,
+    retention_days: u64,
+    listener: tokio::net::TcpListener,
+    app: Router,
+    cancellation: CancellationToken,
+}
+
 fn github_server_meta(default_repo: Option<RepoTarget>) -> ServerMeta {
     let target_note = match &default_repo {
         Some(default_repo) => format!(
@@ -45,12 +56,18 @@ pub async fn run(config: AppConfig) -> Result<()> {
         })?;
     }
 
+    // Initialize healthz listener (opt-in, starts not-ready)
+    let readiness = harnx_healthz::init(&harnx_healthz::HealthzFlags {
+        healthz_addr: config.healthz_addr.clone(),
+    })
+    .await?;
+
     let store = build_store(&config).await?;
 
     if config.http {
-        run_http(store, config).await
+        run_http(store, config, readiness).await
     } else {
-        run_stdio(store, config).await
+        run_stdio(store, config, readiness).await
     }
 }
 
@@ -128,7 +145,11 @@ fn log_startup_target(default_repo: Option<&RepoTarget>) {
     }
 }
 
-async fn run_stdio(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()> {
+async fn run_stdio(
+    store: Arc<GitHubPlanStore>,
+    config: AppConfig,
+    readiness: Option<Readiness>,
+) -> Result<()> {
     let default_repo = default_repo_target(&config);
     log_startup_target(default_repo.as_ref());
 
@@ -142,6 +163,11 @@ async fn run_stdio(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()>
     let server = PlansServer::with_meta(store.clone(), github_server_meta(default_repo.clone()));
     let transport = rmcp::transport::stdio();
     let service = server.serve(transport).await?;
+
+    // Mark ready once stdio serve loop is active
+    if let Some(r) = &readiness {
+        r.ready();
+    }
 
     if config.retention_days == 0 {
         eprintln!("[retention] disabled");
@@ -182,51 +208,51 @@ async fn run_stdio(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()>
     Ok(())
 }
 
-async fn run_http(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()> {
-    let default_repo = default_repo_target(&config);
-    log_startup_target(default_repo.as_ref());
-
-    let ct = CancellationToken::new();
-    let factory_store = store.clone();
+/// Builds the MCP service for HTTP mode.
+fn build_mcp_service(
+    store: Arc<GitHubPlanStore>,
+    default_repo: Option<RepoTarget>,
+    ct: CancellationToken,
+) -> StreamableHttpService<PlansServer<GitHubPlanStore>, NeverSessionManager> {
     let server_config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true)
-        .with_cancellation_token(ct.child_token());
-    let service_default_repo = default_repo.clone();
-    let mcp_service = StreamableHttpService::new(
+        .with_cancellation_token(ct);
+    StreamableHttpService::new(
         move || {
             Ok(PlansServer::with_meta(
-                factory_store.clone(),
-                github_server_meta(service_default_repo.clone()),
+                store.clone(),
+                github_server_meta(default_repo.clone()),
             ))
         },
         Arc::new(NeverSessionManager::default()),
         server_config,
-    );
-    let app = Router::new()
-        .nest_service("/mcp", mcp_service)
-        .layer(axum::middleware::from_fn(
-            harnx_metrics::http_metrics_middleware,
-        ));
-    let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
-        .await
-        .with_context(|| {
-            format!(
-                "harnx-mcp-plans-github: failed to bind {}:{}",
-                config.host, config.port
-            )
-        })?;
+    )
+}
 
-    spawn_shutdown_handler(ct.clone());
+async fn run_http_server_loop(config: HttpServerLoop) -> Result<()> {
+    let HttpServerLoop {
+        store,
+        default_repo,
+        retention_days,
+        listener,
+        app,
+        cancellation: ct,
+    } = config;
+    if retention_days == 0 {
+        eprintln!("[retention] disabled");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { ct.cancelled().await })
+            .await?;
+        return Ok(());
+    }
 
-    eprintln!(
-        "harnx-mcp-plans-github v{}: listening on http://{}:{}/mcp (label: {}, retention: {} days)",
-        env!("CARGO_PKG_VERSION"),
-        config.host,
-        config.port,
-        config.store.plan_label,
-        config.retention_days
-    );
+    let mut retention_handle = tokio::spawn(retention_loop(
+        store.clone(),
+        default_repo.clone(),
+        retention_days,
+    ));
+    let mut backoff = BASE_BACKOFF;
 
     let shutdown_ct = ct.clone();
     let server_handle = tokio::spawn(async move {
@@ -235,19 +261,6 @@ async fn run_http(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()> 
             .await
     });
     tokio::pin!(server_handle);
-
-    if config.retention_days == 0 {
-        eprintln!("[retention] disabled");
-        (&mut server_handle).await??;
-        return Ok(());
-    }
-
-    let mut retention_handle = tokio::spawn(retention_loop(
-        store.clone(),
-        default_repo.clone(),
-        config.retention_days,
-    ));
-    let mut backoff = BASE_BACKOFF;
 
     loop {
         tokio::select! {
@@ -265,12 +278,63 @@ async fn run_http(store: Arc<GitHubPlanStore>, config: AppConfig) -> Result<()> 
                     }
                     Ok(()) => backoff = BASE_BACKOFF,
                 }
-                retention_handle = tokio::spawn(retention_loop(store.clone(), default_repo.clone(), config.retention_days));
+                retention_handle = tokio::spawn(retention_loop(store.clone(), default_repo.clone(), retention_days));
             }
         }
     }
 
     Ok(())
+}
+
+async fn run_http(
+    store: Arc<GitHubPlanStore>,
+    config: AppConfig,
+    readiness: Option<Readiness>,
+) -> Result<()> {
+    let default_repo = default_repo_target(&config);
+    log_startup_target(default_repo.as_ref());
+
+    let ct = CancellationToken::new();
+    let mcp_service = build_mcp_service(store.clone(), default_repo.clone(), ct.child_token());
+    let app = Router::new()
+        .nest_service("/mcp", mcp_service)
+        .layer(axum::middleware::from_fn(
+            harnx_metrics::http_metrics_middleware,
+        ));
+    let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
+        .await
+        .with_context(|| {
+            format!(
+                "harnx-mcp-plans-github: failed to bind {}:{}",
+                config.host, config.port
+            )
+        })?;
+
+    // Mark ready once HTTP listener is bound
+    if let Some(r) = &readiness {
+        r.ready();
+    }
+
+    spawn_shutdown_handler(ct.clone(), readiness);
+
+    eprintln!(
+        "harnx-mcp-plans-github v{}: listening on http://{}:{}/mcp (label: {}, retention: {} days)",
+        env!("CARGO_PKG_VERSION"),
+        config.host,
+        config.port,
+        config.store.plan_label,
+        config.retention_days
+    );
+
+    run_http_server_loop(HttpServerLoop {
+        store,
+        default_repo,
+        retention_days: config.retention_days,
+        listener,
+        app,
+        cancellation: ct,
+    })
+    .await
 }
 
 async fn retention_loop(
@@ -316,7 +380,7 @@ fn parse_issue_number(value: &str) -> Result<u64> {
         .with_context(|| format!("invalid issue number: {value}"))
 }
 
-fn spawn_shutdown_handler(ct: CancellationToken) {
+fn spawn_shutdown_handler(ct: CancellationToken, readiness: Option<Readiness>) {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -339,6 +403,11 @@ fn spawn_shutdown_handler(ct: CancellationToken) {
         #[cfg(not(unix))]
         {
             let _ = tokio::signal::ctrl_c().await;
+        }
+
+        // Mark not-ready before cancellation
+        if let Some(r) = &readiness {
+            r.not_ready();
         }
 
         ct.cancel();

@@ -42,4 +42,9 @@ pub struct Cli {
     /// Also reads from HARNX_METRICS_ADDR env.
     #[arg(long, env = "HARNX_METRICS_ADDR")]
     pub metrics_addr: Option<String>,
+
+    /// Healthz readiness endpoint address (e.g., "0.0.0.0:8080").
+    /// Also reads from HARNX_HEALTHZ_ADDR env.
+    #[arg(long, env = "HARNX_HEALTHZ_ADDR")]
+    pub healthz_addr: Option<String>,
 }

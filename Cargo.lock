@@ -3526,6 +3526,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "harnx-healthz",
  "harnx-metrics",
  "harnx-telemetry",
  "serde",
@@ -3573,6 +3574,7 @@ dependencies = [
  "async-trait",
  "clap",
  "harnx-core",
+ "harnx-healthz",
  "harnx-hooks",
  "harnx-hookset",
  "harnx-hookset-server",
@@ -3748,6 +3750,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-healthz"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "harnx-hooks"
 version = "0.33.4"
 dependencies = [
@@ -3782,6 +3796,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "harnx-core",
+ "harnx-healthz",
  "harnx-hookset",
  "harnx-metrics",
  "harnx-nats-common",
@@ -3802,6 +3817,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "clap",
+ "harnx-healthz",
  "harnx-metrics",
  "harnx-telemetry",
  "k8s-openapi",
@@ -3825,6 +3841,7 @@ dependencies = [
  "async-trait",
  "clap",
  "harnx-core",
+ "harnx-healthz",
  "harnx-metrics",
  "harnx-nats-common",
  "harnx-runtime",
@@ -3888,6 +3905,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "chrono",
+ "harnx-healthz",
  "harnx-mcp-plans-core",
  "harnx-metrics",
  "harnx-telemetry",
@@ -3916,6 +3934,7 @@ dependencies = [
  "axum",
  "clap",
  "harnx-core",
+ "harnx-healthz",
  "harnx-metrics",
  "harnx-telemetry",
  "log",
@@ -3939,6 +3958,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "harnx-core",
+ "harnx-healthz",
  "harnx-metrics",
  "harnx-telemetry",
  "iana-time-zone",
@@ -4025,6 +4045,7 @@ dependencies = [
  "chrono",
  "filetime",
  "harnx-core",
+ "harnx-healthz",
  "harnx-metrics",
  "harnx-toolset",
  "harnx-toolset-server",
@@ -4052,6 +4073,7 @@ dependencies = [
  "clap",
  "harnx-core",
  "harnx-engine",
+ "harnx-healthz",
  "harnx-hooks",
  "harnx-hookset",
  "harnx-hookset-server",
@@ -4148,6 +4170,7 @@ dependencies = [
  "harnx-core",
  "harnx-engine",
  "harnx-fetch",
+ "harnx-healthz",
  "harnx-hooks",
  "harnx-hookset",
  "harnx-hookset-server",
@@ -4244,6 +4267,7 @@ dependencies = [
  "futures",
  "futures-util",
  "harnx-core",
+ "harnx-healthz",
  "harnx-hooks",
  "harnx-hookset",
  "harnx-metrics",
@@ -4385,6 +4409,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "harnx-core",
+ "harnx-healthz",
  "harnx-metrics",
  "harnx-nats-common",
  "harnx-telemetry",
@@ -4450,6 +4475,7 @@ dependencies = [
  "anyhow",
  "clap",
  "harnx-core",
+ "harnx-healthz",
  "harnx-metrics",
  "harnx-runtime",
  "harnx-telemetry",

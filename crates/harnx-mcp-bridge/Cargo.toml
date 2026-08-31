@@ -16,6 +16,7 @@ harnx-metrics = { workspace = true }
 harnx-nats-common = { workspace = true }
 harnx-telemetry = { workspace = true, features = ["mcp"] }
 harnx-toolset = { path = "../harnx-toolset" }
+harnx-healthz = { workspace = true }
 harnx-toolset-server = { path = "../harnx-toolset-server" }
 libc = { workspace = true }
 log = { workspace = true }

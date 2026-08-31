@@ -65,6 +65,10 @@ pub struct Args {
         value_name = "COMMAND"
     )]
     pub command: Vec<String>,
+
+    /// Readiness listener configuration.
+    #[command(flatten)]
+    pub healthz: harnx_healthz::HealthzFlags,
 }
 
 /// Hook dispatch behavior when the server fails.
@@ -233,20 +237,10 @@ mod tests {
     }
 
     fn hook(command: &[&str], persistent: bool) -> ClaudeCompatibleHook {
-        Args {
-            name: "test-hook".to_string(),
-            event: "PreToolUse".to_string(),
-            matcher: Some("exec".to_string()),
-            priority: 7,
-            timeout: Some(5),
-            fail_policy: CliFailPolicy::Closed,
-            persistent,
-            jaq: None,
-            command: command.iter().map(|word| word.to_string()).collect(),
-            package_dir: None,
-        }
-        .try_into()
-        .expect("valid test hook")
+        let mut args = base_test_args("test-hook");
+        args.command = command.iter().map(|word| word.to_string()).collect();
+        args.persistent = persistent;
+        hook_from_args(args)
     }
 
     /// Hooks needing shell syntax now ask for a shell explicitly.
@@ -256,20 +250,32 @@ mod tests {
     }
 
     fn jaq_hook(expression: &str, fail_policy: CliFailPolicy) -> ClaudeCompatibleHook {
+        let mut args = base_test_args("test-jaq-hook");
+        args.jaq = Some(expression.to_string());
+        args.fail_policy = fail_policy;
+        hook_from_args(args)
+    }
+
+    /// Common `Args` defaults for hook construction in tests; callers override
+    /// only the fields relevant to their case.
+    fn base_test_args(name: &str) -> Args {
         Args {
-            name: "test-jaq-hook".to_string(),
+            name: name.to_string(),
             event: "PreToolUse".to_string(),
             matcher: Some("exec".to_string()),
             priority: 7,
             timeout: Some(5),
-            fail_policy,
+            fail_policy: CliFailPolicy::Closed,
             persistent: false,
-            jaq: Some(expression.to_string()),
+            jaq: None,
             command: Vec::new(),
             package_dir: None,
+            healthz: Default::default(),
         }
-        .try_into()
-        .expect("valid jaq hook")
+    }
+
+    fn hook_from_args(args: Args) -> ClaudeCompatibleHook {
+        args.try_into().expect("valid test hook")
     }
 
     #[test]
@@ -360,6 +366,7 @@ mod tests {
             jaq: Some(".tool_name ==".to_string()),
             command: Vec::new(),
             package_dir: None,
+            healthz: Default::default(),
         };
 
         let error = ClaudeCompatibleHook::try_from(args)

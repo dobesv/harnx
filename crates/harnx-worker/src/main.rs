@@ -55,6 +55,9 @@ struct Cli {
     /// any free port). If omitted, no metrics listener is started.
     #[command(flatten)]
     metrics: harnx_metrics::MetricsFlags,
+    /// HTTP readiness endpoint address. If omitted, no healthz listener is started.
+    #[command(flatten)]
+    healthz: harnx_healthz::HealthzFlags,
 }
 
 impl Cli {
@@ -142,6 +145,7 @@ async fn main() -> Result<()> {
 
 async fn run(cli: Cli) -> Result<()> {
     harnx_metrics::init(&cli.metrics)?;
+    let readiness = harnx_healthz::init(&cli.healthz).await?;
     let config = Arc::new(RwLock::new(
         Config::init_headless(WorkingMode::Cmd, true).await?,
     ));
@@ -157,7 +161,7 @@ async fn run(cli: Cli) -> Result<()> {
     let daemon = cli.daemon_config()?;
     // `None` selects the agent loop's default call path
     // (`call_with_retry_and_fallback`), which is what the worker wants.
-    harnx_runtime::nats_worker::run_worker_daemon(config, daemon, None).await
+    harnx_runtime::nats_worker::run_worker_daemon(config, daemon, None, readiness).await
 }
 
 #[cfg(test)]

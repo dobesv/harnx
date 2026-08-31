@@ -313,7 +313,13 @@ async fn spawn_capturing_worker(
     let (selected_tx, selected_rx) = tokio::sync::mpsc::unbounded_channel();
     let daemon = WorkerDaemonConfig::managing(LOCAL_CLUSTER_KEY, "tool-cache-race-e2e");
     let worker = tokio::spawn(async move {
-        run_worker_daemon(config, daemon, Some(capture_selected_tools(selected_tx))).await
+        run_worker_daemon(
+            config,
+            daemon,
+            Some(capture_selected_tools(selected_tx)),
+            None,
+        )
+        .await
     });
     tokio::time::timeout(Duration::from_secs(5), readiness.next())
         .await?
@@ -414,7 +420,7 @@ async fn a_session_only_starts_the_servers_its_agent_uses() -> anyhow::Result<()
     let daemon = WorkerDaemonConfig::managing(LOCAL_CLUSTER_KEY, "tool-reconciler-e2e");
     let worker_config = config.clone();
     let _worker = tokio::spawn(async move {
-        run_worker_daemon(worker_config, daemon, Some(stub_call_fn())).await
+        run_worker_daemon(worker_config, daemon, Some(stub_call_fn()), None).await
     });
 
     let client = async_nats::ConnectOptions::new()

@@ -224,6 +224,7 @@ pub async fn run_worker_daemon(
     config: GlobalConfig,
     mut daemon: WorkerDaemonConfig,
     call_fn: Option<crate::agent_loop::AgentCallFn>,
+    readiness: Option<harnx_healthz::Readiness>,
 ) -> Result<()> {
     let instance_id = resolve_worker_scope(daemon.manage_servers)?;
     let startup = prepare_worker_startup(&config, &daemon).await?;
@@ -242,6 +243,9 @@ pub async fn run_worker_daemon(
     // creates instead of always sitting at the default.
     daemon.lease.replicas = startup.replicas;
     let services = launch_worker_services(&config, &daemon, &startup, &instance_id).await?;
+    if let Some(readiness) = &readiness {
+        readiness.ready();
+    }
     let runtime = Arc::new(WorkerRuntime {
         config,
         instance_id,
