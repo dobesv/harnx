@@ -2,9 +2,13 @@ use super::{
     create_agent_stubs, normalize_screen, test_config, test_config_with_mock_client_and_agent,
 };
 use crate::test_utils::{TestEnvironment, TuiTestHarness, ENV_LOCK};
-use crate::types::{MonitoredSessionKey, SubAgentStatus, TranscriptItem, TuiEvent};
+use crate::types::{MonitoredSessionKey, SubAgentStatus, SubAgentView, TranscriptItem, TuiEvent};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use harnx_core::event::{AgentEvent, ContentBlock, ModelEvent, ToolEvent, TurnEvent};
+use harnx_core::api_types::CompletionTokenUsage;
+use harnx_core::event::{
+    AgentEvent, ContentBlock, ModelEvent, SubAgentProgress, SubAgentProgressStatus, ToolEvent,
+    TurnEvent,
+};
 use std::time::Duration;
 
 fn monitored_key(agent: &str, session_id: &str) -> MonitoredSessionKey {
@@ -13,6 +17,22 @@ fn monitored_key(agent: &str, session_id: &str) -> MonitoredSessionKey {
         agent: agent.to_string(),
         session_id: session_id.to_string(),
     }
+}
+
+fn subagent_view(key: MonitoredSessionKey) -> SubAgentView {
+    SubAgentView {
+        key,
+        status: SubAgentStatus::Running,
+        progress: None,
+    }
+}
+
+fn open_subagent_keys(tui: &crate::types::Tui) -> Vec<MonitoredSessionKey> {
+    tui.app
+        .subagent_view_stack
+        .iter()
+        .map(|view| view.key.clone())
+        .collect()
 }
 
 fn assistant_text(text: &str) -> TranscriptItem {
@@ -25,14 +45,40 @@ fn assistant_text(text: &str) -> TranscriptItem {
 }
 
 async fn emit_subagent_started(tui: &mut crate::types::Tui, key: &MonitoredSessionKey) {
+    emit_subagent_invocation_started(tui, key, None).await;
+}
+
+async fn emit_subagent_invocation_started(
+    tui: &mut crate::types::Tui,
+    key: &MonitoredSessionKey,
+    invocation_id: Option<&str>,
+) {
     tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
         TurnEvent::SubAgentStarted {
             agent: key.agent.clone(),
             session_id: key.session_id.clone(),
+            invocation_id: invocation_id.map(str::to_string),
         },
     )))
     .await
     .unwrap();
+}
+
+fn subagent_progress(
+    key: &MonitoredSessionKey,
+    invocation_id: &str,
+    status: SubAgentProgressStatus,
+    elapsed_ms: u64,
+) -> SubAgentProgress {
+    SubAgentProgress {
+        invocation_id: invocation_id.into(),
+        agent: key.agent.clone(),
+        session_id: key.session_id.clone(),
+        status,
+        elapsed_ms,
+        usage: CompletionTokenUsage::new(Some(1_200), Some(345), Some(67)),
+        tool_call_count: 4,
+    }
 }
 
 fn completed_subagent_event(key: &MonitoredSessionKey) -> AgentEvent {
@@ -58,7 +104,11 @@ async fn compact_subagent_row_deduplicates_durable_completion() {
 
     assert!(matches!(
         harness.tui().app.transcript.as_slice(),
-        [TranscriptItem::SubAgentSession { key: row_key, status: SubAgentStatus::Running }]
+        [TranscriptItem::SubAgentSession {
+            key: row_key,
+            status: SubAgentStatus::Running,
+            ..
+        }]
             if row_key == &key
     ));
     assert_eq!(harness.tui().subagent_monitor_handles.len(), 1);
@@ -82,9 +132,188 @@ async fn compact_subagent_row_deduplicates_durable_completion() {
 
     assert!(matches!(
         harness.tui().app.transcript.as_slice(),
-        [TranscriptItem::SubAgentSession { key: row_key, status: SubAgentStatus::Completed }]
+        [TranscriptItem::SubAgentSession {
+            key: row_key,
+            status: SubAgentStatus::Completed,
+            ..
+        }]
             if row_key == &key
     ));
+}
+
+#[tokio::test]
+async fn progress_animates_counts_elapsed_and_freezes_terminal_metrics() {
+    let mut harness = TuiTestHarness::with_size(90, 12).await;
+    harness.tui().clear_transcript();
+    harness.tui().app.llm_busy = false;
+    let key = monitored_key("researcher", "progress-session");
+    emit_subagent_invocation_started(harness.tui(), &key, Some("inv-progress")).await;
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+            TurnEvent::SubAgentProgress(subagent_progress(
+                &key,
+                "inv-progress",
+                SubAgentProgressStatus::Running,
+                10_000,
+            )),
+        )))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let running_elapsed = match &harness.tui().app.transcript[0] {
+        TranscriptItem::SubAgentSession {
+            progress: Some(progress),
+            ..
+        } => progress.elapsed_ms(),
+        other => panic!("expected progress row, got {other:?}"),
+    };
+    assert!(running_elapsed >= 10_020);
+    assert!(
+        !harness.tui().app.llm_busy,
+        "child progress must not change root busy state"
+    );
+
+    harness.tui().app.spinner_index = 0;
+    harness.render();
+    let first_frame = harness.screen_contents();
+    assert!(first_frame.contains('⠋'));
+    assert!(first_frame.contains("in 1200  out 345  cache 67  tools 4"));
+    harness.tui().app.spinner_index = 1;
+    harness.render();
+    assert!(harness.screen_contents().contains('⠙'));
+
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+            TurnEvent::SubAgentProgress(subagent_progress(
+                &key,
+                "inv-progress",
+                SubAgentProgressStatus::Done,
+                12_345,
+            )),
+        )))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    match &harness.tui().app.transcript[0] {
+        TranscriptItem::SubAgentSession {
+            status: SubAgentStatus::Completed,
+            progress: Some(progress),
+            ..
+        } => assert_eq!(progress.elapsed_ms(), 12_345),
+        other => panic!("expected completed progress row, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn terminal_progress_is_not_reopened_by_child_monitor_or_late_progress() {
+    let mut harness = TuiTestHarness::new().await;
+    harness.tui().clear_transcript();
+    harness.tui().app.llm_busy = true;
+    let key = monitored_key("researcher", "terminal-session");
+    emit_subagent_invocation_started(harness.tui(), &key, Some("inv-terminal")).await;
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+            TurnEvent::SubAgentProgress(subagent_progress(
+                &key,
+                "inv-terminal",
+                SubAgentProgressStatus::Done,
+                12_345,
+            )),
+        )))
+        .await
+        .unwrap();
+
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::SubAgentSessionSnapshot {
+            key: key.clone(),
+            transcript: vec![],
+            status: SubAgentStatus::Running,
+        })
+        .await
+        .unwrap();
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::SubAgentSessionEvent {
+            key: key.clone(),
+            event: AgentEvent::Turn(TurnEvent::Started),
+        })
+        .await
+        .unwrap();
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+            TurnEvent::SubAgentProgress(subagent_progress(
+                &key,
+                "inv-terminal",
+                SubAgentProgressStatus::Running,
+                20_000,
+            )),
+        )))
+        .await
+        .unwrap();
+
+    match &harness.tui().app.transcript[0] {
+        TranscriptItem::SubAgentSession {
+            status: SubAgentStatus::Completed,
+            progress: Some(progress),
+            ..
+        } => {
+            assert_eq!(progress.snapshot.status, SubAgentProgressStatus::Done);
+            assert_eq!(progress.elapsed_ms(), 12_345);
+        }
+        other => panic!("expected terminal progress row, got {other:?}"),
+    }
+    assert!(
+        harness.tui().app.llm_busy,
+        "terminal child progress must remain done while the parent stays busy"
+    );
+}
+
+#[tokio::test]
+async fn invocation_ids_keep_reused_child_sessions_as_distinct_rows() {
+    let mut harness = TuiTestHarness::new().await;
+    harness.tui().clear_transcript();
+    let key = monitored_key("researcher", "reused-session");
+
+    for (invocation_id, elapsed_ms) in [("inv-1", 1_000), ("inv-2", 2_000)] {
+        emit_subagent_invocation_started(harness.tui(), &key, Some(invocation_id)).await;
+        harness
+            .tui()
+            .handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+                TurnEvent::SubAgentProgress(subagent_progress(
+                    &key,
+                    invocation_id,
+                    SubAgentProgressStatus::Done,
+                    elapsed_ms,
+                )),
+            )))
+            .await
+            .unwrap();
+    }
+
+    let invocations = harness
+        .tui()
+        .app
+        .transcript
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::SubAgentSession { invocation_id, .. } => invocation_id.as_deref(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(invocations, ["inv-1", "inv-2"]);
+
+    harness.tui().app.transcript_focus = Some(0);
+    assert!(harness.tui().open_focused_root_subagent());
+    let opened = harness.tui().app.subagent_view_stack.last().unwrap();
+    let progress = opened.progress.as_ref().unwrap();
+    assert_eq!(progress.snapshot.invocation_id, "inv-1");
+    assert_eq!(progress.elapsed_ms(), 1_000);
 }
 
 #[tokio::test]
@@ -145,7 +374,19 @@ async fn nested_session_harness() -> (TuiTestHarness, MonitoredSessionKey, Monit
     harness.tui().clear_transcript();
     let parent = monitored_key("researcher", "parent-session-123");
     let nested = monitored_key("fact-checker", "nested-session-456");
-    emit_subagent_started(harness.tui(), &parent).await;
+    emit_subagent_invocation_started(harness.tui(), &parent, Some("inv-parent")).await;
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+            TurnEvent::SubAgentProgress(subagent_progress(
+                &parent,
+                "inv-parent",
+                SubAgentProgressStatus::Running,
+                2_000,
+            )),
+        )))
+        .await
+        .unwrap();
     harness
         .tui()
         .handle_tui_event(TuiEvent::SubAgentSessionSnapshot {
@@ -155,6 +396,8 @@ async fn nested_session_harness() -> (TuiTestHarness, MonitoredSessionKey, Monit
                 TranscriptItem::SubAgentSession {
                     key: nested.clone(),
                     status: SubAgentStatus::Running,
+                    invocation_id: None,
+                    progress: None,
                 },
             ],
             status: SubAgentStatus::Running,
@@ -194,7 +437,7 @@ async fn open_focused_root_subagent(harness: &mut TuiTestHarness) {
 async fn focused_subagent_row_opens_fullscreen_only_after_enter() {
     let (mut harness, parent, _) = nested_session_harness().await;
     open_focused_root_subagent(&mut harness).await;
-    assert_eq!(harness.tui().app.subagent_view_stack, vec![parent]);
+    assert_eq!(open_subagent_keys(harness.tui()), vec![parent]);
     harness.render();
     insta::assert_snapshot!(
         "subagent_session_fullscreen",
@@ -207,18 +450,58 @@ async fn fullscreen_subagent_enter_drills_into_nested_session_and_returns() {
     let (mut harness, parent, nested) = nested_session_harness().await;
     open_focused_root_subagent(&mut harness).await;
     press_key(&mut harness, KeyCode::Up).await;
-    assert_eq!(harness.tui().app.subagent_view_stack, vec![parent.clone()]);
+    assert_eq!(open_subagent_keys(harness.tui()), vec![parent.clone()]);
     press_key(&mut harness, KeyCode::Enter).await;
     assert_eq!(
-        harness.tui().app.subagent_view_stack,
+        open_subagent_keys(harness.tui()),
         vec![parent.clone(), nested.clone()]
     );
     press_key(&mut harness, KeyCode::PageUp).await;
     assert!(!harness.tui().app.monitored_sessions[&nested].scroll.follow);
     press_key(&mut harness, KeyCode::Esc).await;
-    assert_eq!(harness.tui().app.subagent_view_stack, vec![parent]);
+    assert_eq!(open_subagent_keys(harness.tui()), vec![parent]);
     press_key(&mut harness, KeyCode::Esc).await;
     assert!(harness.tui().app.subagent_view_stack.is_empty());
+}
+
+#[tokio::test]
+async fn nested_progress_is_attached_to_the_parent_child_transcript() {
+    let mut harness = TuiTestHarness::new().await;
+    harness.tui().clear_transcript();
+    let parent = monitored_key("researcher", "parent-session");
+    let nested = monitored_key("reviewer", "nested-session");
+    emit_subagent_invocation_started(harness.tui(), &parent, Some("parent-inv")).await;
+
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::SubAgentSessionEvent {
+            key: parent.clone(),
+            event: AgentEvent::sub_agent(
+                harnx_core::event::AgentSource {
+                    agent: nested.agent.clone(),
+                    session_id: Some(nested.session_id.clone()),
+                    model: None,
+                },
+                AgentEvent::Turn(TurnEvent::SubAgentProgress(subagent_progress(
+                    &nested,
+                    "nested-inv",
+                    SubAgentProgressStatus::Running,
+                    3_000,
+                ))),
+            ),
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        harness.tui().app.monitored_sessions[&parent].transcript.as_slice(),
+        [TranscriptItem::SubAgentSession {
+            key,
+            invocation_id: Some(invocation_id),
+            progress: Some(_),
+            ..
+        }] if key == &nested && invocation_id == "nested-inv"
+    ));
 }
 
 #[tokio::test]
@@ -242,7 +525,7 @@ async fn fullscreen_subagent_enter_opens_focused_entry_detail() {
 
     press_key(&mut harness, KeyCode::Esc).await;
     assert!(!harness.tui().app.detail_view_open);
-    assert_eq!(harness.tui().app.subagent_view_stack, vec![parent]);
+    assert_eq!(open_subagent_keys(harness.tui()), vec![parent]);
 }
 
 #[tokio::test]
@@ -306,11 +589,14 @@ async fn root_session_change_aborts_child_monitors_and_discards_child_views() {
         TurnEvent::SubAgentStarted {
             agent: child.agent.clone(),
             session_id: child.session_id.clone(),
+            invocation_id: None,
         },
     )))
     .await
     .unwrap();
-    tui.app.subagent_view_stack.push(child.clone());
+    tui.app
+        .subagent_view_stack
+        .push(subagent_view(child.clone()));
     let abort_handle = tui.subagent_monitor_handles[&child].abort_handle();
 
     {
@@ -422,7 +708,7 @@ async fn paste_is_ignored_while_child_transcript_is_fullscreen() {
     tui.set_input_text("unchanged draft");
     tui.app
         .subagent_view_stack
-        .push(monitored_key("worker", "visible-child"));
+        .push(subagent_view(monitored_key("worker", "visible-child")));
 
     tui.handle_paste("hidden paste".into()).await;
 

@@ -727,9 +727,24 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
                         if let Some(key) =
                             cluster.and_then(|cluster| subagent_key_from_output(&r.output, cluster))
                         {
+                            let progress = subagent_progress_from_output(&r.output)
+                                .map(crate::types::SubAgentInvocationProgress::new);
+                            let invocation_id = progress
+                                .as_ref()
+                                .map(|progress| progress.snapshot.invocation_id.clone());
+                            let status = progress.as_ref().map_or(
+                                crate::types::SubAgentStatus::Completed,
+                                |progress| {
+                                    crate::types::SubAgentStatus::from_progress(
+                                        progress.snapshot.status,
+                                    )
+                                },
+                            );
                             items.push(TranscriptItem::SubAgentSession {
                                 key,
-                                status: crate::types::SubAgentStatus::Completed,
+                                status,
+                                invocation_id,
+                                progress,
                             });
                             continue;
                         }
@@ -779,6 +794,12 @@ pub(crate) fn subagent_key_from_output(
     })
 }
 
+pub(crate) fn subagent_progress_from_output(
+    output: &serde_json::Value,
+) -> Option<harnx_core::event::SubAgentProgress> {
+    serde_json::from_value(output.get("sub_agent_progress")?.clone()).ok()
+}
+
 fn flatten_transcript_item_to_compaction_lines(item: &TranscriptItem, lines: &mut Vec<String>) {
     match item {
         TranscriptItem::UserText { text, .. }
@@ -816,7 +837,7 @@ fn flatten_transcript_item_to_compaction_lines(item: &TranscriptItem, lines: &mu
             lines.push(crate::render_helpers::source_heading(source));
         }
         TranscriptItem::CompactionMarker { text, .. } => lines.push(text.clone()),
-        TranscriptItem::SubAgentSession { key, status } => lines.push(format!(
+        TranscriptItem::SubAgentSession { key, status, .. } => lines.push(format!(
             "sub-agent {} [{}] {}",
             key.agent,
             key.session_id,
@@ -1228,7 +1249,11 @@ mod tests {
         assert_eq!(items.len(), 2, "tool call plus compact child row only");
         assert!(matches!(
             &items[1],
-            TranscriptItem::SubAgentSession { key, status: crate::types::SubAgentStatus::Completed }
+            TranscriptItem::SubAgentSession {
+                key,
+                status: crate::types::SubAgentStatus::Completed,
+                ..
+            }
                 if key.cluster == "remote"
                     && key.agent == "researcher"
                     && key.session_id == "child-session"

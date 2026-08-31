@@ -2,7 +2,8 @@
 
 use crate::markdown_render::RenderedEntry;
 use crate::types::{
-    MonitoredSessionKey, MonitoredSessionState, SubAgentStatus, TranscriptItem, Tui, SPINNER_FRAMES,
+    MonitoredSessionKey, MonitoredSessionState, RenderEntryState, SubAgentInvocationProgress,
+    SubAgentStatus, TranscriptItem, Tui, SPINNER_FRAMES,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
@@ -11,16 +12,22 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 pub(super) fn render_subagent_row(
-    key: &MonitoredSessionKey,
-    status: &SubAgentStatus,
+    item: &TranscriptItem,
+    spinner_index: usize,
     width: u16,
 ) -> RenderedEntry {
-    let short_id: String = key.session_id.chars().take(8).collect();
-    let (icon, color) = match status {
-        SubAgentStatus::Running => ("●", Color::Yellow),
-        SubAgentStatus::Completed => ("✓", Color::Green),
-        SubAgentStatus::Failed => ("✗", Color::Red),
+    let TranscriptItem::SubAgentSession {
+        key,
+        status,
+        progress,
+        ..
+    } = item
+    else {
+        unreachable!("sub-agent row renderer requires a sub-agent item");
     };
+    let short_id: String = key.session_id.chars().take(8).collect();
+    let (icon, color) = status_icon(status, spinner_index);
+    let metrics = progress.as_ref().map(format_progress).unwrap_or_default();
     RenderedEntry::from_lines(
         vec![Line::from(vec![
             Span::styled(
@@ -28,7 +35,7 @@ pub(super) fn render_subagent_row(
                 Style::default().fg(color),
             ),
             Span::styled(
-                format!(" [{short_id}]  {}", status.label()),
+                format!(" [{short_id}]  {}{metrics}", status.label()),
                 Style::default().fg(Color::DarkGray),
             ),
         ])],
@@ -36,10 +43,16 @@ pub(super) fn render_subagent_row(
     )
 }
 
-pub(super) fn render_subagent_detail(
-    key: &MonitoredSessionKey,
-    status: &SubAgentStatus,
-) -> Vec<Line<'static>> {
+pub(super) fn render_subagent_detail(item: &TranscriptItem) -> Vec<Line<'static>> {
+    let TranscriptItem::SubAgentSession {
+        key,
+        status,
+        progress,
+        ..
+    } = item
+    else {
+        unreachable!("sub-agent detail renderer requires a sub-agent item");
+    };
     let label = Style::default().fg(Color::DarkGray);
     let field = |name: &str, value: &str| {
         Line::from(vec![
@@ -47,13 +60,61 @@ pub(super) fn render_subagent_detail(
             Span::raw(value.to_string()),
         ])
     };
-    vec![
+    let mut lines = vec![
         Line::from(Span::styled("── sub-agent ──", label)),
         field("agent", &key.agent),
         field("session_id", &key.session_id),
         field("cluster", &key.cluster),
         field("status", status.label()),
-    ]
+    ];
+    if let Some(progress) = progress.as_ref() {
+        lines.extend([
+            field("invocation_id", &progress.snapshot.invocation_id),
+            field("elapsed", &format_elapsed(progress.elapsed_ms())),
+            field(
+                "input_tokens",
+                &progress.snapshot.usage.input_tokens.to_string(),
+            ),
+            field(
+                "output_tokens",
+                &progress.snapshot.usage.output_tokens.to_string(),
+            ),
+            field(
+                "cached_tokens",
+                &progress.snapshot.usage.cached_tokens.to_string(),
+            ),
+            field("tool_calls", &progress.snapshot.tool_call_count.to_string()),
+        ]);
+    }
+    lines
+}
+
+fn format_progress(progress: &SubAgentInvocationProgress) -> String {
+    format!(
+        "  {}  in {}  out {}  cache {}  tools {}",
+        format_elapsed(progress.elapsed_ms()),
+        progress.snapshot.usage.input_tokens,
+        progress.snapshot.usage.output_tokens,
+        progress.snapshot.usage.cached_tokens,
+        progress.snapshot.tool_call_count,
+    )
+}
+
+fn format_elapsed(elapsed_ms: u64) -> String {
+    let seconds = elapsed_ms / 1_000;
+    format!("{seconds}s")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_elapsed;
+
+    #[test]
+    fn elapsed_time_uses_completed_whole_seconds() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(1_999), "1s");
+        assert_eq!(format_elapsed(12_345), "12s");
+    }
 }
 
 impl Tui {
@@ -76,13 +137,15 @@ impl Tui {
 
     fn render_subagent_session_view(&mut self, frame: &mut Frame<'_>, size: Rect) {
         frame.render_widget(ratatui::widgets::Clear, size);
-        let Some(key) = self.app.subagent_view_stack.last().cloned() else {
+        let Some(view) = self.app.subagent_view_stack.last().cloned() else {
             return;
         };
+        let key = view.key;
+        let header_height = if view.progress.is_some() { 2 } else { 1 };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
+                Constraint::Length(header_height),
                 Constraint::Min(1),
                 Constraint::Length(1),
             ])
@@ -108,7 +171,8 @@ impl Tui {
             chunks[0],
             ChildHeader {
                 key: &key,
-                status: &state.status,
+                status: &view.status,
+                progress: view.progress.as_ref(),
                 spinner_index: options.spinner_index,
             },
         );
@@ -167,6 +231,7 @@ struct ChildRenderOptions {
 struct ChildHeader<'a> {
     key: &'a MonitoredSessionKey,
     status: &'a SubAgentStatus,
+    progress: Option<&'a SubAgentInvocationProgress>,
     spinner_index: usize,
 }
 
@@ -181,19 +246,23 @@ struct ChildEntryRender<'a> {
 fn render_child_header(frame: &mut Frame<'_>, area: Rect, header: ChildHeader<'_>) {
     let (icon, color) = status_icon(header.status, header.spinner_index);
     let short_id: String = header.key.session_id.chars().take(8).collect();
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" {icon} @ {}", header.key.agent),
-                Style::default().fg(color),
-            ),
-            Span::styled(
-                format!(" [{short_id}]  {}", header.status.label()),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])),
-        area,
-    );
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!(" {icon} @ {}", header.key.agent),
+            Style::default().fg(color),
+        ),
+        Span::styled(
+            format!(" [{short_id}]  {}", header.status.label()),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])];
+    if let Some(progress) = header.progress {
+        lines.push(Line::from(Span::styled(
+            format!(" {}", format_progress(progress).trim()),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_child_entries(
@@ -214,7 +283,7 @@ fn render_child_entries(
                 render.options.show_ts,
                 render.options.use_utc,
                 render.width,
-                Some(index) == streaming_idx,
+                RenderEntryState::new(Some(index) == streaming_idx, render.options.spinner_index),
                 render.theme,
             );
             if render.focus == Some(index) {

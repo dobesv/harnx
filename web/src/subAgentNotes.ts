@@ -2,10 +2,17 @@ export type SubAgentNoteStatus = 'running' | 'done' | 'failed';
 
 export interface SubAgentNote {
   id: string;
+  invocationId?: string;
   agent: string;
   sessionId: string;
   parentMessageId: string;
   status: SubAgentNoteStatus;
+  elapsedMs: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  toolCallCount: number;
+  updatedAtMs: number;
 }
 
 export interface SubAgentNotesState {
@@ -25,7 +32,23 @@ type EventRecord = Record<string, unknown>;
 interface SubAgentIdentity {
   agent: string;
   sessionId: string;
+  invocationId?: string;
 }
+
+interface SubAgentProgressValue extends SubAgentIdentity {
+  invocationId: string;
+  status: SubAgentNoteStatus;
+  elapsedMs: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  toolCallCount: number;
+}
+
+type ProgressMetrics = Pick<
+  SubAgentProgressValue,
+  'elapsedMs' | 'inputTokens' | 'outputTokens' | 'cachedTokens' | 'toolCallCount'
+>;
 
 type EventReducer = (
   state: SubAgentNotesState,
@@ -38,6 +61,12 @@ function record(value: unknown): EventRecord | undefined {
 
 function nonBlankString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+}
+
+function nonNegativeNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined;
 }
 
 function eventType(event: unknown): string | undefined {
@@ -54,12 +83,17 @@ function eventRecords(value: unknown): EventRecord[] {
 function subAgentIdentity(
   agentValue: unknown,
   sessionIdValue: unknown,
+  invocationIdValue?: unknown,
 ): SubAgentIdentity | undefined {
   const agent = nonBlankString(agentValue);
   if (!agent) return undefined;
   const sessionId = nonBlankString(sessionIdValue);
   if (!sessionId) return undefined;
-  return { agent, sessionId };
+  return {
+    agent,
+    sessionId,
+    invocationId: nonBlankString(invocationIdValue),
+  };
 }
 
 function subAgentMarker(value: unknown): SubAgentIdentity | undefined {
@@ -67,15 +101,62 @@ function subAgentMarker(value: unknown): SubAgentIdentity | undefined {
   return subAgentIdentity(marker?.agent, marker?.session_id);
 }
 
-function resultMarker(content: unknown): SubAgentIdentity | undefined {
-  if (typeof content === 'string') {
-    try {
-      return subAgentMarker(JSON.parse(content));
-    } catch {
-      return undefined;
-    }
+function progressStatus(value: unknown): SubAgentNoteStatus | undefined {
+  if (typeof value !== 'string') return undefined;
+  if (!['running', 'done', 'failed'].includes(value)) return undefined;
+  return value as SubAgentNoteStatus;
+}
+
+function progressMetrics(progress: EventRecord): ProgressMetrics | undefined {
+  const usage = record(progress.usage);
+  const values = [
+    nonNegativeNumber(progress.elapsed_ms),
+    nonNegativeNumber(usage?.input_tokens),
+    nonNegativeNumber(usage?.output_tokens),
+    nonNegativeNumber(usage?.cached_tokens),
+    nonNegativeNumber(progress.tool_call_count),
+  ];
+  if (values.some((value) => value === undefined)) return undefined;
+  const [elapsedMs, inputTokens, outputTokens, cachedTokens, toolCallCount] = values as number[];
+  return { elapsedMs, inputTokens, outputTokens, cachedTokens, toolCallCount };
+}
+
+function subAgentProgress(value: unknown): SubAgentProgressValue | undefined {
+  const progress = record(value);
+  if (!progress) return undefined;
+  const identity = subAgentIdentity(
+    progress.agent,
+    progress.session_id,
+    progress.invocation_id,
+  );
+  if (!identity?.invocationId) return undefined;
+  const status = progressStatus(progress.status);
+  if (!status) return undefined;
+  const metrics = progressMetrics(progress);
+  if (!metrics) return undefined;
+  return {
+    ...identity,
+    ...metrics,
+    invocationId: identity.invocationId,
+    status,
+  };
+}
+
+function resultValue(content: unknown): EventRecord | undefined {
+  if (typeof content !== 'string') return record(content);
+  try {
+    return record(JSON.parse(content));
+  } catch {
+    return undefined;
   }
-  return subAgentMarker(content);
+}
+
+function resultMarker(content: unknown): SubAgentIdentity | undefined {
+  return subAgentMarker(resultValue(content));
+}
+
+function resultProgress(content: unknown): SubAgentProgressValue | undefined {
+  return subAgentProgress(resultValue(content)?.sub_agent_progress);
 }
 
 function toolCalls(message: EventRecord): EventRecord[] {
@@ -105,26 +186,46 @@ function snapshotNote(
   message: EventRecord,
   parentByToolCall: Map<string, string>,
 ): SubAgentNote | undefined {
+  const context = snapshotContext(message, parentByToolCall);
+  if (!context) return undefined;
+  const progress = resultProgress(message.content);
+  const marker = progress ?? resultMarker(message.content);
+  if (!marker) return undefined;
+  const metrics = restoredMetrics(progress);
+  return {
+    id: `snapshot:${context.parentMessageId}:${context.callId}`,
+    invocationId: progress?.invocationId,
+    agent: marker.agent,
+    sessionId: marker.sessionId,
+    parentMessageId: context.parentMessageId,
+    status: progress?.status ?? 'done',
+    ...metrics,
+    updatedAtMs: Date.now(),
+  };
+}
+
+function snapshotContext(
+  message: EventRecord,
+  parentByToolCall: Map<string, string>,
+): { callId: string; parentMessageId: string } | undefined {
   if (nonBlankString(message.role) !== 'tool') return undefined;
   const callId = toolCallId(message);
   if (!callId) return undefined;
   const parentMessageId = parentByToolCall.get(callId);
-  if (!parentMessageId) return undefined;
-  const marker = resultMarker(message.content);
-  if (!marker) return undefined;
-  return {
-    id: `snapshot:${parentMessageId}:${callId}`,
-    agent: marker.agent,
-    sessionId: marker.sessionId,
-    parentMessageId,
-    status: 'done',
-  };
+  return parentMessageId ? { callId, parentMessageId } : undefined;
+}
+
+function restoredMetrics(progress: SubAgentProgressValue | undefined): ProgressMetrics {
+  if (!progress) {
+    return { elapsedMs: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, toolCallCount: 0 };
+  }
+  const { elapsedMs, inputTokens, outputTokens, cachedTokens, toolCallCount } = progress;
+  return { elapsedMs, inputTokens, outputTokens, cachedTokens, toolCallCount };
 }
 
 function optionalNote(note: SubAgentNote | undefined): SubAgentNote[] {
   return note ? [note] : [];
 }
-
 function uniqueNotes(notes: SubAgentNote[]): SubAgentNote[] {
   const byId = new Map(notes.map((note) => [note.id, note]));
   return [...byId.values()];
@@ -141,7 +242,7 @@ function notesFromSnapshot(messages: unknown): SubAgentNote[] {
 
 function startedIdentity(value: unknown): SubAgentIdentity | undefined {
   const marker = record(value);
-  return subAgentIdentity(marker?.agent, marker?.session_id);
+  return subAgentIdentity(marker?.agent, marker?.session_id, marker?.invocation_id);
 }
 
 function sameIdentity(note: SubAgentNote, identity: SubAgentIdentity): boolean {
@@ -149,23 +250,24 @@ function sameIdentity(note: SubAgentNote, identity: SubAgentIdentity): boolean {
   return note.sessionId === identity.sessionId;
 }
 
-function isDuplicateRunningNote(
+function isDuplicateNote(
   note: SubAgentNote,
   identity: SubAgentIdentity,
   parentMessageId: string,
 ): boolean {
-  if (note.status !== 'running') return false;
   if (note.parentMessageId !== parentMessageId) return false;
+  if (identity.invocationId) return note.invocationId === identity.invocationId;
+  if (note.status !== 'running') return false;
   return sameIdentity(note, identity);
 }
 
-function hasDuplicateRunningNote(
+function hasDuplicateNote(
   state: SubAgentNotesState,
   identity: SubAgentIdentity,
   parentMessageId: string,
 ): boolean {
   return state.notes.some((note) => (
-    isDuplicateRunningNote(note, identity, parentMessageId)
+    isDuplicateNote(note, identity, parentMessageId)
   ));
 }
 
@@ -175,11 +277,18 @@ function runningNote(
   parentMessageId: string,
 ): SubAgentNote {
   return {
-    id: `live:${state.nextId}`,
+    id: identity.invocationId ? `live:${identity.invocationId}` : `live:${state.nextId}`,
+    invocationId: identity.invocationId,
     agent: identity.agent,
     sessionId: identity.sessionId,
     parentMessageId,
     status: 'running',
+    elapsedMs: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedTokens: 0,
+    toolCallCount: 0,
+    updatedAtMs: Date.now(),
   };
 }
 
@@ -188,7 +297,7 @@ function startNote(state: SubAgentNotesState, value: unknown): SubAgentNotesStat
   if (!identity) return state;
   const parentMessageId = state.latestParentMessageId;
   if (!parentMessageId) return state;
-  if (hasDuplicateRunningNote(state, identity, parentMessageId)) return state;
+  if (hasDuplicateNote(state, identity, parentMessageId)) return state;
 
   return {
     ...state,
@@ -202,10 +311,72 @@ function isMatchingRunningNote(
   identity: SubAgentIdentity,
 ): boolean {
   if (note.status !== 'running') return false;
+  if (identity.invocationId) return note.invocationId === identity.invocationId;
   return sameIdentity(note, identity);
 }
 
+function noteFromProgress(
+  progress: SubAgentProgressValue,
+  parentMessageId: string,
+): SubAgentNote {
+  return {
+    id: `live:${progress.invocationId}`,
+    invocationId: progress.invocationId,
+    agent: progress.agent,
+    sessionId: progress.sessionId,
+    parentMessageId,
+    status: progress.status,
+    elapsedMs: progress.elapsedMs,
+    inputTokens: progress.inputTokens,
+    outputTokens: progress.outputTokens,
+    cachedTokens: progress.cachedTokens,
+    toolCallCount: progress.toolCallCount,
+    updatedAtMs: Date.now(),
+  };
+}
+
+function applyProgress(
+  state: SubAgentNotesState,
+  value: unknown,
+): SubAgentNotesState {
+  const progress = subAgentProgress(value);
+  if (!progress) return state;
+  const index = state.notes.findIndex((note) => note.invocationId === progress.invocationId);
+  if (index >= 0) {
+    if (state.notes[index].status !== 'running') return state;
+    return {
+      ...state,
+      notes: state.notes.map((note, noteIndex) => (
+        noteIndex === index
+          ? { ...note, ...noteFromProgress(progress, note.parentMessageId), id: note.id }
+          : note
+      )),
+    };
+  }
+  const parentMessageId = state.latestParentMessageId;
+  if (!parentMessageId) return state;
+  return {
+    ...state,
+    notes: [...state.notes, noteFromProgress(progress, parentMessageId)],
+    nextId: state.nextId + 1,
+  };
+}
+
 function completeNote(state: SubAgentNotesState, content: unknown): SubAgentNotesState {
+  const progress = resultProgress(content);
+  if (progress) return applyProgress(state, {
+    invocation_id: progress.invocationId,
+    agent: progress.agent,
+    session_id: progress.sessionId,
+    status: progress.status,
+    elapsed_ms: progress.elapsedMs,
+    usage: {
+      input_tokens: progress.inputTokens,
+      output_tokens: progress.outputTokens,
+      cached_tokens: progress.cachedTokens,
+    },
+    tool_call_count: progress.toolCallCount,
+  });
   const marker = resultMarker(content);
   if (!marker) return state;
 
@@ -217,13 +388,25 @@ function completeNote(state: SubAgentNotesState, content: unknown): SubAgentNote
   return {
     ...state,
     notes: state.notes.map((note, noteIndex) => (
-      noteIndex === index ? { ...note, status: 'done' } : note
+      noteIndex === index ? freezeNote(note, 'done') : note
     )),
   };
 }
 
+function freezeNote(note: SubAgentNote, status: Exclude<SubAgentNoteStatus, 'running'>): SubAgentNote {
+  const localElapsed = note.status === 'running'
+    ? Math.max(0, Date.now() - note.updatedAtMs)
+    : 0;
+  return {
+    ...note,
+    status,
+    elapsedMs: note.elapsedMs + localElapsed,
+    updatedAtMs: Date.now(),
+  };
+}
+
 function failRunningNote(note: SubAgentNote): SubAgentNote {
-  return note.status === 'running' ? { ...note, status: 'failed' } : note;
+  return note.status === 'running' ? freezeNote(note, 'failed') : note;
 }
 
 function failUnresolvedNotes(state: SubAgentNotesState): SubAgentNotesState {
@@ -263,8 +446,9 @@ function startFromCustomEvent(
   state: SubAgentNotesState,
   event: EventRecord,
 ): SubAgentNotesState {
-  if (event.name !== 'sub_agent_started') return state;
-  return startNote(state, event.value);
+  if (event.name === 'sub_agent_started') return startNote(state, event.value);
+  if (event.name === 'sub_agent_progress') return applyProgress(state, event.value);
+  return state;
 }
 
 function completeFromToolResult(

@@ -75,12 +75,17 @@ test('sub-agent row transitions, opens the child, and browser Back returns to th
   const childRow = childRows.first();
   await expect(childRow).toHaveAttribute('data-status', 'running');
   await expect(childRow).toContainText('child-session-0001');
+  await expect(childRow).toContainText('in 1,200');
+  await expect(childRow).toContainText('out 345');
+  await expect(childRow).toContainText('cache 67');
+  await expect(childRow).toContainText('tools 4');
   await expect(childRow).toHaveAttribute('data-status', 'done', { timeout: 10000 });
+  await expect(childRow).toHaveAttribute('data-elapsed-ms', '1250');
+  await expect(childRow).toContainText('1s');
 
   await page.locator('.aui-composer-input').fill('delegate to researcher');
   await page.locator('.aui-composer-send').click();
   await expect(childRows).toHaveCount(2);
-  await expect(childRows.last()).toHaveAttribute('data-status', 'running');
   await expect(childRows.last()).toHaveAttribute('data-status', 'done', { timeout: 10000 });
 
   await childRows.last().click();

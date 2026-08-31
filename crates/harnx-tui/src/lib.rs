@@ -14,6 +14,7 @@ pub mod render_helpers;
 mod session_activity;
 mod session_history_loader;
 mod subagent_monitor;
+mod subagent_progress;
 mod subagent_render;
 mod subagent_sessions;
 mod subagent_transcript;

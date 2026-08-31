@@ -240,7 +240,10 @@ fn spawn_metis_worker(url: &str) -> tokio::task::JoinHandle<anyhow::Result<()>> 
 /// A worker call_fn that holds the turn open for `delay` before replying, so
 /// the session stays active (lease held, renew task running) long enough for a
 /// lease renewal — and its session-index `last_activity` refresh — to fire.
-fn slow_prompt_call_fn(reply: &'static str, delay: Duration) -> crate::agent_loop::AgentCallFn {
+pub(super) fn slow_prompt_call_fn(
+    reply: &'static str,
+    delay: Duration,
+) -> crate::agent_loop::AgentCallFn {
     Arc::new(move |_input, _config, _abort| {
         Box::pin(async move {
             tokio::time::sleep(delay).await;
@@ -265,7 +268,7 @@ fn spawn_metis_worker_with_fast_renew(
     spawn_metis_worker_with_call_fn_and_daemon(url, call_fn, daemon)
 }
 
-fn spawn_metis_worker_with_call_fn(
+pub(super) fn spawn_metis_worker_with_call_fn(
     url: &str,
     call_fn: crate::agent_loop::AgentCallFn,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
@@ -616,7 +619,9 @@ fn echoing_call_fn(captured: Arc<AsyncMutex<Vec<String>>>) -> crate::agent_loop:
     })
 }
 
-async fn test_subagent_toolset(url: &str) -> Arc<super::subagent_toolset::SubagentToolset> {
+pub(super) async fn test_subagent_toolset(
+    url: &str,
+) -> Arc<super::subagent_toolset::SubagentToolset> {
     let client = async_nats::connect(url)
         .await
         .expect("connect sub-agent toolset to test nats");
@@ -631,7 +636,7 @@ async fn test_subagent_toolset(url: &str) -> Arc<super::subagent_toolset::Subage
     ))
 }
 
-fn subagent_test_env<'a>(
+pub(super) fn subagent_test_env<'a>(
     url: &'a str,
     seeded: &'a SeededRemoteParentConfig,
 ) -> (TestEnvGuard, TestEnvGuard, TestEnvGuard) {
@@ -906,6 +911,7 @@ async fn call_registered_agent(
                     if let AgentEvent::Turn(harnx_core::event::TurnEvent::SubAgentStarted {
                         agent,
                         session_id,
+                        ..
                     }) = *event
                     {
                         assert_eq!(source.agent, agent);
@@ -1001,47 +1007,6 @@ async fn worker_registers_and_delegates_to_every_configured_agent() {
             format!("stub remote reply over nats: delegate to {agent}")
         );
     }
-
-    daemon.abort();
-    let _ = daemon.await;
-    let _ = nats.kill();
-    let _ = nats.wait();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subagent_new_and_prompt_results_include_agent_source_marker() {
-    let _env_guard = env_lock().await;
-    let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
-        return;
-    };
-    let seeded = seed_remote_config(&url);
-    let _env = subagent_test_env(&url, &seeded);
-    let daemon = spawn_metis_worker_with_call_fn(&url, fixed_prompt_call_fn("marker response"));
-    let toolset = test_subagent_toolset(&url).await;
-
-    let created = toolset
-        .invoke("session_new", json!({}), CancellationToken::new())
-        .await
-        .expect("create marked child session");
-    let session_id = created["session_id"]
-        .as_str()
-        .expect("new result session id")
-        .to_string();
-    assert_eq!(created["sub_agent"]["agent"], "metis");
-    assert_eq!(created["sub_agent"]["session_id"], session_id);
-    assert!(created["sub_agent"].get("model").is_none());
-
-    let prompted = toolset
-        .invoke(
-            "session_prompt",
-            json!({ "message": "continue marked session", "session_id": session_id }),
-            CancellationToken::new(),
-        )
-        .await
-        .expect("prompt marked child session");
-    assert_eq!(prompted["sub_agent"]["agent"], "metis");
-    assert_eq!(prompted["sub_agent"]["session_id"], session_id);
-    assert_eq!(prompted["session_id"], session_id);
 
     daemon.abort();
     let _ = daemon.await;
