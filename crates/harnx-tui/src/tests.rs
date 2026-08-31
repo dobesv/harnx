@@ -1,7 +1,7 @@
 use crate::markdown_render::MarkdownBlockData;
 use crate::test_utils::{TestEnvironment, TuiTestHarness, ENV_LOCK};
 use crate::types::Tui;
-use crate::types::{ToolCallBody, TranscriptItem, TuiEvent};
+use crate::types::{ToolCallBody, ToolConfirmationEvent, TranscriptItem, TuiEvent};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_core::event::{
     AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, PlanEntry, SessionEvent,
@@ -5943,6 +5943,75 @@ async fn test_d5_modal_y_confirms_n_cancels() {
         harness.tui().app.modal.is_none(),
         "Expected modal to be cleared after Esc"
     );
+}
+
+#[tokio::test]
+async fn tool_confirmation_does_not_replace_an_existing_modal() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.app.modal = Some(crate::types::ModalState::ConfirmDelete { from: 3, to: 3 });
+    let (reply, decision) = std::sync::mpsc::channel();
+
+    tui.handle_tui_event(TuiEvent::ToolConfirmation(ToolConfirmationEvent::Show {
+        confirmation_id: 41,
+        tool_name: "atlas_session_handoff".to_string(),
+        input_preview: r#"{"prompt":"execute"}"#.to_string(),
+        reason: Some("Hand off this plan?".to_string()),
+        reply,
+    }))
+    .await
+    .unwrap();
+
+    assert!(!decision.recv().unwrap());
+    assert!(matches!(
+        tui.app.modal,
+        Some(crate::types::ModalState::ConfirmDelete { from: 3, to: 3 })
+    ));
+    assert!(tui.app.pending_confirm_reply.is_none());
+    assert!(tui.app.transcript.iter().any(|item| matches!(
+        item,
+        TranscriptItem::SystemText(text) if text.contains("another modal is already open")
+    )));
+}
+
+#[tokio::test]
+async fn remote_confirmation_cleanup_dismisses_only_its_own_modal() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (reply, decision) = std::sync::mpsc::channel();
+
+    tui.handle_tui_event(TuiEvent::ToolConfirmation(ToolConfirmationEvent::Show {
+        confirmation_id: 42,
+        tool_name: "atlas_session_handoff".to_string(),
+        input_preview: r#"{"prompt":"execute"}"#.to_string(),
+        reason: Some("Hand off this plan?".to_string()),
+        reply,
+    }))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::ToolConfirmation(ToolConfirmationEvent::Dismiss {
+        confirmation_id: 43,
+    }))
+    .await
+    .unwrap();
+    assert!(matches!(
+        tui.app.modal,
+        Some(crate::types::ModalState::ConfirmToolUse { .. })
+    ));
+
+    tui.handle_tui_event(TuiEvent::ToolConfirmation(ToolConfirmationEvent::Dismiss {
+        confirmation_id: 42,
+    }))
+    .await
+    .unwrap();
+    assert!(!decision.recv().unwrap());
+    assert!(tui.app.modal.is_none());
+    assert!(tui.app.pending_confirm_reply.is_none());
+    assert!(tui.app.pending_confirm_id.is_none());
+    assert!(tui.app.transcript.iter().any(|item| matches!(
+        item,
+        TranscriptItem::SystemText(text) if text.contains("expired or was cancelled")
+    )));
 }
 
 #[tokio::test(flavor = "multi_thread")]

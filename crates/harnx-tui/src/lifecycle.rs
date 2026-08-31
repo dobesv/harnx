@@ -3,7 +3,8 @@ use crate::event_source::{CrosstermEventSource, EventSource};
 use crate::terminal::{cleanup_terminal_state, PanicTerminalHookGuard};
 use crate::types::Tui;
 use crate::types::{
-    App, ModalState, PendingMessage, TranscriptItem, TuiEvent, SPINNER_FRAMES, TICK_RATE,
+    App, ModalState, PendingMessage, ToolConfirmationEvent, TranscriptItem, TuiEvent,
+    SPINNER_FRAMES, TICK_RATE,
 };
 use anyhow::Result;
 #[cfg(test)]
@@ -139,6 +140,7 @@ fn build_initial_app(
         transcript_selection_anchor: None,
         modal: None,
         pending_confirm_reply: None,
+        pending_confirm_id: None,
         detail_view_scroll: {
             let mut s = ratatui_widget_scrolling::ScrollState::new();
             s.follow = false;
@@ -586,17 +588,18 @@ impl Tui {
     /// quitting), it denies.
     fn install_tool_confirm_bridge(&self) {
         let event_tx = self.event_tx.clone();
-        let confirm: std::sync::Arc<harnx_runtime::tool::ConfirmToolUseFn> = std::sync::Arc::new(
+        let confirm: Arc<harnx_runtime::tool::ConfirmToolUseFn> = Arc::new(
             move |call: &harnx_core::tool::ToolCall,
                   input: &serde_json::Value,
                   reason: Option<&str>| {
                 let (reply_tx, reply_rx) = std::sync::mpsc::channel::<bool>();
-                let event = TuiEvent::ConfirmToolUse {
+                let event = TuiEvent::ToolConfirmation(ToolConfirmationEvent::Show {
+                    confirmation_id: next_tool_confirmation_id(),
                     tool_name: call.name.clone(),
                     input_preview: confirm_input_preview(input),
                     reason: reason.map(str::to_string),
                     reply: reply_tx,
-                };
+                });
                 if event_tx.send(event).is_err() {
                     return harnx_runtime::tool::ToolUseConfirmation::Deny { reason: None };
                 }
@@ -1093,6 +1096,64 @@ fn confirm_input_preview(input: &serde_json::Value) -> String {
     }
 }
 
+fn next_tool_confirmation_id() -> u64 {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Ensures a remote confirmation modal cannot outlive the request that owns
+/// it. The event carries an identity so cleanup never dismisses a newer modal.
+struct ToolConfirmationDismissGuard {
+    event_tx: tokio::sync::mpsc::UnboundedSender<TuiEvent>,
+    confirmation_id: u64,
+}
+
+impl Drop for ToolConfirmationDismissGuard {
+    fn drop(&mut self) {
+        let _ = self
+            .event_tx
+            .send(TuiEvent::ToolConfirmation(ToolConfirmationEvent::Dismiss {
+                confirmation_id: self.confirmation_id,
+            }));
+    }
+}
+
+/// Convert a worker-side NATS confirmation request into the same modal event
+/// used by the in-process tool path, then asynchronously wait for the user's
+/// decision without blocking the TUI event loop.
+pub(crate) fn nats_tool_confirmation_handler(
+    event_tx: tokio::sync::mpsc::UnboundedSender<TuiEvent>,
+) -> Arc<harnx_runtime::nats_tool_confirmation::ToolConfirmationHandler> {
+    Arc::new(move |request| {
+        let event_tx = event_tx.clone();
+        Box::pin(async move {
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel::<bool>();
+            let confirmation_id = next_tool_confirmation_id();
+            let event = TuiEvent::ToolConfirmation(ToolConfirmationEvent::Show {
+                confirmation_id,
+                tool_name: request.tool_name,
+                input_preview: confirm_input_preview(&request.arguments),
+                reason: request.reason,
+                reply: reply_tx,
+            });
+            if event_tx.send(event).is_err() {
+                return false;
+            }
+            let _dismiss = ToolConfirmationDismissGuard {
+                event_tx,
+                confirmation_id,
+            };
+            tokio::task::spawn_blocking(move || {
+                reply_rx
+                    .recv_timeout(harnx_runtime::nats_tool_confirmation::TOOL_CONFIRMATION_TIMEOUT)
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false)
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,6 +1163,78 @@ mod tests {
     use harnx_runtime::tool::ToolDeclaration;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nats_confirmation_handler_routes_request_through_tui_modal_event() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler = nats_tool_confirmation_handler(event_tx);
+        let decision = tokio::spawn(handler(
+            harnx_runtime::nats_tool_confirmation::ToolConfirmationRequest {
+                session_id: "session-1".to_string(),
+                tool_call_id: Some("call-1".to_string()),
+                tool_name: "atlas_session_handoff".to_string(),
+                arguments: json!({"prompt": "execute"}),
+                reason: Some("Hand off this plan?".to_string()),
+            },
+        ));
+
+        let event = event_rx.recv().await.expect("confirmation modal event");
+        let TuiEvent::ToolConfirmation(ToolConfirmationEvent::Show {
+            confirmation_id,
+            tool_name,
+            input_preview,
+            reason,
+            reply,
+        }) = event
+        else {
+            panic!("expected tool confirmation event");
+        };
+        assert_eq!(tool_name, "atlas_session_handoff");
+        assert_eq!(input_preview, r#"{"prompt":"execute"}"#);
+        assert_eq!(reason.as_deref(), Some("Hand off this plan?"));
+        assert_ne!(confirmation_id, 0);
+        reply.send(true).expect("reply to confirmation");
+        assert!(decision.await.expect("confirmation task"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_nats_confirmation_requests_modal_dismissal() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler = nats_tool_confirmation_handler(event_tx);
+        let decision = tokio::spawn(handler(
+            harnx_runtime::nats_tool_confirmation::ToolConfirmationRequest {
+                session_id: "session-1".to_string(),
+                tool_call_id: Some("call-1".to_string()),
+                tool_name: "atlas_session_handoff".to_string(),
+                arguments: json!({"prompt": "execute"}),
+                reason: Some("Hand off this plan?".to_string()),
+            },
+        ));
+
+        let event = event_rx.recv().await.expect("confirmation modal event");
+        let TuiEvent::ToolConfirmation(ToolConfirmationEvent::Show {
+            confirmation_id,
+            reply,
+            ..
+        }) = event
+        else {
+            panic!("expected tool confirmation event");
+        };
+
+        decision.abort();
+        let _ = decision.await;
+        let dismiss = event_rx.recv().await.expect("confirmation dismissal event");
+        assert!(matches!(
+            dismiss,
+            TuiEvent::ToolConfirmation(ToolConfirmationEvent::Dismiss {
+                confirmation_id: dismissed
+            }) if dismissed == confirmation_id
+        ));
+
+        // Release the blocking receiver that the cancelled async task left
+        // behind until the TUI processes the dismissal.
+        reply.send(false).expect("dismiss confirmation modal");
+    }
 
     #[test]
     fn messages_to_transcript_uses_markdown_when_template_exists() {

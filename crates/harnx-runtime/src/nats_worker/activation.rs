@@ -22,6 +22,10 @@ pub struct SessionActivate {
     pub requested_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_worker_id: Option<String>,
+    /// Ephemeral Core NATS subject owned by the frontend that activated this
+    /// turn. Workers use it only when a `PreToolUse` hook asks the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_confirmation_subject: Option<String>,
 }
 
 impl SessionActivate {
@@ -31,6 +35,7 @@ impl SessionActivate {
             epoch: Utc::now().to_rfc3339(),
             requested_seq: None,
             target_worker_id: None,
+            tool_confirmation_subject: None,
         }
     }
 
@@ -44,6 +49,11 @@ impl SessionActivate {
             target_worker_id: Some(worker_id.into()),
             ..Self::new(session_id)
         }
+    }
+
+    pub fn with_tool_confirmation_subject(mut self, subject: Option<&str>) -> Self {
+        self.tool_confirmation_subject = subject.map(str::to_string);
+        self
     }
 
     /// Dedup id for the cluster-shared notify stream: session plus epoch.
@@ -72,6 +82,7 @@ mod tests {
         let activation: SessionActivate = serde_json::from_slice(legacy).unwrap();
         assert_eq!(activation.requested_seq, None);
         assert_eq!(activation.target_worker_id, None);
+        assert_eq!(activation.tool_confirmation_subject, None);
         assert_eq!(activation.msg_id(), "s1:now");
     }
 }
