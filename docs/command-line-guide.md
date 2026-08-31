@@ -74,6 +74,17 @@ distinct from CLI subcommands. Use `prompt` as the canonical syntax for piped
 stdin and file-only input as well. Bare stdin and file-only forms remain
 supported for compatibility.
 
+For a normal one-shot prompt, Harnx writes the root agent and session heading
+to stderr after creating the session. Delegations also write a start line, a
+running status line every 10 seconds, and an immediate done or failed line.
+Each status identifies the child agent/session and reports elapsed time,
+input/output/cached tokens, and tool calls; concurrent children are tracked
+independently.
+
+`--final-only` suppresses the root heading, delegation status, and all other
+startup/progress output. On success, stdout contains only the final response,
+which makes the mode safe for command substitution and pipelines.
+
 ## Shell Integration
 
 Simply type `alt+e` to let `harnx` provide intelligent completions directly in your terminal.

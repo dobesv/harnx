@@ -10,14 +10,17 @@ import {
 const SUB_AGENT_SESSION_ID = 'child-session-0001';
 let subAgentExchangeId = 0;
 
-const SUB_AGENT_RESULT = JSON.stringify({
-  session_id: SUB_AGENT_SESSION_ID,
-  response: 'Child task complete.',
-  sub_agent: {
+function subAgentProgress(invocationId: string, status: 'running' | 'done', elapsedMs: number) {
+  return {
+    invocation_id: invocationId,
     agent: 'researcher',
     session_id: SUB_AGENT_SESSION_ID,
-  },
-});
+    status,
+    elapsed_ms: elapsedMs,
+    usage: { input_tokens: 1200, output_tokens: 345, cached_tokens: 67 },
+    tool_call_count: 4,
+  };
+}
 
 function isSseRequest(request: Request): boolean {
   return request.headers.get('accept')?.includes('text/event-stream') ?? false;
@@ -257,11 +260,97 @@ interface SubAgentRun extends MockRun {
 function nextSubAgentRunIds() {
   const exchangeId = ++subAgentExchangeId;
   return {
+    invocationId: `mock-invocation-${exchangeId}`,
     assistantMessageId: `assistant-delegation-${exchangeId}`,
     toolCallId: `call-sub-agent-${exchangeId}`,
     toolResultMessageId: `tool-result-sub-agent-${exchangeId}`,
     finalMessageId: `assistant-final-${exchangeId}`,
   };
+}
+
+type SubAgentRunIds = ReturnType<typeof nextSubAgentRunIds>;
+
+function subAgentResultContent(ids: SubAgentRunIds) {
+  return JSON.stringify({
+    session_id: SUB_AGENT_SESSION_ID,
+    response: 'Child task complete.',
+    sub_agent: { agent: 'researcher', session_id: SUB_AGENT_SESSION_ID },
+    sub_agent_progress: subAgentProgress(ids.invocationId, 'done', 1_250),
+  });
+}
+
+function emitSubAgentStart(run: MockRun, ids: SubAgentRunIds) {
+  run.controller.enqueue(encodeSseEvent({
+    type: 'TOOL_CALL_START',
+    toolCallId: ids.toolCallId,
+    toolCallName: 'researcher_session_prompt',
+    parentMessageId: ids.assistantMessageId,
+  }));
+  run.controller.enqueue(encodeSseEvent({
+    type: 'TOOL_CALL_ARGS',
+    toolCallId: ids.toolCallId,
+    delta: JSON.stringify({ message: 'Research this task' }),
+  }));
+  run.controller.enqueue(encodeSseEvent({
+    type: 'CUSTOM',
+    threadId: run.threadId,
+    runId: run.runId,
+    name: 'sub_agent_started',
+    value: {
+      agent: 'researcher',
+      session_id: SUB_AGENT_SESSION_ID,
+      invocation_id: ids.invocationId,
+    },
+  }));
+}
+
+async function emitSubAgentProgress(run: MockRun, ids: SubAgentRunIds) {
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  run.controller.enqueue(encodeSseEvent({
+    type: 'CUSTOM',
+    threadId: run.threadId,
+    runId: run.runId,
+    name: 'sub_agent_progress',
+    value: subAgentProgress(ids.invocationId, 'running', 500),
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  run.controller.enqueue(encodeSseEvent({
+    type: 'CUSTOM',
+    threadId: run.threadId,
+    runId: run.runId,
+    name: 'sub_agent_progress',
+    value: subAgentProgress(ids.invocationId, 'done', 1_250),
+  }));
+}
+
+function emitSubAgentResult(run: MockRun, ids: SubAgentRunIds, content: string) {
+  run.controller.enqueue(encodeSseEvent({ type: 'TOOL_CALL_END', toolCallId: ids.toolCallId }));
+  run.controller.enqueue(encodeSseEvent({
+    type: 'TOOL_CALL_RESULT',
+    messageId: ids.toolResultMessageId,
+    toolCallId: ids.toolCallId,
+    content,
+    role: 'tool',
+  }));
+  run.controller.enqueue(encodeSseEvent({
+    type: 'TEXT_MESSAGE_START',
+    messageId: ids.finalMessageId,
+    role: 'assistant',
+  }));
+  run.controller.enqueue(encodeSseEvent({
+    type: 'TEXT_MESSAGE_CONTENT',
+    messageId: ids.finalMessageId,
+    delta: 'Delegation complete.',
+  }));
+  run.controller.enqueue(encodeSseEvent({
+    type: 'TEXT_MESSAGE_END',
+    messageId: ids.finalMessageId,
+  }));
+  run.controller.enqueue(encodeSseEvent({
+    type: 'RUN_FINISHED',
+    threadId: run.threadId,
+    runId: run.runId,
+  }));
 }
 
 async function emitSubAgentRun({
@@ -272,55 +361,15 @@ async function emitSubAgentRun({
   userText,
 }: SubAgentRun) {
   const ids = nextSubAgentRunIds();
-  controller.enqueue(encodeSseEvent({
-    type: 'TOOL_CALL_START',
-    toolCallId: ids.toolCallId,
-    toolCallName: 'researcher_session_prompt',
-    parentMessageId: ids.assistantMessageId,
-  }));
-  controller.enqueue(encodeSseEvent({
-    type: 'TOOL_CALL_ARGS',
-    toolCallId: ids.toolCallId,
-    delta: JSON.stringify({ message: 'Research this task' }),
-  }));
-  controller.enqueue(encodeSseEvent({
-    type: 'CUSTOM',
-    threadId,
-    runId,
-    name: 'sub_agent_started',
-    value: { agent: 'researcher', session_id: SUB_AGENT_SESSION_ID },
-  }));
-  await new Promise((resolve) => setTimeout(resolve, 750));
-  controller.enqueue(encodeSseEvent({
-    type: 'TOOL_CALL_END',
-    toolCallId: ids.toolCallId,
-  }));
-  controller.enqueue(encodeSseEvent({
-    type: 'TOOL_CALL_RESULT',
-    messageId: ids.toolResultMessageId,
-    toolCallId: ids.toolCallId,
-    content: SUB_AGENT_RESULT,
-    role: 'tool',
-  }));
-  controller.enqueue(encodeSseEvent({
-    type: 'TEXT_MESSAGE_START',
-    messageId: ids.finalMessageId,
-    role: 'assistant',
-  }));
-  controller.enqueue(encodeSseEvent({
-    type: 'TEXT_MESSAGE_CONTENT',
-    messageId: ids.finalMessageId,
-    delta: 'Delegation complete.',
-  }));
-  controller.enqueue(encodeSseEvent({
-    type: 'TEXT_MESSAGE_END',
-    messageId: ids.finalMessageId,
-  }));
-  controller.enqueue(encodeSseEvent({ type: 'RUN_FINISHED', threadId, runId }));
+  const resultContent = subAgentResultContent(ids);
+  const run = { controller, threadId, runId };
+  emitSubAgentStart(run, ids);
+  await emitSubAgentProgress(run, ids);
+  emitSubAgentResult(run, ids, resultContent);
   persistSubAgentExchange({
     session,
     userText,
-    resultContent: SUB_AGENT_RESULT,
+    resultContent,
     ...ids,
   });
   controller.close();

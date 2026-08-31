@@ -1,12 +1,16 @@
 //! NATS toolset for nested sub-agent sessions.
 
+use super::subagent_progress::SubagentProgressReporter;
 use super::{publish_control_command, ControlCommand};
+use crate::nats_event_sink::NatsEventSink;
 use crate::nats_session::{NatsSession, NatsSessionConfig, NatsTurnResult};
 use crate::nats_session_log::NatsSessionLog;
 use crate::nats_worker::SessionActivationRoute;
 use async_nats::jetstream;
 use async_trait::async_trait;
-use harnx_core::event::{AgentEvent, AgentSource, NullSink, TurnEvent};
+use harnx_core::event::{
+    AgentEvent, AgentSource, SubAgentProgress, SubAgentProgressStatus, TurnEvent,
+};
 use harnx_core::package_namespace::sanitize_for_tool_name;
 use harnx_core::session::SessionLogEntry;
 use harnx_toolset::{
@@ -15,13 +19,14 @@ use harnx_toolset::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 // `_session_new` has no arguments, so a fixed bootstrap message creates the
 // durable session and preserves blocking call-and-return semantics.
 const SESSION_NEW_INITIAL_PROMPT: &str = "Start a new session.";
+const SUBAGENT_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub(crate) struct SubagentSessionRoute {
@@ -57,6 +62,7 @@ pub(crate) struct SubagentToolset {
     server_name: String,
     client: async_nats::Client,
     jetstream: jetstream::Context,
+    progress_heartbeat: Duration,
 }
 
 impl SubagentToolset {
@@ -76,7 +82,14 @@ impl SubagentToolset {
             route,
             client,
             jetstream,
+            progress_heartbeat: SUBAGENT_PROGRESS_HEARTBEAT,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_progress_heartbeat(mut self, heartbeat: Duration) -> Self {
+        self.progress_heartbeat = heartbeat;
+        self
     }
 
     async fn create_session(
@@ -101,29 +114,22 @@ impl SubagentToolset {
         session_id: Option<String>,
         parent_session_id: Option<String>,
         cancel: CancellationToken,
-    ) -> Result<NatsTurnResult, ToolInvokeError> {
+    ) -> Result<CompletedSubagentTurn, ToolInvokeError> {
         let session = self.create_session(session_id).await?;
         let child_session_id = session.session_id().to_string();
-        if let Some(parent_session_id) = parent_session_id {
-            self.emit_parent_subagent_started(&parent_session_id, &child_session_id)
-                .await?;
-        }
-        let sink = Arc::new(NullSink);
+        let reporter = self
+            .start_progress_reporter(&child_session_id, parent_session_id)
+            .await?;
+        let sink = reporter.sink();
         let (cancel_tx, cancel_rx) = mpsc::channel(1);
         let run_turn = session.run_turn(message, sink, Some(cancel_rx));
         tokio::pin!(run_turn);
 
-        tokio::select! {
+        let turn = tokio::select! {
             result = &mut run_turn => {
-                let result = result.map_err(|error| {
+                result.map_err(|error| {
                     ToolInvokeError::Recoverable(format!("run sub-agent turn: {error:#}"))
-                })?;
-                if result.was_cancelled || self.turn_has_cancel(&result).await {
-                    return Err(ToolInvokeError::Recoverable(
-                        "sub-agent turn was cancelled".to_string(),
-                    ));
-                }
-                Ok(result)
+                })
             }
             _ = cancel.cancelled() => {
                 let _ = cancel_tx.send(()).await;
@@ -132,13 +138,68 @@ impl SubagentToolset {
                     "sub-agent tool call aborted".to_string(),
                 ))
             }
+        };
+
+        let result = match turn {
+            Ok(result) => result,
+            Err(error) => {
+                if let Err(report_error) = reporter.finish(SubAgentProgressStatus::Failed).await {
+                    log::debug!("failed to publish terminal sub-agent progress: {report_error:#}");
+                }
+                return Err(error);
+            }
+        };
+        let cancelled = result.was_cancelled || self.turn_has_cancel(&result).await;
+        let status = if subagent_turn_failed(&result, cancelled) {
+            SubAgentProgressStatus::Failed
+        } else {
+            SubAgentProgressStatus::Done
+        };
+        let progress = reporter.finish(status).await.map_err(|error| {
+            ToolInvokeError::Recoverable(format!("publish terminal sub-agent progress: {error:#}"))
+        })?;
+        if cancelled {
+            return Err(ToolInvokeError::Recoverable(
+                "sub-agent turn was cancelled".to_string(),
+            ));
         }
+        Ok(CompletedSubagentTurn { result, progress })
+    }
+
+    async fn start_progress_reporter(
+        &self,
+        child_session_id: &str,
+        parent_session_id: Option<String>,
+    ) -> Result<SubagentProgressReporter, ToolInvokeError> {
+        let invocation_id = uuid::Uuid::new_v4().to_string();
+        let parent_sink = match parent_session_id {
+            Some(parent_session_id) => {
+                let sink = NatsEventSink::new(
+                    self.client.clone(),
+                    self.jetstream.clone(),
+                    parent_session_id,
+                )
+                .await;
+                self.emit_parent_subagent_started(&sink, child_session_id, &invocation_id)
+                    .await?;
+                Some(sink)
+            }
+            None => None,
+        };
+        Ok(SubagentProgressReporter::spawn(
+            self.agent.clone(),
+            child_session_id.to_string(),
+            invocation_id,
+            parent_sink,
+            self.progress_heartbeat,
+        ))
     }
 
     async fn emit_parent_subagent_started(
         &self,
-        parent_session_id: &str,
+        parent_sink: &NatsEventSink,
         child_session_id: &str,
+        invocation_id: &str,
     ) -> Result<(), ToolInvokeError> {
         let source = AgentSource {
             agent: self.agent.clone(),
@@ -150,35 +211,13 @@ impl SubagentToolset {
             AgentEvent::Turn(TurnEvent::SubAgentStarted {
                 agent: self.agent.clone(),
                 session_id: child_session_id.to_string(),
+                invocation_id: Some(invocation_id.to_string()),
             }),
         );
-        let stream_name = crate::nats_session_log::stream_name_for_session(parent_session_id);
-        let after_seq = match self.jetstream.get_stream(&stream_name).await {
-            Ok(mut stream) => stream
-                .info()
-                .await
-                .map(|info| info.state.last_sequence)
-                .unwrap_or(0),
-            Err(_) => 0,
-        };
-        let envelope = crate::nats_event_sink::AdvisoryEnvelope::new(after_seq, event);
-        self.client
-            .publish(
-                crate::nats_event_sink::events_subject(parent_session_id),
-                envelope
-                    .to_bytes()
-                    .map_err(|error| ToolInvokeError::Recoverable(error.to_string()))?
-                    .into(),
-            )
-            .await
-            .map_err(|error| {
-                ToolInvokeError::Recoverable(format!(
-                    "publish sub-agent start event to parent session: {error}"
-                ))
-            })?;
-        self.client.flush().await.map_err(|error| {
+        parent_sink.emit_required(event);
+        parent_sink.flush().await.map_err(|error| {
             ToolInvokeError::Recoverable(format!(
-                "flush sub-agent start event to parent session: {error}"
+                "publish sub-agent start event to parent session: {error:#}"
             ))
         })
     }
@@ -233,17 +272,21 @@ impl SubagentToolset {
         self.turn_result_value(&result)
     }
 
-    fn turn_result_value(&self, result: &NatsTurnResult) -> Result<Value, ToolInvokeError> {
-        let response = require_response(result)?;
+    fn turn_result_value(
+        &self,
+        completed: &CompletedSubagentTurn,
+    ) -> Result<Value, ToolInvokeError> {
+        let response = require_response(&completed.result)?;
         let source = AgentSource {
             agent: self.agent.clone(),
-            session_id: Some(result.session_id.clone()),
+            session_id: Some(completed.result.session_id.clone()),
             model: None,
         };
         Ok(json!({
-            "session_id": result.session_id,
+            "session_id": completed.result.session_id,
             "response": response,
             "sub_agent": source,
+            "sub_agent_progress": completed.progress,
         }))
     }
 
@@ -273,6 +316,21 @@ impl SubagentToolset {
             })?;
         Ok(json!({ "session_id": session_id, "cancelled": true }))
     }
+}
+
+struct CompletedSubagentTurn {
+    result: NatsTurnResult,
+    progress: SubAgentProgress,
+}
+
+fn subagent_turn_failed(result: &NatsTurnResult, cancelled: bool) -> bool {
+    if cancelled {
+        return true;
+    }
+    if result.error.is_some() {
+        return true;
+    }
+    result.response.is_none()
 }
 
 fn require_response(result: &NatsTurnResult) -> Result<&str, ToolInvokeError> {

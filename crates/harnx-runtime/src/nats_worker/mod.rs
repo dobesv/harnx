@@ -39,12 +39,15 @@ mod hook_registration;
 mod hook_supervisor;
 mod process_manager;
 pub mod server_reconciler;
+mod subagent_progress;
 mod subagent_toolset;
 mod tool_registry;
 mod tool_supervisor;
 
 #[cfg(test)]
 mod session_start_hook_tests;
+#[cfg(test)]
+mod subagent_progress_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 

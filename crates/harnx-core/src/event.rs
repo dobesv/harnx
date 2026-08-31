@@ -136,7 +136,10 @@ pub enum TurnEvent {
     SubAgentStarted {
         agent: String,
         session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        invocation_id: Option<String>,
     },
+    SubAgentProgress(SubAgentProgress),
     Ended {
         outcome: TurnOutcome,
     },
@@ -262,6 +265,31 @@ pub struct AgentSource {
     pub model: Option<String>,
 }
 
+/// Per-delegation progress shared by every frontend.
+///
+/// A child session can be prompted more than once, so `invocation_id` rather
+/// than session identity is the correlation key. Usage and tool counts cover
+/// only work performed directly by this invocation; nested agents report their
+/// own snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubAgentProgress {
+    pub invocation_id: String,
+    pub agent: String,
+    pub session_id: String,
+    pub status: SubAgentProgressStatus,
+    pub elapsed_ms: u64,
+    pub usage: CompletionTokenUsage,
+    pub tool_call_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubAgentProgressStatus {
+    Running,
+    Done,
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanEntry {
     pub status: String,
@@ -328,6 +356,54 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("Warning"));
         assert!(json.contains("hello"));
+    }
+
+    #[test]
+    fn sub_agent_progress_round_trips_with_stable_status_names() {
+        let event = AgentEvent::Turn(TurnEvent::SubAgentProgress(SubAgentProgress {
+            invocation_id: "invocation-1".into(),
+            agent: "researcher".into(),
+            session_id: "session-1".into(),
+            status: SubAgentProgressStatus::Running,
+            elapsed_ms: 12_345,
+            usage: CompletionTokenUsage::new(Some(11), Some(7), Some(3)),
+            tool_call_count: 2,
+        }));
+
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            value["Turn"]["SubAgentProgress"]["status"],
+            serde_json::json!("running")
+        );
+        let decoded: AgentEvent = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentEvent::Turn(TurnEvent::SubAgentProgress(SubAgentProgress {
+                invocation_id,
+                elapsed_ms: 12_345,
+                tool_call_count: 2,
+                ..
+            })) if invocation_id == "invocation-1"
+        ));
+    }
+
+    #[test]
+    fn sub_agent_started_accepts_legacy_payload_without_invocation_id() {
+        let event: TurnEvent = serde_json::from_value(serde_json::json!({
+            "SubAgentStarted": {
+                "agent": "researcher",
+                "session_id": "session-1"
+            }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            event,
+            TurnEvent::SubAgentStarted {
+                invocation_id: None,
+                ..
+            }
+        ));
     }
 
     #[test]

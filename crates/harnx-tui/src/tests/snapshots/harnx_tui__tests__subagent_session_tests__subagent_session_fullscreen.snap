@@ -3,10 +3,10 @@ source: crates/harnx-tui/src/tests/subagent_session_tests.rs
 expression: normalize_screen(&harness.screen_contents())
 ---
  ⠋ @ researcher [parent-s]  running
+ 2s  in 1200  out 345  cache 67  tools 4
 parent transcript
 
 ✓ @ fact-checker [nested-s]  done
-
 
 
 

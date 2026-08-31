@@ -647,9 +647,21 @@ impl AgUiSink {
                 "turn_handoff_requested",
                 json!({ "agent": agent, "session_id": session_id }),
             ),
-            TurnEvent::SubAgentStarted { agent, session_id } => self.emit_custom(
+            TurnEvent::SubAgentStarted {
+                agent,
+                session_id,
+                invocation_id,
+            } => self.emit_custom(
                 "sub_agent_started",
-                json!({ "agent": agent, "session_id": session_id }),
+                json!({
+                    "agent": agent,
+                    "session_id": session_id,
+                    "invocation_id": invocation_id,
+                }),
+            ),
+            TurnEvent::SubAgentProgress(progress) => self.emit_custom(
+                "sub_agent_progress",
+                serde_json::to_value(progress).expect("sub-agent progress should serialize"),
             ),
             TurnEvent::Started => {}
         }
@@ -1649,3 +1661,7 @@ fn history_role_for_client(role: &Role) -> MessageRole {
 #[cfg(test)]
 #[path = "ag_ui_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ag_ui_subagent_tests.rs"]
+mod subagent_tests;

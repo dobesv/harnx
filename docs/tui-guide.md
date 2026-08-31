@@ -19,9 +19,11 @@ There is no readline-based REPL.
 - **Attachments:** `.attach <path>` to attach a file to the next message; `.detach` to remove.
   - **Large pastes** (more than 8 lines or more than 512 characters) are automatically saved as a text attachment instead of being inserted inline. Smaller multi-line pastes are inserted directly into the input.
 - **Sub-agent monitoring:** Delegated child sessions appear as compact rows with
-  running, done, or failed status. Focus a row with normal transcript `↑` / `↓`
-  navigation and press `Enter` to open the child's complete transcript
-  fullscreen.
+  running, done, or failed status, elapsed time, input/output/cached tokens, and
+  tool-call count. Running rows use the normal animated spinner and advance the
+  elapsed time locally between progress snapshots; terminal rows freeze at the
+  completed duration. Focus a row with normal transcript `↑` / `↓` navigation
+  and press `Enter` to open the child's complete transcript fullscreen.
 
 ### Transcript and sub-agent navigation
 
@@ -42,6 +44,8 @@ Child activity is monitored separately from the root turn, so it does not
 change the root input, busy indicator, or streaming message. Completed child
 views remain available while the same root session is selected; switching the
 root agent/session closes all child monitors and clears those views.
+Each delegation has its own row and progress counters, so prompting an existing
+child session again does not overwrite the earlier invocation's summary.
 
 ## Dot-Commands
 

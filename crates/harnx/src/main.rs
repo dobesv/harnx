@@ -510,6 +510,16 @@ fn source_heading(source: &AgentSource) -> String {
     source.heading()
 }
 
+fn one_shot_session_heading(final_only: bool, agent: &str, session_id: &str) -> Option<String> {
+    (!final_only).then(|| {
+        source_heading(&AgentSource {
+            agent: agent.to_string(),
+            session_id: Some(session_id.to_string()),
+            model: None,
+        })
+    })
+}
+
 struct BreakdownSections<'a> {
     first_user: &'a str,
     last_user: Option<&'a str>,
@@ -640,7 +650,7 @@ async fn start_directive(
 
     let initializer = {
         let config = config.read();
-        harnx_runtime::SessionInitializer::named_from_config(agent, &config)
+        harnx_runtime::SessionInitializer::named_from_config(agent.clone(), &config)
     };
     let session = harnx_runtime::NatsSession::from_global_config(
         harnx_runtime::NatsSessionConfig {
@@ -654,6 +664,9 @@ async fn start_directive(
     )
     .await
     .context("failed to create NATS session")?;
+    if let Some(heading) = one_shot_session_heading(final_only, &agent, session.session_id()) {
+        eprintln!("{heading}");
+    }
     let sink = harnx_core::sink::current_agent_event_sink()
         .context("CLI agent event sink is not installed")?;
     let tracking_sink = Arc::new(oneshot_nats::AssistantTextTrackingSink::new(sink));
@@ -742,6 +755,22 @@ use harnx_runtime::bootstrap::setup_logger;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_shot_heading_identifies_root_agent_and_session() {
+        assert_eq!(
+            one_shot_session_heading(false, "coding/coder", "session-123").as_deref(),
+            Some("> coding/coder ▸ session-123")
+        );
+    }
+
+    #[test]
+    fn final_only_suppresses_one_shot_heading() {
+        assert_eq!(
+            one_shot_session_heading(true, "coding/coder", "session-123"),
+            None
+        );
+    }
 
     fn user_text(text: &str) -> TranscriptItem {
         TranscriptItem::UserText {

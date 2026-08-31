@@ -1,4 +1,4 @@
-use harnx_core::event::{AgentSource, PlanEntry};
+use harnx_core::event::{AgentSource, PlanEntry, SubAgentProgress, SubAgentProgressStatus};
 use harnx_runtime::config::GlobalConfig;
 use harnx_runtime::config::SessionMeta;
 use harnx_runtime::local_orchestrator::LocalWorkerSupervisor;
@@ -169,8 +169,23 @@ pub(super) struct App {
     /// Child-session state is intentionally separate from the root transcript
     /// so nested events cannot mutate root busy, input, or streaming state.
     pub(super) monitored_sessions: HashMap<MonitoredSessionKey, MonitoredSessionState>,
-    /// Fullscreen child-session drilldown stack. The last key is displayed.
-    pub(super) subagent_view_stack: Vec<MonitoredSessionKey>,
+    /// Fullscreen child-session drilldown stack. The last invocation is displayed.
+    pub(super) subagent_view_stack: Vec<SubAgentView>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct RenderEntryState {
+    pub skip_cache: bool,
+    pub spinner_index: usize,
+}
+
+impl RenderEntryState {
+    pub(super) fn new(skip_cache: bool, spinner_index: usize) -> Self {
+        Self {
+            skip_cache,
+            spinner_index,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -178,6 +193,13 @@ pub struct MonitoredSessionKey {
     pub cluster: String,
     pub agent: String,
     pub session_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct SubAgentView {
+    pub key: MonitoredSessionKey,
+    pub status: SubAgentStatus,
+    pub progress: Option<SubAgentInvocationProgress>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,6 +216,38 @@ impl SubAgentStatus {
             Self::Completed => "done",
             Self::Failed => "failed",
         }
+    }
+
+    pub(super) fn from_progress(status: SubAgentProgressStatus) -> Self {
+        match status {
+            SubAgentProgressStatus::Running => Self::Running,
+            SubAgentProgressStatus::Done => Self::Completed,
+            SubAgentProgressStatus::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SubAgentInvocationProgress {
+    pub snapshot: SubAgentProgress,
+    received_at: std::time::Instant,
+}
+
+impl SubAgentInvocationProgress {
+    pub(super) fn new(snapshot: SubAgentProgress) -> Self {
+        Self {
+            snapshot,
+            received_at: std::time::Instant::now(),
+        }
+    }
+
+    pub(super) fn elapsed_ms(&self) -> u64 {
+        if self.snapshot.status != SubAgentProgressStatus::Running {
+            return self.snapshot.elapsed_ms;
+        }
+        self.snapshot.elapsed_ms.saturating_add(
+            u64::try_from(self.received_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        )
     }
 }
 
@@ -366,6 +420,8 @@ pub enum TranscriptItem {
     SubAgentSession {
         key: MonitoredSessionKey,
         status: SubAgentStatus,
+        invocation_id: Option<String>,
+        progress: Option<SubAgentInvocationProgress>,
     },
 }
 

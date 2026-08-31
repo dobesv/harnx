@@ -54,7 +54,7 @@ impl ChatCompletionsOutput {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompletionTokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,

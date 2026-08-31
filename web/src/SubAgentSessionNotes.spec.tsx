@@ -12,6 +12,12 @@ const note = (
   sessionId,
   parentMessageId: 'assistant-1',
   status,
+  elapsedMs: status === 'running' ? 1_000 : 2_500,
+  inputTokens: 120,
+  outputTokens: 45,
+  cachedTokens: 30,
+  toolCallCount: 3,
+  updatedAtMs: Date.now(),
 });
 
 describe('SubAgentSessionNotes', () => {
@@ -28,6 +34,12 @@ describe('SubAgentSessionNotes', () => {
     expect(screen.getByText('Running').closest('button')).toHaveAttribute('data-status', 'running');
     expect(screen.getByText('Done').closest('button')).toHaveAttribute('data-status', 'done');
     expect(screen.getByText('Failed').closest('button')).toHaveAttribute('data-status', 'failed');
+    expect(screen.getAllByText('in 120')).toHaveLength(3);
+    expect(screen.getAllByText('out 45')).toHaveLength(3);
+    expect(screen.getAllByText('cache 30')).toHaveLength(3);
+    expect(screen.getAllByText('tools 3')).toHaveLength(3);
+    expect(screen.getAllByText('2s')).toHaveLength(2);
+    expect(screen.queryByText('2.5s')).not.toBeInTheDocument();
     expect(screen.getByRole('button', {
       name: `Open researcher sub-agent session ${fullSessionId} (running)`,
     })).toBeVisible();

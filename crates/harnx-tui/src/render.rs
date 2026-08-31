@@ -1,10 +1,10 @@
 use crate::markdown_render::{MarkdownBlockData, RenderedEntry};
 use crate::subagent_render::{render_subagent_detail, render_subagent_row};
-use crate::types::Tui;
 use crate::types::{
     App, ModalState, ToolCallBody, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT,
     SPINNER_FRAMES,
 };
+use crate::types::{RenderEntryState, Tui};
 use harnx_core::event::{AgentEvent, SessionEvent, TurnEvent};
 use harnx_runtime::config::GlobalConfig;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -159,7 +159,7 @@ impl Tui {
         show_ts: bool,
         use_utc: bool,
         width: u16,
-        skip_cache: bool,
+        state: RenderEntryState,
         theme: Option<&Theme>,
     ) -> RenderedEntry {
         match entry {
@@ -278,7 +278,7 @@ impl Tui {
                     });
                     entry.total_height += 1;
                 }
-                if !skip_cache {
+                if !state.skip_cache {
                     *rendered_cache = Some((width, show_seq, show_ts, use_utc, entry.clone()));
                 }
                 entry
@@ -314,7 +314,7 @@ impl Tui {
                 }
                 let body_base = Style::default().add_modifier(Modifier::DIM);
                 let entry = crate::markdown_render::render_markdown(text, body_base, width, theme);
-                if !skip_cache {
+                if !state.skip_cache {
                     *rendered_cache = Some((width, show_seq, show_ts, use_utc, entry.clone()));
                 }
                 entry
@@ -389,13 +389,13 @@ impl Tui {
                         },
                     );
                 }
-                if !skip_cache {
+                if !state.skip_cache {
                     *rendered_cache = Some((width, show_seq, show_ts, use_utc, entry.clone()));
                 }
                 entry
             }
-            TranscriptItem::SubAgentSession { key, status } => {
-                render_subagent_row(key, status, width)
+            item @ TranscriptItem::SubAgentSession { .. } => {
+                render_subagent_row(item, state.spinner_index, width)
             }
             TranscriptItem::AttachmentHeader(text) => {
                 let lines = Self::render_text_entry(
@@ -1216,8 +1216,8 @@ impl Tui {
                 lines.push(Line::from(Span::styled("── notice ──", label_style)));
                 push_field!("text", text);
             }
-            TranscriptItem::SubAgentSession { key, status } => {
-                lines.extend(render_subagent_detail(key, status));
+            item @ TranscriptItem::SubAgentSession { .. } => {
+                lines.extend(render_subagent_detail(item));
             }
         }
         lines
@@ -1332,7 +1332,7 @@ impl Tui {
                     show_ts,
                     use_utc,
                     width,
-                    Some(i) == streaming_idx,
+                    RenderEntryState::new(Some(i) == streaming_idx, self.app.spinner_index),
                     self.code_theme.as_ref(),
                 );
                 if let Some(range) = selected_range {

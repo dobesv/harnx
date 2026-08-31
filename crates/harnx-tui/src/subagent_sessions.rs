@@ -1,9 +1,11 @@
 //! Navigation and transcript state for detached handoffs and nested sessions.
 
-use crate::lifecycle::{session_history_transcript_items, subagent_key_from_output};
-use crate::subagent_transcript::{apply_child_event, flatten_subagent_event, update_row};
+use crate::lifecycle::{
+    session_history_transcript_items, subagent_key_from_output, subagent_progress_from_output,
+};
+use crate::subagent_transcript::{apply_child_event, flatten_subagent_event};
 use crate::types::{
-    MonitoredSessionKey, MonitoredSessionState, SubAgentStatus, TranscriptItem, Tui,
+    MonitoredSessionKey, MonitoredSessionState, SubAgentStatus, SubAgentView, TranscriptItem, Tui,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_core::event::{AgentEvent, SessionEvent, ToolEvent, TurnEvent};
@@ -24,17 +26,17 @@ impl Tui {
     }
 
     pub(super) fn open_focused_root_subagent(&mut self) -> bool {
-        let Some(key) = self
+        let Some(view) = self
             .app
             .transcript_focus
             .and_then(|focus| self.app.transcript.get(focus))
-            .and_then(subagent_row_key)
+            .and_then(subagent_row_view)
         else {
             return false;
         };
         self.app.detail_view_open = false;
         self.app.detail_view_entry = None;
-        self.app.subagent_view_stack.push(key);
+        self.app.subagent_view_stack.push(view);
         true
     }
 
@@ -45,7 +47,12 @@ impl Tui {
     }
 
     pub(super) fn handle_subagent_view_key(&mut self, key: KeyEvent) {
-        let Some(current) = self.app.subagent_view_stack.last().cloned() else {
+        let Some(current) = self
+            .app
+            .subagent_view_stack
+            .last()
+            .map(|view| view.key.clone())
+        else {
             return;
         };
         if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
@@ -71,8 +78,17 @@ impl Tui {
             return;
         };
         match item {
-            TranscriptItem::SubAgentSession { key, .. } => {
-                self.app.subagent_view_stack.push(key);
+            TranscriptItem::SubAgentSession {
+                key,
+                status,
+                progress,
+                ..
+            } => {
+                self.app.subagent_view_stack.push(SubAgentView {
+                    key,
+                    status,
+                    progress,
+                });
             }
             entry => self.open_child_detail(entry),
         }
@@ -89,7 +105,7 @@ impl Tui {
     }
 
     pub(super) fn scroll_open_subagent(&mut self, up: bool) -> bool {
-        let Some(key) = self.app.subagent_view_stack.last() else {
+        let Some(key) = self.app.subagent_view_stack.last().map(|view| &view.key) else {
             return false;
         };
         let Some(state) = self.app.monitored_sessions.get_mut(key) else {
@@ -112,47 +128,6 @@ impl Tui {
             .as_ref()
             .map(|(_, cluster)| cluster.clone())
             .unwrap_or_else(|| harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string())
-    }
-
-    pub(super) fn record_subagent_started(
-        &mut self,
-        parent: Option<&MonitoredSessionKey>,
-        key: MonitoredSessionKey,
-    ) {
-        if key.agent.trim().is_empty() || key.session_id.trim().is_empty() {
-            return;
-        }
-        self.upsert_subagent_row(parent, key.clone(), SubAgentStatus::Running);
-        let state = self
-            .app
-            .monitored_sessions
-            .entry(key.clone())
-            .or_insert_with(|| MonitoredSessionState::new(SubAgentStatus::Running));
-        state.status = SubAgentStatus::Running;
-        state.streaming_open = false;
-        self.update_subagent_row_status(&key, SubAgentStatus::Running);
-        self.ensure_subagent_monitor(key);
-        self.pin_transcript_to_bottom();
-    }
-
-    pub(super) fn record_subagent_completed(
-        &mut self,
-        parent: Option<&MonitoredSessionKey>,
-        key: MonitoredSessionKey,
-    ) {
-        self.upsert_subagent_row(parent, key.clone(), SubAgentStatus::Completed);
-        let state = self
-            .app
-            .monitored_sessions
-            .entry(key.clone())
-            .or_insert_with(|| MonitoredSessionState::new(SubAgentStatus::Completed));
-        if state.status != SubAgentStatus::Failed {
-            state.status = SubAgentStatus::Completed;
-        }
-        let status = state.status.clone();
-        self.update_subagent_row_status(&key, status);
-        self.ensure_subagent_monitor(key);
-        self.pin_transcript_to_bottom();
     }
 
     pub(super) fn handle_subagent_snapshot(
@@ -239,76 +214,58 @@ impl Tui {
         event: &AgentEvent,
         is_sub_agent: bool,
     ) -> bool {
-        match event {
-            AgentEvent::Session(SessionEvent::HandoffCommitted { agent, session_id })
-                if !is_sub_agent =>
-            {
+        if let AgentEvent::Session(SessionEvent::HandoffCommitted { agent, session_id }) = event {
+            if !is_sub_agent {
                 self.handle_handoff_committed(agent.clone(), session_id.clone())
                     .await;
-                true
+                return true;
             }
-            AgentEvent::Turn(TurnEvent::SubAgentStarted { agent, session_id }) => {
+        }
+        self.handle_subagent_marker(None, event)
+    }
+
+    fn handle_subagent_marker(
+        &mut self,
+        parent: Option<&MonitoredSessionKey>,
+        event: &AgentEvent,
+    ) -> bool {
+        let cluster = parent.map_or_else(
+            || self.current_session_cluster(),
+            |parent| parent.cluster.clone(),
+        );
+        match event {
+            AgentEvent::Turn(TurnEvent::SubAgentStarted {
+                agent,
+                session_id,
+                invocation_id,
+            }) => {
                 self.record_subagent_started(
-                    None,
+                    parent,
                     MonitoredSessionKey {
                         agent: agent.clone(),
                         session_id: session_id.clone(),
-                        cluster: self.current_session_cluster(),
+                        cluster,
                     },
+                    invocation_id.clone(),
                 );
                 true
             }
+            AgentEvent::Turn(TurnEvent::SubAgentProgress(progress)) => {
+                self.record_subagent_progress(parent, progress.clone());
+                true
+            }
             AgentEvent::Tool(ToolEvent::Completed { output, .. }) => {
-                let Some(key) = subagent_key_from_output(output, &self.current_session_cluster())
-                else {
+                if let Some(progress) = subagent_progress_from_output(output) {
+                    self.record_subagent_progress(parent, progress);
+                    return true;
+                }
+                let Some(key) = subagent_key_from_output(output, &cluster) else {
                     return false;
                 };
-                self.record_subagent_completed(None, key);
+                self.record_subagent_completed(parent, key);
                 true
             }
             _ => false,
-        }
-    }
-
-    fn upsert_subagent_row(
-        &mut self,
-        parent: Option<&MonitoredSessionKey>,
-        key: MonitoredSessionKey,
-        status: SubAgentStatus,
-    ) {
-        let transcript = match parent {
-            Some(parent) => {
-                &mut self
-                    .app
-                    .monitored_sessions
-                    .entry(parent.clone())
-                    .or_insert_with(|| MonitoredSessionState::new(SubAgentStatus::Running))
-                    .transcript
-            }
-            None => &mut self.app.transcript,
-        };
-        let latest_tool = transcript
-            .iter()
-            .rposition(|item| matches!(item, TranscriptItem::ToolCall { .. }));
-        let latest_row = transcript.iter().rposition(
-            |item| matches!(item, TranscriptItem::SubAgentSession { key: row_key, .. } if row_key == &key),
-        );
-        if latest_row.is_some_and(|row| latest_tool.is_none_or(|tool| row > tool)) {
-            if let Some(TranscriptItem::SubAgentSession {
-                status: row_status, ..
-            }) = latest_row.and_then(|row| transcript.get_mut(row))
-            {
-                *row_status = status;
-            }
-        } else {
-            transcript.push(TranscriptItem::SubAgentSession { key, status });
-        }
-    }
-
-    fn update_subagent_row_status(&mut self, key: &MonitoredSessionKey, status: SubAgentStatus) {
-        update_row(&mut self.app.transcript, key, &status);
-        for state in self.app.monitored_sessions.values_mut() {
-            update_row(&mut state.transcript, key, &status);
         }
     }
 
@@ -317,27 +274,7 @@ impl Tui {
         parent: &MonitoredSessionKey,
         event: &AgentEvent,
     ) -> bool {
-        match event {
-            AgentEvent::Turn(TurnEvent::SubAgentStarted { agent, session_id }) => {
-                self.record_subagent_started(
-                    Some(parent),
-                    MonitoredSessionKey {
-                        agent: agent.clone(),
-                        session_id: session_id.clone(),
-                        cluster: parent.cluster.clone(),
-                    },
-                );
-                true
-            }
-            AgentEvent::Tool(ToolEvent::Completed { output, .. }) => {
-                let Some(child) = subagent_key_from_output(output, &parent.cluster) else {
-                    return false;
-                };
-                self.record_subagent_completed(Some(parent), child);
-                true
-            }
-            _ => false,
-        }
+        self.handle_subagent_marker(Some(parent), event)
     }
 
     async fn reset_for_handoff_target(&mut self) {
@@ -400,6 +337,22 @@ fn scroll_child(state: &mut MonitoredSessionState, up: bool, lines: usize) {
 fn subagent_row_key(item: &TranscriptItem) -> Option<MonitoredSessionKey> {
     match item {
         TranscriptItem::SubAgentSession { key, .. } => Some(key.clone()),
+        _ => None,
+    }
+}
+
+fn subagent_row_view(item: &TranscriptItem) -> Option<SubAgentView> {
+    match item {
+        TranscriptItem::SubAgentSession {
+            key,
+            status,
+            progress,
+            ..
+        } => Some(SubAgentView {
+            key: key.clone(),
+            status: status.clone(),
+            progress: progress.clone(),
+        }),
         _ => None,
     }
 }

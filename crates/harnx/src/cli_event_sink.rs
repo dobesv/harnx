@@ -6,12 +6,13 @@
 //! previously owned by `render::render_stream`. Non-streaming events
 //! (notices, errors, usage, tool starts/failures) still go to stderr.
 
+use std::collections::HashMap;
 use std::io::{stdout, Write};
 use std::sync::{Arc, Mutex};
 
 use harnx_core::event::{
     AgentEvent, AgentEventSink, AgentSource, ContentBlock, ModelEvent, NoticeEvent, SessionEvent,
-    ToolEvent, TurnEvent, UserEvent,
+    SubAgentProgress, SubAgentProgressStatus, ToolEvent, TurnEvent, UserEvent,
 };
 
 use harnx_render::{MarkdownRender, RenderOptions};
@@ -49,6 +50,83 @@ struct CliSinkState {
     highlight: bool,
     render_options: RenderOptions,
     final_only: bool,
+    subagents: CliSubagentReporter,
+}
+
+const SUBAGENT_REPORT_INTERVAL_MS: u64 = 10_000;
+
+#[derive(Default)]
+struct CliSubagentReporter {
+    invocations: HashMap<String, CliInvocationReport>,
+}
+
+#[derive(Default)]
+struct CliInvocationReport {
+    last_running_bucket: u64,
+    terminal: bool,
+}
+
+impl CliSubagentReporter {
+    fn started(
+        &mut self,
+        agent: &str,
+        session_id: &str,
+        invocation_id: Option<&str>,
+    ) -> Option<String> {
+        if let Some(invocation_id) = invocation_id {
+            if self.invocations.contains_key(invocation_id) {
+                return None;
+            }
+            self.invocations
+                .insert(invocation_id.to_string(), CliInvocationReport::default());
+        }
+        Some(format!(
+            "[sub-agent] started agent={agent} session={session_id}"
+        ))
+    }
+
+    fn progress(&mut self, progress: &SubAgentProgress) -> Option<String> {
+        let report = self
+            .invocations
+            .entry(progress.invocation_id.clone())
+            .or_default();
+        if report.terminal {
+            return None;
+        }
+        if progress.status == SubAgentProgressStatus::Running {
+            let bucket = progress.elapsed_ms / SUBAGENT_REPORT_INTERVAL_MS;
+            if bucket == 0 || bucket <= report.last_running_bucket {
+                return None;
+            }
+            report.last_running_bucket = bucket;
+        } else {
+            report.terminal = true;
+        }
+        Some(format_subagent_progress(progress))
+    }
+}
+
+fn format_subagent_progress(progress: &SubAgentProgress) -> String {
+    let status = match progress.status {
+        SubAgentProgressStatus::Running => "running",
+        SubAgentProgressStatus::Done => "done",
+        SubAgentProgressStatus::Failed => "failed",
+    };
+    format!(
+        "[sub-agent] {status} agent={} session={} elapsed={} in={} out={} cached={} tools={}",
+        progress.agent,
+        progress.session_id,
+        format_elapsed(progress.elapsed_ms),
+        progress.usage.input_tokens,
+        progress.usage.output_tokens,
+        progress.usage.cached_tokens,
+        progress.tool_call_count,
+    )
+}
+
+fn format_elapsed(elapsed_ms: u64) -> String {
+    let seconds = elapsed_ms / 1_000;
+    format!("{seconds}s")
 }
 
 impl CliAgentEventSink {
@@ -82,6 +160,7 @@ impl CliAgentEventSink {
                 highlight,
                 render_options,
                 final_only,
+                subagents: CliSubagentReporter::default(),
             })),
         }
     }
@@ -271,6 +350,166 @@ impl CliSinkState {
     fn render_markdown_line(&mut self, text: &str) -> String {
         self.with_markdown(text, |r, t| r.render_line(t), str::to_string)
     }
+
+    fn print_event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::Turn(event) => self.print_turn_event(event),
+            AgentEvent::Notice(event) => self.print_notice(event),
+            AgentEvent::Model(event) => self.print_model_event(event),
+            AgentEvent::User(event) => self.print_user_event(event),
+            AgentEvent::Tool(event) => self.print_tool_event(event),
+            AgentEvent::Session(event) => self.print_session_event(event),
+            AgentEvent::Status(_) => {}
+            other => eprintln!("{}", dimmed_text(&format!("[event] {other:?}"))),
+        }
+    }
+
+    fn print_turn_event(&mut self, event: TurnEvent) {
+        match event {
+            TurnEvent::Started => {}
+            TurnEvent::Ended { .. } => self.cleanup_or_warn(),
+            TurnEvent::RetryAttempt { attempt, reason } => {
+                eprintln!("{}", warning_text(&format!("retry #{attempt}: {reason}")));
+            }
+            TurnEvent::ModelFallback { from, to } => {
+                eprintln!(
+                    "{}",
+                    warning_text(&format!("model fallback: {from} → {to}"))
+                );
+            }
+            TurnEvent::HandoffRequested { agent, .. } => {
+                eprintln!("{}", dimmed_text(&format!("handoff → {agent}")));
+            }
+            TurnEvent::SubAgentStarted {
+                agent,
+                session_id,
+                invocation_id,
+            } => {
+                if let Some(line) =
+                    self.subagents
+                        .started(&agent, &session_id, invocation_id.as_deref())
+                {
+                    eprintln!("{}", dimmed_text(&line));
+                }
+            }
+            TurnEvent::SubAgentProgress(progress) => self.print_subagent_progress(progress),
+        }
+    }
+
+    fn print_subagent_progress(&mut self, progress: SubAgentProgress) {
+        let Some(line) = self.subagents.progress(&progress) else {
+            return;
+        };
+        if progress.status == SubAgentProgressStatus::Failed {
+            eprintln!("{}", warning_text(&line));
+        } else {
+            eprintln!("{}", dimmed_text(&line));
+        }
+    }
+
+    fn print_notice(&self, event: NoticeEvent) {
+        match event {
+            NoticeEvent::Info(message) => println!("{message}"),
+            NoticeEvent::Warning(message) => eprintln!("{}", warning_text(&message)),
+            NoticeEvent::Error(message) => {
+                eprintln!("{}", warning_text(&format!("error: {message}")));
+            }
+        }
+    }
+
+    fn print_model_event(&mut self, event: ModelEvent) {
+        match event {
+            ModelEvent::MessageChunk { blocks } | ModelEvent::ThoughtChunk { blocks } => {
+                self.print_content_blocks(blocks);
+            }
+            ModelEvent::Final { output, .. } => {
+                if !output.is_empty() {
+                    eprintln!("{output}");
+                }
+                self.cleanup_or_warn();
+            }
+            ModelEvent::Error(error) => {
+                self.cleanup_or_warn();
+                eprintln!("{}", warning_text(&format!("LLM error: {error}")));
+            }
+            ModelEvent::Usage {
+                input,
+                output,
+                cached,
+                ..
+            } => print_usage(input, output, cached),
+        }
+    }
+
+    fn print_content_blocks(&mut self, blocks: Vec<ContentBlock>) {
+        for block in blocks {
+            let ContentBlock::Text(text) = block else {
+                continue;
+            };
+            if let Err(error) = self.handle_chunk_text(&text) {
+                eprintln!("{}", warning_text(&format!("render failed: {error}")));
+                break;
+            }
+        }
+    }
+
+    fn print_user_event(&mut self, event: UserEvent) {
+        let UserEvent::Message { content } = event;
+        self.cleanup_or_warn();
+        if !content.is_empty() {
+            eprintln!("{}", dimmed_text(&content));
+        }
+    }
+
+    fn print_tool_event(&mut self, event: ToolEvent) {
+        match event {
+            ToolEvent::Started { name, markdown, .. } => {
+                self.print_tool_started(&name, markdown.as_deref());
+            }
+            ToolEvent::Failed { error, .. } => {
+                eprintln!("{}", warning_text(&format!("tool error: {error}")));
+            }
+            ToolEvent::Completed {
+                output, markdown, ..
+            } => self.print_tool_completed(&output, markdown.as_deref()),
+            ToolEvent::Blocked { name, reason, .. } => {
+                eprintln!("{}", warning_text(&format!("blocked: {name} — {reason}")));
+            }
+            ToolEvent::Progress { .. } | ToolEvent::Update { .. } => {}
+        }
+    }
+
+    fn print_session_event(&mut self, event: SessionEvent) {
+        match event {
+            SessionEvent::CompactingStarted => {
+                eprintln!("{}", dimmed_text("Compacting the session..."));
+            }
+            SessionEvent::CompactingCompleted => {
+                self.cleanup_or_warn();
+                eprintln!("{}", dimmed_text("✓ Compacted the session."));
+            }
+            SessionEvent::CompactingFailed(error) => {
+                self.cleanup_or_warn();
+                eprintln!("{}", warning_text(&format!("compaction failed: {error}")));
+            }
+            SessionEvent::TitleGenerationFailed(error) => {
+                eprintln!(
+                    "{}",
+                    warning_text(&format!("title generation failed: {error}"))
+                );
+            }
+            other => eprintln!("{}", dimmed_text(&format!("[event] {other:?}"))),
+        }
+    }
+
+    fn cleanup_or_warn(&mut self) {
+        if let Err(error) = self.cleanup() {
+            eprintln!(
+                "{}",
+                warning_text(&format!("cli-sink cleanup failed: {error}"))
+            );
+        }
+    }
 }
 
 impl AgentEventSink for CliAgentEventSink {
@@ -289,165 +528,23 @@ impl AgentEventSink for CliAgentEventSink {
         if is_model_output_event(&event) {
             state.maybe_emit_source_heading(source.as_ref());
         }
-        match event {
-            AgentEvent::Status(_) | AgentEvent::Turn(TurnEvent::Started) => {}
-            AgentEvent::Turn(TurnEvent::Ended { .. }) => {
-                if let Err(err) = state.cleanup() {
-                    eprintln!(
-                        "{}",
-                        warning_text(&format!("cli-sink cleanup failed: {err}"))
-                    );
-                }
-            }
-            AgentEvent::Turn(TurnEvent::RetryAttempt { attempt, reason }) => {
-                eprintln!("{}", warning_text(&format!("retry #{attempt}: {reason}")));
-            }
-            AgentEvent::Turn(TurnEvent::ModelFallback { from, to }) => {
-                eprintln!(
-                    "{}",
-                    warning_text(&format!("model fallback: {from} → {to}"))
-                );
-            }
-            AgentEvent::Turn(TurnEvent::HandoffRequested { agent, .. }) => {
-                eprintln!("{}", dimmed_text(&format!("handoff → {agent}")));
-            }
-            AgentEvent::Notice(NoticeEvent::Info(msg)) => {
-                // Info notices go to stdout — they're user-facing output
-                // (save confirmations, dry-run echo, progress messages) that
-                // shell scripts may pipe/capture. Warnings + Errors keep
-                // their stderr routing below.
-                println!("{msg}");
-            }
-            AgentEvent::Notice(NoticeEvent::Warning(msg)) => {
-                eprintln!("{}", warning_text(&msg));
-            }
-            AgentEvent::Notice(NoticeEvent::Error(msg)) => {
-                eprintln!("{}", warning_text(&format!("error: {msg}")));
-            }
-            AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
-                for block in blocks {
-                    if let ContentBlock::Text(text) = block {
-                        if let Err(err) = state.handle_chunk_text(&text) {
-                            eprintln!("{}", warning_text(&format!("render failed: {err}")));
-                            break;
-                        }
-                    }
-                }
-            }
-            AgentEvent::Model(ModelEvent::ThoughtChunk { blocks }) => {
-                // Treat thought chunks identically to message chunks for now;
-                // richer <think>…</think> framing is deferred.
-                for block in blocks {
-                    if let ContentBlock::Text(text) = block {
-                        if let Err(err) = state.handle_chunk_text(&text) {
-                            eprintln!("{}", warning_text(&format!("render failed: {err}")));
-                            break;
-                        }
-                    }
-                }
-            }
-            AgentEvent::Model(ModelEvent::Final { output, .. }) => {
-                // If streaming produced no chunks (short-circuit path),
-                // print the full output so the user still sees it.
-                if !output.is_empty() {
-                    eprintln!("{output}");
-                }
-                if let Err(err) = state.cleanup() {
-                    eprintln!(
-                        "{}",
-                        warning_text(&format!("cli-sink cleanup failed: {err}"))
-                    );
-                }
-            }
-            AgentEvent::Model(ModelEvent::Error(err)) => {
-                if let Err(cleanup_err) = state.cleanup() {
-                    eprintln!(
-                        "{}",
-                        warning_text(&format!("cli-sink cleanup failed: {cleanup_err}"))
-                    );
-                }
-                eprintln!("{}", warning_text(&format!("LLM error: {err}")));
-            }
-            AgentEvent::User(UserEvent::Message { content }) => {
-                if let Err(err) = state.cleanup() {
-                    eprintln!(
-                        "{}",
-                        warning_text(&format!("cli-sink cleanup failed: {err}"))
-                    );
-                }
-                if !content.is_empty() {
-                    eprintln!("{}", dimmed_text(&content));
-                }
-            }
-            AgentEvent::Model(ModelEvent::Usage {
-                input,
-                output,
-                cached,
-                session_label: _,
-            }) => {
-                if input > 0 || output > 0 || cached > 0 {
-                    let cached_suffix = if cached > 0 {
-                        format!(" (cached {cached})")
-                    } else {
-                        String::new()
-                    };
-                    eprintln!(
-                        "{}",
-                        dimmed_text(&format!("[tokens] in={input} out={output}{cached_suffix}"))
-                    );
-                }
-            }
-            AgentEvent::Tool(ToolEvent::Started { name, markdown, .. }) => {
-                state.print_tool_started(&name, markdown.as_deref());
-            }
-            AgentEvent::Tool(ToolEvent::Failed { error, .. }) => {
-                eprintln!("{}", warning_text(&format!("tool error: {error}")));
-            }
-            AgentEvent::Tool(ToolEvent::Completed {
-                output, markdown, ..
-            }) => {
-                state.print_tool_completed(&output, markdown.as_deref());
-            }
-            AgentEvent::Tool(ToolEvent::Blocked { name, reason, .. }) => {
-                eprintln!("{}", warning_text(&format!("blocked: {name} — {reason}")));
-            }
-            // Silent for Progress / Update — they are streamed mid-call
-            // updates that would clutter stderr.
-            AgentEvent::Tool(_) => {}
-            // Compaction lifecycle uses stable log lines in one-shot mode.
-            AgentEvent::Session(SessionEvent::CompactingStarted) => {
-                eprintln!("{}", dimmed_text("Compacting the session..."));
-            }
-            AgentEvent::Session(SessionEvent::CompactingCompleted) => {
-                if let Err(err) = state.cleanup() {
-                    eprintln!(
-                        "{}",
-                        warning_text(&format!("cli-sink cleanup failed: {err}"))
-                    );
-                }
-                eprintln!("{}", dimmed_text("✓ Compacted the session."));
-            }
-            AgentEvent::Session(SessionEvent::CompactingFailed(err)) => {
-                if let Err(cleanup_err) = state.cleanup() {
-                    eprintln!(
-                        "{}",
-                        warning_text(&format!("cli-sink cleanup failed: {cleanup_err}"))
-                    );
-                }
-                eprintln!("{}", warning_text(&format!("compaction failed: {err}")));
-            }
-            AgentEvent::Session(SessionEvent::TitleGenerationFailed(err)) => {
-                eprintln!(
-                    "{}",
-                    warning_text(&format!("title generation failed: {err}"))
-                );
-            }
-            // Every other variant — Session (other), Status, Plan — still gets
-            // captured so nothing silently disappears. These receive dedicated
-            // renderers in a future plan.
-            other => eprintln!("{}", dimmed_text(&format!("[event] {other:?}"))),
-        }
+        state.print_event(event);
     }
+}
+
+fn print_usage(input: u64, output: u64, cached: u64) {
+    if input == 0 && output == 0 && cached == 0 {
+        return;
+    }
+    let cached_suffix = if cached > 0 {
+        format!(" (cached {cached})")
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "{}",
+        dimmed_text(&format!("[tokens] in={input} out={output}{cached_suffix}"))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +571,7 @@ mod tests {
             highlight,
             render_options: RenderOptions::default(),
             final_only: false,
+            subagents: CliSubagentReporter::default(),
         }
     }
 
@@ -551,6 +649,138 @@ mod tests {
         let state = sink.state.lock().unwrap();
         assert!(state.buffer.is_empty());
         assert!(state.last_ui_output_source.is_none());
+        assert!(state.subagents.invocations.is_empty());
+    }
+
+    fn subagent_progress(
+        invocation_id: &str,
+        session_id: &str,
+        status: SubAgentProgressStatus,
+        elapsed_ms: u64,
+    ) -> SubAgentProgress {
+        SubAgentProgress {
+            invocation_id: invocation_id.into(),
+            agent: "researcher".into(),
+            session_id: session_id.into(),
+            status,
+            elapsed_ms,
+            usage: harnx_core::api_types::CompletionTokenUsage::new(Some(120), Some(45), Some(30)),
+            tool_call_count: 3,
+        }
+    }
+
+    #[test]
+    fn subagent_reporter_prints_identity_at_start() {
+        let mut reporter = CliSubagentReporter::default();
+        let line = reporter
+            .started("researcher", "child-session", Some("inv-1"))
+            .expect("first start is reported");
+
+        assert!(line.contains("agent=researcher"));
+        assert!(line.contains("session=child-session"));
+        assert!(reporter
+            .started("researcher", "child-session", Some("inv-1"))
+            .is_none());
+    }
+
+    #[test]
+    fn subagent_reporter_rate_limits_metric_changes_to_heartbeat_buckets() {
+        let mut reporter = CliSubagentReporter::default();
+        reporter.started("researcher", "child", Some("inv-1"));
+
+        assert!(reporter
+            .progress(&subagent_progress(
+                "inv-1",
+                "child",
+                SubAgentProgressStatus::Running,
+                9_999,
+            ))
+            .is_none());
+        let first = reporter
+            .progress(&subagent_progress(
+                "inv-1",
+                "child",
+                SubAgentProgressStatus::Running,
+                10_000,
+            ))
+            .expect("first heartbeat boundary is reported");
+        assert!(first.contains("elapsed=10s"));
+        assert!(first.contains("in=120 out=45 cached=30 tools=3"));
+        assert!(reporter
+            .progress(&subagent_progress(
+                "inv-1",
+                "child",
+                SubAgentProgressStatus::Running,
+                19_999,
+            ))
+            .is_none());
+        assert!(reporter
+            .progress(&subagent_progress(
+                "inv-1",
+                "child",
+                SubAgentProgressStatus::Running,
+                20_000,
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn subagent_reporter_always_reports_one_terminal_state() {
+        for status in [SubAgentProgressStatus::Done, SubAgentProgressStatus::Failed] {
+            let mut reporter = CliSubagentReporter::default();
+            reporter.started("researcher", "child", Some("inv-1"));
+            let terminal = subagent_progress("inv-1", "child", status, 1_250);
+            let line = reporter
+                .progress(&terminal)
+                .expect("terminal progress is reported immediately");
+            assert!(line.contains(if status == SubAgentProgressStatus::Done {
+                " done "
+            } else {
+                " failed "
+            }));
+            assert!(line.contains("elapsed=1s"));
+            assert!(reporter.progress(&terminal).is_none());
+        }
+    }
+
+    #[test]
+    fn subagent_reporter_tracks_concurrent_invocations_independently() {
+        let mut reporter = CliSubagentReporter::default();
+        reporter.started("researcher", "child-a", Some("inv-a"));
+        reporter.started("researcher", "child-b", Some("inv-b"));
+
+        assert!(reporter
+            .progress(&subagent_progress(
+                "inv-a",
+                "child-a",
+                SubAgentProgressStatus::Running,
+                10_000,
+            ))
+            .is_some());
+        assert!(reporter
+            .progress(&subagent_progress(
+                "inv-b",
+                "child-b",
+                SubAgentProgressStatus::Running,
+                10_000,
+            ))
+            .is_some());
+        assert!(reporter
+            .progress(&subagent_progress(
+                "inv-a",
+                "child-a",
+                SubAgentProgressStatus::Running,
+                15_000,
+            ))
+            .is_none());
+        assert!(reporter
+            .progress(&subagent_progress(
+                "inv-b",
+                "child-b",
+                SubAgentProgressStatus::Running,
+                20_000,
+            ))
+            .is_some());
     }
 
     // ----------------------------------------------------------------

@@ -12,11 +12,19 @@ pub(super) fn update_row(
     status: &SubAgentStatus,
 ) {
     if let Some(TranscriptItem::SubAgentSession {
-        status: row_status, ..
+        status: row_status,
+        progress,
+        ..
     }) = transcript.iter_mut().rev().find(
         |item| matches!(item, TranscriptItem::SubAgentSession { key: row_key, .. } if row_key == key),
     ) {
-        *row_status = status.clone();
+        // Invocation progress is authoritative for invocation rows. The
+        // independently attached child-session monitor can briefly observe a
+        // pending durable turn after the parent already received the terminal
+        // tool result, so it must not repaint a completed invocation as running.
+        if progress.is_none() {
+            *row_status = status.clone();
+        }
     }
 }
 

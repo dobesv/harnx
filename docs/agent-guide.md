@@ -361,7 +361,7 @@ Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP
 
 ### Sub-Agent Tool Result Marker
 
-When `{agent}_session_new` or `{agent}_session_prompt` completes, the tool returns a JSON object containing the sub-agent response text and a structured identification marker (`sub_agent`):
+When `{agent}_session_new` or `{agent}_session_prompt` completes, the tool returns a JSON object containing the sub-agent response text, the existing structured identification marker (`sub_agent`), and the invocation's terminal progress snapshot (`sub_agent_progress`):
 
 ```json
 {
@@ -370,11 +370,31 @@ When `{agent}_session_new` or `{agent}_session_prompt` completes, the tool retur
   "sub_agent": {
     "agent": "researcher",
     "session_id": "01948a3f-7b1c-7123-8901-abcdef123456"
+  },
+  "sub_agent_progress": {
+    "invocation_id": "8aa9a68a-034e-4df3-a9cf-6db978644f30",
+    "agent": "researcher",
+    "session_id": "01948a3f-7b1c-7123-8901-abcdef123456",
+    "status": "done",
+    "elapsed_ms": 12430,
+    "usage": {
+      "input_tokens": 1480,
+      "output_tokens": 392,
+      "cached_tokens": 960
+    },
+    "tool_call_count": 3
   }
 }
 ```
 
-The `sub_agent` marker carries the exact `AgentSource` structure (`agent`, `session_id`), giving client interfaces explicit sub-agent identity without requiring tool-name heuristics.
+The `sub_agent` marker keeps its original wire shape and carries the exact
+`AgentSource` identity (`agent`, `session_id`). `sub_agent_progress` lets
+clients restore terminal metrics from durable session history. Metrics are
+scoped to one delegation invocation, even when several invocations reuse the
+same child session. Token usage accumulates every model call made directly by
+that child; tool count includes tools started directly by it. Nested agents'
+model and tool events stay on their own progress rows and are not double
+counted in the parent invocation.
 
 ### Live Event Streaming for User Interfaces
 
@@ -385,14 +405,15 @@ sessions.{session_id}.events
 ```
 
 Client interfaces can attach to a child session's stream to render activity
-live. The TUI does this automatically: it inserts a compact selectable child
-row, monitors the child independently, and opens its full transcript when the
-row receives focus. Nested rows can be used to drill into grandchildren. Press
-`Esc` to return one level. The Web UI inserts a compact child-session row under
-the parent assistant message, updates it when the parent receives the durable
-tool result, and restores completed rows from session history. Select a row to
-open the child session; browser Back returns to the parent. Child output remains
-in the child transcript rather than being rendered inline in the parent.
+live. The TUI inserts a compact selectable child row with an animated running
+spinner, locally advancing elapsed time, separate input/output/cached-token
+counts, and tool-call count. It freezes elapsed time at completion and opens
+the child's full transcript when the row receives focus. Nested rows can be
+used to drill into grandchildren; press `Esc` to return one level. The Web UI
+renders the same metrics under the parent assistant message, restores completed
+rows from session history, and retains navigation into the child session.
+Child output remains in the child transcript rather than being rendered inline
+in the parent.
 
 To allow interfaces to attach before the sub-agent prompt completes, an early advisory event is emitted on the parent session's stream (`sessions.{parent_session_id}.events`) immediately when delegation begins:
 
@@ -402,11 +423,18 @@ AgentEvent::SubAgent {
     event: Box::new(AgentEvent::Turn(TurnEvent::SubAgentStarted {
         agent: "researcher",
         session_id: "01948...",
+        invocation_id: Some("8aa9a68a-034e-4df3-a9cf-6db978644f30"),
     })),
 }
 ```
 
-When a UI receives `TurnEvent::SubAgentStarted` on the parent stream, it can immediately subscribe to `sessions.{child_session_id}.events` for real-time progress before `{agent}_session_prompt` returns its final output.
+`invocation_id` is optional on `SubAgentStarted` for compatibility with older
+producers. New producers follow it with `TurnEvent::SubAgentProgress` events on
+the parent stream. A running snapshot is published whenever tokens or the tool
+count changes, every 10 seconds as a heartbeat, and once more with `done` or
+`failed` status at termination. These snapshots carry the same fields as the
+durable `sub_agent_progress` result above. Raw child transcript events are not
+forwarded to the parent stream.
 
 ## Examples
 
