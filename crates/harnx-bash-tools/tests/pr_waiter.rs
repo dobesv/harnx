@@ -4,7 +4,9 @@ use harnx_bash_tools::discover_tool_templates;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const PR_URL: &str = "https://github.com/example/project/pull/42";
 
@@ -38,16 +40,16 @@ fn run_waiter(fake_gh: &str, direct_pr: bool, stall_seconds: u64) -> Output {
     )
     .expect("build fixture PATH");
 
-    let mut command = Command::new("timeout");
+    let mut command = Command::new("bash");
     command
-        .arg("5")
-        .arg("bash")
         .arg(waiter_path())
         .env("PATH", joined_path)
         .env("STATE_DIR", state_dir)
         .env("HARNX_WAIT_PR_POLL_SECONDS", "0")
         .env("HARNX_WAIT_PR_STALL_SECONDS", stall_seconds.to_string())
-        .env("HARNX_WAIT_PR_SETTLE_SECONDS", "0");
+        .env("HARNX_WAIT_PR_SETTLE_SECONDS", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if direct_pr {
         command.env("PR_URL", PR_URL);
     } else {
@@ -55,7 +57,20 @@ fn run_waiter(fake_gh: &str, direct_pr: bool, stall_seconds: u64) -> Output {
             .env("REPO", "example/project")
             .env("BRANCH", "feature");
     }
-    command.output().expect("run waiter")
+    let mut child = command.spawn().expect("run waiter");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child.try_wait().expect("query waiter process").is_some() {
+            return child.wait_with_output().expect("collect waiter output");
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill timed out waiter");
+            let output = child.wait_with_output().expect("collect timed out waiter");
+            let (stdout, stderr) = output_text(&output);
+            panic!("waiter exceeded 5 seconds: stdout={stdout}\nstderr={stderr}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn output_text(output: &Output) -> (String, String) {
