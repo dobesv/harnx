@@ -3,7 +3,7 @@
 set -euo pipefail
 
 poll_seconds="${HARNX_WAIT_PR_POLL_SECONDS:-60}"
-stall_seconds="${HARNX_WAIT_PR_STALL_SECONDS:-7200}"
+stall_seconds="${HARNX_WAIT_PR_STALL_SECONDS:-900}"
 settle_seconds="${HARNX_WAIT_PR_SETTLE_SECONDS:-300}"
 max_errors="${HARNX_WAIT_PR_MAX_ERRORS:-3}"
 
@@ -11,6 +11,12 @@ pr_url="${PR_URL:-}"
 repo="${REPO:-}"
 branch="${BRANCH:-}"
 head_owner="${HEAD_OWNER:-}"
+
+stderr_file=$(mktemp "${TMPDIR:-/tmp}/harnx-wait-pr.XXXXXX")
+cleanup() {
+  rm -f -- "$stderr_file"
+}
+trap cleanup EXIT
 
 started_at=$SECONDS
 consecutive_errors=0
@@ -73,12 +79,14 @@ fi
 
 if [[ -z "$pr_url" ]]; then
   if [[ -z "$repo" ]]; then
-    if repo_output=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>&1); then
+    if repo_output=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' \
+      2>"$stderr_file"); then
       :
     else
       status=$?
+      repo_error=$(<"$stderr_file")
       printf 'Could not determine the GitHub repository (exit %s): %.240s\n' \
-        "$status" "${repo_output%%$'\n'*}" >&2
+        "$status" "${repo_error%%$'\n'*}" >&2
       exit 1
     fi
     repo="$repo_output"
@@ -99,11 +107,13 @@ while true; do
   if [[ -z "$pr_url" ]]; then
     if matches=$(gh pr list --repo "$repo" --head "$branch" --state open --limit 20 \
       --json url,headRepositoryOwner \
-      --jq '.[] | [(.headRepositoryOwner.login // ""), .url] | @tsv' 2>&1); then
+      --jq '.[] | [(.headRepositoryOwner.login // ""), .url] | @tsv' \
+      2>"$stderr_file"); then
       consecutive_errors=0
     else
       status=$?
-      retry_or_fail "find pull request" "$status" "$matches"
+      matches_error=$(<"$stderr_file")
+      retry_or_fail "find pull request" "$status" "$matches_error"
       sleep_until_next_poll
       continue
     fi
@@ -132,11 +142,12 @@ while true; do
   if pr_info=$(gh pr view "$pr_url" \
     --json state,url,headRefOid,updatedAt,comments,reviews \
     --jq '[.state, .url, .headRefOid, .updatedAt, ((.comments // []) | map({id, createdAt, updatedAt, body}) | sort_by(.id) | tojson | @base64), ((.reviews // []) | map({id, submittedAt, state, body}) | sort_by(.id) | tojson | @base64)] | @tsv' \
-    2>&1); then
+    2>"$stderr_file"); then
     :
   else
     status=$?
-    retry_or_fail "read pull request" "$status" "$pr_info"
+    pr_error=$(<"$stderr_file")
+    retry_or_fail "read pull request" "$status" "$pr_error"
     sleep_until_next_poll
     continue
   fi
@@ -154,13 +165,22 @@ while true; do
   if [[ "$pr_state" == "OPEN" ]]; then
     if check_rows=$(gh pr checks "$pr_url" --json bucket,name,state,workflow \
       --jq 'sort_by(.workflow, .name, .state, .bucket) | .[] | [.bucket, .workflow, .name, .state] | @tsv' \
-      2>&1); then
+      2>"$stderr_file"); then
       consecutive_errors=0
     else
       status=$?
-      retry_or_fail "read status checks" "$status" "$check_rows"
-      sleep_until_next_poll
-      continue
+      checks_error=$(<"$stderr_file")
+      if ((status == 8)) && [[ -n "$check_rows" ]]; then
+        consecutive_errors=0
+      elif ((status == 1)) && \
+        [[ "$check_rows" == *"no checks reported"* || "$checks_error" == *"no checks reported"* ]]; then
+        check_rows=""
+        consecutive_errors=0
+      else
+        retry_or_fail "read status checks" "$status" "${checks_error:-$check_rows}"
+        sleep_until_next_poll
+        continue
+      fi
     fi
   fi
   consecutive_errors=0

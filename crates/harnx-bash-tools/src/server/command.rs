@@ -346,7 +346,9 @@ impl BashServer {
         let stdout_task = tokio::spawn(read_pipe_to_file(stdout, stdout_file));
         let stderr_task = tokio::spawn(read_pipe_to_file(stderr, stderr_file));
 
-        let (status, timed_out) = wait_for_child(child.as_mut(), timeout_secs).await?;
+        let (status, timed_out) = wait_for_child(child.as_mut(), timeout_secs)
+            .await
+            .map_err(|err| internal_error(err.to_string()))?;
 
         let stdout_bytes = join_pipe(stdout_task, "stdout").await?;
         let stderr_bytes = join_pipe(stderr_task, "stderr").await?;
@@ -371,28 +373,16 @@ impl BashServer {
 async fn wait_for_child(
     child: &mut dyn ChildWrapper,
     timeout_secs: Option<u64>,
-) -> Result<(std::process::ExitStatus, bool), ErrorData> {
+) -> anyhow::Result<(std::process::ExitStatus, bool)> {
     let Some(timeout_secs) = timeout_secs else {
-        return child
-            .wait()
-            .await
-            .map(|status| (status, false))
-            .map_err(|err| internal_error(format!("failed waiting for command: {err}")));
+        return Ok((child.wait().await?, false));
     };
 
     match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-        Ok(result) => result
-            .map(|status| (status, false))
-            .map_err(|err| internal_error(format!("failed waiting for command: {err}"))),
+        Ok(result) => Ok((result?, false)),
         Err(_) => {
-            child.start_kill().map_err(|err| {
-                internal_error(format!("failed to kill command after timeout: {err}"))
-            })?;
-            child
-                .wait()
-                .await
-                .map(|status| (status, true))
-                .map_err(|err| internal_error(format!("failed waiting for killed command: {err}")))
+            child.start_kill()?;
+            Ok((child.wait().await?, true))
         }
     }
 }

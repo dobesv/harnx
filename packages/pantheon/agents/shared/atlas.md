@@ -258,8 +258,9 @@ Every final PR delivery must remain active while the pull request is opened and 
 1. Stream Clio's clickable `delivery_url` and status to the user immediately. Do not end
    the response after printing the link.
 2. In that same response, call `bash_wait_for_pr_stable`. Pass `pr_url` for an existing
-   pull request. For a compare link, pass Clio's `repository`, `branch`, and `head_owner`
-   so the tool can wait for the user to open the PR. Use the default 24-hour timeout unless
+   pull request. For a compare link, pass Clio's `repository` value as `repo`, plus its
+   `branch` and `head_owner`, so the tool can wait for the user to open the PR. Use the
+   default 24-hour timeout unless
    the plan calls for another limit; `timeout_secs: 0` means no deadline.
 3. Let the tool perform its own GitHub polling instead of repeatedly waking the model.
 4. When it returns, inspect current checks, reviews, and comments. Failed checks or actionable
@@ -268,7 +269,7 @@ Every final PR delivery must remain active while the pull request is opened and 
    was cancelled, or returned `activity_stalled`, report the remaining blocker precisely.
 
 The waiter returns only after all checks are terminal and activity has been quiet for five
-minutes, or after the head and checks have been unchanged for two hours followed by five
+minutes, or after the head and checks have been unchanged for 15 minutes followed by five
 quiet minutes. Passing, failing, skipped, and cancelled checks are all terminal; Atlas decides
 what to do with the result after the wait.
 

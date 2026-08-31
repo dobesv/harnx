@@ -30,8 +30,8 @@ impl BashToolset {
     }
 
     /// Remove temporary execution logs created by this toolset instance.
-    pub fn cleanup_log_dir(&self) -> std::io::Result<()> {
-        self.server.cleanup_log_dir()
+    pub async fn cleanup_log_dir(&self) -> std::io::Result<()> {
+        self.server.cleanup_log_dir().await
     }
 }
 
@@ -304,7 +304,10 @@ mod tests {
         });
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !started.exists() {
+            while !tokio::fs::try_exists(&started)
+                .await
+                .expect("query started marker")
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
@@ -318,8 +321,13 @@ mod tests {
 
         assert!(matches!(result, Err(ToolInvokeError::Fatal(_))));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(!finished.exists(), "cancelled command continued running");
-        let _ = toolset.cleanup_log_dir();
+        assert!(
+            !tokio::fs::try_exists(&finished)
+                .await
+                .expect("query finished marker"),
+            "cancelled command continued running"
+        );
+        let _ = toolset.cleanup_log_dir().await;
     }
 
     #[cfg(unix)]

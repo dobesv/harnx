@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
     let toolset = BashToolset::new(sandbox_config, templates).await?;
     let cleanup_toolset = toolset.clone();
     let result = harnx_toolset_server::run_toolset_main(toolset).await;
-    if let Err(err) = cleanup_toolset.cleanup_log_dir() {
+    if let Err(err) = cleanup_toolset.cleanup_log_dir().await {
         log::warn!("failed to clean temp log dir: {err}");
     }
     result

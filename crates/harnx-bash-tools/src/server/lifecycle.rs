@@ -318,11 +318,11 @@ impl BashServer {
         self.inner.spawned.lock().await.insert(execution_id, entry);
     }
 
-    pub fn cleanup_log_dir(&self) -> std::io::Result<()> {
-        if self.inner.log_dir.exists() {
-            std::fs::remove_dir_all(&self.inner.log_dir)
-        } else {
-            Ok(())
+    pub async fn cleanup_log_dir(&self) -> std::io::Result<()> {
+        match tokio::fs::remove_dir_all(&self.inner.log_dir).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
         }
     }
 }

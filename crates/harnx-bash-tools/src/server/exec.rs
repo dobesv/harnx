@@ -35,7 +35,8 @@ impl BashServer {
             ErrorData::invalid_params(format!("unknown tool template: {name}"), None)
         })?;
         let mut script_args = args.clone();
-        let requested_timeout = parse_template_timeout(script_args.remove(COMMAND_TIMEOUT_ARG))?;
+        let requested_timeout = parse_template_timeout(script_args.remove(COMMAND_TIMEOUT_ARG))
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         let bound = registered
             .template
             .validate_and_bind(&script_args)
@@ -401,16 +402,14 @@ fn resolve_command_timeout(requested: Option<u64>) -> Option<u64> {
     }
 }
 
-fn parse_template_timeout(value: Option<Value>) -> Result<Option<u64>, ErrorData> {
+fn parse_template_timeout(value: Option<Value>) -> anyhow::Result<Option<u64>> {
     match value {
         None => Ok(None),
-        Some(Value::Number(number)) => number.as_u64().map(Some).ok_or_else(|| {
-            ErrorData::invalid_params("timeout_secs must be a non-negative integer", None)
-        }),
-        Some(_) => Err(ErrorData::invalid_params(
-            "timeout_secs must be a non-negative integer",
-            None,
-        )),
+        Some(Value::Number(number)) => match number.as_u64() {
+            Some(number) => Ok(Some(number)),
+            None => anyhow::bail!("timeout_secs must be a non-negative integer"),
+        },
+        Some(_) => anyhow::bail!("timeout_secs must be a non-negative integer"),
     }
 }
 

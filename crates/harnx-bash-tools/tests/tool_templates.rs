@@ -169,7 +169,7 @@ async fn bash_toolset_call_templates_match_mcp_handler() {
             spec.name
         );
     }
-    let _ = toolset.cleanup_log_dir();
+    let _ = toolset.cleanup_log_dir().await;
 }
 
 #[tokio::test]
@@ -239,9 +239,14 @@ async fn template_tool_validates_then_runs_through_exec_pipeline() {
         result.to_string().contains("7"),
         "unexpected result: {result}"
     );
-    assert!(marker.exists(), "valid invocation did not execute script");
+    assert!(
+        tokio::fs::try_exists(&marker).await.expect("query marker"),
+        "valid invocation did not execute script"
+    );
 
-    std::fs::remove_file(&marker).expect("remove marker");
+    tokio::fs::remove_file(&marker)
+        .await
+        .expect("remove marker");
     let error = toolset
         .invoke(
             "echo_num",
@@ -255,8 +260,11 @@ async fn template_tool_validates_then_runs_through_exec_pipeline() {
         error.to_string().contains("integer"),
         "unexpected error: {error}"
     );
-    assert!(!marker.exists(), "validation failure executed script");
-    let _ = toolset.cleanup_log_dir();
+    assert!(
+        !tokio::fs::try_exists(&marker).await.expect("query marker"),
+        "validation failure executed script"
+    );
+    let _ = toolset.cleanup_log_dir().await;
 }
 
 #[cfg(unix)]
@@ -270,12 +278,16 @@ async fn template_timeout_is_adjustable_and_zero_is_unlimited() {
         "",
         "sleep \"$DELAY\"; printf finished",
     );
-    let yaml = std::fs::read_to_string(&template_path).expect("read generated template");
+    let yaml = tokio::fs::read_to_string(&template_path)
+        .await
+        .expect("read generated template");
     let yaml = yaml.replace(
         "description: Test slow\n",
         "description: Test slow\nparameters:\n  delay: { type: number, required: true }\n",
     );
-    std::fs::write(&template_path, yaml).expect("add delay parameter");
+    tokio::fs::write(&template_path, yaml)
+        .await
+        .expect("add delay parameter");
     let templates =
         discover_tool_templates(None, &[template_path], &[]).expect("discover command template");
     let toolset = BashToolset::new(sandbox_config_for(directory.path()), templates)
@@ -303,7 +315,7 @@ async fn template_timeout_is_adjustable_and_zero_is_unlimited() {
         .expect("zero timeout should disable the deadline");
     assert_ne!(unlimited["isError"], json!(true));
     assert!(unlimited.to_string().contains("finished"));
-    let _ = toolset.cleanup_log_dir();
+    let _ = toolset.cleanup_log_dir().await;
 }
 
 #[tokio::test]
@@ -349,5 +361,5 @@ async fn reserved_builtin_name_is_hard_error_when_explicit_and_skipped_when_auto
         .await
         .expect("built-in exec remains callable");
     assert!(result.to_string().contains("builtin-exec"));
-    let _ = toolset.cleanup_log_dir();
+    let _ = toolset.cleanup_log_dir().await;
 }

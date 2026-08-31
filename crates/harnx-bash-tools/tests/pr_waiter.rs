@@ -10,6 +10,23 @@ use std::time::{Duration, Instant};
 
 const PR_URL: &str = "https://github.com/example/project/pull/42";
 
+struct WaiterFixture<'a> {
+    fake_gh: &'a str,
+    direct_pr: bool,
+    stall_seconds: u64,
+}
+
+struct ExpectedWaiter<'a> {
+    output: Output,
+    stdout_fragments: &'a [&'a str],
+}
+
+struct ExpectedCheck<'a> {
+    command: &'a str,
+    stall_seconds: u64,
+    stdout_fragments: &'a [&'a str],
+}
+
 fn waiter_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../packages/pantheon/scripts/wait-for-pr-stable.sh")
@@ -19,7 +36,12 @@ fn templates_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/pantheon/bash_tools")
 }
 
-fn run_waiter(fake_gh: &str, direct_pr: bool, stall_seconds: u64) -> Output {
+fn run_waiter(fixture: WaiterFixture<'_>) -> Output {
+    let WaiterFixture {
+        fake_gh,
+        direct_pr,
+        stall_seconds,
+    } = fixture;
     let fixture = tempfile::tempdir().expect("fixture directory");
     let bin_dir = fixture.path().join("bin");
     let state_dir = fixture.path().join("state");
@@ -80,31 +102,46 @@ fn output_text(output: &Output) -> (String, String) {
     )
 }
 
-fn count_occurrences(text: &str, pattern: &str) -> usize {
-    text.match_indices(pattern).count()
+fn assert_successful_waiter(expected: ExpectedWaiter<'_>) -> (String, String) {
+    let ExpectedWaiter {
+        output,
+        stdout_fragments,
+    } = expected;
+    let (stdout, stderr) = output_text(&output);
+    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    for expected in stdout_fragments {
+        assert!(
+            stdout.contains(expected),
+            "stdout does not contain {expected:?}: {stdout}"
+        );
+    }
+    (stdout, stderr)
 }
 
-fn assert_waiter_status(
-    check: &str,
-    stall_seconds: u64,
-    expected_reason: &str,
-    expected_count: &str,
-) {
+fn assert_waiter_check(expected: ExpectedCheck<'_>) -> (String, String) {
+    let ExpectedCheck {
+        command,
+        stall_seconds,
+        stdout_fragments,
+    } = expected;
     let fake_gh = format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
 case "$1 $2" in
   "pr view") printf 'OPEN\t%s\tsha-1\tupdated-1\tcomments-1\treviews-1\n' 'https://github.com/example/project/pull/42' ;;
-  "pr checks") printf '{check}\n' ;;
+  "pr checks") {command} ;;
   *) exit 91 ;;
 esac
 "#
     );
-    let output = run_waiter(&fake_gh, true, stall_seconds);
-    let (stdout, stderr) = output_text(&output);
-    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
-    assert!(stdout.contains(expected_reason), "stdout={stdout}");
-    assert!(stdout.contains(expected_count), "stdout={stdout}");
+    assert_successful_waiter(ExpectedWaiter {
+        output: run_waiter(WaiterFixture {
+            fake_gh: &fake_gh,
+            direct_pr: true,
+            stall_seconds,
+        }),
+        stdout_fragments,
+    })
 }
 
 #[test]
@@ -115,9 +152,18 @@ fn shipped_pantheon_templates_are_valid() {
 }
 
 #[test]
+fn shipped_waiter_uses_fifteen_minute_stall_threshold() {
+    let script = fs::read_to_string(waiter_path()).expect("read shipped waiter");
+    assert!(
+        script.contains("HARNX_WAIT_PR_STALL_SECONDS:-900"),
+        "waiter must default to the issue's 15-minute unchanged-status threshold"
+    );
+}
+
+#[test]
 fn waiter_discovers_pr_then_returns_after_terminal_checks_are_quiet() {
-    let output = run_waiter(
-        r#"#!/usr/bin/env bash
+    let output = run_waiter(WaiterFixture {
+        fake_gh: r#"#!/usr/bin/env bash
 set -euo pipefail
 case "$1 $2" in
   "pr list")
@@ -135,21 +181,24 @@ case "$1 $2" in
   *) exit 91 ;;
 esac
 "#,
-        false,
-        999,
-    );
-    let (stdout, stderr) = output_text(&output);
-    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
-    assert!(stdout.contains("Waiting for an open pull request"));
-    assert!(stdout.contains("Monitoring https://github.com/example/project/pull/42"));
-    assert!(stdout.contains("reason=checks_terminal"));
-    assert!(stdout.contains("checks_pass=1"));
+        direct_pr: false,
+        stall_seconds: 999,
+    });
+    assert_successful_waiter(ExpectedWaiter {
+        output,
+        stdout_fragments: &[
+            "Waiting for an open pull request",
+            "Monitoring https://github.com/example/project/pull/42",
+            "reason=checks_terminal",
+            "checks_pass=1",
+        ],
+    });
 }
 
 #[test]
 fn waiter_resets_terminal_settlement_when_pr_activity_changes() {
-    let output = run_waiter(
-        r#"#!/usr/bin/env bash
+    let output = run_waiter(WaiterFixture {
+        fake_gh: r#"#!/usr/bin/env bash
 set -euo pipefail
 case "$1 $2" in
   "pr view")
@@ -166,43 +215,96 @@ case "$1 $2" in
   *) exit 91 ;;
 esac
 "#,
-        true,
-        999,
-    );
-    let (stdout, stderr) = output_text(&output);
-    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
+        direct_pr: true,
+        stall_seconds: 999,
+    });
+    let (stdout, _) = assert_successful_waiter(ExpectedWaiter {
+        output,
+        stdout_fragments: &["reason=checks_terminal"],
+    });
     assert_eq!(
-        count_occurrences(&stdout, "All 1 status checks are terminal"),
+        stdout.matches("All 1 status checks are terminal").count(),
         2,
         "activity should restart the quiet period: {stdout}"
     );
-    assert!(stdout.contains("reason=checks_terminal"));
 }
 
 #[test]
 fn waiter_returns_when_pending_checks_stall() {
-    assert_waiter_status(
-        r"pending\tCI\tbuild\tIN_PROGRESS",
-        0,
-        "reason=activity_stalled",
-        "checks_pending=1",
+    assert_waiter_check(ExpectedCheck {
+        command: r"printf 'pending\tCI\tbuild\tIN_PROGRESS\n'",
+        stall_seconds: 0,
+        stdout_fragments: &["reason=activity_stalled", "checks_pending=1"],
+    });
+}
+
+#[test]
+fn waiter_accepts_pending_rows_from_gh_exit_eight() {
+    let (_, stderr) = assert_waiter_check(ExpectedCheck {
+        command: "printf 'pending\\tCI\\tbuild\\tIN_PROGRESS\\n'; exit 8",
+        stall_seconds: 0,
+        stdout_fragments: &["reason=activity_stalled", "checks_pending=1"],
+    });
+    assert!(!stderr.contains("GitHub query failed"), "stderr={stderr}");
+}
+
+#[test]
+fn waiter_treats_no_reported_checks_as_an_empty_set() {
+    let (_, stderr) = assert_waiter_check(ExpectedCheck {
+        command: "printf 'no checks reported\\n' >&2; exit 1",
+        stall_seconds: 0,
+        stdout_fragments: &["reason=activity_stalled", "checks_total=0"],
+    });
+    assert!(!stderr.contains("GitHub query failed"), "stderr={stderr}");
+}
+
+#[test]
+fn waiter_keeps_successful_gh_stderr_out_of_parsed_values() {
+    let output = run_waiter(WaiterFixture {
+        fake_gh: r#"#!/usr/bin/env bash
+set -euo pipefail
+case "$1 $2" in
+  "pr list")
+    printf 'list warning\n' >&2
+    printf 'example\t%s\n' 'https://github.com/example/project/pull/42'
+    ;;
+  "pr view")
+    printf 'view warning\n' >&2
+    printf 'OPEN\t%s\tsha-1\tupdated-1\tcomments-1\treviews-1\n' 'https://github.com/example/project/pull/42'
+    ;;
+  "pr checks")
+    printf 'checks warning\n' >&2
+    printf 'pass\tCI\tbuild\tSUCCESS\n'
+    ;;
+  *) exit 91 ;;
+esac
+"#,
+        direct_pr: false,
+        stall_seconds: 999,
+    });
+    let (_, stderr) = assert_successful_waiter(ExpectedWaiter {
+        output,
+        stdout_fragments: &["reason=checks_terminal", "checks_pass=1"],
+    });
+    assert!(
+        stderr.is_empty(),
+        "successful warnings must stay private: {stderr}"
     );
 }
 
 #[test]
 fn waiter_treats_failed_checks_as_terminal() {
-    assert_waiter_status(
-        r"fail\tCI\tbuild\tFAILURE",
-        999,
-        "reason=checks_terminal",
-        "checks_fail=1",
-    );
+    assert_waiter_check(ExpectedCheck {
+        command: r"printf 'fail\tCI\tbuild\tFAILURE\n'",
+        stall_seconds: 999,
+        stdout_fragments: &["reason=checks_terminal", "checks_fail=1"],
+    });
 }
 
 #[test]
 fn waiter_retries_transient_github_errors_and_limits_persistent_failures() {
-    let transient = run_waiter(
-        r#"#!/usr/bin/env bash
+    let transient = run_waiter(WaiterFixture {
+        fake_gh: r#"#!/usr/bin/env bash
 set -euo pipefail
 case "$1 $2" in
   "pr view")
@@ -221,9 +323,9 @@ case "$1 $2" in
   *) exit 91 ;;
 esac
 "#,
-        true,
-        999,
-    );
+        direct_pr: true,
+        stall_seconds: 999,
+    });
     let (stdout, stderr) = output_text(&transient);
     assert!(
         transient.status.success(),
@@ -233,15 +335,15 @@ esac
     assert!(stderr.contains("attempt 2/3"));
     assert!(stdout.contains("reason=checks_terminal"));
 
-    let persistent = run_waiter(
-        r#"#!/usr/bin/env bash
+    let persistent = run_waiter(WaiterFixture {
+        fake_gh: r#"#!/usr/bin/env bash
 set -euo pipefail
 printf 'still unavailable\n' >&2
 exit 1
 "#,
-        true,
-        999,
-    );
+        direct_pr: true,
+        stall_seconds: 999,
+    });
     let (stdout, stderr) = output_text(&persistent);
     assert!(
         !persistent.status.success(),
@@ -253,8 +355,8 @@ exit 1
 
 #[test]
 fn waiter_rejects_ambiguous_branch_matches() {
-    let output = run_waiter(
-        r#"#!/usr/bin/env bash
+    let output = run_waiter(WaiterFixture {
+        fake_gh: r#"#!/usr/bin/env bash
 set -euo pipefail
 case "$1 $2" in
   "pr list")
@@ -264,9 +366,9 @@ case "$1 $2" in
   *) exit 91 ;;
 esac
 "#,
-        false,
-        999,
-    );
+        direct_pr: false,
+        stall_seconds: 999,
+    });
     let (stdout, stderr) = output_text(&output);
     assert!(!output.status.success(), "stdout={stdout}\nstderr={stderr}");
     assert!(stderr.contains("Multiple open pull requests"));
