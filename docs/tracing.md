@@ -42,13 +42,16 @@ Each `llm_request` span records LLM model metadata:
 - `gen_ai.system`: LLM provider identifier (e.g. `openai`, `anthropic`, `gemini`).
 - `gen_ai.request.model`: Active model name (e.g. `gpt-4o`, `claude-3-5-sonnet-20241022`).
 
-Successful non-streaming spans also record token usage when the provider returns it:
+Successful non-streaming spans also record token usage and cost attributes when available:
 
-- `gen_ai.usage.input_tokens`: Prompt input token count.
+- `gen_ai.usage.input_tokens`: Total prompt input token count (includes cached tokens).
 - `gen_ai.usage.output_tokens`: Completion output token count.
-- `harnx.gen_ai.usage.cached_tokens`: Prompt cache read tokens (included only when returned by the provider).
+- `gen_ai.usage.cache_read.input_tokens`: Prompt cache read token count.
+- `gen_ai.usage.cache_write.input_tokens`: Prompt cache creation/write token count.
+- `harnx.gen_ai.usage.cached_tokens`: Legacy alias for prompt cache read tokens (retained for backward compatibility).
+- `harnx.gen_ai.cost.usd`: Estimated dollar cost for the request (f64, present only when required model pricing is available).
 
-Streaming usage is available only after the `llm_request` span closes, so streaming spans do not include these token attributes.
+Streaming usage is available only after the `llm_request` span closes, so streaming spans do not include these token and cost attributes.
 
 ## Cross-Process Context Propagation
 
@@ -72,7 +75,7 @@ Tracing support across workspace binaries falls into four tiers:
 
 ## Non-Goals & Limitations
 
-- **No cost attribution**: Token usage numbers are recorded on LLM request spans, but tracing itself does not attach financial cost to spans. Cumulative token usage and dollar cost metrics are available via the Prometheus endpoint (see [Prometheus Metrics](metrics.md)). `harnx_llm_cost_dollars` is emitted by `harnx-worker` only, and only when the model has both input and output prices configured.
+- **Span cost attribution**: Non-streaming `llm_request` spans record estimated per-call cost via the custom `harnx.gen_ai.cost.usd` attribute when required model pricing is configured (omitted when pricing is incomplete; OpenTelemetry semantic conventions currently lack a standard cost attribute, per semconv-genai #101). Cumulative process cost and token metrics remain available via the Prometheus endpoint (see [Prometheus Metrics](metrics.md)).
 - **Third-party MCP servers**: External MCP servers that do not process rmcp `_meta` context will complete tool requests normally, but will not attach downstream child spans. The trace degrades gracefully by ending at the `harnx-mcp-bridge` boundary.
 
 ## Runnable Example

@@ -21,6 +21,7 @@
 
 use crate::*;
 use anyhow::{bail, Result};
+use harnx_core::model::{normalize_cache_usage, CacheAccounting, RawCacheUsage};
 use harnx_core::text::strip_think_tag;
 use harnx_core::tool::ToolResult;
 
@@ -319,6 +320,40 @@ fn responses_tool_result_output(tool_result: &ToolResult) -> String {
     tool_result.output.to_string()
 }
 
+/// Normalizes Responses API usage to the OTel-subset convention.
+///
+/// The OpenAI Responses API (`/v1/responses`) is an OpenAI-family endpoint and uses
+/// `normalize_cache_usage` with the per-model `cache_accounting` flag. This handles
+/// proxies like LiteLLM/agentgateway that may front a disjoint backend (Anthropic/Bedrock)
+/// while exposing an OpenAI-compatible wire format. The default `subset` is correct
+/// for direct OpenAI and well-behaved proxies that normalize themselves.
+fn openai_normalize_responses_usage(
+    usage: &Value,
+    accounting: CacheAccounting,
+    model_name: &str,
+) -> harnx_core::api_types::CompletionTokenUsage {
+    let details = &usage["input_tokens_details"];
+    let read = details["cached_tokens"]
+        .as_u64()
+        .or_else(|| usage["cache_read_input_tokens"].as_u64())
+        .unwrap_or_default();
+    let write = details["cache_write_tokens"]
+        .as_u64()
+        .or_else(|| details["cache_creation_tokens"].as_u64())
+        .or_else(|| usage["cache_creation_input_tokens"].as_u64())
+        .unwrap_or_default();
+    normalize_cache_usage(
+        RawCacheUsage {
+            input: usage["input_tokens"].as_u64().unwrap_or_default(),
+            output: usage["output_tokens"].as_u64().unwrap_or_default(),
+            read,
+            write,
+        },
+        accounting,
+        model_name,
+    )
+}
+
 /// Parse a non-streaming OpenAI Responses API JSON into `ChatCompletionsOutput`.
 ///
 /// Mirrors `gemini_extract_chat_completions_text` but reads the Responses `output[]` array.
@@ -352,14 +387,15 @@ fn responses_tool_result_output(tool_result: &ToolResult) -> String {
 /// # Usage field names
 ///
 /// Responses API uses `input_tokens` / `output_tokens` (not `prompt_tokens` / `completion_tokens`).
-/// Cached tokens are under `usage.input_tokens_details.cached_tokens`.
+/// Cache reads are under `usage.input_tokens_details.cached_tokens`; cache writes use
+/// `cache_write_tokens` or proxy alias `cache_creation_tokens`.
 ///
 /// # Wire-shape note
 ///
 /// The `encrypted_content` field on reasoning items contains an opaque blob for reasoning replay.
 /// This is captured into `thought_signature` on the tool call to enable stateless replay across
 /// tool turns.
-pub fn openai_extract_responses(data: &Value) -> Result<ChatCompletionsOutput> {
+pub fn openai_extract_responses(data: &Value, model: &Model) -> Result<ChatCompletionsOutput> {
     let mut text_parts = vec![];
     let mut thought_parts = vec![];
     let mut tool_calls = vec![];
@@ -450,12 +486,8 @@ pub fn openai_extract_responses(data: &Value) -> Result<ChatCompletionsOutput> {
         bail!("Invalid Responses output: no text, tool_calls, or reasoning found in: {data}");
     }
 
-    // Extract usage tokens
-    // Wire-shape: Responses uses input_tokens/output_tokens, not prompt_tokens/completion_tokens
-    let input_tokens = data["usage"]["input_tokens"].as_u64();
-    let output_tokens = data["usage"]["output_tokens"].as_u64();
-    // Cached tokens under input_tokens_details.cached_tokens
-    let cached_tokens = data["usage"]["input_tokens_details"]["cached_tokens"].as_u64();
+    let usage =
+        openai_normalize_responses_usage(&data["usage"], model.cache_accounting(), model.name());
 
     // Extract response id
     let id = data["id"].as_str().map(|s| s.to_string());
@@ -465,9 +497,10 @@ pub fn openai_extract_responses(data: &Value) -> Result<ChatCompletionsOutput> {
         tool_calls,
         thought,
         id,
-        input_tokens,
-        output_tokens,
-        cached_tokens,
+        input_tokens: Some(usage.input_tokens),
+        output_tokens: Some(usage.output_tokens),
+        cached_tokens: Some(usage.cached_tokens),
+        cache_write_tokens: Some(usage.cache_write_tokens),
     })
 }
 
@@ -487,6 +520,8 @@ use reqwest::RequestBuilder;
 /// and reasoning state across events.
 #[derive(Default)]
 pub struct ResponsesStreamState {
+    cache_accounting: CacheAccounting,
+    model_name: String,
     /// Pending function calls indexed by item_id: (name, args_buffer, call_id)
     /// When `function_call_arguments.done` arrives, we finalize and emit.
     pub pending_tool_calls: HashMap<String, PendingToolCall>,
@@ -502,6 +537,119 @@ pub struct PendingToolCall {
     pub name: String,
     pub arguments: String,
     pub call_id: Option<String>,
+}
+
+impl ResponsesStreamState {
+    fn for_model(model: &Model) -> Self {
+        Self {
+            cache_accounting: model.cache_accounting(),
+            model_name: model.name().to_string(),
+            ..Default::default()
+        }
+    }
+}
+
+fn responses_output_item_added(state: &mut ResponsesStreamState, data: &Value) {
+    let item = &data["item"];
+    let item_id = item["id"].as_str().unwrap_or_default();
+    match item["type"].as_str() {
+        Some("function_call") => {
+            state.pending_tool_calls.insert(
+                item_id.to_string(),
+                PendingToolCall {
+                    name: item["name"].as_str().unwrap_or_default().to_string(),
+                    arguments: String::new(),
+                    call_id: item["call_id"].as_str().map(str::to_string),
+                },
+            );
+        }
+        Some("reasoning") => {
+            state.reasoning_item_id = Some(item_id.to_string());
+            state.encrypted_content = None;
+        }
+        _ => {}
+    }
+}
+
+fn responses_function_arguments_delta(state: &mut ResponsesStreamState, data: &Value) {
+    let item_id = data["item_id"].as_str().unwrap_or_default();
+    if let Some(pending) = state.pending_tool_calls.get_mut(item_id) {
+        if let Some(delta) = data["delta"].as_str() {
+            pending.arguments.push_str(delta);
+        }
+    }
+}
+
+fn responses_finalize_tool_call(
+    state: &mut ResponsesStreamState,
+    handler: &mut SseHandler,
+    item_id: &str,
+) -> Result<()> {
+    let Some(pending) = state.pending_tool_calls.remove(item_id) else {
+        return Ok(());
+    };
+    let arguments = if pending.arguments.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(&pending.arguments).unwrap_or_else(|_| json!({}))
+    };
+    handler.tool_call(ToolCall::new(
+        pending.name,
+        arguments,
+        pending.call_id,
+        state.encrypted_content.clone(),
+    ))
+}
+
+fn responses_output_item_done(
+    state: &mut ResponsesStreamState,
+    handler: &mut SseHandler,
+    data: &Value,
+) -> Result<()> {
+    let item = &data["item"];
+    match item["type"].as_str() {
+        Some("reasoning") => {
+            if let Some(encrypted) = item["encrypted_content"].as_str() {
+                state.encrypted_content = Some(encrypted.to_string());
+            }
+            Ok(())
+        }
+        Some("function_call") => {
+            responses_finalize_tool_call(state, handler, item["id"].as_str().unwrap_or_default())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn responses_completed(state: &mut ResponsesStreamState, handler: &mut SseHandler, data: &Value) {
+    if let Some(encrypted) = &state.encrypted_content {
+        handler.attach_thought_signature_to_pending_tool_calls(encrypted.clone());
+    }
+    state.encrypted_content = None;
+
+    let Some(usage) = data["response"]
+        .get("usage")
+        .filter(|value| value.is_object())
+    else {
+        return;
+    };
+    let usage = openai_normalize_responses_usage(usage, state.cache_accounting, &state.model_name);
+    handler.set_usage(StreamingUsage {
+        input_tokens: Some(usage.input_tokens),
+        output_tokens: Some(usage.output_tokens),
+        cached_tokens: Some(usage.cached_tokens),
+        cache_write_tokens: Some(usage.cache_write_tokens),
+    });
+}
+
+fn responses_stream_error(data: &Value) -> Result<()> {
+    if let Some(err_obj) = data.get("error").or_else(|| {
+        data.get("response")
+            .and_then(|response| response.get("error"))
+    }) {
+        return crate::catch_error(&json!({"error": err_obj}), 500, None);
+    }
+    bail!("Responses stream error: {}", data)
 }
 
 /// Process a single Responses SSE event.
@@ -546,139 +694,30 @@ pub(crate) fn openai_handle_responses_event(
         }
 
         // New output item added: track in state
-        "response.output_item.added" => {
-            let item = &data["item"];
-            let item_type = item["type"].as_str().unwrap_or("");
-            let item_id = item["id"].as_str().unwrap_or_default();
-
-            match item_type {
-                "function_call" => {
-                    let name = item["name"].as_str().unwrap_or_default().to_string();
-                    let call_id = item["call_id"].as_str().map(|s| s.to_string());
-                    state.pending_tool_calls.insert(
-                        item_id.to_string(),
-                        PendingToolCall {
-                            name,
-                            arguments: String::new(),
-                            call_id,
-                        },
-                    );
-                }
-                "reasoning" => {
-                    // Track reasoning item for encrypted_content capture
-                    state.reasoning_item_id = Some(item_id.to_string());
-                    // Clear any prior encrypted_content
-                    state.encrypted_content = None;
-                }
-                _ => {}
-            }
-        }
+        "response.output_item.added" => responses_output_item_added(state, data),
 
         // Accumulate function call arguments
         "response.function_call_arguments.delta" => {
-            let item_id = data["item_id"].as_str().unwrap_or_default();
-            if let Some(pending) = state.pending_tool_calls.get_mut(item_id) {
-                if let Some(delta) = data["delta"].as_str() {
-                    pending.arguments.push_str(delta);
-                }
-            }
+            responses_function_arguments_delta(state, data);
         }
 
         // Function call arguments done: finalize and emit
         "response.function_call_arguments.done" => {
-            let item_id = data["item_id"].as_str().unwrap_or_default();
-            if let Some(pending) = state.pending_tool_calls.remove(item_id) {
-                // Parse accumulated arguments
-                let arguments: Value = if pending.arguments.is_empty() {
-                    json!({})
-                } else {
-                    serde_json::from_str(&pending.arguments).unwrap_or_else(|_| json!({}))
-                };
-
-                // Attach encrypted_content as thought_signature if available.
-                // If not available yet (reasoning arrives after tool call), response.completed
-                // attaches it to all pending tool calls.
-                let thought_signature = state.encrypted_content.clone();
-
-                handler.tool_call(ToolCall::new(
-                    pending.name,
-                    arguments,
-                    pending.call_id,
-                    thought_signature,
-                ))?;
-            }
+            responses_finalize_tool_call(
+                state,
+                handler,
+                data["item_id"].as_str().unwrap_or_default(),
+            )?;
         }
 
         // Output item done: capture reasoning encrypted_content, finalize function_call
-        "response.output_item.done" => {
-            let item = &data["item"];
-            let item_type = item["type"].as_str().unwrap_or("");
-            let item_id = item["id"].as_str().unwrap_or_default();
-
-            match item_type {
-                "reasoning" => {
-                    // Capture encrypted_content for subsequent tool calls. If tool calls
-                    // were already emitted without this signature, keep encrypted_content
-                    // until response.completed to attach it then.
-                    if let Some(encrypted) = item["encrypted_content"].as_str() {
-                        state.encrypted_content = Some(encrypted.to_string());
-                    }
-                }
-                "function_call" => {
-                    // Finalize if not already done via function_call_arguments.done
-                    if let Some(pending) = state.pending_tool_calls.remove(item_id) {
-                        let arguments: Value = if pending.arguments.is_empty() {
-                            json!({})
-                        } else {
-                            serde_json::from_str(&pending.arguments).unwrap_or_else(|_| json!({}))
-                        };
-
-                        let thought_signature = state.encrypted_content.clone();
-
-                        handler.tool_call(ToolCall::new(
-                            pending.name,
-                            arguments,
-                            pending.call_id,
-                            thought_signature,
-                        ))?;
-                    }
-                }
-                _ => {}
-            }
-        }
+        "response.output_item.done" => responses_output_item_done(state, handler, data)?,
 
         // Response completed: emit usage and attach late reasoning if needed
-        "response.completed" => {
-            // If we have encrypted_content from reasoning that arrived AFTER tool calls
-            // were emitted, attach it now to the last pending tool call in handler.
-            if let Some(encrypted) = &state.encrypted_content {
-                // Note: handler.tool_call() has already been called for each tool call.
-                handler.attach_thought_signature_to_pending_tool_calls(encrypted.clone());
-            }
-            state.encrypted_content = None;
-
-            // Wire-shape note: usage is nested under `response.usage` (not top-level)
-            let response = &data["response"];
-            let usage = &response["usage"];
-
-            let input_tokens = usage["input_tokens"].as_u64();
-            let output_tokens = usage["output_tokens"].as_u64();
-            let cached_tokens = usage["input_tokens_details"]["cached_tokens"].as_u64();
-
-            handler.set_usage(input_tokens, output_tokens, cached_tokens);
-        }
+        "response.completed" => responses_completed(state, handler, data),
 
         // Error handling
-        "response.failed" | "response.error" | "error" => {
-            if let Some(err_obj) = data
-                .get("error")
-                .or_else(|| data.get("response").and_then(|r| r.get("error")))
-            {
-                return crate::catch_error(&json!({"error": err_obj}), 500, None);
-            }
-            // Fallback: generic error
-            bail!("Responses stream error: {}", data);
-        }
+        "response.failed" | "response.error" | "error" => return responses_stream_error(data),
 
         // Ignore other events
         _ => {
@@ -737,9 +776,9 @@ fn handle_responses_sse_message(
 pub async fn openai_responses_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
-    _model: &Model,
+    model: &Model,
 ) -> Result<()> {
-    let mut state = ResponsesStreamState::default();
+    let mut state = ResponsesStreamState::for_model(model);
 
     let handle = |message: crate::SseMmessage| -> Result<bool> {
         handle_responses_sse_message(&mut state, handler, &message)
@@ -765,6 +804,29 @@ mod tests {
         let mut model = Model::new("openai", "gpt-5.6-sol");
         model.set_max_tokens(Some(tokens), true);
         model
+    }
+
+    fn assert_output_usage(actual: &ChatCompletionsOutput, expected: &CompletionTokenUsage) {
+        assert_eq!(
+            (
+                actual.input_tokens,
+                actual.output_tokens,
+                actual.cached_tokens,
+                actual.cache_write_tokens,
+            ),
+            (
+                Some(expected.input_tokens),
+                Some(expected.output_tokens),
+                Some(expected.cached_tokens),
+                Some(expected.cache_write_tokens),
+            )
+        );
+        assert!(expected.input_tokens >= expected.cached_tokens + expected.cache_write_tokens);
+    }
+
+    fn assert_usage(actual: &CompletionTokenUsage, expected: &CompletionTokenUsage) {
+        assert_eq!(actual, expected);
+        assert!(actual.input_tokens >= actual.cached_tokens + actual.cache_write_tokens);
     }
 
     #[test]
@@ -1160,19 +1222,77 @@ mod tests {
             "usage": {
                 "input_tokens": 10,
                 "output_tokens": 20,
-                "input_tokens_details": { "cached_tokens": 5 }
+                "input_tokens_details": {
+                    "cached_tokens": 5,
+                    "cache_write_tokens": 2
+                }
             }
         });
 
-        let output = openai_extract_responses(&responses_json).expect("Should parse");
+        let output =
+            openai_extract_responses(&responses_json, &test_model()).expect("Should parse");
 
-        assert_eq!(output.text, "Hello, how can I help?");
-        assert!(output.tool_calls.is_empty());
-        assert!(output.thought.is_none());
-        assert_eq!(output.id, Some("resp_test123".to_string()));
-        assert_eq!(output.input_tokens, Some(10));
-        assert_eq!(output.output_tokens, Some(20));
-        assert_eq!(output.cached_tokens, Some(5));
+        assert_eq!(
+            (
+                output.text.as_str(),
+                output.tool_calls.len(),
+                output.thought.as_deref(),
+                output.id.as_deref(),
+            ),
+            ("Hello, how can I help?", 0, None, Some("resp_test123"))
+        );
+        assert_output_usage(
+            &output,
+            &CompletionTokenUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+                cached_tokens: 5,
+                cache_write_tokens: 2,
+            },
+        );
+    }
+
+    #[test]
+    fn responses_disjoint_accounting_adds_cache_buckets_on_both_paths() {
+        let mut model = test_model();
+        model.data_mut().cache_accounting = Some(CacheAccounting::Disjoint);
+        let usage = json!({
+            "input_tokens": 60,
+            "output_tokens": 5,
+            "input_tokens_details": {
+                "cached_tokens": 20,
+                "cache_creation_tokens": 10
+            }
+        });
+        let response = json!({
+            "id": "resp_disjoint",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Hello"}]
+            }],
+            "usage": usage.clone()
+        });
+        let output = openai_extract_responses(&response, &model)
+            .expect("disjoint Responses usage should parse");
+        let expected = CompletionTokenUsage {
+            input_tokens: 90,
+            output_tokens: 5,
+            cached_tokens: 20,
+            cache_write_tokens: 10,
+        };
+        assert_output_usage(&output, &expected);
+
+        let (mut handler, _rx) = test_handler();
+        let mut state = ResponsesStreamState::for_model(&model);
+        openai_handle_responses_event(
+            &mut state,
+            &mut handler,
+            "response.completed",
+            &json!({"response": {"usage": usage}}),
+        )
+        .expect("disjoint streaming usage should parse");
+        let (_, _, _, usage) = handler.take();
+        assert_usage(&usage, &expected);
     }
 
     #[test]
@@ -1193,7 +1313,8 @@ mod tests {
             }
         });
 
-        let output = openai_extract_responses(&responses_json).expect("Should parse");
+        let output =
+            openai_extract_responses(&responses_json, &test_model()).expect("Should parse");
 
         assert!(output.text.is_empty());
         assert_eq!(output.tool_calls.len(), 1);
@@ -1230,7 +1351,8 @@ mod tests {
             }
         });
 
-        let output = openai_extract_responses(&responses_json).expect("Should parse");
+        let output =
+            openai_extract_responses(&responses_json, &test_model()).expect("Should parse");
 
         // Thought contains reasoning summary
         assert_eq!(
@@ -1264,7 +1386,8 @@ mod tests {
             "usage": {}
         });
 
-        let output = openai_extract_responses(&responses_json).expect("Should parse");
+        let output =
+            openai_extract_responses(&responses_json, &test_model()).expect("Should parse");
 
         assert_eq!(output.text, "Part one.\n\nPart two.");
     }
@@ -1298,7 +1421,8 @@ mod tests {
             "usage": {}
         });
 
-        let output = openai_extract_responses(&responses_json).expect("Should parse");
+        let output =
+            openai_extract_responses(&responses_json, &test_model()).expect("Should parse");
 
         assert_eq!(output.tool_calls.len(), 2);
         for call in &output.tool_calls {
@@ -1324,7 +1448,8 @@ mod tests {
             "usage": {}
         });
 
-        let output = openai_extract_responses(&responses_json).expect("Should parse");
+        let output =
+            openai_extract_responses(&responses_json, &test_model()).expect("Should parse");
 
         assert_eq!(output.tool_calls.len(), 1);
         assert_eq!(output.tool_calls[0].arguments, json!({}));
@@ -1354,7 +1479,8 @@ mod tests {
             "usage": {}
         });
 
-        let output = openai_extract_responses(&responses_json).expect("Should parse");
+        let output =
+            openai_extract_responses(&responses_json, &test_model()).expect("Should parse");
 
         assert_eq!(
             output.thought,
@@ -1388,7 +1514,8 @@ mod tests {
             "usage": {}
         });
 
-        let output = openai_extract_responses(&responses_json).expect("Should parse");
+        let output =
+            openai_extract_responses(&responses_json, &test_model()).expect("Should parse");
 
         assert_eq!(output.thought, Some("Let me think...".to_string()));
         assert_eq!(output.text, "Final answer.");
@@ -1634,6 +1761,37 @@ mod tests {
     }
 
     #[test]
+    fn test_streaming_completed_without_usage_preserves_existing_usage() {
+        let (mut handler, _rx) = test_handler();
+        let mut state = ResponsesStreamState::default();
+        handler.set_usage(StreamingUsage {
+            input_tokens: Some(11),
+            output_tokens: Some(7),
+            cached_tokens: Some(3),
+            cache_write_tokens: Some(2),
+        });
+
+        openai_handle_responses_event(
+            &mut state,
+            &mut handler,
+            "response.completed",
+            &json!({"response": {"usage": null}}),
+        )
+        .expect("usage-less completion should be ignored");
+
+        let (_, _, _, usage) = handler.take();
+        assert_usage(
+            &usage,
+            &CompletionTokenUsage {
+                input_tokens: 11,
+                output_tokens: 7,
+                cached_tokens: 3,
+                cache_write_tokens: 2,
+            },
+        );
+    }
+
+    #[test]
     fn test_streaming_usage_on_completed() {
         let (mut handler, _rx) = test_handler();
         let mut state = ResponsesStreamState::default();
@@ -1646,7 +1804,8 @@ mod tests {
                     "input_tokens": 100,
                     "output_tokens": 50,
                     "input_tokens_details": {
-                        "cached_tokens": 20
+                        "cached_tokens": 20,
+                        "cache_creation_tokens": 10
                     }
                 }
             }
@@ -1655,9 +1814,15 @@ mod tests {
             .expect("Should handle");
 
         let (_text, _thought, _calls, usage) = handler.take();
-        assert_eq!(usage.input_tokens, 100);
-        assert_eq!(usage.output_tokens, 50);
-        assert_eq!(usage.cached_tokens, 20);
+        assert_usage(
+            &usage,
+            &CompletionTokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cached_tokens: 20,
+                cache_write_tokens: 10,
+            },
+        );
     }
 
     #[test]

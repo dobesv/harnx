@@ -5,6 +5,7 @@
 pub mod ag_ui;
 pub mod ag_ui_rpc;
 mod ag_ui_sync;
+mod ag_ui_usage;
 pub mod session_actor;
 mod session_actor_types;
 mod session_routes;

@@ -25,12 +25,14 @@ impl ProgressMetric {
                 input,
                 output,
                 cached,
+                cache_write,
                 ..
-            }) => Some(Self::Usage(CompletionTokenUsage::new(
-                Some(input),
-                Some(output),
-                Some(cached),
-            ))),
+            }) => Some(Self::Usage(CompletionTokenUsage {
+                input_tokens: input,
+                output_tokens: output,
+                cached_tokens: cached,
+                cache_write_tokens: cache_write,
+            })),
             AgentEvent::Tool(ToolEvent::Started { .. }) => Some(Self::ToolStarted),
             AgentEvent::SubAgent { .. } => None,
             _ => None,
@@ -244,6 +246,30 @@ mod tests {
     }
 
     #[test]
+    fn usage_event_preserves_cache_write_tokens() {
+        let event = AgentEvent::Model(ModelEvent::Usage {
+            input: 12,
+            output: 4,
+            cached: 5,
+            cache_write: 3,
+            session_label: None,
+        });
+
+        let Some(ProgressMetric::Usage(usage)) = ProgressMetric::from_event(event) else {
+            panic!("expected usage metric");
+        };
+        assert_eq!(
+            usage,
+            CompletionTokenUsage {
+                input_tokens: 12,
+                output_tokens: 4,
+                cached_tokens: 5,
+                cache_write_tokens: 3,
+            }
+        );
+    }
+
+    #[test]
     fn ignores_nested_agent_metrics() {
         let nested = AgentEvent::sub_agent(
             AgentSource {
@@ -255,6 +281,7 @@ mod tests {
                 input: 99,
                 output: 88,
                 cached: 77,
+                cache_write: 66,
                 session_label: None,
             }),
         );

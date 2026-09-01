@@ -28,6 +28,18 @@ fn yaml_to_json(yaml: &str) -> serde_json::Value {
         .unwrap_or_else(|_| serde_json::Value::String(yaml.to_string()))
 }
 
+macro_rules! usage_event {
+    ($input:expr, $output:expr, $cached:expr, $session_label:expr) => {
+        AgentEvent::Model(ModelEvent::Usage {
+            input: $input,
+            output: $output,
+            cached: $cached,
+            cache_write: 0,
+            session_label: $session_label.map(str::to_string),
+        })
+    };
+}
+
 fn test_config() -> GlobalConfig {
     let config = Arc::new(RwLock::new(Config::default()));
     {
@@ -1493,12 +1505,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
             session_id: Some("session-1".to_string()),
             model: None,
         },
-        AgentEvent::Model(ModelEvent::Usage {
-            input: 12,
-            output: 34,
-            cached: 5,
-            session_label: Some("> argus ▸ session-1".to_string()),
-        }),
+        usage_event!(12, 34, 5, Some("> argus ▸ session-1")),
     )))
     .await
     .unwrap();
@@ -1589,12 +1596,7 @@ async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
             session_id: Some("session-nested".to_string()),
             model: None,
         },
-        AgentEvent::Model(ModelEvent::Usage {
-            input: 10,
-            output: 20,
-            cached: 0,
-            session_label: Some("> pytheas ▸ session-nested".to_string()),
-        }),
+        usage_event!(10, 20, 0, Some("> pytheas ▸ session-nested")),
     )))
     .await
     .unwrap();
@@ -1637,23 +1639,13 @@ async fn consecutive_usage_updates_replace_previous_usage_row_for_same_source() 
 
     tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
         source.clone(),
-        AgentEvent::Model(ModelEvent::Usage {
-            input: 10,
-            output: 1,
-            cached: 0,
-            session_label: None,
-        }),
+        usage_event!(10, 1, 0, None),
     )))
     .await
     .unwrap();
     tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
         source.clone(),
-        AgentEvent::Model(ModelEvent::Usage {
-            input: 20,
-            output: 2,
-            cached: 0,
-            session_label: None,
-        }),
+        usage_event!(20, 2, 0, None),
     )))
     .await
     .unwrap();
@@ -3964,12 +3956,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
         .tui()
         .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
             sub_source.clone(),
-            AgentEvent::Model(ModelEvent::Usage {
-                input: 500,
-                output: 200,
-                cached: 100,
-                session_label: Some("> researcher ▸ research-session-1".to_string()),
-            }),
+            usage_event!(500, 200, 100, Some("> researcher ▸ research-session-1")),
         )))
         .await
         .unwrap();

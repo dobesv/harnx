@@ -1180,6 +1180,8 @@ mod tests {
         let mut model_data = ModelData::new("metrics-model");
         model_data.input_price = Some(3.0);
         model_data.output_price = Some(15.0);
+        model_data.cache_read_price = Some(0.3);
+        model_data.cache_write_price = Some(3.75);
         Model::from_config("mypkg/openai", &[model_data])
             .into_iter()
             .next()
@@ -1189,9 +1191,9 @@ mod tests {
     fn metrics_mock_turn(
         text: &str,
         tool_call_id: Option<&str>,
-        usage: (u64, u64, u64),
+        usage: (u64, u64, u64, u64),
     ) -> MockTurn {
-        let (input_tokens, output_tokens, cached_tokens) = usage;
+        let (input_tokens, output_tokens, cached_tokens, cache_write_tokens) = usage;
         let tool_calls = tool_call_id
             .map(|id| ToolCall::new("noop".to_owned(), json!({}), Some(id.to_owned()), None))
             .into_iter()
@@ -1203,6 +1205,7 @@ mod tests {
                 input_tokens: Some(input_tokens),
                 output_tokens: Some(output_tokens),
                 cached_tokens: Some(cached_tokens),
+                cache_write_tokens: Some(cache_write_tokens),
                 ..Default::default()
             })
             .build()
@@ -1212,9 +1215,17 @@ mod tests {
         Arc::new(
             MockClient::builder()
                 .model(model.clone())
-                .add_turn(metrics_mock_turn("first tool", Some("call-1"), (10, 5, 2)))
-                .add_turn(metrics_mock_turn("second tool", Some("call-2"), (20, 7, 4)))
-                .add_turn(metrics_mock_turn("all done", None, (30, 11, 8)))
+                .add_turn(metrics_mock_turn(
+                    "first tool",
+                    Some("call-1"),
+                    (10, 5, 2, 1),
+                ))
+                .add_turn(metrics_mock_turn(
+                    "second tool",
+                    Some("call-2"),
+                    (20, 7, 4, 3),
+                ))
+                .add_turn(metrics_mock_turn("all done", None, (30, 11, 8, 5)))
                 .build(),
         )
     }
@@ -1293,6 +1304,14 @@ mod tests {
             token_metric_value(&snapshot, "cached"),
             &DebugValue::Counter(14)
         );
+        assert_eq!(
+            token_metric_value(&snapshot, "cache_read"),
+            &DebugValue::Counter(14)
+        );
+        assert_eq!(
+            token_metric_value(&snapshot, "cache_write"),
+            &DebugValue::Counter(9)
+        );
 
         let cost_value = metric_value(
             &snapshot,
@@ -1307,9 +1326,15 @@ mod tests {
         let DebugValue::Gauge(actual_cost) = cost_value else {
             panic!("cost should be a floating-point cumulative gauge, got {cost_value:?}");
         };
+        let expected_usage = CompletionTokenUsage {
+            input_tokens: 60,
+            output_tokens: 23,
+            cached_tokens: 14,
+            cache_write_tokens: 9,
+        };
         let expected_cost = model
-            .cost_usd(60, 23)
-            .expect("test model has input and output prices");
+            .cost_usd(&expected_usage)
+            .expect("test model has input, cache-read, cache-write, and output prices");
         assert!(
             (actual_cost.into_inner() - expected_cost).abs() < 1e-12,
             "cost should equal sum of three calls"

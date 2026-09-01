@@ -1,6 +1,11 @@
 use crate::*;
 
-use harnx_core::{message::MessageContentPart, text::strip_think_tag, tool::ToolResult};
+use harnx_core::{
+    message::MessageContentPart,
+    model::{normalize_cache_usage, RawCacheUsage},
+    text::strip_think_tag,
+    tool::ToolResult,
+};
 
 use anyhow::{bail, Context, Result};
 use reqwest::RequestBuilder;
@@ -123,8 +128,8 @@ pub async fn openai_chat_completions(
     debug!("non-stream-data: {data}");
     harnx_core::llm_trace::response("openai", &data);
     match model.endpoint() {
-        Some("responses") => crate::openai_responses::openai_extract_responses(&data),
-        _ => openai_extract_chat_completions(&data),
+        Some("responses") => crate::openai_responses::openai_extract_responses(&data, model),
+        _ => openai_extract_chat_completions(&data, model),
     }
 }
 
@@ -250,34 +255,41 @@ pub(crate) fn openai_handle_tool_call_delta(
     Ok(())
 }
 
-pub(crate) fn openai_handle_final_usage(handler: &mut SseHandler, data: &Value) {
+pub(crate) fn openai_handle_final_usage(
+    handler: &mut SseHandler,
+    data: &Value,
+    model: &Model,
+) {
     // Only capture usage from the final usage-only chunk (where choices is empty/absent).
     // Some providers send partial usage in intermediate chunks which would give wrong values.
-    let Some(usage) = data.get("usage") else {
+    let Some(usage) = data.get("usage").filter(|value| value.is_object()) else {
         return;
     };
     let choices_empty = data["choices"].as_array().is_none_or(|c| c.is_empty());
     if !choices_empty {
         return;
     }
-    handler.set_usage(
-        usage["prompt_tokens"].as_u64(),
-        usage["completion_tokens"].as_u64(),
-        usage["prompt_tokens_details"]["cached_tokens"].as_u64(),
-    );
+    let usage = openai_normalize_chat_usage(usage, model);
+    handler.set_usage(StreamingUsage {
+        input_tokens: Some(usage.input_tokens),
+        output_tokens: Some(usage.output_tokens),
+        cached_tokens: Some(usage.cached_tokens),
+        cache_write_tokens: Some(usage.cache_write_tokens),
+    });
 }
 
 pub(crate) fn openai_handle_stream_event(
     state: &mut OpenAiStreamState,
     handler: &mut SseHandler,
     data: &Value,
+    model: &Model,
 ) -> Result<()> {
     if let Some(_err) = data["error"].as_object() {
         return crate::catch_error(data, 500, None);
     }
     openai_handle_text_delta(state, handler, data)?;
     openai_handle_tool_call_delta(state, handler, data)?;
-    openai_handle_final_usage(handler, data);
+    openai_handle_final_usage(handler, data, model);
     Ok(())
 }
 
@@ -302,7 +314,7 @@ pub async fn openai_chat_completions_streaming(
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
         harnx_core::llm_trace::stream_event("openai", &data);
-        openai_handle_stream_event(&mut state, handler, &data)?;
+        openai_handle_stream_event(&mut state, handler, &data, model)?;
         Ok(false)
     };
 
@@ -488,7 +500,43 @@ pub fn openai_build_embeddings_body(data: &EmbeddingsData, model: &Model) -> Val
     })
 }
 
-pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
+/// Normalizes chat/completions usage to the OTel-subset convention.
+///
+/// The OpenAI chat/completions API is an OpenAI-family endpoint and uses
+/// `normalize_cache_usage` with the per-model `cache_accounting` flag. This handles
+/// proxies like LiteLLM/agentgateway that may front a disjoint backend (Anthropic/Bedrock)
+/// while exposing an OpenAI-compatible wire format. The default `subset` is correct
+/// for direct OpenAI and well-behaved proxies that normalize themselves.
+fn openai_normalize_chat_usage(
+    usage: &Value,
+    model: &Model,
+) -> harnx_core::api_types::CompletionTokenUsage {
+    let details = &usage["prompt_tokens_details"];
+    let read = details["cached_tokens"]
+        .as_u64()
+        .or_else(|| usage["cache_read_input_tokens"].as_u64())
+        .unwrap_or_default();
+    let write = details["cache_write_tokens"]
+        .as_u64()
+        .or_else(|| details["cache_creation_tokens"].as_u64())
+        .or_else(|| usage["cache_creation_input_tokens"].as_u64())
+        .unwrap_or_default();
+    normalize_cache_usage(
+        RawCacheUsage {
+            input: usage["prompt_tokens"].as_u64().unwrap_or_default(),
+            output: usage["completion_tokens"].as_u64().unwrap_or_default(),
+            read,
+            write,
+        },
+        model.cache_accounting(),
+        model.name(),
+    )
+}
+
+pub fn openai_extract_chat_completions(
+    data: &Value,
+    model: &Model,
+) -> Result<ChatCompletionsOutput> {
     let text = data["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or_default();
@@ -528,14 +576,19 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     } else {
         text.to_string()
     };
+    let usage = data
+        .get("usage")
+        .filter(|value| value.is_object())
+        .map(|usage| openai_normalize_chat_usage(usage, model));
     let output = ChatCompletionsOutput {
         text,
         tool_calls,
         thought: None,
         id: data["id"].as_str().map(|v| v.to_string()),
-        input_tokens: data["usage"]["prompt_tokens"].as_u64(),
-        output_tokens: data["usage"]["completion_tokens"].as_u64(),
-        cached_tokens: data["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64(),
+        input_tokens: usage.as_ref().map(|usage| usage.input_tokens),
+        output_tokens: usage.as_ref().map(|usage| usage.output_tokens),
+        cached_tokens: usage.as_ref().map(|usage| usage.cached_tokens),
+        cache_write_tokens: usage.as_ref().map(|usage| usage.cache_write_tokens),
     };
     Ok(output)
 }
@@ -554,8 +607,168 @@ mod tests {
 
     use harnx_core::{
         message::{ImageUrl, Message, MessageContent, MessageContentPart, MessageContentToolCalls, MessageRole},
+        model::CacheAccounting,
         tool::{ToolCall, ToolResult},
     };
+
+    fn chat_response(usage: Value) -> Value {
+        json!({
+            "id": "chatcmpl_test",
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": usage,
+        })
+    }
+
+    fn assert_output_usage(actual: &ChatCompletionsOutput, expected: &CompletionTokenUsage) {
+        assert_eq!(
+            (
+                actual.input_tokens,
+                actual.output_tokens,
+                actual.cached_tokens,
+                actual.cache_write_tokens,
+            ),
+            (
+                Some(expected.input_tokens),
+                Some(expected.output_tokens),
+                Some(expected.cached_tokens),
+                Some(expected.cache_write_tokens),
+            )
+        );
+        assert!(expected.input_tokens >= expected.cached_tokens + expected.cache_write_tokens);
+    }
+
+    fn assert_usage(actual: &CompletionTokenUsage, expected: CompletionTokenUsage) {
+        assert_eq!(actual, &expected);
+        assert!(actual.input_tokens >= actual.cached_tokens + actual.cache_write_tokens);
+    }
+
+    #[test]
+    fn openai_chat_without_usage_leaves_token_fields_absent() {
+        let model = Model::new("openai", "gpt-test");
+        let response = json!({
+            "id": "chatcmpl_test",
+            "choices": [{"message": {"content": "Hello"}}],
+        });
+
+        let output = openai_extract_chat_completions(&response, &model)
+            .expect("usage-less response should parse");
+
+        assert_eq!(output.input_tokens, None);
+        assert_eq!(output.output_tokens, None);
+        assert_eq!(output.cached_tokens, None);
+        assert_eq!(output.cache_write_tokens, None);
+    }
+
+    #[test]
+    fn openai_chat_null_final_usage_does_not_replace_stream_usage() {
+        let model = Model::new("openai", "gpt-test");
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        handler.set_usage(StreamingUsage {
+            input_tokens: Some(11),
+            output_tokens: Some(7),
+            cached_tokens: Some(3),
+            cache_write_tokens: Some(2),
+        });
+
+        openai_handle_final_usage(
+            &mut handler,
+            &json!({"choices": [], "usage": null}),
+            &model,
+        );
+
+        let (_, _, _, usage) = handler.take();
+        assert_usage(
+            &usage,
+            CompletionTokenUsage {
+                input_tokens: 11,
+                output_tokens: 7,
+                cached_tokens: 3,
+                cache_write_tokens: 2,
+            },
+        );
+    }
+
+    #[test]
+    fn openai_chat_parses_subset_cache_write_on_both_paths() {
+        let model = Model::new("openai", "gpt-test");
+        let usage = json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "prompt_tokens_details": {
+                "cached_tokens": 30,
+                "cache_write_tokens": 10
+            }
+        });
+        let output = openai_extract_chat_completions(&chat_response(usage.clone()), &model)
+            .expect("non-streaming usage should parse");
+        let expected = CompletionTokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cached_tokens: 30,
+            cache_write_tokens: 10,
+        };
+        assert_output_usage(&output, &expected);
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = OpenAiStreamState::default();
+        let event = json!({"choices": [], "usage": usage});
+        openai_handle_stream_event(&mut state, &mut handler, &event, &model)
+            .expect("final usage event should parse");
+        let (_, _, _, usage) = handler.take();
+        assert_usage(&usage, expected);
+    }
+
+    #[test]
+    fn openai_chat_parses_litellm_aliases() {
+        let model = Model::new("openai", "proxy-model");
+        let response = chat_response(json!({
+            "prompt_tokens": 120,
+            "completion_tokens": 5,
+            "cache_read_input_tokens": 40,
+            "prompt_tokens_details": {"cache_creation_tokens": 15}
+        }));
+        let output = openai_extract_chat_completions(&response, &model)
+            .expect("LiteLLM aliases should parse");
+        assert_output_usage(
+            &output,
+            &CompletionTokenUsage {
+                input_tokens: 120,
+                output_tokens: 5,
+                cached_tokens: 40,
+                cache_write_tokens: 15,
+            },
+        );
+    }
+
+    #[test]
+    fn openai_chat_cache_accounting_controls_disjoint_normalization() {
+        let response = chat_response(json!({
+            "prompt_tokens": 60,
+            "completion_tokens": 5,
+            "cache_read_input_tokens": 20,
+            "cache_creation_input_tokens": 10
+        }));
+        let subset = Model::new("openai", "subset-proxy");
+        let subset_output = openai_extract_chat_completions(&response, &subset)
+            .expect("subset usage should parse");
+        assert_eq!(subset_output.input_tokens, Some(60));
+
+        let mut disjoint = Model::new("openai", "disjoint-proxy");
+        disjoint.data_mut().cache_accounting = Some(CacheAccounting::Disjoint);
+        let disjoint_output = openai_extract_chat_completions(&response, &disjoint)
+            .expect("disjoint usage should parse");
+        assert_output_usage(
+            &disjoint_output,
+            &CompletionTokenUsage {
+                input_tokens: 90,
+                output_tokens: 5,
+                cached_tokens: 20,
+                cache_write_tokens: 10,
+            },
+        );
+    }
 
     fn test_tool_result(id: &str, name: &str, output: Value) -> ToolResult {
         ToolResult::new(
@@ -636,8 +849,13 @@ mod tests {
         ];
 
         for chunk in &chunks {
-            openai_handle_stream_event(&mut state, &mut handler, chunk)
-                .expect("stream event should process");
+            openai_handle_stream_event(
+                &mut state,
+                &mut handler,
+                chunk,
+                &Model::new("openai", "test-model"),
+            )
+            .expect("stream event should process");
         }
         // [DONE] flushes the still-pending final tool call.
         openai_emit_pending_tool_call(&mut state, &mut handler).expect("finalize should succeed");
@@ -920,7 +1138,12 @@ mod tests {
             }
         });
 
-        let result = openai_handle_stream_event(&mut state, &mut handler, &event);
+        let result = openai_handle_stream_event(
+            &mut state,
+            &mut handler,
+            &event,
+            &Model::new("openai", "test-model"),
+        );
         assert!(result.is_err(), "Stream error event should return an error");
         let err = result.unwrap_err();
         let llm_err = err.downcast_ref::<LlmError>().expect("Should be an LlmError");

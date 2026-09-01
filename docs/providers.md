@@ -17,6 +17,62 @@ All clients support these common fields:
 
 ---
 
+## Model Definitions & Pricing
+
+Clients can override model defaults or supply custom model entries using the `models` list field in client configuration files. Default model metadata and prices are loaded from Harnx's built-in model catalog (auto-generated from LiteLLM).
+
+### Model Configuration Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | **Required.** Model name or deployment identifier. |
+| `real_name` | string | Optional actual API model identifier passed to the backend provider. |
+| `type` | string | Model category (`chat` or `embedding`). Defaults to `chat`. |
+| `max_input_tokens` | integer | Maximum context/input token capacity. |
+| `max_output_tokens` | integer | Maximum completion/output token capacity. |
+| `input_price` | float | USD price per 1,000,000 uncached input tokens. |
+| `output_price` | float | USD price per 1,000,000 output tokens. |
+| `cache_read_price` | float | USD price per 1,000,000 cache-read input tokens (optional; auto-generated from LiteLLM base rates; tiered rates are unrepresented). |
+| `cache_write_price` | float | USD price per 1,000,000 cache-write/creation input tokens (optional; auto-generated from LiteLLM base rates; tiered rates are unrepresented). |
+| `cache_accounting` | string | Cache token accounting mode (`subset` or `disjoint`; default `subset`). |
+| `supports_vision` | boolean | Whether the model supports vision/image inputs. |
+| `supports_tool_use` | boolean | Whether the model supports tool calls. |
+
+### Cache Accounting (`cache_accounting`)
+
+The `cache_accounting` field controls how input token counts from API responses are normalized into OpenTelemetry-subset token counts:
+
+- `subset` (**default**): The API's reported `input_tokens` already includes all cache tokens (`input_tokens >= cache_read + cache_write`). Uncached input tokens are computed as `input_tokens - cache_read - cache_write`.
+- `disjoint`: The API's reported `input_tokens` excludes cache tokens. Total input tokens are computed as `input_tokens + cache_read + cache_write`.
+
+#### Usage and Proxy Guidance
+
+- **Native Providers**: Native `claude`, `bedrock`, and `vertexai` clients normalize usage automatically. You do **not** need to set `cache_accounting` for native client definitions.
+- **Proxies (`openai` / `openai-compatible`)**: The `cache_accounting` flag exists for `openai` or `openai-compatible` client configurations pointing at an intermediary proxy (such as LiteLLM or agentgateway) fronting a different provider backend.
+- **Default is Correct for Standard Proxies**: LiteLLM and agentgateway already normalize token usage to subset accounting by default, so the default `subset` setting is correct for almost all proxy setups.
+- **When to set `disjoint`**: Set `cache_accounting: disjoint` **only** for a passthrough or legacy proxy that forwards a backend's cache-excluding input token count (where input tokens do not already include cache tokens).
+- **Misconfiguration Warning**: Setting `disjoint` when the proxy is actually `subset` silently **overcharges** by adding cache tokens to total input twice (this is not auto-detectable). Conversely, if `subset` is configured but the API returns `input_tokens < cache_read + cache_write`, Harnx logs a one-time warning per model and clamps uncached input tokens to zero.
+- **Field Name Aliases**: OpenAI-family parsers automatically handle common response field aliases, including OpenAI `cache_write_tokens`, LiteLLM `cache_creation_tokens`, and top-level `cache_read_input_tokens`/`cache_creation_input_tokens`. Non-standard field layouts are a documented limitation.
+
+#### Example: Proxy Model with Cache Pricing and Disjoint Accounting
+
+```yaml
+type: openai-compatible
+api_base: "https://proxy.example.com/v1"
+api_key: "..."
+models:
+  - name: "custom-passthrough-claude"
+    max_input_tokens: 200000
+    max_output_tokens: 8192
+    input_price: 3.0
+    output_price: 15.0
+    cache_read_price: 0.30
+    cache_write_price: 3.75
+    cache_accounting: disjoint
+```
+
+---
+
 ## OpenAI
 
 Standard OpenAI API integration.

@@ -760,22 +760,21 @@ fn ag_ui_sink_usage_event_includes_context_fields_and_legacy_fields() {
         input: 12,
         output: 34,
         cached: 5,
+        cache_write: 7,
         session_label: Some("sess-a".to_string()),
     }));
 
     match rx.try_recv().expect("usage event") {
         Event::Custom(CustomEvent { name, value, .. }) => {
             assert_eq!(name, "usage");
-            assert_eq!(value["input"], json!(12));
-            assert_eq!(value["output"], json!(34));
-            assert_eq!(value["cached"], json!(5));
-            assert_eq!(value["session_label"], json!("sess-a"));
-            assert_eq!(value["context_tokens"], json!(321));
-            assert_eq!(value["max_context_tokens"], json!(1000));
-            let pct = value["context_percent"]
-                .as_f64()
-                .expect("context_percent is a number");
-            assert!((pct - 32.1).abs() < 0.01, "context_percent was {pct}");
+            assert_eq!(
+                value,
+                json!({
+                    "input": 12, "output": 34, "cached": 5, "cache_write": 7,
+                    "session_label": "sess-a", "context_tokens": 321,
+                    "max_context_tokens": 1000, "context_percent": 32.1_f32
+                })
+            );
         }
         other => panic!("expected usage custom event, got: {other:?}"),
     }

@@ -34,7 +34,12 @@ pub struct ChatCompletionsData {
     pub attachments_dir: Option<std::path::PathBuf>,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Completion output with token usage in the OTel-subset convention.
+///
+/// `input_tokens` includes all cache tokens. `cached_tokens` (cache reads) and
+/// `cache_write_tokens` are subsets of it. The invariant is
+/// `input_tokens >= cached_tokens + cache_write_tokens`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatCompletionsOutput {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
@@ -43,6 +48,8 @@ pub struct ChatCompletionsOutput {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<u64>,
 }
 
 impl ChatCompletionsOutput {
@@ -54,11 +61,18 @@ impl ChatCompletionsOutput {
     }
 }
 
+/// Token usage in the OTel-subset convention.
+///
+/// `input_tokens` includes all cache tokens. `cached_tokens` (cache reads) and
+/// `cache_write_tokens` are subsets of it. The invariant is
+/// `input_tokens >= cached_tokens + cache_write_tokens`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompletionTokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
 }
 
 impl CompletionTokenUsage {
@@ -67,13 +81,22 @@ impl CompletionTokenUsage {
             input_tokens: input.unwrap_or(0),
             output_tokens: output.unwrap_or(0),
             cached_tokens: cached.unwrap_or(0),
+            cache_write_tokens: 0,
         }
+    }
+
+    /// Returns input tokens outside both cache subsets, saturating on invalid provider counts.
+    pub fn uncached_input_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_sub(self.cached_tokens)
+            .saturating_sub(self.cache_write_tokens)
     }
 
     pub fn accumulate(&mut self, other: &CompletionTokenUsage) {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
         self.cached_tokens += other.cached_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -129,6 +152,69 @@ impl RerankData {
 }
 
 pub type RerankOutput = Vec<RerankResult>;
+
+#[cfg(test)]
+mod tests {
+    use super::{ChatCompletionsOutput, CompletionTokenUsage};
+
+    #[test]
+    fn uncached_input_tokens_uses_cache_subsets_and_saturates() {
+        let usage = CompletionTokenUsage {
+            input_tokens: 1_000,
+            cached_tokens: 200,
+            cache_write_tokens: 50,
+            ..Default::default()
+        };
+        assert_eq!(usage.uncached_input_tokens(), 750);
+
+        let provider_quirk = CompletionTokenUsage {
+            input_tokens: 100,
+            cached_tokens: 200,
+            ..Default::default()
+        };
+        assert_eq!(provider_quirk.uncached_input_tokens(), 0);
+    }
+
+    #[test]
+    fn accumulate_sums_cache_write_tokens() {
+        let mut total = CompletionTokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cached_tokens: 30,
+            cache_write_tokens: 10,
+        };
+        let next = CompletionTokenUsage {
+            input_tokens: 50,
+            output_tokens: 5,
+            cached_tokens: 15,
+            cache_write_tokens: 7,
+        };
+
+        total.accumulate(&next);
+
+        assert_eq!(
+            total,
+            CompletionTokenUsage {
+                input_tokens: 150,
+                output_tokens: 25,
+                cached_tokens: 45,
+                cache_write_tokens: 17,
+            }
+        );
+    }
+
+    #[test]
+    fn cache_write_tokens_default_when_deserializing_old_data() {
+        let usage: CompletionTokenUsage =
+            serde_json::from_str(r#"{"input_tokens":100,"output_tokens":20,"cached_tokens":30}"#)
+                .expect("old token usage should deserialize");
+        let output: ChatCompletionsOutput = serde_json::from_str(r#"{"text":"","tool_calls":[]}"#)
+            .expect("old completion output should deserialize");
+
+        assert_eq!(usage.cache_write_tokens, 0);
+        assert_eq!(output.cache_write_tokens, None);
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct RerankResult {

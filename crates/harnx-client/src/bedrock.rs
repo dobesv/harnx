@@ -374,6 +374,19 @@ fn bedrock_handle_content_block_stop(
     bedrock_emit_pending_tool_call(state, handler)
 }
 
+/// Bedrock's API is disjoint: `inputTokens` excludes cache buckets.
+/// This helper sums all input-token fields to produce the OTel-subset total.
+fn bedrock_input_tokens(usage: &Value) -> Option<u64> {
+    [
+        usage["inputTokens"].as_u64(),
+        usage["cacheReadInputTokens"].as_u64(),
+        usage["cacheWriteInputTokens"].as_u64(),
+    ]
+    .into_iter()
+    .flatten()
+    .reduce(u64::saturating_add)
+}
+
 fn bedrock_handle_stream_event(
     state: &mut BedrockStreamState,
     handler: &mut SseHandler,
@@ -385,11 +398,13 @@ fn bedrock_handle_stream_event(
         "contentBlockDelta" => bedrock_handle_content_block_delta(state, handler, data)?,
         "contentBlockStop" => bedrock_handle_content_block_stop(state, handler)?,
         "metadata" => {
-            handler.set_usage(
-                data["usage"]["inputTokens"].as_u64(),
-                data["usage"]["outputTokens"].as_u64(),
-                data["usage"]["cacheReadInputTokens"].as_u64(),
-            );
+            let usage = &data["usage"];
+            handler.set_usage(StreamingUsage {
+                input_tokens: bedrock_input_tokens(usage),
+                output_tokens: usage["outputTokens"].as_u64(),
+                cached_tokens: usage["cacheReadInputTokens"].as_u64(),
+                cache_write_tokens: usage["cacheWriteInputTokens"].as_u64(),
+            });
         }
         _ => {}
     }
@@ -744,9 +759,10 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         tool_calls,
         thought: reasoning,
         id: None,
-        input_tokens: data["usage"]["inputTokens"].as_u64(),
+        input_tokens: bedrock_input_tokens(&data["usage"]),
         output_tokens: data["usage"]["outputTokens"].as_u64(),
         cached_tokens: data["usage"]["cacheReadInputTokens"].as_u64(),
+        cache_write_tokens: data["usage"]["cacheWriteInputTokens"].as_u64(),
     };
     Ok(output)
 }
@@ -871,6 +887,64 @@ mod tests {
     use super::*;
     use harnx_core::abort::create_abort_signal;
     use tokio::sync::mpsc::unbounded_channel;
+
+    fn assert_output_usage(actual: &ChatCompletionsOutput, expected: &CompletionTokenUsage) {
+        assert_eq!(
+            (
+                actual.input_tokens,
+                actual.output_tokens,
+                actual.cached_tokens,
+                actual.cache_write_tokens,
+            ),
+            (
+                Some(expected.input_tokens),
+                Some(expected.output_tokens),
+                Some(expected.cached_tokens),
+                Some(expected.cache_write_tokens),
+            )
+        );
+        assert!(expected.input_tokens >= expected.cached_tokens + expected.cache_write_tokens);
+    }
+
+    fn assert_usage(actual: &CompletionTokenUsage, expected: &CompletionTokenUsage) {
+        assert_eq!(actual, expected);
+        assert!(actual.input_tokens >= actual.cached_tokens + actual.cache_write_tokens);
+    }
+
+    #[test]
+    fn bedrock_parses_and_normalizes_cache_write_on_both_paths() {
+        let response = json!({
+            "output": {"message": {"content": [{"text": "Hello"}]}},
+            "usage": {
+                "inputTokens": 50,
+                "outputTokens": 10,
+                "cacheReadInputTokens": 30,
+                "cacheWriteInputTokens": 20
+            }
+        });
+        let output = extract_chat_completions(&response)
+            .expect("non-streaming Bedrock response should parse");
+        let expected = CompletionTokenUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            cached_tokens: 30,
+            cache_write_tokens: 20,
+        };
+        assert_output_usage(&output, &expected);
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = BedrockStreamState::default();
+        bedrock_handle_stream_event(
+            &mut state,
+            &mut handler,
+            "metadata",
+            &json!({"usage": response["usage"].clone()}),
+        )
+        .expect("streaming Bedrock metadata should parse");
+        let (_, _, _, usage) = handler.take();
+        assert_usage(&usage, &expected);
+    }
 
     /// Regression test: two toolUse blocks in one Bedrock streaming
     /// response must not cause the first one to be emitted twice.

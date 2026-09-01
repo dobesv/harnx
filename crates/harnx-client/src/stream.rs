@@ -8,6 +8,14 @@ use reqwest_eventsource::{Error as EventSourceError, Event, RequestBuilderExt};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamingUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+}
+
 pub struct SseHandler {
     sender: UnboundedSender<SseEvent>,
     abort_signal: AbortSignal,
@@ -18,6 +26,7 @@ pub struct SseHandler {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cached_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
 }
 
 impl SseHandler {
@@ -32,6 +41,7 @@ impl SseHandler {
             input_tokens: None,
             output_tokens: None,
             cached_tokens: None,
+            cache_write_tokens: None,
         }
     }
 
@@ -167,29 +177,20 @@ impl SseHandler {
         }
     }
 
-    pub fn set_usage(
-        &mut self,
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
-        cached_tokens: Option<u64>,
-    ) {
+    pub fn set_usage(&mut self, usage: StreamingUsage) {
         if self.abort_signal.aborted() {
             return;
         }
-        if input_tokens.is_some() {
-            self.input_tokens = input_tokens;
-        }
-        if output_tokens.is_some() {
-            self.output_tokens = output_tokens;
-        }
-        if cached_tokens.is_some() {
-            self.cached_tokens = cached_tokens;
-        }
+        self.input_tokens = usage.input_tokens.or(self.input_tokens);
+        self.output_tokens = usage.output_tokens.or(self.output_tokens);
+        self.cached_tokens = usage.cached_tokens.or(self.cached_tokens);
+        self.cache_write_tokens = usage.cache_write_tokens.or(self.cache_write_tokens);
     }
 
     pub fn take(self) -> (String, Option<String>, Vec<ToolCall>, CompletionTokenUsage) {
-        let usage =
+        let mut usage =
             CompletionTokenUsage::new(self.input_tokens, self.output_tokens, self.cached_tokens);
+        usage.cache_write_tokens = self.cache_write_tokens.unwrap_or_default();
         let thought = if self.thought_buffer.is_empty() {
             None
         } else {

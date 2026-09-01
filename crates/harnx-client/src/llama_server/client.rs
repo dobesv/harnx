@@ -219,7 +219,7 @@ impl crate::LlamaServerClient {
                         sse_buffer.drain(..2);
                     }
 
-                    Self::handle_sse_event(&event_bytes, &mut state, handler)?;
+                    Self::handle_sse_event(&event_bytes, &mut state, handler, &self.model)?;
                 }
             }
         }
@@ -257,6 +257,7 @@ impl crate::LlamaServerClient {
         event_bytes: &[u8],
         state: &mut OpenAiStreamState,
         handler: &mut SseHandler,
+        model: &Model,
     ) -> Result<()> {
         // Split event into lines and process each "data:" line
         let event_str = std::str::from_utf8(event_bytes).context("SSE event is not valid UTF-8")?;
@@ -274,7 +275,7 @@ impl crate::LlamaServerClient {
                     serde_json::from_str(data_str).context("Failed to parse SSE data as JSON")?;
                 debug!("llama-sse: {value}");
                 harnx_core::llm_trace::stream_event("llama-server", &value);
-                openai_handle_stream_event(state, handler, &value)?;
+                openai_handle_stream_event(state, handler, &value, model)?;
             }
         }
 
@@ -324,7 +325,7 @@ impl crate::Client for crate::LlamaServerClient {
         debug!("llama-response: {response}");
         harnx_core::llm_trace::response("llama-server", &response);
 
-        openai_extract_chat_completions(&response)
+        openai_extract_chat_completions(&response, &self.model)
     }
 
     async fn chat_completions_streaming_inner(
@@ -385,7 +386,12 @@ mod tests {
 
         // Single SSE event with content delta
         let event = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}";
-        crate::LlamaServerClient::handle_sse_event(event, &mut state, &mut handler).unwrap();
+        crate::LlamaServerClient::handle_sse_event(
+            event,
+            &mut state,
+            &mut handler,
+            &Model::new("llama-server", "test-model"),
+        ).unwrap();
 
         let (buffer, _thought, _tool_calls, _usage) = handler.take();
         assert!(buffer.contains("Hello"));
@@ -406,7 +412,12 @@ mod tests {
         ];
 
         for event in events {
-            crate::LlamaServerClient::handle_sse_event(event, &mut state, &mut handler).unwrap();
+            crate::LlamaServerClient::handle_sse_event(
+            event,
+            &mut state,
+            &mut handler,
+            &Model::new("llama-server", "test-model"),
+        ).unwrap();
         }
 
         // Finalize pending tool call
@@ -426,11 +437,21 @@ mod tests {
 
         // Process a tool call first
         let tool_event = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc1\",\"function\":{\"name\":\"test_func\",\"arguments\":\"\"}}]}}]}";
-        crate::LlamaServerClient::handle_sse_event(tool_event, &mut state, &mut handler).unwrap();
+        crate::LlamaServerClient::handle_sse_event(
+            tool_event,
+            &mut state,
+            &mut handler,
+            &Model::new("llama-server", "test-model"),
+        ).unwrap();
 
         // Then [DONE] marker
         let event_done = b"data: [DONE]";
-        crate::LlamaServerClient::handle_sse_event(event_done, &mut state, &mut handler).unwrap();
+        crate::LlamaServerClient::handle_sse_event(
+            event_done,
+            &mut state,
+            &mut handler,
+            &Model::new("llama-server", "test-model"),
+        ).unwrap();
 
         // Finalize pending tool call
         openai_emit_pending_tool_call(&mut state, &mut handler).unwrap();
@@ -482,7 +503,12 @@ mod tests {
         // Event with two valid data lines (each parsed separately)
         let event =
             b"data: {\"choices\":[{\"delta\":{\"content\":\"Part1\"}}]}\ndata: {\"choices\":[{\"delta\":{\"content\":\"Part2\"}}]}";
-        crate::LlamaServerClient::handle_sse_event(event, &mut state, &mut handler).unwrap();
+        crate::LlamaServerClient::handle_sse_event(
+            event,
+            &mut state,
+            &mut handler,
+            &Model::new("llama-server", "test-model"),
+        ).unwrap();
 
         let (buffer, _thought, _tool_calls, _usage) = handler.take();
         assert!(buffer.contains("Part1"));

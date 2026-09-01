@@ -47,6 +47,8 @@ FIELD_ORDER = [
     "require_max_tokens",
     "input_price",
     "output_price",
+    "cache_read_price",
+    "cache_write_price",
     "supports_vision",
     "supports_tool_use",
     "patches",
@@ -448,13 +450,26 @@ def model_type_for_mode(mode: str) -> str | None:
     return None
 
 
+def build_price_fields(payload: dict[str, Any], mode: str) -> dict[str, float | int]:
+    price_keys = [("input_price", "input_cost_per_token")]
+    if mode == "chat":
+        # Tiered cache rates (`*_above_*`) aren't represented; use base rates only.
+        price_keys.extend(
+            [
+                ("output_price", "output_cost_per_token"),
+                ("cache_read_price", "cache_read_input_token_cost"),
+                ("cache_write_price", "cache_creation_input_token_cost"),
+            ]
+        )
+    prices = ((field, scale_price(payload.get(key))) for field, key in price_keys)
+    return {field: price for field, price in prices if price is not None}
+
+
 def build_model_from_litellm(name: str, payload: dict[str, Any], mode: str) -> dict[str, Any]:
     model: dict[str, Any] = {"name": name}
 
     max_input = normalize_number(payload.get("max_input_tokens") or payload.get("max_tokens"))
     max_output = normalize_number(payload.get("max_output_tokens") or payload.get("max_output_token"))
-    input_price = scale_price(payload.get("input_cost_per_token"))
-    output_price = scale_price(payload.get("output_cost_per_token"))
     supports_vision = normalize_bool(
         payload.get("supports_vision")
         if "supports_vision" in payload
@@ -467,10 +482,7 @@ def build_model_from_litellm(name: str, payload: dict[str, Any], mode: str) -> d
         model["max_input_tokens"] = max_input
     if max_output is not None:
         model["max_output_tokens"] = max_output
-    if input_price is not None:
-        model["input_price"] = input_price
-    if output_price is not None and mode == "chat":
-        model["output_price"] = output_price
+    model.update(build_price_fields(payload, mode))
     if supports_vision is not None and mode == "chat":
         model["supports_vision"] = supports_vision
     if supports_tool_use is not None and mode == "chat":
@@ -486,12 +498,18 @@ def should_skip_model(today: dt.date, payload: dict[str, Any]) -> bool:
     if deprecation_date is not None and deprecation_date < today:
         return True
     # Skip models with no useful data (e.g. LiteLLM's "container" entry)
+    cache_price_fields = {
+        "cache_read_input_token_cost",
+        "cache_creation_input_token_cost",
+    }
     useful_fields = {
         "max_input_tokens", "max_output_tokens", "max_tokens",
         "input_cost_per_token", "output_cost_per_token",
         "supports_vision", "supports_function_calling",
     }
-    if not any(payload.get(f) for f in useful_fields):
+    if not any(payload.get(field) for field in useful_fields) and not any(
+        payload.get(field) is not None for field in cache_price_fields
+    ):
         return True
     return False
 

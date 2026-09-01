@@ -1,5 +1,5 @@
 use crate::lifecycle::session_history_transcript_items;
-use crate::render_helpers::{render_status_line, render_usage_line};
+use crate::render_helpers::render_status_line;
 use crate::strip_ansi;
 use crate::types::Tui;
 use crate::types::{TranscriptItem, TuiEvent};
@@ -1012,28 +1012,8 @@ impl Tui {
                 }
             }
             AgentEvent::Plan { entries } => vec![TranscriptItem::Plan(entries)],
-            AgentEvent::Model(ModelEvent::Usage {
-                input,
-                output,
-                cached,
-                session_label,
-            }) => {
-                let line = render_usage_line(
-                    input,
-                    output,
-                    cached,
-                    session_label.as_deref(),
-                    source.as_ref(),
-                );
-                if let Some(line) = line {
-                    if self.update_existing_usage_line(source.as_ref(), &line) {
-                        vec![]
-                    } else {
-                        vec![TranscriptItem::UsageLine(line)]
-                    }
-                } else {
-                    vec![]
-                }
+            AgentEvent::Model(event @ ModelEvent::Usage { .. }) => {
+                self.render_usage_event(source.as_ref(), event)
             }
             AgentEvent::Tool(ToolEvent::Started {
                 name,
@@ -1294,7 +1274,11 @@ impl Tui {
         self.app.last_usage_transcript_idx = None;
     }
 
-    fn update_existing_usage_line(&mut self, source: Option<&AgentSource>, line: &str) -> bool {
+    pub(super) fn update_existing_usage_line(
+        &mut self,
+        source: Option<&AgentSource>,
+        line: &str,
+    ) -> bool {
         if self.app.last_usage_source.as_ref() != source {
             return false;
         }
