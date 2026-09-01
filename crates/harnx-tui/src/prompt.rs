@@ -64,6 +64,31 @@ fn test_tool_round_callback(ctx: &PromptTaskContext) -> harnx_runtime::OnToolRou
     })
 }
 
+#[cfg(test)]
+fn test_agent_loop_context(
+    ctx: &PromptTaskContext,
+    call_fn: harnx_runtime::AgentCallFn,
+    on_tool_round: harnx_runtime::OnToolRoundFn,
+    on_text_response: harnx_runtime::OnTextResponseFn,
+) -> harnx_runtime::AgentLoopContext {
+    harnx_runtime::AgentLoopContext {
+        instance_id: harnx_core::instance::ServerScope::new(),
+        config: ctx.config.clone(),
+        abort_signal: ctx.abort_signal.clone(),
+        token_budget: None,
+        usage_at_start: Default::default(),
+        call_fn: Some(call_fn),
+        on_tool_round: Some(on_tool_round),
+        on_text_response: Some(on_text_response),
+        initial_with_embeddings: true,
+        initial_resume_count: 0,
+        max_resume: None,
+        nats_hook_provider: None,
+        pending_async_context: None,
+        working_dir: None,
+    }
+}
+
 impl Tui {
     /// Queue input submitted while the current turn is busy. Plain text for a
     /// durable session can reach the running worker's next tool-round seam;
@@ -329,20 +354,7 @@ impl Tui {
                 })
             },
         );
-        let loop_ctx = harnx_runtime::AgentLoopContext {
-            instance_id: harnx_core::instance::ServerScope::new(),
-            config: ctx.config.clone(),
-            abort_signal: ctx.abort_signal.clone(),
-            call_fn: Some(call_fn),
-            on_tool_round: Some(on_tool_round),
-            on_text_response: Some(on_text_response),
-            initial_with_embeddings: true,
-            initial_resume_count: 0,
-            max_resume: None,
-            nats_hook_provider: None,
-            pending_async_context: None,
-            working_dir: None,
-        };
+        let loop_ctx = test_agent_loop_context(&ctx, call_fn, on_tool_round, on_text_response);
 
         harnx_runtime::run_agent_loop_with_local_handoff(&loop_ctx, input).await
     }

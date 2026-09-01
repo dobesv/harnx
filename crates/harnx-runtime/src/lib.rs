@@ -34,6 +34,7 @@ pub mod nats_worker;
 pub mod remote_session_cleanup;
 pub mod server_identity;
 pub mod session_history;
+pub mod terminated_result;
 #[cfg(test)]
 mod test_environment;
 pub mod test_utils;
@@ -45,10 +46,15 @@ mod worker_identity;
 // Re-export session types for frontends
 pub use nats_session::{
     send_control_command, DurableTextEnqueue, NatsSession, NatsSessionConfig, NatsTurnResult,
-    SessionLeaseWatchdog,
+    RunTurnOptions, SessionLeaseWatchdog,
 };
 pub use nats_session_metadata::{SessionInitializer, SessionOverrides};
 pub use nats_worker::{ControlCommand, SessionActivationRoute};
+pub use terminated_result::{
+    budget_terminal_message, parse_budget_terminal, synthesize_terminated_result, BudgetTerminal,
+    InvocationBufferingSink, SynthesizedResult, TerminationDetails, TerminationInputs,
+    TerminationKind, TerminationUsage, INVOCATION_TEXT_TAIL_CAP_BYTES,
+};
 
 pub use agent_loop::{
     continue_agent_loop_from_tool_round, run_agent_loop, run_agent_loop_with_local_handoff,

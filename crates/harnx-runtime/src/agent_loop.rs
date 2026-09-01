@@ -87,6 +87,8 @@ pub struct AgentLoopContext {
     pub config: GlobalConfig,
     pub instance_id: harnx_core::instance::ServerScope,
     pub abort_signal: AbortSignal,
+    pub token_budget: Option<u64>,
+    pub usage_at_start: CompletionTokenUsage,
     /// Optional custom LLM call function. `None` → uses the default
     /// non-streaming `call_with_retry_and_fallback`.
     pub call_fn: Option<AgentCallFn>,
@@ -467,17 +469,19 @@ fn emit_user_prompt_block_notice(reason: String) {
     ));
 }
 
-async fn user_prompt_gate_passes(
+async fn pre_model_call_boundary_passes(
     ctx: &AgentLoopContext,
     input: &Input,
     turn: &TurnHookContext,
     resume_count: u32,
-) -> bool {
-    let Some(reason) = user_prompt_block_reason(ctx, input, turn, resume_count).await else {
-        return true;
-    };
-    emit_user_prompt_block_notice(reason);
-    false
+) -> Result<bool> {
+    if let Some(reason) = user_prompt_block_reason(ctx, input, turn, resume_count).await {
+        emit_user_prompt_block_notice(reason);
+        return Ok(false);
+    }
+
+    enforce_token_budget(ctx)?;
+    Ok(true)
 }
 
 type AgentModelResult = Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)>;
@@ -818,6 +822,27 @@ fn finish_agent_loop(config: &GlobalConfig, abort_signal: &AbortSignal) -> Resul
     Ok(LoopResult::Completed)
 }
 
+fn enforce_token_budget(ctx: &AgentLoopContext) -> Result<()> {
+    let Some(budget) = ctx.token_budget.filter(|budget| *budget > 0) else {
+        return Ok(());
+    };
+    let current_budgeted = ctx
+        .config
+        .read()
+        .session
+        .as_ref()
+        .map(|session| session.completion_usage().budgeted_tokens())
+        .unwrap_or_default();
+    let budgeted = current_budgeted.saturating_sub(ctx.usage_at_start.budgeted_tokens());
+
+    if budgeted >= budget {
+        return Err(anyhow::Error::msg(crate::budget_terminal_message(
+            budgeted, budget,
+        )));
+    }
+    Ok(())
+}
+
 #[tracing::instrument(
     name = "agent_turn",
     skip_all,
@@ -851,7 +876,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
         config.write().before_chat_completion(&input)?;
 
         let turn = turn_hook_context(ctx);
-        if !user_prompt_gate_passes(ctx, &input, &turn, resume_count).await {
+        if !pre_model_call_boundary_passes(ctx, &input, &turn, resume_count).await? {
             break;
         }
 
@@ -1235,6 +1260,8 @@ mod tests {
             config,
             instance_id: harnx_core::instance::ServerScope::new(),
             abort_signal: create_abort_signal(),
+            token_budget: None,
+            usage_at_start: CompletionTokenUsage::default(),
             call_fn: None,
             on_tool_round: None,
             on_text_response: None,
@@ -1362,6 +1389,8 @@ mod tests {
             instance_id: harnx_core::instance::ServerScope::new(),
             config: global_config,
             abort_signal: create_abort_signal(),
+            token_budget: None,
+            usage_at_start: CompletionTokenUsage::default(),
             call_fn: Some(call_fn),
             on_tool_round: Some(on_tool_round),
             on_text_response: None,

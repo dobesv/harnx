@@ -33,6 +33,7 @@ pub struct RunAgentLoopArgs<'a> {
     pub instance_id: harnx_core::instance::ServerScope,
     pub initial_input: Input,
     pub abort_signal: AbortSignal,
+    pub token_budget: Option<u64>,
     pub call_fn: Option<crate::agent_loop::AgentCallFn>,
     pub lease: Option<Arc<NatsSessionLease>>,
     /// Route used by this worker. Same-cluster handoffs reuse it so local
@@ -199,6 +200,7 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
         instance_id,
         initial_input,
         abort_signal,
+        token_budget,
         call_fn,
         lease,
         activation_route,
@@ -237,6 +239,7 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
         config: config.clone(),
         instance_id,
         abort_signal: abort_signal.clone(),
+        token_budget,
         call_fn,
         on_tool_round,
         working_dir,
@@ -261,6 +264,14 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
         event_sink,
     })
     .await;
+    finish_agent_loop(hook_supervisor, attachment_sync, result).await
+}
+
+async fn finish_agent_loop(
+    hook_supervisor: Option<HookServerSupervisor>,
+    attachment_sync: SessionAttachmentSync,
+    result: Result<NatsAgentLoopOutcome>,
+) -> Result<NatsAgentLoopOutcome> {
     shutdown_agent_hooks(hook_supervisor).await;
     attachment_sync.finish(result).await
 }
@@ -324,6 +335,7 @@ struct AgentContextParams {
     config: GlobalConfig,
     instance_id: harnx_core::instance::ServerScope,
     abort_signal: AbortSignal,
+    token_budget: Option<u64>,
     call_fn: Option<crate::agent_loop::AgentCallFn>,
     on_tool_round: Option<OnToolRoundFn>,
     working_dir: Option<std::path::PathBuf>,
@@ -333,6 +345,11 @@ async fn build_agent_loop_context(
     params: AgentContextParams,
 ) -> crate::agent_loop::AgentLoopContext {
     let config_snapshot = params.config.read().clone();
+    let usage_at_start = config_snapshot
+        .session
+        .as_ref()
+        .map(|session| session.completion_usage().clone())
+        .unwrap_or_default();
     let active_package = config_snapshot.active_package();
     // Activation has already waited for this session's on-demand tool
     // servers to register. Replace any snapshot captured while startup was
@@ -349,6 +366,8 @@ async fn build_agent_loop_context(
         config: params.config,
         instance_id: params.instance_id,
         abort_signal: params.abort_signal,
+        token_budget: params.token_budget,
+        usage_at_start,
         call_fn: params.call_fn,
         on_tool_round: params.on_tool_round,
         on_text_response: None,

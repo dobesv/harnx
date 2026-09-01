@@ -25,6 +25,8 @@ Options:
   -f, --file <FILE>                    Include files, directories, or URLs
   -S, --no-stream                      Turn off stream mode
       --final-only                     Print only the final response
+      --timeout-secs <SECONDS>         Set maximum invocation duration in seconds (0 or unset = no limit)
+      --token-budget <TOKENS>          Set maximum budgeted tokens for invocation (0 or unset = unlimited)
       --dry-run                        Display the message without sending it
       --info                           Display information
       --sync-models                    Sync models updates
@@ -63,6 +65,7 @@ harnx --macro macro1                           # Execute macro 'macro1'
 harnx --macro macro2 -- arg1 arg2              # Execute macro 'macro2' with args
 
 output=$(harnx prompt --final-only -- "$input") # Return only the final response
+harnx prompt --timeout-secs 30 --token-budget 100000 -- "Summarize system logs"
 cat prompt.txt | harnx prompt                    # Read the prompt from stdin
 
 harnx prompt -f a.png -f b.png diff images     # Use files
@@ -84,6 +87,48 @@ independently.
 `--final-only` suppresses the root heading, delegation status, and all other
 startup/progress output. On success, stdout contains only the final response,
 which makes the mode safe for command substitution and pipelines.
+
+## Bounding a One-Shot Run
+
+Non-interactive prompts (`harnx prompt` or `harnx -- <text>`) can set per-invocation execution limits using `--timeout-secs` and `--token-budget`. Interactive TUI sessions (`harnx`) and Web UI runs are unbounded by design.
+
+- `--timeout-secs <SECONDS>`: Maximum execution time in seconds. Passing `0` or omitting the option means no time limit.
+- `--token-budget <TOKENS>`: Maximum budgeted tokens for the invocation. Passing `0` or omitting the option means unlimited tokens.
+
+### Limit Exhaustion Behavior
+
+When a non-interactive invocation reaches either limit:
+1. The active turn is hard-cancelled through the background cancellation path.
+2. Harnx writes a synthesized human-readable explanation to `stdout`.
+3. Harnx writes a single compact JSON line to `stderr`.
+4. The process exits with code **2** (distinct from generic error exit code 1).
+
+If `--final-only` is active, normal startup headers and progress lines are suppressed, but on limit exhaustion Harnx still prints the synthesized text to `stdout` and the JSON line to `stderr`.
+
+### Stderr JSON Interface
+
+The single stderr JSON line provides a stable, machine-readable contract for downstream scripts and tooling:
+
+```json
+{"kind":"timeout","session_id":"01948a3f-7b1c-7123-8901-abcdef123456","usage":{"input_uncached":120,"cache_write":0,"output":45,"budgeted":165},"thinking_excerpt":null,"retry_hint":"You can retry by sending a new message to the same session id `01948a3f-7b1c-7123-8901-abcdef123456` with revised or narrower instructions."}
+```
+
+Field reference:
+- `kind`: `"timeout"` or `"budget_exceeded"`.
+- `session_id`: Session ID of the cancelled turn. Pass this ID on a subsequent prompt command to retry in the same session.
+- `usage`: Object containing token metrics for the cancelled turn:
+  - `input_uncached`: Uncached input tokens.
+  - `cache_write`: Tokens written to prompt cache.
+  - `output`: Output tokens generated.
+  - `budgeted`: Budget metric: `(input_tokens - cached_tokens) + output_tokens`. Excludes prompt cache reads.
+- `thinking_excerpt`: String containing captured thinking text prior to cancellation, or `null` if none was captured.
+- `retry_hint`: Human-readable text explaining how to retry the session.
+
+### Execution & Limitation Details
+
+- **Budget metric & scope**: Token budget applies per invocation as a fresh delta. Each retry starts with a clean budget allowance. Workers evaluate token usage at turn boundaries before calling the model, so at least one model call executes when `token_budget > 0`.
+- **Caller-side timeout vs worker-side budget**: `--timeout-secs` is enforced on the caller side. If the CLI process disconnects or terminates unexpectedly, the caller-side timeout timer stops, leaving any detached worker running. In contrast, `--token-budget` is enforced worker-side before model calls, bounding costs even if a worker becomes orphaned.
+- **Thinking excerpt limitation**: Non-streaming model calls do not yield partial thinking text during an active request. A mid-call timeout on a non-streaming request produces an empty thinking excerpt ("none captured"). Budget exhaustion triggers at turn boundaries and can include thinking text when streaming is enabled.
 
 ## Shell Integration
 

@@ -1,16 +1,17 @@
 //! NATS toolset for nested sub-agent sessions.
 
+mod termination;
+
 use super::subagent_progress::SubagentProgressReporter;
 use super::{publish_control_command, ControlCommand};
 use crate::nats_event_sink::NatsEventSink;
 use crate::nats_session::{NatsSession, NatsSessionConfig, NatsTurnResult};
 use crate::nats_session_log::NatsSessionLog;
 use crate::nats_worker::SessionActivationRoute;
+use crate::SynthesizedResult;
 use async_nats::jetstream;
 use async_trait::async_trait;
-use harnx_core::event::{
-    AgentEvent, AgentSource, SubAgentProgress, SubAgentProgressStatus, TurnEvent,
-};
+use harnx_core::event::{AgentEvent, AgentSource, SubAgentProgress, TurnEvent};
 use harnx_core::package_namespace::sanitize_for_tool_name;
 use harnx_core::session::SessionLogEntry;
 use harnx_toolset::{
@@ -20,7 +21,6 @@ use harnx_toolset::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 // `_session_new` has no arguments, so a fixed bootstrap message creates the
@@ -110,60 +110,9 @@ impl SubagentToolset {
 
     async fn run_prompt(
         &self,
-        message: &str,
-        session_id: Option<String>,
-        parent_session_id: Option<String>,
-        cancel: CancellationToken,
+        params: termination::PromptParams<'_>,
     ) -> Result<CompletedSubagentTurn, ToolInvokeError> {
-        let session = self.create_session(session_id).await?;
-        let child_session_id = session.session_id().to_string();
-        let reporter = self
-            .start_progress_reporter(&child_session_id, parent_session_id)
-            .await?;
-        let sink = reporter.sink();
-        let (cancel_tx, cancel_rx) = mpsc::channel(1);
-        let run_turn = session.run_turn(message, sink, Some(cancel_rx));
-        tokio::pin!(run_turn);
-
-        let turn = tokio::select! {
-            result = &mut run_turn => {
-                result.map_err(|error| {
-                    ToolInvokeError::Recoverable(format!("run sub-agent turn: {error:#}"))
-                })
-            }
-            _ = cancel.cancelled() => {
-                let _ = cancel_tx.send(()).await;
-                let _ = (&mut run_turn).await;
-                Err(ToolInvokeError::Fatal(
-                    "sub-agent tool call aborted".to_string(),
-                ))
-            }
-        };
-
-        let result = match turn {
-            Ok(result) => result,
-            Err(error) => {
-                if let Err(report_error) = reporter.finish(SubAgentProgressStatus::Failed).await {
-                    log::debug!("failed to publish terminal sub-agent progress: {report_error:#}");
-                }
-                return Err(error);
-            }
-        };
-        let cancelled = result.was_cancelled || self.turn_has_cancel(&result).await;
-        let status = if subagent_turn_failed(&result, cancelled) {
-            SubAgentProgressStatus::Failed
-        } else {
-            SubAgentProgressStatus::Done
-        };
-        let progress = reporter.finish(status).await.map_err(|error| {
-            ToolInvokeError::Recoverable(format!("publish terminal sub-agent progress: {error:#}"))
-        })?;
-        if cancelled {
-            return Err(ToolInvokeError::Recoverable(
-                "sub-agent turn was cancelled".to_string(),
-            ));
-        }
-        Ok(CompletedSubagentTurn { result, progress })
+        termination::run_prompt(self, params).await
     }
 
     async fn start_progress_reporter(
@@ -240,12 +189,14 @@ impl SubagentToolset {
     ) -> Result<Value, ToolInvokeError> {
         let args: NewSessionArgs = parse_args(SUBAGENT_SESSION_NEW_TOOL, args)?;
         let result = self
-            .run_prompt(
-                SESSION_NEW_INITIAL_PROMPT,
-                None,
-                args.parent_session_id,
+            .run_prompt(termination::PromptParams {
+                message: SESSION_NEW_INITIAL_PROMPT,
+                session_id: None,
+                parent_session_id: args.parent_session_id,
+                timeout_secs: None,
+                token_budget: None,
                 cancel,
-            )
+            })
             .await?;
         self.turn_result_value(&result)
     }
@@ -262,12 +213,14 @@ impl SubagentToolset {
             ));
         }
         let result = self
-            .run_prompt(
-                &args.message,
-                normalize_session_id(args.session_id),
-                args.parent_session_id,
+            .run_prompt(termination::PromptParams {
+                message: &args.message,
+                session_id: normalize_session_id(args.session_id),
+                parent_session_id: args.parent_session_id,
+                timeout_secs: args.timeout_secs,
+                token_budget: args.token_budget,
                 cancel,
-            )
+            })
             .await?;
         self.turn_result_value(&result)
     }
@@ -276,18 +229,7 @@ impl SubagentToolset {
         &self,
         completed: &CompletedSubagentTurn,
     ) -> Result<Value, ToolInvokeError> {
-        let response = require_response(&completed.result)?;
-        let source = AgentSource {
-            agent: self.agent.clone(),
-            session_id: Some(completed.result.session_id.clone()),
-            model: None,
-        };
-        Ok(json!({
-            "session_id": completed.result.session_id,
-            "response": response,
-            "sub_agent": source,
-            "sub_agent_progress": completed.progress,
-        }))
+        termination::result_value(self, completed)
     }
 
     async fn session_load(&self, args: Value) -> Result<Value, ToolInvokeError> {
@@ -319,8 +261,10 @@ impl SubagentToolset {
 }
 
 struct CompletedSubagentTurn {
-    result: NatsTurnResult,
+    session_id: String,
+    result: Option<NatsTurnResult>,
     progress: SubAgentProgress,
+    termination: Option<SynthesizedResult>,
 }
 
 fn subagent_turn_failed(result: &NatsTurnResult, cancelled: bool) -> bool {
@@ -374,6 +318,10 @@ struct PromptArgs {
     message: String,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[serde(default)]
+    token_budget: Option<u64>,
     #[serde(default, rename = "__harnx_parent_session_id")]
     parent_session_id: Option<String>,
 }
@@ -458,6 +406,14 @@ fn session_prompt_spec(agent: &str, display_name: &str) -> ToolSpec {
                 "session_id": {
                     "type": "string",
                     "description": "To continue a conversation, use the exact session ID returned by session_prompt or session_new"
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Maximum invocation duration in seconds; 0 or unset means no time limit"
+                },
+                "token_budget": {
+                    "type": "integer",
+                    "description": "Maximum budgeted tokens for this invocation; 0 or unset means unlimited"
                 }
             },
             "required": ["message"]
@@ -557,6 +513,24 @@ mod tests {
             json!({ "type": "object", "properties": {} })
         );
         assert_eq!(tools[1].input_schema["required"], json!(["message"]));
+        assert_eq!(
+            tools[1].input_schema["properties"]["timeout_secs"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            tools[1].input_schema["properties"]["token_budget"]["type"],
+            "integer"
+        );
+        assert!(
+            tools[1].input_schema["properties"]["timeout_secs"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("seconds"))
+        );
+        assert!(
+            tools[1].input_schema["properties"]["token_budget"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("unlimited"))
+        );
         assert_eq!(tools[2].input_schema["required"], json!(["session_id"]));
         assert_eq!(tools[3].input_schema["required"], json!(["session_id"]));
         assert_eq!(tools[0].timeout_secs, Some(0));
