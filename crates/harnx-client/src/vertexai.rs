@@ -233,11 +233,12 @@ fn gemini_handle_stream_chunk(handler: &mut SseHandler, data: &Value) -> Result<
     {
         bail!("Blocked due to safety")
     }
-    handler.set_usage(
-        data["usageMetadata"]["promptTokenCount"].as_u64(),
-        data["usageMetadata"]["candidatesTokenCount"].as_u64(),
-        data["usageMetadata"]["cachedContentTokenCount"].as_u64(),
-    );
+    handler.set_usage(StreamingUsage {
+        input_tokens: data["usageMetadata"]["promptTokenCount"].as_u64(),
+        output_tokens: data["usageMetadata"]["candidatesTokenCount"].as_u64(),
+        cached_tokens: data["usageMetadata"]["cachedContentTokenCount"].as_u64(),
+        cache_write_tokens: Some(0),
+    });
 
     Ok(())
 }
@@ -355,6 +356,7 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
         input_tokens: data["usageMetadata"]["promptTokenCount"].as_u64(),
         output_tokens: data["usageMetadata"]["candidatesTokenCount"].as_u64(),
         cached_tokens: data["usageMetadata"]["cachedContentTokenCount"].as_u64(),
+        cache_write_tokens: Some(0),
     };
     Ok(output)
 }
@@ -696,6 +698,57 @@ fn content_has_function_response(content: &serde_json::Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    fn assert_output_usage(actual: &ChatCompletionsOutput, expected: &CompletionTokenUsage) {
+        assert_eq!(
+            (
+                actual.input_tokens,
+                actual.output_tokens,
+                actual.cached_tokens,
+                actual.cache_write_tokens,
+            ),
+            (
+                Some(expected.input_tokens),
+                Some(expected.output_tokens),
+                Some(expected.cached_tokens),
+                Some(expected.cache_write_tokens),
+            )
+        );
+        assert!(expected.input_tokens >= expected.cached_tokens + expected.cache_write_tokens);
+    }
+
+    fn assert_usage(actual: &CompletionTokenUsage, expected: &CompletionTokenUsage) {
+        assert_eq!(actual, expected);
+        assert!(actual.input_tokens >= actual.cached_tokens + actual.cache_write_tokens);
+    }
+
+    #[test]
+    fn gemini_usage_keeps_cache_read_as_subset_on_both_paths() {
+        let response = json!({
+            "candidates": [{"content": {"parts": [{"text": "Hello"}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 10,
+                "cachedContentTokenCount": 30
+            }
+        });
+        let output = gemini_extract_chat_completions_text(&response)
+            .expect("non-streaming Gemini response should parse");
+        let expected = CompletionTokenUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            cached_tokens: 30,
+            cache_write_tokens: 0,
+        };
+        assert_output_usage(&output, &expected);
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        gemini_handle_stream_chunk(&mut handler, &response)
+            .expect("streaming Gemini chunk should parse");
+        let (_, _, _, usage) = handler.take();
+        assert_usage(&usage, &expected);
+    }
+
     #[test]
     fn gemini_serializer_appends_tool_images_after_function_responses() {
         let mut first_tool_call = ToolCall::new(

@@ -207,7 +207,7 @@ Cross-process live synchronization and durable session persistence use NATS.
 | `Session::LogSeqAssigned` | dropped | Persistence bookkeeping for local transcript patching; not useful on AG-UI wire. |
 | `Plan { entries }` | `CUSTOM` | Name: `plan`. Carries serialized plan entries for plan/todo panels. |
 | `Status(StatusLine)` | dropped | Spinner/status chatter is high-frequency and not durable transcript structure, so server keeps it off wire. |
-| `Model::Usage` | `CUSTOM` | Name: `usage`. Carries input/output/cached/session label for token-cost displays. |
+| `Model::Usage` | `CUSTOM` | Name: `usage`. Carries input/output/cached/cache-write/session label for token-cost displays. |
 | `Notice::Error` / `Model::Error` | `RUN_ERROR` | Terminal user-visible error path. |
 
 Intentionally dropped today:

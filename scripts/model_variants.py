@@ -105,11 +105,13 @@ def _variant_from_base(
         "max_input_tokens",
         "input_price",
         "output_price",
+        "cache_read_price",
+        "cache_write_price",
         "supports_vision",
         "supports_tool_use",
         "endpoint",
     ):
-        if field in base_model:
+        if field in base_model and field not in variant:
             variant[field] = base_model[field]
     return variant
 

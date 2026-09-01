@@ -72,6 +72,7 @@ pub enum ModelEvent {
         input: u64,
         output: u64,
         cached: u64,
+        cache_write: u64,
         session_label: Option<String>,
     },
 }

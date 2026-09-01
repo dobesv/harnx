@@ -6,6 +6,7 @@ use crate::utils::{warning_text, AbortSignal};
 use anyhow::Result;
 use std::sync::Arc;
 
+use harnx_core::model::Model;
 use harnx_engine::retry::{CallFuture, TurnContext};
 
 pub use harnx_core::retry_config::ModelCooldownMap;
@@ -49,6 +50,43 @@ fn build_turn_context(config: &GlobalConfig) -> TurnContext {
         // installed `MockClient`.
         init_client_fn: Arc::new(super::init_client),
         select_model_fn: Arc::new(|input, model| input.agent.set_model(model.clone())),
+    }
+}
+
+fn record_llm_metrics(agent_name: &str, model: &Model, usage: &CompletionTokenUsage) {
+    let client_name = model.client_name().to_owned();
+    let model_name = model.name().to_owned();
+
+    // Token/cost metrics are recorded once at the retry wrapper, NOT at
+    // ModelEvent::Usage/Final (double-count: tool loops emit multiple Usage;
+    // Final duplicates the terminal call). This seam sees the correct agent,
+    // fallback-corrected model, and prices for every call including sub-agents.
+    for (usage_type, tokens) in [
+        ("input", usage.input_tokens),
+        ("output", usage.output_tokens),
+        ("cached", usage.cached_tokens),
+        ("cache_read", usage.cached_tokens),
+        ("cache_write", usage.cache_write_tokens),
+    ] {
+        metrics::counter!(
+            harnx_metrics::LLM_TOKENS_TOTAL,
+            "agent" => agent_name.to_owned(),
+            "client" => client_name.clone(),
+            "model" => model_name.clone(),
+            "type" => usage_type,
+        )
+        .increment(tokens);
+    }
+
+    if let Some(cost) = model.cost_usd(usage) {
+        // Counter increments accept only u64, so cumulative f64 cost is a monotonic gauge.
+        metrics::gauge!(
+            harnx_metrics::LLM_COST_DOLLARS,
+            "agent" => agent_name.to_owned(),
+            "client" => client_name,
+            "model" => model_name,
+        )
+        .increment(cost);
     }
 }
 
@@ -115,52 +153,7 @@ where
     .await?;
 
     let agent = input.agent();
-    let model = agent.model();
-    let agent_name = agent.name().to_owned();
-    let client_name = model.client_name().to_owned();
-    let model_name = model.name().to_owned();
-    let usage = &result.3;
-
-    // Token/cost recording: record ONCE here after the retry wrapper returns.
-    // Do NOT add recording at ModelEvent::Usage/Final (double-count: tool loops emit
-    // multiple Usage; Final duplicates the terminal call) or via GlobalConfig (wrong
-    // agent/model for fallback/title/compaction). This seam sees the correct agent,
-    // fallback-corrected model, and prices for every chat-completion call including
-    // sub-agents and title/compaction.
-    metrics::counter!(
-        harnx_metrics::LLM_TOKENS_TOTAL,
-        "agent" => agent_name.clone(),
-        "client" => client_name.clone(),
-        "model" => model_name.clone(),
-        "type" => "input",
-    )
-    .increment(usage.input_tokens);
-    metrics::counter!(
-        harnx_metrics::LLM_TOKENS_TOTAL,
-        "agent" => agent_name.clone(),
-        "client" => client_name.clone(),
-        "model" => model_name.clone(),
-        "type" => "output",
-    )
-    .increment(usage.output_tokens);
-    metrics::counter!(
-        harnx_metrics::LLM_TOKENS_TOTAL,
-        "agent" => agent_name.clone(),
-        "client" => client_name.clone(),
-        "model" => model_name.clone(),
-        "type" => "cached",
-    )
-    .increment(usage.cached_tokens);
-    if let Some(cost) = model.cost_usd(usage.input_tokens, usage.output_tokens) {
-        // metrics::Counter::increment accepts only u64, so cumulative f64 dollar cost is a monotonic gauge.
-        metrics::gauge!(
-            harnx_metrics::LLM_COST_DOLLARS,
-            "agent" => agent_name.clone(),
-            "client" => client_name.clone(),
-            "model" => model_name.clone(),
-        )
-        .increment(cost);
-    }
+    record_llm_metrics(agent.name(), agent.model(), &result.3);
 
     Ok(result)
 }

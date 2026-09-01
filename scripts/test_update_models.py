@@ -130,6 +130,17 @@ class TestThinkingVariant(unittest.TestCase):
         self.assertEqual(len(variant["patches"]), 1)
         self.assertIn('budget_tokens":16000', variant["patches"][0])
 
+    def test_real_name_alias_inherits_base_cache_prices(self) -> None:
+        base = self._base_claude_model()
+        base["cache_read_price"] = 0.5
+        base["cache_write_price"] = 6.25
+
+        alias = um.thinking_variants(base, "claude")[0]
+
+        self.assertEqual(alias["real_name"], base["name"])
+        self.assertEqual(alias["cache_read_price"], base["cache_read_price"])
+        self.assertEqual(alias["cache_write_price"], base["cache_write_price"])
+
     def test_thinking_variant_preserves_supports_tool_use(self) -> None:
         variant = um.thinking_variants(self._base_claude_model(), "claude")[0]
         self.assertTrue(variant.get("supports_tool_use"))
@@ -315,6 +326,24 @@ class TestShouldSkipModel(unittest.TestCase):
         payload = {"max_input_tokens": 128000, "mode": "chat"}
         self.assertFalse(um.should_skip_model(self.TODAY, payload))
 
+    def test_model_with_only_cache_pricing_not_skipped(self) -> None:
+        for field in (
+            "cache_read_input_token_cost",
+            "cache_creation_input_token_cost",
+        ):
+            with self.subTest(field=field):
+                self.assertFalse(
+                    um.should_skip_model(self.TODAY, {field: 0.0000003})
+                )
+
+    def test_model_with_only_zero_cache_prices_not_skipped(self) -> None:
+        payload = {
+            "cache_read_input_token_cost": 0.0,
+            "cache_creation_input_token_cost": 0.0,
+        }
+
+        self.assertFalse(um.should_skip_model(self.TODAY, payload))
+
 
 class TestProviderPrefixParsing(unittest.TestCase):
     def test_standard_format_parsed(self) -> None:
@@ -387,6 +416,30 @@ class TestBuildModelFromLiteLLM(unittest.TestCase):
         self.assertAlmostEqual(m["input_price"], 2.5, places=4)
         self.assertAlmostEqual(m["output_price"], 10.0, places=4)
 
+    def test_cache_pricing_uses_scaled_base_rates(self) -> None:
+        m = um.build_model_from_litellm(
+            "test",
+            self._chat_payload(
+                cache_read_input_token_cost=0.0000003,
+                cache_creation_input_token_cost=0.00000375,
+                cache_read_input_token_cost_above_200k_tokens=0.0000006,
+                cache_creation_input_token_cost_above_1hr=0.000006,
+            ),
+            "chat",
+        )
+        self.assertAlmostEqual(m["cache_read_price"], 0.3, places=4)
+        self.assertAlmostEqual(m["cache_write_price"], 3.75, places=4)
+
+    def test_cache_pricing_omitted_for_non_chat_models(self) -> None:
+        payload = {
+            "input_cost_per_token": 0.00000002,
+            "cache_read_input_token_cost": 0.00000001,
+            "cache_creation_input_token_cost": 0.00000003,
+        }
+        m = um.build_model_from_litellm("embed-test", payload, "embedding")
+        self.assertNotIn("cache_read_price", m)
+        self.assertNotIn("cache_write_price", m)
+
     def test_supports_vision_mapped(self) -> None:
         m = um.build_model_from_litellm("test", self._chat_payload(supports_vision=True), "chat")
         self.assertTrue(m["supports_vision"])
@@ -420,6 +473,29 @@ class TestBuildModelFromLiteLLM(unittest.TestCase):
         m = um.build_model_from_litellm("test", payload, "chat")
         self.assertNotIn("input_price", m)
         self.assertNotIn("output_price", m)
+        self.assertNotIn("cache_read_price", m)
+        self.assertNotIn("cache_write_price", m)
+
+    def test_cache_prices_follow_output_price_in_field_order(self) -> None:
+        ordered = um.ordered_model(
+            {
+                "name": "test",
+                "supports_vision": True,
+                "cache_write_price": 3.75,
+                "output_price": 15,
+                "cache_read_price": 0.3,
+            }
+        )
+        self.assertEqual(
+            list(ordered),
+            [
+                "name",
+                "output_price",
+                "cache_read_price",
+                "cache_write_price",
+                "supports_vision",
+            ],
+        )
 
 
 class TestMergeOldFields(unittest.TestCase):

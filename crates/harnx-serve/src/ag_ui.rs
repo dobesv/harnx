@@ -8,6 +8,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::ag_ui_sync::{history_warning_event, pending_user_prompt, wire_message_id};
+use crate::ag_ui_usage::UsagePayloadInput;
 use crate::session_actor::{
     PromptResult, SessionCommand, SessionHandle, SessionInfo, SessionRegistry, SubscribeResult,
 };
@@ -473,33 +474,10 @@ impl AgUiSink {
         }));
     }
 
-    fn session_usage_context(&self) -> Option<UsageContextSnapshot> {
+    pub(super) fn session_usage_context(&self) -> Option<UsageContextSnapshot> {
         self.session_context
             .as_ref()
             .and_then(|session_context| session_context())
-    }
-
-    fn build_usage_payload(
-        &self,
-        input: u64,
-        output: u64,
-        cached: u64,
-        session_label: Option<String>,
-    ) -> serde_json::Value {
-        let mut payload = json!({
-            "input": input,
-            "output": output,
-            "cached": cached,
-            "session_label": session_label,
-        });
-        if let Some(context) = self.session_usage_context() {
-            payload["context_tokens"] = json!(context.context_tokens);
-            payload["max_context_tokens"] = json!(context.max_context_tokens);
-            if let Some(percent) = context.context_percent {
-                payload["context_percent"] = json!(percent);
-            }
-        }
-        payload
     }
 
     fn emit_tool_summary(&self, tool_call_id: String, markdown: String) {
@@ -589,10 +567,17 @@ impl AgUiSink {
                 input,
                 output,
                 cached,
+                cache_write,
                 session_label,
             } => self.emit_custom(
                 "usage",
-                self.build_usage_payload(input, output, cached, session_label),
+                self.build_usage_payload(UsagePayloadInput {
+                    input,
+                    output,
+                    cached,
+                    cache_write,
+                    session_label,
+                }),
             ),
             ModelEvent::Error(message) => self.record_model_error(message, is_sub_agent),
         }

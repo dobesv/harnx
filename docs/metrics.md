@@ -37,7 +37,7 @@ All exported metrics use the `harnx_` prefix.
 
 | Metric Name | Type | Labels | Description | Binaries |
 |-------------|------|--------|-------------|----------|
-| `harnx_llm_tokens_total` | Counter | `agent`, `client`, `model`, `type` | Chat-completion token count (`type` is `input`, `output`, or `cached`). | `harnx-worker` |
+| `harnx_llm_tokens_total` | Counter | `agent`, `client`, `model`, `type` | Chat-completion token count (`type` is `input`, `output`, `cache_read`, `cache_write`, or deprecated alias `cached`). | `harnx-worker` |
 | `harnx_llm_cost_dollars` | Gauge | `agent`, `client`, `model` | Cumulative estimated LLM cost in USD. Monotonically increases over process lifetime. | `harnx-worker` |
 | `harnx_http_requests_total` | Counter | `method`, `route`, `status` | HTTP request count. `route` uses template patterns or static names. | HTTP servers (`harnx-serve`, `aws-creds`, `k8s-creds`, `proxy-auth`, rmcp `--http` servers) |
 | `harnx_http_request_duration_seconds` | Histogram | `method`, `route` | HTTP request latency histogram (buckets: 0.005s to 10s). | HTTP servers |
@@ -50,8 +50,9 @@ Histogram buckets for duration metrics use default boundaries: `[0.005, 0.01, 0.
 
 - **`client` label semantics**: The `client` label matches the configured client name (`model.client_name()`). This may be a package-qualified alias like `mypkg/openai` rather than a canonical backend name.
 - **Chat completions only**: Token usage and cost metrics apply exclusively to chat completions. Embeddings and reranker requests do not emit token metrics.
-- **Cost metric mechanics**: `harnx_llm_cost_dollars` is exported as a gauge because the underlying metrics facade does not support floating-point counters. It increases monotonically per process and is emitted only when both input and output unit prices are configured for the model.
-- **Cached token pricing**: Cost calculations currently exclude cached tokens. Cached token volume is tracked separately via `harnx_llm_tokens_total{type="cached"}`.
+- **Cost metric mechanics**: `harnx_llm_cost_dollars` is exported as a gauge because the underlying metrics facade does not support floating-point counters. It increases monotonically per process and is emitted only when required unit prices are configured for the model. If a request includes cached tokens (cache-read or cache-write) but the matching cache price is missing, the cost calculation returns `None` and the gauge is not incremented for that call.
+- **Cached token pricing**: Cost calculations include cache-read (`cache_read_price`) and cache-write (`cache_write_price`) pricing using a uniform formula: `(uncached_input × input_price + cache_read × cache_read_price + cache_write × cache_write_price + output × output_price) / 1,000,000`. `harnx_llm_tokens_total` emits `cache_read` and `cache_write` series in addition to `input` and `output`. The `cached` type is retained as a deprecated alias of `cache_read` for dashboard backward compatibility.
+- **Token counting semantics change**: `input_tokens` uses the OpenTelemetry subset convention, where `input_tokens` includes all cache tokens (`input_tokens >= cache_read + cache_write`). For Anthropic and Bedrock providers, `input_tokens` now includes cached tokens (previously Anthropic excluded cache-read tokens; Bedrock excluded cache-read and discarded cache-write). OpenAI and Gemini were already subset models and remain unchanged. Dashboards or queries that sum Anthropic or Bedrock `input_tokens` will reflect higher values than before.
 - **Cardinality protection**: Metrics omit `session_id` and raw dynamic URL paths to prevent cardinality explosion. HTTP route labels use matched path templates (such as `/token/{context}`) or fixed route identifiers (`proxy` for `harnx-proxy-auth`).
 
 ## Extending Metrics
@@ -98,6 +99,8 @@ Example output:
 # TYPE harnx_llm_tokens_total counter
 harnx_llm_tokens_total{agent="coding",client="openai",model="gpt-4o",type="input"} 1420
 harnx_llm_tokens_total{agent="coding",client="openai",model="gpt-4o",type="output"} 385
+harnx_llm_tokens_total{agent="coding",client="openai",model="gpt-4o",type="cache_read"} 512
+harnx_llm_tokens_total{agent="coding",client="openai",model="gpt-4o",type="cache_write"} 0
 harnx_llm_tokens_total{agent="coding",client="openai",model="gpt-4o",type="cached"} 512
 
 # HELP harnx_llm_cost_dollars Cumulative estimated LLM cost in USD
@@ -137,4 +140,3 @@ harnx_http_request_duration_seconds_count{method="GET",route="/v1/models"} 12
 ## Follow-ups
 
 - **Canonical provider label** ([#1592](https://github.com/dobesv/harnx/issues/1592)): Add a distinct `provider` label alongside `client` to reflect the underlying provider backend.
-- **Cached token cost calculation** ([#1568](https://github.com/dobesv/harnx/issues/1568)): Incorporate cached token discount rates into `harnx_llm_cost_dollars`.
