@@ -430,10 +430,15 @@ impl NatsSession {
         })
     }
 
-    async fn publish_activation(&self, user_msg_seq: u64) -> Result<()> {
+    async fn publish_activation(
+        &self,
+        user_msg_seq: u64,
+        tool_confirmation_subject: Option<&str>,
+    ) -> Result<()> {
         match &self.config.activation_route {
             SessionActivationRoute::ClusterShared => {
-                let activation = SessionActivate::new(&self.session_id);
+                let activation = SessionActivate::new(&self.session_id)
+                    .with_tool_confirmation_subject(tool_confirmation_subject);
                 publish_session_activate(&self.jetstream, &self.config.cluster, &activation)
                     .await
                     .context("failed to publish session activation")?;
@@ -443,7 +448,8 @@ impl NatsSession {
                 worker_id,
             } => {
                 let activation =
-                    SessionActivate::targeted(&self.session_id, user_msg_seq, worker_id);
+                    SessionActivate::targeted(&self.session_id, user_msg_seq, worker_id)
+                        .with_tool_confirmation_subject(tool_confirmation_subject);
                 publish_targeted_session_activate(
                     &self.jetstream,
                     LocalWorkerTarget::new(session_scope, worker_id)?,
@@ -485,7 +491,10 @@ impl NatsSession {
         let appended = self
             .append_user_content(MessageContent::Text(user_message.to_string()))
             .await?;
-        let activation_error = self.publish_activation(appended.user_msg_seq).await.err();
+        let activation_error = self
+            .publish_activation(appended.user_msg_seq, None)
+            .await
+            .err();
         Ok(DurableTextEnqueue {
             user_msg_seq: appended.user_msg_seq,
             activation_error,
@@ -515,7 +524,7 @@ impl NatsSession {
         if requested_seq_status(&entries, user_msg_seq)? == RequestedSeqStatus::Covered {
             return Ok(None);
         }
-        self.publish_activation(user_msg_seq).await?;
+        self.publish_activation(user_msg_seq, None).await?;
         Ok(Some(user_msg_seq))
     }
 
@@ -541,6 +550,25 @@ impl NatsSession {
             MessageContent::Text(user_message.to_string()),
             event_sink,
             pending_cancel,
+            None,
+        )
+        .await
+    }
+
+    /// Run a text turn while routing `PreToolUse` approval requests from the
+    /// worker to an interactive frontend.
+    pub async fn run_turn_with_tool_confirmation(
+        &self,
+        user_message: &str,
+        event_sink: Arc<dyn AgentEventSink>,
+        pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
+        handler: Arc<crate::nats_tool_confirmation::ToolConfirmationHandler>,
+    ) -> Result<NatsTurnResult> {
+        self.run_turn_content(
+            MessageContent::Text(user_message.to_string()),
+            event_sink,
+            pending_cancel,
+            Some(handler),
         )
         .await
     }
@@ -565,7 +593,32 @@ impl NatsSession {
             source_dir,
         )
         .await?;
-        self.run_turn_content(content, event_sink, pending_cancel)
+        self.run_turn_content(content, event_sink, pending_cancel, None)
+            .await
+    }
+
+    /// Run a turn from a composed input while routing `PreToolUse` approval
+    /// requests from the worker to an interactive frontend.
+    pub async fn run_turn_input_with_tool_confirmation(
+        &self,
+        input: &crate::config::Input,
+        source_dir: Option<&std::path::Path>,
+        event_sink: Arc<dyn AgentEventSink>,
+        pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
+        handler: Arc<crate::nats_tool_confirmation::ToolConfirmationHandler>,
+    ) -> Result<NatsTurnResult> {
+        let mut content = input.message_content();
+        crate::nats_attachments::externalize_message_attachments(
+            crate::nats_attachments::AttachmentLocation::new(
+                &self.jetstream,
+                self.attachment_replicas,
+                &self.session_id,
+            ),
+            &mut content,
+            source_dir,
+        )
+        .await?;
+        self.run_turn_content(content, event_sink, pending_cancel, Some(handler))
             .await
     }
 
@@ -574,6 +627,9 @@ impl NatsSession {
         content: MessageContent,
         event_sink: Arc<dyn AgentEventSink>,
         pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
+        tool_confirmation_handler: Option<
+            Arc<crate::nats_tool_confirmation::ToolConfirmationHandler>,
+        >,
     ) -> Result<NatsTurnResult> {
         // Step 1: Append user message to durable log BEFORE activating.
         // The worker derives input from the last user message.
@@ -607,8 +663,26 @@ impl NatsSession {
         // loading path. Replaying it on every newly-created per-turn session
         // duplicates all prior messages in interactive and continued sessions.
 
-        // Step 3: Publish activation to wake a worker.
-        self.publish_activation(user_msg_seq).await?;
+        // Step 3: Subscribe the interactive frontend before publishing the
+        // activation so a fast worker cannot observe an `ask` decision before
+        // the confirmation bridge is ready.
+        let confirmation_subject = tool_confirmation_handler
+            .as_ref()
+            .map(|_| self.client.new_inbox());
+        let _confirmation_responder =
+            match (confirmation_subject.as_ref(), tool_confirmation_handler) {
+                (Some(subject), Some(handler)) => Some(
+                    crate::nats_tool_confirmation::ToolConfirmationResponder::start(
+                        self.client.clone(),
+                        subject.clone(),
+                        handler,
+                    )
+                    .await?,
+                ),
+                _ => None,
+            };
+        self.publish_activation(user_msg_seq, confirmation_subject.as_deref())
+            .await?;
 
         // Step 4: Stream events and handle control until turn completion.
         let mut event_stream = event_stream;

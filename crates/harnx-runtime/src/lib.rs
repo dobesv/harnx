@@ -28,6 +28,7 @@ pub mod nats_metrics;
 pub mod nats_session;
 pub mod nats_session_log;
 pub mod nats_session_metadata;
+pub mod nats_tool_confirmation;
 pub mod nats_tool_provider;
 pub mod nats_worker;
 pub mod remote_session_cleanup;

@@ -28,6 +28,18 @@ pub(super) struct PromptTaskContext {
     pub(super) event_tx: mpsc::UnboundedSender<TuiEvent>,
 }
 
+async fn run_nats_turn_with_tui_confirmation(
+    session: &NatsSession,
+    input: &harnx_runtime::config::Input,
+    sink: Arc<dyn harnx_core::event::AgentEventSink>,
+    event_tx: mpsc::UnboundedSender<TuiEvent>,
+) -> Result<harnx_runtime::nats_session::NatsTurnResult> {
+    let handler = crate::lifecycle::nats_tool_confirmation_handler(event_tx);
+    session
+        .run_turn_input_with_tool_confirmation(input, None, sink, None, handler)
+        .await
+}
+
 #[cfg(test)]
 fn test_tool_round_callback(ctx: &PromptTaskContext) -> harnx_runtime::OnToolRoundFn {
     let event_tx = ctx.event_tx.clone();
@@ -416,7 +428,9 @@ impl Tui {
         .await
         .context("failed to create NATS session")?;
 
-        let result = session.run_turn_input(&input, None, sink, None).await?;
+        let result =
+            run_nats_turn_with_tui_confirmation(&session, &input, sink, ctx.event_tx.clone())
+                .await?;
         harnx_runtime::commands::update_last_message_after_nats_turn(&ctx.config, input, &result);
         log::info!(
             "prompt completed: cluster={} session_id={} cancelled={}",

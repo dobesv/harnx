@@ -42,6 +42,15 @@ impl WorkerRuntime {
             let base = self.config.read().clone();
             Arc::new(parking_lot::RwLock::new(base))
         };
+        if let Some(subject) = activation.tool_confirmation_subject.as_ref() {
+            let confirm = crate::nats_tool_confirmation::nats_confirm_tool_use(
+                self.client.clone(),
+                subject.clone(),
+                activation.session_id.clone(),
+                abort_signal.clone(),
+            );
+            per_session.write().set_tui_confirm_tool_use(Some(confirm));
+        }
         let agent_setup = super::daemon::install_session_metadata_agent(&per_session, &metadata);
 
         // Create event sink for live fan-out. `new` seeds `after_seq` from stream once.
@@ -173,6 +182,16 @@ impl WorkerRuntime {
                 }
 
                 Self::record_session_turn_end(&backend, &lease, turn_cursor_val).await?;
+
+                // The confirmation subject belongs to the frontend request
+                // that published this activation. A queued continuation may
+                // run after that frontend has returned and dropped its
+                // responder, so it must not retain the stale callback. A new
+                // interactive request publishes its own activation and
+                // turn-scoped subject.
+                if activation.tool_confirmation_subject.is_some() {
+                    per_session.write().set_tui_confirm_tool_use(None);
+                }
 
                 log::info!(
                     "execute_session turn complete: session_id={} turn_cursor={} activation_high_water={:?}",

@@ -748,33 +748,11 @@ impl Tui {
                 self.pin_transcript_to_bottom();
                 self.refresh_input_chrome();
             }
-            TuiEvent::ConfirmToolUse {
-                tool_name,
-                input_preview,
-                reason,
-                reply,
-            } => {
-                // A blocked tool-eval thread is waiting on `reply`. Show the
-                // native modal and remember the channel; answering the modal
-                // (handle_modal_key) sends the decision back.
-                self.app.pending_confirm_reply = Some(reply);
-                self.app.modal = Some(crate::types::ModalState::ConfirmToolUse {
-                    tool_name,
-                    input_preview,
-                    reason,
-                });
+            TuiEvent::ToolConfirmation(event) => {
+                self.handle_tool_confirmation_event(event);
             }
         }
         Ok(())
-    }
-
-    /// Resolve an in-flight tool-use confirmation: send the decision to the
-    /// blocked tool-eval thread and dismiss the modal.
-    fn resolve_tool_confirm(&mut self, allow: bool) {
-        if let Some(reply) = self.app.pending_confirm_reply.take() {
-            let _ = reply.send(allow);
-        }
-        self.app.modal = None;
     }
 
     #[cfg(test)]

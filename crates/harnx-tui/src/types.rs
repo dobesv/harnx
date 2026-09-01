@@ -141,6 +141,9 @@ pub(super) struct App {
     /// `ModalState::ConfirmToolUse`; the blocked tool-eval thread waits on the
     /// receiver, and answering the modal sends the decision here.
     pub(super) pending_confirm_reply: Option<std::sync::mpsc::Sender<bool>>,
+    /// Identity of `pending_confirm_reply`. Remote handlers use it to dismiss
+    /// only their own modal when a turn is cancelled or times out.
+    pub(super) pending_confirm_id: Option<u64>,
     pub(super) detail_view_scroll: ratatui_widget_scrolling::ScrollState,
     pub(super) detail_view_open: bool,
     pub(super) detail_view_text: Option<String>,
@@ -464,6 +467,21 @@ impl App {
     }
 }
 
+pub(crate) enum ToolConfirmationEvent {
+    /// A `PreToolUse` hook asked for confirmation. The blocked tool-eval thread
+    /// waits on `reply`; the main loop shows a modal and sends the decision back.
+    Show {
+        confirmation_id: u64,
+        tool_name: String,
+        input_preview: String,
+        reason: Option<String>,
+        reply: std::sync::mpsc::Sender<bool>,
+    },
+    /// The remote request stopped waiting. Dismiss the matching modal without
+    /// disturbing a newer confirmation or another modal.
+    Dismiss { confirmation_id: u64 },
+}
+
 pub(crate) enum TuiEvent {
     Agent(harnx_core::event::AgentEvent),
     /// The locally-owned prompt task has exited. `Turn::Ended` normally closes
@@ -501,12 +519,5 @@ pub(crate) enum TuiEvent {
     /// Prompt task consumed pending message; retained for queued-message tests.
     #[allow(dead_code)]
     PendingMessageConsumed(PendingMessage),
-    /// A `PreToolUse` hook asked for confirmation. The blocked tool-eval thread
-    /// waits on `reply`; the main loop shows a modal and sends the decision back.
-    ConfirmToolUse {
-        tool_name: String,
-        input_preview: String,
-        reason: Option<String>,
-        reply: std::sync::mpsc::Sender<bool>,
-    },
+    ToolConfirmation(ToolConfirmationEvent),
 }
