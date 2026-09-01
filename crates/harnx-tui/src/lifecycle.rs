@@ -743,6 +743,9 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
                                     )
                                 },
                             );
+                            if let Some(item) = subagent_reply_item_from_output(&r.output) {
+                                items.push(item);
+                            }
                             items.push(TranscriptItem::SubAgentSession {
                                 key,
                                 status,
@@ -778,6 +781,24 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
         }
     }
     items
+}
+
+pub(crate) fn subagent_response_from_output(output: &serde_json::Value) -> Option<&str> {
+    output.get("response").and_then(|r| r.as_str())
+}
+
+pub(crate) fn subagent_reply_item_from_output(
+    output: &serde_json::Value,
+) -> Option<TranscriptItem> {
+    let response = subagent_response_from_output(output)?;
+    let trimmed = response.trim_end_matches('\n');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(TranscriptItem::ToolResultMarkdown {
+        text: crate::strip_ansi(trimmed).to_string(),
+        rendered_cache: None,
+    })
 }
 
 pub(crate) fn subagent_key_from_output(
@@ -1379,9 +1400,24 @@ mod tests {
 
         let items =
             messages_to_transcript_items_for_cluster(&messages, &HashMap::new(), Some("remote"));
-        assert_eq!(items.len(), 2, "tool call plus compact child row only");
+        assert_eq!(
+            items.len(),
+            3,
+            "tool call, result body, and compact child row"
+        );
+
+        // Check ToolCall
+        assert!(matches!(&items[0], TranscriptItem::ToolCall { .. }));
+
+        // Check ToolResultMarkdown
         assert!(matches!(
             &items[1],
+            TranscriptItem::ToolResultMarkdown { text, .. } if text == "child response"
+        ));
+
+        // Check SubAgentSession
+        assert!(matches!(
+            &items[2],
             TranscriptItem::SubAgentSession {
                 key,
                 status: crate::types::SubAgentStatus::Completed,
@@ -1391,8 +1427,33 @@ mod tests {
                     && key.agent == "researcher"
                     && key.session_id == "child-session"
         ));
-        assert!(items
-            .iter()
-            .all(|item| !matches!(item, TranscriptItem::ToolResultMarkdown { .. })));
+    }
+
+    #[test]
+    fn test_subagent_response_from_output() {
+        let output = json!({
+            "response": "the reply text",
+            "sub_agent": {
+                "agent": "researcher",
+                "session_id": "child-session"
+            }
+        });
+        assert_eq!(
+            super::subagent_response_from_output(&output),
+            Some("the reply text")
+        );
+
+        let missing = json!({
+            "sub_agent": {
+                "agent": "researcher",
+                "session_id": "child-session"
+            }
+        });
+        assert_eq!(super::subagent_response_from_output(&missing), None);
+
+        let wrong_type = json!({
+            "response": {"not": "string"}
+        });
+        assert_eq!(super::subagent_response_from_output(&wrong_type), None);
     }
 }
