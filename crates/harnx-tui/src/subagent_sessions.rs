@@ -255,14 +255,21 @@ impl Tui {
                 true
             }
             AgentEvent::Tool(ToolEvent::Completed { output, .. }) => {
-                if let Some(progress) = subagent_progress_from_output(output) {
-                    self.record_subagent_progress(parent, progress);
-                    return true;
-                }
+                let progress = subagent_progress_from_output(output);
                 let Some(key) = subagent_key_from_output(output, &cluster) else {
+                    if let Some(progress) = progress {
+                        self.record_subagent_progress(parent, progress);
+                        return true;
+                    }
                     return false;
                 };
-                self.record_subagent_completed(parent, key);
+
+                self.insert_subagent_reply(parent, &key, output);
+
+                match progress {
+                    Some(progress) => self.record_subagent_progress(parent, progress),
+                    None => self.record_subagent_completed(parent, key),
+                }
                 true
             }
             _ => false,
@@ -292,6 +299,38 @@ impl Tui {
         self.pin_transcript_to_bottom();
         self.refresh_input_chrome();
         self.sync_session_activity_monitor();
+    }
+    /// Insert the sub-agent's final reply (from the tool result `response`
+    /// field) as a `ToolResultMarkdown` row immediately before its
+    /// `SubAgentSession` status row, keeping it adjacent to the originating
+    /// `ToolCall`. No-op when the result carries no reply text.
+    fn insert_subagent_reply(
+        &mut self,
+        parent: Option<&MonitoredSessionKey>,
+        key: &MonitoredSessionKey,
+        output: &serde_json::Value,
+    ) {
+        let Some(result_item) = crate::lifecycle::subagent_reply_item_from_output(output) else {
+            return;
+        };
+        let progress = crate::lifecycle::subagent_progress_from_output(output);
+        let invocation_id = progress.as_ref().map(|p| p.invocation_id.as_str());
+        let transcript = self.subagent_transcript_mut(parent);
+        insert_reply_before_status_row(transcript, key, invocation_id, result_item);
+    }
+
+    /// The transcript that owns `parent`'s sub-agent rows: the monitored
+    /// child transcript for a nested parent, otherwise the main transcript.
+    fn subagent_transcript_mut(
+        &mut self,
+        parent: Option<&MonitoredSessionKey>,
+    ) -> &mut Vec<TranscriptItem> {
+        if let Some(parent) = parent {
+            if let Some(session) = self.app.monitored_sessions.get_mut(parent) {
+                return &mut session.transcript;
+            }
+        }
+        &mut self.app.transcript
     }
 }
 
@@ -373,5 +412,53 @@ fn handoff_target(agent: &str, inherited_cluster: &str) -> (String, String) {
         harnx_core::agent_ref::AgentRef::Local(_) => {
             (agent.to_string(), inherited_cluster.to_string())
         }
+    }
+}
+
+/// Place `result_item` right before the matched `SubAgentSession` row (falling
+/// back to appending when no matching row exists, preserving the ToolCall ->
+/// ToolResultMarkdown -> SubAgentSession ordering invariant so future maintainers
+/// don't break detail-view pairing).
+/// Skips insertion when an identical reply row is already present to keep
+/// re-delivered terminal events idempotent.
+fn insert_reply_before_status_row(
+    transcript: &mut Vec<TranscriptItem>,
+    key: &MonitoredSessionKey,
+    invocation_id: Option<&str>,
+    result_item: TranscriptItem,
+) {
+    let Some(pos) = transcript.iter().rposition(|item| {
+        let TranscriptItem::SubAgentSession {
+            key: row_key,
+            invocation_id: row_inv_id,
+            ..
+        } = item
+        else {
+            return false;
+        };
+        if row_key != key {
+            return false;
+        }
+        if let Some(inv_id) = invocation_id {
+            row_inv_id.as_deref() == Some(inv_id)
+        } else {
+            true
+        }
+    }) else {
+        transcript.push(result_item);
+        return;
+    };
+
+    let already_has_result = pos > 0
+        && match (&transcript[pos - 1], &result_item) {
+            (
+                TranscriptItem::ToolResultMarkdown { text: t1, .. },
+                TranscriptItem::ToolResultMarkdown { text: t2, .. },
+            ) => t1 == t2,
+            _ => false,
+        };
+
+    if !already_has_result {
+        transcript.insert(pos, result_item);
     }
 }
