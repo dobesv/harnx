@@ -227,11 +227,25 @@ pub async fn publish_targeted_session_activate(
         .context("targeted activation is missing requested_seq")?;
     let subject = targeted_notify_subject(target);
     ensure_local_notify_stream(jetstream).await?;
-    let message_id = format!(
-        "{}:{}:{}:{requested_seq}",
-        target.session_scope, target.worker_id, activation.session_id
-    );
+    // Each activation attempt must remain deliverable. A previous worker may
+    // have acknowledged the same requested sequence and then stalled before
+    // completing it; a sequence-only message ID would make JetStream suppress
+    // the recovery publish for its duplicate window. The worker's active-map,
+    // lease, and requested-sequence coverage checks make repeated deliveries
+    // safe.
+    let message_id = targeted_activation_message_id(target, activation, requested_seq);
     publish_activation(jetstream, subject, activation, message_id).await
+}
+
+fn targeted_activation_message_id(
+    target: LocalWorkerTarget<'_>,
+    activation: &SessionActivate,
+    requested_seq: u64,
+) -> String {
+    format!(
+        "{}:{}:{}:{requested_seq}:{}",
+        target.session_scope, target.worker_id, activation.session_id, activation.epoch
+    )
 }
 
 async fn publish_activation(
@@ -415,6 +429,20 @@ mod tests {
         assert_ne!(
             targeted_consumer_name(first).unwrap(),
             targeted_consumer_name(second).unwrap()
+        );
+    }
+
+    #[test]
+    fn targeted_reactivation_is_not_suppressed_by_the_prior_attempt() {
+        let target = LocalWorkerTarget::new(LOCAL_CLUSTER_KEY, "local-worker").unwrap();
+        let mut first = SessionActivate::targeted("session", 42, "local-worker");
+        first.epoch = "first-attempt".to_string();
+        let mut second = SessionActivate::targeted("session", 42, "local-worker");
+        second.epoch = "recovery-attempt".to_string();
+
+        assert_ne!(
+            targeted_activation_message_id(target, &first, 42),
+            targeted_activation_message_id(target, &second, 42),
         );
     }
 }

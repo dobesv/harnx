@@ -109,32 +109,11 @@ impl Tui {
         session_id: String,
         cluster: String,
     ) -> Result<NatsSession> {
-        let abort_signal = harnx_runtime::utils::create_abort_signal();
-        let activation_route = harnx_runtime::local_orchestrator::activation_route_for_cluster(
-            &cluster,
-            &self.local_worker,
-            abort_signal.clone(),
-        )
-        .await?;
-        let initializer = {
-            let config = self.config.read();
-            let agent = config
-                .remote_agent
-                .as_ref()
-                .map(|(agent, _)| agent.clone())
-                .or_else(|| config.agent.as_ref().map(|agent| agent.name().to_string()))
-                .unwrap_or_default();
-            harnx_runtime::SessionInitializer::named_from_config(agent, &config)
-        };
-        NatsSession::from_global_config(
-            NatsSessionConfig {
-                cluster,
-                initializer,
-                session_id: Some(session_id),
-                activation_route,
-            },
+        crate::remote_session::nats_session_for_target(
             &self.config,
-            abort_signal,
+            &self.local_worker,
+            session_id,
+            cluster,
         )
         .await
     }

@@ -722,13 +722,15 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
     let parent_global_config = Arc::new(parking_lot::RwLock::new(parent_config));
     let abort_signal = harnx_core::abort::create_abort_signal();
     let session_cfg = cluster_shared_session_config("local", session_id.clone());
-    let session =
+    let session = Arc::new(
         crate::NatsSession::from_global_config(session_cfg, &parent_global_config, abort_signal)
             .await
-            .expect("build NATS session");
+            .expect("build NATS session"),
+    );
 
+    let running_session = Arc::clone(&session);
     let run_turn = tokio::spawn(async move {
-        session
+        running_session
             .run_turn("delegate over nats", Arc::new(NoopEventSink), None)
             .await
     });
@@ -737,13 +739,10 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
         .await
         .expect("worker never entered in-flight call_fn before cancel publish");
 
-    let raw_client = async_nats::connect(&url)
+    assert!(session
+        .cancel_pending_turn()
         .await
-        .expect("connect raw nats client for cancel publish");
-    crate::send_control_command(&raw_client, &session_id, crate::ControlCommand::Cancel)
-        .await
-        .expect("publish cancel control command");
-
+        .expect("durably cancel pending turn"));
     assert!(
         wait_for_condition(NATS_TEST_CONDITION_TIMEOUT, || worker_saw_abort
             .load(Ordering::SeqCst))
@@ -751,38 +750,20 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
         "worker call_fn never observed abort after remote cancel publish"
     );
 
-    let log_client = async_nats::connect(&url)
-        .await
-        .expect("connect nats client for session log polling");
-    let log = NatsSessionLog::new(async_nats::jetstream::new(log_client), session_id.clone());
-    let _cancel_entries = tokio::time::timeout(NATS_TEST_CONDITION_TIMEOUT, async {
-        loop {
-            let entries = log
-                .load_events_async()
-                .await
-                .expect("load session log entries");
-            if entries
-                .iter()
-                .any(|(_, entry)| matches!(entry, SessionLogEntry::Cancel { .. }))
-            {
-                break entries;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("durable session log never recorded Cancel entry");
-
     let _turn_result = tokio::time::timeout(NATS_TEST_CONDITION_TIMEOUT, run_turn)
         .await
         .expect("run_turn task did not complete after remote cancel")
         .expect("run_turn join must succeed")
         .expect("run_turn must return result after remote cancel");
 
+    let log_client = async_nats::connect(&url)
+        .await
+        .expect("connect nats client for final session log");
+    let log = NatsSessionLog::new(async_nats::jetstream::new(log_client), session_id);
     let final_entries = log
         .load_events_async()
         .await
-        .expect("reload final session log entries after run_turn completion");
+        .expect("load final session log after run_turn completion");
     let cancel_fence_token = final_entries.iter().find_map(|(_, entry)| match entry {
         SessionLogEntry::Cancel { fence_token } => Some(*fence_token),
         _ => None,

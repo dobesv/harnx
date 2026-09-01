@@ -311,9 +311,11 @@ available in case the holder releases before seeing them.
 
 The worker inherits its owning frontend's environment and current directory.
 Restart the frontend after intentional configuration, environment, working
-directory, installation, or binary changes. Health checks do not proactively
-restart a running child for those changes. Crash recovery retains the same
-worker ID and consumer route but starts a new PID.
+directory, installation, or binary changes. Before reusing a running child,
+the frontend waits for a fresh readiness heartbeat; a child whose process still
+exists but whose event loop has stopped is replaced. Health checks do not
+restart a responsive child merely for input changes. Crash and stall recovery
+retain the same worker ID and consumer route but start a new PID.
 
 Frontend and worker executables may be built separately as long as their local
 readiness protocol is compatible. Build SHA is diagnostic and does not decide
@@ -422,6 +424,10 @@ agents:
 
 Clients communicate with the active worker over specific NATS subjects:
 - **Cancel**: `sessions.{id}.control` — Deliver a cancel command to the worker.
+  Interactive cancellation re-activates a pending session when necessary and
+  uses request/reply confirmation; the worker acknowledges only after its
+  fenced `Cancel` entry is durable. Plain fire-and-forget publish remains
+  available to compatible callers.
 - **Set Pending**: Update the pending user message without triggering execution.
 
 Semantics are consistent because the authoritative state is derived from the durable JetStream log.
@@ -472,7 +478,9 @@ operations. Once the append succeeds, its log sequence is authoritative: an
 activation failure must be retried for the pending durable turn and must never
 fall back to appending the same frontend text again. Session reconstruction and
 the worker lease make repeated activation safe while preserving exactly one
-user row.
+user row. Each targeted recovery attempt has a distinct JetStream message ID,
+so an activation already acknowledged by a worker that later stalled cannot
+suppress the replacement worker's wakeup during the duplicate window.
 
 ## Cleanup
 

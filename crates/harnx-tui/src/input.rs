@@ -240,30 +240,7 @@ impl Tui {
                     prompt_abort.set_ctrlc();
                 }
 
-                if let Some((ref session_id, ref cluster)) = self.active_remote_session {
-                    let config = self.config.clone();
-                    let session_id = session_id.clone();
-                    let cluster = cluster.clone();
-                    tokio::spawn(async move {
-                        let config = config.read().clone();
-                        match config.nats_client(&cluster).await {
-                            Ok(client) => {
-                                if let Err(e) = harnx_runtime::send_control_command(
-                                    &client,
-                                    &session_id,
-                                    harnx_runtime::ControlCommand::Cancel,
-                                )
-                                .await
-                                {
-                                    log::warn!("Failed to send NATS cancel command: {e}");
-                                }
-                            }
-                            Err(e) => {
-                                log::warn!("Failed to connect to NATS for cancel: {e}");
-                            }
-                        }
-                    });
-                }
+                self.cancel_active_remote_session();
 
                 self.app.transcript.push(TranscriptItem::SystemText(
                     "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),

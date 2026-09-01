@@ -25,6 +25,7 @@ pub mod types;
 
 mod completion;
 mod detail_view;
+mod remote_session;
 
 #[cfg(test)]
 mod tests;

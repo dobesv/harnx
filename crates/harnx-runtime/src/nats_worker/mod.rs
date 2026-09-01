@@ -57,7 +57,9 @@ pub use agent_loop::{
     RunAgentLoopArgs,
 };
 pub use backend::{FencedSessionLogSink, NatsSessionLogBackend};
-pub use control::{control_subject, publish_control_command, ControlCommand};
+pub use control::{
+    control_subject, publish_control_command, request_control_command, ControlCommand,
+};
 pub use daemon::{
     new_remote_session_id, new_worker_id, notify_subject, publish_session_activate,
     publish_targeted_session_activate, resolve_worker_scope, run_worker_daemon,
