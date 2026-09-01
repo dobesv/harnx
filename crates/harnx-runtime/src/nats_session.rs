@@ -52,8 +52,8 @@ use crate::nats_session_log::NatsSessionLog;
 use crate::nats_session_metadata::{SessionInitializer, SessionMetadata, SessionMetadataStore};
 use crate::nats_worker::{
     new_remote_session_id, publish_control_command, publish_session_activate,
-    publish_targeted_session_activate, ControlCommand, LocalWorkerTarget, SessionActivate,
-    SessionActivationRoute,
+    publish_targeted_session_activate, request_control_command, ControlCommand, LocalWorkerTarget,
+    SessionActivate, SessionActivationRoute,
 };
 use crate::utils::AbortSignal;
 
@@ -71,16 +71,21 @@ const ORPHAN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// Two reads at the interval above leave ~4s of slack for a worker's lease
 /// release to race the barrier it just wrote.
 const ORPHAN_MISSING_CHECKS: u32 = 2;
+const CONTROL_ACK_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+const CONTROL_ACK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+const CANCEL_RECOVERY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(crate::nats_lease::DEFAULT_LEASE_TTL.as_secs() + 10);
 
-/// Detects a turn whose worker vanished without writing a barrier.
+/// Lease-backed detector for a session whose worker disappeared without
+/// writing a durable terminal entry.
 ///
 /// The worker writes its assistant message (or its `Error` entry) before
 /// releasing the session lease, so "lease gone, nothing in the log" means the
-/// worker died — a panic, a kill, a lost connection. Only trips once a lease
-/// has actually been observed, so a worker that is slow to claim the activation
-/// is never mistaken for a dead one. A turn no worker ever picks up still waits
-/// indefinitely, which is the correct behaviour for a queued session.
-struct OrphanWatchdog {
+/// worker died — a panic, a kill, or a lost connection. The first observed
+/// lease arms the detector. A session that is merely queued and has never been
+/// claimed therefore remains pending, while a lease that later expires is
+/// reported as orphaned after a short confirmation window.
+pub struct SessionLeaseWatchdog {
     lease_config: crate::nats_lease::NatsLeaseConfig,
     /// Opened once and reused: `get_key_value` costs a `stream_info` round trip
     /// that the per-poll `get` does not.
@@ -90,8 +95,8 @@ struct OrphanWatchdog {
     missing_checks: u32,
 }
 
-impl OrphanWatchdog {
-    fn new() -> Self {
+impl SessionLeaseWatchdog {
+    pub fn new() -> Self {
         Self {
             lease_config: crate::nats_lease::NatsLeaseConfig::default(),
             bucket: None,
@@ -102,7 +107,11 @@ impl OrphanWatchdog {
     }
 
     /// The failure message to end the turn with, or `None` to keep waiting.
-    async fn check(&mut self, jetstream: &jetstream::Context, session_id: &str) -> Option<String> {
+    pub async fn check(
+        &mut self,
+        jetstream: &jetstream::Context,
+        session_id: &str,
+    ) -> Option<String> {
         let now = tokio::time::Instant::now();
         if now < self.next_check {
             return None;
@@ -151,6 +160,12 @@ impl OrphanWatchdog {
         self.saw_lease = true;
         self.missing_checks = 0;
         None
+    }
+}
+
+impl Default for SessionLeaseWatchdog {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -528,6 +543,60 @@ impl NatsSession {
         Ok(Some(user_msg_seq))
     }
 
+    /// Cancel the latest pending turn and wait until a lease holder confirms
+    /// the durable cancellation.
+    ///
+    /// Re-activation is intentional: after a local worker is replaced, the new
+    /// process first needs to claim the pending session and install its control
+    /// subscription. The bounded retry window includes one default lease TTL,
+    /// allowing a killed holder's lease to expire before its replacement
+    /// writes the fenced `Cancel` entry.
+    pub async fn cancel_pending_turn(&self) -> Result<bool> {
+        let Some(user_msg_seq) = self.activate_pending_turn().await? else {
+            return Ok(false);
+        };
+        let deadline = tokio::time::Instant::now() + CANCEL_RECOVERY_TIMEOUT;
+        loop {
+            if self.request_cancel_acknowledgement().await {
+                return Ok(true);
+            }
+            if self.pending_turn_is_covered(user_msg_seq).await? {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for worker to durably cancel session '{}'",
+                    self.session_id
+                );
+            }
+            tokio::time::sleep(CONTROL_ACK_RETRY_DELAY).await;
+        }
+    }
+
+    async fn request_cancel_acknowledgement(&self) -> bool {
+        let result = request_control_command(
+            &self.client,
+            &self.session_id,
+            &ControlCommand::Cancel,
+            CONTROL_ACK_ATTEMPT_TIMEOUT,
+        )
+        .await;
+        if let Err(error) = &result {
+            log::debug!(
+                "session cancel not yet acknowledged: session_id={} error={error:#}",
+                self.session_id,
+            );
+        }
+        result.is_ok()
+    }
+
+    async fn pending_turn_is_covered(&self, user_msg_seq: u64) -> Result<bool> {
+        let Ok(entries) = self.load_durable_entries().await else {
+            return Ok(false);
+        };
+        Ok(requested_seq_status(&entries, user_msg_seq)? == RequestedSeqStatus::Covered)
+    }
+
     /// Run a turn: append user message, activate worker, stream events until completion.
     ///
     /// This is the main entry point for all frontends (CLI and TUI).
@@ -708,7 +777,7 @@ impl NatsSession {
         // Wrap channel in Option for select! handling.
         let mut pending_cancel_rx = pending_cancel;
         let mut was_cancelled = false;
-        let mut orphan_watchdog = OrphanWatchdog::new();
+        let mut orphan_watchdog = SessionLeaseWatchdog::new();
         let mut saw_terminal_model_error = false;
         let mut saw_turn_ended = false;
 

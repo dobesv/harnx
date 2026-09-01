@@ -12,7 +12,7 @@ use crate::nats_worker::{
 };
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
-use harnx_core::abort::AbortSignal;
+use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::sink::emit_agent_event;
 use std::fs::File;
@@ -24,6 +24,9 @@ use tokio::process::{Child, Command};
 
 const READINESS_POLL_INITIAL: Duration = Duration::from_millis(50);
 const READINESS_POLL_MAX: Duration = Duration::from_millis(500);
+/// A healthy worker publishes readiness every 250ms. Waiting for four missed
+/// markers distinguishes an event-loop stall from ordinary scheduler jitter.
+const WORKER_HEALTH_TIMEOUT: Duration = Duration::from_secs(1);
 const WORKER_SLOW_NOTICE_AFTER: Duration = Duration::from_secs(5);
 const WORKER_SLOW_NOTICE_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_WORKER_CRASHES: u32 = 3;
@@ -174,7 +177,8 @@ impl LocalWorkerSupervisor {
         Ok(supervisor)
     }
 
-    /// Check health and respawn this supervisor's worker after a crash.
+    /// Check health and respawn this supervisor's worker after a crash or
+    /// event-loop stall.
     /// Running workers are never restarted for binary or configuration changes.
     pub async fn ensure(&mut self, abort_signal: AbortSignal) -> Result<LocalWorkerRoute> {
         if self
@@ -189,17 +193,61 @@ impl LocalWorkerSupervisor {
             self.stop_worker();
         }
 
+        // Subscribe before checking or spawning. Core NATS does not replay old
+        // readiness markers, so a marker received below proves the existing
+        // worker's event loop is currently making progress. The same
+        // subscription then admits a replacement without a spawn/subscribe
+        // race.
+        let mut readiness = self.subscribe_to_readiness().await?;
         if self.child_is_running()? {
-            return Ok(self.route.clone());
+            let expected_pid = self
+                .worker_pid()
+                .context("running local worker has no PID")?;
+            if self
+                .wait_for_health_marker(&mut readiness, expected_pid, abort_signal.clone())
+                .await?
+            {
+                return Ok(self.route.clone());
+            }
+            log::warn!(
+                "local worker {} pid={} stopped reporting readiness; respawning",
+                self.route.worker_id(),
+                expected_pid,
+            );
+            self.stop_worker();
         }
 
-        // Subscribe before spawning so a fast worker cannot publish its first
-        // readiness marker between spawn and subscription setup.
-        let mut readiness = self.subscribe_to_readiness().await?;
         self.crashes = 0;
         let expected_pid = self.spawn_worker()?;
         self.wait_for_readiness(&mut readiness, expected_pid, abort_signal)
             .await
+    }
+
+    async fn wait_for_health_marker(
+        &mut self,
+        readiness: &mut async_nats::Subscriber,
+        expected_pid: u32,
+        abort_signal: AbortSignal,
+    ) -> Result<bool> {
+        let deadline = tokio::time::sleep(WORKER_HEALTH_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = wait_abort_signal(&abort_signal) => {
+                    bail!("cancelled while checking the local worker");
+                }
+                _ = &mut deadline => return Ok(false),
+                message = readiness.next() => {
+                    let message = message.context("local worker readiness subscription closed")?;
+                    if self
+                        .accept_readiness(&message.payload, expected_pid)?
+                        .is_some()
+                    {
+                        return self.child_is_running();
+                    }
+                }
+            }
+        }
     }
 
     async fn wait_for_readiness(

@@ -357,7 +357,9 @@ Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP
   The child worker renews its session lease independently of model and tool
   activity; if that worker disappears without writing a durable result, the
   waiting session detects the expired lease and returns an error. Parent aborts
-  and explicit `session_cancel` calls still cancel the child turn.
+  and explicit `session_cancel` calls still cancel the child turn. TUI child
+  rows also refresh durable history and sample the same lease, so a lost worker
+  becomes failed instead of displaying a running spinner indefinitely.
 
 ### Sub-Agent Tool Result Marker
 
