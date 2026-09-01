@@ -285,6 +285,24 @@ fn add_opt_u64(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
+fn claude_usage(usage: &Value) -> StreamingUsage {
+    let cached_tokens = usage["cache_read_input_tokens"].as_u64();
+    let cache_write_tokens = usage["cache_creation_input_tokens"].as_u64();
+    let input_tokens = add_opt_u64(
+        add_opt_u64(usage["input_tokens"].as_u64(), cache_write_tokens),
+        cached_tokens,
+    );
+    StreamingUsage {
+        input_tokens,
+        // Anthropic omits output tokens on message_start, so this stays None there.
+        // message_delta supplies the real value and set_usage's or-merge replaces it,
+        // keeping streaming and non-streaming usage on one safe parsing path.
+        output_tokens: usage["output_tokens"].as_u64(),
+        cached_tokens,
+        cache_write_tokens,
+    }
+}
+
 fn claude_handle_stream_event(
     state: &mut ClaudeStreamState,
     handler: &mut SseHandler,
@@ -295,28 +313,12 @@ fn claude_handle_stream_event(
     };
     match typ {
         "message_start" => {
-            let usage = &data["message"]["usage"];
-            handler.set_usage(
-                add_opt_u64(
-                    usage["input_tokens"].as_u64(),
-                    usage["cache_creation_input_tokens"].as_u64(),
-                ),
-                None,
-                usage["cache_read_input_tokens"].as_u64(),
-            );
+            // Anthropic reports cache buckets disjoint from input tokens.
+            handler.set_usage(claude_usage(&data["message"]["usage"]));
         }
         "message_delta" => {
-            // message_delta usage fields are cumulative and override
-            // earlier values from message_start when present
-            let usage = &data["usage"];
-            handler.set_usage(
-                add_opt_u64(
-                    usage["input_tokens"].as_u64(),
-                    usage["cache_creation_input_tokens"].as_u64(),
-                ),
-                usage["output_tokens"].as_u64(),
-                usage["cache_read_input_tokens"].as_u64(),
-            );
+            // Cumulative fields override message_start values when present.
+            handler.set_usage(claude_usage(&data["usage"]));
         }
         "content_block_start" => claude_handle_content_block_start(state, handler, data)?,
         "content_block_delta" => claude_handle_content_block_delta(state, handler, data)?,
@@ -643,17 +645,16 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
         }
     }
 
+    let usage = claude_usage(&data["usage"]);
     let output = ChatCompletionsOutput {
         text,
         tool_calls,
         thought: reasoning,
         id: data["id"].as_str().map(|v| v.to_string()),
-        input_tokens: add_opt_u64(
-            data["usage"]["input_tokens"].as_u64(),
-            data["usage"]["cache_creation_input_tokens"].as_u64(),
-        ),
-        output_tokens: data["usage"]["output_tokens"].as_u64(),
-        cached_tokens: data["usage"]["cache_read_input_tokens"].as_u64(),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_tokens: usage.cached_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
     };
     Ok(output)
 }
@@ -661,6 +662,29 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_output_usage(actual: &ChatCompletionsOutput, expected: &CompletionTokenUsage) {
+        assert_eq!(
+            (
+                actual.input_tokens,
+                actual.output_tokens,
+                actual.cached_tokens,
+                actual.cache_write_tokens,
+            ),
+            (
+                Some(expected.input_tokens),
+                Some(expected.output_tokens),
+                Some(expected.cached_tokens),
+                Some(expected.cache_write_tokens),
+            )
+        );
+        assert!(expected.input_tokens >= expected.cached_tokens + expected.cache_write_tokens);
+    }
+
+    fn assert_usage(actual: &CompletionTokenUsage, expected: &CompletionTokenUsage) {
+        assert_eq!(actual, expected);
+        assert!(actual.input_tokens >= actual.cached_tokens + actual.cache_write_tokens);
+    }
 
     #[test]
     fn claude_array_attachment_uses_file_source_for_remote_ref() {
@@ -1360,9 +1384,8 @@ system_prompt_prefix:
     }
 
     /// Regression test for issue #159.
-    /// `claude_extract_chat_completions` must add `cache_creation_input_tokens`
-    /// to `input_tokens` so the "In" count in the status bar reflects all tokens
-    /// consumed by the request, not just the residual non-cached portion.
+    /// `claude_extract_chat_completions` must add Anthropic's disjoint cache
+    /// buckets to `input_tokens` so the "In" count reflects all input tokens.
     #[test]
     fn claude_extract_includes_cache_creation_in_input_tokens() {
         let response = json!({
@@ -1379,13 +1402,15 @@ system_prompt_prefix:
         let output = claude_extract_chat_completions(&response)
             .expect("extraction should succeed");
 
-        assert_eq!(
-            output.input_tokens,
-            Some(1005),
-            "input_tokens must include cache_creation_input_tokens (issue #159)"
+        assert_output_usage(
+            &output,
+            &CompletionTokenUsage {
+                input_tokens: 1005,
+                output_tokens: 10,
+                cached_tokens: 0,
+                cache_write_tokens: 1000,
+            },
         );
-        assert_eq!(output.output_tokens, Some(10));
-        assert_eq!(output.cached_tokens, Some(0));
     }
 
     /// Regression test for issue #159 — non-zero cache_read alongside cache_creation.
@@ -1405,9 +1430,52 @@ system_prompt_prefix:
         let output = claude_extract_chat_completions(&response)
             .expect("extraction should succeed");
 
-        assert_eq!(output.input_tokens, Some(1005), "input + cache_creation");
-        assert_eq!(output.cached_tokens, Some(500), "cache_read preserved");
-        assert_eq!(output.output_tokens, Some(10));
+        assert_output_usage(
+            &output,
+            &CompletionTokenUsage {
+                input_tokens: 1505,
+                output_tokens: 10,
+                cached_tokens: 500,
+                cache_write_tokens: 1000,
+            },
+        );
+    }
+
+    #[test]
+    fn claude_streaming_normalizes_all_cache_buckets() {
+        use harnx_core::abort::create_abort_signal;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = ClaudeStreamState::default();
+        let start = json!({
+            "type": "message_start",
+            "message": {"usage": {
+                "input_tokens": 5,
+                "cache_creation_input_tokens": 1000,
+                "cache_read_input_tokens": 500
+            }}
+        });
+        let delta = json!({
+            "type": "message_delta",
+            "usage": {"output_tokens": 10}
+        });
+        claude_handle_stream_event(&mut state, &mut handler, &start)
+            .expect("message_start usage should parse");
+        claude_handle_stream_event(&mut state, &mut handler, &delta)
+            .expect("message_delta usage should parse");
+
+        let (_, _, _, usage) = handler.take();
+        assert_usage(
+            &usage,
+            &CompletionTokenUsage {
+                input_tokens: 1505,
+                output_tokens: 10,
+                cached_tokens: 500,
+                cache_write_tokens: 1000,
+            },
+        );
     }
 
     /// Regression test for issue #159 — no cache_creation field present.

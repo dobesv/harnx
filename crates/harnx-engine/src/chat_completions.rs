@@ -25,7 +25,10 @@ fn llm_request_span(client: &dyn Client) -> tracing::Span {
         gen_ai.request.model = client.model().name(),
         gen_ai.usage.input_tokens = tracing::field::Empty,
         gen_ai.usage.output_tokens = tracing::field::Empty,
+        gen_ai.usage.cache_read.input_tokens = tracing::field::Empty,
+        gen_ai.usage.cache_write.input_tokens = tracing::field::Empty,
         harnx.gen_ai.usage.cached_tokens = tracing::field::Empty,
+        harnx.gen_ai.cost.usd = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
         otel.status_description = tracing::field::Empty,
     )
@@ -34,6 +37,12 @@ fn llm_request_span(client: &dyn Client) -> tracing::Span {
 fn record_token_count(span: &tracing::Span, field: &'static str, value: Option<u64>) {
     if let Some(value) = value {
         span.record(field, i64::try_from(value).unwrap_or(i64::MAX));
+    }
+}
+
+fn record_cost(span: &tracing::Span, cost: Option<f64>) {
+    if let Some(cost) = cost {
+        span.record("harnx.gen_ai.cost.usd", cost);
     }
 }
 
@@ -118,9 +127,11 @@ pub async fn run_chat_completion(
                 input_tokens,
                 output_tokens,
                 cached_tokens,
+                cache_write_tokens,
                 ..
             } = output;
-            let usage = CompletionTokenUsage::new(input_tokens, output_tokens, cached_tokens);
+            let mut usage = CompletionTokenUsage::new(input_tokens, output_tokens, cached_tokens);
+            usage.cache_write_tokens = cache_write_tokens.unwrap_or_default();
 
             if !text.is_empty() && extract_code {
                 text = extract_code_block(&strip_think_tag(&text)).to_string();
@@ -131,6 +142,7 @@ pub async fn run_chat_completion(
                     input: usage.input_tokens,
                     output: usage.output_tokens,
                     cached: usage.cached_tokens,
+                    cache_write: usage.cache_write_tokens,
                     session_label: None,
                 }));
             }
@@ -182,6 +194,7 @@ pub async fn run_chat_completion_streaming(
                     input: usage.input_tokens,
                     output: usage.output_tokens,
                     cached: usage.cached_tokens,
+                    cache_write: usage.cache_write_tokens,
                     session_label: None,
                 }));
             }
@@ -233,9 +246,26 @@ pub async fn chat_completions_with_data(
             record_token_count(&span, "gen_ai.usage.output_tokens", output.output_tokens);
             record_token_count(
                 &span,
+                "gen_ai.usage.cache_read.input_tokens",
+                output.cached_tokens,
+            );
+            record_token_count(
+                &span,
+                "gen_ai.usage.cache_write.input_tokens",
+                output.cache_write_tokens,
+            );
+            record_token_count(
+                &span,
                 "harnx.gen_ai.usage.cached_tokens",
                 output.cached_tokens,
             );
+            let mut usage = CompletionTokenUsage::new(
+                output.input_tokens,
+                output.output_tokens,
+                output.cached_tokens,
+            );
+            usage.cache_write_tokens = output.cache_write_tokens.unwrap_or_default();
+            record_cost(&span, client.model().cost_usd(&usage));
         }
         Err(error) => record_llm_error(&span, error),
     }
@@ -245,8 +275,11 @@ pub async fn chat_completions_with_data(
 
 #[cfg(test)]
 mod tests {
-    use super::run_chat_completion_streaming;
-    use harnx_client::{ChatCompletionsData, ClientCallContext, CompletionTokenUsage, SseHandler};
+    use super::{chat_completions_with_data, run_chat_completion_streaming};
+    use harnx_client::{
+        ChatCompletionsData, ChatCompletionsOutput, ClientCallContext, CompletionTokenUsage, Model,
+        ModelData, SseHandler,
+    };
     use harnx_core::abort::create_abort_signal;
     use harnx_core::event::{AgentEvent, AgentEventSink, ModelEvent, NoticeEvent};
     use harnx_core::sink::{clear_agent_event_sink, install_agent_event_sink};
@@ -331,6 +364,110 @@ mod tests {
     fn sse_handler() -> SseHandler {
         let (tx, _rx) = unbounded_channel();
         SseHandler::new(tx, create_abort_signal())
+    }
+
+    fn priced_span_model(name: &str, cache_write_price: Option<f64>) -> Model {
+        let mut data = ModelData::new(name);
+        data.input_price = Some(3.0);
+        data.output_price = Some(15.0);
+        data.cache_read_price = Some(0.3);
+        data.cache_write_price = cache_write_price;
+        Model::from_config("mock", &[data])
+            .into_iter()
+            .next()
+            .expect("span test model should exist")
+    }
+
+    fn span_test_output() -> ChatCompletionsOutput {
+        ChatCompletionsOutput {
+            text: "done".to_owned(),
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(100_000),
+            cached_tokens: Some(200_000),
+            cache_write_tokens: Some(100_000),
+            ..Default::default()
+        }
+    }
+
+    fn span_attribute_f64(attributes: &[opentelemetry::KeyValue], key: &str) -> Option<f64> {
+        attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == key)
+            .and_then(|attribute| match &attribute.value {
+                opentelemetry::Value::F64(value) => Some(*value),
+                _ => None,
+            })
+    }
+
+    fn collect_llm_request_span(
+        name: &str,
+        cache_write_price: Option<f64>,
+    ) -> opentelemetry_sdk::trace::SpanData {
+        let spans = harnx_telemetry::collect_test_spans(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime should build")
+                .block_on(async {
+                    let client = MockClient::builder()
+                        .model(priced_span_model(name, cache_write_price))
+                        .add_turn(MockTurnBuilder::new().output(span_test_output()).build())
+                        .build();
+                    chat_completions_with_data(
+                        &client,
+                        ChatCompletionsData {
+                            stream: false,
+                            ..streaming_data()
+                        },
+                        &ClientCallContext {
+                            user_agent: None,
+                            dry_run: false,
+                        },
+                    )
+                    .await
+                    .expect("mock completion should succeed");
+                });
+        });
+
+        assert_eq!(spans.len(), 1);
+        spans.into_iter().next().expect("span should be exported")
+    }
+
+    fn assert_cache_usage_attributes(span: &opentelemetry_sdk::trace::SpanData) {
+        for (key, value) in [
+            ("gen_ai.usage.cache_read.input_tokens", 200_000_i64),
+            ("gen_ai.usage.cache_write.input_tokens", 100_000_i64),
+            ("harnx.gen_ai.usage.cached_tokens", 200_000_i64),
+        ] {
+            assert!(
+                span.attributes
+                    .contains(&opentelemetry::KeyValue::new(key, value)),
+                "missing {key}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn llm_request_span_records_cache_usage_and_cost_when_priced() {
+        harnx_core::require_nextest();
+        let span = collect_llm_request_span("priced-model", Some(3.75));
+
+        assert_cache_usage_attributes(&span);
+        let cost = span_attribute_f64(&span.attributes, "harnx.gen_ai.cost.usd")
+            .expect("priced span should contain cost");
+        assert!((cost - 4.035).abs() < 1e-12, "unexpected span cost: {cost}");
+    }
+
+    #[test]
+    fn llm_request_span_omits_cost_when_cache_price_is_missing() {
+        harnx_core::require_nextest();
+        let span = collect_llm_request_span("unpriced-model", None);
+
+        assert_cache_usage_attributes(&span);
+        assert!(span
+            .attributes
+            .iter()
+            .all(|attribute| attribute.key.as_str() != "harnx.gen_ai.cost.usd"));
     }
 
     fn stream_error() -> anyhow::Error {

@@ -3,12 +3,15 @@
 //! lives in `harnx/src/client/model.rs` because it uses macro-generated
 //! provider enumeration.
 
+use crate::api_types::CompletionTokenUsage;
 use crate::message::{Message, MessageContent, MessageContentPart, MessageContentToolCalls};
 use crate::text::{estimate_token_length, strip_think_tag};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt::Display;
+use std::sync::{Mutex, OnceLock};
 
 const PER_MESSAGES_TOKENS: usize = 5;
 const BASIS_TOKENS: usize = 2;
@@ -169,14 +172,42 @@ impl Model {
         self.data.output_price
     }
 
-    /// Dollar cost for a call given token counts, or None if pricing is unknown.
-    /// cost = input*input_price/1e6 + output*output_price/1e6
-    /// Cached tokens are NOT charged separately here (see #1568).
-    pub fn cost_usd(&self, input_tokens: u64, output_tokens: u64) -> Option<f64> {
+    pub fn cache_read_price(&self) -> Option<f64> {
+        self.data.cache_read_price
+    }
+
+    pub fn cache_write_price(&self) -> Option<f64> {
+        self.data.cache_write_price
+    }
+
+    pub fn cache_accounting(&self) -> CacheAccounting {
+        self.data.cache_accounting.unwrap_or_default()
+    }
+
+    /// Dollar cost for a call, with all prices expressed per million tokens.
+    ///
+    /// Cost is uncached input, cache-read input, cache-write input, and output at
+    /// their respective prices. Returns `None` when input/output pricing is unknown
+    /// or a nonzero cache bucket has no matching cache price.
+    pub fn cost_usd(&self, usage: &CompletionTokenUsage) -> Option<f64> {
         let input_price = self.input_price()?;
         let output_price = self.output_price()?;
-        let cost = input_tokens as f64 * input_price / 1_000_000.0
-            + output_tokens as f64 * output_price / 1_000_000.0;
+        let uncached = usage.uncached_input_tokens();
+        let cache_read_cost = if usage.cached_tokens > 0 {
+            usage.cached_tokens as f64 * self.cache_read_price()?
+        } else {
+            0.0
+        };
+        let cache_write_cost = if usage.cache_write_tokens > 0 {
+            usage.cache_write_tokens as f64 * self.cache_write_price()?
+        } else {
+            0.0
+        };
+        let cost = (uncached as f64 * input_price
+            + cache_read_cost
+            + cache_write_cost
+            + usage.output_tokens as f64 * output_price)
+            / 1_000_000.0;
         Some(cost)
     }
 
@@ -278,6 +309,72 @@ impl Model {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheAccounting {
+    #[default]
+    Subset,
+    Disjoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawCacheUsage {
+    pub input: u64,
+    pub output: u64,
+    pub read: u64,
+    pub write: u64,
+}
+
+static WARNED_CACHE_ACCOUNTING_MODELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// Converts parsed token counts to the canonical OTel-subset representation.
+///
+/// The canonical convention is `input_tokens >= cached_tokens + cache_write_tokens`.
+/// - `Subset` keeps input unchanged because it already includes cache tokens.
+/// - `Disjoint` adds cache reads and writes to input.
+///
+/// Invalid subset counts (input < cache) are preserved and warned once per model,
+/// so provider quirks cannot trigger double-counting. The `uncached_input_tokens`
+/// method clamps negative results to zero.
+pub fn normalize_cache_usage(
+    usage: RawCacheUsage,
+    accounting: CacheAccounting,
+    model_name: &str,
+) -> CompletionTokenUsage {
+    let RawCacheUsage {
+        input,
+        output,
+        read,
+        write,
+    } = usage;
+    let cache_tokens = read.saturating_add(write);
+    let input_tokens = match accounting {
+        CacheAccounting::Disjoint => input.saturating_add(cache_tokens),
+        CacheAccounting::Subset => {
+            if input < cache_tokens {
+                let should_warn = WARNED_CACHE_ACCOUNTING_MODELS
+                    .get_or_init(|| Mutex::new(HashSet::new()))
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(model_name.to_owned());
+                if should_warn {
+                    log::warn!(
+                        "input_tokens ({input}) < cache tokens (read {read} + write {write}) for model '{model_name}'; set cache_accounting: disjoint"
+                    );
+                }
+            }
+            input
+        }
+    };
+
+    CompletionTokenUsage {
+        input_tokens,
+        output_tokens: output,
+        cached_tokens: read,
+        cache_write_tokens: write,
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelData {
     pub name: String,
@@ -293,6 +390,12 @@ pub struct ModelData {
     pub input_price: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_price: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_price: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_price: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_accounting: Option<CacheAccounting>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patches: Option<Vec<String>>,
 
@@ -495,6 +598,20 @@ pub struct ModelsOverride {
 mod tests {
     use super::*;
 
+    fn model_with_prices(
+        input: Option<f64>,
+        output: Option<f64>,
+        cache_read: Option<f64>,
+        cache_write: Option<f64>,
+    ) -> Model {
+        let mut data = ModelData::new("test-model");
+        data.input_price = input;
+        data.output_price = output;
+        data.cache_read_price = cache_read;
+        data.cache_write_price = cache_write;
+        Model::from_config("test", &[data]).remove(0)
+    }
+
     #[test]
     fn model_endpoint_accessor_reflects_yaml_endpoint() {
         let with_endpoint: ModelData =
@@ -504,6 +621,96 @@ mod tests {
 
         assert_eq!(models[0].endpoint(), Some("responses"));
         assert_eq!(models[1].endpoint(), None);
+    }
+
+    #[test]
+    fn normalize_cache_usage_handles_disjoint_and_subset_inputs() {
+        for (input, accounting, model_name) in [
+            (700, CacheAccounting::Disjoint, "disjoint-model"),
+            (1_000, CacheAccounting::Subset, "subset-model"),
+        ] {
+            let usage = normalize_cache_usage(
+                RawCacheUsage {
+                    input,
+                    output: 50,
+                    read: 200,
+                    write: 100,
+                },
+                accounting,
+                model_name,
+            );
+
+            assert_eq!(
+                usage,
+                CompletionTokenUsage {
+                    input_tokens: 1_000,
+                    output_tokens: 50,
+                    cached_tokens: 200,
+                    cache_write_tokens: 100,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_cache_usage_warns_once_and_preserves_invalid_subset_input() {
+        let model_name = "invalid-subset-model";
+        let raw_usage = RawCacheUsage {
+            input: 100,
+            output: 50,
+            read: 200,
+            write: 0,
+        };
+        let usage = normalize_cache_usage(raw_usage, CacheAccounting::Subset, model_name);
+
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cached_tokens, 200);
+        assert_eq!(usage.cache_write_tokens, 0);
+        assert_eq!(usage.uncached_input_tokens(), 0);
+
+        let warned_models = WARNED_CACHE_ACCOUNTING_MODELS
+            .get()
+            .expect("warning set should be initialized");
+        let warned_count = warned_models
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        assert!(warned_models
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(model_name));
+
+        normalize_cache_usage(raw_usage, CacheAccounting::Subset, model_name);
+
+        assert_eq!(
+            warned_models
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            warned_count
+        );
+    }
+
+    #[test]
+    fn cache_accounting_round_trips_and_defaults_to_subset() {
+        for (accounting, serialized) in [
+            (CacheAccounting::Subset, r#""subset""#),
+            (CacheAccounting::Disjoint, r#""disjoint""#),
+        ] {
+            assert_eq!(serde_json::to_string(&accounting).unwrap(), serialized);
+            assert_eq!(
+                serde_json::from_str::<CacheAccounting>(serialized).unwrap(),
+                accounting
+            );
+        }
+        assert_eq!(CacheAccounting::default(), CacheAccounting::Subset);
+
+        let data: ModelData = serde_yaml::from_str("name: default-accounting\n").unwrap();
+        let model = Model::from_config("test", &[data])
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(model.cache_accounting(), CacheAccounting::Subset);
     }
 
     #[test]
@@ -542,42 +749,78 @@ mod tests {
     }
 
     #[test]
-    fn cost_usd_computes_correctly_when_both_prices_present() {
+    fn cost_usd_without_cache_matches_input_output_formula() {
         // 1_000_000 input @ $3/M + 1_000_000 output @ $15/M == $18.0
-        let mut data = ModelData::new("test-model");
-        data.input_price = Some(3.0);
-        data.output_price = Some(15.0);
-        let model = Model::from_config("test", &[data])
-            .into_iter()
-            .next()
-            .unwrap();
-        let cost = model.cost_usd(1_000_000, 1_000_000);
-        assert_eq!(cost, Some(18.0));
+        let model = model_with_prices(Some(3.0), Some(15.0), None, None);
+        let usage = CompletionTokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+
+        assert_eq!(model.cost_usd(&usage), Some(18.0));
+    }
+
+    #[test]
+    fn cost_usd_prices_uncached_read_write_and_output_tokens() {
+        let model = model_with_prices(Some(3.0), Some(15.0), Some(0.30), Some(3.75));
+        let usage = CompletionTokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+            cached_tokens: 200_000,
+            cache_write_tokens: 100_000,
+        };
+
+        // $2.10 uncached + $0.06 read + $0.375 write + $1.50 output = $4.035.
+        let cost = model.cost_usd(&usage).unwrap();
+        assert!((cost - 4.035).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cost_usd_returns_none_when_cache_read_price_missing() {
+        let model = model_with_prices(Some(3.0), Some(15.0), None, None);
+        let usage = CompletionTokenUsage {
+            input_tokens: 1_000_000,
+            cached_tokens: 100_000,
+            ..Default::default()
+        };
+
+        assert_eq!(model.cost_usd(&usage), None);
+    }
+
+    #[test]
+    fn cost_usd_returns_none_when_cache_write_price_missing() {
+        let model = model_with_prices(Some(3.0), Some(15.0), None, None);
+        let usage = CompletionTokenUsage {
+            input_tokens: 1_000_000,
+            cache_write_tokens: 100_000,
+            ..Default::default()
+        };
+
+        assert_eq!(model.cost_usd(&usage), None);
     }
 
     #[test]
     fn cost_usd_returns_none_when_input_price_missing() {
-        let mut data = ModelData::new("test-model");
-        data.input_price = None;
-        data.output_price = Some(15.0);
-        let model = Model::from_config("test", &[data])
-            .into_iter()
-            .next()
-            .unwrap();
-        let cost = model.cost_usd(1_000_000, 1_000_000);
-        assert_eq!(cost, None);
+        let model = model_with_prices(None, Some(15.0), None, None);
+        let usage = CompletionTokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+
+        assert_eq!(model.cost_usd(&usage), None);
     }
 
     #[test]
     fn cost_usd_returns_none_when_output_price_missing() {
-        let mut data = ModelData::new("test-model");
-        data.input_price = Some(3.0);
-        data.output_price = None;
-        let model = Model::from_config("test", &[data])
-            .into_iter()
-            .next()
-            .unwrap();
-        let cost = model.cost_usd(1_000_000, 1_000_000);
-        assert_eq!(cost, None);
+        let model = model_with_prices(Some(3.0), None, None, None);
+        let usage = CompletionTokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+
+        assert_eq!(model.cost_usd(&usage), None);
     }
 }

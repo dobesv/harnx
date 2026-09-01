@@ -436,7 +436,8 @@ impl CliSinkState {
                 input,
                 output,
                 cached,
-                ..
+                cache_write: _,
+                session_label: _,
             } => print_usage(input, output, cached),
         }
     }
