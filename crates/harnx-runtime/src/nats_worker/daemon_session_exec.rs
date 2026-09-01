@@ -152,6 +152,7 @@ impl WorkerRuntime {
                         instance_id: self.instance_id.clone(),
                         initial_input: input,
                         abort_signal: abort_signal.clone(),
+                        token_budget: activation.token_budget,
                         call_fn: self.call_fn.clone(),
                         lease: None,
                         activation_route: self.activation_route.clone(),

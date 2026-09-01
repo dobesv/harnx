@@ -344,7 +344,7 @@ Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP
 - **Markdown-only agent definitions**: Agents are defined solely by Markdown files with YAML front-matter in `<config-dir>/agents/*.md` (or package agents). ACP server configuration (`acp_servers/*.yaml`) and ACP stdio child processes no longer exist.
 - **Auto-registered toolsets**: For every configured agent, the worker daemon registers a NATS-backed 4-tool toolset. Each registration advertises the raw names `session_new`, `session_prompt`, `session_load`, and `session_cancel`; the provider exposes them to agents with an agent-relative prefix:
   - `{agent}_session_new`: Creates a new sub-agent session and returns its initial response along with session metadata.
-  - `{agent}_session_prompt`: Sends a prompt message (`message`, optional `session_id`) to a sub-agent session, returning the sub-agent's final text response. The parent session ID is propagated internally.
+  - `{agent}_session_prompt`: Sends a prompt message (`message`, optional `session_id`, optional `timeout_secs`, optional `token_budget`) to a sub-agent session, returning the sub-agent's final response text or a synthesized termination result. The parent session ID is propagated internally.
   - `{agent}_session_load`: Reads prior event history for an existing sub-agent session log.
   - `{agent}_session_cancel`: Cancels an in-flight prompt on a sub-agent session.
 - **Route-aware execution**: On persistent clusters, sub-agent turns use the
@@ -397,6 +397,66 @@ same child session. Token usage accumulates every model call made directly by
 that child; tool count includes tools started directly by it. Nested agents'
 model and tool events stay on their own progress rows and are not double
 counted in the parent invocation.
+
+### Per-Invocation Execution Limits & Sub-Agent Termination
+
+Parent agents can pass per-invocation execution limits when calling `{agent}_session_prompt`:
+
+- `timeout_secs` (integer, seconds): Maximum time allowed for the sub-agent invocation. Passing `0` or omitting the argument sets no time limit.
+- `token_budget` (integer, tokens): Maximum cumulative tokens allowed for the sub-agent invocation. Passing `0` or omitting the argument sets no token limit.
+
+Interactive user paths (TUI and Web UI) are unbounded by design.
+
+#### Result Envelope on Limit Reached
+
+When a sub-agent invocation reaches a timeout or token budget limit:
+1. The child session turn is hard-cancelled through the background cancellation path.
+2. The sub-agent tool completes as a normal `Ok` tool result (not a tool execution error).
+3. The returned JSON object includes a synthesized explanation in `response`, plus a structured `termination` sub-object:
+
+```json
+{
+  "session_id": "01948a3f-7b1c-7123-8901-abcdef123456",
+  "response": "The invocation was stopped after reaching its time limit.\n\nNo thinking text was captured (the non-streaming path produces none mid-call).\n\nYou can retry by sending a new message to the same session id `01948a3f-7b1c-7123-8901-abcdef123456` with revised or narrower instructions.\n\nUsage: used 165 budgeted tokens.",
+  "sub_agent": {
+    "agent": "researcher",
+    "session_id": "01948a3f-7b1c-7123-8901-abcdef123456"
+  },
+  "sub_agent_progress": {
+    "invocation_id": "8aa9a68a-034e-4df3-a9cf-6db978644f30",
+    "agent": "researcher",
+    "session_id": "01948a3f-7b1c-7123-8901-abcdef123456",
+    "status": "done",
+    "elapsed_ms": 30012,
+    "usage": {
+      "input_tokens": 120,
+      "output_tokens": 45,
+      "cached_tokens": 0
+    },
+    "tool_call_count": 1
+  },
+  "termination": {
+    "kind": "timeout",
+    "session_id": "01948a3f-7b1c-7123-8901-abcdef123456",
+    "usage": {
+      "input_uncached": 120,
+      "cache_write": 0,
+      "output": 45,
+      "budgeted": 165
+    },
+    "thinking_excerpt": null,
+    "retry_hint": "You can retry by sending a new message to the same session id `01948a3f-7b1c-7123-8901-abcdef123456` with revised or narrower instructions."
+  }
+}
+```
+
+The parent agent can inspect `termination.kind` (`"timeout"` or `"budget_exceeded"`) and retry by sending a new message to the same `session_id`.
+
+#### Design Guarantees & Limitations
+
+- **Budget metric & scope**: Token budget metric is `(input_tokens - cached_tokens) + output_tokens` (uncached input + cache writes + output; cache reads excluded). It applies per invocation as a fresh delta; retrying a session starts a clean token budget allowance. Workers evaluate budget before each model call, so at least one model call executes when `token_budget > 0`.
+- **Enforcement asymmetry**: `timeout_secs` is enforced on the caller side and stops invocations whose calling session remains alive. If a calling process dies while waiting, caller-side timeout does not stop the detached sub-agent worker. However, `token_budget` is enforced worker-side before model calls, bounding cost even for orphaned workers.
+- **Thinking excerpts**: Non-streaming model calls do not yield intermediate thinking text during an active request, so mid-call timeouts produce an empty thinking excerpt ("none captured"). Budget limits trigger at turn boundaries and can capture thinking excerpts when streaming is enabled.
 
 ### Live Event Streaming for User Interfaces
 

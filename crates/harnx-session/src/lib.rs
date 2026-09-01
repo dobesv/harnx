@@ -32,6 +32,8 @@ pub fn build_context(
         instance_id: harnx_core::instance::ServerScope::new(),
         config: prompt_config,
         abort_signal,
+        token_budget: None,
+        usage_at_start: Default::default(),
         call_fn,
         on_tool_round,
         on_text_response: None,

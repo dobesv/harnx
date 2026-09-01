@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use harnx::test_utils::interrupt::{
     script_call_trivial_tool, script_call_wait_tool, script_stall_streaming, send_sigint,
-    spawn_oneshot, spawn_oneshot_final_only, spawn_oneshot_in_tmux, spawn_tui, wait_for_cmd_exit,
-    wait_for_exit, wait_for_prompt_return, write_minimal_config, write_with_blocking_hook,
-    write_with_wait_tool,
+    spawn_oneshot, spawn_oneshot_final_only, spawn_oneshot_in_tmux, spawn_oneshot_with_args,
+    spawn_tui, wait_for_cmd_exit, wait_for_exit, wait_for_prompt_return, write_minimal_config,
+    write_with_blocking_hook, write_with_wait_tool,
 };
 use harnx::test_utils::mock_openai_server::{
     MockOpenAiError, MockOpenAiScript, MockOpenAiServer, MockOpenAiTurn,
@@ -31,6 +31,24 @@ fn wait_for_mock_request(mock: &MockOpenAiServer) -> Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
     Ok(())
+}
+
+fn collect_child_output(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, String, String)> {
+    use std::io::Read;
+
+    let status = wait_for_exit(child, timeout)?;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_string(&mut stdout)?;
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr)?;
+    }
+    Ok((status, stdout, stderr))
 }
 
 #[test]
@@ -78,6 +96,74 @@ fn one_shot_local_turn_runs_over_nats() -> Result<()> {
             && stderr.contains("harnx -a default -s "),
         "one-shot should report its resumable session: {stderr:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn one_shot_timeout_emits_contract_then_same_session_retry_succeeds() -> Result<()> {
+    harnx_core::require_nextest();
+    if std::process::Command::new("nats-server")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!(
+            "nats-server unavailable; skipping one_shot_timeout_emits_contract_then_same_session_retry_succeeds"
+        );
+        return Ok(());
+    }
+
+    let mock = MockOpenAiServer::start(MockOpenAiScript {
+        turns: vec![MockOpenAiTurn {
+            text_chunks: vec!["partial".to_string(), "too late".to_string()],
+            ..Default::default()
+        }],
+        fallback_text: "same-session retry succeeded".to_string(),
+        chunk_delay_ms: 2_000,
+    })?;
+    let tmp = tempfile::tempdir()?;
+    let paths = write_minimal_config(tmp.path(), &format!("http://127.0.0.1:{}/v1", mock.port()))?;
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let mut child = spawn_oneshot_with_args(
+        &paths,
+        &harnx_bin,
+        "time out this turn",
+        &["--final-only", "--timeout-secs", "1"],
+    )?;
+    let (status, stdout, stderr) = collect_child_output(&mut child, Duration::from_secs(10))?;
+
+    assert_eq!(status.code(), Some(2), "stderr: {stderr:?}");
+    assert!(stdout.contains("reaching its time limit"), "{stdout:?}");
+    assert!(
+        stdout.contains("same session id"),
+        "missing same-session retry hint: {stdout:?}"
+    );
+    assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
+    let termination: serde_json::Value = serde_json::from_str(stderr.trim())?;
+    assert_eq!(termination["kind"], "timeout");
+    let session_id = termination["session_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .expect("timeout contract should contain a session id")
+        .to_string();
+
+    // Timeout handling awaits durable Cancel coverage before returning. An
+    // immediate retry exercises the tombstone race that coverage prevents.
+    let mut retry = spawn_oneshot_with_args(
+        &paths,
+        &harnx_bin,
+        "retry after timeout",
+        &["--final-only", "--session", &session_id],
+    )?;
+    let (retry_status, retry_stdout, retry_stderr) =
+        collect_child_output(&mut retry, Duration::from_secs(45))?;
+    assert!(
+        retry_status.success(),
+        "same-session retry exited with {retry_status}; stderr: {retry_stderr:?}"
+    );
+    assert_eq!(retry_stdout, "same-session retry succeeded\n");
+    assert_eq!(retry_stderr, "");
+    assert_eq!(mock.get_request_log().len(), 2);
     Ok(())
 }
 

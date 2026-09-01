@@ -169,6 +169,16 @@ impl Default for SessionLeaseWatchdog {
     }
 }
 
+/// Per-invocation settings for a NATS-backed turn.
+///
+/// Extensible struct for per-invocation parameters. Add future parameters here
+/// rather than breaking the positional `run_turn` signature. The default is
+/// unbounded (all fields `None`), preserving compatibility with interactive callers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RunTurnOptions {
+    pub token_budget: Option<u64>,
+}
+
 /// Configuration for a NATS session.
 #[derive(Clone)]
 pub struct NatsSessionConfig {
@@ -449,11 +459,13 @@ impl NatsSession {
         &self,
         user_msg_seq: u64,
         tool_confirmation_subject: Option<&str>,
+        token_budget: Option<u64>,
     ) -> Result<()> {
         match &self.config.activation_route {
             SessionActivationRoute::ClusterShared => {
                 let activation = SessionActivate::new(&self.session_id)
-                    .with_tool_confirmation_subject(tool_confirmation_subject);
+                    .with_tool_confirmation_subject(tool_confirmation_subject)
+                    .with_token_budget(token_budget);
                 publish_session_activate(&self.jetstream, &self.config.cluster, &activation)
                     .await
                     .context("failed to publish session activation")?;
@@ -464,7 +476,8 @@ impl NatsSession {
             } => {
                 let activation =
                     SessionActivate::targeted(&self.session_id, user_msg_seq, worker_id)
-                        .with_tool_confirmation_subject(tool_confirmation_subject);
+                        .with_tool_confirmation_subject(tool_confirmation_subject)
+                        .with_token_budget(token_budget);
                 publish_targeted_session_activate(
                     &self.jetstream,
                     LocalWorkerTarget::new(session_scope, worker_id)?,
@@ -507,7 +520,7 @@ impl NatsSession {
             .append_user_content(MessageContent::Text(user_message.to_string()))
             .await?;
         let activation_error = self
-            .publish_activation(appended.user_msg_seq, None)
+            .publish_activation(appended.user_msg_seq, None, None)
             .await
             .err();
         Ok(DurableTextEnqueue {
@@ -539,7 +552,7 @@ impl NatsSession {
         if requested_seq_status(&entries, user_msg_seq)? == RequestedSeqStatus::Covered {
             return Ok(None);
         }
-        self.publish_activation(user_msg_seq, None).await?;
+        self.publish_activation(user_msg_seq, None, None).await?;
         Ok(Some(user_msg_seq))
     }
 
@@ -615,11 +628,29 @@ impl NatsSession {
         event_sink: Arc<dyn AgentEventSink>,
         pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
     ) -> Result<NatsTurnResult> {
+        self.run_turn_with_options(
+            user_message,
+            event_sink,
+            pending_cancel,
+            RunTurnOptions::default(),
+        )
+        .await
+    }
+
+    /// Run a text turn with per-invocation settings.
+    pub async fn run_turn_with_options(
+        &self,
+        user_message: &str,
+        event_sink: Arc<dyn AgentEventSink>,
+        pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
+        options: RunTurnOptions,
+    ) -> Result<NatsTurnResult> {
         self.run_turn_content(
             MessageContent::Text(user_message.to_string()),
             event_sink,
             pending_cancel,
             None,
+            options,
         )
         .await
     }
@@ -638,6 +669,7 @@ impl NatsSession {
             event_sink,
             pending_cancel,
             Some(handler),
+            RunTurnOptions::default(),
         )
         .await
     }
@@ -662,8 +694,14 @@ impl NatsSession {
             source_dir,
         )
         .await?;
-        self.run_turn_content(content, event_sink, pending_cancel, None)
-            .await
+        self.run_turn_content(
+            content,
+            event_sink,
+            pending_cancel,
+            None,
+            RunTurnOptions::default(),
+        )
+        .await
     }
 
     /// Run a turn from a composed input while routing `PreToolUse` approval
@@ -687,8 +725,14 @@ impl NatsSession {
             source_dir,
         )
         .await?;
-        self.run_turn_content(content, event_sink, pending_cancel, Some(handler))
-            .await
+        self.run_turn_content(
+            content,
+            event_sink,
+            pending_cancel,
+            Some(handler),
+            RunTurnOptions::default(),
+        )
+        .await
     }
 
     async fn run_turn_content(
@@ -699,6 +743,7 @@ impl NatsSession {
         tool_confirmation_handler: Option<
             Arc<crate::nats_tool_confirmation::ToolConfirmationHandler>,
         >,
+        options: RunTurnOptions,
     ) -> Result<NatsTurnResult> {
         // Step 1: Append user message to durable log BEFORE activating.
         // The worker derives input from the last user message.
@@ -750,8 +795,12 @@ impl NatsSession {
                 ),
                 _ => None,
             };
-        self.publish_activation(user_msg_seq, confirmation_subject.as_deref())
-            .await?;
+        self.publish_activation(
+            user_msg_seq,
+            confirmation_subject.as_deref(),
+            options.token_budget,
+        )
+        .await?;
 
         // Step 4: Stream events and handle control until turn completion.
         let mut event_stream = event_stream;
@@ -1493,6 +1542,13 @@ mod tests {
             self.count.fetch_add(1, Ordering::SeqCst);
             self.events.lock().unwrap().push(event);
         }
+    }
+
+    #[test]
+    fn default_run_turn_options_keep_interactive_callers_unbounded() {
+        // TUI and WebUI use run_turn_input* methods, which delegate with this
+        // default and expose no caller-side timeout argument.
+        assert_eq!(RunTurnOptions::default().token_budget, None);
     }
 
     /// A turn's last flush must not swallow notices just because the durable log

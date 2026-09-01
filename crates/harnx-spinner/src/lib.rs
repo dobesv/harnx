@@ -285,7 +285,14 @@ where
         spinner_ret?;
         task_ret
     } else {
-        task.await
+        tokio::select! {
+            ret = task => ret,
+            _ = wait_abort_signal(&abort_signal) => {
+                // Selecting this branch drops the task future. For non-streaming model
+                // calls, that also cancels the in-flight reqwest request.
+                bail!("Aborted.");
+            },
+        }
     }
 }
 
@@ -324,4 +331,37 @@ async fn run_abortable_spinner(
 
     spinner.clear_message()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harnx_core::abort::create_abort_signal;
+    use tokio::time::{sleep, timeout};
+
+    #[tokio::test]
+    async fn non_tty_abort_interrupts_in_flight_task() {
+        assert!(!is_stdout_terminal(), "test requires non-TTY stdout");
+
+        let abort_signal = create_abort_signal();
+        let abort_trigger = abort_signal.clone();
+        let abort = async move {
+            sleep(Duration::from_millis(25)).await;
+            abort_trigger.set_ctrlc();
+        };
+        let run = timeout(
+            Duration::from_millis(500),
+            abortable_run_with_spinner(
+                std::future::pending::<Result<()>>(),
+                "Waiting",
+                abort_signal,
+            ),
+        );
+
+        let ((), result) = tokio::join!(abort, run);
+        let error = result
+            .expect("abort should interrupt the pending task promptly")
+            .expect_err("aborted task should return an error");
+        assert_eq!(error.to_string(), "Aborted.");
+    }
 }

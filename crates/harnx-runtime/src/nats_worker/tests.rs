@@ -28,6 +28,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
+mod invocation_limit_tests;
 mod subagent_discovery_tests;
 mod transcript_render_tests;
 

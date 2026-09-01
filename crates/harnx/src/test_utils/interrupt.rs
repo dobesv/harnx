@@ -388,7 +388,8 @@ pub fn spawn_oneshot_final_only(
     spawn_oneshot_with_args(paths, harnx_bin, prompt, &["--final-only"])
 }
 
-fn spawn_oneshot_with_args(
+/// Spawns a one-shot command with extra CLI arguments before the prompt separator.
+pub fn spawn_oneshot_with_args(
     paths: &ConfigPaths,
     harnx_bin: &Path,
     prompt: &str,
