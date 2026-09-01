@@ -236,6 +236,7 @@ impl Tui {
             current_prompt_abort: None,
             current_prompt_handle: None,
             active_remote_session: None,
+            tool_confirmation_route: Arc::new(parking_lot::Mutex::new(None)),
             pending_remote_activations: HashSet::new(),
             session_activity_target: None,
             session_activity_handle: None,

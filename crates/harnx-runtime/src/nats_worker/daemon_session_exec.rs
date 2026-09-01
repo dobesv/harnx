@@ -184,15 +184,10 @@ impl WorkerRuntime {
 
                 Self::record_session_turn_end(&backend, &lease, turn_cursor_val).await?;
 
-                // The confirmation subject belongs to the frontend request
-                // that published this activation. A queued continuation may
-                // run after that frontend has returned and dropped its
-                // responder, so it must not retain the stale callback. A new
-                // interactive request publishes its own activation and
-                // turn-scoped subject.
-                if activation.tool_confirmation_subject.is_some() {
-                    per_session.write().set_tui_confirm_tool_use(None);
-                }
+                // The activation carries a frontend-scoped route, not a
+                // turn-scoped responder. Keep it while this activation drains
+                // queued continuations; a detached frontend unsubscribes and
+                // requests to its dead subject fail closed.
 
                 log::info!(
                     "execute_session turn complete: session_id={} turn_cursor={} activation_high_water={:?}",

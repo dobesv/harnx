@@ -196,6 +196,8 @@ impl Tui {
     pub(super) fn sync_session_activity_monitor(&mut self) {
         self.sync_subagent_monitor_root();
         self.sync_known_subagent_rows();
+        let confirmation_target = self.session_activity_destination();
+        self.sync_tool_confirmation_route(confirmation_target.as_ref());
         let desired = self
             .current_prompt_abort
             .is_none()
@@ -232,6 +234,7 @@ impl Tui {
 
 impl Drop for Tui {
     fn drop(&mut self) {
+        self.clear_tool_confirmation_route();
         self.stop_session_activity_monitor();
         self.stop_subagent_monitors();
     }

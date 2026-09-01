@@ -13,7 +13,10 @@ use harnx_runtime::test_utils::{MockClient, MockTurnBuilder};
 use parking_lot::RwLock;
 use ratatui::style::Modifier;
 use ratatui::text::Line;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::sync::Notify;
 
@@ -8708,4 +8711,178 @@ fn messages_to_transcript_items_renders_tool_message_with_seq() {
             .any(|item| matches!(item, TranscriptItem::ToolCall { seq: Some(5), .. })),
         "tool message should render into targetable tool transcript rows"
     );
+}
+
+#[tokio::test]
+async fn confirm_tool_modal_options_always_visible_with_long_input() {
+    let mut harness = TuiTestHarness::new().await;
+    // Set a very small terminal so it's guaranteed to be constrained
+    harness.terminal.backend_mut().resize(80, 20);
+
+    let long_input = r#"{"prompt":"Execute handoff immediately. I am going to write a very long sentence here to make sure that the input preview takes up a lot of space, way more than would normally fit in the terminal, so that it forces the modal to clip its contents. But wait, there is more! Here is some extra data to push it over the edge."}"#;
+
+    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmToolUse {
+        tool_name: "atlas_session_handoff".to_string(),
+        input_preview: long_input.to_string(),
+        reason: Some("Hand off this plan to another agent?".to_string()),
+    });
+
+    harness.render();
+    let contents = harness.screen_contents();
+    let rendered = normalize_screen(&contents);
+
+    // Assert that the title is visible
+    assert!(
+        rendered.contains("Allow tool 'atlas_session_handoff'?"),
+        "Tool name header not found"
+    );
+
+    // Assert that the options text is fully visible (which was getting pushed off screen previously)
+    assert!(
+        rendered.contains("[y] allow   [n] deny   (Enter/Esc denies)"),
+        "Options text not found. The modal likely clipped it!"
+    );
+}
+
+#[tokio::test]
+async fn confirm_tool_modal_renders_on_short_terminals_without_panicking() {
+    let long_input = r#"{"prompt":"A long confirmation input that must be clipped while the footer remains visible. Repeat: A long confirmation input that must be clipped while the footer remains visible."}"#;
+
+    for height in [10, 6] {
+        let mut harness = TuiTestHarness::with_size(80, height).await;
+        harness.tui().app.modal = Some(crate::types::ModalState::ConfirmToolUse {
+            tool_name: "atlas_session_handoff".to_string(),
+            input_preview: long_input.to_string(),
+            reason: Some("Confirm this handoff?".to_string()),
+        });
+
+        harness.render();
+        let rendered = normalize_screen(&harness.screen_contents());
+        assert!(
+            rendered.contains("[y] allow   [n] deny   (Enter/Esc denies)"),
+            "confirmation footer missing at terminal height {height}: {rendered}"
+        );
+    }
+}
+
+fn test_confirmation_route(
+    shutdown: &Arc<AtomicBool>,
+) -> crate::types::ToolConfirmationRouteHandle {
+    crate::types::ToolConfirmationRouteHandle::Test(Arc::clone(shutdown))
+}
+
+fn assert_test_confirmation_route(
+    route: &crate::types::ToolConfirmationRouteHandle,
+    expected: &Arc<AtomicBool>,
+) {
+    match route {
+        crate::types::ToolConfirmationRouteHandle::Test(actual) => {
+            assert!(Arc::ptr_eq(actual, expected));
+        }
+        crate::types::ToolConfirmationRouteHandle::Nats(_) => {
+            panic!("expected test confirmation route")
+        }
+    }
+}
+
+#[test]
+fn tool_confirmation_route_slot_reuses_same_target() {
+    let routes = Arc::new(parking_lot::Mutex::new(None));
+    let target = ("session-a".to_string(), "cluster-a".to_string());
+    let existing_shutdown = Arc::new(AtomicBool::new(false));
+    let redundant_shutdown = Arc::new(AtomicBool::new(false));
+
+    let installed = crate::prompt::install_tool_confirmation_route(
+        &routes,
+        target.clone(),
+        test_confirmation_route(&existing_shutdown),
+    );
+    assert_test_confirmation_route(&installed, &existing_shutdown);
+
+    let matched = crate::prompt::matching_tool_confirmation_route(&routes, &target)
+        .expect("same target should reuse installed route");
+    assert_test_confirmation_route(&matched, &existing_shutdown);
+
+    let reused = crate::prompt::install_tool_confirmation_route(
+        &routes,
+        target,
+        test_confirmation_route(&redundant_shutdown),
+    );
+    assert_test_confirmation_route(&reused, &existing_shutdown);
+    assert!(!existing_shutdown.load(Ordering::SeqCst));
+    assert!(
+        redundant_shutdown.load(Ordering::SeqCst),
+        "redundant same-target route must shut down"
+    );
+}
+
+#[test]
+fn tool_confirmation_route_slot_evicts_stale_target() {
+    let routes = Arc::new(parking_lot::Mutex::new(None));
+    let target_a = ("session-a".to_string(), "cluster-a".to_string());
+    let target_b = ("session-b".to_string(), "cluster-a".to_string());
+    let shutdown_a = Arc::new(AtomicBool::new(false));
+    let shutdown_b = Arc::new(AtomicBool::new(false));
+
+    crate::prompt::install_tool_confirmation_route(
+        &routes,
+        target_a.clone(),
+        test_confirmation_route(&shutdown_a),
+    );
+    let installed_b = crate::prompt::install_tool_confirmation_route(
+        &routes,
+        target_b.clone(),
+        test_confirmation_route(&shutdown_b),
+    );
+
+    assert!(shutdown_a.load(Ordering::SeqCst));
+    assert!(!shutdown_b.load(Ordering::SeqCst));
+    assert_test_confirmation_route(&installed_b, &shutdown_b);
+    assert!(crate::prompt::matching_tool_confirmation_route(&routes, &target_a).is_none());
+    let matched_b = crate::prompt::matching_tool_confirmation_route(&routes, &target_b)
+        .expect("new target should occupy route slot");
+    assert_test_confirmation_route(&matched_b, &shutdown_b);
+}
+
+#[tokio::test]
+async fn tui_sync_and_clear_shut_down_confirmation_routes() {
+    let mut harness = TuiTestHarness::new().await;
+    let tui = harness.tui();
+    let target_a = ("session-a".to_string(), "cluster-a".to_string());
+    let target_b = ("session-b".to_string(), "cluster-a".to_string());
+    let sync_shutdown = Arc::new(AtomicBool::new(false));
+
+    crate::prompt::install_tool_confirmation_route(
+        &tui.tool_confirmation_route,
+        target_a.clone(),
+        test_confirmation_route(&sync_shutdown),
+    );
+    tui.sync_tool_confirmation_route(Some(&target_a));
+    assert!(!sync_shutdown.load(Ordering::SeqCst));
+    assert!(crate::prompt::matching_tool_confirmation_route(
+        &tui.tool_confirmation_route,
+        &target_a
+    )
+    .is_some());
+
+    tui.sync_tool_confirmation_route(Some(&target_b));
+    assert!(sync_shutdown.load(Ordering::SeqCst));
+    assert!(tui.tool_confirmation_route.lock().is_none());
+
+    let clear_shutdown = Arc::new(AtomicBool::new(false));
+    crate::prompt::install_tool_confirmation_route(
+        &tui.tool_confirmation_route,
+        target_b,
+        test_confirmation_route(&clear_shutdown),
+    );
+    tui.clear_tool_confirmation_route();
+    assert!(clear_shutdown.load(Ordering::SeqCst));
+    assert!(tui.tool_confirmation_route.lock().is_none());
+}
+
+#[test]
+fn tool_confirmation_json_fence_exceeds_content_backticks() {
+    let markdown = crate::render::fenced_json_markdown(r#"{"value":"```inside````"}"#);
+    assert!(markdown.starts_with("`````json\n"));
+    assert!(markdown.ends_with("\n`````"));
 }
