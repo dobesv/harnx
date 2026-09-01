@@ -22,6 +22,8 @@ pub struct SessionActivate {
     pub requested_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
     /// Ephemeral Core NATS subject owned by the frontend that activated this
     /// turn. Workers use it only when a `PreToolUse` hook asks the user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -35,6 +37,7 @@ impl SessionActivate {
             epoch: Utc::now().to_rfc3339(),
             requested_seq: None,
             target_worker_id: None,
+            token_budget: None,
             tool_confirmation_subject: None,
         }
     }
@@ -53,6 +56,11 @@ impl SessionActivate {
 
     pub fn with_tool_confirmation_subject(mut self, subject: Option<&str>) -> Self {
         self.tool_confirmation_subject = subject.map(str::to_string);
+        self
+    }
+
+    pub fn with_token_budget(mut self, token_budget: Option<u64>) -> Self {
+        self.token_budget = token_budget;
         self
     }
 
@@ -77,12 +85,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn activation_payload_contains_only_session_routing_state() {
+    fn activation_payload_without_token_budget_round_trips() {
         let legacy = br#"{"session_id":"s1","epoch":"now"}"#;
         let activation: SessionActivate = serde_json::from_slice(legacy).unwrap();
         assert_eq!(activation.requested_seq, None);
         assert_eq!(activation.target_worker_id, None);
+        assert_eq!(activation.token_budget, None);
         assert_eq!(activation.tool_confirmation_subject, None);
         assert_eq!(activation.msg_id(), "s1:now");
+
+        let encoded = serde_json::to_value(&activation).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({ "session_id": "s1", "epoch": "now" })
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionActivate>(encoded).unwrap(),
+            activation
+        );
+    }
+
+    #[test]
+    fn activation_payload_with_token_budget_round_trips() {
+        let activation = SessionActivate::new("s1").with_token_budget(Some(4_096));
+        let encoded = serde_json::to_value(&activation).unwrap();
+        assert_eq!(encoded["token_budget"], 4_096);
+        assert_eq!(
+            serde_json::from_value::<SessionActivate>(encoded).unwrap(),
+            activation
+        );
     }
 }

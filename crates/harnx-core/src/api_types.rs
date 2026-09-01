@@ -102,6 +102,15 @@ impl CompletionTokenUsage {
     pub fn is_empty(&self) -> bool {
         self.input_tokens == 0 && self.output_tokens == 0
     }
+
+    /// Token count for budgeting purposes.
+    ///
+    /// Cache reads (`cached_tokens`) are excluded — they're the re-sent stable
+    /// prefix that grows each turn and cost ~nothing. Cache writes
+    /// (`cache_write_tokens`) are counted — they're new content.
+    pub fn budgeted_tokens(&self) -> u64 {
+        self.input_tokens.saturating_sub(self.cached_tokens) + self.output_tokens
+    }
 }
 
 impl std::fmt::Display for CompletionTokenUsage {
@@ -213,6 +222,36 @@ mod tests {
 
         assert_eq!(usage.cache_write_tokens, 0);
         assert_eq!(output.cache_write_tokens, None);
+    }
+
+    #[test]
+    fn budgeted_tokens_excludes_cache_reads_keeps_cache_writes() {
+        // Zero cache: straight sum.
+        let zero_cache = CompletionTokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        assert_eq!(zero_cache.budgeted_tokens(), 150);
+
+        // Cache-heavy read: reads excluded.
+        let cache_read = CompletionTokenUsage {
+            input_tokens: 1000,
+            output_tokens: 50,
+            cached_tokens: 800,
+            cache_write_tokens: 0,
+        };
+        assert_eq!(cache_read.budgeted_tokens(), 250);
+
+        // Cache write present: writes counted (not subtracted).
+        let cache_write = CompletionTokenUsage {
+            input_tokens: 1000,
+            output_tokens: 50,
+            cached_tokens: 200,
+            cache_write_tokens: 300,
+        };
+        assert_eq!(cache_write.budgeted_tokens(), 850);
     }
 }
 

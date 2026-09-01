@@ -563,7 +563,7 @@ fn entries_after_last_barrier(entries: &[SessionLogEntry]) -> &[SessionLogEntry]
         .iter()
         .enumerate()
         .rev()
-        .find_map(|(index, entry)| is_final_assistant_message(entry).then_some(index));
+        .find_map(|(index, entry)| is_terminal_barrier(entry).then_some(index));
 
     last_barrier.map_or(entries, |index| &entries[index + 1..])
 }
@@ -575,7 +575,7 @@ fn entries_after_last_barrier_with_seq(
         .iter()
         .enumerate()
         .rev()
-        .find_map(|(index, (_, entry))| is_final_assistant_message(entry).then_some(index));
+        .find_map(|(index, (_, entry))| is_terminal_barrier(entry).then_some(index));
 
     last_barrier.map_or_else(
         || entries.iter().map(|(seq, e)| (*seq, e)).collect(),
@@ -588,18 +588,20 @@ fn entries_after_last_barrier_with_seq(
     )
 }
 
-fn is_final_assistant_message(entry: &SessionLogEntry) -> bool {
-    // A barrier is any final assistant text Message. Tool calls live in separate
-    // `ToolCalls` entries, so an assistant `Message` always marks the end of a
-    // completed turn. The fence_token is `Some(..)` for worker-originated (NATS HA)
-    // turns and `None` for local-mode turns — BOTH are barriers. The client-side
-    // `id` is irrelevant to barrier detection.
+fn is_terminal_barrier(entry: &SessionLogEntry) -> bool {
+    // Tool calls live in separate `ToolCalls` entries, so an assistant Message
+    // closes a successful turn. Error closes a failed turn and prevents a
+    // completed tool round from being resumed after the worker stops.
+    //
+    // Invariant: a terminal Error ends reconstruction; later user messages
+    // start a fresh turn. This barrier is required for budget-terminal handling
+    // and also fixes a latent replay gap for ordinary worker errors.
     matches!(
         entry,
         SessionLogEntry::Message {
             role: MessageRole::Assistant,
             ..
-        }
+        } | SessionLogEntry::Error { .. }
     )
 }
 
@@ -609,6 +611,13 @@ mod tests {
     use crate::message::MessageContent;
     use serde_json::json;
 
+    fn worker_error(fence_token: u64) -> SessionLogEntry {
+        SessionLogEntry::Error {
+            message: "worker failed".to_string(),
+            fence_token,
+            timestamp: None,
+        }
+    }
     #[test]
     fn empty_log_is_idle_with_no_next_turn_messages() {
         assert_case(
@@ -625,6 +634,32 @@ mod tests {
             vec![final_assistant("done")],
             ExpectedState::Idle {
                 next_turn_messages: &[],
+            },
+        );
+    }
+
+    #[test]
+    fn error_is_terminal_and_later_user_starts_next_turn() {
+        let failed_turn = vec![
+            user_message("u1"),
+            tool_calls_assistant(7),
+            tool_results("tool-a"),
+            worker_error(7),
+        ];
+        assert_case(
+            failed_turn.clone(),
+            ExpectedState::Idle {
+                next_turn_messages: &[],
+            },
+        );
+
+        assert_case(
+            failed_turn
+                .into_iter()
+                .chain([user_message("u2")])
+                .collect(),
+            ExpectedState::Idle {
+                next_turn_messages: &["u2"],
             },
         );
     }

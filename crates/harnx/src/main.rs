@@ -37,6 +37,10 @@ use std::{sync::Arc, time::Duration};
 
 use harnx_runtime::remote_session_cleanup::{run_remote_cleanup, RemoteCleanupStats};
 
+fn invocation_limit_reached(error: &anyhow::Error) -> bool {
+    error.is::<oneshot_nats::InvocationLimitReached>()
+}
+
 /// Routing decision for `--list-sessions` handler.
 /// Extracted as a pure function for testability.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,8 +106,11 @@ async fn main() -> Result<()> {
 
     let result = run_main(cli).await;
     telemetry.shutdown().await;
-    if let Some(err) = result? {
-        render_error(err);
+    if let Some(error) = result? {
+        if invocation_limit_reached(&error) {
+            std::process::exit(oneshot_nats::INVOCATION_LIMIT_EXIT_CODE);
+        }
+        render_error(error);
         std::process::exit(1);
     }
     Ok(())
@@ -480,12 +487,19 @@ async fn run_one_shot(
     }
     let input = create_input(config, text, &cli.file, abort_signal.clone()).await?;
     let aborted_check = abort_signal.clone();
-    let result = start_directive(config, input, abort_signal, cli.final_only).await;
+    let options = oneshot_nats::InvocationOptions::new(
+        abort_signal,
+        cli.final_only,
+        cli.timeout_secs,
+        cli.token_budget,
+    );
+    let result = start_directive(config, input, options).await;
     exit_session(config, !cli.final_only)?;
-    if aborted_check.aborted() {
-        bail!("interrupted by user");
+    match result {
+        Err(error) if invocation_limit_reached(&error) => Err(error),
+        _ if aborted_check.aborted() => bail!("interrupted by user"),
+        result => result,
     }
-    result
 }
 
 fn session_resume_command(config: &GlobalConfig) -> Option<String> {
@@ -620,10 +634,10 @@ fn exit_session(config: &GlobalConfig, show_resume_hint: bool) -> Result<()> {
 async fn start_directive(
     config: &GlobalConfig,
     mut input: Input,
-    abort_signal: AbortSignal,
-    final_only: bool,
+    options: oneshot_nats::InvocationOptions,
 ) -> Result<()> {
-    crate::config::input::use_embeddings(&mut input, config, abort_signal.clone()).await?;
+    crate::config::input::use_embeddings(&mut input, config, options.abort_signal().clone())
+        .await?;
 
     let (agent, cluster, session_id) = {
         let cfg = config.read();
@@ -644,7 +658,7 @@ async fn start_directive(
     let activation_route = harnx_runtime::local_orchestrator::activation_route_for_cluster(
         &cluster,
         &local_worker,
-        abort_signal.clone(),
+        options.abort_signal().clone(),
     )
     .await?;
 
@@ -660,53 +674,33 @@ async fn start_directive(
             activation_route,
         },
         config,
-        abort_signal,
+        options.abort_signal().clone(),
     )
     .await
     .context("failed to create NATS session")?;
-    if let Some(heading) = one_shot_session_heading(final_only, &agent, session.session_id()) {
+    if let Some(heading) =
+        one_shot_session_heading(options.final_only(), &agent, session.session_id())
+    {
         eprintln!("{heading}");
     }
     let sink = harnx_core::sink::current_agent_event_sink()
         .context("CLI agent event sink is not installed")?;
-    let tracking_sink = Arc::new(oneshot_nats::AssistantTextTrackingSink::new(sink));
-    let result = session
-        .run_turn(&input.text(), tracking_sink.clone(), None)
-        .await?;
-
-    let worker_error = result.error.clone();
-    finish_one_shot_output(final_only, &tracking_sink, result);
-    // A worker-side failure must not exit 0 — scripts driving one-shot mode
-    // rely on the exit code to tell an answer from a dead turn.
-    match worker_error {
-        Some(error) => Err(anyhow::anyhow!(error)),
-        None => Ok(()),
-    }
-}
-
-fn finish_one_shot_output(
-    final_only: bool,
-    tracking_sink: &oneshot_nats::AssistantTextTrackingSink,
-    result: harnx_runtime::NatsTurnResult,
-) {
-    if final_only {
-        print_final_response(&result);
-    } else {
-        tracking_sink.emit_durable_response_if_needed(result);
-    }
-}
-
-fn print_final_response(result: &harnx_runtime::NatsTurnResult) {
-    if result.was_cancelled || result.error.is_some() {
-        return;
-    }
-    let Some(response) = result.response.as_deref().filter(|text| !text.is_empty()) else {
-        return;
-    };
-    print!("{response}");
-    if !response.ends_with('\n') {
-        println!();
-    }
+    let buffering_sink = Arc::new(harnx_runtime::InvocationBufferingSink::new(sink));
+    let tracking_sink = Arc::new(oneshot_nats::AssistantTextTrackingSink::new(
+        buffering_sink.clone(),
+    ));
+    let input_text = input.text();
+    let result =
+        oneshot_nats::run_turn(&session, &input_text, tracking_sink.clone(), &options).await?;
+    oneshot_nats::finish_turn(
+        result,
+        oneshot_nats::TurnOutput {
+            session_id: session.session_id(),
+            buffering_sink: &buffering_sink,
+            tracking_sink: &tracking_sink,
+            options: &options,
+        },
+    )
 }
 
 async fn start_interactive(config: &GlobalConfig) -> Result<()> {

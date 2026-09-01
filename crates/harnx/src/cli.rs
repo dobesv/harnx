@@ -55,6 +55,12 @@ pub struct Cli {
     /// Print only the final response in non-interactive mode
     #[clap(long, global = true, hide = true)]
     pub final_only: bool,
+    /// Maximum one-shot invocation duration in seconds (0 or unset means no limit)
+    #[clap(long, value_name = "SECONDS", global = true)]
+    pub timeout_secs: Option<u64>,
+    /// Maximum budgeted tokens for one-shot invocation (0 or unset means unlimited)
+    #[clap(long, value_name = "TOKENS", global = true)]
+    pub token_budget: Option<u64>,
     /// Display the message without sending it
     #[clap(long, global = true, hide = true)]
     pub dry_run: bool,
@@ -193,7 +199,7 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Commands, InfoSubcommands, SessionSubcommands};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn parses_info_agent_subcommand() {
@@ -251,6 +257,51 @@ mod tests {
                 }))
             );
         }
+    }
+
+    #[test]
+    fn parses_prompt_invocation_limits_before_or_after_subcommand() {
+        let before = Cli::try_parse_from([
+            "harnx",
+            "--timeout-secs",
+            "12",
+            "--token-budget",
+            "345",
+            "prompt",
+            "hello",
+        ])
+        .unwrap();
+        let after = Cli::try_parse_from([
+            "harnx",
+            "prompt",
+            "--timeout-secs",
+            "12",
+            "--token-budget",
+            "345",
+            "hello",
+        ])
+        .unwrap();
+
+        for cli in [before, after] {
+            assert_eq!(cli.timeout_secs, Some(12));
+            assert_eq!(cli.token_budget, Some(345));
+        }
+    }
+
+    #[test]
+    fn prompt_help_exposes_invocation_limits() {
+        let mut command = Cli::command();
+        command.build();
+        let help = command
+            .find_subcommand_mut("prompt")
+            .expect("prompt subcommand")
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("--timeout-secs <SECONDS>"));
+        assert!(help.contains("0 or unset means no limit"));
+        assert!(help.contains("--token-budget <TOKENS>"));
+        assert!(help.contains("0 or unset means unlimited"));
     }
 
     #[test]
