@@ -3,10 +3,8 @@
 //! subscription, and handing the claimed session off to execution.
 
 use super::backend::NatsSessionLogBackend;
-use super::control::{control_subject, ControlCommand};
-use super::daemon::{
-    should_append_control_log_entry, SessionActivate, SessionActivationRoute, WorkerActivationMode,
-};
+use super::control::{control_subject, SessionControlHandler};
+use super::daemon::{SessionActivate, SessionActivationRoute, WorkerActivationMode};
 use super::daemon_background::BackgroundServices;
 use super::server_reconciler::{tool_servers_for_activation, ServerReconciler};
 use crate::config::GlobalConfig;
@@ -608,36 +606,12 @@ impl WorkerRuntime {
             .flush()
             .await
             .context("flush session control subscription")?;
-        let ctrl_abort = ctx.abort_signal.clone();
-        let ctrl_lease = Arc::clone(ctx.lease);
-        let ctrl_backend = ctx.backend.clone();
-        Ok(tokio::spawn(async move {
-            use futures_util::StreamExt;
-            let mut messages = subscriber;
-            while let Some(msg) = messages.next().await {
-                // Parse the control command.
-                let Ok(command) = ControlCommand::from_bytes(&msg.payload) else {
-                    log::debug!("invalid control command payload, ignoring");
-                    continue;
-                };
-                match command {
-                    ControlCommand::Cancel => {
-                        // Worker-originated: append Cancel entry (worker's fence token),
-                        // THEN fire AbortSignal.
-                        if should_append_control_log_entry(&ctrl_lease) {
-                            let cancel_entry = harnx_core::session::SessionLogEntry::Cancel {
-                                fence_token: ctrl_lease.fence_token(),
-                            };
-                            // Append BEFORE firing abort; if append fails, still abort (safe).
-                            if let Err(e) = ctrl_backend.append_event_blocking(&cancel_entry) {
-                                log::warn!("failed to append Cancel entry: {e}");
-                            }
-                        }
-                        ctrl_abort.set_ctrlc();
-                    }
-                }
-            }
-        }))
+        // A request/reply acknowledgement is sent only after the worker has
+        // written the fenced Cancel entry. It is published before firing abort
+        // so execute_session cannot tear down this listener in between.
+        let handler =
+            SessionControlHandler::new(ctx.client, ctx.lease, ctx.backend, ctx.abort_signal);
+        Ok(tokio::spawn(handler.listen(subscriber)))
     }
 }
 

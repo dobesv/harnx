@@ -205,6 +205,16 @@ fn kill_process(pid: u32) {
     );
 }
 
+fn stop_process(pid: u32) {
+    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
+    assert_eq!(
+        result,
+        0,
+        "stop worker {pid}: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
 fn process_exists(pid: u32) -> bool {
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
@@ -292,6 +302,37 @@ async fn crash_and_respawn(frontend: &mut LocalWorkerSupervisor, old_pid: u32) -
         assert!(Instant::now() < deadline, "worker was not respawned");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn running_worker_without_readiness_heartbeats_is_replaced() {
+    require_nextest();
+    let Some(binary) = skip_without_binaries() else {
+        return;
+    };
+    let root = tempfile::tempdir().expect("create isolated supervisor environment");
+    let _environment = isolated_environment(root.path());
+    write_trivial_agent_config(root.path(), "http://127.0.0.1:1/v1");
+
+    let mut supervisor =
+        LocalWorkerSupervisor::start_with_worker_binary(binary, create_abort_signal())
+            .await
+            .expect("start frontend worker");
+    let stalled_pid = supervisor.worker_pid().expect("worker PID");
+    let route = supervisor.route().clone();
+    stop_process(stalled_pid);
+
+    let recovered_route = supervisor
+        .ensure(create_abort_signal())
+        .await
+        .expect("replace unresponsive frontend worker");
+    let replacement_pid = supervisor.worker_pid().expect("replacement worker PID");
+
+    assert_ne!(replacement_pid, stalled_pid);
+    assert_eq!(recovered_route, route);
+    wait_for_process_exit(stalled_pid).await;
+    drop(supervisor);
+    wait_for_process_exit(replacement_pid).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

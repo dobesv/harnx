@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+const DURABLE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttachmentOutcome {
@@ -169,30 +170,59 @@ async fn monitor_subagent_attachment(
     if status != SubAgentStatus::Running {
         return AttachmentOutcome::Terminal;
     }
-    while let Some(envelope) = stream.next().await {
-        if !stream.should_render(&envelope) || !boundary.follows_attach(envelope.after_seq) {
-            continue;
-        }
-        let terminal = is_subagent_terminal_event(&envelope.event);
-        if event_tx
-            .send(TuiEvent::SubAgentSessionEvent {
-                key: key.clone(),
-                event: envelope.event,
-            })
-            .is_err()
-        {
-            return AttachmentOutcome::Disconnected;
-        }
-        if terminal {
-            return match refresh_terminal_subagent_snapshot(config, event_tx, key).await {
-                Some(SubAgentStatus::Completed | SubAgentStatus::Failed) => {
-                    AttachmentOutcome::Terminal
+    let Some(client) = stream_client(config, &key.cluster).await else {
+        return AttachmentOutcome::Disconnected;
+    };
+    let jetstream = async_nats::jetstream::new(client);
+    let mut lease_watchdog = harnx_runtime::SessionLeaseWatchdog::new();
+    loop {
+        match tokio::time::timeout(DURABLE_REFRESH_INTERVAL, stream.next()).await {
+            Ok(Some(envelope)) => {
+                if !stream.should_render(&envelope) || !boundary.follows_attach(envelope.after_seq)
+                {
+                    continue;
                 }
-                Some(SubAgentStatus::Running) | None => AttachmentOutcome::Disconnected,
-            };
+                let terminal = is_subagent_terminal_event(&envelope.event);
+                if event_tx
+                    .send(TuiEvent::SubAgentSessionEvent {
+                        key: key.clone(),
+                        event: envelope.event,
+                    })
+                    .is_err()
+                {
+                    return AttachmentOutcome::Disconnected;
+                }
+                if terminal {
+                    return match refresh_terminal_subagent_snapshot(config, event_tx, key).await {
+                        Some(SubAgentStatus::Completed | SubAgentStatus::Failed) => {
+                            AttachmentOutcome::Terminal
+                        }
+                        Some(SubAgentStatus::Running) | None => AttachmentOutcome::Disconnected,
+                    };
+                }
+            }
+            Ok(None) => return AttachmentOutcome::Disconnected,
+            Err(_) => {
+                if stream.refresh_history().await.is_err() {
+                    return AttachmentOutcome::Disconnected;
+                }
+                if subagent_history_status(stream.history()) != SubAgentStatus::Running {
+                    let _ = send_subagent_snapshot(config, event_tx, key, stream.history()).await;
+                    return AttachmentOutcome::Terminal;
+                }
+                if let Some(reason) = lease_watchdog.check(&jetstream, &key.session_id).await {
+                    let mut transcript = load_subagent_transcript(config, key).await;
+                    transcript.push(TranscriptItem::ErrorText(reason));
+                    let _ = event_tx.send(TuiEvent::SubAgentSessionSnapshot {
+                        key: key.clone(),
+                        transcript,
+                        status: SubAgentStatus::Failed,
+                    });
+                    return AttachmentOutcome::Terminal;
+                }
+            }
         }
     }
-    AttachmentOutcome::Disconnected
 }
 
 async fn refresh_terminal_subagent_snapshot(
