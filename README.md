@@ -208,9 +208,15 @@ Use standalone `harnx-serve` binary for HTTP deployment:
 
 ```sh
 $ harnx-serve --addr 127.0.0.1:8000
-Embeddings API:       http://127.0.0.1:8000/v1/embeddings
-Rerank API:           http://127.0.0.1:8000/v1/rerank
+Web UI:                http://127.0.0.1:8000/
+Embeddings API (POST): http://127.0.0.1:8000/v1/embeddings
+Rerank API (POST):     http://127.0.0.1:8000/v1/rerank
 ```
+
+Open the Web UI URL in a browser (requires the web-ui assets — installed by
+`cargo xtask install`, or pass `--web-assets <dir>`). The API lines are POST-only
+endpoints for programmatic use. When binding to a wildcard host (e.g. `0.0.0.0`),
+the printed URL uses loopback (`127.0.0.1`) so it's directly clickable.
 
 Pass `--model <MODEL>` or `--dry-run` as needed.
 For interactive agent sessions, use AG-UI control plane exposed by `harnx-serve` under `/v1/agents`. See [crates/harnx-serve/README.md](crates/harnx-serve/README.md).
