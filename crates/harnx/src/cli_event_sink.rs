@@ -499,6 +499,11 @@ impl CliSinkState {
                     warning_text(&format!("title generation failed: {error}"))
                 );
             }
+            // Persistence bookkeeping: the TUI patches transcript rows with the
+            // assigned log seq for edit/delete/rewind targeting, but the CLI
+            // makes no use of it. Drop it silently instead of printing a raw
+            // `[event] LogSeqAssigned { seq: N }` debug line on every log write.
+            SessionEvent::LogSeqAssigned { .. } => {}
             other => eprintln!("{}", dimmed_text(&format!("[event] {other:?}"))),
         }
     }
@@ -1215,5 +1220,34 @@ mod tests {
         sink.emit(AgentEvent::Session(SessionEvent::CompactingFailed(
             "something went wrong".to_string(),
         )));
+    }
+
+    // ----------------------------------------------------------------
+    // LogSeqAssigned is persistence bookkeeping the CLI doesn't use. It
+    // must be dropped silently, not routed to the `[event] {other:?}`
+    // debug catch-all (regression test for issue #1631).
+    // ----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn log_seq_assigned_is_handled_without_panic() {
+        let sink = CliAgentEventSink::new(
+            false,
+            RenderOptions::default(),
+            harnx_core::abort::create_abort_signal(),
+        );
+        sink.emit(AgentEvent::Session(SessionEvent::LogSeqAssigned {
+            seq: 42,
+        }));
+        // Dropping the event must not disturb the render buffer or the
+        // tracked output source — nothing was printed for it.
+        let state = sink.state.lock().unwrap();
+        assert!(
+            state.buffer.is_empty(),
+            "LogSeqAssigned must not write to the render buffer"
+        );
+        assert!(
+            state.last_ui_output_source.is_none(),
+            "LogSeqAssigned must not be treated as model output"
+        );
     }
 }

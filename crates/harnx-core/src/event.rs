@@ -178,6 +178,9 @@ pub enum SessionEvent {
     /// Emitted after a message or tool-calls entry has been written to the
     /// session log. The TUI uses this to patch the `seq` field on the
     /// most-recently-pushed `AssistantText` or `ToolCall` transcript item.
+    /// NATS clients suppress worker-emitted events and regenerate logical seq
+    /// from JetStream history, so this event is still load-bearing for live
+    /// TUI mutation commands (edit/delete/rewind) — do not remove.
     LogSeqAssigned {
         seq: usize,
     },
