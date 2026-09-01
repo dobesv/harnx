@@ -22,7 +22,7 @@ use crate::session_routes::AgentSessionRef;
 use harnx_core::message::MessageRole;
 use harnx_rag::*;
 use harnx_runtime::{client::*, config::*, utils::*};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
@@ -41,7 +41,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashMap},
     convert::Infallible,
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock},
     time::{Instant, SystemTime},
@@ -148,6 +148,45 @@ fn log_startup_environment_diagnostics() {
     }
 }
 
+/// Build a browser-openable base URL (`http://host:port`) from a bound socket
+/// address. Wildcard bind hosts (`0.0.0.0`, `::`) aren't directly reachable in
+/// a browser, so map them to loopback. IPv6 hosts are bracketed per RFC 3986,
+/// and a link-local scope/zone id is preserved with the RFC 6874 `%25` escape.
+fn browser_base_url(addr: SocketAddr) -> String {
+    // A zone/scope id only exists on IPv6 sockets; carry it through so a
+    // link-local bind (e.g. `fe80::1%eth0`) yields a usable URL.
+    let scope_id = match addr {
+        SocketAddr::V6(v6) => v6.scope_id(),
+        SocketAddr::V4(_) => 0,
+    };
+    // Normalize IPv4-mapped IPv6 (e.g. `::ffff:0.0.0.0`) to plain IPv4 so
+    // wildcard detection and formatting match native IPv4.
+    let ip = match addr.ip() {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    };
+    let host = match ip {
+        IpAddr::V4(v4) if v4.is_unspecified() => Ipv4Addr::LOCALHOST.to_string(),
+        IpAddr::V4(v4) => v4.to_string(),
+        // Wildcard `::` maps to loopback, which is never scoped.
+        IpAddr::V6(v6) if v6.is_unspecified() => format!("[{}]", Ipv6Addr::LOCALHOST),
+        IpAddr::V6(v6) if scope_id != 0 => format!("[{v6}%25{scope_id}]"),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    format!("http://{host}:{}", addr.port())
+}
+
+/// Choose the base URL to advertise on startup. Prefer the socket's real bound
+/// address so ephemeral (`:0`) ports and wildcard hosts resolve correctly; fall
+/// back to the requested address string when the OS can't report a local
+/// address.
+fn advertised_base_url(local_addr: Option<SocketAddr>, requested_addr: &str) -> String {
+    match local_addr {
+        Some(addr) => browser_base_url(addr),
+        None => format!("http://{requested_addr}"),
+    }
+}
+
 pub async fn run(
     config: GlobalConfig,
     addr: Option<String>,
@@ -172,12 +211,26 @@ pub async fn run(
         web_assets.unwrap_or_else(|| harnx_core::config_paths::data_dir().join("web-assets"));
     let server = Arc::new(Server::new(&config, web_assets));
     let listener = TcpListener::bind(&addr).await?;
+    // Advertise the bound address so URLs reflect the real host/port even when
+    // the request used an ephemeral port (":0") or a bare port. Fall back to
+    // the requested `addr` string if the OS can't report a local address.
+    let local_addr = match listener.local_addr() {
+        Ok(local_addr) => Some(local_addr),
+        Err(err) => {
+            warn!("could not resolve bound listener address, advertising requested address: {err}");
+            None
+        }
+    };
+    let base_url = advertised_base_url(local_addr, &addr);
     if let Some(r) = &readiness {
         r.ready();
     }
     let stop_server = server.run(listener).await?;
-    println!("Embeddings API:       http://{addr}/v1/embeddings");
-    println!("Rerank API:           http://{addr}/v1/rerank");
+    // Lead with the Web UI URL — that's the one you open in a browser. The
+    // API endpoints below are POST-only, so they're listed for reference only.
+    println!("Web UI:                {base_url}/");
+    println!("Embeddings API (POST): {base_url}/v1/embeddings");
+    println!("Rerank API (POST):     {base_url}/v1/rerank");
     shutdown_signal().await;
     if let Some(r) = &readiness {
         r.not_ready();
@@ -1514,6 +1567,82 @@ mod tests {
     use super::*;
     use crate::test_support::TestConfigSandbox;
     use http::HeaderValue;
+
+    #[test]
+    fn browser_base_url_maps_wildcards_and_brackets_ipv6() {
+        // Wildcard IPv4 -> loopback so the URL is clickable.
+        assert_eq!(
+            browser_base_url("0.0.0.0:8000".parse().unwrap()),
+            "http://127.0.0.1:8000"
+        );
+        // Wildcard IPv6 -> loopback, bracketed.
+        assert_eq!(
+            browser_base_url("[::]:8000".parse().unwrap()),
+            "http://[::1]:8000"
+        );
+        // Concrete IPv4 passes through with its real port.
+        assert_eq!(
+            browser_base_url("127.0.0.1:9123".parse().unwrap()),
+            "http://127.0.0.1:9123"
+        );
+        // Concrete IPv6 loopback stays bracketed.
+        assert_eq!(
+            browser_base_url("[::1]:8000".parse().unwrap()),
+            "http://[::1]:8000"
+        );
+        // Concrete global IPv6 stays bracketed.
+        assert_eq!(
+            browser_base_url("[2001:db8::1]:8080".parse().unwrap()),
+            "http://[2001:db8::1]:8080"
+        );
+        // Ephemeral (0) and max ports are preserved verbatim.
+        assert_eq!(
+            browser_base_url("127.0.0.1:0".parse().unwrap()),
+            "http://127.0.0.1:0"
+        );
+        assert_eq!(
+            browser_base_url("0.0.0.0:65535".parse().unwrap()),
+            "http://127.0.0.1:65535"
+        );
+        // IPv4-mapped IPv6 wildcard normalizes to plain IPv4 loopback.
+        assert_eq!(
+            browser_base_url("[::ffff:0.0.0.0]:8000".parse().unwrap()),
+            "http://127.0.0.1:8000"
+        );
+        // IPv4-mapped IPv6 concrete address normalizes to plain IPv4.
+        assert_eq!(
+            browser_base_url("[::ffff:127.0.0.1]:8000".parse().unwrap()),
+            "http://127.0.0.1:8000"
+        );
+        // Link-local IPv6 preserves its zone/scope id, RFC 6874 `%25`-escaped.
+        let scoped = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            8000,
+            0,
+            18,
+        ));
+        assert_eq!(browser_base_url(scoped), "http://[fe80::1%2518]:8000");
+    }
+
+    #[test]
+    fn advertised_base_url_prefers_local_addr_and_falls_back_to_requested() {
+        // With a resolved local address, use it (wildcard maps to loopback,
+        // ephemeral port resolved to the real one).
+        assert_eq!(
+            advertised_base_url(Some("0.0.0.0:45877".parse().unwrap()), "0.0.0.0:0"),
+            "http://127.0.0.1:45877"
+        );
+        // Without a local address, fall back to the requested address string.
+        assert_eq!(
+            advertised_base_url(None, "127.0.0.1:8000"),
+            "http://127.0.0.1:8000"
+        );
+        // Fallback preserves whatever the caller passed, even a bare host:port.
+        assert_eq!(
+            advertised_base_url(None, "example.internal:9000"),
+            "http://example.internal:9000"
+        );
+    }
 
     #[test]
     fn percent_decode_decodes_slashes_and_preserves_invalid_escapes() {
