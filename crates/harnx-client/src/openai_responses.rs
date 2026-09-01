@@ -20,7 +20,7 @@
 //! reasoning replay, and streaming support.
 
 use crate::*;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use harnx_core::model::{normalize_cache_usage, CacheAccounting, RawCacheUsage};
 use harnx_core::text::strip_think_tag;
 use harnx_core::tool::ToolResult;
@@ -354,6 +354,19 @@ fn openai_normalize_responses_usage(
     )
 }
 
+/// Parse a Responses tool-call arguments string into a JSON value.
+///
+/// An empty string maps to an empty object `{}` (the API omits arguments for
+/// no-arg calls). A non-empty but malformed string is a hard error, matching the
+/// chat parser (`openai.rs`) rather than silently degrading to `{}`.
+fn parse_responses_tool_arguments(name: &str, arguments: &str) -> Result<Value> {
+    if arguments.is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(arguments)
+        .with_context(|| format!("Tool call '{name}' have non-JSON arguments '{arguments}'"))
+}
+
 /// Parse a non-streaming OpenAI Responses API JSON into `ChatCompletionsOutput`.
 ///
 /// Mirrors `gemini_extract_chat_completions_text` but reads the Responses `output[]` array.
@@ -444,15 +457,8 @@ pub fn openai_extract_responses(data: &Value, model: &Model) -> Result<ChatCompl
                     let call_id = item["call_id"].as_str().map(|s| s.to_string());
 
                     // Arguments come as JSON string; parse to Value
-                    let arguments: Value = if let Some(args_str) = item["arguments"].as_str() {
-                        if args_str.is_empty() {
-                            json!({})
-                        } else {
-                            serde_json::from_str(args_str).unwrap_or_else(|_| json!({}))
-                        }
-                    } else {
-                        json!({})
-                    };
+                    let args_str = item["arguments"].as_str().unwrap_or_default();
+                    let arguments = parse_responses_tool_arguments(name, args_str)?;
 
                     // Associate pending encrypted_content as thought_signature for every
                     // function_call in this reasoning turn.
@@ -588,11 +594,7 @@ fn responses_finalize_tool_call(
     let Some(pending) = state.pending_tool_calls.remove(item_id) else {
         return Ok(());
     };
-    let arguments = if pending.arguments.is_empty() {
-        json!({})
-    } else {
-        serde_json::from_str(&pending.arguments).unwrap_or_else(|_| json!({}))
-    };
+    let arguments = parse_responses_tool_arguments(&pending.name, &pending.arguments)?;
     handler.tool_call(ToolCall::new(
         pending.name,
         arguments,
@@ -1326,6 +1328,83 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_tool_call_malformed_arguments_errors() {
+        // Non-empty but malformed arguments must surface an error instead of
+        // silently degrading to `{}` (matches the chat parser).
+        let responses_json = json!({
+            "id": "resp_tool_bad",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_bad",
+                    "name": "get_weather",
+                    "arguments": "{\"location\": "
+                }
+            ],
+            "usage": {
+                "input_tokens": 15,
+                "output_tokens": 10
+            }
+        });
+
+        let err = openai_extract_responses(&responses_json, &test_model())
+            .expect_err("Malformed arguments should surface an error");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-JSON arguments"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("get_weather"),
+            "error should name the tool call: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_responses_tool_arguments_empty_defaults_to_object() {
+        // Empty -> `{}` (API omits arguments for no-arg calls).
+        let parsed = parse_responses_tool_arguments("noop", "").expect("empty is ok");
+        assert_eq!(parsed, json!({}));
+    }
+
+    #[test]
+    fn test_parse_responses_tool_arguments_valid_object_round_trips() {
+        let parsed = parse_responses_tool_arguments("get_weather", r#"{"city":"NYC"}"#)
+            .expect("valid object is ok");
+        assert_eq!(parsed, json!({"city": "NYC"}));
+    }
+
+    #[test]
+    fn test_parse_responses_tool_arguments_malformed_errors_with_context() {
+        // Malformed / truncated -> error naming the tool and echoing the raw args.
+        let err = parse_responses_tool_arguments("get_weather", r#"{"city":"#)
+            .expect_err("truncated object should error");
+        let msg = err.to_string();
+        assert!(msg.contains("non-JSON arguments"), "message: {msg}");
+        assert!(msg.contains("get_weather"), "should name the tool: {msg}");
+    }
+
+    #[test]
+    fn test_parse_responses_tool_arguments_whitespace_only_errors() {
+        // Whitespace-only is not valid JSON -> error (distinct from the empty case).
+        let result = parse_responses_tool_arguments("noop", "   ");
+        assert!(
+            result.is_err(),
+            "whitespace-only args should error, not default to {{}}"
+        );
+    }
+
+    #[test]
+    fn test_parse_responses_tool_arguments_bare_literal_passes_through() {
+        // Bare JSON literals are valid JSON and pass through unchanged, matching the
+        // chat parser (`openai.rs`), which likewise does not enforce object-shaped args.
+        let parsed =
+            parse_responses_tool_arguments("noop", "123").expect("number literal is valid JSON");
+        assert_eq!(parsed, json!(123));
+    }
+
+    #[test]
     fn test_extract_reasoning_and_tool_call() {
         // Reasoning followed by tool call: encrypted_content -> thought_signature
         let responses_json = json!({
@@ -1578,6 +1657,102 @@ mod tests {
         assert!(text.is_empty()); // Reasoning goes to thought buffer
         assert_eq!(thought, Some("Thinking...".to_string()));
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_streaming_tool_call_malformed_arguments_errors() {
+        // Non-empty but malformed streamed arguments must surface an error,
+        // not silently degrade to `{}` (matches the chat parser).
+        let (mut handler, _rx) = test_handler();
+        let mut state = ResponsesStreamState::default();
+
+        // 1. Function call item added
+        let data = json!({
+            "item": {
+                "type": "function_call",
+                "id": "fc_bad",
+                "name": "get_weather",
+                "call_id": "call_bad"
+            }
+        });
+        openai_handle_responses_event(
+            &mut state,
+            &mut handler,
+            "response.output_item.added",
+            &data,
+        )
+        .expect("Should handle");
+
+        // 2. Malformed arguments delta (truncated / invalid JSON)
+        let data = json!({
+            "item_id": "fc_bad",
+            "delta": "{\"city\":"
+        });
+        openai_handle_responses_event(
+            &mut state,
+            &mut handler,
+            "response.function_call_arguments.delta",
+            &data,
+        )
+        .expect("Should handle");
+
+        // 3. Arguments done -> finalize should error on the malformed buffer
+        let data = json!({"item_id": "fc_bad"});
+        let err = openai_handle_responses_event(
+            &mut state,
+            &mut handler,
+            "response.function_call_arguments.done",
+            &data,
+        )
+        .expect_err("Malformed streamed arguments should surface an error");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-JSON arguments"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("get_weather"),
+            "error should name the tool call: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_streaming_tool_call_empty_arguments_default_object() {
+        // Empty streamed arguments must still default to `{}` (unchanged behavior).
+        let (mut handler, _rx) = test_handler();
+        let mut state = ResponsesStreamState::default();
+
+        let data = json!({
+            "item": {
+                "type": "function_call",
+                "id": "fc_empty",
+                "name": "list_files",
+                "call_id": "call_empty"
+            }
+        });
+        openai_handle_responses_event(
+            &mut state,
+            &mut handler,
+            "response.output_item.added",
+            &data,
+        )
+        .expect("Should handle");
+
+        // No arguments delta arrives; finalize with an empty buffer.
+        let data = json!({"item_id": "fc_empty"});
+        openai_handle_responses_event(
+            &mut state,
+            &mut handler,
+            "response.function_call_arguments.done",
+            &data,
+        )
+        .expect("Empty arguments should default to {} without error");
+
+        let (_text, _thought, calls, _usage) = handler.take();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "list_files");
+        assert_eq!(calls[0].arguments, json!({}));
     }
 
     #[test]

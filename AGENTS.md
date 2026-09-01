@@ -137,6 +137,24 @@ them.
 - **Configuration:** `config.yaml` holds global settings. Clients and MCP servers use individual YAML files; agents are Markdown files with YAML front matter in `agents/`.
 - **Dual license:** MIT OR Apache-2.0. Preserve license headers where present.
 
+### Tool-call argument parsing
+
+When a provider client parses tool-call arguments from LLM output, use this pattern:
+
+```rust
+let arguments: Value = if arguments_str.is_empty() {
+    json!({})
+} else {
+    serde_json::from_str(arguments_str)
+        .with_context(|| format!("Tool call '{name}' have non-JSON arguments '{arguments_str}'"))?
+};
+```
+
+Empty string maps to `{}` (API omits arguments for no-arg calls). Non-empty malformed JSON
+propagates as an error with context naming the tool and echoing the raw argument string.
+This convention is consolidated across all provider parsers (`openai.rs`, `openai_responses.rs`,
+`bedrock.rs`, `claude.rs`, `cohere.rs`).
+
 ## Issue/task tracker
 
 GitHub Issues is the issue/task tracker for this project.
