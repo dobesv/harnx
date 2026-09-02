@@ -68,7 +68,9 @@ impl ServerHandler for BashServer {
                 registered.description.clone(),
                 registered.input_schema.clone(),
             )
-            .with_meta(call_template_meta(name))
+            .with_meta(call_template_meta(&tool_templates::command_template_call(
+                name,
+            )))
         }));
         Ok(ListToolsResult::with_all_items(tools))
     }
