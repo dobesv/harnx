@@ -76,10 +76,11 @@ pnpm build
 ```
 
 ### Type Checking
-To run the TypeScript compiler without emitting files:
+This project uses TypeScript project references. The root `tsconfig.json` has `"files": []` and only references sub-projects. Run `-b` (build mode) to typecheck all files:
 ```bash
-pnpm exec tsc --noEmit
+pnpm exec tsc -b
 ```
+A bare `tsc --noEmit` loads the root config and typechecks **zero files** — it always exits 0 and provides no verification. This is a common footgun: always use `tsc -b`.
 
 ### CI Workflow
 The web client is integrated into the `.github/workflows/web-ci.yml` lane. It runs automatically on any changes to the `web/**` path.
