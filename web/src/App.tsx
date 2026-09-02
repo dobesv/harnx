@@ -22,6 +22,8 @@ import { SubAgentSessionNotes } from './SubAgentSessionNotes';
 import { cancel } from './api';
 import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
+import { AttachIcon, SendIcon } from './icons';
+import { AgentDropdown, SessionDropdown, AgentSessionMenu } from './composer/AgentSessionMenu';
 import './chat.css';
 
 interface QueuedMessage {
@@ -133,9 +135,17 @@ const MyAttachment = () => (
 const MyComposer = ({
   agentName,
   sessionId,
+  onSwitchAgent,
+  onSwitchSession,
+  switchAgentHref,
+  switchSessionHref,
 }: {
   agentName: string;
   sessionId: string;
+  onSwitchAgent: () => void;
+  onSwitchSession: () => void;
+  switchAgentHref: string;
+  switchSessionHref: string;
 }) => {
   const { setErrorText } = useContext(PendingContext);
   const isRunning = useAuiState(s => s.thread.isRunning);
@@ -227,20 +237,38 @@ const MyComposer = ({
       ? 'Type a message to queue after this run...'
       : 'Type a message...';
 
+  const menuProps = { agentName, sessionId, switchAgentHref, switchSessionHref, onSwitchAgent, onSwitchSession };
+  const sendLabel = queuedMessage ? 'Queued' : isRunning ? 'Queue' : 'Send';
+
   return (
     <ComposerPrimitive.Root className="aui-composer" onSubmit={handleSubmit}>
       {queueCountLabel ? <div className="aui-composer-queue-hint">{queueCountLabel}</div> : null}
-      <div className="aui-composer-row">
-        <div className="aui-composer-attachments">
-          <ComposerPrimitive.Attachments components={{ Attachment: MyAttachment }} />
+      <div className="aui-composer-attachments">
+        <ComposerPrimitive.Attachments components={{ Attachment: MyAttachment }} />
+      </div>
+      <ComposerPrimitive.Input
+        className="aui-composer-input"
+        placeholder={placeholder}
+        render={<textarea ref={setTextareaRef} rows={1} onInput={(e) => resizeTextarea(e.currentTarget)} />}
+      />
+      <div className="aui-composer-controls">
+        <ComposerPrimitive.AddAttachment className="aui-composer-add-attachment aui-composer-icon-btn" aria-label="Attach file" title="Attach file">
+          <AttachIcon />
+          <span className="aui-visually-hidden">Attach file</span>
+        </ComposerPrimitive.AddAttachment>
+        
+        <div className="aui-composer-controls-desktop">
+          <AgentDropdown {...menuProps} />
+          <SessionDropdown {...menuProps} />
         </div>
-        <ComposerPrimitive.AddAttachment className="aui-composer-add-attachment">Attach</ComposerPrimitive.AddAttachment>
-        <ComposerPrimitive.Input
-          className="aui-composer-input"
-          placeholder={placeholder}
-          render={<textarea ref={setTextareaRef} rows={1} onInput={(e) => resizeTextarea(e.currentTarget)} />}
-        />
-        <button type="submit" className="aui-composer-send">{queuedMessage ? 'Queued' : isRunning ? 'Queue' : 'Send'}</button>
+        <div className="aui-composer-controls-mobile">
+          <AgentSessionMenu {...menuProps} />
+        </div>
+        
+        <button type="submit" className="aui-composer-send aui-composer-icon-btn" aria-label={sendLabel} title={sendLabel}>
+          <SendIcon />
+          <span className="aui-visually-hidden">{sendLabel}</span>
+        </button>
         <CancelButton agentName={agentName} sessionId={sessionId} />
       </div>
     </ComposerPrimitive.Root>
@@ -364,7 +392,7 @@ const BatchInterruptUI = () => {
   );
 };
 
-const MyThread = ({ agentName, sessionId, onRunFinish }: { agentName: string, sessionId: string, onRunFinish: () => void }) => {
+const MyThread = ({ agentName, sessionId, onRunFinish, onSwitchAgent, onSwitchSession, switchAgentHref, switchSessionHref }: { agentName: string, sessionId: string, onRunFinish: () => void, onSwitchAgent: () => void, onSwitchSession: () => void, switchAgentHref: string, switchSessionHref: string }) => {
   const isEmpty = useAuiState(s => s.thread.messages.length === 0);
 
   return (
@@ -385,6 +413,10 @@ const MyThread = ({ agentName, sessionId, onRunFinish }: { agentName: string, se
           <MyComposer
             agentName={agentName}
             sessionId={sessionId}
+            onSwitchAgent={onSwitchAgent}
+            onSwitchSession={onSwitchSession}
+            switchAgentHref={switchAgentHref}
+            switchSessionHref={switchSessionHref}
           />
         </div>
       </div>
@@ -481,42 +513,6 @@ const SessionPicker = ({
   </div>
 );
 
-const BreadcrumbButton = ({ children, onClick }: { children: React.ReactNode, onClick: () => void }) => (
-  <button type="button" className="top-nav-crumb-button" onClick={onClick}>
-    {children}
-  </button>
-);
-
-const TopNav = ({
-  agentName,
-  sessionId,
-  onSwitchAgent,
-  onSwitchSession
-}: {
-  agentName: string;
-  sessionId: string;
-  onSwitchAgent: () => void;
-  onSwitchSession: () => void;
-}) => (
-  <div className="top-nav" aria-label="Breadcrumb">
-    <div className="top-nav-breadcrumbs">
-      <BreadcrumbButton onClick={onSwitchAgent}>harnx</BreadcrumbButton>
-      {agentName ? (
-        <>
-          <span className="top-nav-separator" aria-hidden="true">›</span>
-          <BreadcrumbButton onClick={onSwitchSession}>{agentName}</BreadcrumbButton>
-        </>
-      ) : null}
-      {sessionId ? (
-        <>
-          <span className="top-nav-separator" aria-hidden="true">›</span>
-          <span className="top-nav-crumb-active" aria-current="page">{sessionId}</span>
-        </>
-      ) : null}
-    </div>
-  </div>
-);
-
 export default function App() {
   const {
     agents,
@@ -561,12 +557,6 @@ export default function App() {
         />
       ) : (
         <div className="chat-layout">
-          <TopNav
-            agentName={selectedAgent}
-            sessionId={selectedSessionId}
-            onSwitchAgent={clearAgent}
-            onSwitchSession={clearSession}
-          />
           <div className="chat-main">
             <ChatProvider
               key={`${selectedAgent}:${selectedSessionId}`}
@@ -576,7 +566,15 @@ export default function App() {
               onHandoff={handleHandoff}
               onOpenSubAgent={navigateSession}
             >
-              <MyThread agentName={selectedAgent} sessionId={selectedSessionId} onRunFinish={refreshSessions} />
+              <MyThread
+                agentName={selectedAgent}
+                sessionId={selectedSessionId}
+                onRunFinish={refreshSessions}
+                onSwitchAgent={clearAgent}
+                onSwitchSession={clearSession}
+                switchAgentHref="/"
+                switchSessionHref={`/agents/${encodeURIComponent(selectedAgent)}`}
+              />
             </ChatProvider>
           </div>
         </div>
