@@ -124,13 +124,9 @@ impl Toolset for BashToolset {
                 idempotent_hint: false,
                 read_only_hint: false,
                 timeout_secs: Some(0),
-                meta: Some(
-                    serde_json::json!({ "call_template": name })
-                        .as_object()
-                        .expect("object literal")
-                        .clone(),
-                ),
+                meta: None,
             }
+            .with_call_template(&tool_templates::command_template_call(name))
         }));
         tools
     }
