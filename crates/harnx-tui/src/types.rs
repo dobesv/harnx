@@ -8,7 +8,9 @@ use crate::markdown_render::RenderedEntry;
 use chrono::{DateTime, Utc};
 use ratatui_textarea::TextArea;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use syntect::highlighting::Theme;
@@ -19,6 +21,32 @@ pub(super) const MIN_INPUT_HEIGHT: u16 = 3;
 pub(super) const MAX_INPUT_HEIGHT: u16 = 8;
 pub(super) const TICK_RATE: Duration = Duration::from_millis(80);
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExitWorkerState {
+    Remote,
+    LocalOwnedHere,
+    LocalOwnedElsewhere,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExitPhase {
+    Prompting,
+    Interrupting,
+}
+
+pub(crate) type ExitCancelFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
+pub(crate) type ExitCancelFactory = Arc<
+    dyn Fn(
+            GlobalConfig,
+            Arc<Mutex<Option<LocalWorkerSupervisor>>>,
+            String,
+            String,
+        ) -> ExitCancelFuture
+        + Send
+        + Sync,
+>;
 
 pub struct Tui {
     pub(super) config: GlobalConfig,
@@ -49,6 +77,16 @@ pub struct Tui {
     /// The (session_id, cluster) of the remote agent currently running, if any.
     /// Set in `start_prompt` and cleared when the turn completes.
     pub(super) active_remote_session: Option<(String, String)>,
+    /// Builds the durable cancel operation used by interrupt-and-exit.
+    /// Injected via `start_exit_cancel`; awaited in `poll_pending_exit_cancel`.
+    pub(crate) exit_cancel_factory: ExitCancelFactory,
+    /// In-flight durable cancel for exit paths. Must complete before `should_quit`
+    /// so process exit (which drops `LocalWorkerSupervisor` and kills the worker)
+    /// does not race the cancel request. Polling via `now_or_never` preserves the
+    /// future across ticks — dropping/consuming it would lose the cancel.
+    pub(crate) pending_exit_cancel: Option<ExitCancelFuture>,
+    /// Deferred warning text emitted after terminal restoration.
+    pub(crate) exit_interrupt_error: Option<String>,
     /// Confirmation route retained for the frontend's current session. Prompt
     /// and busy-enqueue paths share it so queued continuations keep a live modal.
     pub(super) tool_confirmation_route: SharedToolConfirmationRoute,
@@ -368,6 +406,11 @@ pub(super) enum ModalState {
         tool_name: String,
         input_preview: String,
         reason: Option<String>,
+    },
+    /// Agent is still working when user tries to exit.
+    ConfirmExit {
+        worker_state: ExitWorkerState,
+        phase: ExitPhase,
     },
     /// Agent selection
     AgentPicker {
