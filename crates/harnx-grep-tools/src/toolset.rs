@@ -1,7 +1,7 @@
 use crate::server::{grep_query_schema, GrepQueryParams, GrepServer};
 use async_trait::async_trait;
 use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
-use rmcp::model::{CallToolResult, ErrorCode, ErrorData};
+use rmcp::model::{CallToolResult, ErrorData};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -48,9 +48,6 @@ fn map_result(result: Result<CallToolResult, ErrorData>) -> Result<Value, ToolIn
         Ok(result) => serde_json::to_value(result).map_err(|err| {
             ToolInvokeError::Fatal(format!("failed to serialize tool result: {err}"))
         }),
-        Err(err) if err.code == ErrorCode::INTERNAL_ERROR => {
-            Err(ToolInvokeError::Fatal(err.message.to_string()))
-        }
         Err(err) => Err(ToolInvokeError::Recoverable(err.message.to_string())),
     }
 }
@@ -97,9 +94,9 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn maps_server_errors_by_error_code() {
+    fn maps_all_server_errors_to_recoverable() {
         let internal = map_result(Err(ErrorData::internal_error("server failed", None)));
-        assert!(matches!(internal, Err(ToolInvokeError::Fatal(_))));
+        assert!(matches!(internal, Err(ToolInvokeError::Recoverable(_))));
 
         let invalid = map_result(Err(ErrorData::invalid_params("bad input", None)));
         assert!(matches!(invalid, Err(ToolInvokeError::Recoverable(_))));

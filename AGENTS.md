@@ -155,6 +155,19 @@ propagates as an error with context naming the tool and echoing the raw argument
 This convention is consolidated across all provider parsers (`openai.rs`, `openai_responses.rs`,
 `bedrock.rs`, `claude.rs`, `cohere.rs`).
 
+### Native toolset error mapping
+
+Native `Toolset` implementations' `map_result` must map **all** `ErrorData` from handlers (both
+`internal_error` and `invalid_params`) to `ToolInvokeError::Recoverable`. Reserve `Fatal` for:
+
+- result-serialization failure in the `Ok` branch (`serde_json::to_value`)
+- true transport/lifecycle death (e.g. MCP bridge `TransportClosed`)
+
+**Why:** `Fatal` aborts the agent turn; `Recoverable` surfaces as `{"is_error": true, ...}` so the
+session continues and the agent can retry. The canonical pattern is
+`crates/harnx-fs-tools/src/toolset.rs:59-66`. When adding a native toolset, do not special-case
+`ErrorCode::INTERNAL_ERROR` to `Fatal`.
+
 ## Issue/task tracker
 
 GitHub Issues is the issue/task tracker for this project.
