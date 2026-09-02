@@ -7,7 +7,7 @@ use crate::tool_templates;
 use async_trait::async_trait;
 use harnx_sandbox_common::SandboxConfig;
 use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
-use rmcp::model::{CallToolResult, ErrorCode, ErrorData, Tool};
+use rmcp::model::{CallToolResult, ErrorData, Tool};
 use rmcp::schemars::JsonSchema;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -64,9 +64,6 @@ fn map_result(result: Result<CallToolResult, ErrorData>) -> Result<Value, ToolIn
         Ok(result) => serde_json::to_value(result).map_err(|err| {
             ToolInvokeError::Fatal(format!("failed to serialize tool result: {err}"))
         }),
-        Err(err) if err.code == ErrorCode::INTERNAL_ERROR => {
-            Err(ToolInvokeError::Fatal(err.message.to_string()))
-        }
         Err(err) => Err(ToolInvokeError::Recoverable(err.message.to_string())),
     }
 }
@@ -159,9 +156,9 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn maps_server_errors_by_error_code() {
+    fn maps_all_server_errors_to_recoverable() {
         let internal = map_result(Err(ErrorData::internal_error("server failed", None)));
-        assert!(matches!(internal, Err(ToolInvokeError::Fatal(_))));
+        assert!(matches!(internal, Err(ToolInvokeError::Recoverable(_))));
 
         let invalid = map_result(Err(ErrorData::invalid_params("bad input", None)));
         assert!(matches!(invalid, Err(ToolInvokeError::Recoverable(_))));
