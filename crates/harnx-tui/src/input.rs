@@ -1,8 +1,7 @@
 use crate::lifecycle::session_history_transcript_items;
 use crate::render_helpers::render_status_line;
 use crate::strip_ansi;
-use crate::types::Tui;
-use crate::types::{TranscriptItem, TuiEvent};
+use crate::types::{ExitPhase, ModalState, TranscriptItem, Tui, TuiEvent};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use crossterm::ExecutableCommand;
@@ -177,6 +176,63 @@ pub(super) fn tool_completed_to_transcript_items(
 }
 
 impl Tui {
+    pub(crate) async fn request_exit(&mut self) {
+        if !self.app.llm_busy {
+            self.app.should_quit = true;
+            return;
+        }
+
+        let worker_state = self.exit_worker_state().await;
+        self.app.modal = Some(ModalState::ConfirmExit {
+            worker_state,
+            phase: ExitPhase::Prompting,
+        });
+    }
+
+    async fn handle_ctrl_d(&mut self) {
+        // Preserve Ctrl+D's existing idle abort; busy exit defers it to modal confirmation.
+        if !self.app.llm_busy {
+            self.abort_signal.set_ctrld();
+        }
+        self.request_exit().await;
+    }
+
+    async fn handle_ctrl_c(&mut self) {
+        // Abort signal goes both to the Tui-level signal (used by
+        // dot-commands) and to the in-flight prompt task's own
+        // signal (if any). Per-task signals are why we no longer
+        // need to "reset" anything before the next submission —
+        // the running task can never be un-aborted.
+        self.abort_signal.set_ctrlc();
+        if let Some(prompt_abort) = &self.current_prompt_abort {
+            prompt_abort.set_ctrlc();
+        }
+
+        // Fire-and-forget cancel; TUI stays alive so detached spawn is safe.
+        // Exit paths that quit must use cancel_sequencing via start_exit_cancel.
+        self.cancel_active_remote_session();
+
+        self.app.transcript.push(TranscriptItem::SystemText(
+            "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),
+        ));
+        // Discard any queued message — Ctrl+C means "cancel
+        // everything", including the message you typed while the
+        // task was running.
+        self.app.pending_message = None;
+        *self.shared_pending_message.lock().await = None;
+        // `llm_busy` stays true while a prompt task is still
+        // winding down; the Final/Error event from that task is
+        // what flips it off. Flipping it eagerly here is what
+        // produced Bug 2 — the next Enter would race a fresh
+        // prompt task against the still-running old one. When no
+        // prompt task is in flight (idle Ctrl+C) we still clear
+        // the flag for parity with the prior UX.
+        if self.current_prompt_handle.is_none() {
+            self.app.llm_busy = false;
+            self.active_remote_session = None;
+        }
+    }
+
     async fn handle_browsing_key(&mut self, key: KeyEvent) -> Result<()> {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, KeyModifiers::NONE) => {
@@ -225,43 +281,8 @@ impl Tui {
         }
 
         match (key.code, key.modifiers) {
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                self.abort_signal.set_ctrld();
-                self.app.should_quit = true;
-            }
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                // Abort signal goes both to the Tui-level signal (used by
-                // dot-commands) and to the in-flight prompt task's own
-                // signal (if any). Per-task signals are why we no longer
-                // need to "reset" anything before the next submission —
-                // the running task can never be un-aborted.
-                self.abort_signal.set_ctrlc();
-                if let Some(prompt_abort) = &self.current_prompt_abort {
-                    prompt_abort.set_ctrlc();
-                }
-
-                self.cancel_active_remote_session();
-
-                self.app.transcript.push(TranscriptItem::SystemText(
-                    "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),
-                ));
-                // Discard any queued message — Ctrl+C means "cancel
-                // everything", including the message you typed while the
-                // task was running.
-                self.app.pending_message = None;
-                *self.shared_pending_message.lock().await = None;
-                // `llm_busy` stays true while a prompt task is still
-                // winding down; the Final/Error event from that task is
-                // what flips it off. Flipping it eagerly here is what
-                // produced Bug 2 — the next Enter would race a fresh
-                // prompt task against the still-running old one. When no
-                // prompt task is in flight (idle Ctrl+C) we still clear
-                // the flag for parity with the prior UX.
-                if self.current_prompt_handle.is_none() {
-                    self.app.llm_busy = false;
-                    self.active_remote_session = None;
-                }
-            }
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => self.handle_ctrl_d().await,
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.handle_ctrl_c().await,
             (KeyCode::Up, KeyModifiers::NONE) => {
                 self.handle_up_key(key);
             }
@@ -1888,7 +1909,7 @@ impl Tui {
                 }
             }
             harnx_runtime::commands::CommandOutcome::Exit => {
-                self.app.should_quit = true;
+                self.request_exit().await;
             }
             harnx_runtime::commands::CommandOutcome::OpenAgentPicker => {
                 self.open_agent_picker().await;
@@ -2181,11 +2202,45 @@ fn format_usage(usage: &harnx_core::api_types::CompletionTokenUsage) -> String {
 }
 
 impl Tui {
-    /// Handle keystrokes while a confirmation modal is open.
-    ///
-    /// - `y` or `Enter` → confirm action, clear modal, execute the action.
-    /// - `n` or `Esc` → cancel, clear modal.
-    /// - All other keys are consumed (no action).
+    fn handle_confirm_exit_key(&mut self, phase: ExitPhase, key: KeyEvent) {
+        if phase == ExitPhase::Prompting && !self.app.llm_busy {
+            self.app.modal = None;
+            self.app.should_quit = true;
+            return;
+        }
+
+        match phase {
+            ExitPhase::Prompting => match (key.code, key.modifiers) {
+                (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                    self.app.modal = None;
+                    self.abort_signal.set_ctrld();
+                    self.app.should_quit = true;
+                }
+                (KeyCode::Esc, KeyModifiers::NONE) => {
+                    self.app.modal = None;
+                }
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                    if self.active_remote_session.is_none() {
+                        self.app.modal = None;
+                        self.app.should_quit = true;
+                        return;
+                    }
+                    if let Some(ModalState::ConfirmExit { phase, .. }) = self.app.modal.as_mut() {
+                        *phase = ExitPhase::Interrupting;
+                    }
+                    if !self.start_exit_cancel() {
+                        self.app.modal = None;
+                        self.app.should_quit = true;
+                    }
+                }
+                _ => {}
+            },
+            ExitPhase::Interrupting => {}
+        }
+    }
+
+    /// Handle keystrokes while a modal is open. Each specialized modal owns
+    /// its key bindings; delete and rewind confirmations use the y/n fallback.
     pub(super) async fn handle_modal_key(&mut self, key: KeyEvent) -> Result<()> {
         match self.app.modal.as_ref() {
             Some(crate::types::ModalState::AgentPicker { .. })
@@ -2209,6 +2264,9 @@ impl Tui {
                     _ => {}
                 }
             }
+            Some(crate::types::ModalState::ConfirmExit { phase, .. }) => {
+                self.handle_confirm_exit_key(*phase, key)
+            }
             Some(_) => match (key.code, key.modifiers) {
                 (KeyCode::Char('y'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE) => {
                     self.confirm_modal_action().await?;
@@ -2224,9 +2282,8 @@ impl Tui {
     }
 
     async fn handle_picker_key(&mut self, key: KeyEvent) -> Result<()> {
-        // Ctrl+C and Ctrl+D exit — there is no in-flight prompt to abort.
         if matches!(key.code, KeyCode::Char('c' | 'd')) && key.modifiers == KeyModifiers::CONTROL {
-            self.app.should_quit = true;
+            self.request_exit().await;
             return Ok(());
         }
         match key.code {
@@ -2413,7 +2470,7 @@ impl Tui {
                         should_show_agent_picker = true;
                     } else {
                         // Direct startup with `-a <agent>`, no prior session. ESC exits.
-                        self.app.should_quit = true;
+                        self.request_exit().await;
                     }
                 } else if matches!(
                     self.app.modal,
@@ -2424,7 +2481,7 @@ impl Tui {
                         self.app.modal = None;
                     } else {
                         // No agent active (startup). ESC exits the process (#467).
-                        self.app.should_quit = true;
+                        self.request_exit().await;
                     }
                 } else if self.app.modal.is_some() {
                     self.app.modal = None;

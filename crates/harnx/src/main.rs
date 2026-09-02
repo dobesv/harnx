@@ -706,6 +706,9 @@ async fn start_directive(
 async fn start_interactive(config: &GlobalConfig) -> Result<()> {
     let mut tui: Tui = Tui::init(config).await?;
     let result = tui.run().await;
+    if let Some(details) = tui.exit_interrupt_error() {
+        eprintln!("Warning: failed to interrupt active session while exiting ({details}).");
+    }
     let source = {
         let cfg = config.read();
         AgentSource {
