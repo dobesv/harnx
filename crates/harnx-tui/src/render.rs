@@ -856,6 +856,12 @@ impl Tui {
             ModalState::ConfirmToolUse { .. } => {
                 self.render_tool_confirm_overlay(frame, screen_size, modal);
             }
+            ModalState::ConfirmExit {
+                worker_state,
+                phase,
+            } => {
+                self.render_exit_confirm_modal(frame, screen_size, *worker_state, *phase);
+            }
             ModalState::AgentPicker {
                 agents,
                 selected,
@@ -905,7 +911,60 @@ impl Tui {
             }
         }
     }
+    fn render_exit_confirm_modal(
+        &self,
+        frame: &mut Frame<'_>,
+        screen_size: ratatui::layout::Rect,
+        worker_state: crate::types::ExitWorkerState,
+        phase: crate::types::ExitPhase,
+    ) {
+        let title = "Agent is still working";
+        let body = exit_body_copy(worker_state);
+        let action_line = match phase {
+            crate::types::ExitPhase::Prompting => {
+                "Ctrl+D — exit without interrupting    Ctrl+C — interrupt and exit    Esc — stay"
+            }
+            crate::types::ExitPhase::Interrupting => "Interrupting…",
+        };
 
+        let desired_width = 83u16 + 4; // Action line width (83) + borders
+        let modal_width = desired_width.min(screen_size.width.saturating_sub(4));
+
+        let body_wrapped = textwrap::wrap(body, modal_width.saturating_sub(4) as usize);
+        let action_wrapped = textwrap::wrap(action_line, modal_width.saturating_sub(4) as usize);
+
+        let modal_height = (2 + body_wrapped.len() + 1 + action_wrapped.len()) as u16;
+
+        let modal_x = (screen_size.width.saturating_sub(modal_width)) / 2;
+        let modal_y = (screen_size.height.saturating_sub(modal_height)) / 2;
+        let modal_area = ratatui::layout::Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+        frame.render_widget(ratatui::widgets::Clear, modal_area);
+
+        let mut lines = Vec::new();
+        for line in body_wrapped {
+            lines.push(Line::from(Span::styled(
+                line.into_owned(),
+                Style::default().fg(Color::Reset),
+            )));
+        }
+        lines.push(Line::from("")); // blank line
+        for line in action_wrapped {
+            lines.push(Line::from(Span::styled(
+                line.into_owned(),
+                Style::default().fg(Color::Reset),
+            )));
+        }
+
+        let modal = Paragraph::new(lines).block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Reset)),
+        );
+
+        frame.render_widget(modal, modal_area);
+    }
     fn render_simple_modal(
         &self,
         frame: &mut Frame<'_>,
@@ -1402,6 +1461,16 @@ pub(crate) fn session_picker_highlight_index(selected: usize, has_error: bool) -
         selected + 1
     } else {
         selected
+    }
+}
+
+pub(crate) fn exit_body_copy(state: crate::types::ExitWorkerState) -> &'static str {
+    use crate::types::ExitWorkerState;
+    match state {
+        ExitWorkerState::Remote => "Runs on a remote worker. Exit without interrupting and it keeps running there; reopening the session resumes it.",
+        ExitWorkerState::LocalOwnedHere => "Runs on a local worker owned by this client. Exit without interrupting and the work stops; reopening the session resumes it from where it stopped.",
+        ExitWorkerState::LocalOwnedElsewhere => "Runs on a local worker owned by another client. Exit without interrupting and it keeps running there; reopening the session resumes it.",
+        ExitWorkerState::Unknown => "May keep running after you exit. If still in progress when you reopen, it resumes.",
     }
 }
 

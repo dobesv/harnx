@@ -236,6 +236,9 @@ impl Tui {
             current_prompt_abort: None,
             current_prompt_handle: None,
             active_remote_session: None,
+            exit_cancel_factory: crate::remote_session::default_exit_cancel_factory(),
+            pending_exit_cancel: None,
+            exit_interrupt_error: None,
             tool_confirmation_route: Arc::new(parking_lot::Mutex::new(None)),
             pending_remote_activations: HashSet::new(),
             session_activity_target: None,
@@ -423,6 +426,10 @@ impl Tui {
         &self.app.transcript
     }
 
+    pub fn exit_interrupt_error(&self) -> Option<&str> {
+        self.exit_interrupt_error.as_deref()
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         let _panic_terminal_hook = PanicTerminalHookGuard::install();
         let mut terminal = Self::setup_terminal()?;
@@ -500,6 +507,7 @@ impl Tui {
                 self.handle_tui_event(evt).await?;
                 drained += 1;
             }
+            self.poll_pending_exit_cancel().await;
             if drained >= WATCHDOG_EVENT_DRAIN {
                 // A single tick draining this many events means a producer is
                 // flooding the channel faster than the UI consumes it — the
