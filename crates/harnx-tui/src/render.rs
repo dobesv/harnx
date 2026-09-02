@@ -18,6 +18,20 @@ fn dim_style(color: Color) -> Style {
     Style::default().fg(color).add_modifier(Modifier::DIM)
 }
 
+pub(super) fn fenced_json_markdown(content: &str) -> String {
+    let mut longest_run = 0usize;
+    let mut current_run = 0usize;
+    for character in content.chars() {
+        if character == '`' {
+            current_run = current_run.saturating_add(1);
+            longest_run = longest_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+    let fence = "`".repeat(longest_run.saturating_add(1).max(3));
+    format!("{fence}json\n{content}\n{fence}")
+}
 fn plan_detail_lines(plan: &[harnx_core::event::PlanEntry], label: Style) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled("── plan ──", label))];
     lines.extend(plan.iter().enumerate().map(|(index, entry)| {
@@ -433,23 +447,75 @@ impl Tui {
         }
     }
 
-    pub(crate) fn draw(&mut self, frame: &mut Frame<'_>) {
-        let size = frame.area();
-        let input_width = size.width.saturating_sub(2).max(1);
+    fn bottom_region_height(&self, input_width: u16, screen_height: u16) -> u16 {
+        if let Some(modal @ ModalState::ConfirmToolUse { .. }) = &self.app.modal {
+            let max_height = (screen_height / 2).max(6);
+            return self
+                .confirm_tool_modal_height(input_width, modal)
+                .clamp(6, max_height);
+        }
+
         let input_height = self
             .input_height(input_width)
             .clamp(MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT);
-        let attachment_height: u16 = if self.app.attachments.is_empty() {
-            0
-        } else {
-            1
-        };
+        let attachment_height = u16::from(!self.app.attachments.is_empty());
+        input_height + attachment_height
+    }
+
+    fn render_bottom_region(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        if let Some(modal @ ModalState::ConfirmToolUse { .. }) = self.app.modal.clone() {
+            self.render_tool_confirm_modal(frame, area, &modal);
+            return;
+        }
+
+        let title = self.build_input_title();
+        self.app.input.set_block(
+            Block::default()
+                .borders(Borders::NONE)
+                .title(title)
+                .border_style(
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ),
+        );
+        frame.render_widget(&self.app.input, area);
+
+        if !self.app.attachments.is_empty() {
+            let names: Vec<&str> = self
+                .app
+                .attachments
+                .iter()
+                .map(|attachment| attachment.display_name.as_str())
+                .collect();
+            let footer_text = format!("  Attached: {}   [.detach to remove]", names.join(", "));
+            let footer_area =
+                ratatui::layout::Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+            let footer = Paragraph::new(Line::from(Span::styled(
+                footer_text,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::DIM),
+            )));
+            frame.render_widget(footer, footer_area);
+        }
+    }
+
+    fn render_overlay_modal(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        if let Some(modal) = &self.app.modal {
+            if !matches!(modal, ModalState::ConfirmToolUse { .. }) {
+                self.render_modal(frame, area, modal);
+            }
+        }
+    }
+    pub(crate) fn draw(&mut self, frame: &mut Frame<'_>) {
+        let size = frame.area();
+        let input_width = size.width.saturating_sub(2).max(1);
+
+        let bottom_height = self.bottom_region_height(input_width, size.height);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(input_height + attachment_height),
-            ])
+            .constraints([Constraint::Min(1), Constraint::Length(bottom_height)])
             .split(size);
 
         let show_seq = self.app.show_sequence_numbers;
@@ -502,41 +568,7 @@ impl Tui {
 
         self.app.last_known_input_width = chunks[1].width.saturating_sub(2).max(1);
 
-        let title = self.build_input_title();
-        self.app.input.set_block(
-            Block::default()
-                .borders(Borders::NONE)
-                .title(title)
-                .border_style(
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ),
-        );
-        frame.render_widget(&self.app.input, chunks[1]);
-
-        if !self.app.attachments.is_empty() {
-            let names: Vec<&str> = self
-                .app
-                .attachments
-                .iter()
-                .map(|a| a.display_name.as_str())
-                .collect();
-            let footer_text = format!("  Attached: {}   [.detach to remove]", names.join(", "));
-            let footer_area = ratatui::layout::Rect::new(
-                chunks[1].x,
-                chunks[1].y + chunks[1].height - 1,
-                chunks[1].width,
-                1,
-            );
-            let footer = Paragraph::new(Line::from(Span::styled(
-                footer_text,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::DIM),
-            )));
-            frame.render_widget(footer, footer_area);
-        }
+        self.render_bottom_region(frame, chunks[1]);
 
         // Render completion popup above the input area
         if !self.app.completions.is_empty() {
@@ -620,10 +652,8 @@ impl Tui {
             return;
         }
 
-        // Render confirmation modal on top of everything else
-        if let Some(modal) = &self.app.modal {
-            self.render_modal(frame, size, modal);
-        }
+        // Render other modals on top of everything else
+        self.render_overlay_modal(frame, size);
     }
 
     pub(super) fn input_height(&self, available_width: u16) -> u16 {
@@ -823,18 +853,8 @@ impl Tui {
                 let prompt_text = format!("Rewind to entry {}? [y/N]", seq);
                 self.render_simple_modal(frame, screen_size, &prompt_text);
             }
-            ModalState::ConfirmToolUse {
-                tool_name,
-                input_preview,
-                reason,
-            } => {
-                self.render_tool_confirm_modal(
-                    frame,
-                    screen_size,
-                    tool_name,
-                    input_preview,
-                    reason.as_deref(),
-                );
+            ModalState::ConfirmToolUse { .. } => {
+                self.render_tool_confirm_overlay(frame, screen_size, modal);
             }
             ModalState::AgentPicker {
                 agents,
@@ -912,71 +932,6 @@ impl Tui {
                 .border_style(Style::default().fg(Color::Reset)),
         );
 
-        frame.render_widget(modal, modal_area);
-    }
-
-    /// Multi-line confirmation modal for a `PreToolUse` "ask" gate. Shows the
-    /// tool name, optional reason, optional argument preview, and a [y/N] prompt.
-    fn render_tool_confirm_modal(
-        &self,
-        frame: &mut Frame<'_>,
-        screen_size: ratatui::layout::Rect,
-        tool_name: &str,
-        input_preview: &str,
-        reason: Option<&str>,
-    ) {
-        let dim = Style::default().fg(Color::DarkGray);
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        lines.push(Line::from(Span::styled(
-            format!("Allow tool '{tool_name}'?"),
-            Style::default()
-                .fg(Color::Reset)
-                .add_modifier(Modifier::BOLD),
-        )));
-        if let Some(r) = reason.filter(|r| !r.is_empty()) {
-            lines.push(Line::from(vec![
-                Span::styled("Reason: ", dim),
-                Span::styled(r.to_string(), Style::default().fg(Color::Reset)),
-            ]));
-        }
-        if !input_preview.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("Input: ", dim),
-                Span::styled(input_preview.to_string(), dim),
-            ]));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "[y] allow   [n] deny   (Enter/Esc denies)",
-            dim,
-        )));
-
-        let content_width = lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.chars().count())
-                    .sum::<usize>()
-            })
-            .max()
-            .unwrap_or(0) as u16;
-        let modal_width = (content_width + 4)
-            .max(24)
-            .min(screen_size.width.saturating_sub(4));
-        let modal_height = (lines.len() as u16 + 2).min(screen_size.height.saturating_sub(2));
-
-        let modal_x = (screen_size.width.saturating_sub(modal_width)) / 2;
-        let modal_y = (screen_size.height.saturating_sub(modal_height)) / 2;
-        let modal_area = ratatui::layout::Rect::new(modal_x, modal_y, modal_width, modal_height);
-
-        frame.render_widget(ratatui::widgets::Clear, modal_area);
-        let modal = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Tool confirmation")
-                .border_style(Style::default().fg(Color::Yellow)),
-        );
         frame.render_widget(modal, modal_area);
     }
 

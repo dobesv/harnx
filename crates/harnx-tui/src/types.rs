@@ -49,6 +49,9 @@ pub struct Tui {
     /// The (session_id, cluster) of the remote agent currently running, if any.
     /// Set in `start_prompt` and cleared when the turn completes.
     pub(super) active_remote_session: Option<(String, String)>,
+    /// Confirmation route retained for the frontend's current session. Prompt
+    /// and busy-enqueue paths share it so queued continuations keep a live modal.
+    pub(super) tool_confirmation_route: SharedToolConfirmationRoute,
     /// Sessions whose durable text append succeeded but whose worker activation
     /// must be retried without submitting the text as a second user message.
     pub(super) pending_remote_activations: HashSet<(String, String)>,
@@ -69,6 +72,41 @@ pub struct Tui {
     pub(crate) app: App,
     pub(crate) event_tx: mpsc::UnboundedSender<TuiEvent>,
     pub(crate) event_rx: mpsc::UnboundedReceiver<TuiEvent>,
+}
+
+pub(super) type SharedToolConfirmationRoute =
+    Arc<parking_lot::Mutex<Option<ActiveToolConfirmationRoute>>>;
+
+pub(super) struct ActiveToolConfirmationRoute {
+    pub(super) target: (String, String),
+    pub(super) route: ToolConfirmationRouteHandle,
+}
+
+#[derive(Clone)]
+pub(super) enum ToolConfirmationRouteHandle {
+    Nats(Arc<harnx_runtime::nats_tool_confirmation::ToolConfirmationRoute>),
+    #[cfg(test)]
+    Test(Arc<std::sync::atomic::AtomicBool>),
+}
+
+impl ToolConfirmationRouteHandle {
+    pub(super) fn shutdown(&self) {
+        match self {
+            Self::Nats(route) => route.shutdown(),
+            #[cfg(test)]
+            Self::Test(shutdown) => shutdown.store(true, std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
+    pub(super) fn nats(
+        &self,
+    ) -> Option<Arc<harnx_runtime::nats_tool_confirmation::ToolConfirmationRoute>> {
+        match self {
+            Self::Nats(route) => Some(Arc::clone(route)),
+            #[cfg(test)]
+            Self::Test(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

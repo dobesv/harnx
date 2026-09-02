@@ -1,5 +1,8 @@
 use crate::types::Tui;
-use crate::types::{PendingMessage, TranscriptItem, TuiEvent};
+use crate::types::{
+    ActiveToolConfirmationRoute, PendingMessage, SharedToolConfirmationRoute,
+    ToolConfirmationRouteHandle, TranscriptItem, TuiEvent,
+};
 use anyhow::{Context, Result};
 #[cfg(test)]
 use harnx_core::event::{AgentEvent, ModelEvent};
@@ -26,17 +29,79 @@ pub(super) struct PromptTaskContext {
     pub(super) local_worker:
         Arc<Mutex<Option<harnx_runtime::local_orchestrator::LocalWorkerSupervisor>>>,
     pub(super) event_tx: mpsc::UnboundedSender<TuiEvent>,
+    pub(super) tool_confirmation_route: SharedToolConfirmationRoute,
+}
+
+pub(super) fn matching_tool_confirmation_route(
+    routes: &SharedToolConfirmationRoute,
+    target: &(String, String),
+) -> Option<ToolConfirmationRouteHandle> {
+    routes
+        .lock()
+        .as_ref()
+        .filter(|route| &route.target == target)
+        .map(|route| route.route.clone())
+}
+
+pub(super) fn install_tool_confirmation_route(
+    routes: &SharedToolConfirmationRoute,
+    target: (String, String),
+    created: ToolConfirmationRouteHandle,
+) -> ToolConfirmationRouteHandle {
+    let mut routes = routes.lock();
+    if let Some(existing) = routes.as_ref() {
+        if existing.target == target {
+            created.shutdown();
+            return existing.route.clone();
+        }
+        existing.route.shutdown();
+    }
+    *routes = Some(ActiveToolConfirmationRoute {
+        target,
+        route: created.clone(),
+    });
+    created
+}
+async fn ensure_tool_confirmation_route(
+    session: &NatsSession,
+    target: (String, String),
+    routes: &SharedToolConfirmationRoute,
+    event_tx: mpsc::UnboundedSender<TuiEvent>,
+) -> Result<Arc<harnx_runtime::nats_tool_confirmation::ToolConfirmationRoute>> {
+    if let Some(route) =
+        matching_tool_confirmation_route(routes, &target).and_then(|route| route.nats())
+    {
+        return Ok(route);
+    }
+
+    let handler = crate::lifecycle::nats_tool_confirmation_handler(event_tx);
+    let created = Arc::new(session.tool_confirmation_route(handler).await?);
+    install_tool_confirmation_route(
+        routes,
+        target,
+        ToolConfirmationRouteHandle::Nats(Arc::clone(&created)),
+    )
+    .nats()
+    .context("tool confirmation slot contained a non-NATS route")
 }
 
 async fn run_nats_turn_with_tui_confirmation(
     session: &NatsSession,
     input: &harnx_runtime::config::Input,
-    sink: Arc<dyn harnx_core::event::AgentEventSink>,
-    event_tx: mpsc::UnboundedSender<TuiEvent>,
+    cluster: &str,
+    ctx: &PromptTaskContext,
 ) -> Result<harnx_runtime::nats_session::NatsTurnResult> {
-    let handler = crate::lifecycle::nats_tool_confirmation_handler(event_tx);
+    let sink = Arc::new(TuiAgentEventSink::new(ctx.event_tx.clone()));
+    let target = (session.session_id().to_string(), cluster.to_string());
+    let route = ensure_tool_confirmation_route(
+        session,
+        target,
+        &ctx.tool_confirmation_route,
+        ctx.event_tx.clone(),
+    )
+    .await?;
     session
-        .run_turn_input_with_tool_confirmation(input, None, sink, None, handler)
+        .run_turn_input_with_tool_confirmation_route(input, None, sink, None, &route)
         .await
 }
 
@@ -90,6 +155,28 @@ fn test_agent_loop_context(
 }
 
 impl Tui {
+    pub(super) fn clear_tool_confirmation_route(&self) {
+        let route = self.tool_confirmation_route.lock().take();
+        if let Some(route) = &route {
+            route.route.shutdown();
+        }
+        drop(route);
+    }
+
+    pub(super) fn sync_tool_confirmation_route(&self, target: Option<&(String, String)>) {
+        let route = {
+            let mut route = self.tool_confirmation_route.lock();
+            let keep = route
+                .as_ref()
+                .is_some_and(|route| target == Some(&route.target));
+            (!keep).then(|| route.take()).flatten()
+        };
+        if let Some(route) = &route {
+            route.route.shutdown();
+        }
+        drop(route);
+    }
+
     /// Queue input submitted while the current turn is busy. Plain text for a
     /// durable session can reach the running worker's next tool-round seam;
     /// other input retains the frontend-owned next-turn fallback.
@@ -149,9 +236,17 @@ impl Tui {
         session_id: String,
         cluster: String,
     ) -> Result<()> {
-        self.nats_session_for_target(session_id, cluster)
-            .await?
-            .activate_pending_turn()
+        let target = (session_id.clone(), cluster.clone());
+        let session = self.nats_session_for_target(session_id, cluster).await?;
+        let route = ensure_tool_confirmation_route(
+            &session,
+            target,
+            &self.tool_confirmation_route,
+            self.event_tx.clone(),
+        )
+        .await?;
+        session
+            .activate_pending_turn_with_tool_confirmation(&route)
             .await?;
         Ok(())
     }
@@ -178,7 +273,16 @@ impl Tui {
         }
 
         let session = self.nats_session_for_target(session_id, cluster).await?;
-        let enqueued = session.enqueue_text(&pending.text).await?;
+        let route = ensure_tool_confirmation_route(
+            &session,
+            target.clone(),
+            &self.tool_confirmation_route,
+            self.event_tx.clone(),
+        )
+        .await?;
+        let enqueued = session
+            .enqueue_text_with_tool_confirmation(&pending.text, &route)
+            .await?;
         if let Some(error) = enqueued.activation_error() {
             log::warn!(
                 "queued user message durably at sequence {} but activation failed; retrying at turn completion: {error:#}",
@@ -230,6 +334,9 @@ impl Tui {
         }
 
         self.current_prompt_abort = None;
+        if task.aborted() {
+            self.clear_tool_confirmation_route();
+        }
         if let Some(error) = error {
             self.finish_main_prompt_error(error).await;
         }
@@ -395,7 +502,6 @@ impl Tui {
         )
         .await?;
 
-        let sink = Arc::new(TuiAgentEventSink::new(ctx.event_tx.clone()));
         let session_id = ctx
             .config
             .read()
@@ -419,9 +525,7 @@ impl Tui {
         .await
         .context("failed to create NATS session")?;
 
-        let result =
-            run_nats_turn_with_tui_confirmation(&session, &input, sink, ctx.event_tx.clone())
-                .await?;
+        let result = run_nats_turn_with_tui_confirmation(&session, &input, &cluster, &ctx).await?;
         harnx_runtime::commands::update_last_message_after_nats_turn(&ctx.config, input, &result);
         log::info!(
             "prompt completed: cluster={} session_id={} cancelled={}",

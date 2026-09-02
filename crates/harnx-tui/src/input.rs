@@ -1332,6 +1332,7 @@ impl Tui {
             shared_pending_message: self.shared_pending_message.clone(),
             local_worker: self.local_worker.clone(),
             event_tx: event_tx.clone(),
+            tool_confirmation_route: self.tool_confirmation_route.clone(),
         };
 
         let handle = tokio::spawn(async move {

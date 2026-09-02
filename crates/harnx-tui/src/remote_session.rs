@@ -61,6 +61,7 @@ async fn cancel_remote_session(
 
 impl Tui {
     pub(super) fn cancel_active_remote_session(&self) {
+        self.clear_tool_confirmation_route();
         let Some((session_id, cluster)) = self.active_remote_session.clone() else {
             return;
         };
