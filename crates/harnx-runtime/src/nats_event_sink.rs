@@ -330,6 +330,9 @@ impl AgentEventSink for NatsEventSink {
 // Client-side attach helper
 // ---------------------------------------------------------------------------
 
+/// Type alias for JetStream context to avoid needing async_nats in downstream crates.
+pub type JetstreamContext = async_nats::jetstream::Context;
+
 /// Client-side helper for attaching to a session's event stream.
 ///
 /// Provides gap-free, dup-free event delivery:

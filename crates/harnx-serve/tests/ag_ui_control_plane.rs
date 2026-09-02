@@ -1,3 +1,7 @@
+mod support;
+
+use support::{read_sse_until as read_sse_until_impl, AppResponse, SseRead};
+
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -26,80 +30,14 @@ use harnx_serve::{
 };
 use http::Method;
 use http_body_util::BodyExt;
-use hyper::Response;
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, Notify};
-use tokio_stream::StreamExt;
 use uuid::Uuid;
-
-type AppResponse = Response<http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>>;
-
-#[derive(Debug, Default)]
-struct SseRead {
-    frames: Vec<String>,
-    events: Vec<Value>,
-    comments: Vec<String>,
-}
-
 async fn read_sse_until<F>(response: AppResponse, timeout: Duration, done: F) -> SseRead
 where
     F: Fn(&SseRead) -> bool,
 {
-    let fut = async {
-        let mut body = response.into_body().into_data_stream();
-        let mut read = SseRead::default();
-        let mut partial = String::new();
-
-        while !done(&read) {
-            match tokio::time::timeout(timeout, body.next()).await {
-                Ok(Some(Ok(chunk))) => {
-                    partial.push_str(std::str::from_utf8(&chunk).expect("sse utf8"));
-                }
-                Ok(Some(Err(err))) => {
-                    panic!(
-                        "error while reading SSE stream before predicate satisfied: {err}. frames: {:?}, events: {:?}, comments: {:?}",
-                        read.frames, read.events, read.comments
-                    );
-                }
-                Ok(None) => {
-                    break;
-                }
-                Err(_) => {
-                    panic!(
-                        "timed out after {timeout:?} waiting for SSE predicate. frames: {:?}, events: {:?}, comments: {:?}",
-                        read.frames, read.events, read.comments
-                    );
-                }
-            }
-
-            while let Some(idx) = partial.find("\n\n") {
-                let frame = partial[..idx].trim().to_string();
-                partial.drain(..idx + 2);
-                if frame.is_empty() {
-                    continue;
-                }
-                read.frames.push(frame.clone());
-                if frame.starts_with(':') {
-                    read.comments.push(frame);
-                } else {
-                    let payload = frame
-                        .strip_prefix("data: ")
-                        .expect("sse frame should start with data prefix");
-                    read.events
-                        .push(serde_json::from_str(payload).expect("valid event json"));
-                }
-                if done(&read) {
-                    return read;
-                }
-            }
-        }
-
-        read
-    };
-
-    tokio::time::timeout(timeout, fut)
-        .await
-        .expect("SSE read should finish before outer timeout")
+    read_sse_until_impl(response, timeout, done).await
 }
 
 async fn open_sse(
