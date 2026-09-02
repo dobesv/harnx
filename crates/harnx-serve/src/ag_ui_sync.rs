@@ -46,3 +46,22 @@ pub(crate) fn history_warning_event(message: String) -> Event {
         value: json!({ "message": message }),
     })
 }
+
+pub(crate) fn frame_run_boundary_event(event_type: &str, thread_id: &str, run_id: &str) -> String {
+    let body = serde_json::json!({
+        "type": event_type,
+        "threadId": thread_id,
+        "runId": run_id,
+    });
+    format!("data: {body}\n\n")
+}
+
+pub(crate) fn frame_run_error_event(thread_id: &str, run_id: &str, message: &str) -> String {
+    let body = serde_json::json!({
+        "type": "RUN_ERROR",
+        "threadId": thread_id,
+        "runId": run_id,
+        "message": message,
+    });
+    format!("data: {body}\n\n")
+}

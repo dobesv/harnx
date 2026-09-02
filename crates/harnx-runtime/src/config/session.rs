@@ -97,6 +97,21 @@ pub fn replay_log_entries_for_external(
     )
 }
 
+/// Replay external log entries while preserving a trailing tool-call batch as
+/// pending. Read-only observers use this while a worker still holds the lease.
+pub fn replay_log_entries_for_external_preserving_pending(
+    raw_entries: &[(usize, SessionLogEntry)],
+    name: &str,
+) -> Result<Session> {
+    replay_log_entries_into_session(
+        raw_entries,
+        name,
+        Session::default(),
+        true,
+        TrailingToolCallPolicy::Pending,
+    )
+}
+
 /// Replay conversation-only NATS entries into state initialized from canonical
 /// session metadata. Header and title rows are protocol violations in this
 /// path: their state belongs in KV and must never be synthesized or repaired

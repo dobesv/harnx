@@ -3,6 +3,7 @@
 //! Depends on `harnx-runtime` for Config + Client orchestration.
 
 pub mod ag_ui;
+mod ag_ui_remote_follow;
 pub mod ag_ui_rpc;
 mod ag_ui_sync;
 mod ag_ui_usage;
@@ -1394,10 +1395,10 @@ pub(crate) async fn load_nats_session(
         .await?
         .ok_or_else(|| anyhow!("Not Found"))?
         .metadata;
-    // Sample the lease before taking the bounded log snapshot. If a worker is
-    // active, a trailing ToolCalls row is in flight rather than interrupted.
-    // Sampling first also avoids calling a just-finished turn interrupted when
-    // its result lands while the historical read is underway.
+    // Double-sample lease status: before and after the bounded log read.
+    // Mirrors load_remote_transcript_for_render in harnx-runtime. A trailing
+    // ToolCalls row is in flight (pending) rather than interrupted when either
+    // sample shows an active lease.
     let lease_was_active = harnx_runtime::nats_lease::session_has_active_lease(&jetstream, session)
         .await
         .map_err(|err| anyhow!("Failed to inspect worker lease for session '{session}': {err}"))?;
@@ -1410,8 +1411,7 @@ pub(crate) async fn load_nats_session(
         .await
         .map_err(|err| anyhow!("Failed to load session history for '{session}': {err}"))?;
     // If there was no holder before the read, sample once more to cover a
-    // worker acquiring the lease and appending ToolCalls while the bounded
-    // snapshot was being taken.
+    // worker acquiring the lease and appending ToolCalls during the read.
     let preserve_pending = if lease_was_active {
         true
     } else {

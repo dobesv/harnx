@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::ag_ui_sync::{history_warning_event, pending_user_prompt, wire_message_id};
+use crate::ag_ui_sync::{
+    frame_run_boundary_event, frame_run_error_event, history_warning_event, pending_user_prompt,
+    wire_message_id,
+};
 use crate::ag_ui_usage::UsagePayloadInput;
 use crate::session_actor::{
     PromptResult, SessionCommand, SessionHandle, SessionInfo, SessionRegistry, SubscribeResult,
@@ -183,7 +186,7 @@ impl std::error::Error for AgUiError {}
 /// Run lifecycle events are owned by the session actor. This adapter maps
 /// streamed content and nested-agent steps, and records terminal errors for the
 /// actor to publish after it closes any open content segments.
-enum AgUiEventTx {
+pub(crate) enum AgUiEventTx {
     Unbounded(UnboundedSender<Event>),
     Broadcast(broadcast::Sender<Event>),
 }
@@ -269,7 +272,7 @@ impl AgUiSink {
         )
     }
 
-    fn with_snapshot(
+    pub(crate) fn with_snapshot(
         tx: impl Into<AgUiEventTx>,
         message_id: MessageId,
         text_message_started: bool,
@@ -831,25 +834,6 @@ pub fn parse_run_input(body: &[u8]) -> Result<RunAgentInput<JsonValue, JsonValue
     })
 }
 
-fn frame_run_boundary_event(event_type: &str, thread_id: &str, run_id: &str) -> String {
-    let body = serde_json::json!({
-        "type": event_type,
-        "threadId": thread_id,
-        "runId": run_id,
-    });
-    format!("data: {body}\n\n")
-}
-
-fn frame_run_error_event(thread_id: &str, run_id: &str, message: &str) -> String {
-    let body = serde_json::json!({
-        "type": "RUN_ERROR",
-        "threadId": thread_id,
-        "runId": run_id,
-        "message": message,
-    });
-    format!("data: {body}\n\n")
-}
-
 #[derive(Clone, Copy)]
 enum FirstRunState {
     AwaitingStarted,
@@ -1124,7 +1108,7 @@ fn frame_live_event(
     }
 }
 
-fn snapshot_event(messages: Vec<AgUiMessage>) -> Event {
+pub(crate) fn snapshot_event(messages: Vec<AgUiMessage>) -> Event {
     Event::MessagesSnapshot(MessagesSnapshotEvent {
         base: BaseEvent {
             timestamp: None,
@@ -1133,7 +1117,6 @@ fn snapshot_event(messages: Vec<AgUiMessage>) -> Event {
         messages,
     })
 }
-
 async fn subscribe(handle: &SessionHandle) -> SubscribeResult {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     handle
@@ -1307,7 +1290,7 @@ fn build_promptless_event_stream(
     Box::pin(tokio_stream::StreamExt::chain(started, body))
 }
 
-fn build_ag_ui_event_stream(
+pub(crate) fn build_ag_ui_event_stream(
     handle: &SessionHandle,
     run_id: &str,
     thread_id_text: &str,
@@ -1367,7 +1350,7 @@ fn build_ag_ui_event_stream(
 }
 
 pub async fn ag_ui_run_with_call_fn(
-    _base_config: &Config,
+    base_config: &Config,
     registry: &SessionRegistry,
     agent: &str,
     session: &str,
@@ -1388,7 +1371,7 @@ pub async fn ag_ui_run_with_call_fn(
     let handle = registry.get_or_spawn(key);
     let subscription = subscribe(&handle).await;
     let session_info = get_info(&handle).await;
-    let is_active = session_state_is_active(&session_info.state);
+    let local_is_active = session_state_is_active(&session_info.state);
     let has_prompt = pending_user_prompt(&run_input, &subscription.snapshot);
     let thread_id = derive_thread_id(session);
     let thread_id_text = thread_id.to_string();
@@ -1397,18 +1380,34 @@ pub async fn ag_ui_run_with_call_fn(
         let _ = prompt(&handle, text).await;
     }
 
-    let event_stream = build_ag_ui_event_stream(
-        &handle,
-        &run_id,
-        &thread_id_text,
-        subscription,
-        has_prompt.as_deref(),
-        is_active,
-    );
+    let stream = if let Some(stream) = crate::ag_ui_remote_follow::resolve_event_stream(
+        crate::ag_ui_remote_follow::EventStreamParams {
+            config: base_config,
+            session_id: session,
+            run_id: &run_id,
+            thread_id: &thread_id_text,
+            subscription: &subscription,
+            eligible: has_prompt.is_none() && !local_is_active,
+        },
+    )
+    .await?
+    {
+        stream
+    } else {
+        build_ag_ui_event_stream(
+            &handle,
+            &run_id,
+            &thread_id_text,
+            subscription,
+            has_prompt.as_deref(),
+            local_is_active,
+        )
+    };
+
     let unsubscribe_guard = UnsubscribeOnDrop {
         handle: handle.clone(),
     };
-    let stream = tokio_stream::StreamExt::map(event_stream, move |frame| {
+    let stream = tokio_stream::StreamExt::map(stream, move |frame| {
         let _guard = &unsubscribe_guard;
         Ok::<_, Infallible>(Frame::data(frame))
     });

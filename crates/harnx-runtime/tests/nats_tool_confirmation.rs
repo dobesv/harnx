@@ -5,6 +5,8 @@
 //! tests exercise the real handoff tool and hook server for both answers.
 
 mod common;
+#[path = "nats_tool_confirmation/multi_client.rs"]
+mod multi_client;
 
 use anyhow::{Context, Result};
 use harnx_core::{event::NullSink, require_nextest, session::SessionLogEntry, tool::ToolCall};

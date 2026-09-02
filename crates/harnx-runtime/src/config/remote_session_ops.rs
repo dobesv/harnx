@@ -434,17 +434,45 @@ fn consume_window_member(
 pub async fn load_remote_transcript_for_render(
     session: &NatsSession,
 ) -> Result<RemoteTranscriptState> {
+    // Double-sample lease status: before and after the bounded log read.
+    // Mirrors load_nats_session in harnx-serve. A worker appending ToolCalls
+    // mid-read would be captured by the second sample; the first sample
+    // preserves pending state for a lease released during the read.
+    let lease_was_active =
+        crate::nats_lease::session_has_active_lease(session.jetstream(), session.session_id())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to inspect worker lease for session '{}'",
+                    session.session_id()
+                )
+            })?;
     let log = NatsSessionLog::new(
         session.jetstream().clone(),
         session.session_id().to_string(),
     );
     let entries = log.load_events_async().await?;
-    transcript_state_from_entries(&entries, session.session_id())
+    // If the first sample was idle, check again for a worker that acquired the
+    // lease and appended this snapshot's trailing tool call during the read.
+    let preserve_pending = if lease_was_active {
+        true
+    } else {
+        crate::nats_lease::session_has_active_lease(session.jetstream(), session.session_id())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to inspect worker lease for session '{}'",
+                    session.session_id()
+                )
+            })?
+    };
+    transcript_state_from_entries(&entries, session.session_id(), preserve_pending)
 }
 
 fn transcript_state_from_entries(
     entries: &[(u64, SessionLogEntry)],
     session_id: &str,
+    preserve_pending: bool,
 ) -> Result<RemoteTranscriptState> {
     let effective_entries = harnx_core::session_reconstruct::apply_log_mutations_nats(entries)
         .context("failed to reconstruct remote session log for transcript render")?;
@@ -459,7 +487,14 @@ fn transcript_state_from_entries(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut session = super::session::replay_log_entries_for_external(&raw_entries, session_id)?;
+    let mut session = if preserve_pending {
+        super::session::replay_log_entries_for_external_preserving_pending(
+            &raw_entries,
+            session_id,
+        )?
+    } else {
+        super::session::replay_log_entries_for_external(&raw_entries, session_id)?
+    };
 
     renumber_remote_messages_for_window(
         &mut session.compressed_messages,
@@ -666,7 +701,7 @@ mod transcript_tests {
             message(2, MessageRole::Assistant, "prior answer"),
         ];
 
-        let state = transcript_state_from_entries(&entries, "legacy-session")
+        let state = transcript_state_from_entries(&entries, "legacy-session", false)
             .expect("reconstruct headerless NATS transcript");
         let rows = state
             .messages
