@@ -440,6 +440,34 @@ Multiple clients can attach to a single session:
 
 Late-joining clients automatically converge to the same state by replaying the durable log.
 
+### Busy-State Reflection for Remote Workers
+
+When a NATS worker holds the session lease, the Web UI's AG-UI `/run` endpoint
+follows a different path than the local-actor case:
+
+- **Local actor running**: the SSE stream follows the `SessionActor` broadcast,
+  which emits real-time `AgentEvent`s from the model/tool loop.
+- **Local actor idle + remote lease active**: the AG-UI endpoint attaches to
+  `SessionEventStream` advisories, translates them to AG-UI frames, and
+  terminates when a durable `TurnEnd` matching the snapshot's last `User`
+  sequence is observed. A sustained lease absence (5 consecutive 1s polls with
+  no `TurnEnd`) is treated as worker crash and forces finish.
+
+The session metadata watch endpoint (`GET .../events`, `session_updates` in the
+serve implementation) is separate from the AG-UI `/run` stream and provides
+lightweight `session-updated` notifications that trigger client rehydration.
+Two distinct endpoints keep the AG-UI run stream finite and properly sequenced
+(RUN_STARTED → … → RUN_FINISHED), while the watch channel converges late
+observers on the same durable state.
+
+Tool confirmations are **point-to-point** over NATS: the worker sends the
+confirmation request to the `ToolConfirmationRoute` subject carried on the
+activation (stored as `tool_confirmation_subject`). Only the owning frontend
+receives the prompt; other observers see the resulting durable log updates
+after approval.
+
+### Trailing Tool Calls: Pending vs. Interrupted
+
 A bounded history snapshot can legitimately end at `ToolCalls` while the lease
 holder is still executing the tool. Read-only observers sample the session
 lease before loading history (and again afterward if it was initially free):
