@@ -364,19 +364,18 @@ impl Toolset for SubagentToolset {
 }
 
 fn tool_specs(agent: &str) -> Vec<ToolSpec> {
-    let display_name = sanitize_for_tool_name(agent);
     vec![
-        session_new_spec(agent, &display_name),
-        session_prompt_spec(agent, &display_name),
-        session_id_tool_spec(agent, &display_name, SessionIdTool::Load),
-        session_id_tool_spec(agent, &display_name, SessionIdTool::Cancel),
+        session_new_spec(agent),
+        session_prompt_spec(agent),
+        session_id_tool_spec(agent, SessionIdTool::Load),
+        session_id_tool_spec(agent, SessionIdTool::Cancel),
     ]
 }
 
 /// A truncated session ID, so the call header stays one short line.
 const SHORT_SESSION_ID: &str = "{{ args.session_id | truncate(8, end='') }}";
 
-fn session_new_spec(agent: &str, display_name: &str) -> ToolSpec {
+fn session_new_spec(agent: &str) -> ToolSpec {
     ToolSpec {
         name: SUBAGENT_SESSION_NEW_TOOL.to_string(),
         description: format!("Create a new session on the '{agent}' agent"),
@@ -387,10 +386,10 @@ fn session_new_spec(agent: &str, display_name: &str) -> ToolSpec {
         meta: None,
     }
     .without_request_timeout()
-    .with_call_template(&format!("@ {display_name} new session"))
+    .with_call_template(&format!("@ {agent} new session"))
 }
 
-fn session_prompt_spec(agent: &str, display_name: &str) -> ToolSpec {
+fn session_prompt_spec(agent: &str) -> ToolSpec {
     ToolSpec {
         name: SUBAGENT_SESSION_PROMPT_TOOL.to_string(),
         description: format!(
@@ -425,7 +424,7 @@ fn session_prompt_spec(agent: &str, display_name: &str) -> ToolSpec {
     }
     .without_request_timeout()
     .with_call_template(&format!(
-        "@ {display_name}{{% if args.session_id %}} [{SHORT_SESSION_ID}]{{% endif %}}\n{{{{ args.message }}}}"
+        "@ {agent}{{% if args.session_id %}} [{SHORT_SESSION_ID}]{{% endif %}}\n{{{{ args.message }}}}"
     ))
 }
 
@@ -466,7 +465,7 @@ impl SessionIdTool {
     }
 }
 
-fn session_id_tool_spec(agent: &str, display_name: &str, tool: SessionIdTool) -> ToolSpec {
+fn session_id_tool_spec(agent: &str, tool: SessionIdTool) -> ToolSpec {
     let verb = tool.verb();
     ToolSpec {
         name: tool.tool_name().to_string(),
@@ -486,7 +485,7 @@ fn session_id_tool_spec(agent: &str, display_name: &str, tool: SessionIdTool) ->
         timeout_secs: Some(60),
         meta: None,
     }
-    .with_call_template(&format!("@ {display_name} {verb} {SHORT_SESSION_ID}"))
+    .with_call_template(&format!("@ {agent} {verb} {SHORT_SESSION_ID}"))
 }
 
 #[cfg(test)]
@@ -539,11 +538,8 @@ mod tests {
 
     /// Without a `call_template` the client renders a YAML dump of the
     /// arguments, which for `session_prompt` means the whole prompt body.
-    #[test]
-    fn every_session_tool_advertises_a_call_template() {
-        let tools = tool_specs("pkg/helper");
-
-        let templates = tools
+    fn call_templates(agent: &str) -> Vec<String> {
+        tool_specs(agent)
             .iter()
             .map(|tool| {
                 tool.meta
@@ -551,16 +547,36 @@ mod tests {
                     .and_then(|meta| meta.get("call_template"))
                     .and_then(Value::as_str)
                     .unwrap_or_else(|| panic!("tool '{}' has no call_template", tool.name))
+                    .to_string()
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
 
+    /// A packaged agent shows its canonical `pkg/agent` name, not the sanitized
+    /// tool-name form (`pkg__agent`) used for routing.
+    #[test]
+    fn every_session_tool_advertises_a_call_template() {
         assert_eq!(
-            templates,
+            call_templates("pkg/helper"),
             vec![
-                "@ pkg__helper new session",
-                "@ pkg__helper{% if args.session_id %} [{{ args.session_id | truncate(8, end='') }}]{% endif %}\n{{ args.message }}",
-                "@ pkg__helper load {{ args.session_id | truncate(8, end='') }}",
-                "@ pkg__helper cancel {{ args.session_id | truncate(8, end='') }}",
+                "@ pkg/helper new session",
+                "@ pkg/helper{% if args.session_id %} [{{ args.session_id | truncate(8, end='') }}]{% endif %}\n{{ args.message }}",
+                "@ pkg/helper load {{ args.session_id | truncate(8, end='') }}",
+                "@ pkg/helper cancel {{ args.session_id | truncate(8, end='') }}",
+            ]
+        );
+    }
+
+    /// A top-level (non-packaged) agent name has no `/`, so it renders unchanged.
+    #[test]
+    fn call_templates_use_a_bare_agent_name_unchanged() {
+        assert_eq!(
+            call_templates("helper"),
+            vec![
+                "@ helper new session",
+                "@ helper{% if args.session_id %} [{{ args.session_id | truncate(8, end='') }}]{% endif %}\n{{ args.message }}",
+                "@ helper load {{ args.session_id | truncate(8, end='') }}",
+                "@ helper cancel {{ args.session_id | truncate(8, end='') }}",
             ]
         );
     }
