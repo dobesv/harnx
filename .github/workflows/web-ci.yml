@@ -63,7 +63,7 @@ jobs:
         if: needs.changes.outputs.web == 'true'
         uses: pnpm/action-setup@v6
         with:
-          version: 11.25.0
+          version: 12.3.0
 
       - name: Set up Node
         if: needs.changes.outputs.web == 'true'
