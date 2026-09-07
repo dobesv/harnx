@@ -115,7 +115,7 @@ textwrap = "0.16.0"
 ansi_colours = "1.2.2"
 reqwest-eventsource = { git = "https://github.com/jpopesculian/reqwest-eventsource", rev = "356e2f61827b193bd5ab389c38059bcc2eed90aa" }
 log = { version = "0.4.20", features = ["std"] }
-gix = { version = "0.86.0", features = ["blob-diff", "worktree-mutation", "tree-editor", "blocking-network-client"] }
+gix = { version = "0.87.0", features = ["blob-diff", "worktree-mutation", "tree-editor", "blocking-network-client"] }
 oci-client = "0.17"
 semver = { version = "1.0", features = ["serde"] }
 mockall = "0.15"
