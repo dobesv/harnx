@@ -6,6 +6,7 @@ use crate::utils::{warning_text, AbortSignal};
 use anyhow::Result;
 use std::sync::Arc;
 
+use harnx_client::ClientConfig;
 use harnx_core::model::Model;
 use harnx_engine::retry::{CallFuture, TurnContext};
 
@@ -53,9 +54,19 @@ fn build_turn_context(config: &GlobalConfig) -> TurnContext {
     }
 }
 
-fn record_llm_metrics(agent_name: &str, model: &Model, usage: &CompletionTokenUsage) {
+fn record_llm_metrics(
+    agent_name: &str,
+    model: &Model,
+    usage: &CompletionTokenUsage,
+    clients: &[ClientConfig],
+) {
     let client_name = model.client_name().to_owned();
     let model_name = model.name().to_owned();
+    let provider = clients
+        .iter()
+        .find(|c| c.effective_name() == model.client_name())
+        .map(|c| c.type_name())
+        .unwrap_or("");
 
     // Token/cost metrics are recorded once at the retry wrapper, NOT at
     // ModelEvent::Usage/Final (double-count: tool loops emit multiple Usage;
@@ -73,6 +84,7 @@ fn record_llm_metrics(agent_name: &str, model: &Model, usage: &CompletionTokenUs
             "agent" => agent_name.to_owned(),
             "client" => client_name.clone(),
             "model" => model_name.clone(),
+            "provider" => provider,
             "type" => usage_type,
         )
         .increment(tokens);
@@ -85,6 +97,7 @@ fn record_llm_metrics(agent_name: &str, model: &Model, usage: &CompletionTokenUs
             "agent" => agent_name.to_owned(),
             "client" => client_name,
             "model" => model_name,
+            "provider" => provider,
         )
         .increment(cost);
     }
@@ -153,7 +166,7 @@ where
     .await?;
 
     let agent = input.agent();
-    record_llm_metrics(agent.name(), agent.model(), &result.3);
+    record_llm_metrics(agent.name(), agent.model(), &result.3, &turn_ctx.clients);
 
     Ok(result)
 }
