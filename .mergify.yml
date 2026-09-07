@@ -7,7 +7,9 @@ queue_rules:
     update_method: rebase
     batch_max_wait_time: 15 m 34 s
     batch_max_failure_resolution_attempts: 10
-    # The batch is only merged once every required check is green.
+    # The batch is only merged once every required check is green. Keep the
+    # main-branch GitHub ruleset's required checks synchronized with this list
+    # so merges outside Mergify cannot bypass the same safety gates.
     merge_conditions:
       - check-success=All (ubuntu-latest)
       - check-success=All (macos-latest)
@@ -20,13 +22,9 @@ queue_rules:
       - check-success=Playwright E2E Tests
 
 pull_request_rules:
-  - name: Automerge passing Renovate PRs
-    conditions:
-      - author=renovate[bot]
-    actions:
-      queue:
-        name: main
-
+  # Renovate applies this label only to non-major updates. Keeping merge
+  # ownership here avoids racing Renovate's platform-native automerge against
+  # the queue's full set of required checks.
   - name: Automerge PRs labeled automerge
     conditions:
       - label=automerge
