@@ -5,26 +5,18 @@
   ],
   "semanticCommits": "enabled",
   "automerge": false,
-  "automergeType": "pr",
-  "platformAutomerge": true,
   "minimumReleaseAge": "3 days",
   "internalChecksFilter": "strict",
   "packageRules": [
     {
-      "description": "Automerge minor and patch updates",
+      "description": "Queue non-major updates for Mergify",
       "matchUpdateTypes": ["minor", "patch", "digest", "pin"],
-      "automerge": true
+      "addLabels": ["automerge"]
     },
     {
       "description": "Do not automerge major updates",
       "matchUpdateTypes": ["major"],
       "automerge": false
-    },
-    {
-      "description": "Automerge non-major GitHub Actions updates",
-      "matchManagers": ["github-actions"],
-      "matchUpdateTypes": ["minor", "patch", "digest", "pin"],
-      "automerge": true
     }
   ]
 }
