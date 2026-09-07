@@ -51,9 +51,9 @@ use crate::nats_event_sink::SessionEventStream;
 use crate::nats_session_log::NatsSessionLog;
 use crate::nats_session_metadata::{SessionInitializer, SessionMetadata, SessionMetadataStore};
 use crate::nats_worker::{
-    new_remote_session_id, publish_control_command, publish_session_activate,
-    publish_targeted_session_activate, request_control_command, ControlCommand, LocalWorkerTarget,
-    SessionActivate, SessionActivationRoute,
+    publish_control_command, publish_session_activate, publish_targeted_session_activate,
+    request_control_command, ControlCommand, LocalWorkerTarget, SessionActivate,
+    SessionActivationRoute,
 };
 use crate::utils::AbortSignal;
 
@@ -341,6 +341,12 @@ impl NatsSession {
     ///
     /// Connects to the NATS cluster and generates/reuses a session ID.
     ///
+    /// Session ID resolution:
+    /// - If `config.session_id` is set and non-empty, uses that ID unchanged
+    ///   (supports both short IDs and legacy UUID v7).
+    /// - Otherwise, reserves a new short ID via `reserve_short_session_id`
+    ///   against the canonical session metadata store.
+    ///
     /// This function takes the NATS connection components directly to avoid
     /// Send issues with GlobalConfig's parking_lot lock guard across await points.
     pub async fn new(
@@ -349,15 +355,19 @@ impl NatsSession {
         jetstream: jetstream::Context,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
-        // Resolve session ID (new or existing)
-        let session_id = config
-            .session_id
-            .clone()
-            .unwrap_or_else(new_remote_session_id);
-
         let metadata_store = SessionMetadataStore::ensure(&jetstream, 1)
             .await
             .context("failed to open canonical session metadata store")?;
+        let session_id = match config.session_id.as_ref() {
+            Some(id) if !id.trim().is_empty() => id.clone(),
+            _ => {
+                crate::utils::session_name::reserve_short_session_id(
+                    &metadata_store,
+                    &config.initializer,
+                )
+                .await?
+            }
+        };
         ensure_session_metadata(
             &metadata_store,
             &jetstream,

@@ -70,7 +70,12 @@ impl SessionActivate {
     }
 }
 
-/// Generate a fresh remote session id (UUID v7, time-ordered).
+/// Generate a UUID session ID for tests; production paths must reserve a short ID.
+///
+/// This returns a raw UUID v7 and must not be used for production session creation.
+/// Use `Config::reserve_new_session_id`, `NatsSession::new`, or the HTTP POST endpoint
+/// instead — they reserve a collision-safe short ID against the canonical NATS metadata
+/// store. See `utils::session_name` for the canonical ID format and reservation path.
 pub fn new_remote_session_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }

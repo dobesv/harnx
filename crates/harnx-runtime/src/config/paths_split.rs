@@ -145,20 +145,7 @@ impl Config {
             server.replicas.unwrap_or(1),
         )
         .await?;
-        let mut seconds = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        loop {
-            let candidate = crate::utils::session_name::encode_timestamp_session_id(seconds);
-            let metadata =
-                crate::nats_session_metadata::SessionMetadata::new(&candidate, initializer.clone());
-            if store.create(&metadata).await?.is_some() {
-                return Ok(candidate);
-            }
-            seconds = seconds.saturating_add(1);
-        }
+        crate::utils::session_name::reserve_short_session_id(&store, initializer).await
     }
 
     pub fn rag_file(&self, name: &str) -> PathBuf {
