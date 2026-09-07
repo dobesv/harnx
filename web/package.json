@@ -17,7 +17,7 @@
   "dependencies": {
     "@ag-ui/client": "0.0.59",
     "@assistant-ui/react": "0.15.17",
-    "@assistant-ui/react-ag-ui": "0.0.57",
+    "@assistant-ui/react-ag-ui": "0.0.58",
     "@assistant-ui/react-markdown": "0.14.13",
     "@assistant-ui/react-syntax-highlighter": "0.14.5",
     "@radix-ui/react-dropdown-menu": "2.1.24",
