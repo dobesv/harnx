@@ -203,4 +203,27 @@ describe('useAgentSessions', () => {
       ['agent9', 'agent10'],
     );
   });
-});
+
+  it('markSessionNotFresh transitions isFreshSession from true to false', async () => {
+    vi.mocked(api.createSession).mockResolvedValueOnce({ session_id: 'test-fresh' });
+    vi.mocked(api.listSessions).mockResolvedValue([]);
+
+    const { result } = renderHook(() => useAgentSessions());
+    
+    act(() => {
+      result.current.selectAgent('agent-fresh');
+    });
+
+    await act(async () => {
+      await result.current.newChat();
+    });
+
+    expect(result.current.selectedSessionId).toBe('test-fresh');
+    expect(result.current.isFreshSession).toBe(true);
+
+    act(() => {
+      result.current.markSessionNotFresh('test-fresh');
+    });
+
+    expect(result.current.isFreshSession).toBe(false);
+  });});
