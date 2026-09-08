@@ -12,8 +12,10 @@ use crate::ag_ui_sync::{
     wire_message_id,
 };
 use crate::ag_ui_usage::UsagePayloadInput;
+use crate::interrupt_resume::{parse_resume_params, validate_resume, InterruptResumeParam};
 use crate::session_actor::{
-    PromptResult, SessionCommand, SessionHandle, SessionInfo, SessionRegistry, SubscribeResult,
+    PromptResult, SessionCommand, SessionHandle, SessionInfo, SessionPromptOptions,
+    SessionRegistry, SubscribeResult,
 };
 
 #[cfg(test)]
@@ -68,6 +70,8 @@ struct RelaxedRunAgentInput<TState = JsonValue> {
     tools: Vec<Tool>,
     #[serde(default)]
     context: Vec<Context>,
+    #[serde(default)]
+    resume: Vec<InterruptResumeParam>,
     #[serde(rename = "forwardedProps", default)]
     forwarded_props: serde_json::Map<String, serde_json::Value>,
 }
@@ -1045,6 +1049,22 @@ fn frame_guarded_live_event(event: Event, guard: &mut LiveStreamGuard) -> Option
     }
 }
 
+fn frame_run_finished_event(thread_id: &str, run_id: &str, result: Option<JsonValue>) -> Bytes {
+    let mut body = serde_json::json!({
+        "type": "RUN_FINISHED",
+        "threadId": thread_id,
+        "runId": run_id,
+    });
+    if let Some(result) = result {
+        if let Some(outcome) = result.get("outcome") {
+            body["outcome"] = outcome.clone();
+        } else {
+            body["result"] = result;
+        }
+    }
+    Bytes::from(format!("data: {body}\n\n"))
+}
+
 fn frame_live_event(
     event: Event,
     state: &mut FirstRunState,
@@ -1060,13 +1080,7 @@ fn frame_live_event(
             }
             Event::RunFinished(event) => {
                 *state = FirstRunState::Complete;
-                let body = serde_json::json!({
-                    "type": "RUN_FINISHED",
-                    "threadId": thread_id,
-                    "runId": run_id,
-                    "result": event.result,
-                });
-                Some(Bytes::from(format!("data: {body}\n\n")))
+                Some(frame_run_finished_event(thread_id, run_id, event.result))
             }
             Event::RunError(err) => {
                 *state = FirstRunState::Errored;
@@ -1082,13 +1096,7 @@ fn frame_live_event(
             Event::RunStarted(_) => None,
             Event::RunFinished(event) => {
                 *state = FirstRunState::Complete;
-                let body = serde_json::json!({
-                    "type": "RUN_FINISHED",
-                    "threadId": thread_id,
-                    "runId": run_id,
-                    "result": event.result,
-                });
-                Some(Bytes::from(format!("data: {body}\n\n")))
+                Some(frame_run_finished_event(thread_id, run_id, event.result))
             }
             Event::RunError(err) => {
                 *state = FirstRunState::Errored;
@@ -1127,13 +1135,13 @@ async fn subscribe(handle: &SessionHandle) -> SubscribeResult {
     reply_rx.await.expect("recv subscribe")
 }
 
-async fn prompt(handle: &SessionHandle, text: &str) -> PromptResult {
+async fn prompt(handle: &SessionHandle, text: &str, options: SessionPromptOptions) -> PromptResult {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     handle
         .tx
         .send(SessionCommand::Prompt {
             text: text.to_string(),
-            options: crate::session_actor::SessionPromptOptions::default(),
+            options,
             reply: reply_tx,
         })
         .await
@@ -1164,13 +1172,11 @@ impl Drop for UnsubscribeOnDrop {
     }
 }
 
-/// Whether a session has a live run that a fresh (promptless) subscribe/reload
-/// should FOLLOW rather than terminate.
+/// Whether a session has local run state that blocks idle or remote-follow handling.
 ///
-/// Both `Running` and `Interrupted` are active: `Interrupted` means the run is
-/// paused awaiting a tool approval (HITL). A reload during that window must
-/// attach to the live broadcast so the pending approval prompt reappears — NOT
-/// emit a synthetic RUN_FINISHED that would close the stream and drop the gate.
+/// A promptless `Running` subscription follows live events. `Interrupted` is also
+/// active, but its saved outcome is replayed as a terminal `RUN_FINISHED`; the client
+/// renders that gate and submits the decision as a new resume run.
 fn session_state_is_active(state: &crate::session_actor::SessionState) -> bool {
     matches!(
         state,
@@ -1260,12 +1266,28 @@ fn build_promptless_event_stream(
     snapshot_frame: Option<Bytes>,
     live_stream: impl tokio_stream::Stream<Item = Event> + Send + Sync + 'static,
     is_active: bool,
+    interrupt_outcome: Option<JsonValue>,
 ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Bytes> + Send + Sync + 'static>> {
     let started = tokio_stream::once(Bytes::from(frame_run_boundary_event(
         "RUN_STARTED",
         thread_id_text,
         run_id,
     )));
+
+    if let Some(outcome) = interrupt_outcome {
+        // An approval interrupt is terminal for this AG-UI run. Replay it on every
+        // promptless join so a reconnecting client can render the pending gate,
+        // then let the client submit its decision as a new resume run.
+        let hydrated = tokio_stream::StreamExt::chain(started, tokio_stream::iter(snapshot_frame));
+        return Box::pin(tokio_stream::StreamExt::chain(
+            hydrated,
+            tokio_stream::once(frame_run_finished_event(
+                thread_id_text,
+                run_id,
+                Some(json!({ "outcome": outcome })),
+            )),
+        ));
+    }
 
     if !is_active {
         // Idle session: hydrate history then emit a synthetic RUN_FINISHED so the
@@ -1281,9 +1303,8 @@ fn build_promptless_event_stream(
         ));
     }
 
-    // Active session (Running or Interrupted — e.g. page reload mid-run or during a
-    // tool-approval wait): emit exactly ONE RUN_STARTED, hydrate history, then
-    // follow the live broadcast body until the real terminal event.
+    // Running session (e.g. page reload mid-run): emit exactly one RUN_STARTED,
+    // hydrate history, then follow the live broadcast body until the real terminal event.
     // `build_live_event_body` carries the snapshot_frame and does NOT emit its own
     // RUN_STARTED, so the client never sees a duplicate boundary.
     let body = build_live_event_body(run_id, thread_id_text, snapshot_frame, live_stream);
@@ -1301,8 +1322,14 @@ pub(crate) fn build_ag_ui_event_stream(
     let SubscribeResult {
         snapshot,
         history_warnings,
+        state,
         events,
     } = subscription;
+    let interrupt_outcome = match state {
+        crate::session_actor::SessionState::Interrupted { pending, .. } => Some(pending.metadata),
+        crate::session_actor::SessionState::Idle
+        | crate::session_actor::SessionState::Running { .. } => None,
+    };
     let initial_events = has_prompt
         .is_none()
         .then(|| snapshot_event(snapshot))
@@ -1345,6 +1372,7 @@ pub(crate) fn build_ag_ui_event_stream(
             initial_frame,
             live_stream,
             is_active,
+            interrupt_outcome,
         ),
     }
 }
@@ -1363,6 +1391,8 @@ pub async fn ag_ui_run_with_call_fn(
         .run_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let resume = parse_resume_params(&relaxed_run_input.resume)
+        .map_err(|err| AgUiError::BadRequest(format!("invalid AG-UI resume: {err}")))?;
     let run_input = parse_run_input(req_body)?;
     let key = crate::session_actor::SessionKey {
         agent: agent.to_string(),
@@ -1370,14 +1400,35 @@ pub async fn ag_ui_run_with_call_fn(
     };
     let handle = registry.get_or_spawn(key);
     let subscription = subscribe(&handle).await;
-    let session_info = get_info(&handle).await;
-    let local_is_active = session_state_is_active(&session_info.state);
-    let has_prompt = pending_user_prompt(&run_input, &subscription.snapshot);
+    let unsubscribe_guard = UnsubscribeOnDrop {
+        handle: handle.clone(),
+    };
+    let subscribed_state = subscription.state.clone();
+    let local_is_active = session_state_is_active(&subscribed_state);
+    let fresh_user_prompt = resume
+        .is_empty()
+        .then(|| pending_user_prompt(&run_input, &subscription.snapshot))
+        .flatten();
+    let requested_prompt = if resume.is_empty() {
+        fresh_user_prompt
+    } else {
+        let pending_text = validate_resume(&resume, &subscribed_state)
+            .map_err(|err| AgUiError::BadRequest(format!("invalid AG-UI resume: {err}")))?;
+        Some(pending_text.to_string())
+    };
     let thread_id = derive_thread_id(session);
     let thread_id_text = thread_id.to_string();
 
-    if let Some(text) = has_prompt.as_deref() {
-        let _ = prompt(&handle, text).await;
+    if let Some(text) = requested_prompt.as_deref() {
+        let _ = prompt(
+            &handle,
+            text,
+            SessionPromptOptions {
+                resume,
+                ..SessionPromptOptions::default()
+            },
+        )
+        .await;
     }
 
     let stream = if let Some(stream) = crate::ag_ui_remote_follow::resolve_event_stream(
@@ -1387,7 +1438,7 @@ pub async fn ag_ui_run_with_call_fn(
             run_id: &run_id,
             thread_id: &thread_id_text,
             subscription: &subscription,
-            eligible: has_prompt.is_none() && !local_is_active,
+            eligible: requested_prompt.is_none() && !local_is_active,
         },
     )
     .await?
@@ -1399,14 +1450,11 @@ pub async fn ag_ui_run_with_call_fn(
             &run_id,
             &thread_id_text,
             subscription,
-            has_prompt.as_deref(),
+            requested_prompt.as_deref(),
             local_is_active,
         )
     };
 
-    let unsubscribe_guard = UnsubscribeOnDrop {
-        handle: handle.clone(),
-    };
     let stream = tokio_stream::StreamExt::map(stream, move |frame| {
         let _guard = &unsubscribe_guard;
         Ok::<_, Infallible>(Frame::data(frame))

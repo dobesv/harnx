@@ -57,11 +57,14 @@ The proxy is configured to be **SSE-safe**. It disables buffering for `text/even
   - Streaming text, thinking, and tool-call rendering.
   - Session switching.
   - Turn cancellation.
+  - Tool approval and session handoff confirmations (approve/deny responses and reconnect replay).
+  - Queued message viewing, editing (restoring to composer), and cancellation.
 - **Out of Scope** (Deferred to `harnx-webui-parity` backlog):
+  - Mid-turn message injection timing parity (the web queue flushes when the current run finishes).
+  - General transcript message editing and history rewinding (beyond pending queued messages).
   - File attachments.
-  - Tool approval workflows.
-  - Message editing and rewinding.
   - Model switching.
+  - NATS single-owner-route fanout redesign for multi-client tool approvals.
 
 ### Known Cosmetic Issues
 

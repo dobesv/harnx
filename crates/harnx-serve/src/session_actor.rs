@@ -324,6 +324,7 @@ impl SessionActor {
                 let _ = reply.send(SubscribeResult {
                     snapshot: self.history_snapshot.clone(),
                     history_warnings: self.history_warnings.clone(),
+                    state: self.state.clone(),
                     events: self.broadcast_tx.subscribe(),
                 });
             }
