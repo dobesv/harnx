@@ -235,7 +235,16 @@ pub fn strip_shebang_line(command: &str) -> &str {
 
 fn make_template_env<'a>() -> Environment<'a> {
     let mut env = Environment::new();
-    env.set_undefined_behavior(UndefinedBehavior::Lenient);
+    // Chainable, not Lenient: Lenient tolerates *printing* an undefined value
+    // but still raises "undefined value" when you access an attribute/index of
+    // an undefined intermediate. Result templates like
+    // `{{ result.content[0].text | default('') }}` walk into `result.content`,
+    // which is absent on recoverable-error results (`{"is_error": true,
+    // "error": ...}` — no `content` field). Under Lenient that raised before
+    // `default('')` could apply, spamming `warn!("template error ...")` (#1537).
+    // Chainable makes each missing hop evaluate to undefined so the `default`
+    // filter is honored. Syntax errors and other hard failures still error.
+    env.set_undefined_behavior(UndefinedBehavior::Chainable);
     // `truncate` is not a minijinja built-in; register it so templates can do
     // `{{ args.message | truncate(60) }}` or `{{ args.id | truncate(8, end='') }}`.
     env.add_filter(
@@ -695,7 +704,8 @@ mod tests {
 
     #[test]
     fn test_render_tool_call_template_missing_var() {
-        // Lenient mode: missing variable renders as empty string, not an error
+        // A missing variable prints as empty string, not an error, under the
+        // env's undefined behavior (see `make_template_env`).
         let result =
             render_tool_call_template("{{ args.missing }}", &serde_json::json!({}), "fallback");
         assert!(result.is_ok());
@@ -770,6 +780,43 @@ mod tests {
             "raw fallback",
         );
         assert_eq!(rendered.unwrap(), "ERROR: boom");
+    }
+
+    /// Issue #1537: recoverable-error tool results have shape
+    /// `{"is_error": true, "error": ...}` with no `content` field. The shared
+    /// plans result template indexes into `result.content[0].text`, so a
+    /// missing `content` must not raise "undefined value" — the `default('')`
+    /// filter has to be honored (Chainable undefined behavior), not defeated
+    /// by an error on the intermediate access (the old Lenient behavior).
+    #[test]
+    fn test_render_result_template_error_shape_no_content_does_not_raise() {
+        // The exact template every plans tool shares (tool_templates::RESULT).
+        let template = "{{ result.content[0].text | default('') }}";
+        let error_result = serde_json::json!({
+            "is_error": true,
+            "error": "note note-1 not found in plan 'p'",
+        });
+        let rendered = render_tool_result_template(template, &error_result, "raw fallback");
+        assert_eq!(
+            rendered.expect("error-shape result must render without error"),
+            ""
+        );
+
+        // Empty content array is the same missing-index case one hop deeper.
+        let empty_content = serde_json::json!({ "content": [] });
+        let rendered = render_tool_result_template(template, &empty_content, "raw fallback");
+        assert_eq!(
+            rendered.expect("empty-content result must render without error"),
+            ""
+        );
+
+        // Success shape still renders its text.
+        let ok_result = serde_json::json!({ "content": [{"text": "hello"}] });
+        let rendered = render_tool_result_template(template, &ok_result, "raw fallback");
+        assert_eq!(
+            rendered.expect("success-shape result must render its text"),
+            "hello"
+        );
     }
 
     /// Issue #434: the bash exec call_template must always close its code

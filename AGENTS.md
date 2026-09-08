@@ -177,6 +177,24 @@ propagates as an error with context naming the tool and echoing the raw argument
 This convention is consolidated across all provider parsers (`openai.rs`, `openai_responses.rs`,
 `bedrock.rs`, `claude.rs`, `cohere.rs`).
 
+### Tool result templates and undefined behavior
+
+Tool display templates are rendered by `make_template_env()` in
+`crates/harnx-core/src/tool.rs`, which MUST use `UndefinedBehavior::Chainable`
+(not `Lenient`). MiniJinja's `Lenient` mode tolerates printing an undefined
+value, but it still raises "undefined value" when accessing an attribute or
+index of an undefined intermediate — `default()` filters cannot rescue this.
+
+The canonical result template `{{ result.content[0].text | default('') }}`
+walks into `result.content`, which is absent on recoverable-error results
+(`{"is_error": true, "error": ...}` — no `content` field). Under `Lenient`,
+indexing into undefined raises before `default('')` applies (#1537).
+
+When writing result templates:
+- be null-safe for the error-result shape (`result.content` may be absent)
+- `| default(...)` only works because Chainable makes missing intermediate
+  paths evaluate to undefined; syntax errors and unknown filters still error
+
 ### Native toolset error mapping
 
 Native `Toolset` implementations' `map_result` must map **all** `ErrorData` from handlers (both

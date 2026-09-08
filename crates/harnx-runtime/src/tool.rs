@@ -877,6 +877,42 @@ mod tests {
         });
     }
 
+    /// Issue #1537: a recoverable-error tool result is shaped
+    /// `{"is_error": true, "error": ...}` (no `content`). The shared plans
+    /// result template `{{ result.content[0].text | default('') }}` must render
+    /// it without a MiniJinja "undefined value" error — the `default('')` has to
+    /// win, yielding empty markdown, instead of the template blowing up and
+    /// logging `warn!("template error ...")`.
+    #[test]
+    fn render_result_for_display_handles_error_shape_without_content() {
+        let decl = make_decl_with_templates(
+            "get_note",
+            None,
+            Some("{{ result.content[0].text | default('') }}"),
+        );
+        let mut decl_map = HashMap::new();
+        decl_map.insert(decl.name.clone(), decl);
+        let call = ToolCall::new(
+            "get_note".to_string(),
+            json!({"plan": "p", "note_id": "note-1"}),
+            Some("call-1".to_string()),
+            None,
+        );
+        let error_result = json!({
+            "is_error": true,
+            "error": "note note-1 not found in plan 'p'",
+        });
+        let rendered = render_result_for_display(&call, &error_result, "raw fallback", &decl_map);
+        // Some("") — the template rendered successfully to empty, NOT None
+        // (which would mean no template) and NOT the raw fallback (which would
+        // mean the template raised and got caught).
+        assert_eq!(
+            rendered.as_deref(),
+            Some(""),
+            "error-shape result must render the template to empty, not raise"
+        );
+    }
+
     #[test]
     fn render_result_for_display_returns_none_when_no_template() {
         let decl = make_decl_with_templates("bash_exec", None, None);
