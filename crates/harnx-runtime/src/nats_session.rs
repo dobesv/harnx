@@ -1375,6 +1375,10 @@ fn render_log_entry_to_sink(
             render_error_entry(message, &sink);
             false
         }
+        // Production replay path is currently unused. Live advisory event is
+        // emitted at creation, and durable entry feeds model context during
+        // reconstruction, so replaying it here would double-render on reattach.
+        SessionLogEntry::SubAgentStarted { .. } => false,
         SessionLogEntry::DataUrls { .. }
         | SessionLogEntry::Compress { .. }
         | SessionLogEntry::TurnEnd { .. }

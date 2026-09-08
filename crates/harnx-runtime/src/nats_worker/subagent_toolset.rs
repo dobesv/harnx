@@ -65,6 +65,11 @@ pub(crate) struct SubagentToolset {
     progress_heartbeat: Duration,
 }
 
+struct SubagentStart<'a> {
+    child_session_id: &'a str,
+    invocation_id: &'a str,
+}
+
 impl SubagentToolset {
     pub(crate) fn new(
         agent: impl Into<String>,
@@ -126,11 +131,18 @@ impl SubagentToolset {
                 let sink = NatsEventSink::new(
                     self.client.clone(),
                     self.jetstream.clone(),
-                    parent_session_id,
+                    parent_session_id.clone(),
                 )
                 .await;
-                self.emit_parent_subagent_started(&sink, child_session_id, &invocation_id)
-                    .await?;
+                self.emit_parent_subagent_started(
+                    &sink,
+                    &parent_session_id,
+                    SubagentStart {
+                        child_session_id,
+                        invocation_id: &invocation_id,
+                    },
+                )
+                .await?;
                 Some(sink)
             }
             None => None,
@@ -147,9 +159,13 @@ impl SubagentToolset {
     async fn emit_parent_subagent_started(
         &self,
         parent_sink: &NatsEventSink,
-        child_session_id: &str,
-        invocation_id: &str,
+        parent_session_id: &str,
+        start: SubagentStart<'_>,
     ) -> Result<(), ToolInvokeError> {
+        let SubagentStart {
+            child_session_id,
+            invocation_id,
+        } = start;
         let source = AgentSource {
             agent: self.agent.clone(),
             session_id: Some(child_session_id.to_string()),
@@ -168,7 +184,23 @@ impl SubagentToolset {
             ToolInvokeError::Recoverable(format!(
                 "publish sub-agent start event to parent session: {error:#}"
             ))
-        })
+        })?;
+
+        let entry = SessionLogEntry::SubAgentStarted {
+            agent: self.agent.clone(),
+            session_id: child_session_id.to_string(),
+            invocation_id: Some(invocation_id.to_string()),
+        };
+        if let Err(error) =
+            NatsSessionLog::new(self.jetstream.clone(), parent_session_id.to_string())
+                .append_event_async(&entry)
+                .await
+        {
+            log::warn!(
+                "failed to append durable sub-agent start entry to parent session '{parent_session_id}': {error:#}"
+            );
+        }
+        Ok(())
     }
 
     async fn turn_has_cancel(&self, result: &NatsTurnResult) -> bool {
@@ -279,12 +311,18 @@ fn subagent_turn_failed(result: &NatsTurnResult, cancelled: bool) -> bool {
 
 fn require_response(result: &NatsTurnResult) -> Result<&str, ToolInvokeError> {
     if let Some(error) = &result.error {
-        return Err(ToolInvokeError::Recoverable(format!(
-            "sub-agent turn failed: {error}"
-        )));
+        return Err(ToolInvokeError::Recoverable(
+            termination::subagent_error_message(
+                format_args!("sub-agent turn failed: {error}"),
+                &result.session_id,
+            ),
+        ));
     }
     result.response.as_deref().ok_or_else(|| {
-        ToolInvokeError::Recoverable("sub-agent turn returned no final response".to_string())
+        ToolInvokeError::Recoverable(termination::subagent_error_message(
+            "sub-agent turn returned no final response",
+            &result.session_id,
+        ))
     })
 }
 
