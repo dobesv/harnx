@@ -723,6 +723,9 @@ async fn advance_tool_round(
             prompt: switch.prompt,
         }));
     }
+    // Mid-loop title generation fires after each tool round on the continue path.
+    // Kept out of run_agent_loop_inner to avoid adding LoC to that already-complex method.
+    Config::maybe_generate_title_mid_loop(Arc::clone(&ctx.config));
     Ok(ToolRoundAdvance::Continue(Box::new(merged_input)))
 }
 

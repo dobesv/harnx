@@ -225,15 +225,26 @@ the terminal window title in the TUI and the browser tab title in the web UI (as
   agent's front matter (the agent-level value takes precedence). Point it at a
   small, fast chat model.
 - **title_update_threshold**: Number of tokens of growth after which the title
-  is regenerated. Defaults to `50000`. The first title is generated on the first
-  exchange (growth from 0 crosses any non-zero threshold). Set to `0` to disable
-  automatic title generation entirely.
+  is regenerated (applies both at turn end and during the tool loop). Defaults
+  to `50000`. The first title is generated on the first exchange (growth from 0
+  crosses any non-zero threshold). Set to `0` to disable automatic title
+  generation entirely.
+- **title_update_interval_secs**: Optional minimum seconds between title
+  regenerations while the tool loop is running. Titles regenerate mid-loop
+  whenever token growth reaches `title_update_threshold` or
+  `title_update_interval_secs` seconds elapse, whichever comes first. Defaults to
+  `0`, which disables only the time trigger while token-based mid-loop updates
+  remain active. Set `>0` (such as `30`) to also refresh on a time cadence during
+  long tool rounds that do not grow many tokens. The first title appears promptly
+  by bypassing the interval. Setting `title_update_threshold: 0` disables all
+  title generation, including mid-loop updates.
 
 Example `config.yaml`:
 
 ```yaml
 title_agent: title-writer      # an agent configured with a small, fast model
 title_update_threshold: 50000
+title_update_interval_secs: 30
 ```
 
 You can also override the title agent for a specific agent in its front matter:
