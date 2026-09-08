@@ -82,7 +82,9 @@ pub async fn reconcile_bucket_replicas(
     let mut config = fetch_stream_config(jetstream, &stream_name).await?;
     let current_replicas = config.num_replicas;
     if num_replicas <= current_replicas {
-        decline_lowering_replicas(bucket, current_replicas, num_replicas);
+        if should_log_declined_lowering(current_replicas, num_replicas) {
+            decline_lowering_replicas(bucket, current_replicas, num_replicas);
+        }
         return Ok(());
     }
     config.num_replicas = num_replicas;
@@ -107,7 +109,7 @@ async fn reconcile_bucket_config(
     let mut config = fetch_stream_config(jetstream, &stream_name).await?;
     let current_replicas = config.num_replicas;
     let raise_replicas = num_replicas > current_replicas;
-    if num_replicas < current_replicas {
+    if should_log_declined_lowering(current_replicas, num_replicas) {
         decline_lowering_replicas(bucket, current_replicas, num_replicas);
     }
     if config.max_age == ttl && !raise_replicas {
@@ -130,6 +132,13 @@ fn decline_lowering_replicas(bucket: &str, current_replicas: usize, requested_re
     log::debug!(
         "bucket '{bucket}' has {current_replicas} replicas; declining to lower to the requested {requested_replicas} (replicas never go down through reconcile — recreate the bucket to scale down deliberately)"
     );
+}
+
+/// Whether a reconcile request that won't raise the replica count should log a
+/// "declining to lower" notice. Only a strictly lower request is a decline;
+/// an equal request is a silent no-op.
+fn should_log_declined_lowering(current_replicas: usize, requested_replicas: usize) -> bool {
+    requested_replicas < current_replicas
 }
 
 async fn fetch_stream_config(
@@ -165,4 +174,24 @@ async fn update_stream_reporting_replicas(
         )
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn equal_requested_replicas_is_not_a_decline() {
+        assert!(!should_log_declined_lowering(3, 3));
+    }
+
+    #[test]
+    fn lower_requested_replicas_is_a_decline() {
+        assert!(should_log_declined_lowering(3, 1));
+    }
+
+    #[test]
+    fn higher_requested_replicas_is_not_a_decline() {
+        assert!(!should_log_declined_lowering(1, 3));
+    }
 }
