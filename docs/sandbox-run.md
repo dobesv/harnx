@@ -59,6 +59,8 @@ For project access, the shims use [Project-Root Pseudo-Variables](#project-root-
 
 A single dispatcher script can handle the entire Node family by detecting which name it was called with. Common Node caches are already whitelisted by default, and project roots are granted automatically.
 
+> **Corepack note:** `pnpm`/`yarn` run through Corepack need no extra flags — `~/.cache/node/corepack` is exec by default (see [Home directory](#home-directory)). Without that default, pnpm 12 and newer fail with `Could not run the pnpm binary at ~/.cache/node/corepack/... EACCES`, because Corepack spawns a native binary out of that cache instead of a script run through `node`. If you worked around this with `--allow-rwx ~/.cache/node/corepack` in your own shim, that line is now redundant — keeping it is harmless, and it additionally re-enables in-sandbox version downloads.
+
 > **`npx` note:** the default whitelist grants `~/.npm` read+write but **not execute** (a writable+executable directory lets sandboxed code plant a binary the host might later run). `npx <pkg>@<version>` installs the package under `~/.npm/_npx/<hash>/node_modules/` and then executes its bin from there, so without an exec grant it fails with `sh: 1: <pkg>: Permission denied`. The shim below opts in with `--allow-rwx ~/.npm`. Omit that line if you never use `npx` to run cached package binaries.
 ```bash
 #!/usr/bin/env bash
@@ -311,11 +313,21 @@ The `--working-dir <path>` flag changes where the sandboxed command starts, but 
 | :----- | :---- |
 | Read | `~/.gitconfig`, `~/.gitignore`, `~/.gitignore_global`, `~/.tool-versions` |
 | Read/Write | `~/.cache`, `~/go/pkg`, `~/.npm`, `~/.yarn`, `~/.cargo/registry`, `~/.cargo/git`, `~/.bun/install/cache`, `~/.local/share/pnpm`, `~/.local/share/uv` |
-| Exec | `~/.local/bin`, `~/.local/lib`, `~/.bun`, `~/.asdf`, `~/go/bin`, `~/.cargo`, `~/.nvm`, `~/.cargo/bin`, `~/.mono`, `~/.pyenv`, `~/.rye`, `~/.local/share/claude`, `~/.local/share/opencode`, `~/.local/share/pipx` |
+| Exec | `~/.local/bin`, `~/.local/lib`, `~/.bun`, `~/.asdf`, `~/go/bin`, `~/.cargo`, `~/.nvm`, `~/.cargo/bin`, `~/.mono`, `~/.pyenv`, `~/.rye`, `~/.local/share/claude`, `~/.local/share/opencode`, `~/.local/share/pipx`, `~/.cache/node/corepack` |
 
 Tool-install and self-update operations (such as `cargo install`, `nvm install`, etc.) require explicit write access; grant with `--allow-rwx` or perform them outside the sandbox.
 
 Note that the Read/Write caches above are **not** executable. In particular, `npx <pkg>@<version>` installs and then runs a package binary from `~/.npm/_npx/...`, which fails with `sh: 1: <pkg>: Permission denied` unless you also grant exec. Add `--allow-rwx ~/.npm` (see the [Node shim](#node-yarn-npm-npx-pnpm-node) for an example).
+
+`~/.cache/node/corepack` is the one cache listed under Exec rather than Read/Write, because Corepack spawns the pinned package manager straight out of it — and since pnpm 12 that is a native binary rather than a script run through `node`. Because a more specific grant replaces the one it sits inside, the exec entry also **revokes** the write that `~/.cache` would otherwise give this subtree: sandboxed code can run the cached package manager but cannot swap in a replacement for the host to run later. The trade-off is that Corepack cannot download a *new* package manager version from inside the sandbox. When you bump the `packageManager` field, prime the cache once on the host:
+
+```sh
+corepack install   # run outside the sandbox after changing packageManager
+```
+
+Grant `--allow-rwx ~/.cache/node/corepack` if you would rather let the sandbox download package manager releases itself.
+
+Defaults are skipped when the path does not exist yet, so on a machine that has never run Corepack the *first* sandboxed invocation still fails: the download lands (via the `~/.cache` write grant) but the freshly unpacked binary has no exec grant. The directory exists from then on, so the next run succeeds. `corepack install` on the host avoids the stumble entirely.
 
 Any other `$HOME` subdirectory (e.g. `~/.gemini`, `~/.config`, `~/.ssh`) is **blocked** unless you add it with `--allow-read`, `--allow-write`, or `--allow-rwx`. This is intentional — it prevents the sandboxed process from reading credentials or config files it doesn't need.
 

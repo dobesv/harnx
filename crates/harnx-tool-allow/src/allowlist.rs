@@ -185,6 +185,14 @@ impl PrivilegedPermission {
     }
 }
 
+/// A permission's grants are a flat prefix union, so a narrower grant nested
+/// inside a wider one does **not** subtract from it: with `~/.cache` in the write
+/// set, everything beneath it stays writable no matter what the exec set says.
+/// The birdcage sandbox these grants are converted into (see
+/// `harnx-sandbox-common::args`) resolves overlaps the opposite way, letting the
+/// innermost grant replace the one it sits in. Enforcement therefore comes out
+/// narrower than this check; treat a `true` here as "not rejected up front"
+/// rather than as proof the sandbox will permit the operation.
 fn contains(paths: &BTreeSet<PathBuf>, path: &Path) -> bool {
     let candidate = canonicalize_for_containment(path);
     paths.iter().any(|root| {
