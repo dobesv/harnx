@@ -168,6 +168,30 @@ session continues and the agent can retry. The canonical pattern is
 `crates/harnx-fs-tools/src/toolset.rs:59-66`. When adding a native toolset, do not special-case
 `ErrorCode::INTERNAL_ERROR` to `Fatal`.
 
+### Session log entries and transcript protocol
+
+Adding a `SessionLogEntry` variant in `harnx-core/src/session.rs` is a **transcript-protocol
+change**. Canonical NATS replay hard-rejects `Unknown`, so older workers cannot read
+transcripts containing new variants. Deploy readers before writers in multi-instance
+clusters. Precedents: `TurnEnd` (#1490), `Error` (#1545), `SubAgentStarted` (#1604).
+
+Required match-site updates (3 compile-time exhaustive matches):
+- `config/session.rs` — reconstruction into `Session.messages`
+- `nats_session.rs` — `render_log_entry_to_sink` (usually a no-op arm with comment)
+- `session_history.rs` — `entry_type` and `entry_searchable_text`
+
+Wildcard matches elsewhere (`session_reconstruct.rs`, fence helpers, etc.) compile without
+changes but should be audited for correctness.
+
+Mid-tool entries (arriving between `ToolCalls` and `ToolResults`) must be queued in
+`messages_queued_during_tool` during reconstruction so tool_use→tool_result adjacency is
+preserved. See `SubAgentStarted` handling in `config/session.rs` for the pattern.
+
+Append to another session's log via `NatsSessionLog::new(jetstream, session_id)` with no
+`fence_token`. Used when a tool/client needs durable state visible to a session it doesn't
+hold the lease for (e.g. sub-agent start entries in parent log).
+
+
 ## Issue/task tracker
 
 GitHub Issues is the issue/task tracker for this project.

@@ -997,7 +997,7 @@ async fn worker_registers_and_delegates_to_every_configured_agent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subagent_started_reaches_parent_stream_before_prompt_result() {
+async fn subagent_started_reaches_parent_stream_and_durable_log() {
     let _env_guard = env_lock().await;
     let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
         return;
@@ -1046,6 +1046,20 @@ async fn subagent_started_reaches_parent_stream_before_prompt_result() {
     assert_eq!(result["response"], "early event child response");
     assert_eq!(result["sub_agent"]["agent"], "metis");
     assert_eq!(result["sub_agent"]["session_id"], child_session_id);
+
+    let parent_log = NatsSessionLog::new(jetstream, parent_session_id);
+    let parent_entries = parent_log
+        .load_events_async()
+        .await
+        .expect("load parent log after sub-agent start");
+    assert!(parent_entries.iter().any(|(_, entry)| matches!(
+        entry,
+        SessionLogEntry::SubAgentStarted {
+            agent,
+            session_id,
+            invocation_id: Some(_),
+        } if agent == "metis" && session_id == &child_session_id
+    )));
 
     daemon.abort();
     let _ = daemon.await;

@@ -18,6 +18,12 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 /// A single conversation event in the append-only session transcript.
+///
+/// # Protocol Compatibility
+/// New variants are transcript-protocol changes. Canonical NATS replay
+/// (`replay_nats_entries_into_session_with_policy`) rejects `Unknown`,
+/// so old workers cannot read transcripts containing new variants.
+/// Deploy readers before writers in multi-instance clusters.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum SessionLogEntry {
@@ -104,6 +110,17 @@ pub enum SessionLogEntry {
         fence_token: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timestamp: Option<DateTime<Utc>>,
+    },
+    /// Emitted when a sub-agent delegation starts a child session. Appended to the
+    /// PARENT session's log so the child session_id is visible (and monitorable by
+    /// reconnecting clients) even when the tool result is dropped, e.g. parent-side
+    /// cancellation. Rendered into model context as an informational note.
+    #[serde(rename = "sub_agent_started")]
+    SubAgentStarted {
+        agent: String,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invocation_id: Option<String>,
     },
     #[serde(other)]
     Unknown,
@@ -865,6 +882,35 @@ field: value
         let entry: SessionLogEntry = serde_yaml::from_str(yaml).unwrap();
 
         assert!(matches!(entry, SessionLogEntry::Unknown));
+    }
+
+    #[test]
+    fn session_log_entry_sub_agent_started_serde_round_trip() {
+        let entry = SessionLogEntry::SubAgentStarted {
+            agent: "pantheon/plato".to_string(),
+            session_id: "child-123".to_string(),
+            invocation_id: Some("invocation-456".to_string()),
+        };
+
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(
+            yaml,
+            "type: sub_agent_started\nagent: pantheon/plato\nsession_id: child-123\ninvocation_id: invocation-456\n"
+        );
+        match round_tripped {
+            SessionLogEntry::SubAgentStarted {
+                agent,
+                session_id,
+                invocation_id,
+            } => {
+                assert_eq!(agent, "pantheon/plato");
+                assert_eq!(session_id, "child-123");
+                assert_eq!(invocation_id.as_deref(), Some("invocation-456"));
+            }
+            other => panic!("expected sub_agent_started, got {other:?}"),
+        }
     }
 
     #[test]
