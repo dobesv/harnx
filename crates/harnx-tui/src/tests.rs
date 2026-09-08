@@ -6585,6 +6585,76 @@ async fn test_detail_view_blocks_paste() {
 }
 
 #[tokio::test]
+async fn test_detail_view_shows_full_tool_result_with_assistant_audience() {
+    let mut harness = TuiTestHarness::new().await;
+    harness.tui().app.transcript.clear();
+
+    // Construct MCP-shaped tool output with mixed audience parts
+    let output = serde_json::json!({
+        "content": [
+            {
+                "type": "text",
+                "text": "User-facing summary",
+                "annotations": { "audience": ["user"] }
+            },
+            {
+                "type": "text",
+                "text": "Hidden raw detail data",
+                "annotations": { "audience": ["assistant"] }
+            }
+        ],
+        "isError": false
+    });
+
+    let items = crate::input::tool_completed_to_transcript_items(&output, None);
+    assert_eq!(items.len(), 1);
+
+    // Push the item to transcript
+    harness.tui().app.transcript.push(items[0].clone());
+    harness.tui().app.transcript_focus = Some(0);
+
+    // Open detail view
+    harness
+        .tui()
+        .handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .await
+        .unwrap();
+
+    assert!(harness.tui().app.detail_view_open);
+
+    // Instead of rendering the whole UI, we can just render the detail view entry directly
+    if let TranscriptItem::ToolResultMarkdown {
+        text, full_detail, ..
+    } = &items[0]
+    {
+        assert_eq!(text, "User-facing summary");
+        assert_eq!(
+            full_detail.as_deref(),
+            Some("User-facing summary\nHidden raw detail data")
+        );
+
+        let lines = crate::types::Tui::render_entry_detail(&items[0]);
+        let detail_text = lines
+            .into_iter()
+            .map(|l| {
+                l.spans
+                    .into_iter()
+                    .map(|s| s.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(detail_text.contains("User-facing summary"));
+        assert!(detail_text.contains("Hidden raw detail data"));
+    } else {
+        panic!("Expected ToolResultMarkdown");
+    }
+}
+
+#[tokio::test]
 async fn test_picker_not_shown_when_agent_specified() {
     // When an agent is already set (--agent flag), AgentPicker must NOT appear.
     // SessionPicker may appear if sessions exist for that agent, but AgentPicker must not.
@@ -7769,6 +7839,7 @@ async fn test_browsing_mode_non_navigable_items_visible_not_focusable() {
         .app
         .transcript
         .push(TranscriptItem::ToolResultMarkdown {
+            full_detail: None,
             text: "thinking...".to_string(),
             rendered_cache: None,
         });

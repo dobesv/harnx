@@ -75,7 +75,7 @@ Child model/streaming events are forwarded to the parent only as progress metric
 
 ## Ordering invariant for detail-view pairing
 
-`ToolResultMarkdown` is non-navigable (`types.rs:443-457`) and must sit at the position immediately following its `ToolCall` for `detail_view.rs:append_paired_tool_result` to show the paired result. Hence transcript order for a sub-agent delegation is:
+`ToolResultMarkdown` is non-navigable (`types.rs:529-533`) and must sit at the position immediately following its `ToolCall` for `detail_view.rs:append_paired_tool_result` to show the paired result. Hence transcript order for a sub-agent delegation is:
 
 ```
 ToolCall(prompt) → ToolResultMarkdown(reply) → SubAgentSession(status)
