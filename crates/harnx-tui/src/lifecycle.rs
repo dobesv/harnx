@@ -779,7 +779,9 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
                         );
                         let trimmed = rendered.trim_end_matches('\n');
                         if !trimmed.is_empty() {
+                            let full = crate::input::full_tool_result_detail(&r.output);
                             items.push(TranscriptItem::ToolResultMarkdown {
+                                full_detail: crate::input::full_detail_if_extra(full, trimmed),
                                 text: trimmed.to_string(),
                                 rendered_cache: None,
                             });
@@ -805,6 +807,7 @@ pub(crate) fn subagent_reply_item_from_output(
         return None;
     }
     Some(TranscriptItem::ToolResultMarkdown {
+        full_detail: None,
         text: crate::strip_ansi(trimmed).to_string(),
         rendered_cache: None,
     })

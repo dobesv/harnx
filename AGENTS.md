@@ -231,6 +231,11 @@ Append to another session's log via `NatsSessionLog::new(jetstream, session_id)`
 `fence_token`. Used when a tool/client needs durable state visible to a session it doesn't
 hold the lease for (e.g. sub-agent start entries in parent log).
 
+### TUI transcript items are TUI-local
+
+`TranscriptItem` (`harnx-tui/src/types.rs`) derives only `Clone + Debug` — it is **not** serialized to
+NATS. Adding a field or variant is a local TUI change, not a transcript-protocol change. Contrast
+with `SessionLogEntry` variants (previous section), which are protocol-versioned.
 
 ## Issue/task tracker
 
