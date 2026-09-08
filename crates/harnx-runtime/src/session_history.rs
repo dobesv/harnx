@@ -40,6 +40,7 @@ pub fn entry_type(entry: &SessionLogEntry) -> &'static str {
         SessionLogEntry::Cancel { .. } => "cancel",
         SessionLogEntry::Error { .. } => "error",
         SessionLogEntry::TurnEnd { .. } => "turn_end",
+        SessionLogEntry::SubAgentStarted { .. } => "sub_agent_started",
         SessionLogEntry::EditEntries { .. } => "edit_entries",
         SessionLogEntry::Rewind { .. } => "rewind",
         SessionLogEntry::Unknown => "unknown",
@@ -65,6 +66,14 @@ fn entry_searchable_text(entry: &SessionLogEntry) -> String {
             .join("\n"),
         SessionLogEntry::Compress { prompt } => prompt.clone(),
         SessionLogEntry::Error { message, .. } => message.clone(),
+        SessionLogEntry::SubAgentStarted {
+            agent,
+            session_id,
+            invocation_id,
+        } => format!(
+            "{agent}\n{session_id}\n{}",
+            invocation_id.as_deref().unwrap_or_default()
+        ),
         _ => String::new(),
     }
 }
@@ -170,7 +179,7 @@ pub fn tool_declaration() -> ToolDeclaration {
         "properties": {
             "index_min": {"type": "integer", "description": "Minimum log entry seq (inclusive)."},
             "index_max": {"type": "integer", "description": "Maximum log entry seq (inclusive)."},
-            "type": {"type": "string", "description": "Filter by entry type: message, tool_calls, tool_results, compress, header, data_urls, clear, edit_entries, rewind."},
+            "type": {"type": "string", "description": "Filter by entry type: message, tool_calls, tool_results, sub_agent_started, compress, header, data_urls, clear, edit_entries, rewind."},
             "tool_name": {"type": "string", "description": "Keep only entries referencing this tool name."},
             "text_regex": {"type": "string", "description": "Keep entries whose rendered text matches this regular expression."},
             "limit": {"type": "integer", "description": "Maximum number of rows to return."},
@@ -307,6 +316,21 @@ mod tests {
             entry_type(&SessionLogEntry::Compress { prompt: "s".into() }),
             "compress"
         );
+    }
+
+    #[test]
+    fn sub_agent_started_is_typed_and_searchable() {
+        let entry = SessionLogEntry::SubAgentStarted {
+            agent: "pantheon/plato".into(),
+            session_id: "child-123".into(),
+            invocation_id: Some("invocation-456".into()),
+        };
+
+        assert_eq!(entry_type(&entry), "sub_agent_started");
+        let text = entry_searchable_text(&entry);
+        assert!(text.contains("pantheon/plato"));
+        assert!(text.contains("child-123"));
+        assert!(text.contains("invocation-456"));
     }
 
     fn sample_entries() -> Vec<(usize, SessionLogEntry)> {
