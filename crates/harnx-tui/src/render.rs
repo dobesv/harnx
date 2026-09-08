@@ -4,7 +4,7 @@ use crate::types::{
     App, ModalState, ToolCallBody, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT,
     SPINNER_FRAMES,
 };
-use crate::types::{RenderEntryState, Tui};
+use crate::types::{RenderEntryState, RenderedCache, Tui};
 use harnx_core::event::{AgentEvent, SessionEvent, TurnEvent};
 use harnx_runtime::config::GlobalConfig;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -51,6 +51,17 @@ struct ListModalOpts<'a> {
     /// Optional live-filter query. When `Some`, renders a `🔍 <query>█` search
     /// row above the list and a "No matches" placeholder when the list is empty.
     query: Option<&'a str>,
+}
+
+/// Viewport-dependent inputs for rendering a single `ToolResultMarkdown` row.
+/// Bundled so the render helper stays under the argument-count threshold.
+struct RenderToolResultCtx<'a> {
+    show_seq: bool,
+    show_ts: bool,
+    use_utc: bool,
+    width: u16,
+    skip_cache: bool,
+    theme: Option<&'a Theme>,
 }
 
 impl Tui {
@@ -165,6 +176,27 @@ impl Tui {
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
         ))
+    }
+
+    /// Render a `ToolResultMarkdown` transcript row, reusing the per-entry
+    /// cache when the viewport-dependent inputs are unchanged.
+    fn render_tool_result_entry(
+        text: &str,
+        rendered_cache: &mut RenderedCache,
+        ctx: RenderToolResultCtx<'_>,
+    ) -> RenderedEntry {
+        let key = (ctx.width, ctx.show_seq, ctx.show_ts, ctx.use_utc);
+        if let Some((w, ss, sts, utc, cached)) = rendered_cache.as_ref() {
+            if (*w, *ss, *sts, *utc) == key {
+                return cached.clone();
+            }
+        }
+        let body_base = Style::default().add_modifier(Modifier::DIM);
+        let entry = crate::markdown_render::render_markdown(text, body_base, ctx.width, ctx.theme);
+        if !ctx.skip_cache {
+            *rendered_cache = Some((key.0, key.1, key.2, key.3, entry.clone()));
+        }
+        entry
     }
 
     pub(super) fn render_entry(
@@ -320,19 +352,19 @@ impl Tui {
             TranscriptItem::ToolResultMarkdown {
                 text,
                 rendered_cache,
-            } => {
-                if let Some((w, ss, sts, utc, cached)) = rendered_cache.as_ref() {
-                    if *w == width && *ss == show_seq && *sts == show_ts && *utc == use_utc {
-                        return cached.clone();
-                    }
-                }
-                let body_base = Style::default().add_modifier(Modifier::DIM);
-                let entry = crate::markdown_render::render_markdown(text, body_base, width, theme);
-                if !state.skip_cache {
-                    *rendered_cache = Some((width, show_seq, show_ts, use_utc, entry.clone()));
-                }
-                entry
-            }
+                ..
+            } => Self::render_tool_result_entry(
+                text,
+                rendered_cache,
+                RenderToolResultCtx {
+                    show_seq,
+                    show_ts,
+                    use_utc,
+                    width,
+                    skip_cache: state.skip_cache,
+                    theme,
+                },
+            ),
             TranscriptItem::StatusLine(text) => {
                 let lines = Self::render_text_entry(
                     "",
@@ -1157,9 +1189,9 @@ impl Tui {
                 }
                 push_field!("text", text);
             }
-            TranscriptItem::ToolResultMarkdown { text, .. } => {
+            item @ TranscriptItem::ToolResultMarkdown { .. } => {
                 lines.push(Line::from(Span::styled("── tool result ──", label_style)));
-                push_field!("result", text);
+                push_field!("result", item.tool_result_detail_text().unwrap_or(""));
             }
             TranscriptItem::SourceHeading(source) => {
                 lines.push(Line::from(Span::styled("── source ──", label_style)));

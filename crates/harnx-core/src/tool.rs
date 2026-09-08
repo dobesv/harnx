@@ -422,6 +422,23 @@ impl ToolCall {
     }
 }
 
+/// Like `extract_user_display_text` but includes ALL content text parts
+/// regardless of `annotations.audience` — the full text the agent sees.
+pub fn extract_all_display_text(result: &Value) -> Option<String> {
+    let content = result.get("content")?.as_array()?;
+    let mut parts: Vec<&str> = Vec::new();
+    for item in content {
+        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+            parts.push(text);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
 /// Extracts user-visible text from an MCP `CallToolResult` value.
 ///
 /// The result value has the shape:
@@ -463,6 +480,31 @@ pub fn extract_user_display_text(result: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_extract_all_display_text() {
+        let result = json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "User text",
+                    "annotations": { "audience": ["user"] }
+                },
+                {
+                    "type": "text",
+                    "text": "Assistant text",
+                    "annotations": { "audience": ["assistant"] }
+                }
+            ]
+        });
+        assert_eq!(
+            extract_all_display_text(&result).unwrap(),
+            "User text\nAssistant text"
+        );
+
+        let no_content = json!({ "something_else": "true" });
+        assert_eq!(extract_all_display_text(&no_content), None);
+    }
 
     #[test]
     fn test_extract_user_display_text_basic() {

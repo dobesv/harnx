@@ -156,6 +156,26 @@ pub(super) fn tool_call_body(
 /// `result_template`, and plain text alike. Strips ANSI escapes from
 /// string outputs before extraction so pre-dimmed test inputs render
 /// cleanly.
+pub(crate) fn full_tool_result_detail(output: &serde_json::Value) -> String {
+    let raw = match output {
+        serde_json::Value::String(s) => serde_json::Value::String(strip_ansi(s)),
+        _ => output.clone(),
+    };
+    let text = harnx_core::tool::extract_all_display_text(&raw).unwrap_or_else(|| match &raw {
+        serde_json::Value::String(s) => s.clone(),
+        _ => harnx_runtime::utils::pretty_yaml_block(&raw),
+    });
+    strip_ansi(&text).trim_end_matches('\n').to_string()
+}
+
+pub(crate) fn full_detail_if_extra(full: String, text: &str) -> Option<String> {
+    if full.trim().is_empty() || full.trim() == text.trim() {
+        None
+    } else {
+        Some(full)
+    }
+}
+
 pub(super) fn tool_completed_to_transcript_items(
     output: &serde_json::Value,
     markdown: Option<&str>,
@@ -169,7 +189,9 @@ pub(super) fn tool_completed_to_transcript_items(
     if clean.is_empty() {
         return vec![];
     }
+    let full = full_tool_result_detail(output);
     vec![TranscriptItem::ToolResultMarkdown {
+        full_detail: full_detail_if_extra(full, &clean),
         text: clean,
         rendered_cache: None,
     }]
