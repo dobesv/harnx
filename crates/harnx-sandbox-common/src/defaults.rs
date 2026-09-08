@@ -106,6 +106,14 @@ pub const HOME_EXEC_PATHS: &[&str] = &[
     ".local/share/opencode", // OpenCode
     // Python/JS package managers that install executables here:
     ".local/share/pipx", // pipx (installs aider, etc.)
+    // Corepack unpacks the pinned pnpm/yarn release under ~/.cache/node/corepack/
+    // and spawns it directly. Through pnpm 11 that was a script run via node, so
+    // the exec grant on node was enough; pnpm 12 ships a native binary instead,
+    // which needs exec here or corepack fails with EACCES. Listing it as exec
+    // rather than rwx also narrows the read+write it would otherwise inherit from
+    // ~/.cache, so sandboxed code can run the cached package manager but cannot
+    // swap in a replacement for the host to execute later.
+    ".cache/node/corepack",
 ];
 
 #[cfg(unix)]
@@ -280,5 +288,43 @@ pub fn system_writable_paths() -> Vec<PathBuf> {
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     {
         vec![PathBuf::from("/tmp")]
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Corepack spawns the pinned package manager straight out of its cache, so
+    /// that directory needs exec. It must not also be writable: a directory that
+    /// is both would let sandboxed code plant a binary the host runs later, which
+    /// is the reason `HOME_RWX_PATHS` is empty in the first place.
+    #[test]
+    fn corepack_cache_is_exec_but_never_writable() {
+        assert!(HOME_EXEC_PATHS.contains(&".cache/node/corepack"));
+        assert!(!HOME_WRITE_PATHS.contains(&".cache/node/corepack"));
+        assert!(
+            HOME_RWX_PATHS.is_empty(),
+            "a writable+executable home default reopens the planted-binary escape"
+        );
+    }
+
+    /// A more specific grant replaces the one it sits inside, so emitting exec for
+    /// the Corepack cache narrows it out of the read+write that `~/.cache` gets.
+    #[test]
+    fn home_defaults_narrow_corepack_out_of_the_cache_write_grant() {
+        let mut args = Vec::new();
+        push_home_relative_defaults(&mut args, Path::new("/home/tester"));
+        let flags: Vec<(&OsString, &OsString)> = args
+            .chunks_exact(2)
+            .map(|pair| (&pair[0], &pair[1]))
+            .collect();
+        let granted = |flag: &str, path: &str| {
+            flags.contains(&(&OsString::from(flag), &OsString::from(path)))
+        };
+
+        assert!(granted("--exec", "/home/tester/.cache/node/corepack"));
+        assert!(granted("--write", "/home/tester/.cache"));
+        assert!(!granted("--write", "/home/tester/.cache/node/corepack"));
     }
 }
