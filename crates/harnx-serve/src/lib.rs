@@ -7,6 +7,7 @@ mod ag_ui_remote_follow;
 pub mod ag_ui_rpc;
 mod ag_ui_sync;
 mod ag_ui_usage;
+mod interrupt_resume;
 pub mod session_actor;
 mod session_actor_types;
 mod session_routes;

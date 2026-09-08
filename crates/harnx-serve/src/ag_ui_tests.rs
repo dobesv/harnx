@@ -6,7 +6,10 @@ use harnx_core::{
     event::{AgentEventSink, ModelEvent, SessionEvent, ToolEvent, TurnEvent},
     message::{Message, MessageContent, MessageContentToolCalls},
 };
-use harnx_runtime::{client::ToolCall, config::Config};
+use harnx_runtime::{
+    client::{TestStateGuard, ToolCall},
+    config::Config,
+};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 
@@ -2378,6 +2381,7 @@ async fn ag_ui_run_promptless_join_forwards_live_events_when_session_active() {
             |event| event,
         ),
         true,
+        None,
     );
 
     let sender = tokio::spawn(async move {
@@ -2479,6 +2483,7 @@ async fn ag_ui_promptless_active_reconnect_synthesizes_text_start_before_unmatch
             |event| event,
         ),
         true,
+        None,
     );
     let message_id = MessageId::random();
 
@@ -2536,6 +2541,7 @@ async fn ag_ui_promptless_active_reconnect_drops_unmatched_tool_call_events() {
             |event| event,
         ),
         true,
+        None,
     );
     let tool_call_id = ToolCallId::random();
     let message_id = MessageId::random();
@@ -2608,6 +2614,7 @@ async fn ag_ui_promptless_active_reconnect_forwards_started_tool_call_lifecycle(
             |event| event,
         ),
         true,
+        None,
     );
     let tool_call_id = ToolCallId::random();
     let result_message_id = MessageId::random();
@@ -2695,6 +2702,7 @@ async fn ag_ui_promptless_active_reconnect_synthesizes_step_start_before_unmatch
             |event| event,
         ),
         true,
+        None,
     );
     let step_name = "turn-99".to_string();
 
@@ -2752,6 +2760,7 @@ async fn ag_ui_promptless_active_reconnect_synthesizes_thinking_start_before_unm
             |event| event,
         ),
         true,
+        None,
     );
 
     tx.send(Event::ThinkingEnd(ThinkingEndEvent {
@@ -2806,6 +2815,7 @@ async fn ag_ui_promptless_active_reconnect_synthesizes_thinking_start_and_text_s
             |event| event,
         ),
         true,
+        None,
     );
 
     tx.send(Event::ThinkingTextMessageEnd(ThinkingTextMessageEndEvent {
@@ -2868,6 +2878,7 @@ async fn ag_ui_promptless_active_reconnect_synthesizes_thinking_start_and_text_s
             |event| event,
         ),
         true,
+        None,
     );
 
     tx.send(Event::ThinkingTextMessageContent(
@@ -2931,8 +2942,8 @@ fn session_state_is_active_treats_running_and_interrupted_as_live() {
         started_at: now,
     }));
 
-    // Interrupted (awaiting tool approval): active. A reload here must follow the
-    // live broadcast so the pending approval prompt reappears, not close the stream.
+    // Interrupted remains active for routing, but promptless replay closes with the
+    // saved interrupt outcome instead of following the non-replaying broadcast.
     let pending = PendingInterruptBatch {
         interrupt_run_id: "run-1".into(),
         text: "approve?".into(),
@@ -3067,5 +3078,421 @@ async fn ag_ui_run_empty_last_user_message_joins_only_and_does_not_start_run() {
     assert!(
         load_session_messages(&config, "plain", "empty-last-user").is_empty(),
         "join-only empty prompt should not persist history"
+    );
+}
+
+#[test]
+fn live_run_finished_frames_interrupt_outcome_at_top_level_and_omits_empty_result() {
+    let thread_id = ThreadId::random();
+    let run_id = RunId::random();
+    let interrupt_outcome = json!({
+        "type": "interrupt",
+        "interrupts": [{ "id": "call-1" }],
+    });
+    let interrupt_event = Event::RunFinished(ag_ui_core::event::RunFinishedEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        thread_id: thread_id.clone(),
+        run_id: run_id.clone(),
+        result: Some(json!({ "outcome": interrupt_outcome })),
+    });
+    let mut state = FirstRunState::Active;
+    let mut guard = LiveStreamGuard::default();
+    let interrupt_frame = frame_live_event(
+        interrupt_event,
+        &mut state,
+        &mut guard,
+        &thread_id.to_string(),
+        &run_id.to_string(),
+    )
+    .expect("interrupt terminal frame");
+    let interrupt_wire = parse_sse_frame(
+        String::from_utf8(interrupt_frame.to_vec())
+            .expect("utf8 frame")
+            .trim(),
+    );
+    assert_eq!(interrupt_wire["outcome"]["type"], "interrupt");
+    assert!(interrupt_wire.get("result").is_none());
+
+    let completed_event = Event::RunFinished(ag_ui_core::event::RunFinishedEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        thread_id: thread_id.clone(),
+        run_id: run_id.clone(),
+        result: None,
+    });
+    let mut state = FirstRunState::Active;
+    let completed_frame = frame_live_event(
+        completed_event,
+        &mut state,
+        &mut guard,
+        &thread_id.to_string(),
+        &run_id.to_string(),
+    )
+    .expect("completion terminal frame");
+    let completed_wire = parse_sse_frame(
+        String::from_utf8(completed_frame.to_vec())
+            .expect("utf8 frame")
+            .trim(),
+    );
+    assert!(completed_wire.get("result").is_none());
+    assert!(completed_wire.get("outcome").is_none());
+}
+
+#[tokio::test]
+async fn promptless_interrupted_reconnect_replays_outcome_and_terminates() {
+    let run_id = Uuid::new_v4().to_string();
+    let thread_id = Uuid::new_v4().to_string();
+    let snapshot_frame = Some(Bytes::from(
+        frame_event(&snapshot_event(vec![user_msg("approve this call")])).expect("snapshot frame"),
+    ));
+    let stream = build_promptless_event_stream(
+        &run_id,
+        &thread_id,
+        snapshot_frame,
+        tokio_stream::empty(),
+        true,
+        Some(json!({
+            "type": "interrupt",
+            "interrupts": [{
+                "id": "call-1",
+                "reason": "tool_call",
+                "toolCallId": "call-1",
+                "message": "Approve tool call",
+                "responseSchema": {
+                    "type": "object",
+                    "properties": { "approved": { "type": "boolean" } },
+                    "required": ["approved"],
+                },
+            }],
+        })),
+    );
+
+    let frames = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio_stream::StreamExt::collect::<Vec<_>>(stream),
+    )
+    .await
+    .expect("interrupted reconnect stream should terminate");
+    let events = decode_sse_bytes_chunks(frames);
+    assert_event_type_sequence(
+        &events,
+        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "RUN_FINISHED"],
+    );
+    assert_eq!(events[2]["outcome"]["type"], "interrupt");
+    assert!(events[2].get("result").is_none());
+}
+
+const APPROVAL_AGENT_FRONT_MATTER: &str = "model: openai:gpt-4o\nuse_tools: harnx_agent_session_history_read\nhooks:\n  entries:\n    - command: |\n        harnx-claude-compatible-hook-server --event PreToolUse --matcher '^harnx_agent_session_history_read$' -- printf '\"'\"'{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"approval required\"}}'\"'\"''";
+
+fn sse_interrupt_call_fn(
+    interrupt_ids: Vec<&str>,
+    seen_inputs: Arc<std::sync::Mutex<Vec<String>>>,
+) -> AgentCallFn {
+    let interrupt_ids = interrupt_ids
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let round = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    Arc::new(move |input, _config, _abort| {
+        let interrupt_ids = interrupt_ids.clone();
+        let seen_inputs = Arc::clone(&seen_inputs);
+        let round = Arc::clone(&round);
+        Box::pin(async move {
+            seen_inputs
+                .lock()
+                .expect("seen inputs lock")
+                .push(input.text());
+            let current = round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(match current {
+                0 => (
+                    "approval required".to_string(),
+                    None,
+                    interrupt_ids
+                        .into_iter()
+                        .map(|id| {
+                            ToolCall::new(
+                                "harnx_agent_session_history_read".to_string(),
+                                json!({}),
+                                Some(id),
+                                None,
+                            )
+                        })
+                        .collect(),
+                    CompletionTokenUsage::default(),
+                ),
+                1 => (
+                    "resume complete".to_string(),
+                    None,
+                    vec![],
+                    CompletionTokenUsage::default(),
+                ),
+                other => panic!("resume started an unexpected model round {other}"),
+            })
+        })
+    })
+}
+
+async fn start_sse_interrupt(
+    config: &Config,
+    registry: &SessionRegistry,
+    session_id: &str,
+    prompt_text: &str,
+) -> Vec<Value> {
+    let response = ag_ui_run_with_call_fn(
+        config,
+        registry,
+        "plain",
+        session_id,
+        &ag_ui_request_body(Uuid::new_v4(), prompt_text),
+        None,
+    )
+    .await
+    .expect("start interrupting SSE run");
+    read_sse_events_until(response, |events| {
+        events.iter().any(|event| event["type"] == "RUN_FINISHED")
+    })
+    .await
+}
+
+fn sse_resume_body(interrupts: Value) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "threadId": Uuid::new_v4(),
+        "runId": Uuid::new_v4(),
+        "messages": [{
+            "id": Uuid::new_v4(),
+            "role": "user",
+            "content": "this must not become a fresh user turn",
+        }],
+        "resume": interrupts,
+    }))
+    .expect("resume body")
+}
+
+#[tokio::test]
+async fn promptless_interrupted_session_replays_saved_outcome_through_sse_handler() {
+    let _guard = TestStateGuard::new(None).await;
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent_with_front_matter("plain", APPROVAL_AGENT_FRONT_MATTER, "You are plain.");
+    let config = sandbox.config();
+    let seen_inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = ag_ui_test_registry(
+        &config,
+        Some(sse_interrupt_call_fn(
+            vec!["sse-reconnect-call"],
+            Arc::clone(&seen_inputs),
+        )),
+    );
+    let session_id = "sse-interrupt-reconnect";
+    let first_events =
+        start_sse_interrupt(&config, &registry, session_id, "approve reconnect").await;
+    assert_eq!(
+        first_events.last().expect("initial terminal")["outcome"]["type"],
+        "interrupt"
+    );
+
+    let promptless_body = serde_json::to_vec(&json!({
+        "threadId": Uuid::new_v4(),
+        "runId": Uuid::new_v4(),
+        "messages": [],
+    }))
+    .unwrap();
+    let response = ag_ui_run_with_call_fn(
+        &config,
+        &registry,
+        "plain",
+        session_id,
+        &promptless_body,
+        None,
+    )
+    .await
+    .expect("promptless interrupted reconnect");
+    let read = read_sse_until(response, Duration::from_secs(5), |read| {
+        read.events
+            .iter()
+            .any(|event| event["type"] == "RUN_FINISHED")
+    })
+    .await;
+    assert_event_type_sequence(
+        &read.events,
+        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "RUN_FINISHED"],
+    );
+    assert_eq!(read.events[2]["outcome"]["type"], "interrupt");
+    assert_eq!(
+        read.events[2]["outcome"]["interrupts"][0]["toolCallId"],
+        "sse-reconnect-call"
+    );
+    assert!(read.events[2].get("result").is_none());
+    assert_eq!(
+        seen_inputs.lock().expect("seen inputs lock").as_slice(),
+        ["approve reconnect"]
+    );
+}
+
+#[tokio::test]
+async fn sse_resume_approve_continues_pending_turn_without_fresh_user_prompt() {
+    let _guard = TestStateGuard::new(None).await;
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent_with_front_matter("plain", APPROVAL_AGENT_FRONT_MATTER, "You are plain.");
+    let config = sandbox.config();
+    let seen_inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = ag_ui_test_registry(
+        &config,
+        Some(sse_interrupt_call_fn(
+            vec!["sse-approve-call"],
+            Arc::clone(&seen_inputs),
+        )),
+    );
+    let session_id = "sse-resume-approve";
+    let events =
+        start_sse_interrupt(&config, &registry, session_id, "original approval prompt").await;
+    assert_eq!(events.last().unwrap()["outcome"]["type"], "interrupt");
+
+    let response = ag_ui_run_with_call_fn(
+        &config,
+        &registry,
+        "plain",
+        session_id,
+        &sse_resume_body(json!([{
+            "interruptId": "sse-approve-call",
+            "status": "resolved",
+            "payload": { "approved": true },
+        }])),
+        None,
+    )
+    .await
+    .expect("approve resume response");
+    let resumed_events = read_sse_events_until(response, |events| {
+        events.iter().any(|event| event["type"] == "RUN_FINISHED")
+    })
+    .await;
+    assert_eq!(resumed_events.last().unwrap()["type"], "RUN_FINISHED");
+    assert!(resumed_events.last().unwrap().get("outcome").is_none());
+
+    assert_eq!(
+        seen_inputs.lock().expect("seen inputs lock").as_slice(),
+        ["original approval prompt", "original approval prompt"]
+    );
+    let user_texts = load_session_messages(&config, "plain", session_id)
+        .iter()
+        .filter(|message| message.role.is_user())
+        .map(|message| message.content.to_text())
+        .collect::<Vec<_>>();
+    assert_eq!(user_texts, ["original approval prompt"]);
+}
+
+#[tokio::test]
+async fn sse_resume_deny_continues_with_cancelled_tool_result() {
+    let _guard = TestStateGuard::new(None).await;
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent_with_front_matter("plain", APPROVAL_AGENT_FRONT_MATTER, "You are plain.");
+    let config = sandbox.config();
+    let seen_inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = ag_ui_test_registry(
+        &config,
+        Some(sse_interrupt_call_fn(
+            vec!["sse-deny-call"],
+            Arc::clone(&seen_inputs),
+        )),
+    );
+    let session_id = "sse-resume-deny";
+    start_sse_interrupt(&config, &registry, session_id, "deny this tool").await;
+
+    let response = ag_ui_run_with_call_fn(
+        &config,
+        &registry,
+        "plain",
+        session_id,
+        &sse_resume_body(json!([{
+            "interruptId": "sse-deny-call",
+            "status": "cancelled",
+            "payload": { "approved": false, "reason": "denied in browser" },
+        }])),
+        None,
+    )
+    .await
+    .expect("deny resume response");
+    let resumed_events = read_sse_events_until(response, |events| {
+        events.iter().any(|event| event["type"] == "RUN_FINISHED")
+    })
+    .await;
+    assert_eq!(resumed_events.last().unwrap()["type"], "RUN_FINISHED");
+    assert_eq!(
+        seen_inputs.lock().expect("seen inputs lock").as_slice(),
+        ["deny this tool", "deny this tool"]
+    );
+
+    let messages = crate::session_actor::load_test_session_messages("plain", session_id);
+    let denied_result = messages
+        .iter()
+        .find_map(|message| match &message.content {
+            MessageContent::ToolCalls(tool_calls) => tool_calls
+                .tool_results
+                .iter()
+                .find(|result| result.call.id.as_deref() == Some("sse-deny-call")),
+            _ => None,
+        })
+        .expect("persisted denied tool result");
+    assert_eq!(
+        denied_result.output,
+        json!({ "error": "denied in browser", "blocked_by_hook": true })
+    );
+}
+
+#[tokio::test]
+async fn sse_resume_rejects_unknown_and_incomplete_interrupt_ids() {
+    let _guard = TestStateGuard::new(None).await;
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent_with_front_matter("plain", APPROVAL_AGENT_FRONT_MATTER, "You are plain.");
+    let config = sandbox.config();
+    let seen_inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = ag_ui_test_registry(
+        &config,
+        Some(sse_interrupt_call_fn(
+            vec!["sse-batch-a", "sse-batch-b"],
+            Arc::clone(&seen_inputs),
+        )),
+    );
+    let session_id = "sse-resume-validation";
+    start_sse_interrupt(&config, &registry, session_id, "batch approval").await;
+
+    let unknown = ag_ui_run_with_call_fn(
+        &config,
+        &registry,
+        "plain",
+        session_id,
+        &sse_resume_body(json!([
+            { "interruptId": "sse-batch-a", "status": "resolved", "payload": { "approved": true } },
+            { "interruptId": "unknown", "status": "cancelled", "payload": { "approved": false } },
+        ])),
+        None,
+    )
+    .await
+    .expect_err("unknown interrupt id should fail");
+    assert_bad_request_contains(&unknown, "resume interrupt ids do not match pending batch");
+
+    let incomplete = ag_ui_run_with_call_fn(
+        &config,
+        &registry,
+        "plain",
+        session_id,
+        &sse_resume_body(json!([
+            { "interruptId": "sse-batch-a", "status": "resolved", "payload": { "approved": true } },
+        ])),
+        None,
+    )
+    .await
+    .expect_err("partial interrupt batch should fail");
+    assert_bad_request_contains(
+        &incomplete,
+        "resume decisions must cover every pending interrupt",
+    );
+    assert_eq!(
+        seen_inputs.lock().expect("seen inputs lock").as_slice(),
+        ["batch approval"]
     );
 }

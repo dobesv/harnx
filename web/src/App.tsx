@@ -4,6 +4,7 @@ import {
   MessagePrimitive,
   ComposerPrimitive,
   AttachmentPrimitive,
+  type Attachment,
   useAui,
   useAuiState,
 } from '@assistant-ui/react';
@@ -28,6 +29,7 @@ import './chat.css';
 
 interface QueuedMessage {
   text: string;
+  attachments?: readonly Attachment[];
 }
 
 // Activate a click-like handler from keyboard (Enter / Space) so div-based
@@ -132,7 +134,7 @@ const MyAttachment = () => (
   </AttachmentPrimitive.Root>
 );
 
-const MyComposer = ({
+export const MyComposer = ({
   agentName,
   sessionId,
   onSwitchAgent,
@@ -157,18 +159,26 @@ const MyComposer = ({
   const wasRunning = useRef(isRunning);
   useEffect(() => {
     if (wasRunning.current && !isRunning) {
-      if (queuedMessage?.text.trim()) {
+      if (queuedMessage && (queuedMessage.text.trim() || (queuedMessage.attachments && queuedMessage.attachments.length > 0))) {
         try {
-          composerRuntime.setText(queuedMessage.text);
+          if (queuedMessage.text) composerRuntime.setText(queuedMessage.text);
+          if (queuedMessage.attachments) {
+            for (const att of queuedMessage.attachments) {
+              if (att.file) {
+                void composerRuntime.addAttachment(att.file);
+              }
+            }
+          }
           composerRuntime.send();
           setQueuedMessage(null);
         } catch (err) {
           console.error('Failed to send queued message', err);
+          setErrorText(err instanceof Error ? err.message : 'Failed to send queued message');
         }
       }
     }
     wasRunning.current = isRunning;
-  }, [isRunning, composerRuntime, queuedMessage]);
+  }, [isRunning, composerRuntime, queuedMessage, setErrorText]);
 
   const resizeTextarea = useCallback((el: HTMLTextAreaElement | null) => {
     if (!el) return;
@@ -202,6 +212,30 @@ const MyComposer = ({
     });
   }, []);
 
+  const handleEditQueued = useCallback(() => {
+    if (queuedMessage) {
+      composerRuntime.setText(queuedMessage.text);
+      if (queuedMessage.attachments) {
+        for (const att of queuedMessage.attachments) {
+          if (att.file) {
+            void composerRuntime.addAttachment(att.file);
+          }
+        }
+      }
+      setQueuedMessage(null);
+      requestAnimationFrame(() => {
+        textareaRef.current?.focus();
+        resizeTextarea(textareaRef.current);
+      });
+    }
+  }, [queuedMessage, composerRuntime, resizeTextarea]);
+
+  const handleCancelQueued = useCallback(() => {
+    setQueuedMessage(null);
+    // Focus the textarea after canceling to prevent focus dropping to document.body
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, []);
+
   const resetComposerInput = useCallback(() => {
     composerRuntime.setText('');
     void composerRuntime.clearAttachments();
@@ -215,12 +249,15 @@ const MyComposer = ({
     const state = composerRuntime.getState();
     const text = state.text.trim();
     if (!text && state.attachments.length === 0) return;
-    if (state.attachments.some((a: any) => a.status?.type !== 'complete')) return;
+    if (state.attachments.some((a: Attachment) => a.status?.type !== 'complete')) return;
 
     if (isRunning) {
       setQueuedMessage((current) => {
-        if (!current) return { text };
-        return { text: current.text.trim() ? `${current.text}\n${text}` : text };
+        if (!current) return { text, attachments: state.attachments };
+        return { 
+          text: current.text.trim() ? `${current.text}\n${text}` : text,
+          attachments: [...(current.attachments || []), ...state.attachments]
+        };
       });
       resetComposerInput();
       return;
@@ -230,7 +267,7 @@ const MyComposer = ({
     collapseTextarea();
   };
 
-  const queueCountLabel = queuedMessage ? '1 message queued' : null;
+  
   const placeholder = queuedMessage
     ? 'Current run in progress. Next message queued.'
     : isRunning
@@ -242,7 +279,25 @@ const MyComposer = ({
 
   return (
     <ComposerPrimitive.Root className="aui-composer" onSubmit={handleSubmit}>
-      {queueCountLabel ? <div className="aui-composer-queue-hint">{queueCountLabel}</div> : null}
+      {queuedMessage ? (
+        <div className="aui-composer-queued" data-testid="queued-message">
+          <div className="aui-composer-queued-content">
+            <div className="aui-composer-queued-label">Queued message:</div>
+            <div className="aui-composer-queued-text">
+              {queuedMessage.text || ''}
+              {queuedMessage.attachments && queuedMessage.attachments.length > 0 ? (
+                <span className="aui-composer-queued-attachments-hint">
+                  {queuedMessage.text ? ' ' : ''}[{queuedMessage.attachments.length} attachment{queuedMessage.attachments.length > 1 ? 's' : ''}]
+                </span>
+              ) : null}
+            </div>
+          </div>
+          <div className="aui-composer-queued-actions">
+            <button type="button" onClick={handleEditQueued} className="aui-composer-queued-btn" aria-label="Edit queued message">Edit</button>
+            <button type="button" onClick={handleCancelQueued} className="aui-composer-queued-btn" aria-label="Cancel queued message">Cancel</button>
+          </div>
+        </div>
+      ) : null}
       <div className="aui-composer-attachments">
         <ComposerPrimitive.Attachments components={{ Attachment: MyAttachment }} />
       </div>
@@ -343,25 +398,53 @@ const SendErrorIndicator = () => {
   const { errorText } = useContext(PendingContext);
   if (!errorText) return null;
   return (
-    <div className="aui-error" data-testid="send-error">
+    <div role="alert" className="aui-error" data-testid="send-error">
       {errorText}
     </div>
   );
 };
 
-const BatchInterruptUI = () => {
+export const BatchInterruptUI = () => {
   const interrupts = useAgUiInterrupts();
   const submitResponses = useAgUiSubmitInterruptResponses();
   const [responses, setResponses] = useState<Record<string, 'resolved' | 'cancelled'>>({});
+  const { setErrorText } = useContext(PendingContext);
+
+  // Reset responses for interrupts that are no longer active
+  useEffect(() => {
+    setResponses((prev) => {
+      const next: Record<string, 'resolved' | 'cancelled'> = {};
+      for (const i of interrupts) {
+        if (prev[i.id]) {
+          next[i.id] = prev[i.id];
+        }
+      }
+      if (Object.keys(next).length !== Object.keys(prev).length) {
+        return next;
+      }
+      return prev;
+    });
+  }, [interrupts]);
 
   if (!interrupts.length) return null;
 
-  const handleSubmit = () => {
-    const payload = interrupts.map(i => ({
-      interruptId: i.id,
-      status: responses[i.id] || 'cancelled'
-    }));
-    submitResponses(payload);
+  const handleSubmit = async () => {
+    setErrorText(null);
+    const payload = interrupts.map(i => {
+      const decision = responses[i.id] || 'cancelled';
+      return {
+        interruptId: i.id,
+        status: decision,
+        payload: { approved: decision === 'resolved' }
+      };
+    });
+    
+    try {
+      await submitResponses(payload);
+    } catch (err) {
+      console.error('Failed to submit interrupt responses', err);
+      setErrorText(err instanceof Error ? err.message : String(err));
+    }
   };
 
   return (
