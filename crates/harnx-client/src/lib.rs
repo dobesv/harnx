@@ -138,3 +138,20 @@ impl ClientConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ClientConfig;
+    use serde_json::json;
+
+    #[test]
+    fn client_config_type_name_matches_serde_tag() {
+        for serde_tag in ["openai", "claude", "azure-openai"] {
+            let config: ClientConfig = serde_json::from_value(json!({ "type": serde_tag }))
+                .expect("representative client config should deserialize");
+            assert_eq!(config.type_name(), serde_tag);
+        }
+
+        assert_eq!(ClientConfig::Unknown.type_name(), "");
+    }
+}

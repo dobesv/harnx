@@ -15,9 +15,9 @@ use axum::{
 use clap::Args;
 use metrics_exporter_prometheus::PrometheusBuilder;
 
-/// Total chat-completion tokens by agent, client, model, and token type.
+/// Total chat-completion tokens by agent, client, provider, model, and token type.
 pub const LLM_TOKENS_TOTAL: &str = "harnx_llm_tokens_total";
-/// Cumulative chat-completion cost in dollars by agent, client, and model.
+/// Cumulative chat-completion cost in dollars by agent, client, provider, and model.
 pub const LLM_COST_DOLLARS: &str = "harnx_llm_cost_dollars";
 /// Total HTTP requests by method, route, and status.
 pub const HTTP_REQUESTS_TOTAL: &str = "harnx_http_requests_total";
