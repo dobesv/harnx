@@ -56,6 +56,7 @@ pub(super) fn apply_client_patch(client: &mut ClientConfig, patches: &[String]) 
     let saved_package = match client {
         ClientConfig::OpenAIConfig(c) => c.package.clone(),
         ClientConfig::OpenAICompatibleConfig(c) => c.package.clone(),
+        ClientConfig::CodexConfig(c) => c.package.clone(),
         ClientConfig::GeminiConfig(c) => c.package.clone(),
         ClientConfig::ClaudeConfig(c) => c.package.clone(),
         ClientConfig::CohereConfig(c) => c.package.clone(),

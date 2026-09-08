@@ -1,0 +1,27 @@
+# Codex — ChatGPT Pro/Plus/Team subscription authentication.
+# Uses the OAuth login performed by the official `codex` CLI instead of an
+# OPENAI_API_KEY. Prerequisite: install the `codex` CLI and run `codex login`
+# once so it writes ~/.codex/auth.json (which harnx reads).
+
+type: codex
+
+# Optional: path to the Codex CLI auth file. Defaults to ~/.codex/auth.json.
+# auth_file: "~/.codex/auth.json"
+
+# Optional: override the Codex backend base URL (advanced/testing only).
+# Must be an https:// URL — harnx rejects a non-HTTPS api_base so the
+# subscription token isn't sent over plaintext.
+# api_base: "https://chatgpt.com/backend-api/codex"
+
+# No `models` list is needed: the codex client reuses OpenAI's built-in model
+# catalog, so updating harnx keeps the model list (context sizes, capabilities,
+# the Responses API endpoint) current automatically. Select a model with the
+# client prefix, e.g. `codex:gpt-5`. Add a `models:` list only to override
+# metadata or declare a model the catalog doesn't have yet (e.g. gpt-5-codex):
+# models:
+#   - name: gpt-5-codex
+#     max_input_tokens: 400000
+#     max_output_tokens: 128000
+#     supports_vision: true
+#     supports_tool_use: true
+#     endpoint: responses

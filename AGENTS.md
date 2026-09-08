@@ -36,7 +36,6 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 │   │       ├── serve.rs        # HTTP server mode
 │   │       ├── tool.rs         # Built-in tool definitions
 │   │       ├── mcp_safety.rs   # MCP tool safety classification
-│   │       ├── client/         # LLM provider clients
 │   │       ├── config/         # Configuration, agent/session management
 │   │       ├── render/         # Markdown + streaming output
 │   │       ├── tui/            # Interactive TUI (ratatui)
@@ -133,9 +132,32 @@ them.
 
 - **Error handling:** Use `anyhow::Result` / `anyhow::bail!` throughout.
 - **Async:** All I/O is async via Tokio. Use `async fn` and `.await`.
-- **Client modules:** Each LLM provider lives in `crates/harnx/src/client/` and follows the patterns in `client/common.rs` and `client/macros.rs`.
+- **Client modules:** Provider clients live in `crates/harnx-client/src/` and follow the patterns in `macros.rs`. Config structs live in `crates/harnx-core/src/provider_config/`.
 - **Configuration:** `config.yaml` holds global settings. Clients and MCP servers use individual YAML files; agents are Markdown files with YAML front matter in `agents/`.
 - **Dual license:** MIT OR Apache-2.0. Preserve license headers where present.
+
+
+### Adding a Provider Client
+
+Wire a new provider client via `register_client!` in `crates/harnx-client/src/lib.rs`:
+
+```rust
+register_client!(
+    (myprovider, "myprovider", MyProviderConfig, MyProviderClient),
+    // ...
+);
+```
+
+This macro expands to the module declaration, config enum variant, and client registry. Then:
+
+1. Add a config struct to `crates/harnx-core/src/provider_config/myprovider.rs` and export it in that dir's `mod.rs`.
+2. Add `ClientConfig::MyProviderConfig(_)` match arms in `lib.rs` (`effective_name`/`set_name`/`set_package`) and `crates/harnx-runtime/src/config/patches_split.rs` (`apply_client_patch`).
+3. Implement `Client`:
+   - Sync auth (API key): use `impl_client_trait!` macro (see `cohere.rs` for example).
+   - Async per-request auth (OAuth token refresh): write a manual `impl Client` like `vertexai.rs` or `codex.rs`, running token prep at the top of each `*_inner` method.
+4. For Responses API variants, key `model.endpoint()` to `"responses"` to reuse `openai_responses.rs` helpers.
+
+Env-var field access uses `config_get_fn!` — the macro generates `${STEM}_${FIELD}` lookup where STEM is the client filename (e.g. `myprovider_api_key` → `MYPROVIDER_API_KEY`).
 
 ### Tool-call argument parsing
 
