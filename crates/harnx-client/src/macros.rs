@@ -21,6 +21,19 @@ macro_rules! register_client {
             Unknown,
         }
 
+        impl ClientConfig {
+            /// Returns the canonical serde `type` tag for this client
+            /// (e.g. `openai`, `claude`), or `""` for `Unknown`. Generated
+            /// from the same `$name` token as `#[serde(rename)]` so the tag
+            /// and this accessor cannot drift.
+            pub fn type_name(&self) -> &'static str {
+                match self {
+                    $( ClientConfig::$config(_) => $name, )+
+                    ClientConfig::Unknown => "",
+                }
+            }
+        }
+
         $(
             #[derive(Debug)]
             pub struct $client {

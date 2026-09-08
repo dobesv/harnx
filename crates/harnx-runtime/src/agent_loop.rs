@@ -981,7 +981,9 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{ChatCompletionsOutput, MessageRole, Model, ModelData, TestStateGuard};
+    use crate::client::{
+        ChatCompletionsOutput, ClientConfig, MessageRole, Model, ModelData, TestStateGuard,
+    };
     use crate::test_utils::{MockClient, MockTurn, MockTurnBuilder};
     use crate::utils::create_abort_signal;
     use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, NoticeEvent, TurnEvent};
@@ -1039,6 +1041,7 @@ mod tests {
                 ("agent", "metrics-agent"),
                 ("client", "mypkg/openai"),
                 ("model", "metrics-model"),
+                ("provider", ""),
                 ("type", usage_type),
             ],
         )
@@ -1274,13 +1277,18 @@ mod tests {
         }
     }
 
-    fn run_metrics_tool_loop(model: &Model, mock: Arc<MockClient>) -> Vec<DebugMetric> {
+    fn run_metrics_tool_loop(
+        model: &Model,
+        mock: Arc<MockClient>,
+        clients: Vec<ClientConfig>,
+    ) -> Vec<DebugMetric> {
         let global_config = Arc::new(RwLock::new(Config {
             data: harnx_core::config_data::ConfigData {
                 stream: false,
                 ..Default::default()
             },
             model: model.clone(),
+            clients,
             ..Default::default()
         }));
         let mut input = crate::config::input::from_str(&global_config, "do work", None);
@@ -1311,7 +1319,7 @@ mod tests {
         harnx_core::require_nextest();
         let model = priced_metrics_model();
         let mock = metrics_mock_client(&model);
-        let snapshot = run_metrics_tool_loop(&model, mock.clone());
+        let snapshot = run_metrics_tool_loop(&model, mock.clone(), vec![]);
         assert_eq!(
             mock.conversation_history().conversation_history.len(),
             3,
@@ -1348,6 +1356,7 @@ mod tests {
                 ("agent", "metrics-agent"),
                 ("client", "mypkg/openai"),
                 ("model", "metrics-model"),
+                ("provider", ""),
             ],
         );
         let DebugValue::Gauge(actual_cost) = cost_value else {
@@ -1366,6 +1375,41 @@ mod tests {
             (actual_cost.into_inner() - expected_cost).abs() < 1e-12,
             "cost should equal sum of three calls"
         );
+    }
+
+    #[test]
+    fn configured_client_records_canonical_provider_label() {
+        harnx_core::require_nextest();
+        let model = priced_metrics_model();
+        let mock = metrics_mock_client(&model);
+        let mut client = ClientConfig::OpenAIConfig(Default::default());
+        client.set_name("mypkg/openai".to_owned());
+
+        let snapshot = run_metrics_tool_loop(&model, mock, vec![client]);
+
+        for (usage_type, expected_total) in [
+            ("input", 60),
+            ("output", 23),
+            ("cached", 14),
+            ("cache_read", 14),
+            ("cache_write", 9),
+        ] {
+            assert_eq!(
+                metric_value(
+                    &snapshot,
+                    MetricKind::Counter,
+                    harnx_metrics::LLM_TOKENS_TOTAL,
+                    &[
+                        ("agent", "metrics-agent"),
+                        ("client", "mypkg/openai"),
+                        ("model", "metrics-model"),
+                        ("provider", "openai"),
+                        ("type", usage_type),
+                    ],
+                ),
+                &DebugValue::Counter(expected_total),
+            );
+        }
     }
 
     fn handoff_on_tool_round() -> OnToolRoundFn {
