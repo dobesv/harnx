@@ -17,6 +17,11 @@ title_agent: example-title-agent
 # (default 50000). The first title is generated on the first exchange. Set to 0
 # to disable automatic generation entirely.
 title_update_threshold: 50000
+# Optional time interval for mid-loop title refreshes. Mid-loop updates fire on
+# token growth (title_update_threshold) OR every N seconds. Default 0 disables
+# only the time trigger (token-based mid-loop updates still run). Set to 30
+# here to add a time cadence as an example.
+title_update_interval_secs: 30
 
 # ---- tool-use ----
 tool_use: true

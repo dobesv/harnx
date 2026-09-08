@@ -129,6 +129,13 @@ pub enum MessageContent {
 }
 
 impl MessageContent {
+    /// Extract text content from this message.
+    ///
+    /// Returns an empty string for `ToolCalls` content, which carries tool results,
+    /// assistant text, and optional thought — not raw text. Callers that need to
+    /// summarize `ToolCalls` (e.g., transcript builders, compaction) should match
+    /// on `MessageContent::ToolCalls` directly and extract `calls.text`,
+    /// `calls.thought`, and `result.call.name` rather than using this method.
     pub fn to_text(&self) -> String {
         match self {
             MessageContent::Text(text) => text.to_string(),
