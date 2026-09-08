@@ -1,8 +1,9 @@
 use crate::ag_ui::AppResponse;
+use crate::interrupt_resume::{parse_resume_params, validate_resume, InterruptResumeParam};
 use crate::load_nats_session;
 use crate::session_actor::{
-    InterruptResume, InterruptResumePayload, InterruptResumeStatus, PromptResult, SessionCommand,
-    SessionHandle, SessionInfo, SessionKey, SessionPromptOptions, SessionRegistry, SessionState,
+    PromptResult, SessionCommand, SessionHandle, SessionInfo, SessionKey, SessionPromptOptions,
+    SessionRegistry, SessionState,
 };
 use bytes::Bytes;
 use http::{Method, Response, StatusCode};
@@ -46,48 +47,6 @@ struct PromptParams {
     attachment_refs: Vec<String>,
     #[serde(default)]
     resume: Vec<InterruptResumeParam>,
-}
-
-#[derive(Debug, Deserialize)]
-struct InterruptResumeParam {
-    interrupt_id: String,
-    status: String,
-    payload: InterruptResumePayloadParam,
-}
-
-#[derive(Debug, Deserialize)]
-struct InterruptResumePayloadParam {
-    approved: bool,
-    #[serde(default)]
-    reason: Option<String>,
-}
-
-fn parse_resume_params(params: &[InterruptResumeParam]) -> anyhow::Result<Vec<InterruptResume>> {
-    params
-        .iter()
-        .map(|p| {
-            let status = match p.status.as_str() {
-                "approved" | "resolved" if p.payload.approved => InterruptResumeStatus::Approved,
-                "denied" | "rejected" if !p.payload.approved => InterruptResumeStatus::Denied,
-                other => {
-                    anyhow::bail!(
-                        "invalid resume status/payload for interrupt {}: status={}, approved={}",
-                        p.interrupt_id,
-                        other,
-                        p.payload.approved
-                    )
-                }
-            };
-            Ok(InterruptResume {
-                interrupt_id: p.interrupt_id.clone(),
-                status,
-                payload: InterruptResumePayload {
-                    approved: p.payload.approved,
-                    reason: p.payload.reason.clone(),
-                },
-            })
-        })
-        .collect()
 }
 
 pub async fn handle_ag_ui_rpc(
@@ -302,105 +261,18 @@ async fn handle_prompt(
         }
     };
 
-    if !resume.is_empty() {
-        let SessionState::Interrupted {
-            run_id, pending, ..
-        } = &info.state
-        else {
-            return json_rpc_response(
-                StatusCode::BAD_REQUEST,
-                json_rpc_error(
-                    id,
-                    -32602,
-                    "invalid params",
-                    Some(json!({ "detail": "resume requires interrupted session state" })),
-                ),
-            );
-        };
-        let pending_ids: std::collections::BTreeSet<&str> = pending
-            .interrupts
-            .iter()
-            .map(|entry| entry.id.as_str())
-            .collect();
-        let resume_ids: std::collections::BTreeSet<&str> = resume
-            .iter()
-            .map(|entry| entry.interrupt_id.as_str())
-            .collect();
-        if !resume_ids.is_subset(&pending_ids) {
-            let invalid_ids: Vec<&str> = resume
-                .iter()
-                .filter_map(|entry| {
-                    (!pending_ids.contains(entry.interrupt_id.as_str()))
-                        .then_some(entry.interrupt_id.as_str())
-                })
-                .collect();
-            return json_rpc_response(
-                StatusCode::BAD_REQUEST,
-                json_rpc_error(
-                    id,
-                    -32602,
-                    "invalid params",
-                    Some(json!({
-                        "detail": "resume interrupt ids do not match pending batch",
-                        "invalid_interrupt_ids": invalid_ids,
-                    })),
-                ),
-            );
-        }
-        let mismatched_run_ids: Vec<&str> = resume
-            .iter()
-            .filter_map(|entry| {
-                entry
-                    .interrupt_id
-                    .split(':')
-                    .next()
-                    .filter(|prefix| prefix.starts_with("run_") && *prefix != run_id)
-            })
-            .collect();
-        if !mismatched_run_ids.is_empty() {
-            return json_rpc_response(
-                StatusCode::BAD_REQUEST,
-                json_rpc_error(
-                    id,
-                    -32602,
-                    "invalid params",
-                    Some(json!({
-                        "detail": "resume run_id does not match interrupted run",
-                        "expected_run_id": run_id,
-                        "actual_run_ids": mismatched_run_ids,
-                    })),
-                ),
-            );
-        }
-        if resume_ids != pending_ids {
-            let missing_interrupt_ids: Vec<&str> = pending
-                .interrupts
-                .iter()
-                .filter_map(|entry| {
-                    (!resume_ids.contains(entry.id.as_str())).then_some(entry.id.as_str())
-                })
-                .collect();
-            return json_rpc_response(
-                StatusCode::BAD_REQUEST,
-                json_rpc_error(
-                    id,
-                    -32602,
-                    "invalid params",
-                    Some(json!({
-                        "detail": "resume decisions must cover every pending interrupt",
-                        "missing_interrupt_ids": missing_interrupt_ids,
-                    })),
-                ),
-            );
-        }
-    }
-
     let prompt_text = if resume.is_empty() {
         params.text.as_str()
-    } else if let SessionState::Interrupted { pending, .. } = &info.state {
-        pending.text.as_str()
     } else {
-        params.text.as_str()
+        match validate_resume(&resume, &info.state) {
+            Ok(pending_text) => pending_text,
+            Err(err) => {
+                return json_rpc_response(
+                    StatusCode::BAD_REQUEST,
+                    json_rpc_error(id, -32602, "invalid params", Some(err.details())),
+                );
+            }
+        }
     };
 
     let result = match prompt(
