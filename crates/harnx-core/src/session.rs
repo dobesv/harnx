@@ -231,6 +231,8 @@ pub struct Session {
     #[serde(skip)]
     pub title_last_updated_tokens: usize,
     #[serde(skip)]
+    pub title_last_updated_at: Option<std::time::Instant>,
+    #[serde(skip)]
     pub log_entry_count: usize,
     #[serde(skip)]
     pub tokens: usize,
@@ -455,6 +457,34 @@ impl Session {
 
     pub fn set_title_last_updated_tokens(&mut self, t: usize) {
         self.title_last_updated_tokens = t;
+    }
+
+    pub fn title_last_updated_at(&self) -> Option<std::time::Instant> {
+        self.title_last_updated_at
+    }
+
+    pub fn set_title_last_updated_at(&mut self, t: std::time::Instant) {
+        self.title_last_updated_at = Some(t);
+    }
+
+    /// Time half of the mid-loop token-or-time gate for title regeneration.
+    ///
+    /// Returns false when `interval_secs == 0` (time trigger disabled). Returns
+    /// true when no title exists yet (first title bypass) or
+    /// `title_last_updated_at` is unset/older than `interval_secs`.
+    /// `claim_titling_mid_loop` checks this alongside `need_generate_title` after
+    /// its master-disable, single-flight, manual-freeze, and empty-session guards.
+    pub fn mid_loop_title_interval_elapsed(&self, interval_secs: u64) -> bool {
+        if interval_secs == 0 {
+            return false; // time trigger disabled
+        }
+        if self.title.is_none() {
+            return true; // first title should not be delayed
+        }
+        match self.title_last_updated_at {
+            None => true,
+            Some(t) => t.elapsed() >= std::time::Duration::from_secs(interval_secs),
+        }
     }
 
     pub fn guard_empty(&self) -> Result<()> {
@@ -936,5 +966,50 @@ field: value
         assert!(decoded.markdown.is_none());
         assert!(decoded.content.is_empty());
         assert!(decoded.switch_agent.is_none());
+    }
+
+    #[test]
+    fn mid_loop_title_interval_elapsed_gates_on_time() {
+        use std::time::{Duration, Instant};
+
+        // Case 1: interval_secs == 0 → false (time trigger disabled), even with title set.
+        let session = Session {
+            title: Some("Title".to_string()),
+            ..Default::default()
+        };
+        assert!(!session.mid_loop_title_interval_elapsed(0));
+
+        // Case 2: title.is_none() → true (first title should not be delayed).
+        let session = Session::default();
+        assert!(session.mid_loop_title_interval_elapsed(60));
+
+        // Case 3: title set + title_last_updated_at = Some(Instant::now()) (recent, within interval) → false.
+        let session = Session {
+            title: Some("Existing title".to_string()),
+            title_last_updated_at: Some(Instant::now()),
+            ..Default::default()
+        };
+        let interval = 60;
+        assert!(!session.mid_loop_title_interval_elapsed(interval));
+
+        // Case 4: title set + title_last_updated_at older than interval → true.
+        let interval_secs = 60u64;
+        let old_instant = Instant::now()
+            .checked_sub(Duration::from_secs(interval_secs * 2))
+            .expect("instant far enough from epoch");
+        let session = Session {
+            title: Some("Old title".to_string()),
+            title_last_updated_at: Some(old_instant),
+            ..Default::default()
+        };
+        assert!(session.mid_loop_title_interval_elapsed(interval_secs));
+
+        // Case 5: title set + title_last_updated_at = None (never set) → true.
+        let session = Session {
+            title: Some("Never timestamped".to_string()),
+            title_last_updated_at: None,
+            ..Default::default()
+        };
+        assert!(session.mid_loop_title_interval_elapsed(60));
     }
 }
