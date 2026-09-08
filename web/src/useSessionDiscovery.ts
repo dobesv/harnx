@@ -122,11 +122,17 @@ export function useSessionDiscovery({
     setFreshSessionIds((previous) => previous.filter((id) => id !== sessionId));
   }, [setSelectedSessionId]);
 
+
+  const markSessionNotFresh = useCallback((sessionId: string) => {
+    setFreshSessionIds((previous) => previous.filter((id) => id !== sessionId));
+  }, []);
+
   return {
     sessions: sessionList.sessions,
     sessionsError: sessionList.sessionsError,
     sessionsLoading: sessionList.sessionsLoading,
     isFreshSession: freshSessionIds.includes(selectedSessionId),
+    markSessionNotFresh,
     refreshSessions: sessionList.refreshSessions,
     selectSession,
     newChat,

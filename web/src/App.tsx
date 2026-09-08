@@ -15,22 +15,17 @@ import remarkGfm from 'remark-gfm';
 const SyntaxHighlighter = makeLightAsyncSyntaxHighlighter({ useInlineStyles: false });
 import { ToolCallCard } from './ToolCallCard';
 import { useAgUiInterrupts, useAgUiSubmitInterruptResponses } from '@assistant-ui/react-ag-ui';
-import { ChatProvider } from './ChatProvider';
+import { ChatProvider, attachmentToMessageParts } from './ChatProvider';
 import { PendingContext } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { SubAgentSessionNotes } from './SubAgentSessionNotes';
-import { cancel } from './api';
+import { cancel, sendPrompt, uploadAttachment } from './api';
 import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
 import { AttachIcon, SendIcon } from './icons';
 import { AgentDropdown, SessionDropdown, AgentSessionMenu } from './composer/AgentSessionMenu';
 import './chat.css';
-
-interface QueuedMessage {
-  text: string;
-  attachments?: readonly Attachment[];
-}
 
 // Activate a click-like handler from keyboard (Enter / Space) so div-based
 // "button" affordances (picker cards) are usable without mouse.
@@ -137,6 +132,8 @@ const MyAttachment = () => (
 export const MyComposer = ({
   agentName,
   sessionId,
+  isFreshSession,
+  markSessionNotFresh,
   onSwitchAgent,
   onSwitchSession,
   switchAgentHref,
@@ -144,41 +141,25 @@ export const MyComposer = ({
 }: {
   agentName: string;
   sessionId: string;
+  isFreshSession: boolean;
+  markSessionNotFresh: (sessionId: string) => void;
   onSwitchAgent: () => void;
   onSwitchSession: () => void;
   switchAgentHref: string;
   switchSessionHref: string;
 }) => {
   const { setErrorText } = useContext(PendingContext);
-  const isRunning = useAuiState(s => s.thread.isRunning);
   const composerRuntime = useAui().composer;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const [queuedMessage, setQueuedMessage] = useState<QueuedMessage | null>(null);
+  const [isSending, setIsSending] = useState(false);
+  const userMessageCount = useAuiState(s => s.thread.messages.filter(m => m.role === 'user').length);
+  const prevUserMessageCount = useRef(userMessageCount);
 
-  // Monitor run state to flush queued message
-  const wasRunning = useRef(isRunning);
   useEffect(() => {
-    if (wasRunning.current && !isRunning) {
-      if (queuedMessage && (queuedMessage.text.trim() || (queuedMessage.attachments && queuedMessage.attachments.length > 0))) {
-        try {
-          if (queuedMessage.text) composerRuntime.setText(queuedMessage.text);
-          if (queuedMessage.attachments) {
-            for (const att of queuedMessage.attachments) {
-              if (att.file) {
-                void composerRuntime.addAttachment(att.file);
-              }
-            }
-          }
-          composerRuntime.send();
-          setQueuedMessage(null);
-        } catch (err) {
-          console.error('Failed to send queued message', err);
-          setErrorText(err instanceof Error ? err.message : 'Failed to send queued message');
-        }
-      }
+    if (isSending && userMessageCount > prevUserMessageCount.current) {
+      setIsSending(false);
     }
-    wasRunning.current = isRunning;
-  }, [isRunning, composerRuntime, queuedMessage, setErrorText]);
+  }, [isSending, userMessageCount]);
 
   const resizeTextarea = useCallback((el: HTMLTextAreaElement | null) => {
     if (!el) return;
@@ -212,30 +193,6 @@ export const MyComposer = ({
     });
   }, []);
 
-  const handleEditQueued = useCallback(() => {
-    if (queuedMessage) {
-      composerRuntime.setText(queuedMessage.text);
-      if (queuedMessage.attachments) {
-        for (const att of queuedMessage.attachments) {
-          if (att.file) {
-            void composerRuntime.addAttachment(att.file);
-          }
-        }
-      }
-      setQueuedMessage(null);
-      requestAnimationFrame(() => {
-        textareaRef.current?.focus();
-        resizeTextarea(textareaRef.current);
-      });
-    }
-  }, [queuedMessage, composerRuntime, resizeTextarea]);
-
-  const handleCancelQueued = useCallback(() => {
-    setQueuedMessage(null);
-    // Focus the textarea after canceling to prevent focus dropping to document.body
-    requestAnimationFrame(() => textareaRef.current?.focus());
-  }, []);
-
   const resetComposerInput = useCallback(() => {
     composerRuntime.setText('');
     void composerRuntime.clearAttachments();
@@ -244,70 +201,98 @@ export const MyComposer = ({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSending) return;
     setErrorText(null);
 
     const state = composerRuntime.getState();
     const text = state.text.trim();
     if (!text && state.attachments.length === 0) return;
-    if (state.attachments.some((a: Attachment) => a.status?.type !== 'complete')) return;
 
-    if (isRunning) {
-      setQueuedMessage((current) => {
-        if (!current) return { text, attachments: state.attachments };
-        return { 
-          text: current.text.trim() ? `${current.text}\n${text}` : text,
-          attachments: [...(current.attachments || []), ...state.attachments]
-        };
-      });
+    if (isFreshSession) {
+      // Fresh session: streaming POST via runAgent (composerRuntime.send).
+      // Only the first message follows this path; subsequent messages go out-of-band
+      // via session/prompt while RuntimeSessionSubscriber passively follows the stream.
+      // See design note (#1761 Option A) for why we must NOT optimistically append
+      // the user row to the thread — RuntimeSessionSubscriber.startRun({parentId})
+      // would resend it and the server would treat an unknown client id as a new turn.
+      if (state.attachments.some((a: Attachment) => a.status?.type !== 'complete')) return;
+      composerRuntime.send();
+      markSessionNotFresh(sessionId);
+      collapseTextarea();
+    } else {
+      // Existing session: JSON-RPC session/prompt (no runAgent).
+      // Attaches to the existing stream via RuntimeSessionSubscriber.startRun({parentId}),
+      // which hydrates the server-authored user row without re-execution.
+      setIsSending(true);
+      prevUserMessageCount.current = userMessageCount;
+      const savedText = text;
+      const savedAttachments = state.attachments;
+
       resetComposerInput();
-      return;
-    }
 
-    composerRuntime.send();
-    collapseTextarea();
+      // assistant-ui (0.15.18) only uploads attachments inside composerRuntime.send().
+      // addAttachment() merely marks them as 'running' — the adapter.send() call that
+      // produces the CID happens during send(). Since this out-of-band path deliberately
+      // avoids composerRuntime.send(), we must upload fresh attachments ourselves.
+      // Attachments retained from a previous send already have CIDs in .content.
+      const doSend = async () => {
+        const attachmentRefs: string[] = [];
+        for (const att of savedAttachments) {
+          const parts = attachmentToMessageParts(att);
+          let hasCid = false;
+          for (const p of parts) {
+            if (p.type === 'image' && typeof p.image === 'string') {
+              attachmentRefs.push(p.image);
+              hasCid = true;
+            } else if (p.type === 'file' && typeof p.data === 'string') {
+              attachmentRefs.push(p.data);
+              hasCid = true;
+            }
+          }
+
+          if (!hasCid && att.file) {
+            const refs = await uploadAttachment(agentName, sessionId, att.file as File);
+            attachmentRefs.push(...refs);
+          }
+        }
+
+        await sendPrompt(agentName, sessionId, { text, attachmentRefs });
+      };
+
+      doSend().catch(err => {
+        console.error('Failed to send prompt or upload attachments out of band', err);
+        setErrorText(err instanceof Error ? err.message : String(err));
+        // Restore input
+        composerRuntime.setText(savedText);
+        savedAttachments.forEach((att: Attachment) => {
+          if (att.file) void composerRuntime.addAttachment(att.file);
+        });
+        setIsSending(false);
+        requestAnimationFrame(() => {
+          textareaRef.current?.focus();
+          resizeTextarea(textareaRef.current);
+        });
+      });
+    }
   };
 
   
-  const placeholder = queuedMessage
-    ? 'Current run in progress. Next message queued.'
-    : isRunning
-      ? 'Type a message to queue after this run...'
-      : 'Type a message...';
-
+  const placeholder = 'Type a message...';
   const menuProps = { agentName, sessionId, switchAgentHref, switchSessionHref, onSwitchAgent, onSwitchSession };
-  const sendLabel = queuedMessage ? 'Queued' : isRunning ? 'Queue' : 'Send';
+  const sendLabel = 'Send';
 
   return (
     <ComposerPrimitive.Root className="aui-composer" onSubmit={handleSubmit}>
-      {queuedMessage ? (
-        <div className="aui-composer-queued" data-testid="queued-message">
-          <div className="aui-composer-queued-content">
-            <div className="aui-composer-queued-label">Queued message:</div>
-            <div className="aui-composer-queued-text">
-              {queuedMessage.text || ''}
-              {queuedMessage.attachments && queuedMessage.attachments.length > 0 ? (
-                <span className="aui-composer-queued-attachments-hint">
-                  {queuedMessage.text ? ' ' : ''}[{queuedMessage.attachments.length} attachment{queuedMessage.attachments.length > 1 ? 's' : ''}]
-                </span>
-              ) : null}
-            </div>
-          </div>
-          <div className="aui-composer-queued-actions">
-            <button type="button" onClick={handleEditQueued} className="aui-composer-queued-btn" aria-label="Edit queued message">Edit</button>
-            <button type="button" onClick={handleCancelQueued} className="aui-composer-queued-btn" aria-label="Cancel queued message">Cancel</button>
-          </div>
-        </div>
-      ) : null}
       <div className="aui-composer-attachments">
         <ComposerPrimitive.Attachments components={{ Attachment: MyAttachment }} />
       </div>
       <ComposerPrimitive.Input
         className="aui-composer-input"
         placeholder={placeholder}
-        render={<textarea ref={setTextareaRef} rows={1} onInput={(e) => resizeTextarea(e.currentTarget)} />}
+        render={<textarea disabled={isSending} ref={setTextareaRef} rows={1} onInput={(e) => resizeTextarea(e.currentTarget)} />}
       />
       <div className="aui-composer-controls">
-        <ComposerPrimitive.AddAttachment className="aui-composer-add-attachment aui-composer-icon-btn" aria-label="Attach file" title="Attach file">
+        <ComposerPrimitive.AddAttachment disabled={isSending} className="aui-composer-add-attachment aui-composer-icon-btn" aria-label="Attach file" title="Attach file">
           <AttachIcon />
           <span className="aui-visually-hidden">Attach file</span>
         </ComposerPrimitive.AddAttachment>
@@ -320,8 +305,8 @@ export const MyComposer = ({
           <AgentSessionMenu {...menuProps} />
         </div>
         
-        <button type="submit" className="aui-composer-send aui-composer-icon-btn" aria-label={sendLabel} title={sendLabel}>
-          <SendIcon />
+        <button disabled={isSending} type="submit" className="aui-composer-send aui-composer-icon-btn" aria-label={sendLabel} title={sendLabel}>
+          {isSending ? <span className="aui-spinner"><span></span></span> : <SendIcon />}
           <span className="aui-visually-hidden">{sendLabel}</span>
         </button>
         <CancelButton agentName={agentName} sessionId={sessionId} />
@@ -475,7 +460,7 @@ export const BatchInterruptUI = () => {
   );
 };
 
-const MyThread = ({ agentName, sessionId, onRunFinish, onSwitchAgent, onSwitchSession, switchAgentHref, switchSessionHref }: { agentName: string, sessionId: string, onRunFinish: () => void, onSwitchAgent: () => void, onSwitchSession: () => void, switchAgentHref: string, switchSessionHref: string }) => {
+const MyThread = ({ agentName, sessionId, isFreshSession, markSessionNotFresh, onRunFinish, onSwitchAgent, onSwitchSession, switchAgentHref, switchSessionHref }: { agentName: string, sessionId: string, isFreshSession: boolean, markSessionNotFresh: (sessionId: string) => void, onRunFinish: () => void, onSwitchAgent: () => void, onSwitchSession: () => void, switchAgentHref: string, switchSessionHref: string }) => {
   const isEmpty = useAuiState(s => s.thread.messages.length === 0);
 
   return (
@@ -496,6 +481,8 @@ const MyThread = ({ agentName, sessionId, onRunFinish, onSwitchAgent, onSwitchSe
           <MyComposer
             agentName={agentName}
             sessionId={sessionId}
+            isFreshSession={isFreshSession}
+            markSessionNotFresh={markSessionNotFresh}
             onSwitchAgent={onSwitchAgent}
             onSwitchSession={onSwitchSession}
             switchAgentHref={switchAgentHref}
@@ -612,6 +599,7 @@ export default function App() {
     clearAgent,
     clearSession,
     isFreshSession,
+    markSessionNotFresh,
     navigateSession,
   } = useAgentSessions();
 
@@ -652,6 +640,8 @@ export default function App() {
               <MyThread
                 agentName={selectedAgent}
                 sessionId={selectedSessionId}
+                isFreshSession={isFreshSession}
+                markSessionNotFresh={markSessionNotFresh}
                 onRunFinish={refreshSessions}
                 onSwitchAgent={clearAgent}
                 onSwitchSession={clearSession}

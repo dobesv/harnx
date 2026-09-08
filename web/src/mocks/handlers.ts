@@ -5,6 +5,8 @@ import {
   finishExchange,
   isPromptlessRun,
   persistSubAgentExchange,
+  persistExchange,
+  persistToolExchange,
 } from './sessionUpdates';
 
 const SUB_AGENT_SESSION_ID = 'child-session-0001';
@@ -83,7 +85,8 @@ function buildSnapshot(session: string) {
         id: 'm-system',
         role: 'system',
         content: 'You are mock system prompt content that should be collapsed by default.'
-      }
+      },
+      ...additionalSnapshot(session)
     ];
   }
   if (session === 'session-restored') {
@@ -570,6 +573,16 @@ export const happyPathHandlers = [
       if (body.method === 'session/cancel') {
         return HttpResponse.json({ jsonrpc: '2.0', result: { cancelled: true }, id: body.id });
       }
+      if (body.method === 'session/prompt') {
+        const text = body.params?.text || '';
+        const session = String(params.session);
+        if (session === 'session-gallery') {
+          persistToolExchange(session, text);
+        } else {
+          persistExchange(session, text, `Mock streamed reply to: ${text || 'empty prompt'}`);
+        }
+        return HttpResponse.json({ jsonrpc: '2.0', result: { status: 'accepted', run_id: 'mock-run-123' }, id: body.id });
+      }
       return HttpResponse.json({
         jsonrpc: '2.0',
         error: { code: -32601, message: 'method not found' },
@@ -609,6 +622,14 @@ export const sessionsFailHandlers = [
 export const sendFailHandlers = [
   http.post('/v1/agents/:agent/sessions/:session', async ({ request }) => {
     if (await isRpcRequest(request)) {
+      const body = await request.clone().json() as any;
+      if (body.method === 'session/prompt') {
+        return HttpResponse.json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Simulated sendPrompt error' },
+          id: body.id ?? null,
+        }, { status: 500 });
+      }
       return;
     }
 

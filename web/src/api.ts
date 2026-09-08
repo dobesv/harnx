@@ -1,4 +1,4 @@
-import type { Agent, SessionRef, AgentDetail, JsonRpcResponse, CancelResult } from './types';
+import type { Agent, SessionRef, AgentDetail, JsonRpcResponse, CancelResult, PromptResult } from './types';
 
 const API_BASE = '/v1';
 
@@ -94,4 +94,41 @@ export async function uploadAttachment(agent: string, session: string, file: Fil
   }
   const json = await res.json();
   return json.attachment_refs || [];
+}
+
+export async function sendPrompt(
+  agent: string,
+  session: string,
+  { text, attachmentRefs }: { text: string; attachmentRefs?: string[] }
+): Promise<PromptResult> {
+  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'session/prompt',
+      params: {
+        text,
+        attachment_refs: attachmentRefs ?? []
+      }
+    })
+  });
+
+  let json: JsonRpcResponse<PromptResult> | undefined;
+  try {
+    json = await res.json() as JsonRpcResponse<PromptResult>;
+  } catch {
+    json = undefined;
+  }
+
+  if (json?.error) {
+    throw new Error(`RPC Error: ${json.error.message || json.error.code}`);
+  }
+
+  if (!res.ok) throw new Error(`RPC call failed with HTTP ${res.status}`);
+
+  return json?.result as PromptResult;
 }

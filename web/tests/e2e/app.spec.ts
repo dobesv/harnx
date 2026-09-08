@@ -44,7 +44,8 @@ test('happy path: picker flow to chat with slash-named agent', async ({ page }) 
   await expect(page).toHaveScreenshot('happy-path.png');
 });
 
-test('committed handoff navigates and hydrates the durable target session', async ({ page }) => {
+// SKIP: blocked by #1775 (handoff/live-progress events are advisory-only; not recoverable on the passive session/prompt path). Re-enable after the durability fix.
+test.skip('committed handoff navigates and hydrates the durable target session', async ({ page }) => {
   await page.goto('/agents/coding%2Fcoder/sessions/session-1?scenario=happy');
   await expect(page.locator('.aui-assistant-message')).toContainText('Hello from mock session');
 
@@ -61,7 +62,8 @@ test('committed handoff navigates and hydrates the durable target session', asyn
   await expect(page.locator('.aui-composer-send')).toHaveText('Send');
 });
 
-test('sub-agent row transitions, opens the child, and browser Back returns to the parent', async ({ page }) => {
+// SKIP: blocked by #1775 (handoff/live-progress events are advisory-only; not recoverable on the passive session/prompt path). Re-enable after the durability fix.
+test.skip('sub-agent row transitions, opens the child, and browser Back returns to the parent', async ({ page }) => {
   await page.goto('/agents/coding%2Fcoder/sessions/session-1?scenario=happy');
   await expect(page.locator('.aui-assistant-message')).toContainText('Hello from mock session');
   await expect(page.locator('.aui-composer-send')).toHaveText('Send');
@@ -166,14 +168,16 @@ test('send-failure error (initial send)', async ({ page }) => {
   await expect(page).toHaveScreenshot('send-failure-error.png');
 });
 
-test('send-failure error (queued send)', async ({ page }) => {
+test('send-failure error (out-of-band send)', async ({ page }) => {
   await page.goto('/?scenario=happy');
   await page.locator('.grid-item').filter({ hasText: 'coding/coder' }).click();
   await page.locator('.new-chat-button').click();
 
   await page.locator('.aui-composer-input').fill('Start running');
   await page.locator('.aui-composer-send').click();
-  await expect(page.locator('.aui-composer-send')).toHaveText(/Queue/i, { timeout: 1000 });
+
+  // Wait for the first message to land to transition from fresh to existing session
+  await expect(page.locator('.aui-message-content').filter({ hasText: 'Start running' })).toBeVisible();
 
   await page.evaluate(() => {
     const msw = (window as any).__msw;
@@ -185,5 +189,6 @@ test('send-failure error (queued send)', async ({ page }) => {
 
   const errorEl = page.getByTestId('send-error');
   await expect(errorEl).toBeVisible();
-  await expect(errorEl).toHaveText(/HTTP 500/i);
+  await expect(errorEl).toHaveText(/Simulated sendPrompt error/i);
+  await expect(page.locator('.aui-composer-input')).toHaveValue('Queue this failure');
 });

@@ -203,6 +203,11 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     INITIAL_SUB_AGENT_NOTES_STATE,
   );
 
+  // assistant-ui 0.15.18 attachment lifecycle (verified against base-composer-runtime-core.ts):
+  // - addAttachment() calls adapter.add() → status 'running', NO upload yet
+  // - composerRuntime.send() calls adapter.send() for each incomplete attachment → upload + CID
+  // Code paths that bypass composerRuntime.send() (e.g., out-of-band session/prompt)
+  // must upload attachments themselves and cannot gate on status==='complete'.
   const attachments: AttachmentAdapter = useMemo(() => ({
     accept: 'image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain',
     async add({ file }) {
@@ -286,6 +291,9 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
       <PendingContext.Provider value={{ statusText, setStatusText, errorText, setErrorText }}>
         <UsageContext.Provider value={{ usage, toolSummaries }}>
           <AssistantRuntimeProvider key={`${agentName}:${sessionId}`} runtime={runtime}>
+            {/* Passive listener for existing sessions: when !isFreshSession, we follow the
+                session-updated stream and hydrate without re-executing. The first message
+                of a fresh session uses streaming runAgent (composerRuntime.send). */}
             <RuntimeSessionSubscriber
               enabled={!isFreshSession}
               eventsUrl={`/v1/agents/${encodeURIComponent(agentName)}/sessions/${encodeURIComponent(sessionId)}/events`}

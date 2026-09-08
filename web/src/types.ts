@@ -39,3 +39,8 @@ export interface JsonRpcResponse<T = unknown> {
 export interface CancelResult {
   cancelled: boolean;
 }
+
+export interface PromptResult {
+  status: 'accepted' | 'enqueued';
+  run_id: string;
+}
