@@ -1,3 +1,18 @@
+//! Session ID generation and reservation.
+//!
+//! Harnx session IDs have two formats:
+//! - **Canonical short IDs**: 6-character base64url strings encoding a Unix-seconds
+//!   timestamp (e.g., `"A1b2C3"`). Created via [`reserve_short_session_id`] for
+//!   collision safety against the canonical NATS metadata store.
+//! - **Legacy UUID v7**: 36-character UUIDs (e.g., `"01948a3f-7b1c-7123-8901-abcdef123456"`).
+//!   Readers must tolerate both; see `config::session_meta::session_recency_key` for
+//!   dual-format decoding.
+//!
+//! New sessions must reserve a short ID through the canonical metadata store.
+//! Do **not** use `nats_worker::new_remote_session_id()` — it returns a raw UUID v7
+//! and is test-only. All production paths route through `Config::reserve_new_session_id`,
+//! `NatsSession::new` (when `config.session_id` is None), or the HTTP POST endpoint.
+
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use std::process::Command;
@@ -36,6 +51,26 @@ pub fn decode_timestamp_session_id(id: &str) -> Option<u64> {
     let bytes = URL_SAFE_NO_PAD.decode(id).ok()?;
     let bytes: [u8; 4] = bytes.try_into().ok()?;
     Some(u32::from_be_bytes(bytes) as u64)
+}
+
+/// Atomically reserve a collision-safe short session ID in canonical metadata.
+pub async fn reserve_short_session_id(
+    store: &crate::nats_session_metadata::SessionMetadataStore,
+    initializer: &crate::nats_session_metadata::SessionInitializer,
+) -> anyhow::Result<String> {
+    let mut seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    loop {
+        let candidate = encode_timestamp_session_id(seconds);
+        let metadata =
+            crate::nats_session_metadata::SessionMetadata::new(&candidate, initializer.clone());
+        match store.create(&metadata).await? {
+            Some(_) => return Ok(candidate),
+            None => seconds = seconds.saturating_add(1),
+        }
+    }
 }
 
 /// Generate a unique session ID starting from current time, retrying +1 second until exists(candidate) is false.
