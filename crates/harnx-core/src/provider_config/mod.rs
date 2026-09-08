@@ -7,6 +7,7 @@
 pub mod azure_openai;
 pub mod bedrock;
 pub mod claude;
+pub mod codex;
 pub mod cohere;
 pub mod gemini;
 pub mod llama_server;
