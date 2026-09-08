@@ -7,6 +7,7 @@ class MockEventSource {
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { BatchInterruptUI, MyComposer } from '../App';
+import { sendPrompt, uploadAttachment } from '../api';
 import { PendingContext } from '../PendingContext';
 import * as agUi from '@assistant-ui/react-ag-ui';
 import * as aui from '@assistant-ui/react';
@@ -18,6 +19,10 @@ vi.mock('@assistant-ui/react-ag-ui', async (importOriginal) => {
   return { ...actual, useAgUiInterrupts: vi.fn(), useAgUiSubmitInterruptResponses: vi.fn() };
 });
 
+vi.mock('../api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../api')>();
+  return { ...actual, sendPrompt: vi.fn(), uploadAttachment: vi.fn() };
+});
 vi.mock('@assistant-ui/react', async (importOriginal) => {
   const actual = await importOriginal<typeof aui>();
   return { 
@@ -80,195 +85,223 @@ describe('BatchInterruptUI', () => {
   });
 });
 
-describe('MyComposer - Queued Messages', () => {
-  afterEach(() => {
+
+describe('MyComposer', () => {
+  let composerRuntime: any;
+  let setErrorText: any;
+  let markSessionNotFresh: any;
+
+  beforeEach(() => {
     vi.clearAllMocks();
-  });
+    setErrorText = vi.fn();
+    markSessionNotFresh = vi.fn();
 
-  it('queues a message while running, and edit restores it', async () => {
-    const setErrorText = vi.fn();
-    vi.mocked(aui.useAuiState).mockReturnValue(true); // isRunning = true
-    
-    let composerText = 'my pending text';
-    const composerRuntime = {
-      getState: () => ({ text: composerText, attachments: [] }),
+    // Default useAuiState mock (not running, 0 user messages)
+    vi.mocked(aui.useAuiState).mockImplementation((selector: any) => {
+      const state = { thread: { isRunning: false, messages: [] } };
+      return selector(state);
+    });
+
+    composerRuntime = {
+      getState: () => ({ text: 'hello', attachments: [] }),
       setText: vi.fn(),
       clearAttachments: vi.fn(),
       addAttachment: vi.fn(),
       send: vi.fn(),
       subscribe: vi.fn(() => () => {}),
     };
-    vi.mocked(aui.useAui).mockReturnValue({ composer: composerRuntime } as any);
+    vi.mocked(aui.useAui).mockReturnValue({ 
+      composer: composerRuntime,
+      thread: { getState: () => ({ isRunning: false }) }
+    } as any);
+  });
 
-    render(
-      <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
+  const renderComposer = (isFreshSession: boolean) => {
+    return render(
+      <ChatProvider agentName="foo" sessionId="bar" isFreshSession={isFreshSession} onOpenSubAgent={vi.fn()}>
         <PendingContext.Provider value={{ setErrorText, setStatusText: vi.fn(), statusText: null, errorText: null }}>
-          <MyComposer agentName="foo" sessionId="bar" switchAgentHref="" switchSessionHref="" onSwitchAgent={() => {}} onSwitchSession={() => {}} />
+          <MyComposer 
+            agentName="foo" 
+            sessionId="bar" 
+            isFreshSession={isFreshSession} 
+            markSessionNotFresh={markSessionNotFresh}
+            switchAgentHref="" 
+            switchSessionHref="" 
+            onSwitchAgent={() => {}} 
+            onSwitchSession={() => {}} 
+          />
         </PendingContext.Provider>
       </ChatProvider>
     );
+  };
 
-    // Instead of using form submission, let's just trigger the onSubmit manually or find the form
-    // The Root is an actual ComposerPrimitive.Root, which we didn't mock now.
-    // It should render properly if ChatProvider is there.
-    
+  it('routes fresh session submit via streaming path and marks not fresh', async () => {
+    renderComposer(true);
     const form = document.querySelector('form');
-    expect(form).not.toBeNull();
     fireEvent.submit(form!);
 
-    expect(screen.getByTestId('queued-message')).toBeInTheDocument();
-    expect(screen.getByText('my pending text')).toBeInTheDocument();
-    expect(composerRuntime.setText).toHaveBeenCalledWith('');
-    expect(composerRuntime.clearAttachments).toHaveBeenCalled();
+    expect(composerRuntime.send).toHaveBeenCalled();
+    expect(markSessionNotFresh).toHaveBeenCalledWith('bar');
+    expect(sendPrompt).not.toHaveBeenCalled();
+  });
+
+  it('routes existing session submit via sendPrompt (no second run)', async () => {
+    // This guards the "no duplicate turn" invariant: an out-of-band send must NOT trigger the streaming runAgent path.
+    // The server-side pending_user_prompt behavior is already covered by Rust tests (ag_ui_tests.rs).
+    vi.mocked(sendPrompt).mockResolvedValueOnce({ status: 'enqueued', run_id: '1' });
+    renderComposer(false);
+    const form = document.querySelector('form');
+    fireEvent.submit(form!);
+
     expect(composerRuntime.send).not.toHaveBeenCalled();
-
-    fireEvent.click(screen.getByText('Edit'));
-
-    expect(composerRuntime.setText).toHaveBeenCalledWith('my pending text');
-    expect(screen.queryByTestId('queued-message')).not.toBeInTheDocument();
+    expect(sendPrompt).toHaveBeenCalledWith('foo', 'bar', { text: 'hello', attachmentRefs: [] });
   });
 
-  it('cancel clears the queued message', async () => {
-    const setErrorText = vi.fn();
-    vi.mocked(aui.useAuiState).mockReturnValue(true); // isRunning = true
-    
-    let composerText = 'another pending';
-    const composerRuntime = {
-      getState: () => ({ text: composerText, attachments: [] }),
-      setText: vi.fn(),
-      clearAttachments: vi.fn(),
-      addAttachment: vi.fn(),
-      send: vi.fn(),
-      subscribe: vi.fn(() => () => {}),
-    };
-    vi.mocked(aui.useAui).mockReturnValue({ composer: composerRuntime } as any);
-
-    render(
-      <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
-        <PendingContext.Provider value={{ setErrorText, setStatusText: vi.fn(), statusText: null, errorText: null }}>
-          <MyComposer agentName="foo" sessionId="bar" switchAgentHref="" switchSessionHref="" onSwitchAgent={() => {}} onSwitchSession={() => {}} />
-        </PendingContext.Provider>
-      </ChatProvider>
-    );
-
+  it('routes message #2 via sendPrompt after fresh session flag is cleared', async () => {
+    const { rerender } = renderComposer(true);
     const form = document.querySelector('form');
     fireEvent.submit(form!);
+    expect(composerRuntime.send).toHaveBeenCalled();
+    expect(markSessionNotFresh).toHaveBeenCalledWith('bar');
+    vi.mocked(composerRuntime.send).mockClear();
 
-    expect(screen.getByTestId('queued-message')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByText('Cancel'));
-
-    expect(screen.queryByTestId('queued-message')).not.toBeInTheDocument();
-  });
-
-  it('auto-flushes queued message when run finishes (isRunning goes false)', async () => {
-    const setErrorText = vi.fn();
-    // Start with isRunning = true
-    let isRunning = true;
-    vi.mocked(aui.useAuiState).mockImplementation(() => isRunning);
-    
-    let composerText = 'auto flush text';
-    const composerRuntime = {
-      getState: () => ({ text: composerText, attachments: [] }),
-      setText: vi.fn(),
-      clearAttachments: vi.fn(),
-      addAttachment: vi.fn(),
-      send: vi.fn(),
-      subscribe: vi.fn(() => () => {}),
-    };
-    vi.mocked(aui.useAui).mockReturnValue({ composer: composerRuntime } as any);
-
-    const { rerender } = render(
-      <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
-        <PendingContext.Provider value={{ setErrorText, setStatusText: vi.fn(), statusText: null, errorText: null }}>
-          <MyComposer agentName="foo" sessionId="bar" switchAgentHref="" switchSessionHref="" onSwitchAgent={() => {}} onSwitchSession={() => {}} />
-        </PendingContext.Provider>
-      </ChatProvider>
-    );
-
-    const form = document.querySelector('form');
-    fireEvent.submit(form!);
-
-    expect(screen.getByTestId('queued-message')).toBeInTheDocument();
-    
-    // Simulate run finishing
-    isRunning = false;
+    // Rerender as existing session
     rerender(
       <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
         <PendingContext.Provider value={{ setErrorText, setStatusText: vi.fn(), statusText: null, errorText: null }}>
-          <MyComposer agentName="foo" sessionId="bar" switchAgentHref="" switchSessionHref="" onSwitchAgent={() => {}} onSwitchSession={() => {}} />
+          <MyComposer 
+            agentName="foo" 
+            sessionId="bar" 
+            isFreshSession={false} 
+            markSessionNotFresh={markSessionNotFresh}
+            switchAgentHref="" 
+            switchSessionHref="" 
+            onSwitchAgent={() => {}} 
+            onSwitchSession={() => {}} 
+          />
         </PendingContext.Provider>
       </ChatProvider>
     );
 
-    expect(composerRuntime.setText).toHaveBeenCalledWith('auto flush text');
-    expect(composerRuntime.send).toHaveBeenCalled();
-    expect(screen.queryByTestId('queued-message')).not.toBeInTheDocument();
+    fireEvent.submit(form!);
+    expect(composerRuntime.send).not.toHaveBeenCalled();
+    expect(sendPrompt).toHaveBeenCalled();
   });
 
-  it('queues attachments, edit restores them, and auto-flush re-attaches them', async () => {
-    const setErrorText = vi.fn();
-    let isRunning = true;
-    vi.mocked(aui.useAuiState).mockImplementation(() => isRunning);
-    
-    const mockFile1 = new File([''], 'file1.png');
-    const mockFile2 = new File([''], 'file2.png');
-    const mockAttachments = [
-      { status: { type: 'complete' }, file: mockFile1 },
-      { status: { type: 'complete' }, file: mockFile2 }
-    ];
-    
-    let composerText = 'text with attachments';
-    const composerRuntime = {
-      getState: () => ({ text: composerText, attachments: mockAttachments }),
-      setText: vi.fn(),
-      clearAttachments: vi.fn(),
-      addAttachment: vi.fn(),
-      send: vi.fn(),
-      subscribe: vi.fn(() => () => {}),
-    };
-    vi.mocked(aui.useAui).mockReturnValue({ composer: composerRuntime } as any);
+  it('shows busy state on submit, blocks second submit, and clears when message lands', async () => {
+    let resolveSendPrompt: (value: any) => void;
+    vi.mocked(sendPrompt).mockReturnValue(new Promise(resolve => {
+      resolveSendPrompt = resolve;
+    }));
 
-    const { rerender } = render(
-      <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
-        <PendingContext.Provider value={{ setErrorText, setStatusText: vi.fn(), statusText: null, errorText: null }}>
-          <MyComposer agentName="foo" sessionId="bar" switchAgentHref="" switchSessionHref="" onSwitchAgent={() => {}} onSwitchSession={() => {}} />
-        </PendingContext.Provider>
-      </ChatProvider>
-    );
+    let userMessages = 0;
+    vi.mocked(aui.useAuiState).mockImplementation((selector: any) => {
+      const state = { thread: { isRunning: false, messages: Array(userMessages).fill({ role: 'user' }) } };
+      return selector(state);
+    });
 
+    const { rerender } = renderComposer(false);
     const form = document.querySelector('form');
-    fireEvent.submit(form!);
-
-    // Queued banner should show attachment count
-    expect(screen.getByTestId('queued-message')).toBeInTheDocument();
-    expect(screen.getByText('[2 attachments]')).toBeInTheDocument();
-
-    // Edit restores them
-    fireEvent.click(screen.getByText('Edit'));
-    expect(composerRuntime.addAttachment).toHaveBeenCalledTimes(2);
-    expect(composerRuntime.addAttachment).toHaveBeenCalledWith(mockFile1);
-    expect(composerRuntime.addAttachment).toHaveBeenCalledWith(mockFile2);
     
-    // Re-queue the message to test flush
+    // First submit
     fireEvent.submit(form!);
-    expect(screen.getByTestId('queued-message')).toBeInTheDocument();
     
-    // Clear mock calls to distinguish from Edit
-    vi.mocked(composerRuntime.addAttachment).mockClear();
-
-    // Flush on idle
-    isRunning = false;
+    // Composer disabled
+    expect(screen.getByRole('textbox')).toBeDisabled();
+    expect(document.querySelector('.aui-spinner')).toBeInTheDocument();
+    
+    // Try second submit
+    fireEvent.submit(form!);
+    expect(sendPrompt).toHaveBeenCalledTimes(1);
+    
+    // Resolve RPC
+    resolveSendPrompt!({ status: 'enqueued', run_id: '1' });
+    
+    // Still sending because user message count hasn't increased
     rerender(
       <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
         <PendingContext.Provider value={{ setErrorText, setStatusText: vi.fn(), statusText: null, errorText: null }}>
-          <MyComposer agentName="foo" sessionId="bar" switchAgentHref="" switchSessionHref="" onSwitchAgent={() => {}} onSwitchSession={() => {}} />
+          <MyComposer 
+            agentName="foo" 
+            sessionId="bar" 
+            isFreshSession={false} 
+            markSessionNotFresh={markSessionNotFresh}
+            switchAgentHref="" 
+            switchSessionHref="" 
+            onSwitchAgent={() => {}} 
+            onSwitchSession={() => {}} 
+          />
+        </PendingContext.Provider>
+      </ChatProvider>
+    );
+    expect(screen.getByRole('textbox')).toBeDisabled();
+
+    // Simulate message landing in transcript
+    userMessages = 1;
+    rerender(
+      <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
+        <PendingContext.Provider value={{ setErrorText, setStatusText: vi.fn(), statusText: null, errorText: null }}>
+          <MyComposer 
+            agentName="foo" 
+            sessionId="bar" 
+            isFreshSession={false} 
+            markSessionNotFresh={markSessionNotFresh}
+            switchAgentHref="" 
+            switchSessionHref="" 
+            onSwitchAgent={() => {}} 
+            onSwitchSession={() => {}} 
+          />
         </PendingContext.Provider>
       </ChatProvider>
     );
 
-    expect(composerRuntime.addAttachment).toHaveBeenCalledTimes(2);
-    expect(composerRuntime.addAttachment).toHaveBeenCalledWith(mockFile1);
-    expect(composerRuntime.send).toHaveBeenCalled();
+    // No longer sending
+    expect(screen.getByRole('textbox')).not.toBeDisabled();
+    expect(document.querySelector('.aui-spinner')).not.toBeInTheDocument();
+  });
+
+  it('restores input text and attachments on sendPrompt error', async () => {
+    vi.mocked(uploadAttachment).mockResolvedValueOnce(['cid:file.png']);
+    vi.mocked(sendPrompt).mockRejectedValueOnce(new Error('RPC boom'));
+    
+    const file = new File([''], 'file.png');
+    composerRuntime.getState = () => ({ text: 'my draft', attachments: [{ status: { type: 'running' }, file }] });
+
+    renderComposer(false);
+    const form = document.querySelector('form');
+    fireEvent.submit(form!);
+
+    await waitFor(() => {
+      expect(setErrorText).toHaveBeenCalledWith('RPC boom');
+    });
+
+    expect(composerRuntime.setText).toHaveBeenCalledWith('my draft');
+    expect(composerRuntime.addAttachment).toHaveBeenCalledWith(file);
+    // Re-enables input
+    expect(screen.getByRole('textbox')).not.toBeDisabled();
+  });
+
+  it('uploads attachments on existing-session submit', async () => {
+    vi.mocked(sendPrompt).mockResolvedValueOnce({ status: 'enqueued', run_id: '1' });
+    vi.mocked(uploadAttachment).mockResolvedValueOnce(['cid:file1']);
+    
+    const file = new File([''], 'test.png');
+    composerRuntime.getState = () => ({ 
+      text: 'hello', 
+      attachments: [{ status: { type: 'running' }, file, type: 'image' }] 
+    });
+
+    renderComposer(false);
+    const form = document.querySelector('form');
+    fireEvent.submit(form!);
+
+    await waitFor(() => {
+      expect(uploadAttachment).toHaveBeenCalledWith('foo', 'bar', file);
+    });
+
+    expect(sendPrompt).toHaveBeenCalledWith('foo', 'bar', { 
+      text: 'hello', 
+      attachmentRefs: ['cid:file1'] 
+    });
   });
 });

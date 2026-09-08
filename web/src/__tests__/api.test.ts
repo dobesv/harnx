@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { listAgents, listSessions, createSession, getAgent, cancel, uploadAttachment } from '../api';
+import { listAgents, listSessions, createSession, getAgent, cancel, uploadAttachment, sendPrompt } from '../api';
 
 const fetchMock = vi.fn();
 globalThis.fetch = fetchMock as any;
@@ -166,4 +166,65 @@ describe('api.ts', () => {
     });
   });
 
-});
+
+  describe('sendPrompt', () => {
+    it('resolves on success and formats envelope correctly without attachments', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ result: { status: 'accepted', run_id: 'r1' } }),
+      });
+      const result = await sendPrompt('agent1', 'session1', { text: 'hello' });
+      expect(result).toEqual({ status: 'accepted', run_id: 'r1' });
+      
+      const callArgs = fetchMock.mock.calls[0];
+      expect(callArgs[0]).toBe('/v1/agents/agent1/sessions/session1');
+      expect(callArgs[1].method).toBe('POST');
+      expect(callArgs[1].headers).toEqual({ 'Content-Type': 'application/json' });
+      expect(JSON.parse(callArgs[1].body)).toEqual({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/prompt',
+        params: {
+          text: 'hello',
+          attachment_refs: []
+        }
+      });
+    });
+
+    it('formats envelope correctly with attachments', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ result: { status: 'enqueued', run_id: 'r2' } }),
+      });
+      const result = await sendPrompt('agent1', 'session1', { text: 'hello', attachmentRefs: ['cid:x', 'cid:y'] });
+      expect(result).toEqual({ status: 'enqueued', run_id: 'r2' });
+      
+      const callArgs = fetchMock.mock.calls[0];
+      expect(JSON.parse(callArgs[1].body)).toEqual({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/prompt',
+        params: {
+          text: 'hello',
+          attachment_refs: ['cid:x', 'cid:y']
+        }
+      });
+    });
+
+    it('throws on JSON-RPC error', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ error: { code: -32600, message: 'Invalid request' } }),
+      });
+      await expect(sendPrompt('agent1', 'session1', { text: 'hi' })).rejects.toThrow('RPC Error: Invalid request');
+    });
+
+    it('throws on HTTP failure with no JSON-RPC error body', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: false,
+        status: 500,
+        json: async () => { throw new Error('no body'); },
+      });
+      await expect(sendPrompt('agent', 'session', { text: 'hi' })).rejects.toThrow('RPC call failed with HTTP 500');
+    });
+  });});

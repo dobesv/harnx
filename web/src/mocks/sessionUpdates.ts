@@ -24,11 +24,42 @@ export function additionalSnapshot(session: string): any[] {
   return snapshots.get(session) ?? [];
 }
 
-function persistExchange(session: string, userText: string, reply: string) {
+export function persistExchange(session: string, userText: string, reply: string) {
   const persisted = additionalSnapshot(session);
   persisted.push(
     { id: `mock-user-${messageId++}`, role: 'user', content: userText },
     { id: `mock-assistant-${messageId++}`, role: 'assistant', content: reply },
+  );
+  snapshots.set(session, persisted);
+  notify(session);
+  channel?.postMessage({ session, messages: persisted });
+}
+
+
+export function persistToolExchange(session: string, userText: string) {
+  const persisted = additionalSnapshot(session);
+  persisted.push(
+    { id: `mock-user-${messageId++}`, role: 'user', content: userText },
+    {
+      id: `assistant-${messageId++}`,
+      role: 'assistant',
+      content: '',
+      toolCalls: [{
+        id: 'call_123',
+        type: 'function',
+        call_type: 'function',
+        function: {
+          name: 'fetch_data',
+          arguments: '{"query": "example", "limit": 10}',
+        },
+      }],
+    },
+    {
+      id: `tool-result-${messageId++}`,
+      role: 'tool',
+      toolCallId: 'call_123',
+      content: '{"data": "mock_data", "status": 200}',
+    },
   );
   snapshots.set(session, persisted);
   notify(session);
