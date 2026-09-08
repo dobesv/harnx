@@ -2598,6 +2598,9 @@ mod tests {
             "You are the source agent.",
         );
         sandbox.write_agent("target-agent", "You are the target agent.");
+        if !crate::test_support::ensure_test_nats().await {
+            return;
+        }
 
         // Track invocations per agent
         let source_count = Arc::new(AtomicUsize::new(0));
@@ -2624,10 +2627,7 @@ mod tests {
                         None,
                         vec![ToolCall::new(
                             "target-agent_session_handoff".to_string(),
-                            json!({
-                                "prompt": "delegated work",
-                                "session_id": "handoff-target-session"
-                            }),
+                            json!({ "prompt": "delegated work" }),
                             Some("handoff-call-1".to_string()),
                             None,
                         )],
@@ -2659,9 +2659,7 @@ mod tests {
             other => panic!("expected Accepted, got {other:?}"),
         };
 
-        // Track whether we saw session_handoff event
-        let saw_handoff_event = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let saw_handoff_event_clone = saw_handoff_event.clone();
+        let mut handoff_session_id = None;
 
         // Wait for source run to finish (RUN_FINISHED) and observe handoff event
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -2674,13 +2672,8 @@ mod tests {
                         }
                     }
                     Event::Custom(event) if event.name == "session_handoff" => {
-                        // Verify the handoff event payload
                         assert_eq!(event.value["agent"].as_str(), Some("target-agent"));
-                        assert_eq!(
-                            event.value["session_id"].as_str(),
-                            Some("handoff-target-session")
-                        );
-                        saw_handoff_event_clone.store(true, Ordering::SeqCst);
+                        handoff_session_id = event.value["session_id"].as_str().map(str::to_string);
                     }
                     _ => {}
                 }
@@ -2696,25 +2689,16 @@ mod tests {
             "source agent should be invoked once"
         );
 
-        // Verify session_handoff event was emitted
+        let handoff_session_id =
+            handoff_session_id.expect("session_handoff event should be emitted");
+        assert_eq!(handoff_session_id.len(), 6);
         assert!(
-            saw_handoff_event.load(Ordering::SeqCst),
-            "session_handoff event should be emitted"
+            harnx_runtime::utils::session_name::decode_timestamp_session_id(&handoff_session_id)
+                .is_some(),
+            "handoff without an explicit session ID should reserve a short ID"
         );
 
-        // Verify target actor was actually invoked - poll with timeout
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let count = target_count.load(Ordering::SeqCst);
-                if count >= 1 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("timed out waiting for target agent to run");
-
+        assert_persisted_user_message("target-agent", &handoff_session_id, "delegated work").await;
         assert_eq!(
             target_count.load(Ordering::SeqCst),
             1,
@@ -2723,7 +2707,7 @@ mod tests {
 
         // Verify the target actor was registered (created by handoff)
         assert!(
-            registry.has_session(&key("target-agent", "handoff-target-session")),
+            registry.has_session(&key("target-agent", &handoff_session_id)),
             "target session should be registered in registry after handoff dispatch"
         );
     }

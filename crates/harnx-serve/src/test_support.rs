@@ -129,6 +129,18 @@ pub struct NatsSessionSeed<'a> {
     pub messages: &'a [harnx_core::message::Message],
 }
 
+/// Return whether the optional NATS test dependency is available.
+pub async fn ensure_test_nats() -> bool {
+    if let Err(error) = crate::ensure_frontend_nats_owner().await {
+        if error.to_string().contains("nats-server binary not found") {
+            eprintln!("skipping NATS-backed harnx-serve test: {error}");
+            return false;
+        }
+        panic!("local NATS owner: {error:#}");
+    }
+    true
+}
+
 /// Seed the local NATS store with a complete session for control-plane tests.
 ///
 /// Returns `false` when the optional `nats-server` test dependency is not
@@ -143,12 +155,8 @@ pub async fn seed_nats_session(config: &Config, seed: NatsSessionSeed<'_>) -> bo
         SessionInitializer,
     };
 
-    if let Err(error) = crate::ensure_frontend_nats_owner().await {
-        if error.to_string().contains("nats-server binary not found") {
-            eprintln!("skipping NATS-backed harnx-serve test: {error}");
-            return false;
-        }
-        panic!("local NATS owner: {error:#}");
+    if !ensure_test_nats().await {
+        return false;
     }
     let mut scoped = config.clone();
     scoped.use_agent_by_name(seed.agent).expect("seed agent");

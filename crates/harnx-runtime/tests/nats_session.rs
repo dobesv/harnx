@@ -55,6 +55,13 @@ fn resumed_session_config(session_id: String) -> NatsSessionConfig {
     }
 }
 
+fn new_session_config() -> NatsSessionConfig {
+    NatsSessionConfig {
+        session_id: None,
+        ..resumed_session_config(String::new())
+    }
+}
+
 async fn append_new_reply_after_current_turn_user(
     log: NatsSessionLog,
     client: async_nats::Client,
@@ -119,6 +126,32 @@ struct NoopEventSink;
 
 impl AgentEventSink for NoopEventSink {
     fn emit(&self, _event: AgentEvent) {}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_nats_session_reserves_short_session_id() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: nats-server not available");
+        return Ok(());
+    };
+
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session = NatsSession::new(
+        new_session_config(),
+        client,
+        jetstream,
+        harnx_runtime::utils::create_abort_signal(),
+    )
+    .await?;
+
+    assert_eq!(session.session_id().len(), 6);
+    assert!(
+        harnx_runtime::utils::session_name::decode_timestamp_session_id(session.session_id())
+            .is_some()
+    );
+    Ok(())
 }
 
 /// Test that control commands are sent correctly
