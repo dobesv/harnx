@@ -81,6 +81,7 @@ impl RedactedSessionMetadata {
         let repository_contexts = (!repository_contexts.is_empty()).then_some(repository_contexts);
         let mut extensions = record.metadata.extensions;
         extensions.remove(harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE);
+        extensions.remove(super::TOOL_CONTEXT_NAMESPACE);
         Self {
             schema_version: record.metadata.schema_version,
             session_id: record.metadata.session_id,

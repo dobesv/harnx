@@ -1,4 +1,4 @@
-use super::{SessionAgentSource, SessionOverrides};
+use super::{SessionAgentSource, SessionOverrides, ToolContext};
 use anyhow::Result;
 use harnx_core::agent_config::AgentVariables;
 
@@ -7,6 +7,7 @@ pub struct SessionInitializer {
     pub agent: SessionAgentSource,
     pub variables: AgentVariables,
     pub overrides: SessionOverrides,
+    pub tool_context: ToolContext,
 }
 
 impl SessionInitializer {
@@ -15,6 +16,7 @@ impl SessionInitializer {
             agent: SessionAgentSource::Named { name: name.into() },
             variables,
             overrides: SessionOverrides::default(),
+            tool_context: ToolContext::default(),
         }
     }
 
@@ -29,7 +31,14 @@ impl SessionInitializer {
             },
             variables,
             overrides,
+            tool_context: ToolContext::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_tool_context(mut self, tool_context: ToolContext) -> Self {
+        self.tool_context = tool_context;
+        self
     }
 
     pub fn agent_name(&self) -> Option<&str> {

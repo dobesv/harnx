@@ -32,6 +32,47 @@ fn metadata_round_trip_preserves_identity_and_private_values() {
 }
 
 #[test]
+fn initializer_persists_a_private_tool_context_snapshot() {
+    let mut context = ToolContext::default();
+    context.values.insert(
+        "sandbox".to_string(),
+        serde_json::json!({"sandbox_id": "sandbox-1"}),
+    );
+    let value = SessionMetadata::new(
+        "session-context",
+        SessionInitializer::named("metis", AgentVariables::default())
+            .with_tool_context(context.clone()),
+    );
+    assert_eq!(tool_context(&value).unwrap(), context);
+
+    let redacted = RedactedSessionMetadata::new(
+        MetadataRecord {
+            metadata: value,
+            revision: 1,
+        },
+        None,
+    );
+    assert!(!serde_json::to_string(&redacted)
+        .unwrap()
+        .contains(TOOL_CONTEXT_NAMESPACE));
+}
+
+#[test]
+fn metadata_rejects_an_unknown_private_tool_context_version() {
+    let mut value = metadata();
+    value.extensions.insert(
+        TOOL_CONTEXT_NAMESPACE.to_string(),
+        serde_json::json!({"version": TOOL_CONTEXT_VERSION + 1, "values": {}}),
+    );
+
+    assert!(value
+        .validate(&value.session_id)
+        .unwrap_err()
+        .to_string()
+        .contains("unsupported tool context version"));
+}
+
+#[test]
 fn metadata_rejects_identity_and_extension_size_violations() {
     let value = metadata();
     assert!(value.validate("different").is_err());

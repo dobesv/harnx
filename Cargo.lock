@@ -3837,6 +3837,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-k8s-sandbox-tools"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "axum",
+ "chrono",
+ "clap",
+ "harnx-bash-tools",
+ "harnx-core",
+ "harnx-fs-tools",
+ "harnx-healthz",
+ "harnx-metrics",
+ "harnx-nats-common",
+ "harnx-runtime",
+ "harnx-telemetry",
+ "harnx-toolset",
+ "harnx-toolset-server",
+ "http 1.5.0",
+ "http-body-util",
+ "k8s-openapi",
+ "kube",
+ "log",
+ "metrics",
+ "parking_lot",
+ "reqwest",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "shell-words",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "which",
+]
+
+[[package]]
 name = "harnx-mcp-bridge"
 version = "0.33.4"
 dependencies = [
