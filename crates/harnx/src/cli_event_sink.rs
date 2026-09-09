@@ -422,23 +422,20 @@ impl CliSinkState {
             ModelEvent::MessageChunk { blocks } | ModelEvent::ThoughtChunk { blocks } => {
                 self.print_content_blocks(blocks);
             }
-            ModelEvent::Final { output, .. } => {
+            ModelEvent::Final { output, usage } => {
                 if !output.is_empty() {
                     eprintln!("{output}");
                 }
                 self.cleanup_or_warn();
+                if !usage.is_empty() {
+                    eprintln!("Usage: {usage}");
+                }
             }
             ModelEvent::Error(error) => {
                 self.cleanup_or_warn();
                 eprintln!("{}", warning_text(&format!("LLM error: {error}")));
             }
-            ModelEvent::Usage {
-                input,
-                output,
-                cached,
-                cache_write: _,
-                session_label: _,
-            } => print_usage(input, output, cached),
+            ModelEvent::Usage { .. } => {}
         }
     }
 
@@ -538,21 +535,6 @@ impl AgentEventSink for CliAgentEventSink {
     }
 }
 
-fn print_usage(input: u64, output: u64, cached: u64) {
-    if input == 0 && output == 0 && cached == 0 {
-        return;
-    }
-    let cached_suffix = if cached > 0 {
-        format!(" (cached {cached})")
-    } else {
-        String::new()
-    };
-    eprintln!(
-        "{}",
-        dimmed_text(&format!("[tokens] in={input} out={output}{cached_suffix}"))
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Module-private helpers for line-buffered markdown streaming.
 
@@ -581,12 +563,101 @@ mod tests {
         }
     }
 
-    // The sink writes to stdout (Info notices, streaming chunks) and stderr
-    // (Warning/Error notices, status lines), which is hard to capture in a
-    // unit test without subprocess machinery. We verify here only that
-    // `emit` doesn't panic for a representative sample of event variants —
-    // the behavioral verification (events arrive in the right order) lives
-    // in the integration test at `tests/engine_smoke.rs`.
+    #[cfg(unix)]
+    fn capture_output(action: impl FnOnce()) -> String {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::fd::AsRawFd;
+
+        struct RedirectGuard {
+            stdout: i32,
+            stderr: i32,
+        }
+
+        impl Drop for RedirectGuard {
+            fn drop(&mut self) {
+                // SAFETY: Restores the saved stdout/stderr file descriptors and closes the temp copies.
+                // Sound because nextest runs each test in an isolated process, so there's no concurrent
+                // FD access, and this is the only code touching these descriptors.
+                unsafe {
+                    libc::dup2(self.stdout, libc::STDOUT_FILENO);
+                    libc::dup2(self.stderr, libc::STDERR_FILENO);
+                    libc::close(self.stdout);
+                    libc::close(self.stderr);
+                }
+            }
+        }
+
+        stdout().flush().unwrap();
+        std::io::stderr().flush().unwrap();
+        let mut captured = tempfile::tempfile().unwrap();
+        // SAFETY: Duplicates stdout/stderr FDs to preserve them for later restoration.
+        // Sound because nextest runs each test in an isolated process, so no concurrent FD access.
+        let saved_stdout = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        let saved_stderr = unsafe { libc::dup(libc::STDERR_FILENO) };
+        assert!(saved_stdout >= 0 && saved_stderr >= 0);
+        // SAFETY: Redirects stdout/stderr to the temp file for capture. Sound for the same reason:
+        // process-isolated tests mean no other code is touching these FDs concurrently.
+        assert_eq!(
+            unsafe { libc::dup2(captured.as_raw_fd(), libc::STDOUT_FILENO) },
+            libc::STDOUT_FILENO
+        );
+        assert_eq!(
+            unsafe { libc::dup2(captured.as_raw_fd(), libc::STDERR_FILENO) },
+            libc::STDERR_FILENO
+        );
+        let guard = RedirectGuard {
+            stdout: saved_stdout,
+            stderr: saved_stderr,
+        };
+
+        action();
+        stdout().flush().unwrap();
+        std::io::stderr().flush().unwrap();
+        drop(guard);
+
+        captured.seek(SeekFrom::Start(0)).unwrap();
+        let mut output = String::new();
+        captured.read_to_string(&mut output).unwrap();
+        output
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_usage_is_standalone_and_per_call_usage_is_silent() {
+        let usage = harnx_core::api_types::CompletionTokenUsage {
+            input_tokens: 12,
+            output_tokens: 3,
+            cached_tokens: 2,
+            cache_write_tokens: 1,
+        };
+        let output = capture_output(|| {
+            let mut state = make_state(false);
+            state.handle_markdown_chunk("streamed text").unwrap();
+            state.print_model_event(ModelEvent::Usage {
+                input: 4,
+                output: 1,
+                cached: 2,
+                cache_write: 0,
+                session_label: None,
+            });
+            state.print_model_event(ModelEvent::Final {
+                output: String::new(),
+                usage,
+            });
+        });
+
+        assert!(output.contains("streamed text\nUsage: 📥 12  📤 3  💾 2\n"));
+        assert!(!output.contains("[tokens]"));
+
+        let empty_output = capture_output(|| {
+            make_state(false).print_model_event(ModelEvent::Final {
+                output: String::new(),
+                usage: Default::default(),
+            });
+        });
+        assert!(!empty_output.contains("Usage:"));
+        assert!(!empty_output.contains("[tokens]"));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn emit_handles_each_top_level_variant_without_panic() {

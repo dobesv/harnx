@@ -1503,16 +1503,6 @@ async fn structured_ui_output_variants_render_in_transcript() {
     )))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
-        AgentSource {
-            agent: "argus".to_string(),
-            session_id: Some("session-1".to_string()),
-            model: None,
-        },
-        usage_event!(12, 34, 5, Some("> argus ▸ session-1")),
-    )))
-    .await
-    .unwrap();
     tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
         id: String::new(),
         name: "bash".to_string(),
@@ -1553,7 +1543,6 @@ async fn structured_ui_output_variants_render_in_transcript() {
     assert!(system_entries.contains(&"-> argus_session_prompt completed".to_string()));
     assert!(system_entries.contains(&"Plan:".to_string()));
     assert!(system_entries.contains(&"  [in_progress] Refactor sub-agent formatting".to_string()));
-    assert!(system_entries.contains(&"> argus ▸ session-1   in 12   out 34   cache 5".to_string()));
     assert!(system_entries.contains(&"→ bash".to_string()));
     assert!(system_entries.contains(&"command: ls".to_string()));
     assert!(system_entries.contains(&"line one".to_string()));
@@ -1561,7 +1550,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
 }
 
 #[tokio::test]
-async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
+async fn nested_subagent_tool_call_renders_with_heading() {
     let config = test_config();
     let mut tui = Tui::init(&config).await.unwrap();
 
@@ -1594,17 +1583,6 @@ async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
     .await
     .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
-        AgentSource {
-            agent: "pytheas".to_string(),
-            session_id: Some("session-nested".to_string()),
-            model: None,
-        },
-        usage_event!(10, 20, 0, Some("> pytheas ▸ session-nested")),
-    )))
-    .await
-    .unwrap();
-
     let rendered: Vec<_> = tui
         .app
         .transcript
@@ -1624,72 +1602,6 @@ async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
     assert!(rendered.contains(&"> pytheas ▸ session-nested".to_string()));
     assert!(rendered.contains(&"→ bash".to_string()));
     assert!(rendered.contains(&"command: ls -1 /tmp | wc -l".to_string()));
-    assert!(
-        rendered.contains(&"> pytheas ▸ session-nested   in 10   out 20".to_string()),
-        "rendered transcript missing nested usage line: {rendered:?}"
-    );
-}
-
-#[tokio::test]
-async fn consecutive_usage_updates_replace_previous_usage_row_for_same_source() {
-    let config = test_config();
-    let mut tui = Tui::init(&config).await.unwrap();
-
-    let source = AgentSource {
-        agent: "pytheas".to_string(),
-        session_id: Some("session-1".to_string()),
-        model: None,
-    };
-
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
-        source.clone(),
-        usage_event!(10, 1, 0, None),
-    )))
-    .await
-    .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
-        source.clone(),
-        usage_event!(20, 2, 0, None),
-    )))
-    .await
-    .unwrap();
-
-    let system_entries: Vec<_> = tui
-        .app
-        .transcript
-        .iter()
-        .flat_map(|entry| render_entry_lines(entry, true, false, false))
-        .filter_map(|line| {
-            let text = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            (!text.is_empty()).then_some(text)
-        })
-        .collect();
-
-    assert_eq!(
-        system_entries
-            .iter()
-            .filter(|line| **line == "> pytheas ▸ session-1")
-            .count(),
-        1
-    );
-    assert_eq!(
-        system_entries
-            .iter()
-            .filter(|line| **line == "> pytheas ▸ session-1   in 10   out 1")
-            .count(),
-        0
-    );
-    assert_eq!(
-        system_entries
-            .iter()
-            .filter(|line| **line == "> pytheas ▸ session-1   in 20   out 2")
-            .count(),
-        1
-    );
 }
 
 #[tokio::test]
@@ -8127,12 +8039,6 @@ async fn render_agent_event_compacting_completed_reconciles_live_transcript() {
         },
     ];
     tui.app.streaming_open = true;
-    tui.app.last_usage_transcript_idx = Some(2);
-    tui.app.last_usage_source = Some(AgentSource {
-        agent: "primary".to_string(),
-        session_id: None,
-        model: None,
-    });
     tui.app.transcript_focus = Some(99);
     tui.app.transcript_selection_anchor = Some(88);
 
@@ -8226,8 +8132,6 @@ async fn render_agent_event_compacting_completed_reconciles_live_transcript() {
     ));
     assert!(tui.app.transcript[marker_idx].is_navigable());
     assert!(!tui.app.streaming_open);
-    assert_eq!(tui.app.last_usage_transcript_idx, None);
-    assert_eq!(tui.app.last_usage_source, None);
     assert_eq!(tui.app.transcript_focus, None);
     assert_eq!(tui.app.transcript_selection_anchor, None);
 }

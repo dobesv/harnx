@@ -876,7 +876,6 @@ impl Tui {
             return;
         }
         let is_thought = matches!(&event, AgentEvent::Model(ModelEvent::ThoughtChunk { .. }));
-        let is_usage = matches!(&event, AgentEvent::Model(ModelEvent::Usage { .. }));
         // No streaming-run bookkeeping is needed here: any event that renders a
         // visible transcript item (tool call, tool result, notice, plan, …)
         // becomes the trailing item, which ends the open streaming run on its
@@ -937,7 +936,7 @@ impl Tui {
         if !is_thought {
             self.flush_pending_thought();
         }
-        self.render_ui_output_heading(source.as_ref(), is_usage);
+        self.render_ui_output_heading(source.as_ref());
 
         let rendered_entries = match event {
             AgentEvent::Notice(NoticeEvent::Info(text)) => {
@@ -1032,9 +1031,6 @@ impl Tui {
                 }
             }
             AgentEvent::Plan { entries } => vec![TranscriptItem::Plan(entries)],
-            AgentEvent::Model(event @ ModelEvent::Usage { .. }) => {
-                self.render_usage_event(source.as_ref(), event)
-            }
             AgentEvent::Tool(ToolEvent::Started {
                 name,
                 markdown,
@@ -1094,7 +1090,6 @@ impl Tui {
                 // source. Without this, the first post-compaction message would
                 // render without an agent label.
                 self.app.last_ui_output_source = None;
-                self.clear_usage_tracking();
                 // The transcript is entirely rebuilt, so any prior focus/anchor
                 // indices reference now-different items even when still in
                 // bounds. Clear selection/detail state unconditionally.
@@ -1121,16 +1116,9 @@ impl Tui {
         };
 
         if !rendered_entries.is_empty() {
-            let start_idx = self.app.transcript.len();
             self.app.transcript.extend(rendered_entries);
-            if is_usage {
-                self.app.last_usage_source = source.clone();
-                self.app.last_usage_transcript_idx = Some(start_idx);
-            } else {
-                self.clear_usage_tracking();
-            }
             self.pin_transcript_to_bottom();
-        } else if is_thought || is_usage {
+        } else if is_thought {
             self.pin_transcript_to_bottom();
         }
     }
@@ -1260,11 +1248,7 @@ impl Tui {
         self.pin_transcript_to_bottom();
     }
 
-    pub(super) fn render_ui_output_heading(
-        &mut self,
-        source: Option<&AgentSource>,
-        is_usage: bool,
-    ) {
+    pub(super) fn render_ui_output_heading(&mut self, source: Option<&AgentSource>) {
         let source = source.cloned();
         if source != self.app.last_ui_output_source {
             if let Some(source) = &source {
@@ -1283,41 +1267,6 @@ impl Tui {
             // producing a single run-on paragraph that mixes content from
             // multiple agents on the top-level row.
             self.app.streaming_open = false;
-        }
-        if !is_usage {
-            self.clear_usage_tracking();
-        }
-    }
-
-    fn clear_usage_tracking(&mut self) {
-        self.app.last_usage_source = None;
-        self.app.last_usage_transcript_idx = None;
-    }
-
-    pub(super) fn update_existing_usage_line(
-        &mut self,
-        source: Option<&AgentSource>,
-        line: &str,
-    ) -> bool {
-        if self.app.last_usage_source.as_ref() != source {
-            return false;
-        }
-        let Some(idx) = self.app.last_usage_transcript_idx else {
-            return false;
-        };
-        let Some(entry) = self.app.transcript.get_mut(idx) else {
-            self.clear_usage_tracking();
-            return false;
-        };
-        match entry {
-            TranscriptItem::UsageLine(existing) => {
-                *existing = line.to_string();
-                true
-            }
-            _ => {
-                self.clear_usage_tracking();
-                false
-            }
         }
     }
 

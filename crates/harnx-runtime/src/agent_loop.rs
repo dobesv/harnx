@@ -864,6 +864,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
     let mut resume_count: u32 = ctx.initial_resume_count;
     let mut with_embeddings = ctx.initial_with_embeddings;
     let mut emitted_text_turns: u32 = 0;
+    let mut turn_usage = CompletionTokenUsage::default();
 
     loop {
         if input.is_empty() {
@@ -898,6 +899,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
                 .await;
             }
         };
+        turn_usage.accumulate(&usage);
 
         let tool_results = complete_model_turn(
             ctx,
@@ -972,7 +974,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
             ResumeAction::None => {}
         }
 
-        emit_final_text_response(ctx, output, usage).await;
+        emit_final_text_response(ctx, output, turn_usage).await;
 
         // Done.
         break;
@@ -1118,6 +1120,151 @@ mod tests {
         config.session = Some(session);
         Arc::new(RwLock::new(config))
     }
+
+    fn usage(input: u64, output: u64, cached: u64, cache_write: u64) -> CompletionTokenUsage {
+        CompletionTokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: cached,
+            cache_write_tokens: cache_write,
+        }
+    }
+
+    fn final_usages(sink: &CollectingSink) -> Vec<CompletionTokenUsage> {
+        sink.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(event, source)| match (event, source) {
+                (AgentEvent::Model(harnx_core::event::ModelEvent::Final { usage, .. }), None) => {
+                    Some(usage.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn no_op_tool_round() -> OnToolRoundFn {
+        Arc::new(|_, _| Box::pin(async { Ok(()) }))
+    }
+
+    #[tokio::test]
+    async fn final_usage_sums_every_completion_in_tool_loop() {
+        let _sink_guard = SINK_LOCK.lock().await;
+        let _client_guard = crate::client::TestStateGuard::new(None).await;
+        let tmp = TempDir::new().unwrap();
+        let config = replay_test_config(&tmp);
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&call_count);
+        let call_fn: AgentCallFn = Arc::new(move |_, _, _| {
+            let count = Arc::clone(&count);
+            Box::pin(async move {
+                match count.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok((
+                        "calling tool".to_owned(),
+                        None,
+                        vec![ToolCall::new(
+                            "noop".to_owned(),
+                            json!({}),
+                            Some("call-1".to_owned()),
+                            None,
+                        )],
+                        usage(10, 5, 2, 1),
+                    )),
+                    1 => Ok(("all done".to_owned(), None, vec![], usage(20, 7, 4, 3))),
+                    round => panic!("unexpected model round {round}"),
+                }
+            })
+        });
+        let ctx = make_test_context(config, call_fn, no_op_tool_round());
+        let input = crate::config::input::from_str(&ctx.config, "do work", None);
+        let sink = Arc::new(CollectingSink::default());
+
+        let result = harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+            run_agent_loop(&ctx, input).await
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(result, LoopResult::Completed));
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(final_usages(&sink), [usage(30, 12, 6, 4)]);
+    }
+
+    #[tokio::test]
+    async fn final_usage_matches_single_non_streaming_completion() {
+        let _sink_guard = SINK_LOCK.lock().await;
+        let model = priced_metrics_model();
+        let mock = Arc::new(
+            MockClient::builder()
+                .model(model.clone())
+                .add_turn(metrics_mock_turn("all done", None, (13, 8, 3, 2)))
+                .build(),
+        );
+        let config = Arc::new(RwLock::new(Config {
+            data: harnx_core::config_data::ConfigData {
+                stream: false,
+                ..Default::default()
+            },
+            model: model.clone(),
+            ..Default::default()
+        }));
+        let mut input = crate::config::input::from_str(&config, "do work", None);
+        input.agent_mut().set_model(model);
+        let ctx = metrics_loop_context(config);
+        let sink = Arc::new(CollectingSink::default());
+        let _client_guard = TestStateGuard::new(Some(mock.clone())).await;
+
+        let result = harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+            run_agent_loop(&ctx, input).await
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(result, LoopResult::Completed));
+        assert_eq!(mock.conversation_history().conversation_history.len(), 1);
+        assert_eq!(final_usages(&sink), [usage(13, 8, 3, 2)]);
+    }
+
+    #[tokio::test]
+    async fn final_usage_resets_between_turns() {
+        let _sink_guard = SINK_LOCK.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let config = replay_test_config(&tmp);
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&call_count);
+        let call_fn: AgentCallFn = Arc::new(move |_, _, _| {
+            let count = Arc::clone(&count);
+            Box::pin(async move {
+                let result = match count.fetch_add(1, Ordering::SeqCst) {
+                    0 => ("first turn".to_owned(), None, vec![], usage(11, 3, 2, 1)),
+                    1 => ("second turn".to_owned(), None, vec![], usage(7, 5, 1, 0)),
+                    round => panic!("unexpected model round {round}"),
+                };
+                Ok(result)
+            })
+        });
+        let ctx = make_test_context(config, call_fn, no_op_tool_round());
+        let first_input = crate::config::input::from_str(&ctx.config, "first", None);
+        let second_input = crate::config::input::from_str(&ctx.config, "second", None);
+        let sink = Arc::new(CollectingSink::default());
+
+        harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+            assert!(matches!(
+                run_agent_loop(&ctx, first_input).await.unwrap(),
+                LoopResult::Completed
+            ));
+            assert!(matches!(
+                run_agent_loop(&ctx, second_input).await.unwrap(),
+                LoopResult::Completed
+            ));
+        })
+        .await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(final_usages(&sink), [usage(11, 3, 2, 1), usage(7, 5, 1, 0)]);
+    }
+
     /// Regression test for the user-message-replay bug: a user message typed
     /// during a running tool round (delivered via `on_tool_round` setting
     /// `Input::injected_user_text`) must not be re-emitted on every
