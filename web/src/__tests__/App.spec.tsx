@@ -7,12 +7,22 @@ class MockEventSource {
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { BatchInterruptUI, MyComposer } from '../App';
-import { sendPrompt, uploadAttachment } from '../api';
+import { sendPrompt, uploadAttachment, submitHitlDecision } from '../api';
 import { PendingContext } from '../PendingContext';
 import * as agUi from '@assistant-ui/react-ag-ui';
 import * as aui from '@assistant-ui/react';
 import { vi } from 'vitest';
 import { ChatProvider } from '../ChatProvider';
+
+const defaultPendingContext = {
+  statusText: null,
+  setStatusText: vi.fn(),
+  errorText: null,
+  setErrorText: vi.fn(),
+  hydratedApprovals: [],
+  addHydratedApproval: vi.fn(),
+  clearHydratedApprovals: vi.fn(), removeHydratedApproval: vi.fn(),
+};
 
 vi.mock('@assistant-ui/react-ag-ui', async (importOriginal) => {
   const actual = await importOriginal<typeof agUi>();
@@ -21,7 +31,7 @@ vi.mock('@assistant-ui/react-ag-ui', async (importOriginal) => {
 
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>();
-  return { ...actual, sendPrompt: vi.fn(), uploadAttachment: vi.fn() };
+  return { ...actual, sendPrompt: vi.fn(), uploadAttachment: vi.fn(), submitHitlDecision: vi.fn() };
 });
 vi.mock('@assistant-ui/react', async (importOriginal) => {
   const actual = await importOriginal<typeof aui>();
@@ -32,60 +42,99 @@ vi.mock('@assistant-ui/react', async (importOriginal) => {
   };
 });
 
+
+
 describe('BatchInterruptUI', () => {
   afterEach(() => {
     vi.clearAllMocks();
   });
 
-  it('submits exact payload for approve and deny', async () => {
+  it('submits exact payload for approve and deny via submitHitlDecision', async () => {
     const setErrorText = vi.fn();
-    const submitResponses = vi.fn().mockResolvedValue(undefined);
-    vi.mocked(agUi.useAgUiInterrupts).mockReturnValue([{ id: 'int-1', toolCallId: 'tool-1', reason: '' } as any]);
-    vi.mocked(agUi.useAgUiSubmitInterruptResponses).mockReturnValue(submitResponses);
+    const removeHydratedApproval = vi.fn();
+    vi.mocked(agUi.useAgUiInterrupts).mockReturnValue([{ id: 'int-1', toolCallId: 'tool-1', reason: '', message: 'live interrupt' } as any]);
+    vi.mocked(submitHitlDecision).mockResolvedValue({ applied: true });
 
     render(
-      <PendingContext.Provider value={{ setErrorText, setStatusText: vi.fn(), statusText: null, errorText: null }}>
-        <BatchInterruptUI />
+      <PendingContext.Provider value={{ ...defaultPendingContext, setErrorText, removeHydratedApproval }}>
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
       </PendingContext.Provider>
     );
 
-    fireEvent.click(screen.getByLabelText(/Approve/));
-    fireEvent.click(screen.getByText(/Submit Decisions/));
+    fireEvent.click(screen.getByText('Approve'));
 
     await waitFor(() => {
-      expect(submitResponses).toHaveBeenCalledWith([{ interruptId: 'int-1', status: 'resolved', payload: { approved: true } }]);
+      expect(submitHitlDecision).toHaveBeenCalledWith('test-agent', 'test-session', { toolCallId: 'tool-1', approved: true, note: undefined });
+      expect(removeHydratedApproval).toHaveBeenCalledWith('tool-1');
     });
 
-    fireEvent.click(screen.getByLabelText(/Deny/));
-    fireEvent.click(screen.getByText(/Submit Decisions/));
+    vi.mocked(submitHitlDecision).mockClear();
+    removeHydratedApproval.mockClear();
+
+    fireEvent.click(screen.getByText('Deny'));
 
     await waitFor(() => {
-      expect(submitResponses).toHaveBeenCalledWith([{ interruptId: 'int-1', status: 'cancelled', payload: { approved: false } }]);
+      expect(submitHitlDecision).toHaveBeenCalledWith('test-agent', 'test-session', { toolCallId: 'tool-1', approved: false, note: undefined });
+      expect(removeHydratedApproval).toHaveBeenCalledWith('tool-1');
     });
   });
 
   it('surfaces an error on rejection', async () => {
     const setErrorText = vi.fn();
-    const submitResponses = vi.fn().mockRejectedValue(new Error('Network error'));
     vi.mocked(agUi.useAgUiInterrupts).mockReturnValue([{ id: 'int-2', toolCallId: 'tool-2', reason: '' } as any]);
-    vi.mocked(agUi.useAgUiSubmitInterruptResponses).mockReturnValue(submitResponses);
+    vi.mocked(submitHitlDecision).mockRejectedValue(new Error('Network error'));
 
     render(
-      <PendingContext.Provider value={{ setErrorText, setStatusText: vi.fn(), statusText: null, errorText: null }}>
-        <BatchInterruptUI />
+      <PendingContext.Provider value={{ ...defaultPendingContext, setErrorText }}>
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
       </PendingContext.Provider>
     );
 
-    fireEvent.click(screen.getByLabelText(/Approve/));
-    fireEvent.click(screen.getByText(/Submit Decisions/));
+    fireEvent.click(screen.getByText('Approve'));
 
     await waitFor(() => {
       expect(setErrorText).toHaveBeenCalledWith('Network error');
     });
   });
+
+  it('renders hydrated pending approval from hitl_pending_approval CUSTOM event', () => {
+    vi.mocked(agUi.useAgUiInterrupts).mockReturnValue([]);
+
+    const hydratedApprovals = [
+      { toolCallId: 'tool-1', summary: 'Approve tool call: write_file' },
+    ];
+
+    render(
+      <PendingContext.Provider value={{ ...defaultPendingContext, hydratedApprovals }}>
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    expect(screen.getByTestId('hydrated-pending-approval')).toBeInTheDocument();
+    expect(screen.getByText(/Approve tool call: write_file/)).toBeInTheDocument();
+  });
+
+  it('dedupes hydrated approval when live interrupt has matching toolCallId, showing only one', () => {
+    vi.mocked(agUi.useAgUiInterrupts).mockReturnValue([
+      { id: 'int-1', toolCallId: 'tool-1', reason: 'tool_call', message: 'Approve this' } as any,
+    ]);
+
+    const hydratedApprovals = [
+      { toolCallId: 'tool-1', summary: 'Approve tool call' },
+    ];
+
+    render(
+      <PendingContext.Provider value={{ ...defaultPendingContext, hydratedApprovals }}>
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    // It uses the hydrated one's summary if both exist (because it adds hydrated first)
+    expect(screen.getByText(/Approve tool call/)).toBeInTheDocument();
+    // Only ONE approve button should exist
+    expect(screen.getAllByText('Approve').length).toBe(1);
+  });
 });
-
-
 describe('MyComposer', () => {
   let composerRuntime: any;
   let setErrorText: any;
@@ -119,7 +168,7 @@ describe('MyComposer', () => {
   const renderComposer = (isFreshSession: boolean) => {
     return render(
       <ChatProvider agentName="foo" sessionId="bar" isFreshSession={isFreshSession} onOpenSubAgent={vi.fn()}>
-        <PendingContext.Provider value={{ setErrorText, setStatusText: vi.fn(), statusText: null, errorText: null }}>
+        <PendingContext.Provider value={{ ...defaultPendingContext, setErrorText }}>
           <MyComposer 
             agentName="foo" 
             sessionId="bar" 
@@ -168,7 +217,7 @@ describe('MyComposer', () => {
     // Rerender as existing session
     rerender(
       <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
-        <PendingContext.Provider value={{ setErrorText, setStatusText: vi.fn(), statusText: null, errorText: null }}>
+        <PendingContext.Provider value={{ ...defaultPendingContext, setErrorText }}>
           <MyComposer 
             agentName="foo" 
             sessionId="bar" 
@@ -220,7 +269,7 @@ describe('MyComposer', () => {
     // Still sending because user message count hasn't increased
     rerender(
       <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
-        <PendingContext.Provider value={{ setErrorText, setStatusText: vi.fn(), statusText: null, errorText: null }}>
+        <PendingContext.Provider value={{ ...defaultPendingContext, setErrorText }}>
           <MyComposer 
             agentName="foo" 
             sessionId="bar" 
@@ -240,7 +289,7 @@ describe('MyComposer', () => {
     userMessages = 1;
     rerender(
       <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
-        <PendingContext.Provider value={{ setErrorText, setStatusText: vi.fn(), statusText: null, errorText: null }}>
+        <PendingContext.Provider value={{ ...defaultPendingContext, setErrorText }}>
           <MyComposer 
             agentName="foo" 
             sessionId="bar" 

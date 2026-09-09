@@ -155,6 +155,7 @@ pub enum SessionEvent {
     HandoffCommitted {
         agent: String,
         session_id: String,
+        handoff_tool_call_id: String,
     },
     Saved {
         path: PathBuf,

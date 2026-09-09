@@ -17,8 +17,7 @@ test.describe('Gallery', () => {
     await expect(page).toHaveScreenshot('2-session-picker.png');
   });
 
-  // SKIP: blocked by #1775 (handoff/live-progress events are advisory-only; not recoverable on the passive session/prompt path). Re-enable after the durability fix.
-  test.skip('3. Chat transcript (GFM table, collapsed tool card, status bar usage, active session density)', async ({ page }) => {
+  test('3. Chat transcript (GFM table, collapsed tool card, status bar usage, active session density)', async ({ page }) => {
     await page.goto('/');
     await page.locator('.grid-item').filter({ hasText: 'coding/coder' }).click();
     await page.click('text=session-gallery');

@@ -24,6 +24,7 @@ pub(super) struct PromptParams<'a> {
     pub message: &'a str,
     pub session_id: Option<String>,
     pub parent_session_id: Option<String>,
+    pub tool_call_id: Option<String>,
     pub timeout_secs: Option<u64>,
     pub token_budget: Option<u64>,
     pub cancel: CancellationToken,
@@ -33,10 +34,10 @@ pub(super) async fn run_prompt(
     toolset: &SubagentToolset,
     params: PromptParams<'_>,
 ) -> Result<CompletedSubagentTurn, ToolInvokeError> {
-    let session = toolset.create_session(params.session_id).await?;
+    let session = toolset.create_session(params.session_id.clone()).await?;
     let child_session_id = session.session_id().to_string();
     let reporter = toolset
-        .start_progress_reporter(&child_session_id, params.parent_session_id)
+        .start_progress_reporter(&child_session_id, &params)
         .await?;
     let buffering_sink = Arc::new(InvocationBufferingSink::new(reporter.sink()));
     let turn = await_prompt_turn(

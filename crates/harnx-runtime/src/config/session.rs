@@ -225,9 +225,7 @@ fn replay_log_entries_into_session(
                 session.messages.push(message);
             }
             SessionLogEntry::SubAgentStarted {
-                agent,
-                session_id,
-                invocation_id: _,
+                agent, session_id, ..
             } => {
                 let note = Message::new(
                     MessageRole::User,
@@ -336,6 +334,11 @@ fn replay_log_entries_into_session(
             SessionLogEntry::Error { .. } => {}
             SessionLogEntry::TurnEnd { .. } => {}
             SessionLogEntry::Cancel { .. } => {}
+            // Durable control state is hydrated separately from model messages.
+            // Ignoring it here preserves any pending tool-call/result adjacency.
+            SessionLogEntry::HandoffCommitted { .. }
+            | SessionLogEntry::HitlApprovalRequested { .. }
+            | SessionLogEntry::HitlApprovalDecision { .. } => {}
             SessionLogEntry::EditEntries { .. } | SessionLogEntry::Rewind { .. } => {}
             SessionLogEntry::Unknown => anyhow::ensure!(
                 allow_embedded_metadata,
@@ -1187,6 +1190,66 @@ mod tests {
     }
 
     #[test]
+    fn canonical_nats_replay_accepts_pre_schema_change_transcript() {
+        let content = r#"---
+type: message
+role: user
+content: delegate this
+---
+type: tool_calls
+text: delegating
+calls:
+  - name: plato_session_prompt
+    arguments: {}
+    id: call-1
+---
+type: sub_agent_started
+agent: pantheon/plato
+session_id: child-old
+invocation_id: invocation-old
+---
+type: tool_results
+results:
+  - id: call-1
+    name: plato_session_prompt
+    output:
+      response: done
+---
+type: message
+role: assistant
+content: delegation complete
+---
+type: turn_end
+through_seq: 1
+fence_token: 7
+"#;
+        let raw_entries = collect_raw_log_entries(content, "pre-schema-session")
+            .expect("pre-schema rows should deserialize");
+
+        let loaded = replay_nats_entries_into_session(
+            &raw_entries,
+            "pre-schema-session",
+            Session::default(),
+        )
+        .expect("canonical replay should accept pre-schema variants");
+
+        assert_eq!(
+            loaded
+                .messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            vec![
+                MessageRole::User,
+                MessageRole::Tool,
+                MessageRole::User,
+                MessageRole::Assistant,
+            ]
+        );
+        assert!(loaded.replay_warnings.is_empty());
+    }
+
+    #[test]
     fn load_from_log_enumerates_document_sequence_numbers() {
         let content = r#"---
 type: message
@@ -1626,6 +1689,65 @@ results:
         assert!(loaded.replay_warnings.is_empty());
     }
 
+    #[test]
+    fn replay_ignores_durable_control_entries_inside_tool_round() {
+        let content = r#"---
+type: message
+role: user
+content: perform controlled work
+---
+type: tool_calls
+text: working
+calls:
+  - name: write
+    arguments: {}
+    id: call-1
+---
+type: handoff_committed
+target_agent: pantheon/plato
+target_session_id: target-123
+handoff_tool_call_id: handoff-call
+---
+type: hitl_approval_requested
+tool_call_id: call-1
+summary: Approve write
+fence_token: 7
+---
+type: hitl_approval_decision
+tool_call_id: call-1
+approved: true
+fence_token: 7
+---
+type: tool_results
+results:
+  - id: call-1
+    name: write
+    output:
+      status: done
+---
+type: message
+role: assistant
+content: work complete
+"#;
+
+        let loaded = load_from_log_for_test(content);
+
+        assert_eq!(
+            loaded
+                .messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            vec![MessageRole::User, MessageRole::Tool, MessageRole::Assistant,]
+        );
+        let MessageContent::ToolCalls(tool_calls) = &loaded.messages[1].content else {
+            panic!("expected reconstructed tool message");
+        };
+        assert_eq!(tool_calls.text, "working");
+        assert_eq!(tool_calls.tool_results[0].output["status"], "done");
+        assert!(loaded.replay_warnings.is_empty());
+    }
+
     fn sub_agent_start_entries(child_session_id: &str) -> Vec<(usize, SessionLogEntry)> {
         vec![
             (
@@ -1649,6 +1771,8 @@ results:
                     agent: "pantheon/plato".to_string(),
                     session_id: child_session_id.to_string(),
                     invocation_id: Some("invocation-456".to_string()),
+                    tool_call_id: None,
+                    started_at: None,
                 },
             ),
         ]

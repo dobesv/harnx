@@ -646,6 +646,63 @@ impl NatsSession {
         }
     }
 
+    /// Route a tool-approval decision to the lease holder and wait until its
+    /// fenced durable decision entry has been applied.
+    pub async fn decide_hitl_approval(
+        &self,
+        tool_call_id: &str,
+        approved: bool,
+        note: Option<String>,
+    ) -> Result<bool> {
+        let entries = self.load_durable_entries().await?;
+        let pending = crate::nats_worker::derive_pending_hitl_approvals(&entries)?;
+        if !pending
+            .iter()
+            .any(|approval| approval.tool_call_id == tool_call_id)
+        {
+            return Ok(false);
+        }
+        let Some(_) = self.activate_pending_turn().await? else {
+            anyhow::bail!(
+                "pending HITL approval '{}' has no activatable durable turn",
+                tool_call_id
+            );
+        };
+        let command = ControlCommand::HitlApprovalDecision {
+            tool_call_id: tool_call_id.to_string(),
+            approved,
+            note,
+        };
+        let deadline = tokio::time::Instant::now() + CANCEL_RECOVERY_TIMEOUT;
+        loop {
+            if request_control_command(
+                &self.client,
+                &self.session_id,
+                &command,
+                CONTROL_ACK_ATTEMPT_TIMEOUT,
+            )
+            .await
+            .is_ok()
+            {
+                return Ok(true);
+            }
+            let entries = self.load_durable_entries().await?;
+            let still_pending = crate::nats_worker::derive_pending_hitl_approvals(&entries)?
+                .iter()
+                .any(|approval| approval.tool_call_id == tool_call_id);
+            if !still_pending {
+                return Ok(false);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for worker to apply HITL approval '{}'",
+                    tool_call_id
+                );
+            }
+            tokio::time::sleep(CONTROL_ACK_RETRY_DELAY).await;
+        }
+    }
+
     async fn request_cancel_acknowledgement(&self) -> bool {
         let result = request_control_command(
             &self.client,
@@ -1246,7 +1303,10 @@ impl NatsSession {
                 ))
             },
         );
+        let awaiting_hitl = crate::nats_worker::derive_pending_hitl_approvals(entries)
+            .is_ok_and(|pending| !pending.is_empty());
         status == Some(RequestedSeqStatus::Covered)
+            || awaiting_hitl
             || (saw_turn_ended && Self::has_durable_assistant_response(entries, user_msg_seq))
     }
 
@@ -1375,10 +1435,13 @@ fn render_log_entry_to_sink(
             render_error_entry(message, &sink);
             false
         }
-        // Production replay path is currently unused. Live advisory event is
-        // emitted at creation, and durable entry feeds model context during
-        // reconstruction, so replaying it here would double-render on reattach.
-        SessionLogEntry::SubAgentStarted { .. } => false,
+        // Production replay path is currently unused. Live advisory events are
+        // emitted at creation; later hydration paths replay durable control state.
+        // Rendering these here would duplicate live events on reattach.
+        SessionLogEntry::SubAgentStarted { .. }
+        | SessionLogEntry::HandoffCommitted { .. }
+        | SessionLogEntry::HitlApprovalRequested { .. }
+        | SessionLogEntry::HitlApprovalDecision { .. } => false,
         SessionLogEntry::DataUrls { .. }
         | SessionLogEntry::Compress { .. }
         | SessionLogEntry::TurnEnd { .. }
@@ -1716,6 +1779,7 @@ mod tests {
                 through_seq: 1,
                 fence_token: 7,
                 timestamp: None,
+                usage: None,
             },
         ));
         assert!(NatsSession::is_turn_completion_visible(
@@ -1755,6 +1819,7 @@ mod tests {
                     through_seq: 1,
                     fence_token: 7,
                     timestamp: None,
+                    usage: None,
                 },
             ),
         ];

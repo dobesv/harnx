@@ -458,7 +458,12 @@ async fn invoke_uncached_tool(
         .await
         .insert(request.call_id.clone(), cancel.clone());
     let mut args = std::mem::take(&mut request.args);
-    add_parent_session_id_arg(&request.tool, request.parent_session_id.take(), &mut args);
+    add_parent_context_args(
+        &request.tool,
+        request.parent_session_id.take(),
+        request.tool_call_id.take(),
+        &mut args,
+    );
     let metric_tool = metric_tool_name(context.toolset.as_ref(), &request.tool);
     let start = Instant::now();
     let result = context
@@ -540,13 +545,24 @@ fn finalize_execution_context_for_attestation(
     }
 }
 
-fn add_parent_session_id_arg(tool: &str, parent_session_id: Option<String>, args: &mut Value) {
+fn add_parent_context_args(
+    tool: &str,
+    parent_session_id: Option<String>,
+    tool_call_id: Option<String>,
+    args: &mut Value,
+) {
     if accepts_parent_session_id(tool) {
         if let (Some(parent_session_id), Some(args)) = (parent_session_id, args.as_object_mut()) {
             args.insert(
                 "__harnx_parent_session_id".to_string(),
                 Value::String(parent_session_id),
             );
+            if let Some(tool_call_id) = tool_call_id {
+                args.insert(
+                    "__harnx_tool_call_id".to_string(),
+                    Value::String(tool_call_id),
+                );
+            }
         }
     }
 }
@@ -1044,6 +1060,21 @@ mod tests {
         assert!(!accepts_parent_session_id("session_load"));
         assert!(!accepts_parent_session_id("prompt"));
         assert!(!accepts_parent_session_id("agent_session_prompt"));
+    }
+
+    #[test]
+    fn parent_context_args_include_parent_tool_call_id() {
+        let mut args = serde_json::json!({ "message": "delegate" });
+
+        add_parent_context_args(
+            SUBAGENT_SESSION_PROMPT_TOOL,
+            Some("parent-session".to_string()),
+            Some("parent-tool-call".to_string()),
+            &mut args,
+        );
+
+        assert_eq!(args["__harnx_parent_session_id"], "parent-session");
+        assert_eq!(args["__harnx_tool_call_id"], "parent-tool-call");
     }
 
     struct MetricsTestToolset;

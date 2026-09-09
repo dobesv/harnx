@@ -303,23 +303,27 @@ describe('toAgUiMessages', () => {
       await agent.runAgent({});
 
       // Simulate onEvent CUSTOM session_handoff without RUN_STARTED
+      // Note: Handoff now fires for BOTH live (isRunActive=true) AND hydrated (isRunActive=false)
+      // because we removed the isRunActive guard to support hydration-based navigation.
       await dispatchAgentEvent(subscriber, {
         type: 'CUSTOM',
         name: 'session_handoff',
         value: { agent: 'targetAgent', session_id: '1234' }
       });
-      expect(onHandoff).not.toHaveBeenCalled();
+      // Now fires immediately (no isRunActive guard)
+      expect(onHandoff).toHaveBeenCalledWith('targetAgent', '1234');
 
       // Simulate RUN_STARTED to set isRunActive true
       await dispatchAgentEvent(subscriber, { type: 'RUN_STARTED' });
 
-      // Now session_handoff should trigger the callback
+      // Subsequent handoff should still fire (dedup uses marker id, not isRunActive)
+      onHandoff.mockClear();
       await dispatchAgentEvent(subscriber, {
         type: 'CUSTOM',
         name: 'session_handoff',
-        value: { agent: 'targetAgent', session_id: '1234' }
+        value: { agent: 'targetAgent2', session_id: '5678' }
       });
-      expect(onHandoff).toHaveBeenCalledWith('targetAgent', '1234');
+      expect(onHandoff).toHaveBeenCalledWith('targetAgent2', '5678');
 
       onHandoff.mockClear();
 
@@ -350,12 +354,13 @@ describe('toAgUiMessages', () => {
       // Simulate RUN_FINISHED to set isRunActive false
       await dispatchAgentEvent(subscriber, { type: 'RUN_FINISHED' });
 
-      // session_handoff should not trigger callback again
+      // session_handoff should still fire (isRunActive guard removed for hydration)
+      onHandoff.mockClear();
       await dispatchAgentEvent(subscriber, {
         type: 'CUSTOM',
         name: 'session_handoff',
-        value: { agent: 'targetAgent', session_id: '1234' }
+        value: { agent: 'targetAgent3', session_id: '9999' }
       });
-      expect(onHandoff).not.toHaveBeenCalled();
+      expect(onHandoff).toHaveBeenCalledWith('targetAgent3', '9999');
     });
   });

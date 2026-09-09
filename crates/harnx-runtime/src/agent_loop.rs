@@ -78,6 +78,10 @@ pub type OnTextResponseFn = Arc<
     dyn Fn(String, CompletionTokenUsage) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
 >;
 
+/// Worker callback that durably records the first deferred tool call.
+pub type OnHitlApprovalRequiredFn =
+    Arc<dyn Fn(&crate::tool::DeferredToolCall) -> Result<String> + Send + Sync>;
+
 /// Context for running the unified agent loop.
 ///
 /// Construct one and pass to [`run_agent_loop`]. All fields are `Send` so
@@ -95,6 +99,9 @@ pub struct AgentLoopContext {
     /// Optional callback after each tool round. TUI uses this to emit
     /// `ToolRoundComplete` and inject pending messages.
     pub on_tool_round: Option<OnToolRoundFn>,
+    /// Worker-only callback for converting a deferred confirmation into a
+    /// durable request and clean end-of-activation outcome.
+    pub on_hitl_approval_required: Option<OnHitlApprovalRequiredFn>,
     /// Optional callback on text-only turn end. TUI uses this to emit
     /// `ModelEvent::Final`.
     pub on_text_response: Option<OnTextResponseFn>,
@@ -107,6 +114,23 @@ pub struct AgentLoopContext {
     /// Optional per-session working directory. When unset, runtime falls back
     /// to process cwd for CLI compatibility.
     pub working_dir: Option<PathBuf>,
+}
+
+fn defer_tool_approval(ctx: &AgentLoopContext, error: anyhow::Error) -> Result<LoopResult> {
+    let Some(callback) = &ctx.on_hitl_approval_required else {
+        return Err(error);
+    };
+    let Some(interrupt) = crate::tool::ToolApprovalInterrupt::from_error(&error) else {
+        return Err(error);
+    };
+    let Some(first) = interrupt.deferred_calls.first() else {
+        return Err(error);
+    };
+    if interrupt.deferred_calls.len() > 1 {
+        log::warn!("multiple tool calls requested approval in one round; deferring only the first");
+    }
+    let tool_call_id = callback(first)?;
+    Ok(LoopResult::AwaitingHitlApproval { tool_call_id })
 }
 
 /// Resume a tool round that was interrupted for approval.
@@ -127,8 +151,6 @@ pub async fn continue_agent_loop_from_tool_round(
     decisions: Vec<ToolApprovalDecision>,
     pending_interrupt_ids: std::collections::BTreeSet<String>,
 ) -> Result<LoopResult> {
-    use crate::tool::ToolApprovalInterrupt;
-
     let config = &ctx.config;
 
     // Build a preseeded confirm function that returns decisions for known call IDs.
@@ -160,14 +182,14 @@ pub async fn continue_agent_loop_from_tool_round(
         },
     );
 
-    // Install the override for this resumption
+    let previous_confirmation = config.read().tui_confirm_tool_use.clone();
     config
         .write()
         .set_tui_confirm_tool_use(Some(confirm_override));
 
     // Execute full pending tool round using normal helper. Deferred calls resolve via
     // preseeded confirm function; already-approved calls execute normally.
-    let tool_results = match crate::tool::execute_tool_round_with_persistence(
+    let tool_round = crate::tool::execute_tool_round_with_persistence(
         ctx.tool_round_params(
             config,
             &input,
@@ -179,17 +201,13 @@ pub async fn continue_agent_loop_from_tool_round(
         tool_calls,
         crate::tool::ToolRoundPersistence::REUSE_EXISTING_CALLS,
     )
-    .await
-    {
+    .await;
+    config
+        .write()
+        .set_tui_confirm_tool_use(previous_confirmation);
+    let tool_results = match tool_round {
         Ok(results) => results,
-        Err(err) => {
-            // If we hit another interrupt, propagate it (shouldn't happen with preseeded decisions)
-            if ToolApprovalInterrupt::from_error(&err).is_some() {
-                return Err(err);
-            }
-            // Other errors: propagate
-            return Err(err);
-        }
+        Err(error) => return defer_tool_approval(ctx, error),
     };
 
     // Merge tool results into input for the next round
@@ -203,8 +221,14 @@ pub async fn continue_agent_loop_from_tool_round(
             cb(&mut merged_input, &tool_results).await?;
         }
 
-        if switch_agent.is_some() {
-            return run_agent_loop(ctx, merged_input).await;
+        if let Some(switch) = switch_agent {
+            emit_handoff_request(ctx, &switch);
+            return Ok(LoopResult::HandoffRequested {
+                agent: switch.agent,
+                session_id: switch.session_id,
+                prompt: switch.prompt,
+                tool_call_id: switch.tool_call_id,
+            });
         }
 
         input = merged_input;
@@ -227,10 +251,14 @@ pub struct ToolApprovalDecision {
 
 pub enum LoopResult {
     Completed,
+    AwaitingHitlApproval {
+        tool_call_id: String,
+    },
     HandoffRequested {
         agent: String,
         session_id: Option<String>,
         prompt: String,
+        tool_call_id: Option<String>,
     },
 }
 
@@ -331,11 +359,12 @@ pub async fn run_agent_loop_with_local_handoff(
     with_turn_lifecycle(ctx, async move {
         loop {
             match run_agent_loop_inner(ctx, input).await? {
-                LoopResult::Completed => return Ok(()),
+                LoopResult::Completed | LoopResult::AwaitingHitlApproval { .. } => return Ok(()),
                 LoopResult::HandoffRequested {
                     agent,
                     session_id,
                     prompt,
+                    tool_call_id: _,
                 } => {
                     apply_local_handoff(ctx, &agent, session_id.as_deref(), &prompt).await?;
                     input = crate::config::input::from_str(&ctx.config, &prompt, None);
@@ -721,6 +750,7 @@ async fn advance_tool_round(
             agent: switch.agent,
             session_id: switch.session_id,
             prompt: switch.prompt,
+            tool_call_id: switch.tool_call_id,
         }));
     }
     // Mid-loop title generation fires after each tool round on the continue path.
@@ -901,7 +931,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
         };
         turn_usage.accumulate(&usage);
 
-        let tool_results = complete_model_turn(
+        let tool_results = match complete_model_turn(
             ctx,
             &input,
             CompletionOutput {
@@ -911,7 +941,11 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
                 usage: &usage,
             },
         )
-        .await?;
+        .await
+        {
+            Ok(results) => results,
+            Err(error) => return defer_tool_approval(ctx, error),
+        };
 
         // `injected_user_text` is a one-shot field — it was written to the
         // session by `begin_turn` (inside `add_assistant_text` /
@@ -1417,6 +1451,7 @@ mod tests {
             usage_at_start: CompletionTokenUsage::default(),
             call_fn: None,
             on_tool_round: None,
+            on_hitl_approval_required: None,
             on_text_response: None,
             initial_with_embeddings: false,
             initial_resume_count: 0,
@@ -1587,6 +1622,7 @@ mod tests {
             usage_at_start: CompletionTokenUsage::default(),
             call_fn: Some(call_fn),
             on_tool_round: Some(on_tool_round),
+            on_hitl_approval_required: None,
             on_text_response: None,
             working_dir: None,
             initial_with_embeddings: false,
@@ -1672,6 +1708,7 @@ user prompt"
             agent: "delegate-agent".to_string(),
             prompt: "finish delegated work".to_string(),
             session_id: Some("handoff-target-session".to_string()),
+            tool_call_id: None,
         });
 
         let sink = Arc::new(CollectingSink::default());
@@ -1694,6 +1731,7 @@ user prompt"
             agent,
             session_id,
             prompt,
+            tool_call_id: _,
         }) = result
         else {
             panic!("expected handoff advance");

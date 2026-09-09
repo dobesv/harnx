@@ -110,6 +110,8 @@ pub enum SessionLogEntry {
         fence_token: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timestamp: Option<DateTime<Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<CompletionTokenUsage>,
     },
     /// Emitted when a sub-agent delegation starts a child session. Appended to the
     /// PARENT session's log so the child session_id is visible (and monitorable by
@@ -121,6 +123,36 @@ pub enum SessionLogEntry {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         invocation_id: Option<String>,
+        #[serde(default)]
+        tool_call_id: Option<String>,
+        #[serde(default)]
+        started_at: Option<DateTime<Utc>>,
+    },
+    /// Records a committed agent handoff so clients can navigate durably on replay.
+    /// Written by the lease-holding worker at handoff commit.
+    #[serde(rename = "handoff_committed")]
+    HandoffCommitted {
+        target_agent: String,
+        target_session_id: String,
+        handoff_tool_call_id: String,
+    },
+    /// Records that the worker is awaiting human approval for a tool call.
+    /// Written by the lease-holding worker when it defers a tool call; pairs with HitlApprovalDecision.
+    #[serde(rename = "hitl_approval_requested")]
+    HitlApprovalRequested {
+        tool_call_id: String,
+        summary: String,
+        fence_token: u64,
+    },
+    /// Records the human approve/deny decision for a deferred tool call.
+    /// Written by the lease-holding worker after receiving the routed decision; single-winner via lease+fence+CAS.
+    #[serde(rename = "hitl_approval_decision")]
+    HitlApprovalDecision {
+        tool_call_id: String,
+        approved: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        fence_token: u64,
     },
     #[serde(other)]
     Unknown,
@@ -137,6 +169,10 @@ impl SessionLogEntry {
             | SessionLogEntry::ToolCalls { fence_token, .. } => {
                 *fence_token = Some(fence);
             }
+            SessionLogEntry::HitlApprovalRequested { fence_token, .. }
+            | SessionLogEntry::HitlApprovalDecision { fence_token, .. } => {
+                *fence_token = fence;
+            }
             _ => {}
         }
     }
@@ -150,7 +186,9 @@ impl SessionLogEntry {
             | SessionLogEntry::ToolCalls { fence_token, .. } => *fence_token,
             SessionLogEntry::Cancel { fence_token }
             | SessionLogEntry::Error { fence_token, .. }
-            | SessionLogEntry::TurnEnd { fence_token, .. } => Some(*fence_token),
+            | SessionLogEntry::TurnEnd { fence_token, .. }
+            | SessionLogEntry::HitlApprovalRequested { fence_token, .. }
+            | SessionLogEntry::HitlApprovalDecision { fence_token, .. } => Some(*fence_token),
             _ => None,
         }
     }
@@ -915,32 +953,178 @@ field: value
     }
 
     #[test]
-    fn session_log_entry_sub_agent_started_serde_round_trip() {
-        let entry = SessionLogEntry::SubAgentStarted {
-            agent: "pantheon/plato".to_string(),
-            session_id: "child-123".to_string(),
-            invocation_id: Some("invocation-456".to_string()),
+    fn session_log_entry_handoff_committed_serde_round_trip() {
+        let entry = SessionLogEntry::HandoffCommitted {
+            target_agent: "pantheon/plato".to_string(),
+            target_session_id: "target-123".to_string(),
+            handoff_tool_call_id: "call-456".to_string(),
         };
 
         let yaml = serde_yaml::to_string(&entry).unwrap();
         let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
 
-        assert_eq!(
-            yaml,
-            "type: sub_agent_started\nagent: pantheon/plato\nsession_id: child-123\ninvocation_id: invocation-456\n"
-        );
+        assert!(yaml.starts_with("type: handoff_committed\n"));
+        match round_tripped {
+            SessionLogEntry::HandoffCommitted {
+                target_agent,
+                target_session_id,
+                handoff_tool_call_id,
+            } => {
+                assert_eq!(target_agent, "pantheon/plato");
+                assert_eq!(target_session_id, "target-123");
+                assert_eq!(handoff_tool_call_id, "call-456");
+            }
+            other => panic!("expected handoff_committed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_log_entry_hitl_approval_requested_serde_round_trip() {
+        let entry = SessionLogEntry::HitlApprovalRequested {
+            tool_call_id: "call-1".to_string(),
+            summary: "Approve file write".to_string(),
+            fence_token: 7,
+        };
+
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
+
+        assert!(yaml.starts_with("type: hitl_approval_requested\n"));
+        match round_tripped {
+            SessionLogEntry::HitlApprovalRequested {
+                tool_call_id,
+                summary,
+                fence_token,
+            } => {
+                assert_eq!(tool_call_id, "call-1");
+                assert_eq!(summary, "Approve file write");
+                assert_eq!(fence_token, 7);
+            }
+            other => panic!("expected hitl_approval_requested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_log_entry_hitl_approval_decision_serde_round_trip_and_default() {
+        let entry = SessionLogEntry::HitlApprovalDecision {
+            tool_call_id: "call-1".to_string(),
+            approved: false,
+            note: Some("Use a narrower path".to_string()),
+            fence_token: 7,
+        };
+
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
+
+        assert!(yaml.starts_with("type: hitl_approval_decision\n"));
+        match round_tripped {
+            SessionLogEntry::HitlApprovalDecision {
+                tool_call_id,
+                approved,
+                note,
+                fence_token,
+            } => {
+                assert_eq!(tool_call_id, "call-1");
+                assert!(!approved);
+                assert_eq!(note.as_deref(), Some("Use a narrower path"));
+                assert_eq!(fence_token, 7);
+            }
+            other => panic!("expected hitl_approval_decision, got {other:?}"),
+        }
+
+        let without_note: SessionLogEntry = serde_yaml::from_str(
+            "type: hitl_approval_decision\ntool_call_id: call-old\napproved: true\nfence_token: 7\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            without_note,
+            SessionLogEntry::HitlApprovalDecision {
+                note: None,
+                fence_token: 7,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn session_log_entry_turn_end_usage_serde_round_trip_and_default() {
+        let expected_usage = CompletionTokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cached_tokens: 30,
+            cache_write_tokens: 10,
+        };
+        let entry = SessionLogEntry::TurnEnd {
+            through_seq: 42,
+            fence_token: 7,
+            timestamp: None,
+            usage: Some(expected_usage.clone()),
+        };
+
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
+
+        match round_tripped {
+            SessionLogEntry::TurnEnd { usage, .. } => {
+                assert_eq!(usage, Some(expected_usage));
+            }
+            other => panic!("expected turn_end, got {other:?}"),
+        }
+
+        let old_row: SessionLogEntry = serde_yaml::from_str(
+            "type: turn_end\nthrough_seq: 42\nfence_token: 7\ntimestamp: 2026-09-08T20:01:58Z\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            old_row,
+            SessionLogEntry::TurnEnd { usage: None, .. }
+        ));
+    }
+
+    #[test]
+    fn session_log_entry_sub_agent_started_serde_round_trip_and_defaults() {
+        let started_at = "2026-09-08T20:01:58Z".parse::<DateTime<Utc>>().unwrap();
+        let entry = SessionLogEntry::SubAgentStarted {
+            agent: "pantheon/plato".to_string(),
+            session_id: "child-123".to_string(),
+            invocation_id: Some("invocation-456".to_string()),
+            tool_call_id: Some("call-789".to_string()),
+            started_at: Some(started_at),
+        };
+
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
+
+        assert!(yaml.starts_with("type: sub_agent_started\n"));
         match round_tripped {
             SessionLogEntry::SubAgentStarted {
                 agent,
                 session_id,
                 invocation_id,
+                tool_call_id,
+                started_at: round_tripped_started_at,
             } => {
                 assert_eq!(agent, "pantheon/plato");
                 assert_eq!(session_id, "child-123");
                 assert_eq!(invocation_id.as_deref(), Some("invocation-456"));
+                assert_eq!(tool_call_id.as_deref(), Some("call-789"));
+                assert_eq!(round_tripped_started_at, Some(started_at));
             }
             other => panic!("expected sub_agent_started, got {other:?}"),
         }
+
+        let old_row: SessionLogEntry = serde_yaml::from_str(
+            "type: sub_agent_started\nagent: pantheon/plato\nsession_id: child-old\ninvocation_id: invocation-old\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            old_row,
+            SessionLogEntry::SubAgentStarted {
+                tool_call_id: None,
+                started_at: None,
+                ..
+            }
+        ));
     }
 
     #[test]

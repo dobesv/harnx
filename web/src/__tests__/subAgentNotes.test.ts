@@ -51,7 +51,7 @@ function snapshotEvent() {
       {
         id: 'assistant-1',
         role: 'assistant',
-        toolCalls: [{ id: 'call-1' }, { id: 'call-malformed' }],
+        toolCalls: [{ id: 'call-1' }, { id: 'call-malformed' }, { id: 'call-3-missing-result' }],
       },
       {
         role: 'tool',
@@ -251,6 +251,168 @@ describe('reduceSubAgentNotes', () => {
       { parentMessageId: 'assistant-1', status: 'done' },
       { parentMessageId: 'assistant-2', status: 'done' },
     ]);
+  });
+
+  it('seeds rows from hydrated sub_agent_started with matching tool-result via snapshot', () => {
+    const state = apply(
+      snapshotEvent(),
+      {
+        type: 'CUSTOM',
+        name: 'sub_agent_started',
+        value: {
+          agent: 'researcher',
+          session_id: 'reused-child',
+          invocation_id: 'snapshot-inv-1',
+          tool_call_id: 'call-1',
+          started_at: '2026-09-09T05:15:30Z'
+        }
+      }
+    );
+
+    expect(state.notes.length).toBe(2);
+    // Should NOT duplicate the completed row, because toolCallId matches and it's already "done"
+    expect(state.notes[0]).toMatchObject({
+      id: 'snapshot:assistant-1:call-1',
+      status: 'done',
+      agent: 'researcher',
+      toolCallId: 'call-1',
+    });
+  });
+
+  it('seeds running rows from hydrated sub_agent_started without matching tool-result', () => {
+    const state = apply(
+      snapshotEvent(),
+      {
+        type: 'CUSTOM',
+        name: 'sub_agent_started',
+        value: {
+          agent: 'coder',
+          session_id: 'child-coder-1',
+          invocation_id: 'inv-coder-1',
+          tool_call_id: 'call-3-missing-result',
+          started_at: '2026-09-09T05:15:30Z'
+        }
+      }
+    );
+
+    expect(state.notes.length).toBe(3); // 2 from snapshot + 1 running
+    expect(state.notes[2]).toMatchObject({
+      id: 'live:inv-coder-1',
+      status: 'running',
+      agent: 'coder',
+      sessionId: 'child-coder-1',
+      toolCallId: 'call-3-missing-result',
+      startedAtMs: new Date('2026-09-09T05:15:30Z').getTime()
+    });
+  });
+
+  it('classifies CHILD_TERMINAL to fail a running note', () => {
+    const state = apply(
+      snapshotEvent(),
+      {
+        type: 'CUSTOM',
+        name: 'sub_agent_started',
+        value: {
+          agent: 'coder',
+          session_id: 'child-coder-1',
+          invocation_id: 'inv-coder-1',
+          tool_call_id: 'call-3-missing-result',
+          started_at: '2026-09-09T05:15:30Z'
+        }
+      },
+      {
+        type: 'CHILD_TERMINAL',
+        invocationId: 'inv-coder-1',
+        status: 'failed'
+      }
+    );
+
+    expect(state.notes[2]).toMatchObject({
+      id: 'live:inv-coder-1',
+      status: 'failed',
+    });
+  });
+  it('allows parent authoritative result to override a child-liveness failed state', () => {
+    const state = apply(
+      snapshotEvent(),
+      {
+        type: 'CUSTOM',
+        name: 'sub_agent_started',
+        value: {
+          agent: 'coder',
+          session_id: 'child-coder-1',
+          invocation_id: 'inv-coder-1',
+          tool_call_id: 'call-3-missing-result',
+          started_at: '2026-09-09T05:15:30Z'
+        }
+      },
+      {
+        type: 'CHILD_TERMINAL',
+        invocationId: 'inv-coder-1',
+        status: 'failed'
+      },
+      {
+        type: 'TOOL_CALL_RESULT',
+        toolCallId: 'call-3-missing-result',
+        content: JSON.stringify({
+          sub_agent_progress: {
+            invocation_id: 'inv-coder-1',
+            agent: 'coder',
+            session_id: 'child-coder-1',
+            status: 'done',
+            elapsed_ms: 1000,
+            usage: { input_tokens: 10, output_tokens: 20, cached_tokens: 0 },
+            tool_call_count: 1
+          }
+        })
+      }
+    );
+
+    expect(state.notes[2]).toMatchObject({
+      id: 'live:inv-coder-1',
+      status: 'done',
+      elapsedMs: 1000,
+      inputTokens: 10,
+      outputTokens: 20
+    });
+  });
+
+  it('allows parent authoritative result marker to mark a child-liveness failed state as done', () => {
+    const state = apply(
+      snapshotEvent(),
+      {
+        type: 'CUSTOM',
+        name: 'sub_agent_started',
+        value: {
+          agent: 'coder',
+          session_id: 'child-coder-1',
+          invocation_id: 'inv-coder-1',
+          tool_call_id: 'call-3-missing-result',
+          started_at: '2026-09-09T05:15:30Z'
+        }
+      },
+      {
+        type: 'CHILD_TERMINAL',
+        invocationId: 'inv-coder-1',
+        status: 'failed'
+      },
+      {
+        type: 'TOOL_CALL_RESULT',
+        toolCallId: 'call-3-missing-result',
+        content: JSON.stringify({
+          sub_agent: {
+            agent: 'coder',
+            session_id: 'child-coder-1',
+            invocation_id: 'inv-coder-1'
+          }
+        })
+      }
+    );
+
+    expect(state.notes[2]).toMatchObject({
+      id: 'live:inv-coder-1',
+      status: 'done'
+    });
   });
 
   it('restores completed rows under their launching assistant messages from a snapshot', () => {

@@ -68,6 +68,7 @@ pub(crate) struct SubagentToolset {
 struct SubagentStart<'a> {
     child_session_id: &'a str,
     invocation_id: &'a str,
+    tool_call_id: Option<&'a str>,
 }
 
 impl SubagentToolset {
@@ -123,11 +124,11 @@ impl SubagentToolset {
     async fn start_progress_reporter(
         &self,
         child_session_id: &str,
-        parent_session_id: Option<String>,
+        params: &termination::PromptParams<'_>,
     ) -> Result<SubagentProgressReporter, ToolInvokeError> {
         let invocation_id = uuid::Uuid::new_v4().to_string();
-        let parent_sink = match parent_session_id {
-            Some(parent_session_id) => {
+        let parent_sink = match params.parent_session_id {
+            Some(ref parent_session_id) => {
                 let sink = NatsEventSink::new(
                     self.client.clone(),
                     self.jetstream.clone(),
@@ -136,10 +137,11 @@ impl SubagentToolset {
                 .await;
                 self.emit_parent_subagent_started(
                     &sink,
-                    &parent_session_id,
+                    parent_session_id,
                     SubagentStart {
                         child_session_id,
                         invocation_id: &invocation_id,
+                        tool_call_id: params.tool_call_id.as_deref(),
                     },
                 )
                 .await?;
@@ -165,6 +167,7 @@ impl SubagentToolset {
         let SubagentStart {
             child_session_id,
             invocation_id,
+            tool_call_id,
         } = start;
         let source = AgentSource {
             agent: self.agent.clone(),
@@ -190,6 +193,8 @@ impl SubagentToolset {
             agent: self.agent.clone(),
             session_id: child_session_id.to_string(),
             invocation_id: Some(invocation_id.to_string()),
+            tool_call_id: tool_call_id.map(str::to_string),
+            started_at: Some(chrono::Utc::now()),
         };
         if let Err(error) =
             NatsSessionLog::new(self.jetstream.clone(), parent_session_id.to_string())
@@ -225,6 +230,7 @@ impl SubagentToolset {
                 message: SESSION_NEW_INITIAL_PROMPT,
                 session_id: None,
                 parent_session_id: args.parent_session_id,
+                tool_call_id: args.tool_call_id,
                 timeout_secs: None,
                 token_budget: None,
                 cancel,
@@ -249,6 +255,7 @@ impl SubagentToolset {
                 message: &args.message,
                 session_id: normalize_session_id(args.session_id),
                 parent_session_id: args.parent_session_id,
+                tool_call_id: args.tool_call_id,
                 timeout_secs: args.timeout_secs,
                 token_budget: args.token_budget,
                 cancel,
@@ -349,6 +356,8 @@ fn parse_args<T: for<'de> Deserialize<'de>>(tool: &str, args: Value) -> Result<T
 struct NewSessionArgs {
     #[serde(default, rename = "__harnx_parent_session_id")]
     parent_session_id: Option<String>,
+    #[serde(default, rename = "__harnx_tool_call_id")]
+    tool_call_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -362,6 +371,8 @@ struct PromptArgs {
     token_budget: Option<u64>,
     #[serde(default, rename = "__harnx_parent_session_id")]
     parent_session_id: Option<String>,
+    #[serde(default, rename = "__harnx_tool_call_id")]
+    tool_call_id: Option<String>,
 }
 
 #[derive(Deserialize)]

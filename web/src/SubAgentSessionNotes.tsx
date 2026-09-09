@@ -1,11 +1,80 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useMemo, useContext } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { SubAgentNote } from './subAgentNotes';
+import { HarnxHttpAgent } from './ChatProvider';
+import { SubAgentNotesContext } from './SubAgentNotesContext';
 
 export interface SubAgentSessionNotesProps {
   notes: SubAgentNote[];
   onOpen: (agent: string, sessionId: string) => void;
 }
+
+import { useAgUiRuntime } from '@assistant-ui/react-ag-ui';
+import { AssistantRuntimeProvider } from '@assistant-ui/react';
+import { RuntimeSessionSubscriber } from './RuntimeSessionSubscriber';
+
+function ChildMetricsSubscriber({ note, dispatch }: { note: SubAgentNote, dispatch: (event: unknown) => void }) {
+  const agent = useMemo(() => {
+    let toolCallCount = 0;
+    return new HarnxHttpAgent({
+      url: `/v1/agents/${encodeURIComponent(note.agent)}/sessions/${encodeURIComponent(note.sessionId)}/prompt`,
+      onStatus: () => {},
+      onRunFailed: () => {},
+      onUsage: (usage) => {
+        dispatch({
+          type: 'CUSTOM',
+          name: 'sub_agent_progress',
+          value: {
+            invocation_id: note.invocationId,
+            tool_call_id: note.toolCallId,
+            agent: note.agent,
+            session_id: note.sessionId,
+            elapsed_ms: note.startedAtMs ? Date.now() - note.startedAtMs : 0,
+            tool_call_count: toolCallCount,
+            usage: {
+              input_tokens: usage.input,
+              output_tokens: usage.output,
+              cached_tokens: usage.cached ?? 0,
+            }
+          }
+        });
+      },
+      onToolSummary: () => {
+        toolCallCount++;
+      },
+      onSubAgentEvent: (event: any) => {
+        if (event?.type === 'RUN_FINISHED' || event?.type === 'RUN_ERROR') {
+          const now = Date.now();
+          const graceMs = 5000;
+          if (note.startedAtMs && (now - note.startedAtMs < graceMs)) {
+            return; // within grace period
+          }
+          
+          const isError = event.type === 'RUN_ERROR' || event.result?.status === 'failed';
+
+          dispatch({
+            type: 'CHILD_TERMINAL',
+            invocationId: note.invocationId,
+            toolCallId: note.toolCallId,
+            status: isError ? 'failed' : 'done',
+          });
+        }
+      },
+    });
+  }, [note.agent, note.sessionId, note.invocationId, note.toolCallId, note.startedAtMs, dispatch]);
+
+  const runtime = useAgUiRuntime({ agent });
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <RuntimeSessionSubscriber
+        enabled={true}
+        eventsUrl={`/v1/agents/${encodeURIComponent(note.agent)}/sessions/${encodeURIComponent(note.sessionId)}/events`}
+      />
+    </AssistantRuntimeProvider>
+  );
+}
+
 
 const STATUS_LABEL = {
   running: 'Running',
@@ -39,6 +108,7 @@ function formatTokens(value: number) {
 }
 
 export function SubAgentSessionNotes({ notes, onOpen }: SubAgentSessionNotesProps) {
+  const { dispatch } = useContext(SubAgentNotesContext);
   const [clockMs, setClockMs] = useState(0);
   const hasRunning = notes.some((note) => note.status === 'running');
   useEffect(() => {
@@ -84,6 +154,9 @@ export function SubAgentSessionNotes({ notes, onOpen }: SubAgentSessionNotesProp
               <span className="aui-sub-agent-status-icon" aria-hidden="true" />
               {statusLabel}
             </span>
+            {note.status === 'running' && (
+              <ChildMetricsSubscriber note={note} dispatch={dispatch} />
+            )}
           </button>
         );
       })}

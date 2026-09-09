@@ -1,4 +1,4 @@
-import { useEffect, useRef, useContext, useState, useCallback } from 'react';
+import { useEffect, useRef, useContext, useState, useCallback, useMemo } from 'react';
 import {
   ThreadPrimitive,
   MessagePrimitive,
@@ -14,13 +14,13 @@ import remarkGfm from 'remark-gfm';
 
 const SyntaxHighlighter = makeLightAsyncSyntaxHighlighter({ useInlineStyles: false });
 import { ToolCallCard } from './ToolCallCard';
-import { useAgUiInterrupts, useAgUiSubmitInterruptResponses } from '@assistant-ui/react-ag-ui';
+import { useAgUiInterrupts,  } from '@assistant-ui/react-ag-ui';
 import { ChatProvider, attachmentToMessageParts } from './ChatProvider';
 import { PendingContext } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { SubAgentSessionNotes } from './SubAgentSessionNotes';
-import { cancel, sendPrompt, uploadAttachment } from './api';
+import { cancel, sendPrompt, uploadAttachment, submitHitlDecision } from './api';
 import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
 import { AttachIcon, SendIcon } from './icons';
@@ -389,73 +389,101 @@ const SendErrorIndicator = () => {
   );
 };
 
-export const BatchInterruptUI = () => {
+export const BatchInterruptUI = ({ agentName, sessionId }: { agentName: string; sessionId: string }) => {
   const interrupts = useAgUiInterrupts();
-  const submitResponses = useAgUiSubmitInterruptResponses();
-  const [responses, setResponses] = useState<Record<string, 'resolved' | 'cancelled'>>({});
-  const { setErrorText } = useContext(PendingContext);
+  const { setErrorText, hydratedApprovals, removeHydratedApproval } = useContext(PendingContext);
+  const [submitting, setSubmitting] = useState(false);
+  const [note, setNote] = useState('');
 
-  // Reset responses for interrupts that are no longer active
-  useEffect(() => {
-    setResponses((prev) => {
-      const next: Record<string, 'resolved' | 'cancelled'> = {};
-      for (const i of interrupts) {
-        if (prev[i.id]) {
-          next[i.id] = prev[i.id];
-        }
+  const pendingItems = useMemo(() => {
+    const items: Array<{ toolCallId: string; summary: string }> = [];
+    const seen = new Set<string>();
+
+    for (const a of hydratedApprovals) {
+      items.push(a);
+      seen.add(a.toolCallId);
+    }
+
+    for (const i of interrupts) {
+      if (i.toolCallId && !seen.has(i.toolCallId)) {
+        items.push({ toolCallId: i.toolCallId, summary: i.message || i.reason || i.toolCallId });
+        seen.add(i.toolCallId);
       }
-      if (Object.keys(next).length !== Object.keys(prev).length) {
-        return next;
-      }
-      return prev;
-    });
-  }, [interrupts]);
+    }
 
-  if (!interrupts.length) return null;
+    return items;
+  }, [hydratedApprovals, interrupts]);
 
-  const handleSubmit = async () => {
+  if (pendingItems.length === 0) return null;
+
+  const currentItem = pendingItems[0];
+
+  const handleDecision = async (approved: boolean) => {
     setErrorText(null);
-    const payload = interrupts.map(i => {
-      const decision = responses[i.id] || 'cancelled';
-      return {
-        interruptId: i.id,
-        status: decision,
-        payload: { approved: decision === 'resolved' }
-      };
-    });
-    
+    setSubmitting(true);
     try {
-      await submitResponses(payload);
+      await submitHitlDecision(agentName, sessionId, {
+        toolCallId: currentItem.toolCallId,
+        approved,
+        note: note.trim() || undefined
+      });
+      removeHydratedApproval(currentItem.toolCallId);
+      setNote('');
     } catch (err) {
-      console.error('Failed to submit interrupt responses', err);
+      console.error('Failed to submit decision', err);
       setErrorText(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSubmitting(false);
     }
   };
 
   return (
     <div className="aui-interrupts-batch">
-      <h4 className="aui-interrupts-title">Action Required: Approve Tool Calls</h4>
-      {interrupts.map((interrupt) => (
-        <div key={interrupt.id} className="aui-interrupt">
-          <p className="aui-interrupt-tool-name">Tool: <strong>{interrupt.toolCallId || interrupt.reason}</strong></p>
-          {interrupt.message && <pre className="aui-interrupt-message">{interrupt.message}</pre>}
-          <div className="aui-interrupt-actions">
-            <label>
-              <input type="radio" name={`action-${interrupt.id}`} checked={responses[interrupt.id] === 'resolved'} onChange={() => setResponses((prev: Record<string, 'resolved' | 'cancelled'>) => ({ ...prev, [interrupt.id]: 'resolved' }))} /> Approve
-            </label>
-            <label>
-              <input type="radio" name={`action-${interrupt.id}`} checked={responses[interrupt.id] === 'cancelled'} onChange={() => setResponses((prev: Record<string, 'resolved' | 'cancelled'>) => ({ ...prev, [interrupt.id]: 'cancelled' }))} /> Deny
-            </label>
-          </div>
+      <h4 className="aui-interrupts-title">Action Required: Approve Tool Call</h4>
+      <div className="aui-interrupt" data-testid="hydrated-pending-approval">
+        <p className="aui-interrupt-tool-name">
+          Tool: <strong>{currentItem.summary}</strong>
+        </p>
+        
+        <div style={{ marginTop: '10px' }}>
+          <label style={{ display: 'block', fontSize: '0.9em', marginBottom: '4px' }}>
+            Optional Note:
+          </label>
+          <input
+            type="text"
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            disabled={submitting}
+            placeholder="Reason for approval or denial..."
+            style={{ width: '100%', padding: '6px', boxSizing: 'border-box' }}
+          />
         </div>
-      ))}
-      <button
-        disabled={Object.keys(responses).length !== interrupts.length}
-        onClick={handleSubmit}
-        className="aui-interrupt-submit"
-      >
-        Submit Decisions
-      </button>
+
+        <div className="aui-interrupt-actions" style={{ marginTop: '10px', display: 'flex', gap: '10px' }}>
+          <button
+            disabled={submitting}
+            onClick={() => handleDecision(true)}
+            className="aui-interrupt-submit"
+            style={{ backgroundColor: '#2e7d32', color: 'white', padding: '6px 12px', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
+          >
+            Approve
+          </button>
+          <button
+            disabled={submitting}
+            onClick={() => handleDecision(false)}
+            className="aui-interrupt-submit"
+            style={{ backgroundColor: '#c62828', color: 'white', padding: '6px 12px', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
+          >
+            Deny
+          </button>
+        </div>
+        
+        {pendingItems.length > 1 && (
+          <p className="aui-interrupt-note" style={{ fontSize: '0.85em', color: '#666', marginTop: '10px' }}>
+            {pendingItems.length - 1} more tool call{pendingItems.length - 1 !== 1 ? 's' : ''} awaiting approval
+          </p>
+        )}
+      </div>
     </div>
   );
 };
@@ -475,7 +503,7 @@ const MyThread = ({ agentName, sessionId, isFreshSession, markSessionNotFresh, o
 
       <div className="aui-thread-bottom">
         <StatusBar />
-        <BatchInterruptUI />
+        <BatchInterruptUI agentName={agentName} sessionId={sessionId} />
         <SendErrorIndicator />
         <div className="aui-composer-container">
           <MyComposer

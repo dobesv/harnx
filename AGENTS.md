@@ -85,6 +85,24 @@ test failures.
 **Do not ignore clippy warnings.** CI sets `RUSTFLAGS=--deny warnings` and runs `cargo clippy -- -D warnings`, so any warning will fail the build.
 **CodeScene Health scores MUST NOT decrease as part of the change, only increase**
 
+### Web/Frontend Verification
+
+**Run all web/frontend commands from `web/`, never the repo root.** The root has no
+`package.json`, so corepack cannot resolve the pnpm version and attempts to download
+into a read-only cache, failing with `EROFS: read-only file system`. The `web/`
+directory has `web/package.json` with `packageManager: "pnpm@11.25.0"` already provisioned.
+
+```sh
+cd web
+pnpm exec tsc -b                                    # Typecheck (NOT tsc --noEmit — root tsconfig has files: [] so it always exits 0)
+pnpm exec oxlint                                    # Lint
+pnpm exec vitest run                                # Unit tests
+pnpm test:e2e                                       # Playwright end-to-end tests
+```
+
+**Use `tsc -b`, not `tsc --noEmit`.** The root tsconfig sets `files: []` so
+`--noEmit` is hollow and always exits 0; `-b` builds the actual project references.
+
 ## Commit Conventions
 
 This project uses [Conventional Commits](https://www.conventionalcommits.org/):
@@ -235,6 +253,12 @@ preserved. See `SubAgentStarted` handling in `config/session.rs` for the pattern
 Append to another session's log via `NatsSessionLog::new(jetstream, session_id)` with no
 `fence_token`. Used when a tool/client needs durable state visible to a session it doesn't
 hold the lease for (e.g. sub-agent start entries in parent log).
+
+Worker-written control entries (`HandoffCommitted`, `HitlApprovalRequested`,
+`HitlApprovalDecision`) use `FencedSessionLogSink`, which stamps the lease revision as
+`fence_token`. HITL entries additionally require stream-tail CAS because `is_held()` is not
+broker-authoritative—a stale worker can race after TTL expiry. See
+`nats_worker/backend.rs:FencedSessionLogSink` for the CAS + ownership-revalidation pattern.
 
 ### TUI transcript items are TUI-local
 

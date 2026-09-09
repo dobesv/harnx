@@ -140,6 +140,8 @@ pub struct ToolRequest {
     pub args: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     /// Additive capabilities understood by the caller. An absent field means
     /// private result metadata must not be returned.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -339,6 +341,7 @@ mod tests {
             tool: "time_now".to_string(),
             args: json!({ "timezone": "UTC" }),
             parent_session_id: Some("parent-session".to_string()),
+            tool_call_id: None,
             capabilities: BTreeSet::new(),
         });
         assert_round_trip(ToolReply {

@@ -12,7 +12,7 @@ use crate::ag_ui_sync::{
     wire_message_id,
 };
 use crate::ag_ui_usage::UsagePayloadInput;
-use crate::interrupt_resume::{parse_resume_params, validate_resume, InterruptResumeParam};
+use crate::interrupt_resume::{parse_resume_params, InterruptResumeParam};
 use crate::session_actor::{
     PromptResult, SessionCommand, SessionHandle, SessionInfo, SessionPromptOptions,
     SessionRegistry, SubscribeResult,
@@ -238,7 +238,7 @@ pub struct AgUiSink {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct UsageContextSnapshot {
+pub struct UsageContextSnapshot {
     pub(crate) context_tokens: usize,
     pub(crate) max_context_tokens: Option<usize>,
     pub(crate) context_percent: Option<f32>,
@@ -681,10 +681,16 @@ impl AgUiSink {
 
     fn emit_session_event(&self, event: SessionEvent) {
         match event {
-            SessionEvent::HandoffCommitted { agent, session_id } => self.emit_custom(
-                "session_handoff",
-                json!({ "agent": agent, "session_id": session_id }),
-            ),
+            SessionEvent::HandoffCommitted {
+                agent,
+                session_id,
+                handoff_tool_call_id,
+            } => {
+                self.emit_custom(
+                    "session_handoff",
+                    json!({ "agent": agent, "session_id": session_id, "handoff_tool_call_id": handoff_tool_call_id }),
+                );
+            }
             SessionEvent::CompactingStarted => {
                 self.emit_custom("session_compacting_started", json!({}));
             }
@@ -1175,8 +1181,8 @@ impl Drop for UnsubscribeOnDrop {
 /// Whether a session has local run state that blocks idle or remote-follow handling.
 ///
 /// A promptless `Running` subscription follows live events. `Interrupted` is also
-/// active, but its saved outcome is replayed as a terminal `RUN_FINISHED`; the client
-/// renders that gate and submits the decision as a new resume run.
+/// active for stream selection, but its derived outcome is replayed as terminal
+/// `RUN_FINISHED`; the client submits the decision through `session/hitl_decision`.
 fn session_state_is_active(state: &crate::session_actor::SessionState) -> bool {
     matches!(
         state,
@@ -1260,6 +1266,7 @@ fn build_prompted_event_stream(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_promptless_event_stream(
     run_id: &str,
     thread_id_text: &str,
@@ -1267,7 +1274,18 @@ fn build_promptless_event_stream(
     live_stream: impl tokio_stream::Stream<Item = Event> + Send + Sync + 'static,
     is_active: bool,
     interrupt_outcome: Option<JsonValue>,
+    log_entries: Option<&[(u64, harnx_core::session::SessionLogEntry)]>,
+    tokens_usage: Option<UsageContextSnapshot>,
 ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Bytes> + Send + Sync + 'static>> {
+    // Control-state hydration: emit hydrated CUSTOM events for control entries
+    let control_events = log_entries
+        .map(|entries| control_snapshot_events(entries, tokens_usage.as_ref()))
+        .unwrap_or_default();
+    let control_frames: Vec<Bytes> = control_events
+        .into_iter()
+        .filter_map(|e| frame_event(&e).ok().map(Bytes::from))
+        .collect();
+
     let started = tokio_stream::once(Bytes::from(frame_run_boundary_event(
         "RUN_STARTED",
         thread_id_text,
@@ -1275,12 +1293,11 @@ fn build_promptless_event_stream(
     )));
 
     if let Some(outcome) = interrupt_outcome {
-        // An approval interrupt is terminal for this AG-UI run. Replay it on every
-        // promptless join so a reconnecting client can render the pending gate,
-        // then let the client submit its decision as a new resume run.
+        // An approval interrupt is terminal for this AG-UI run. Replay durable pending
+        // events before RUN_FINISHED so reconnecting clients can render the gate.
         let hydrated = tokio_stream::StreamExt::chain(started, tokio_stream::iter(snapshot_frame));
         return Box::pin(tokio_stream::StreamExt::chain(
-            hydrated,
+            tokio_stream::StreamExt::chain(hydrated, tokio_stream::iter(control_frames)),
             tokio_stream::once(frame_run_finished_event(
                 thread_id_text,
                 run_id,
@@ -1294,7 +1311,7 @@ fn build_promptless_event_stream(
         // client's stream terminates cleanly.
         let hydrated = tokio_stream::StreamExt::chain(started, tokio_stream::iter(snapshot_frame));
         return Box::pin(tokio_stream::StreamExt::chain(
-            hydrated,
+            tokio_stream::StreamExt::chain(hydrated, tokio_stream::iter(control_frames)),
             tokio_stream::once(Bytes::from(frame_run_boundary_event(
                 "RUN_FINISHED",
                 thread_id_text,
@@ -1324,6 +1341,8 @@ pub(crate) fn build_ag_ui_event_stream(
         history_warnings,
         state,
         events,
+        log_entries,
+        tokens_usage,
     } = subscription;
     let interrupt_outcome = match state {
         crate::session_actor::SessionState::Interrupted { pending, .. } => Some(pending.metadata),
@@ -1373,6 +1392,8 @@ pub(crate) fn build_ag_ui_event_stream(
             live_stream,
             is_active,
             interrupt_outcome,
+            log_entries.as_deref(),
+            tokens_usage,
         ),
     }
 }
@@ -1399,36 +1420,34 @@ pub async fn ag_ui_run_with_call_fn(
         session: session.to_string(),
     };
     let handle = registry.get_or_spawn(key);
+    let is_resume = !resume.is_empty();
+    for decision in resume {
+        crate::ag_ui_rpc::route_hitl_decision(
+            &handle,
+            decision.interrupt_id,
+            matches!(
+                decision.status,
+                crate::interrupt_resume::InterruptResumeStatus::Approved
+            ),
+            decision.payload.reason,
+        )
+        .await
+        .map_err(AgUiError::Internal)?;
+    }
     let subscription = subscribe(&handle).await;
     let unsubscribe_guard = UnsubscribeOnDrop {
         handle: handle.clone(),
     };
     let subscribed_state = subscription.state.clone();
     let local_is_active = session_state_is_active(&subscribed_state);
-    let fresh_user_prompt = resume
-        .is_empty()
+    let requested_prompt = (!is_resume)
         .then(|| pending_user_prompt(&run_input, &subscription.snapshot))
         .flatten();
-    let requested_prompt = if resume.is_empty() {
-        fresh_user_prompt
-    } else {
-        let pending_text = validate_resume(&resume, &subscribed_state)
-            .map_err(|err| AgUiError::BadRequest(format!("invalid AG-UI resume: {err}")))?;
-        Some(pending_text.to_string())
-    };
     let thread_id = derive_thread_id(session);
     let thread_id_text = thread_id.to_string();
 
     if let Some(text) = requested_prompt.as_deref() {
-        let _ = prompt(
-            &handle,
-            text,
-            SessionPromptOptions {
-                resume,
-                ..SessionPromptOptions::default()
-            },
-        )
-        .await;
+        let _ = prompt(&handle, text, SessionPromptOptions::default()).await;
     }
 
     let stream = if let Some(stream) = crate::ag_ui_remote_follow::resolve_event_stream(
@@ -1688,6 +1707,210 @@ fn history_role_for_client(role: &Role) -> MessageRole {
         Role::User => MessageRole::User,
         Role::Tool => MessageRole::Tool,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Control-state hydration for promptless subscribe
+// ---------------------------------------------------------------------------
+
+/// Emit CUSTOM events for control entries found in the durable log.
+///
+/// This function scans the durable session log and emits AG-UI CUSTOM events
+/// for control entries (HandoffCommitted, TurnEnd with usage, SubAgentStarted)
+/// so clients can reconstruct control state on promptless attach.
+///
+/// Verticals (t2-handoff, t3-usage, t4-subagent) plug in by adding their
+/// SessionLogEntry → Event::Custom mappings here.
+///
+/// # Marker identity
+///
+/// Each emitted CUSTOM event MUST carry a marker-identity field so clients
+/// can dedupe hydrated vs live events. Hydrated events replay the same shapes
+/// the live path uses, plus the marker id.
+///
+/// - `session_handoff`: `handoff_tool_call_id` (hydrated adds this; live path lacks it)
+/// - `usage`: (emitted with same shape as live path; context computed by caller)
+/// - `sub_agent_started`: `invocation_id` (already in live shape)
+pub(crate) fn control_snapshot_events(
+    entries: &[(u64, harnx_core::session::SessionLogEntry)],
+    tokens_usage: Option<&UsageContextSnapshot>,
+) -> Vec<Event> {
+    let mut events = Vec::new();
+    for (_seq, entry) in entries {
+        match entry {
+            harnx_core::session::SessionLogEntry::HandoffCommitted {
+                target_agent,
+                target_session_id,
+                handoff_tool_call_id,
+            } => {
+                // Hydrated handoff includes marker identity for dedupe
+                events.push(Event::Custom(CustomEvent {
+                    base: BaseEvent {
+                        timestamp: None,
+                        raw_event: None,
+                    },
+                    name: "session_handoff".to_string(),
+                    value: json!({
+                        "agent": target_agent,
+                        "session_id": target_session_id,
+                        "handoff_tool_call_id": handoff_tool_call_id,
+                    }),
+                }));
+            }
+            harnx_core::session::SessionLogEntry::TurnEnd {
+                usage: Some(usage), ..
+            } => {
+                // Hydrate usage as "usage" CUSTOM event matching live path shape.
+                // Context fields (context_tokens, max_context_tokens, context_percent)
+                // are recomputed server-side from the reconstructed session state.
+                let mut value = json!({
+                    "input": usage.input_tokens,
+                    "output": usage.output_tokens,
+                    "cached": usage.cached_tokens,
+                    "cache_write": usage.cache_write_tokens,
+                });
+                // Augment with context fields from reconstructed session state
+                if let Some(context) = tokens_usage {
+                    value["context_tokens"] = json!(context.context_tokens);
+                    if let Some(max) = context.max_context_tokens {
+                        value["max_context_tokens"] = json!(max);
+                    }
+                    if let Some(percent) = context.context_percent {
+                        value["context_percent"] = json!(percent);
+                    }
+                }
+                events.push(Event::Custom(CustomEvent {
+                    base: BaseEvent {
+                        timestamp: None,
+                        raw_event: None,
+                    },
+                    name: "usage".to_string(),
+                    value,
+                }));
+            }
+            harnx_core::session::SessionLogEntry::SubAgentStarted {
+                agent,
+                session_id,
+                invocation_id,
+                tool_call_id,
+                started_at,
+            } => {
+                // Hydrate sub-agent start with marker identity
+                events.push(Event::Custom(CustomEvent {
+                    base: BaseEvent {
+                        timestamp: None,
+                        raw_event: None,
+                    },
+                    name: "sub_agent_started".to_string(),
+                    value: json!({
+                        "agent": agent,
+                        "session_id": session_id,
+                        "invocation_id": invocation_id,
+                        "tool_call_id": tool_call_id,
+                        "started_at": started_at.map(|t| t.to_rfc3339()),
+                    }),
+                }));
+            }
+            // Extension point for additional SessionLogEntry variants handled here.
+            _ => {}
+        }
+    }
+
+    // Derive pending HITL approvals by pairing each decision with the latest
+    // preceding unmatched request occurrence for that provider tool-call ID.
+    let pending_approvals = derive_pending_hitl_approvals(entries);
+    events.extend(pending_approvals);
+
+    events
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingHitlApproval {
+    tool_call_id: String,
+    summary: String,
+}
+
+fn pending_hitl_approvals(
+    entries: &[(u64, harnx_core::session::SessionLogEntry)],
+) -> Vec<PendingHitlApproval> {
+    use harnx_core::session::SessionLogEntry;
+
+    let mut pending = Vec::new();
+    for (_, entry) in entries {
+        match entry {
+            SessionLogEntry::HitlApprovalRequested {
+                tool_call_id,
+                summary,
+                ..
+            } => pending.push(PendingHitlApproval {
+                tool_call_id: tool_call_id.clone(),
+                summary: summary.clone(),
+            }),
+            SessionLogEntry::HitlApprovalDecision { tool_call_id, .. } => {
+                if let Some(index) = pending
+                    .iter()
+                    .rposition(|request| request.tool_call_id == *tool_call_id)
+                {
+                    pending.remove(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    pending
+}
+
+/// Build minimal AG-UI interrupt outcome from unmatched durable approval requests.
+pub(crate) fn derive_hitl_interrupt_outcome(
+    entries: &[(u64, harnx_core::session::SessionLogEntry)],
+) -> Option<JsonValue> {
+    let interrupts = pending_hitl_approvals(entries)
+        .into_iter()
+        .map(|pending| {
+            json!({
+                "id": pending.tool_call_id,
+                "reason": "tool_call",
+                "toolCallId": pending.tool_call_id,
+                "message": pending.summary,
+                "responseSchema": {
+                    "type": "object",
+                    "properties": {
+                        "approved": { "type": "boolean" },
+                        "reason": { "type": "string" }
+                    },
+                    "required": ["approved"]
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    (!interrupts.is_empty()).then(|| {
+        json!({
+            "type": "interrupt",
+            "interrupts": interrupts,
+        })
+    })
+}
+
+/// Derive pending HITL approval events from unmatched durable approval requests.
+fn derive_pending_hitl_approvals(
+    entries: &[(u64, harnx_core::session::SessionLogEntry)],
+) -> Vec<Event> {
+    pending_hitl_approvals(entries)
+        .into_iter()
+        .map(|pending| {
+            Event::Custom(CustomEvent {
+                base: BaseEvent {
+                    timestamp: None,
+                    raw_event: None,
+                },
+                name: "hitl_pending_approval".to_string(),
+                value: json!({
+                    "tool_call_id": pending.tool_call_id,
+                    "summary": pending.summary,
+                }),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

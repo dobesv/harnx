@@ -1,13 +1,36 @@
 import type { UsageData } from './UsageContext';
 import { setDocumentTitle } from './sessionTitle';
 
+/** Global map tracking consumed handoff markers to prevent re-navigation. */
+const consumedHandoffs = new Map<string, Set<string>>();
+
+/** Check if a handoff marker has been consumed for a source session. */
+export function isHandoffConsumed(sourceSessionId: string, handoffToolCallId: string): boolean {
+  const sessionSet = consumedHandoffs.get(sourceSessionId);
+  return sessionSet?.has(handoffToolCallId) ?? false;
+}
+
+/** Mark a handoff marker as consumed for a source session. */
+export function markHandoffConsumed(sourceSessionId: string, handoffToolCallId: string): void {
+  let sessionSet = consumedHandoffs.get(sourceSessionId);
+  if (!sessionSet) {
+    sessionSet = new Set();
+    consumedHandoffs.set(sourceSessionId, sessionSet);
+  }
+  sessionSet.add(handoffToolCallId);
+}
+
 export interface HarnxCustomEventCallbacks {
   onStatus: (text: string | null) => void;
   onRunFailed: (message: string) => void;
   onUsage: (usage: UsageData) => void;
   onToolSummary: (id: string, summary: string) => void;
   onHandoff?: (agent: string, sessionId: string) => void;
+  /** Called when a hitl_pending_approval CUSTOM event is received. */
+  onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
   isRunActive: boolean;
+  /** Source session ID for handoff deduplication (set by ChatProvider). */
+  sourceSessionId?: string;
 }
 
 type CustomEventHandler = (callbacks: HarnxCustomEventCallbacks, value: unknown) => void;
@@ -49,11 +72,12 @@ function isUsageData(value: unknown): value is UsageData {
   );
 }
 
-function handoffTarget(value: unknown): [string, string] | undefined {
+function handoffTarget(value: unknown): { agent: string; sessionId: string; toolCallId?: string } | undefined {
   const handoff = eventRecord(value);
   const agent = nonBlankString(handoff.agent);
   const sessionId = nonBlankString(handoff.session_id);
-  return agent && sessionId ? [agent, sessionId] : undefined;
+  const toolCallId = nonBlankString(handoff.handoff_tool_call_id);
+  return agent && sessionId ? { agent, sessionId, toolCallId } : undefined;
 }
 
 const handlers: Record<string, CustomEventHandler> = {
@@ -82,9 +106,27 @@ const handlers: Record<string, CustomEventHandler> = {
     callbacks.onRunFailed(message);
   },
   session_handoff: (callbacks, value) => {
-    if (!callbacks.isRunActive) return;
     const target = handoffTarget(value);
-    if (target) callbacks.onHandoff?.(...target);
+    if (!target) return;
+
+    // If we have a marker id and source session, check deduplication state
+    if (target.toolCallId && callbacks.sourceSessionId) {
+      if (isHandoffConsumed(callbacks.sourceSessionId, target.toolCallId)) {
+        // Already navigated for this handoff
+        return;
+      }
+      // Mark as consumed before navigating
+      markHandoffConsumed(callbacks.sourceSessionId, target.toolCallId);
+    }
+
+    // Fire for both live (isRunActive=true) and hydrated (isRunActive=false) events
+    callbacks.onHandoff?.(target.agent, target.sessionId);
+  },
+  hitl_pending_approval: (callbacks, value) => {
+    const toolCallId = stringField(value, 'tool_call_id');
+    const summary = stringField(value, 'summary') || '';
+    if (!toolCallId) return;
+    callbacks.onHitlPendingApproval?.(toolCallId, summary);
   },
 };
 

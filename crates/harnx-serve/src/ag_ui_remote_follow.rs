@@ -23,6 +23,8 @@ use tokio::sync::{
 };
 use tokio_stream::{Stream, StreamExt as _};
 
+use crate::ag_ui::UsageContextSnapshot;
+
 use crate::{
     ag_ui::{frame_event, snapshot_event, AgUiError, AgUiSink},
     ag_ui_sync::{frame_run_boundary_event, history_warning_event},
@@ -170,9 +172,19 @@ async fn build_remote_follow_event_stream(
     let through_seq = last_user_sequence(event_stream.history());
 
     if turn_ended(event_stream.history(), through_seq) {
+        // Idle remote session: control-state hydration from durable log
+        // Compute usage context from the reconstructed session (same as local actor path)
+        let tokens_usage = compute_usage_context(params.config, params.session_id).await;
+        let control_events =
+            super::ag_ui::control_snapshot_events(event_stream.history(), tokens_usage.as_ref());
+        let control_frames: Vec<Bytes> = control_events
+            .into_iter()
+            .filter_map(|e| super::ag_ui::frame_event(&e).ok().map(Bytes::from))
+            .collect();
         return Ok(completed_remote_stream(
             started_frame,
             params.snapshot_frame,
+            control_frames,
             params.thread_id,
             params.run_id,
         ));
@@ -213,6 +225,17 @@ fn build_live_follow_stream(params: LiveFollowParams) -> AgUiEventStream {
     let finished = Arc::new(Notify::new());
     let (tx, rx) = tokio::sync::mpsc::channel(FRAME_CHANNEL_SIZE);
 
+    // Control-state hydration for remote-follow: emit control CUSTOM events after snapshot
+    // Use history before spawning the follow task (which takes ownership of event_stream)
+    // Note: For live-follow, we don't recompute context here since the session may still be
+    // actively running on the remote worker. Context will be computed when the follow
+    // transitions to idle and the session is fully reconstructed.
+    let control_events = super::ag_ui::control_snapshot_events(params.event_stream.history(), None);
+    let control_frames: Vec<Bytes> = control_events
+        .into_iter()
+        .filter_map(|e| super::ag_ui::frame_event(&e).ok().map(Bytes::from))
+        .collect();
+
     spawn_follow_task(FollowTaskParams {
         event_stream: params.event_stream,
         jetstream: params.jetstream,
@@ -224,7 +247,8 @@ fn build_live_follow_stream(params: LiveFollowParams) -> AgUiEventStream {
 
     let initial_frames = vec![params.started_frame]
         .into_iter()
-        .chain(params.snapshot_frame);
+        .chain(params.snapshot_frame)
+        .chain(control_frames);
     let event_frames = tokio_stream::wrappers::ReceiverStream::new(rx);
     let finished_stream = finished_event_stream(finished, params.thread_id, params.run_id);
 
@@ -235,9 +259,10 @@ fn build_live_follow_stream(params: LiveFollowParams) -> AgUiEventStream {
     )
 }
 
-fn completed_remote_stream(
+pub(crate) fn completed_remote_stream(
     started_frame: Bytes,
     snapshot_frame: Option<Bytes>,
+    control_frames: Vec<Bytes>,
     thread_id: &str,
     run_id: &str,
 ) -> AgUiEventStream {
@@ -245,6 +270,7 @@ fn completed_remote_stream(
     let frames: Vec<Bytes> = vec![started_frame]
         .into_iter()
         .chain(snapshot_frame)
+        .chain(control_frames)
         .chain(std::iter::once(finished_frame))
         .collect();
     Box::pin(tokio_stream::iter(frames))
@@ -456,4 +482,27 @@ impl AgUiSink {
     ) -> Self {
         Self::with_snapshot(tx, message_id, false, None)
     }
+}
+
+/// Compute usage context snapshot by loading the session from NATS.
+///
+/// This mirrors the logic in `session_actor::refresh_history_snapshot` for the remote-follow
+/// path where we don't have a local actor. The session is reconstructed from the durable log
+/// and context tokens are computed from `session.tokens_usage()` plus `model.max_input_tokens()`.
+async fn compute_usage_context(config: &Config, session_id: &str) -> Option<UsageContextSnapshot> {
+    // Load session from NATS - same function used by session_actor
+    let session = match crate::load_nats_session(config, session_id).await {
+        Ok((s, _entries)) => s,
+        Err(_) => return None,
+    };
+
+    // Compute context exactly as session_actor does
+    let (context_tokens, context_percent) = session.tokens_usage();
+    let max_context_tokens = session.model().max_input_tokens();
+
+    Some(UsageContextSnapshot {
+        context_tokens,
+        max_context_tokens,
+        context_percent: max_context_tokens.map(|_| context_percent),
+    })
 }

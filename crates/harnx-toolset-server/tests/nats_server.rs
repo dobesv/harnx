@@ -31,6 +31,7 @@ async fn assert_idempotent_replay(harness: &TestHarness) -> Result<()> {
         tool: "echo".to_string(),
         args: json!({ "value": 42 }),
         parent_session_id: None,
+        tool_call_id: None,
         capabilities: Default::default(),
     };
     for _ in 0..2 {
@@ -66,6 +67,7 @@ async fn assert_execution_context_capability_is_per_request(harness: &TestHarnes
         tool: "echo".to_string(),
         args: args.clone(),
         parent_session_id: None,
+        tool_call_id: None,
         capabilities: BTreeSet::from([EXECUTION_CONTEXT_NAMESPACE.to_string()]),
     };
     let message = harness
@@ -87,6 +89,7 @@ async fn assert_execution_context_capability_is_per_request(harness: &TestHarnes
         tool: "echo".to_string(),
         args,
         parent_session_id: None,
+        tool_call_id: None,
         capabilities: BTreeSet::new(),
     };
     let message = harness
@@ -114,6 +117,7 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
         tool: "echo".to_string(),
         args: args.clone(),
         parent_session_id: None,
+        tool_call_id: None,
         capabilities: Default::default(),
     };
     let second = ToolRequest {
@@ -121,6 +125,7 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
         tool: "echo".to_string(),
         args: args.clone(),
         parent_session_id: None,
+        tool_call_id: None,
         capabilities: Default::default(),
     };
     let first_call = harness.client.request_with_headers(
@@ -189,6 +194,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
         tool: "echo".to_string(),
         args: json!({}),
         parent_session_id: None,
+        tool_call_id: None,
         capabilities: Default::default(),
     };
     request_early_failure(
@@ -203,6 +209,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
         tool: "echo".to_string(),
         args: json!({}),
         parent_session_id: None,
+        tool_call_id: None,
         capabilities: Default::default(),
     };
     let mut headers = async_nats::HeaderMap::new();
@@ -222,6 +229,7 @@ async fn assert_cancellation(harness: &TestHarness) -> Result<()> {
         tool: "slow".to_string(),
         args: json!({}),
         parent_session_id: None,
+        tool_call_id: None,
         capabilities: Default::default(),
     };
     let slow_request = harness.client.request_with_headers(
@@ -421,6 +429,7 @@ async fn shutdown_drains_in_flight_requests_before_deregistering() -> Result<()>
         tool: "echo".to_string(),
         args: json!({"delay_ms": 500}),
         parent_session_id: None,
+        tool_call_id: None,
         capabilities: Default::default(),
     };
     let delayed_request = harness.client.request_with_headers(

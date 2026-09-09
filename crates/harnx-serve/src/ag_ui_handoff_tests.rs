@@ -34,6 +34,7 @@ fn splits_requested_and_committed_handoff_events() {
     sink.emit(AgentEvent::Session(SessionEvent::HandoffCommitted {
         agent: "target-agent".to_string(),
         session_id: "target-session-123".to_string(),
+        handoff_tool_call_id: "call-test-1".to_string(),
     }));
     sink.emit(AgentEvent::Turn(TurnEvent::Ended {
         outcome: harnx_core::event::TurnOutcome::default(),
@@ -53,6 +54,7 @@ fn nested_handoff_commit_does_not_navigate() {
         event: Box::new(AgentEvent::Session(SessionEvent::HandoffCommitted {
             agent: "nested-target".to_string(),
             session_id: "nested-session".to_string(),
+            handoff_tool_call_id: "call-nested-1".to_string(),
         })),
     });
     assert!(

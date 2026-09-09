@@ -37,10 +37,16 @@ pub(super) const SESSION_TOOL_SERVER_START_TIMEOUT: Duration = Duration::from_se
 /// Borrowed parameters for [`WorkerRuntime::spawn_control_listener`].
 struct ControlListenerCtx<'a> {
     client: &'a async_nats::Client,
+    jetstream: &'a jetstream::Context,
     session_id: &'a str,
     lease: &'a Arc<NatsSessionLease>,
     backend: &'a NatsSessionLogBackend,
     abort_signal: &'a crate::utils::AbortSignal,
+}
+
+struct PreparedControl {
+    task: JoinHandle<()>,
+    hitl_decision_rx: tokio::sync::mpsc::UnboundedReceiver<super::control::AppliedHitlDecision>,
 }
 
 /// Borrowed parameters for [`WorkerRuntime::prepare_and_ack_activation`].
@@ -61,7 +67,7 @@ struct PreparedActivation {
     activation: SessionActivate,
     lease: Arc<NatsSessionLease>,
     abort_signal: crate::utils::AbortSignal,
-    control_task: JoinHandle<()>,
+    control: PreparedControl,
     span: tracing::Span,
 }
 
@@ -343,10 +349,11 @@ impl WorkerRuntime {
         activation: &SessionActivate,
         lease: &Arc<NatsSessionLease>,
         abort_signal: &crate::utils::AbortSignal,
-    ) -> Result<JoinHandle<()>> {
+    ) -> Result<PreparedControl> {
         let backend = NatsSessionLogBackend::new(self.jetstream.clone(), &activation.session_id);
         match Self::spawn_control_listener(ControlListenerCtx {
             client: &self.client,
+            jetstream: &self.jetstream,
             session_id: &activation.session_id,
             lease,
             backend: &backend,
@@ -372,8 +379,8 @@ impl WorkerRuntime {
     async fn prepare_and_ack_activation(
         &self,
         ctx: ActivationAckCtx<'_>,
-    ) -> Result<JoinHandle<()>> {
-        let control_task = match self
+    ) -> Result<PreparedControl> {
+        let control = match self
             .prepare_activation_control(ctx.activation, ctx.lease, ctx.abort_signal)
             .await
         {
@@ -385,13 +392,13 @@ impl WorkerRuntime {
             }
         };
         if let Err(error) = ctx.message.ack().await {
-            control_task.abort();
+            control.task.abort();
             let _ = ctx.lease.release().await;
             self.end_session_tool_servers(&ctx.activation.session_id)
                 .await;
             return Err(anyhow::anyhow!("ack SessionActivate: {error}"));
         }
-        Ok(control_task)
+        Ok(control)
     }
 
     async fn prepare_claimed_activation(
@@ -421,7 +428,7 @@ impl WorkerRuntime {
         );
 
         let abort_signal = crate::utils::create_abort_signal();
-        let control_task = self
+        let control = self
             .prepare_and_ack_activation(ActivationAckCtx {
                 activation: &activation,
                 message,
@@ -433,7 +440,7 @@ impl WorkerRuntime {
             activation,
             lease,
             abort_signal,
-            control_task,
+            control,
             span,
         })
     }
@@ -443,7 +450,7 @@ impl WorkerRuntime {
             activation,
             lease,
             abort_signal,
-            control_task,
+            control,
             span,
         } = prepared;
         let worker = Arc::clone(self);
@@ -461,7 +468,13 @@ impl WorkerRuntime {
                     snapshot.active_sessions_per_worker
                 );
                 let result = worker
-                    .execute_session(activation, Arc::clone(&lease), abort_signal, control_task)
+                    .execute_session(
+                        activation,
+                        Arc::clone(&lease),
+                        abort_signal,
+                        control.task,
+                        control.hitl_decision_rx,
+                    )
                     .await;
                 worker.end_session_tool_servers(&task_session_id).await;
                 nats_metrics::active_session_finished();
@@ -593,7 +606,7 @@ impl WorkerRuntime {
     ///
     /// Returning only after `subscribe` completes is the ordering barrier used by
     /// activation handling before it acknowledges the non-durable work message.
-    async fn spawn_control_listener(ctx: ControlListenerCtx<'_>) -> Result<JoinHandle<()>> {
+    async fn spawn_control_listener(ctx: ControlListenerCtx<'_>) -> Result<PreparedControl> {
         let ctrl_subject = control_subject(ctx.session_id);
         let subscriber = ctx
             .client
@@ -609,9 +622,20 @@ impl WorkerRuntime {
         // A request/reply acknowledgement is sent only after the worker has
         // written the fenced Cancel entry. It is published before firing abort
         // so execute_session cannot tear down this listener in between.
-        let handler =
-            SessionControlHandler::new(ctx.client, ctx.lease, ctx.backend, ctx.abort_signal);
-        Ok(tokio::spawn(handler.listen(subscriber)))
+        let (hitl_decision_tx, hitl_decision_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler = SessionControlHandler::new(
+            ctx.client,
+            ctx.jetstream,
+            ctx.session_id,
+            ctx.lease,
+            ctx.backend,
+            ctx.abort_signal,
+            hitl_decision_tx,
+        );
+        Ok(PreparedControl {
+            task: tokio::spawn(handler.listen(subscriber)),
+            hitl_decision_rx,
+        })
     }
 }
 

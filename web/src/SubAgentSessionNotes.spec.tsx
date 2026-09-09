@@ -1,7 +1,20 @@
 import { fireEvent, render, screen } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, afterEach } from 'vitest';
 import { SubAgentSessionNotes } from './SubAgentSessionNotes';
 import type { SubAgentNote } from './subAgentNotes';
+import { HarnxHttpAgent } from './ChatProvider';
+import { SubAgentNotesContext } from './SubAgentNotesContext';
+
+vi.mock('./ChatProvider', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./ChatProvider')>();
+  return {
+    ...actual,
+    HarnxHttpAgent: vi.fn().mockImplementation(function(this: any, options: any) {
+      this.runAgent = vi.fn();
+      this.simulateEvent = (event: unknown) => options.onSubAgentEvent(event);
+    }),
+  };
+});
 
 const note = (
   status: SubAgentNote['status'],
@@ -21,6 +34,10 @@ const note = (
 });
 
 describe('SubAgentSessionNotes', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
   it('shows the full identity and running, done, and failed appearances', () => {
     const fullSessionId = '01948a3f-7b1c-7123-8901-abcdef123456';
     render(
@@ -56,5 +73,70 @@ describe('SubAgentSessionNotes', () => {
 
     expect(onOpen).toHaveBeenCalledTimes(3);
     expect(onOpen).toHaveBeenLastCalledWith('researcher', 'child-session-done');
+  });
+
+  describe('ChildMetricsSubscriber', () => {
+    it('dispatches CHILD_TERMINAL with status done when RUN_FINISHED is received after grace period cleanly', () => {
+      const dispatch = vi.fn();
+      const runningNote: SubAgentNote = {
+        ...note('running', 'live-child'),
+        startedAtMs: Date.now() - 12000, // 12s ago, past 5s grace
+      };
+
+      render(
+        <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch }}>
+          <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
+        </SubAgentNotesContext.Provider>
+      );
+
+      const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
+      agentInstance.simulateEvent({ type: 'RUN_FINISHED' });
+
+      expect(dispatch).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'CHILD_TERMINAL', status: 'done' })
+      );
+    });
+
+    it('dispatches CHILD_TERMINAL with status failed when RUN_ERROR is received after grace period', () => {
+      const dispatch = vi.fn();
+      const runningNote: SubAgentNote = {
+        ...note('running', 'live-child'),
+        startedAtMs: Date.now() - 10000, // 10s ago, well past 5s grace
+      };
+
+      render(
+        <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch }}>
+          <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
+        </SubAgentNotesContext.Provider>
+      );
+
+      const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
+      agentInstance.simulateEvent({ type: 'RUN_ERROR' });
+
+      expect(dispatch).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'CHILD_TERMINAL', status: 'failed' })
+      );
+    });
+
+    it('ignores RUN_FINISHED when received during startup grace period', () => {
+      const dispatch = vi.fn();
+      const runningNote: SubAgentNote = {
+        ...note('running', 'live-child'),
+        startedAtMs: Date.now() - 1000, // 1s ago, within 5s grace
+      };
+
+      render(
+        <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch }}>
+          <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
+        </SubAgentNotesContext.Provider>
+      );
+
+      const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
+      agentInstance.simulateEvent({ type: 'RUN_FINISHED' });
+
+      expect(dispatch).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'CHILD_TERMINAL' })
+      );
+    });
   });
 });

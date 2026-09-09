@@ -51,16 +51,26 @@ export const RuntimeSessionSubscriber = ({
     // real setup, which must re-arm hydration rather than inherit a stale guard.
     scheduleRefresh();
 
-    const events = new EventSource(eventsUrl);
-    events.addEventListener('session-updated', scheduleRefresh);
-    return () => {
-      disposed = true;
-      events.close();
-      if (timerRef.current !== null) {
-        clearTimeout(timerRef.current);
-        timerRef.current = null;
-      }
-    };
+    if (typeof EventSource !== 'undefined') {
+      const events = new EventSource(eventsUrl);
+      events.addEventListener('session-updated', scheduleRefresh);
+      return () => {
+        disposed = true;
+        events.close();
+        if (timerRef.current !== null) {
+          clearTimeout(timerRef.current);
+          timerRef.current = null;
+        }
+      };
+    } else {
+      return () => {
+        disposed = true;
+        if (timerRef.current !== null) {
+          clearTimeout(timerRef.current);
+          timerRef.current = null;
+        }
+      };
+    }
   }, [enabled, eventsUrl]);
 
   return null;

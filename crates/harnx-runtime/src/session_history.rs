@@ -41,6 +41,9 @@ pub fn entry_type(entry: &SessionLogEntry) -> &'static str {
         SessionLogEntry::Error { .. } => "error",
         SessionLogEntry::TurnEnd { .. } => "turn_end",
         SessionLogEntry::SubAgentStarted { .. } => "sub_agent_started",
+        SessionLogEntry::HandoffCommitted { .. } => "handoff_committed",
+        SessionLogEntry::HitlApprovalRequested { .. } => "hitl_approval_requested",
+        SessionLogEntry::HitlApprovalDecision { .. } => "hitl_approval_decision",
         SessionLogEntry::EditEntries { .. } => "edit_entries",
         SessionLogEntry::Rewind { .. } => "rewind",
         SessionLogEntry::Unknown => "unknown",
@@ -70,9 +73,34 @@ fn entry_searchable_text(entry: &SessionLogEntry) -> String {
             agent,
             session_id,
             invocation_id,
+            tool_call_id,
+            started_at,
         } => format!(
-            "{agent}\n{session_id}\n{}",
-            invocation_id.as_deref().unwrap_or_default()
+            "{agent}\n{session_id}\n{}\n{}\n{}",
+            invocation_id.as_deref().unwrap_or_default(),
+            tool_call_id.as_deref().unwrap_or_default(),
+            started_at
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_default()
+        ),
+        SessionLogEntry::HandoffCommitted {
+            target_agent,
+            target_session_id,
+            handoff_tool_call_id,
+        } => format!("{target_agent}\n{target_session_id}\n{handoff_tool_call_id}"),
+        SessionLogEntry::HitlApprovalRequested {
+            tool_call_id,
+            summary,
+            ..
+        } => format!("{tool_call_id}\n{summary}"),
+        SessionLogEntry::HitlApprovalDecision {
+            tool_call_id,
+            approved,
+            note,
+            ..
+        } => format!(
+            "{tool_call_id}\n{approved}\n{}",
+            note.as_deref().unwrap_or_default()
         ),
         _ => String::new(),
     }
@@ -179,7 +207,7 @@ pub fn tool_declaration() -> ToolDeclaration {
         "properties": {
             "index_min": {"type": "integer", "description": "Minimum log entry seq (inclusive)."},
             "index_max": {"type": "integer", "description": "Maximum log entry seq (inclusive)."},
-            "type": {"type": "string", "description": "Filter by entry type: message, tool_calls, tool_results, sub_agent_started, compress, header, data_urls, clear, edit_entries, rewind."},
+            "type": {"type": "string", "description": "Filter by entry type: message, tool_calls, tool_results, sub_agent_started, handoff_committed, hitl_approval_requested, hitl_approval_decision, compress, data_urls, clear, cancel, error, turn_end, edit_entries, rewind, unknown."},
             "tool_name": {"type": "string", "description": "Keep only entries referencing this tool name."},
             "text_regex": {"type": "string", "description": "Keep entries whose rendered text matches this regular expression."},
             "limit": {"type": "integer", "description": "Maximum number of rows to return."},
@@ -324,6 +352,8 @@ mod tests {
             agent: "pantheon/plato".into(),
             session_id: "child-123".into(),
             invocation_id: Some("invocation-456".into()),
+            tool_call_id: Some("call-789".into()),
+            started_at: None,
         };
 
         assert_eq!(entry_type(&entry), "sub_agent_started");
@@ -331,6 +361,38 @@ mod tests {
         assert!(text.contains("pantheon/plato"));
         assert!(text.contains("child-123"));
         assert!(text.contains("invocation-456"));
+    }
+
+    #[test]
+    fn durable_control_entries_are_typed_and_searchable() {
+        let entries = [
+            SessionLogEntry::HandoffCommitted {
+                target_agent: "pantheon/plato".into(),
+                target_session_id: "target-123".into(),
+                handoff_tool_call_id: "handoff-call".into(),
+            },
+            SessionLogEntry::HitlApprovalRequested {
+                tool_call_id: "call-request".into(),
+                summary: "Approve write".into(),
+                fence_token: 1,
+            },
+            SessionLogEntry::HitlApprovalDecision {
+                tool_call_id: "call-decision".into(),
+                approved: false,
+                note: Some("Narrow the path".into()),
+                fence_token: 1,
+            },
+        ];
+
+        let expected = [
+            ("handoff_committed", "handoff-call"),
+            ("hitl_approval_requested", "Approve write"),
+            ("hitl_approval_decision", "Narrow the path"),
+        ];
+        for (entry, (expected_type, expected_text)) in entries.iter().zip(expected) {
+            assert_eq!(entry_type(entry), expected_type);
+            assert!(entry_searchable_text(entry).contains(expected_text));
+        }
     }
 
     fn sample_entries() -> Vec<(usize, SessionLogEntry)> {
