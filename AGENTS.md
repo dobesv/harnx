@@ -250,6 +250,21 @@ metrics use a **separate mechanism**: `record_completion_usage` in `config/mod.r
 `Session.completion_usage` per model call. These mechanisms are independent. Anyone modifying usage
 display must keep them separate or they'll double-count.
 
+### TUI printable-character keybindings with SHIFT-tolerant matching
+
+Crossterm may report shifted printable characters (`<`, `>`, `G`) with `KeyModifiers::SHIFT` set on
+some terminals. Binding these characters with strict `KeyModifiers::NONE` causes the match arm to
+silently never fire.
+
+Pattern for shift-sensitive char bindings:
+```rust
+(KeyCode::Char('g' | '<') | KeyCode::Home, KeyModifiers::NONE | KeyModifiers::SHIFT) => { ... }
+```
+
+Accept `NONE | SHIFT` on char arms (not CONTROL/ALT combinations). Home/End keycodes don't need
+SHIFT tolerance — they're not char keys. See AgentPicker in `input.rs` for the `||` guard variant,
+and jump-key handlers in `detail_view.rs`/`input.rs`/`subagent_sessions.rs` for the or-pattern form.
+
 ## Issue/task tracker
 
 GitHub Issues is the issue/task tracker for this project.

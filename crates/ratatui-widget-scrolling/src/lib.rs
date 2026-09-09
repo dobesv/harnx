@@ -73,6 +73,26 @@ impl ScrollState {
         value_change
     }
 
+    /// Jump to the top of the scrollable content.
+    /// Sets `position` to 0 and disables follow mode.
+    /// Returns whether `position` actually changed.
+    pub const fn scroll_to_top(&mut self) -> bool {
+        self.follow = false;
+        let changed = self.position != 0;
+        self.position = 0;
+        changed
+    }
+
+    /// Jump to the bottom of the scrollable content.
+    /// Sets `position` to `last_max_position` and enables follow mode.
+    /// Returns whether `position` actually changed.
+    pub const fn scroll_to_bottom(&mut self) -> bool {
+        self.follow = true;
+        let changed = self.position != self.last_max_position;
+        self.position = self.last_max_position;
+        changed
+    }
+
     /// Copy the height cache from `other` into `self`.
     ///
     /// This is used when a secondary scroll view (e.g. the browsing-mode overlay)
@@ -1195,6 +1215,53 @@ mod tests {
         assert_eq!(
             pos, 0,
             "content fits after shrinking, so position clamps to 0"
+        );
+    }
+
+    #[test]
+    fn scroll_to_top_and_bottom() {
+        let mut state = ScrollState::new();
+        state.last_max_position = 10;
+        state.position = 5;
+        state.follow = true;
+
+        // scroll_to_top: should set position to 0 and follow to false
+        let changed = state.scroll_to_top();
+        assert!(
+            changed,
+            "scroll_to_top should return true when position changes"
+        );
+        assert_eq!(state.position, 0, "scroll_to_top should set position to 0");
+        assert!(!state.follow, "scroll_to_top should set follow to false");
+
+        // scroll_to_top again: should return false (no change)
+        let changed_again = state.scroll_to_top();
+        assert!(
+            !changed_again,
+            "scroll_to_top should return false when already at top"
+        );
+
+        // Reset to mid position
+        state.position = 5;
+        state.follow = false;
+
+        // scroll_to_bottom: should set position to last_max_position and follow to true
+        let changed_bottom = state.scroll_to_bottom();
+        assert!(
+            changed_bottom,
+            "scroll_to_bottom should return true when position changes"
+        );
+        assert_eq!(
+            state.position, 10,
+            "scroll_to_bottom should set position to last_max_position"
+        );
+        assert!(state.follow, "scroll_to_bottom should set follow to true");
+
+        // scroll_to_bottom again: should return false (no change)
+        let changed_bottom_again = state.scroll_to_bottom();
+        assert!(
+            !changed_bottom_again,
+            "scroll_to_bottom should return false when already at bottom"
         );
     }
 }

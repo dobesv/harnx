@@ -74,6 +74,15 @@ impl Tui {
             }
             (KeyCode::PageUp, KeyModifiers::NONE) => scroll_detail(&mut self.app, true),
             (KeyCode::PageDown, KeyModifiers::NONE) => scroll_detail(&mut self.app, false),
+            (
+                KeyCode::Char('g' | '<') | KeyCode::Home,
+                KeyModifiers::NONE | KeyModifiers::SHIFT,
+            ) => {
+                self.app.detail_view_scroll.scroll_to_top();
+            }
+            (KeyCode::Char('G' | '>') | KeyCode::End, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                self.app.detail_view_scroll.scroll_to_bottom();
+            }
             _ => return false,
         }
         true
@@ -115,7 +124,7 @@ pub(super) fn detail_view_content(app: &App) -> (Vec<Vec<Line<'static>>>, String
 
 pub(super) fn detail_view_footer_text(app: &App) -> String {
     if app.detail_view_entry.is_some() {
-        " ↑↓/scroll  PgUp/PgDn/scroll  ESC/back".to_string()
+        " ↑↓/scroll  PgUp/PgDn/scroll  g/G top/bot  ESC/back".to_string()
     } else if app
         .copy_notice_until
         .is_some_and(|deadline| std::time::Instant::now() < deadline)
