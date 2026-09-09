@@ -76,6 +76,11 @@ process isolation; `cargo test` shares one process and produces spurious
 failures. The tmux/interrupt e2e tests guard against this and will panic with a
 redirect message if run under `cargo test` (via `harnx_core::require_nextest()`).
 
+FD-redirection tests (e.g., `cli_event_sink.rs` `final_usage_is_standalone`)
+use `dup2` to capture stdout/stderr. Under `cargo test`, libtest's own capture
+intercepts writes before `dup2` sees them, yielding empty buffers and misleading
+test failures.
+
 **Do not skip any of these steps or you WILL miss problems**
 **Do not ignore clippy warnings.** CI sets `RUSTFLAGS=--deny warnings` and runs `cargo clippy -- -D warnings`, so any warning will fail the build.
 **CodeScene Health scores MUST NOT decrease as part of the change, only increase**
@@ -236,6 +241,14 @@ hold the lease for (e.g. sub-agent start entries in parent log).
 `TranscriptItem` (`harnx-tui/src/types.rs`) derives only `Clone + Debug` — it is **not** serialized to
 NATS. Adding a field or variant is a local TUI change, not a transcript-protocol change. Contrast
 with `SessionLogEntry` variants (previous section), which are protocol-versioned.
+
+## Usage Accounting Semantics
+
+`ModelEvent::Final.usage` (`harnx-core/src/event.rs:66-71`) is a **display-only per-turn total** that
+sums every model completion in that turn's tool loop. Session cumulative totals and status-bar
+metrics use a **separate mechanism**: `record_completion_usage` in `config/mod.rs:1082-1085` writes to
+`Session.completion_usage` per model call. These mechanisms are independent. Anyone modifying usage
+display must keep them separate or they'll double-count.
 
 ## Issue/task tracker
 

@@ -22,7 +22,6 @@ pub mod terminal;
 pub mod test_utils;
 mod tool_confirmation;
 pub mod types;
-mod usage;
 
 mod completion;
 mod detail_view;

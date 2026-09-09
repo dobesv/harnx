@@ -46,31 +46,6 @@ pub(crate) fn source_heading(source: &AgentSource) -> String {
     source.heading()
 }
 
-pub(crate) fn render_usage_line(
-    input_tokens: u64,
-    output_tokens: u64,
-    cached_tokens: u64,
-    session_label: Option<&str>,
-    source: Option<&AgentSource>,
-) -> Option<String> {
-    let mut parts = vec![];
-    if let Some(label) = session_label {
-        parts.push(label.to_string());
-    } else if let Some(source) = source {
-        parts.push(source_heading(source));
-    }
-    if input_tokens > 0 {
-        parts.push(format!("in {input_tokens}"));
-    }
-    if output_tokens > 0 {
-        parts.push(format!("out {output_tokens}"));
-    }
-    if cached_tokens > 0 {
-        parts.push(format!("cache {cached_tokens}"));
-    }
-    (!parts.is_empty()).then(|| parts.join("   "))
-}
-
 #[cfg(test)]
 mod markdown_tests {
     //! These tests pin the *behaviors* the templating system relies on:

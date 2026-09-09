@@ -79,7 +79,6 @@ fn transcript_footprint(items: &[TranscriptItem]) -> (usize, usize) {
             | TranscriptItem::ErrorText(s)
             | TranscriptItem::ThoughtText(s)
             | TranscriptItem::StatusLine(s)
-            | TranscriptItem::UsageLine(s)
             | TranscriptItem::AttachmentHeader(s)
             | TranscriptItem::AttachmentItem(s)
             | TranscriptItem::AttachmentPreviewLine(s)
@@ -116,8 +115,6 @@ fn build_initial_app(
         main_streamed_text_idx: None,
         cache_valid_width: None,
         last_ui_output_source: None,
-        last_usage_source: None,
-        last_usage_transcript_idx: None,
         pending_thought_source: None,
         pending_thought_text: String::new(),
         pending_tool_seq: None,
@@ -844,7 +841,6 @@ fn flatten_transcript_item_to_compaction_lines(item: &TranscriptItem, lines: &mu
         | TranscriptItem::ErrorText(text)
         | TranscriptItem::ThoughtText(text)
         | TranscriptItem::StatusLine(text)
-        | TranscriptItem::UsageLine(text)
         | TranscriptItem::AttachmentHeader(text)
         | TranscriptItem::AttachmentItem(text)
         | TranscriptItem::AttachmentPreviewLine(text)

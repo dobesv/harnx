@@ -1077,8 +1077,12 @@ impl Config {
     /// Record token usage without saving any new message — the
     /// round's transcript entries are being written separately by the
     /// split [`append_session_tool_calls`] / [`append_session_tool_results`]
-    /// pair.  Callers use this to keep `completion_usage` current on
+    /// pair. Callers use this to keep `completion_usage` current on
     /// the session while driving the two-phase save directly.
+    ///
+    /// This feeds session cumulative totals (`Session.completion_usage`) used by
+    /// the status bar. It is **unrelated** to `ModelEvent::Final.usage`, which is a
+    /// display-only per-turn sum.
     pub fn record_completion_usage(&mut self, usage: &crate::client::CompletionTokenUsage) {
         if let Some(session) = &mut self.session {
             session.add_completion_usage(usage);
