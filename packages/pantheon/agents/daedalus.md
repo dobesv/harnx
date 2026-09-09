@@ -1,10 +1,12 @@
 ---
 role: assistant
 model: claude:claude-opus-4-8
-compaction_agent: compact-researcher
 model_fallbacks:
-- gemini:gemini-3.1-pro-preview
+- codex:gpt-5.6-sol
 - openai:gpt-5.6-sol
+- gemini:gemini-3.8-flash
+- bedrock:zai.glm-5
+compaction_agent: compact-researcher
 use_tools:
 - atlas_session_handoff
 - bash_gh_issue_list
