@@ -214,7 +214,7 @@ fn scroll_focused_child_into_view(state: &mut MonitoredSessionState, area: Rect)
 
 fn render_child_footer(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
-        Paragraph::new(" ↑↓/browse  ENTER/open  PgUp/PgDn/scroll  ESC/back")
+        Paragraph::new(" ↑↓/browse  ENTER/open  PgUp/PgDn/scroll  g/G top/bot  ESC/back")
             .style(Style::default().fg(Color::DarkGray)),
         area,
     );

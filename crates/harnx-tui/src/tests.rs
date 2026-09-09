@@ -4883,6 +4883,387 @@ async fn test_tall_item_scroll_shows_correct_portion_and_no_dead_zone() {
     );
 }
 
+// ============================================================
+// Issue #948: Jump-to-top/bottom key tests (g/G/</>/Home/End)
+// ============================================================
+
+/// Test that detail viewer (viewer 1) jump-to-top/bottom keys work.
+/// Covers: Char key 'G' (bottom), Home (top), and SHIFT-modified 'g' (top).
+#[tokio::test]
+async fn test_detail_view_jump_keys() {
+    let mut harness = TuiTestHarness::with_size(40, 12).await;
+    harness.tui().clear_transcript();
+
+    // Create enough content to scroll (25 lines in a single item)
+    let lines: Vec<String> = (1..=25).map(|i| format!("detail line {i:02}")).collect();
+    let detail_text = lines.join("\n");
+
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: detail_text,
+            seq: None,
+            timestamp: None,
+            rendered_cache: None,
+        });
+    harness.tui().app.transcript_focus = Some(0);
+    harness.tui().open_detail_view_for_focused_item();
+
+    // Initial render to populate last_max_position
+    harness.render();
+
+    // Scroll to a mid position first
+    for _ in 0..5 {
+        harness.tui().app.detail_view_scroll.scroll_down();
+    }
+    let mid_position = harness.tui().app.detail_view_scroll.position;
+    assert!(mid_position > 0, "should have scrolled down from top");
+
+    // Test jump-to-bottom with 'G' (char key)
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    let bottom_pos = harness.tui().app.detail_view_scroll.position;
+    let max_pos = harness.tui().app.detail_view_scroll.last_max_position;
+    assert_eq!(
+        bottom_pos, max_pos,
+        "'G' should jump to bottom (last_max_position), got {bottom_pos} vs {max_pos}"
+    );
+    assert!(
+        harness.tui().app.detail_view_scroll.follow,
+        "'G' should enable follow mode"
+    );
+
+    // Scroll away from bottom
+    for _ in 0..3 {
+        harness.tui().app.detail_view_scroll.scroll_up();
+    }
+    assert!(harness.tui().app.detail_view_scroll.position < max_pos);
+
+    // Test jump-to-top with 'g' + SHIFT modifier (exercises SHIFT-tolerant match)
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::SHIFT))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.tui().app.detail_view_scroll.position,
+        0,
+        "Shift+g should jump to top"
+    );
+    assert!(
+        !harness.tui().app.detail_view_scroll.follow,
+        "jump-to-top should disable follow"
+    );
+
+    // Test jump-to-top with Home key (keycode)
+    // First scroll down a bit
+    for _ in 0..4 {
+        harness.tui().app.detail_view_scroll.scroll_down();
+    }
+    harness.render();
+    let before_home = harness.tui().app.detail_view_scroll.position;
+    assert!(before_home > 0, "should be scrolled down before Home");
+
+    // Home jumps to top
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.tui().app.detail_view_scroll.position,
+        0,
+        "Home should jump to top"
+    );
+    assert!(
+        !harness.tui().app.detail_view_scroll.follow,
+        "Home should disable follow"
+    );
+
+    // End jumps to bottom
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    let max_pos = harness.tui().app.detail_view_scroll.last_max_position;
+    assert_eq!(
+        harness.tui().app.detail_view_scroll.position,
+        max_pos,
+        "End should jump to bottom"
+    );
+    assert!(
+        harness.tui().app.detail_view_scroll.follow,
+        "End should enable follow"
+    );
+}
+
+/// Test that main transcript (viewer 2) jump keys work when transcript_focus is set.
+/// Enter focus state via Shift+Up (NOT plain Up which enters browsing mode).
+/// Covers: 'g' char key (top), End keycode (bottom).
+#[tokio::test]
+async fn test_main_transcript_jump_keys_with_focus() {
+    let mut harness = TuiTestHarness::with_size(40, 10).await;
+    harness.tui().clear_transcript();
+
+    // Create scrollable content (multiple items)
+    for i in 1..=20 {
+        harness
+            .tui()
+            .app
+            .transcript
+            .push(TranscriptItem::AssistantText {
+                text: format!("Transcript message {i:02}\nLine two of message {i:02}"),
+                seq: None,
+                timestamp: None,
+                rendered_cache: None,
+            });
+    }
+
+    harness.render();
+    let max_pos = harness.tui().app.scroll_state.last_max_position;
+    assert!(max_pos > 0, "content should be scrollable");
+
+    // Gain transcript focus via Shift+Up (sets focus, leaves browsing=false)
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT))
+        .await
+        .unwrap();
+
+    assert!(
+        harness.tui().app.transcript_focus.is_some(),
+        "Shift+Up should set transcript_focus"
+    );
+    assert!(
+        !harness.tui().app.transcript_browsing,
+        "Shift+Up should NOT enter browsing mode"
+    );
+
+    // Scroll down a bit first
+    for _ in 0..5 {
+        harness.tui().app.scroll_state.scroll_down();
+    }
+    harness.render();
+    let mid_position = harness.tui().app.scroll_state.position;
+    assert!(mid_position > 0, "should be scrolled down");
+
+    // Jump to top with 'g' char
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.tui().app.scroll_state.position,
+        0,
+        "'g' should jump to top"
+    );
+    assert!(
+        !harness.tui().app.scroll_state.follow,
+        "jump-to-top should disable follow"
+    );
+
+    // Scroll to bottom via End keycode
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    harness.render();
+    let max_pos = harness.tui().app.scroll_state.last_max_position;
+    assert_eq!(
+        harness.tui().app.scroll_state.position,
+        max_pos,
+        "End should jump to bottom"
+    );
+    assert!(
+        harness.tui().app.scroll_state.follow,
+        "jump-to-bottom should enable follow"
+    );
+}
+
+/// Test that main transcript jump keys do NOT fire without focus.
+/// Without focus, 'g' falls through to textarea (typed into input).
+#[tokio::test]
+async fn test_main_transcript_jump_keys_without_focus_no_op() {
+    let mut harness = TuiTestHarness::with_size(40, 10).await;
+    harness.tui().clear_transcript();
+
+    // Create content but DO NOT set focus
+    for i in 1..=10 {
+        harness
+            .tui()
+            .app
+            .transcript
+            .push(TranscriptItem::AssistantText {
+                text: format!("Message {i}"),
+                seq: None,
+                timestamp: None,
+                rendered_cache: None,
+            });
+    }
+    harness.render();
+
+    // Ensure no focus
+    assert!(
+        harness.tui().app.transcript_focus.is_none(),
+        "should start without focus"
+    );
+
+    // Scroll state should be at bottom (follow=true by default)
+    let initial_position = harness.tui().app.scroll_state.position;
+    let initial_follow = harness.tui().app.scroll_state.follow;
+
+    // Try to send 'g' (jump-to-top) - should fall through
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    // Position/follow should NOT have changed (g went to textarea, not scroll)
+    assert_eq!(
+        harness.tui().app.scroll_state.position,
+        initial_position,
+        "'g' without focus should not scroll"
+    );
+    assert_eq!(
+        harness.tui().app.scroll_state.follow,
+        initial_follow,
+        "'g' without focus should not change follow"
+    );
+
+    // 'G' should also not scroll
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.tui().app.scroll_state.position,
+        initial_position,
+        "'G' without focus should not scroll"
+    );
+}
+
+/// Test that browsing mode (viewer 3) jump keys work.
+/// Enter browsing via plain Up (sets focus AND browsing=true).
+/// Covers: '<' char key (top), '>' char key (bottom), SHIFT modifier.
+#[tokio::test]
+async fn test_browsing_mode_jump_keys() {
+    let mut harness = TuiTestHarness::with_size(60, 12).await;
+    harness.tui().clear_transcript();
+
+    // Create scrollable content
+    for i in 0..25usize {
+        harness.tui().app.transcript.push(TranscriptItem::UserText {
+            text: format!("Browsing item {i:02}"),
+            seq: None,
+            timestamp: None,
+        });
+    }
+
+    harness.render();
+
+    // Enter browsing mode via plain Up
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(
+        harness.tui().app.transcript_browsing,
+        "plain Up should enter browsing mode"
+    );
+    assert!(
+        harness.tui().app.transcript_focus.is_some(),
+        "Up should set transcript_focus"
+    );
+
+    // Render browsing view
+    harness.render();
+    let max_pos = harness.tui().app.browsing_view_scroll.last_max_position;
+    assert!(max_pos > 0, "browsing view should be scrollable");
+
+    // Scroll down a bit
+    for _ in 0..5 {
+        harness.tui().app.browsing_view_scroll.scroll_down();
+    }
+    harness.render();
+    let mid_pos = harness.tui().app.browsing_view_scroll.position;
+    assert!(mid_pos > 0, "should be scrolled down in browsing");
+
+    // Test jump-to-top with '<' char key + SHIFT modifier
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::SHIFT))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.tui().app.browsing_view_scroll.position,
+        0,
+        "Shift+< should jump to top in browsing"
+    );
+    assert!(
+        !harness.tui().app.browsing_view_scroll.follow,
+        "jump-to-top should disable follow"
+    );
+
+    // Test jump-to-bottom with '>' char key
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    harness.render();
+    let max_pos = harness.tui().app.browsing_view_scroll.last_max_position;
+    assert_eq!(
+        harness.tui().app.browsing_view_scroll.position,
+        max_pos,
+        "'>' should jump to bottom in browsing"
+    );
+    assert!(
+        harness.tui().app.browsing_view_scroll.follow,
+        "jump-to-bottom should enable follow"
+    );
+
+    // Test Home keycode in browsing
+    for _ in 0..3 {
+        harness.tui().app.browsing_view_scroll.scroll_up();
+    }
+    harness.render();
+    let before_home = harness.tui().app.browsing_view_scroll.position;
+    assert!(before_home > 0);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.tui().app.browsing_view_scroll.position,
+        0,
+        "Home should jump to top in browsing"
+    );
+}
+
 /// Regression test: when an item is taller than the viewport and the user
 /// scrolls up, the visible window through that item must move *backwards*
 /// through the buffer (toward earlier lines), not forwards.

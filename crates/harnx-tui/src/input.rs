@@ -287,6 +287,15 @@ impl Tui {
             (KeyCode::Char('r'), KeyModifiers::NONE) => {
                 self.handle_transcript_rewind();
             }
+            (
+                KeyCode::Char('g' | '<') | KeyCode::Home,
+                KeyModifiers::NONE | KeyModifiers::SHIFT,
+            ) => {
+                self.app.browsing_view_scroll.scroll_to_top();
+            }
+            (KeyCode::Char('G' | '>') | KeyCode::End, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                self.app.browsing_view_scroll.scroll_to_bottom();
+            }
             _ => {} // consume all other keys to prevent bleed to input
         }
         Ok(())
@@ -460,6 +469,17 @@ impl Tui {
                     key: Key::Enter,
                     ..Default::default()
                 });
+            }
+            (
+                KeyCode::Char('g' | '<') | KeyCode::Home,
+                KeyModifiers::NONE | KeyModifiers::SHIFT,
+            ) if self.app.transcript_focus.is_some() => {
+                self.app.scroll_state.scroll_to_top();
+            }
+            (KeyCode::Char('G' | '>') | KeyCode::End, KeyModifiers::NONE | KeyModifiers::SHIFT)
+                if self.app.transcript_focus.is_some() =>
+            {
+                self.app.scroll_state.scroll_to_bottom();
             }
             _ => {
                 // While a transcript item is focused all unhandled keys are
