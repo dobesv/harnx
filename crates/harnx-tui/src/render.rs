@@ -75,7 +75,7 @@ impl Tui {
             source.model = Some(model.clone());
             source
         });
-        self.render_ui_output_heading(source.as_ref(), false);
+        self.render_ui_output_heading(source.as_ref());
         true
     }
 
@@ -395,17 +395,6 @@ impl Tui {
                         false,
                     ));
                 }
-                RenderedEntry::from_lines(lines, width)
-            }
-            TranscriptItem::UsageLine(text) => {
-                let lines = Self::render_text_entry(
-                    "",
-                    text,
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                    false,
-                );
                 RenderedEntry::from_lines(lines, width)
             }
             TranscriptItem::ToolCall {
@@ -1234,10 +1223,6 @@ impl Tui {
             TranscriptItem::StatusLine(text) => {
                 lines.push(Line::from(Span::styled("── status ──", label_style)));
                 push_field!("status", text);
-            }
-            TranscriptItem::UsageLine(text) => {
-                lines.push(Line::from(Span::styled("── usage ──", label_style)));
-                push_field!("usage", text);
             }
             TranscriptItem::Plan(plan) => lines.extend(plan_detail_lines(plan, label_style)),
             TranscriptItem::AttachmentHeader(text) => {

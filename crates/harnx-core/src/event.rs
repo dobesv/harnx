@@ -65,6 +65,8 @@ pub enum ModelEvent {
     },
     Final {
         output: String,
+        /// Per-turn total: the summed usage of every model completion in this turn's tool loop,
+        /// not just the final response's usage.
         usage: CompletionTokenUsage,
     },
     Error(String),

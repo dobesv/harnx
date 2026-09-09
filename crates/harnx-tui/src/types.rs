@@ -181,8 +181,6 @@ pub(super) struct App {
     pub(super) main_streamed_text_idx: Option<usize>,
     pub(super) cache_valid_width: Option<u16>,
     pub(super) last_ui_output_source: Option<AgentSource>,
-    pub(super) last_usage_source: Option<AgentSource>,
-    pub(super) last_usage_transcript_idx: Option<usize>,
     pub(super) pending_thought_source: Option<AgentSource>,
     pub(super) pending_thought_text: String,
     pub(super) pending_tool_seq: Option<usize>,
@@ -492,7 +490,6 @@ pub enum TranscriptItem {
         detail_text: String,
     },
     Plan(Vec<PlanEntry>),
-    UsageLine(String),
     ToolCall {
         tool_name: String,
         body: Option<ToolCallBody>,
