@@ -359,6 +359,12 @@ fn navigate_child_transcript(state: &mut MonitoredSessionState, key: KeyEvent) {
         }
         (KeyCode::PageUp, KeyModifiers::NONE) => scroll_child(state, true, 10),
         (KeyCode::PageDown, KeyModifiers::NONE) => scroll_child(state, false, 10),
+        (KeyCode::Char('g' | '<') | KeyCode::Home, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            state.scroll.scroll_to_top();
+        }
+        (KeyCode::Char('G' | '>') | KeyCode::End, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            state.scroll.scroll_to_bottom();
+        }
         _ => {}
     }
 }
