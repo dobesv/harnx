@@ -3601,6 +3601,7 @@ dependencies = [
  "bytes",
  "chrono",
  "dirs",
+ "eventsource-stream",
  "futures-util",
  "harnx-core",
  "harnx-telemetry",

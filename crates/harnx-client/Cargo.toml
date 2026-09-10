@@ -17,6 +17,7 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
+eventsource-stream = { workspace = true }
 futures-util = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 harnx-telemetry = { workspace = true }

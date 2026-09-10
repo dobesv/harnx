@@ -262,7 +262,7 @@ where
                 ctx.model_cooldowns.lock().set_cooldown(model_id, cooldown);
 
                 ctx.warn(&format!(
-                    "Model '{}' exhausted retries (error: {}), cooldown {}s. Trying next fallback.",
+                    "Model '{}' exhausted retries (error: {:#}), cooldown {}s. Trying next fallback.",
                     model_id,
                     err,
                     cooldown.as_secs()
@@ -335,11 +335,11 @@ fn handle_attempt_error(
             }
         }
     } else {
-        // Non-LlmError (network timeout, DNS, etc): treat as retryable.
+        // Untyped errors include both transport and response/protocol failures.
         if attempt + 1 < attempts {
             let delay = compute_backoff_delay(retry_config, attempt);
             let msg = format!(
-                "Network error, attempt {}/{}. Retrying in {}ms: {}",
+                "Request error, attempt {}/{}. Retrying in {}ms: {:#}",
                 attempt + 1,
                 attempts,
                 delay.as_millis(),
@@ -425,6 +425,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_retry_warning_includes_cause_without_assuming_network_failure() {
+        let err =
+            anyhow::anyhow!("Invalid provider event-stream (status: 200, content-type: text/html)")
+                .context("Failed to call chat-completions api (client: codex)");
+        let AttemptOutcome::Sleep(_, message) =
+            handle_attempt_error(&err, &RetryConfig::default(), 0, 3)
+        else {
+            panic!("Expected a retry warning");
+        };
+        assert!(message.contains("client: codex"));
+        assert!(message.contains("content-type: text/html"));
+        assert!(message.starts_with("Request error"));
+        assert!(!message.contains("Network error"));
+    }
 
     #[test]
     fn test_backoff_delay() {

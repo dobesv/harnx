@@ -139,6 +139,17 @@ harnx reads the OAuth access token from the configured auth file — `auth_file`
 - This uses the same first-party client path as the Codex CLI and depends on endpoints OpenAI hasn't published as a stable public API; treat it as best-effort for personal subscription use, and make sure your usage complies with OpenAI's terms.
 - If you see authentication errors, re-run `codex login` to refresh your saved credentials.
 
+**Streaming diagnostics:** Codex can return a successful SSE response without a
+`Content-Type` header. Harnx accepts a missing or empty header specifically for
+Codex, but still requires `response.completed`; an empty or interrupted stream
+is not a successful completion. An explicitly different content type remains an
+error, and other providers still require `text/event-stream`.
+
+Retry warnings include the underlying request error, not just the client/model
+wrapper. Debug logs record HTTP status, content type, and retry hints for rejected
+SSE responses. Content-type errors omit the response body because it can contain
+an entire completion, including prompts and encrypted reasoning.
+
 ---
 
 ## Claude (Anthropic)
