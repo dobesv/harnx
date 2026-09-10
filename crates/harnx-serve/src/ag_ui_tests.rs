@@ -2476,7 +2476,7 @@ async fn promptless_active_reconnect_hydrates_control_before_live_events() {
         SessionLogEntry::HandoffCommitted {
             target_agent: "target-agent".to_string(),
             target_session_id: "target-session".to_string(),
-            handoff_tool_call_id: "handoff-call".to_string(),
+            handoff_tool_call_id: Some("handoff-call".to_string()),
         },
     )];
     let live = tokio_stream::iter([Event::RunFinished(ag_ui_core::event::RunFinishedEvent {
@@ -3245,7 +3245,7 @@ fn control_snapshot_events_emits_handoff_with_marker_identity() {
         SessionLogEntry::HandoffCommitted {
             target_agent: "target-agent".to_string(),
             target_session_id: "target-session-123".to_string(),
-            handoff_tool_call_id: "call-abc".to_string(),
+            handoff_tool_call_id: Some("call-abc".to_string()),
         },
     )];
 
@@ -3262,6 +3262,26 @@ fn control_snapshot_events_emits_handoff_with_marker_identity() {
         }
         other => panic!("expected Custom event, got: {other:?}"),
     }
+}
+
+#[test]
+fn control_snapshot_events_omits_missing_handoff_identity() {
+    use harnx_core::session::SessionLogEntry;
+
+    let entries = vec![(
+        1,
+        SessionLogEntry::HandoffCommitted {
+            target_agent: "target-agent".to_string(),
+            target_session_id: "target-session-123".to_string(),
+            handoff_tool_call_id: None,
+        },
+    )];
+
+    let events = control_snapshot_events(&entries, None);
+    let Event::Custom(CustomEvent { value, .. }) = &events[0] else {
+        panic!("expected Custom event")
+    };
+    assert!(value.get("handoff_tool_call_id").is_none());
 }
 
 #[test]
@@ -3481,7 +3501,7 @@ fn control_snapshot_events_processes_multiple_control_entries_in_order() {
             SessionLogEntry::HandoffCommitted {
                 target_agent: "agent-1".to_string(),
                 target_session_id: "session-1".to_string(),
-                handoff_tool_call_id: "call-1".to_string(),
+                handoff_tool_call_id: Some("call-1".to_string()),
             },
         ),
         (
@@ -3757,7 +3777,7 @@ async fn promptless_idle_attach_emits_hydrated_handoff() {
         SessionLogEntry::HandoffCommitted {
             target_agent: "target-agent".to_string(),
             target_session_id: "target-session-123".to_string(),
-            handoff_tool_call_id: "call-abc".to_string(),
+            handoff_tool_call_id: Some("call-abc".to_string()),
         },
     )];
 
@@ -3923,7 +3943,7 @@ async fn idle_remote_path_emits_hydrated_control_events() {
         SessionLogEntry::HandoffCommitted {
             target_agent: "remote-agent".to_string(),
             target_session_id: "remote-session-456".to_string(),
-            handoff_tool_call_id: "call-remote".to_string(),
+            handoff_tool_call_id: Some("call-remote".to_string()),
         },
     )];
 

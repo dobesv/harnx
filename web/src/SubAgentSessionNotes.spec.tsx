@@ -10,8 +10,10 @@ vi.mock('./ChatProvider', async (importOriginal) => {
   return {
     ...actual,
     HarnxHttpAgent: vi.fn().mockImplementation(function(this: any, options: any) {
+      this.options = options;
       this.runAgent = vi.fn();
       this.simulateEvent = (event: unknown) => options.onSubAgentEvent(event);
+      this.simulateUsage = (usage: unknown) => options.onUsage(usage);
     }),
   };
 });
@@ -137,6 +139,82 @@ describe('SubAgentSessionNotes', () => {
       expect(dispatch).not.toHaveBeenCalledWith(
         expect.objectContaining({ type: 'CHILD_TERMINAL' })
       );
+    });
+
+    it('constructs HarnxHttpAgent with session URL without /prompt suffix', () => {
+      const runningNote: SubAgentNote = {
+        ...note('running', 'child-123'),
+        agent: 'researcher',
+      };
+
+      render(
+        <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch: () => {} }}>
+          <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
+        </SubAgentNotesContext.Provider>
+      );
+
+      expect(vi.mocked(HarnxHttpAgent)).toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: '/v1/agents/researcher/sessions/child-123',
+        })
+      );
+    });
+
+    it('preserves accumulated elapsed and updatedAtMs when progress lacks startedAtMs', () => {
+      const dispatch = vi.fn();
+      const runningNote: SubAgentNote = {
+        ...note('running', 'live-child'),
+        elapsedMs: 2000,
+        updatedAtMs: Date.now() - 500,
+        startedAtMs: undefined,
+      };
+
+      render(
+        <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch }}>
+          <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
+        </SubAgentNotesContext.Provider>
+      );
+
+      const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
+      agentInstance.simulateUsage({ input: 50, output: 25, cached: 10 });
+
+      expect(dispatch).toHaveBeenCalledWith({
+        type: 'CUSTOM',
+        name: 'sub_agent_progress',
+        value: expect.objectContaining({
+          elapsed_ms: expect.any(Number),
+          usage: { input_tokens: 50, output_tokens: 25, cached_tokens: 10 },
+        }),
+      });
+
+      const call = dispatch.mock.calls[0][0];
+      // Must be at least 2500ms (2000 accumulated + 500 elapsed since update), NOT 0
+      expect(call.value.elapsed_ms).toBeGreaterThanOrEqual(2450);
+    });
+
+    it('computes elapsed from startedAtMs when present in onUsage', () => {
+      const dispatch = vi.fn();
+      const startTime = Date.now() - 3500;
+      const runningNote: SubAgentNote = {
+        ...note('running', 'live-child'),
+        elapsedMs: 1000,
+        updatedAtMs: Date.now() - 100,
+        startedAtMs: startTime,
+      };
+
+      render(
+        <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch }}>
+          <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
+        </SubAgentNotesContext.Provider>
+      );
+
+      const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
+      agentInstance.simulateUsage({ input: 50, output: 25, cached: 10 });
+
+      const call = dispatch.mock.calls[0][0];
+      // Must be computed from startedAtMs (~3500ms)
+      expect(call.value.elapsed_ms).toBeGreaterThanOrEqual(3400);
+      expect(call.value.started_at).toBe(startTime);
     });
   });
 });

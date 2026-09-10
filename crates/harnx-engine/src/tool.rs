@@ -374,9 +374,15 @@ fn completed_tool_result(
     content: Vec<harnx_core::message::MessageContentPart>,
     execution_context: Option<harnx_core::execution_context::ExecutionContextObservation>,
 ) -> ToolResult {
+    let tool_call_id = call.id.clone();
     let mut result = ToolResult::new(call, output);
     result.content = content;
     result.switch_agent = detect_switch_agent(&result.output);
+    if let Some(switch_agent) = &mut result.switch_agent {
+        if switch_agent.tool_call_id.is_none() {
+            switch_agent.tool_call_id = tool_call_id;
+        }
+    }
     result.execution_context = execution_context;
     result
 }
@@ -1289,6 +1295,65 @@ mod tests {
                 panic!("handoff dispatch should succeed: {err:#}")
             }
         }
+    }
+
+    #[test]
+    fn provider_handoff_inherits_tool_call_id_when_result_omits_it() {
+        let call = ToolCall::new(
+            "remote_handoff".to_string(),
+            json!({}),
+            Some("provider-call-123".to_string()),
+            None,
+        );
+        let result = completed_tool_result(
+            call,
+            json!({
+                "action": "switch_agent",
+                "agent": "target-agent",
+                "prompt": "continue work"
+            }),
+            Vec::new(),
+            None,
+        );
+
+        assert_eq!(
+            result
+                .switch_agent
+                .expect("handoff result")
+                .tool_call_id
+                .as_deref(),
+            Some("provider-call-123")
+        );
+    }
+
+    #[test]
+    fn provider_handoff_keeps_result_tool_call_id() {
+        let call = ToolCall::new(
+            "remote_handoff".to_string(),
+            json!({}),
+            Some("request-call-123".to_string()),
+            None,
+        );
+        let result = completed_tool_result(
+            call,
+            json!({
+                "action": "switch_agent",
+                "agent": "target-agent",
+                "prompt": "continue work",
+                "tool_call_id": "result-call-456"
+            }),
+            Vec::new(),
+            None,
+        );
+
+        assert_eq!(
+            result
+                .switch_agent
+                .expect("handoff result")
+                .tool_call_id
+                .as_deref(),
+            Some("result-call-456")
+        );
     }
 
     #[tokio::test]

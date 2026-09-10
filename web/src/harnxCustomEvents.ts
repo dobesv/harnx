@@ -109,6 +109,14 @@ const handlers: Record<string, CustomEventHandler> = {
     const target = handoffTarget(value);
     if (!target) return;
 
+    // On hydrated replay (!isRunActive), require both a non-blank toolCallId and sourceSessionId.
+    // If either is missing, ignore to prevent spurious re-navigation on replay.
+    if (!callbacks.isRunActive) {
+      if (!target.toolCallId || !callbacks.sourceSessionId) {
+        return;
+      }
+    }
+
     // If we have a marker id and source session, check deduplication state
     if (target.toolCallId && callbacks.sourceSessionId) {
       if (isHandoffConsumed(callbacks.sourceSessionId, target.toolCallId)) {

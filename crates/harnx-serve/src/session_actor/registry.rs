@@ -55,6 +55,13 @@ impl SessionRegistry {
         )
     }
 
+    #[cfg(test)]
+    pub(super) fn local_worker_for_tests(
+        &self,
+    ) -> Arc<Mutex<Option<harnx_runtime::local_orchestrator::LocalWorkerSupervisor>>> {
+        Arc::clone(&self.actor_config.local_worker)
+    }
+
     // Only used by the Unix-only NATS serve tests (`nats_tests`).
     #[cfg(all(test, unix))]
     pub(super) fn new_with_local_worker_for_tests(

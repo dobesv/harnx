@@ -17,10 +17,14 @@ function ChildMetricsSubscriber({ note, dispatch }: { note: SubAgentNote, dispat
   const agent = useMemo(() => {
     let toolCallCount = 0;
     return new HarnxHttpAgent({
-      url: `/v1/agents/${encodeURIComponent(note.agent)}/sessions/${encodeURIComponent(note.sessionId)}/prompt`,
+      url: `/v1/agents/${encodeURIComponent(note.agent)}/sessions/${encodeURIComponent(note.sessionId)}`,
       onStatus: () => {},
       onRunFailed: () => {},
       onUsage: (usage) => {
+        const elapsed = note.startedAtMs
+          ? Math.max(0, Date.now() - note.startedAtMs)
+          : note.elapsedMs + Math.max(0, Date.now() - note.updatedAtMs);
+
         dispatch({
           type: 'CUSTOM',
           name: 'sub_agent_progress',
@@ -29,7 +33,8 @@ function ChildMetricsSubscriber({ note, dispatch }: { note: SubAgentNote, dispat
             tool_call_id: note.toolCallId,
             agent: note.agent,
             session_id: note.sessionId,
-            elapsed_ms: note.startedAtMs ? Date.now() - note.startedAtMs : 0,
+            started_at: note.startedAtMs,
+            elapsed_ms: elapsed,
             tool_call_count: toolCallCount,
             usage: {
               input_tokens: usage.input,
@@ -61,7 +66,7 @@ function ChildMetricsSubscriber({ note, dispatch }: { note: SubAgentNote, dispat
         }
       },
     });
-  }, [note.agent, note.sessionId, note.invocationId, note.toolCallId, note.startedAtMs, dispatch]);
+  }, [note.agent, note.sessionId, note.invocationId, note.toolCallId, note.startedAtMs, note.elapsedMs, note.updatedAtMs, dispatch]);
 
   const runtime = useAgUiRuntime({ agent });
 

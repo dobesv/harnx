@@ -99,7 +99,11 @@ function subAgentIdentity(
   if (!sessionId) return undefined;
   
   const startedAtString = nonBlankString(startedAtValue);
-  const startedAtMs = startedAtString ? new Date(startedAtString).getTime() : undefined;
+  const startedAtMs = typeof startedAtValue === 'number' && Number.isFinite(startedAtValue)
+    ? startedAtValue
+    : startedAtString
+      ? new Date(startedAtString).getTime()
+      : undefined;
 
   return {
     agent,
@@ -142,6 +146,8 @@ function subAgentProgress(value: unknown): SubAgentProgressValue | undefined {
     progress.agent,
     progress.session_id,
     progress.invocation_id,
+    progress.tool_call_id,
+    progress.started_at ?? progress.started_at_ms,
   );
   if (!identity?.invocationId) return undefined;
   const status = progressStatus(progress.status);
@@ -341,10 +347,12 @@ function isMatchingNote(
 function noteFromProgress(
   progress: SubAgentProgressValue,
   parentMessageId: string,
+  existingNote?: SubAgentNote,
 ): SubAgentNote {
   return {
-    id: `live:${progress.invocationId}`,
+    id: existingNote?.id ?? `live:${progress.invocationId}`,
     invocationId: progress.invocationId,
+    toolCallId: progress.toolCallId ?? existingNote?.toolCallId,
     agent: progress.agent,
     sessionId: progress.sessionId,
     parentMessageId,
@@ -355,6 +363,7 @@ function noteFromProgress(
     cachedTokens: progress.cachedTokens,
     toolCallCount: progress.toolCallCount,
     updatedAtMs: Date.now(),
+    startedAtMs: progress.startedAtMs ?? existingNote?.startedAtMs,
   };
 }
 
@@ -373,7 +382,7 @@ function applyProgress(
       ...state,
       notes: state.notes.map((note, noteIndex) => (
         noteIndex === index
-          ? { ...note, ...noteFromProgress(progress, note.parentMessageId), id: note.id }
+          ? noteFromProgress(progress, note.parentMessageId, note)
           : note
       )),
     };
@@ -510,12 +519,11 @@ function childTerminal(state: SubAgentNotesState, event: EventRecord): SubAgentN
 
   if (targetIndex === -1) return state;
 
+  const terminalStatus: Exclude<SubAgentNoteStatus, 'running'> =
+    event.status === 'failed' ? 'failed' : 'done';
+
   const newNotes = [...state.notes];
-  newNotes[targetIndex] = {
-    ...newNotes[targetIndex],
-    status: event.status as SubAgentNoteStatus ?? 'done',
-    updatedAtMs: Date.now(),
-  };
+  newNotes[targetIndex] = freezeNote(newNotes[targetIndex], terminalStatus);
 
   return { ...state, notes: newNotes };
 }

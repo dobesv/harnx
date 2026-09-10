@@ -193,4 +193,50 @@ describe('handoff deduplication', () => {
     // Should NOT fire again - marker already consumed
     expect(handoffCalls).toHaveLength(0);
   });
+
+  it('ignores hydrated replay when marker is missing or blank', () => {
+    const sourceSessionId = 'session-replay-no-marker';
+    const hydratedCallbacks = {
+      ...makeCallbacks(sourceSessionId),
+      isRunActive: false,
+    };
+
+    // 1. handoff_tool_call_id completely omitted
+    handleHarnxCustomEvent('session_handoff', {
+      agent: 'target-agent',
+      session_id: 'target-session',
+    }, hydratedCallbacks as any);
+    expect(handoffCalls).toHaveLength(0);
+
+    // 2. handoff_tool_call_id is empty string
+    handleHarnxCustomEvent('session_handoff', {
+      agent: 'target-agent',
+      session_id: 'target-session',
+      handoff_tool_call_id: '',
+    }, hydratedCallbacks as any);
+    expect(handoffCalls).toHaveLength(0);
+
+    // 3. handoff_tool_call_id is blank string
+    handleHarnxCustomEvent('session_handoff', {
+      agent: 'target-agent',
+      session_id: 'target-session',
+      handoff_tool_call_id: '   ',
+    }, hydratedCallbacks as any);
+    expect(handoffCalls).toHaveLength(0);
+  });
+
+  it('ignores hydrated replay when sourceSessionId is missing', () => {
+    const hydratedCallbacks = {
+      ...makeCallbacks(), // sourceSessionId undefined
+      isRunActive: false,
+    };
+
+    handleHarnxCustomEvent('session_handoff', {
+      agent: 'target-agent',
+      session_id: 'target-session',
+      handoff_tool_call_id: 'tool-call-123',
+    }, hydratedCallbacks as any);
+
+    expect(handoffCalls).toHaveLength(0);
+  });
 });

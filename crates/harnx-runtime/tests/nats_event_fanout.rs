@@ -464,7 +464,7 @@ async fn control_event_flush_preserves_fifo_delivery() -> Result<()> {
     sink.emit_required(AgentEvent::Session(SessionEvent::HandoffCommitted {
         agent: "atlas".into(),
         session_id: "atlas-session".into(),
-        handoff_tool_call_id: "call-test-fanout".into(),
+        handoff_tool_call_id: Some("call-test-fanout".into()),
     }));
     sink.flush().await?;
 

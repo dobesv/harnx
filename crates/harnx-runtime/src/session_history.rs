@@ -87,7 +87,12 @@ fn entry_searchable_text(entry: &SessionLogEntry) -> String {
             target_agent,
             target_session_id,
             handoff_tool_call_id,
-        } => format!("{target_agent}\n{target_session_id}\n{handoff_tool_call_id}"),
+        } => match handoff_tool_call_id {
+            Some(tool_call_id) => {
+                format!("{target_agent}\n{target_session_id}\n{tool_call_id}")
+            }
+            None => format!("{target_agent}\n{target_session_id}"),
+        },
         SessionLogEntry::HitlApprovalRequested {
             tool_call_id,
             summary,
@@ -369,7 +374,7 @@ mod tests {
             SessionLogEntry::HandoffCommitted {
                 target_agent: "pantheon/plato".into(),
                 target_session_id: "target-123".into(),
-                handoff_tool_call_id: "handoff-call".into(),
+                handoff_tool_call_id: Some("handoff-call".into()),
             },
             SessionLogEntry::HitlApprovalRequested {
                 tool_call_id: "call-request".into(),

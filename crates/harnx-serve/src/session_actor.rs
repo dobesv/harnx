@@ -70,6 +70,11 @@ struct RunFinished {
     attachment_refs: Vec<String>,
 }
 
+struct HitlApprovalFinished {
+    result: Result<bool, String>,
+    reply: tokio::sync::oneshot::Sender<Result<bool, String>>,
+}
+
 struct ActorTurnParams {
     prompt_config: GlobalConfig,
     call_fn: Option<AgentCallFn>,
@@ -97,6 +102,8 @@ struct SessionActor {
     active_run: Option<ActiveRun>,
     run_done_tx: mpsc::Sender<RunFinished>,
     run_done_rx: mpsc::Receiver<RunFinished>,
+    hitl_approval_done_tx: mpsc::Sender<HitlApprovalFinished>,
+    hitl_approval_done_rx: mpsc::Receiver<HitlApprovalFinished>,
     /// In-flight turn task, aborted on drop so a panicking or stopping actor doesn't leak it.
     /// Dropping the actor requests cancellation via `JoinHandle::abort`: the task is dropped at
     /// its next await, so a pending write may be dropped rather than completed, and a replacement
@@ -128,6 +135,7 @@ fn spawn_session_actor(
     let (tx, rx) = mpsc::channel(COMMAND_BUFFER);
     let (broadcast_tx, _) = broadcast::channel(BROADCAST_BUFFER);
     let (run_done_tx, run_done_rx) = mpsc::channel(COMMAND_BUFFER);
+    let (hitl_approval_done_tx, hitl_approval_done_rx) = mpsc::channel(COMMAND_BUFFER);
     let actor_id = NEXT_ACTOR_ID.fetch_add(1, Ordering::Relaxed);
     let handle = SessionHandle {
         tx: tx.clone(),
@@ -145,6 +153,8 @@ fn spawn_session_actor(
         active_run: None,
         run_done_tx,
         run_done_rx,
+        hitl_approval_done_tx,
+        hitl_approval_done_rx,
         run_done_task: None,
         reap_ttl,
         reap_deadline: None,
@@ -236,27 +246,32 @@ impl SessionActor {
     }
 
     async fn route_hitl_approval_decision(
-        &self,
-        tool_call_id: &str,
+        actor_config: SessionActorConfig,
+        key: SessionKey,
+        tool_call_id: String,
         approved: bool,
         note: Option<String>,
     ) -> anyhow::Result<bool> {
-        let prompt_config = self.prompt_config();
+        let prompt_config = prompt_config_for_agent_session_from_global(
+            &actor_config.base_config,
+            &key,
+            actor_config.call_fn.is_some(),
+        );
         let activation_route = activation_route_for_cluster(
             LOCAL_CLUSTER_KEY,
-            &self.actor_config.local_worker,
+            &actor_config.local_worker,
             create_abort_signal(),
         )
         .await?;
         let initializer = {
             let config = prompt_config.read();
-            harnx_runtime::SessionInitializer::named_from_config(self.key.agent.clone(), &config)
+            harnx_runtime::SessionInitializer::named_from_config(key.agent, &config)
         };
         let session = NatsSession::from_global_config(
             NatsSessionConfig {
                 cluster: LOCAL_CLUSTER_KEY.to_string(),
                 initializer,
-                session_id: Some(self.key.session.clone()),
+                session_id: Some(key.session),
                 activation_route,
             },
             &prompt_config,
@@ -264,7 +279,7 @@ impl SessionActor {
         )
         .await?;
         session
-            .decide_hitl_approval(tool_call_id, approved, note)
+            .decide_hitl_approval(&tool_call_id, approved, note)
             .await
     }
 
@@ -299,6 +314,10 @@ impl SessionActor {
                         break;
                     };
                     self.handle_run_done(done, &mut reap_sleep).await;
+                }
+                Some(done) = self.hitl_approval_done_rx.recv() => {
+                    self.refresh_history_snapshot().await;
+                    let _ = done.reply.send(done.result);
                 }
                 _ = &mut reap_sleep, if self.reap_deadline.is_some() => {
                     if self.reap_now() {
@@ -355,12 +374,21 @@ impl SessionActor {
                 note,
                 reply,
             } => {
-                let result = self
-                    .route_hitl_approval_decision(&tool_call_id, approved, note)
+                let actor_config = self.actor_config.clone();
+                let key = self.key.clone();
+                let done_tx = self.hitl_approval_done_tx.clone();
+                tokio::spawn(async move {
+                    let result = Self::route_hitl_approval_decision(
+                        actor_config,
+                        key,
+                        tool_call_id,
+                        approved,
+                        note,
+                    )
                     .await
                     .map_err(|error| format!("{error:#}"));
-                self.refresh_history_snapshot().await;
-                let _ = reply.send(result);
+                    let _ = done_tx.send(HitlApprovalFinished { result, reply }).await;
+                });
             }
             SessionCommand::Get { reply } => {
                 self.refresh_history_snapshot().await;
@@ -434,7 +462,7 @@ impl SessionActor {
                         agent: agent.clone(),
                         session_id: session_id.clone(),
                         prompt: prompt.clone(),
-                        handoff_tool_call_id: tool_call_id.clone().unwrap_or_default(),
+                        handoff_tool_call_id: tool_call_id.clone(),
                     },
                 )
                 .await;
@@ -979,6 +1007,42 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn hitl_approval_routing_does_not_block_cancel_command() {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let registry = SessionRegistry::new_for_tests(
+            load_base_config_for_tests(),
+            Duration::from_millis(50),
+            None,
+        );
+        let local_worker = registry.local_worker_for_tests();
+        let worker_guard = local_worker.lock().await;
+        let handle = registry.get_or_spawn(key("plain", "approval-mailbox"));
+        let (approval_reply_tx, mut approval_reply_rx) = oneshot::channel();
+        handle
+            .tx
+            .send(SessionCommand::HitlApprovalDecision {
+                tool_call_id: "approval-call".to_string(),
+                approved: true,
+                note: None,
+                reply: approval_reply_tx,
+            })
+            .await
+            .expect("send approval decision");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut approval_reply_rx)
+                .await
+                .is_err(),
+            "routing should still be waiting for the worker lock"
+        );
+        tokio::time::timeout(Duration::from_secs(1), cancel(&handle))
+            .await
+            .expect("Cancel must remain responsive while approval routing is in flight");
+
+        drop(worker_guard);
+    }
     fn load_session_messages(agent: &str, session_id: &str) -> Vec<Message> {
         super::load_test_session_messages(agent, session_id)
     }

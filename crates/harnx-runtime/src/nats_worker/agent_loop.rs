@@ -776,7 +776,6 @@ async fn run_agent_loop_segment(args: AgentLoopSegmentArgs<'_>) -> Result<NatsAg
             };
             async move {
                 if let Some((agent, session_id, prompt, tool_call_id)) = handoff {
-                    let tool_call_id = tool_call_id.unwrap_or_default();
                     dispatch_nats_handoff(args_ref, agent, session_id, prompt, tool_call_id)
                         .await?;
                 }
@@ -833,7 +832,7 @@ async fn run_hitl_continuation_segment(
             agent.clone(),
             session_id.clone(),
             prompt.clone(),
-            tool_call_id.clone().unwrap_or_default(),
+            tool_call_id.clone(),
         )
         .await?;
     }
@@ -853,7 +852,7 @@ async fn dispatch_nats_handoff(
     agent: String,
     session_id: Option<String>,
     prompt: String,
-    handoff_tool_call_id: String,
+    handoff_tool_call_id: Option<String>,
 ) -> Result<()> {
     let requested_session_id = session_id.filter(|session_id| !session_id.trim().is_empty());
     let destination = resolve_handoff_destination(args, &agent).await?;
@@ -956,7 +955,7 @@ async fn emit_handoff_committed(
     requested_agent: &str,
     committed_agent: String,
     session_id: String,
-    handoff_tool_call_id: String,
+    handoff_tool_call_id: Option<String>,
 ) -> Result<()> {
     use harnx_core::event::{AgentEvent, SessionEvent};
 

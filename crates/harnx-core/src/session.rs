@@ -134,7 +134,8 @@ pub enum SessionLogEntry {
     HandoffCommitted {
         target_agent: String,
         target_session_id: String,
-        handoff_tool_call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handoff_tool_call_id: Option<String>,
     },
     /// Records that the worker is awaiting human approval for a tool call.
     /// Written by the lease-holding worker when it defers a tool call; pairs with HitlApprovalDecision.
@@ -957,7 +958,7 @@ field: value
         let entry = SessionLogEntry::HandoffCommitted {
             target_agent: "pantheon/plato".to_string(),
             target_session_id: "target-123".to_string(),
-            handoff_tool_call_id: "call-456".to_string(),
+            handoff_tool_call_id: Some("call-456".to_string()),
         };
 
         let yaml = serde_yaml::to_string(&entry).unwrap();
@@ -972,10 +973,25 @@ field: value
             } => {
                 assert_eq!(target_agent, "pantheon/plato");
                 assert_eq!(target_session_id, "target-123");
-                assert_eq!(handoff_tool_call_id, "call-456");
+                assert_eq!(handoff_tool_call_id.as_deref(), Some("call-456"));
             }
             other => panic!("expected handoff_committed, got {other:?}"),
         }
+
+        let entry_without_id = SessionLogEntry::HandoffCommitted {
+            target_agent: "pantheon/plato".to_string(),
+            target_session_id: "target-789".to_string(),
+            handoff_tool_call_id: None,
+        };
+        let yaml_without_id = serde_yaml::to_string(&entry_without_id).unwrap();
+        assert!(!yaml_without_id.contains("handoff_tool_call_id"));
+        assert!(matches!(
+            serde_yaml::from_str::<SessionLogEntry>(&yaml_without_id).unwrap(),
+            SessionLogEntry::HandoffCommitted {
+                handoff_tool_call_id: None,
+                ..
+            }
+        ));
     }
 
     #[test]

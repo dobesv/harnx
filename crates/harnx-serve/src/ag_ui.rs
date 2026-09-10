@@ -686,10 +686,11 @@ impl AgUiSink {
                 session_id,
                 handoff_tool_call_id,
             } => {
-                self.emit_custom(
-                    "session_handoff",
-                    json!({ "agent": agent, "session_id": session_id, "handoff_tool_call_id": handoff_tool_call_id }),
-                );
+                let mut value = json!({ "agent": agent, "session_id": session_id });
+                if let Some(tool_call_id) = handoff_tool_call_id {
+                    value["handoff_tool_call_id"] = json!(tool_call_id);
+                }
+                self.emit_custom("session_handoff", value);
             }
             SessionEvent::CompactingStarted => {
                 self.emit_custom("session_compacting_started", json!({}));
@@ -1730,7 +1731,7 @@ fn history_role_for_client(role: &Role) -> MessageRole {
 /// can dedupe hydrated vs live events. Hydrated events replay the same shapes
 /// the live path uses, plus the marker id.
 ///
-/// - `session_handoff`: `handoff_tool_call_id` (hydrated adds this; live path lacks it)
+/// - `session_handoff`: optional `handoff_tool_call_id` when provider identity is available
 /// - `usage`: (emitted with same shape as live path; context computed by caller)
 /// - `sub_agent_started`: `invocation_id` (already in live shape)
 pub(crate) fn control_snapshot_events(
@@ -1748,18 +1749,20 @@ pub(crate) fn control_snapshot_events(
                 target_session_id,
                 handoff_tool_call_id,
             } => {
-                // Hydrated handoff includes marker identity for dedupe
+                let mut value = json!({
+                    "agent": target_agent,
+                    "session_id": target_session_id,
+                });
+                if let Some(tool_call_id) = handoff_tool_call_id {
+                    value["handoff_tool_call_id"] = json!(tool_call_id);
+                }
                 events.push(Event::Custom(CustomEvent {
                     base: BaseEvent {
                         timestamp: None,
                         raw_event: None,
                     },
                     name: "session_handoff".to_string(),
-                    value: json!({
-                        "agent": target_agent,
-                        "session_id": target_session_id,
-                        "handoff_tool_call_id": handoff_tool_call_id,
-                    }),
+                    value,
                 }));
             }
             harnx_core::session::SessionLogEntry::TurnEnd {

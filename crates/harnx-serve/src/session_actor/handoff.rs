@@ -19,7 +19,7 @@ pub(super) struct HandoffRequest {
     pub(super) agent: String,
     pub(super) session_id: Option<String>,
     pub(super) prompt: String,
-    pub(super) handoff_tool_call_id: String,
+    pub(super) handoff_tool_call_id: Option<String>,
 }
 
 impl SessionActor {
@@ -104,7 +104,7 @@ impl SessionActor {
         done: &RunFinished,
         agent: String,
         session_id: String,
-        handoff_tool_call_id: String,
+        handoff_tool_call_id: Option<String>,
     ) {
         done.sink
             .emit(AgentEvent::Session(SessionEvent::HandoffCommitted {

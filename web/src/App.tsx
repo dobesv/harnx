@@ -14,7 +14,7 @@ import remarkGfm from 'remark-gfm';
 
 const SyntaxHighlighter = makeLightAsyncSyntaxHighlighter({ useInlineStyles: false });
 import { ToolCallCard } from './ToolCallCard';
-import { useAgUiInterrupts,  } from '@assistant-ui/react-ag-ui';
+import { useAgUiInterrupts } from '@assistant-ui/react-ag-ui';
 import { ChatProvider, attachmentToMessageParts } from './ChatProvider';
 import { PendingContext } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
@@ -394,25 +394,28 @@ export const BatchInterruptUI = ({ agentName, sessionId }: { agentName: string; 
   const { setErrorText, hydratedApprovals, removeHydratedApproval } = useContext(PendingContext);
   const [submitting, setSubmitting] = useState(false);
   const [note, setNote] = useState('');
+  const [resolvedToolCallIds, setResolvedToolCallIds] = useState<Set<string>>(() => new Set());
 
   const pendingItems = useMemo(() => {
     const items: Array<{ toolCallId: string; summary: string }> = [];
     const seen = new Set<string>();
 
     for (const a of hydratedApprovals) {
-      items.push(a);
-      seen.add(a.toolCallId);
+      if (!resolvedToolCallIds.has(a.toolCallId)) {
+        items.push(a);
+        seen.add(a.toolCallId);
+      }
     }
 
     for (const i of interrupts) {
-      if (i.toolCallId && !seen.has(i.toolCallId)) {
+      if (i.toolCallId && !seen.has(i.toolCallId) && !resolvedToolCallIds.has(i.toolCallId)) {
         items.push({ toolCallId: i.toolCallId, summary: i.message || i.reason || i.toolCallId });
         seen.add(i.toolCallId);
       }
     }
 
     return items;
-  }, [hydratedApprovals, interrupts]);
+  }, [hydratedApprovals, interrupts, resolvedToolCallIds]);
 
   if (pendingItems.length === 0) return null;
 
@@ -428,6 +431,7 @@ export const BatchInterruptUI = ({ agentName, sessionId }: { agentName: string; 
         note: note.trim() || undefined
       });
       removeHydratedApproval(currentItem.toolCallId);
+      setResolvedToolCallIds((prev) => new Set(prev).add(currentItem.toolCallId));
       setNote('');
     } catch (err) {
       console.error('Failed to submit decision', err);
@@ -446,10 +450,11 @@ export const BatchInterruptUI = ({ agentName, sessionId }: { agentName: string; 
         </p>
         
         <div style={{ marginTop: '10px' }}>
-          <label style={{ display: 'block', fontSize: '0.9em', marginBottom: '4px' }}>
+          <label htmlFor="hitl-optional-note" style={{ display: 'block', fontSize: '0.9em', marginBottom: '4px' }}>
             Optional Note:
           </label>
           <input
+            id="hitl-optional-note"
             type="text"
             value={note}
             onChange={(e) => setNote(e.target.value)}

@@ -415,6 +415,83 @@ describe('reduceSubAgentNotes', () => {
     });
   });
 
+  it('freezes elapsedMs on CHILD_TERMINAL by accumulating localElapsed', () => {
+    const startTime = Date.now() - 5000;
+    const initial = apply(
+      toolStart('parent-msg'),
+      {
+        type: 'CUSTOM',
+        name: 'sub_agent_started',
+        value: {
+          agent: 'coder',
+          session_id: 'child-1',
+          invocation_id: 'inv-freeze-1',
+          tool_call_id: 'call-1',
+          started_at: new Date(startTime).toISOString(),
+        },
+      }
+    );
+
+    const runningNote = initial.notes[0];
+    const modifiedState: SubAgentNotesState = {
+      ...initial,
+      notes: [{
+        ...runningNote,
+        elapsedMs: 1500,
+        updatedAtMs: Date.now() - 2000,
+      }],
+    };
+
+    const terminalState = reduceSubAgentNotes(modifiedState, {
+      type: 'CHILD_TERMINAL',
+      invocationId: 'inv-freeze-1',
+      status: 'done',
+    });
+
+    const frozenNote = terminalState.notes[0];
+    expect(frozenNote.status).toBe('done');
+    expect(frozenNote.elapsedMs).toBeGreaterThanOrEqual(3400);
+  });
+
+  it('preserves startedAtMs and toolCallId when applyProgress receives update without started_at', () => {
+    const startTime = 1725800000000;
+    const initial = apply(
+      toolStart('parent-msg'),
+      {
+        type: 'CUSTOM',
+        name: 'sub_agent_started',
+        value: {
+          agent: 'coder',
+          session_id: 'child-1',
+          invocation_id: 'inv-prog-1',
+          tool_call_id: 'call-1',
+          started_at: new Date(startTime).toISOString(),
+        },
+      }
+    );
+
+    expect(initial.notes[0].startedAtMs).toBe(startTime);
+    expect(initial.notes[0].toolCallId).toBe('call-1');
+
+    const updated = reduceSubAgentNotes(initial, {
+      type: 'CUSTOM',
+      name: 'sub_agent_progress',
+      value: {
+        agent: 'coder',
+        session_id: 'child-1',
+        invocation_id: 'inv-prog-1',
+        status: 'running',
+        elapsed_ms: 2500,
+        usage: { input_tokens: 50, output_tokens: 25, cached_tokens: 10 },
+        tool_call_count: 2,
+      },
+    });
+
+    expect(updated.notes[0].startedAtMs).toBe(startTime);
+    expect(updated.notes[0].toolCallId).toBe('call-1');
+    expect(updated.notes[0].elapsedMs).toBe(2500);
+  });
+
   it('restores completed rows under their launching assistant messages from a snapshot', () => {
     const state = apply(snapshotEvent());
 

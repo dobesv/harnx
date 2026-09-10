@@ -49,7 +49,7 @@ describe('BatchInterruptUI', () => {
     vi.clearAllMocks();
   });
 
-  it('submits exact payload for approve and deny via submitHitlDecision', async () => {
+  it('submits exact payload for approve via submitHitlDecision and clears live gate', async () => {
     const setErrorText = vi.fn();
     const removeHydratedApproval = vi.fn();
     vi.mocked(agUi.useAgUiInterrupts).mockReturnValue([{ id: 'int-1', toolCallId: 'tool-1', reason: '', message: 'live interrupt' } as any]);
@@ -68,15 +68,39 @@ describe('BatchInterruptUI', () => {
       expect(removeHydratedApproval).toHaveBeenCalledWith('tool-1');
     });
 
-    vi.mocked(submitHitlDecision).mockClear();
-    removeHydratedApproval.mockClear();
+    // After approval, the live interrupt gate clears and returns null
+    expect(screen.queryByTestId('hydrated-pending-approval')).not.toBeInTheDocument();
+  });
+
+  it('submits deny payload with note and associates label with input', async () => {
+    const setErrorText = vi.fn();
+    const removeHydratedApproval = vi.fn();
+    vi.mocked(agUi.useAgUiInterrupts).mockReturnValue([{ id: 'int-1', toolCallId: 'tool-1', reason: '', message: 'live interrupt' } as any]);
+    vi.mocked(submitHitlDecision).mockResolvedValue({ applied: true });
+
+    render(
+      <PendingContext.Provider value={{ ...defaultPendingContext, setErrorText, removeHydratedApproval }}>
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    // Verify label association (a11y)
+    const noteInput = screen.getByLabelText('Optional Note:');
+    expect(noteInput).toBeInTheDocument();
+    fireEvent.change(noteInput, { target: { value: 'unsafe tool call' } });
 
     fireEvent.click(screen.getByText('Deny'));
 
     await waitFor(() => {
-      expect(submitHitlDecision).toHaveBeenCalledWith('test-agent', 'test-session', { toolCallId: 'tool-1', approved: false, note: undefined });
+      expect(submitHitlDecision).toHaveBeenCalledWith('test-agent', 'test-session', {
+        toolCallId: 'tool-1',
+        approved: false,
+        note: 'unsafe tool call',
+      });
       expect(removeHydratedApproval).toHaveBeenCalledWith('tool-1');
     });
+
+    expect(screen.queryByTestId('hydrated-pending-approval')).not.toBeInTheDocument();
   });
 
   it('surfaces an error on rejection', async () => {
@@ -133,6 +157,35 @@ describe('BatchInterruptUI', () => {
     expect(screen.getByText(/Approve tool call/)).toBeInTheDocument();
     // Only ONE approve button should exist
     expect(screen.getAllByText('Approve').length).toBe(1);
+  });
+
+  it('advances to next pending item when first item is decided', async () => {
+    vi.mocked(agUi.useAgUiInterrupts).mockReturnValue([
+      { id: 'int-1', toolCallId: 'tool-1', reason: '', message: 'Tool 1 interrupt' } as any,
+      { id: 'int-2', toolCallId: 'tool-2', reason: '', message: 'Tool 2 interrupt' } as any,
+    ]);
+    vi.mocked(submitHitlDecision).mockResolvedValue({ applied: true });
+
+    render(
+      <PendingContext.Provider value={defaultPendingContext}>
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    expect(screen.getByText('Tool 1 interrupt')).toBeInTheDocument();
+    expect(screen.getByText('1 more tool call awaiting approval')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('Approve'));
+
+    await waitFor(() => {
+      expect(submitHitlDecision).toHaveBeenCalledWith('test-agent', 'test-session', { toolCallId: 'tool-1', approved: true, note: undefined });
+    });
+
+    // After tool-1 is resolved, tool-2 is displayed
+    await waitFor(() => {
+      expect(screen.getByText('Tool 2 interrupt')).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/more tool call/)).not.toBeInTheDocument();
   });
 });
 describe('MyComposer', () => {

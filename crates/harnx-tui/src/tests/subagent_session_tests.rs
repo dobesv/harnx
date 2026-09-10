@@ -761,7 +761,7 @@ async fn tui_switches_only_after_committed_handoff_and_ignores_late_source_compl
         harnx_core::event::SessionEvent::HandoffCommitted {
             agent: "target".into(),
             session_id: "target-session".into(),
-            handoff_tool_call_id: "call-tui-test".into(),
+            handoff_tool_call_id: Some("call-tui-test".into()),
         },
     )))
     .await

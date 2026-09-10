@@ -302,21 +302,27 @@ describe('toAgUiMessages', () => {
 
       await agent.runAgent({});
 
-      // Simulate onEvent CUSTOM session_handoff without RUN_STARTED
-      // Note: Handoff now fires for BOTH live (isRunActive=true) AND hydrated (isRunActive=false)
-      // because we removed the isRunActive guard to support hydration-based navigation.
+      // A markerless handoff during hydrated replay (!isRunActive) is ignored
       await dispatchAgentEvent(subscriber, {
         type: 'CUSTOM',
         name: 'session_handoff',
         value: { agent: 'targetAgent', session_id: '1234' }
       });
-      // Now fires immediately (no isRunActive guard)
+      expect(onHandoff).not.toHaveBeenCalled();
+
+      // Hydrated handoff with marker identity navigates
+      agent.setSourceSessionId('source-session');
+      await dispatchAgentEvent(subscriber, {
+        type: 'CUSTOM',
+        name: 'session_handoff',
+        value: { agent: 'targetAgent', session_id: '1234', handoff_tool_call_id: 'call-handoff-1' }
+      });
       expect(onHandoff).toHaveBeenCalledWith('targetAgent', '1234');
 
       // Simulate RUN_STARTED to set isRunActive true
       await dispatchAgentEvent(subscriber, { type: 'RUN_STARTED' });
 
-      // Subsequent handoff should still fire (dedup uses marker id, not isRunActive)
+      // Subsequent live handoff should still fire (dedup uses marker id, not isRunActive)
       onHandoff.mockClear();
       await dispatchAgentEvent(subscriber, {
         type: 'CUSTOM',
@@ -354,12 +360,20 @@ describe('toAgUiMessages', () => {
       // Simulate RUN_FINISHED to set isRunActive false
       await dispatchAgentEvent(subscriber, { type: 'RUN_FINISHED' });
 
-      // session_handoff should still fire (isRunActive guard removed for hydration)
+      // Markerless handoff during replay/inactive must be ignored
       onHandoff.mockClear();
       await dispatchAgentEvent(subscriber, {
         type: 'CUSTOM',
         name: 'session_handoff',
         value: { agent: 'targetAgent3', session_id: '9999' }
+      });
+      expect(onHandoff).not.toHaveBeenCalled();
+
+      // Handoff with marker identity during replay/inactive should fire
+      await dispatchAgentEvent(subscriber, {
+        type: 'CUSTOM',
+        name: 'session_handoff',
+        value: { agent: 'targetAgent3', session_id: '9999', handoff_tool_call_id: 'call-handoff-2' }
       });
       expect(onHandoff).toHaveBeenCalledWith('targetAgent3', '9999');
     });
