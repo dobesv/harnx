@@ -208,7 +208,7 @@ fn gemini_handle_part(handler: &mut SseHandler, part: &Value, index: usize) -> R
         handler.tool_call(ToolCall::new(
             name.to_string(),
             json!(args),
-            None,
+            part["functionCall"]["id"].as_str().map(ToOwned::to_owned),
             thought_signature,
         ))?;
     }
@@ -325,7 +325,7 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
                 tool_calls.push(ToolCall::new(
                     name.to_string(),
                     json!(args),
-                    None,
+                    part["functionCall"]["id"].as_str().map(ToOwned::to_owned),
                     thought_signature,
                 ));
             }
@@ -457,10 +457,13 @@ pub fn gemini_build_chat_completions_body(
                             model_parts.push(json!({ "text": text }));
                         }
                         for tool_result in tool_results.iter() {
-                            let call_obj = json!({
+                            let mut call_obj = json!({
                                 "name": tool_result.call.name,
                                 "args": tool_result.call.arguments,
                             });
+                            if let Some(id) = &tool_result.call.id {
+                                call_obj["id"] = id.clone().into();
+                            }
                             let mut part_obj = json!({ "functionCall": call_obj });
                             if let Some(signature) = &tool_result.call.thought_signature {
                                 if let Some(obj) = part_obj.as_object_mut() {
@@ -474,7 +477,7 @@ pub fn gemini_build_chat_completions_body(
                         }
                         let mut function_parts: Vec<Value> = Vec::new();
                 for tool_result in &tool_results {
-                    function_parts.push(json!({
+                    let mut function_part = json!({
                         "functionResponse": {
                             "name": tool_result.call.name,
                             "response": {
@@ -482,7 +485,11 @@ pub fn gemini_build_chat_completions_body(
                                 "content": tool_result.output,
                             }
                         }
-                    }));
+                    });
+                    if let Some(id) = &tool_result.call.id {
+                        function_part["functionResponse"]["id"] = id.clone().into();
+                    }
+                    function_parts.push(function_part);
                 }
                 for tool_result in &tool_results {
                     for part in &tool_result.content {
@@ -940,11 +947,6 @@ mod tests {
     /// pins both behaviours AND verifies the serialiser echoes them back.
     #[test]
     fn gemini_streaming_thought_roundtrips_into_next_request_body() {
-        use harnx_core::api_types::ChatCompletionsData;
-        use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
-        use harnx_core::model::Model;
-        use harnx_core::tool::ToolResult;
-
         let (tx, _rx) = unbounded_channel();
         let mut handler = SseHandler::new(tx, create_abort_signal());
 
@@ -955,7 +957,7 @@ mod tests {
                 {"thought": "Plan the call."},
                 {"text": "Running ls."},
                 {
-                    "functionCall": {"name": "Bash", "args": {"cmd": "ls"}},
+                    "functionCall": {"id": "gemini-call-17", "name": "Bash", "args": {"cmd": "ls"}},
                     "thoughtSignature": "sig_gemini_xyz"
                 }
             ]}}]
@@ -963,6 +965,9 @@ mod tests {
         gemini_handle_stream_chunk(&mut handler, &chunk).expect("stream chunk should process");
 
         let (text, thought, tool_calls, _usage) = handler.take();
+        assert_eq!(tool_calls[0].id.as_deref(), Some("gemini-call-17"));
+        let non_stream = gemini_extract_chat_completions_text(&chunk).unwrap();
+        assert_eq!(non_stream.tool_calls[0].id.as_deref(), Some("gemini-call-17"));
         // Gemini prepends "\n\n" for non-first parts (gemini_handle_part).
         assert!(
             text.contains("Running ls."),
@@ -986,37 +991,7 @@ mod tests {
 
         // Now feed it back through the serialiser and confirm the next
         // request body carries thought + thoughtSignature on the model turn.
-        let tool_result = ToolResult::new(tool_calls.into_iter().next().unwrap(), json!("ok"));
-        let messages = vec![
-            Message::new(
-                MessageRole::User,
-                MessageContent::Text("Run a command".to_string()),
-            ),
-            Message::new(
-                MessageRole::Tool,
-                MessageContent::ToolCalls(MessageContentToolCalls::new(
-                    vec![tool_result],
-                    text,
-                    thought,
-                )),
-            ),
-        ];
-        let mut model = Model::new("gemini", "gemini-2.5-pro");
-        model.set_max_tokens(Some(4096), true);
-        let body = gemini_build_chat_completions_body(
-            ChatCompletionsData {
-                messages,
-                temperature: None,
-                top_p: None,
-                functions: None,
-                stream: true,
-                attachments_dir: None,
-            },
-            &model,
-            HashMap::new(),
-        )
-        .unwrap();
-
+        let body = gemini_tool_result_request(tool_calls, text, thought);
         let contents = body["contents"].as_array().unwrap();
         let model_turn = contents
             .iter()
@@ -1032,10 +1007,52 @@ mod tests {
             .iter()
             .find(|p| p["functionCall"].is_object())
             .expect("model turn must include a functionCall part");
+        assert_eq!(fcall_part["functionCall"]["id"], "gemini-call-17");
+        let response = contents.iter().flat_map(|c| c["parts"].as_array().unwrap())
+            .find_map(|p| p.get("functionResponse")).unwrap();
+        assert_eq!(response["id"], "gemini-call-17");
         assert_eq!(
             fcall_part["thoughtSignature"], "sig_gemini_xyz",
             "thoughtSignature must be echoed verbatim alongside the functionCall"
         );
+    }
+
+    fn gemini_tool_result_request(tool_calls: Vec<ToolCall>, text: String, thought: Option<String>) -> Value {
+        use harnx_core::api_types::ChatCompletionsData;
+        use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+        use harnx_core::model::Model;
+        use harnx_core::tool::ToolResult;
+
+        let tool_results = tool_calls.into_iter().map(|call| ToolResult::new(call, json!("ok"))).collect();
+        let messages = vec![
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text("Run a command".to_string()),
+            ),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    tool_results,
+                    text,
+                    thought,
+                )),
+            ),
+        ];
+        let mut model = Model::new("gemini", "gemini-2.5-pro");
+        model.set_max_tokens(Some(4096), true);
+        gemini_build_chat_completions_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: true,
+                attachments_dir: None,
+            },
+            &model,
+            HashMap::new(),
+        )
+        .unwrap()
     }
 }
 

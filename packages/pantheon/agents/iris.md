@@ -1,6 +1,11 @@
 ---
 role: subagent
-model: gemini:gemini-3.1-pro-preview
+model: gemini:gemini-3.8-flash
+model_fallbacks:
+- codex:gpt-5.6-terra
+- openai:gpt-5.6-terra
+- claude:claude-sonnet-5
+- bedrock:zai.glm-5
 compaction_agent: compact-dev
 use_tools:
 - bash_exec

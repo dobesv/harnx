@@ -43,10 +43,23 @@ class TestOpenAIEffortVariants(unittest.TestCase):
             self.assertIn(f'{{"effort":"{effort}"}}', patch)
 
     def test_base_patch_is_programmatic(self) -> None:
-        model = self._base()
-        model["patches"] = ["stale"]
-        um.apply_openai_base_patches(model, "openai")
-        self.assertEqual(model["patches"], [um.OPENAI_NO_SAMPLING_PATCH])
+        for name in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"):
+            with self.subTest(name=name):
+                model = self._base(name)
+                model["patches"] = ["stale"]
+                um.apply_openai_base_patches(model, "openai")
+                self.assertEqual(model["patches"], [um.OPENAI_NO_SAMPLING_PATCH])
+
+    def test_astra_max_preserves_endpoint_and_refreshed_prices(self) -> None:
+        base = self._base("gpt-6-astra")
+        base.update(input_price=10, output_price=50)
+        variants = um.openai_effort_variants(base, "openai")
+        self.assertEqual([v["name"] for v in variants], ["gpt-6-astra:max"])
+        self.assertEqual(variants[0]["real_name"], "gpt-6-astra")
+        self.assertEqual(variants[0]["input_price"], 10)
+        self.assertEqual(variants[0]["output_price"], 50)
+        self.assertEqual(variants[0]["endpoint"], "responses")
+        self.assertIn('"effort":"max"', variants[0]["patches"][0])
 
     def test_terra_only_exposes_the_curated_high_alias(self) -> None:
         variants = um.openai_effort_variants(self._base("gpt-5.6-terra"), "openai")
@@ -62,6 +75,25 @@ class TestOpenAIEffortVariants(unittest.TestCase):
 
 
 class TestProviderModelRegeneration(unittest.TestCase):
+    def test_fable_5_1_regenerates_adaptive_variants_with_required_limit(self) -> None:
+        name = "claude-fable-5-1"
+        base = {"name": name, "max_output_tokens": 128000, "input_price": 10}
+        old = {f"{name}:thinking": {"name": f"{name}:thinking"}}
+        for provider in ("claude", "vertexai"):
+            with self.subTest(provider=provider):
+                models = um.regenerate_provider_models(provider, old, {name: base}, [])
+                self.assertEqual({m["name"] for m in models},
+                                 {name, f"{name}:xhigh", f"{name}:max"})
+                for model in models:
+                    self.assertTrue(model["require_max_tokens"])
+                    self.assertEqual(model["max_output_tokens"], 128000)
+                    self.assertEqual(model["input_price"], 10)
+                    self.assertIn('"type":"adaptive"', model["patches"][0])
+                    self.assertNotIn("budget_tokens", model["patches"][0])
+                    if provider == "claude":
+                        self.assertIn("drop_block", model["patches"][0])
+                        self.assertIn("thinking-binding-controls-2026-08-01", model["patches"][0])
+
     def test_openai_aliases_refresh_while_unowned_max_alias_survives(self) -> None:
         old_models = {
             "gpt-5.6-sol:high": {"name": "gpt-5.6-sol:high", "input_price": 99},

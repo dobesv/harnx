@@ -87,19 +87,27 @@ fn effort_aliases_set_effort_in_the_request_body() {
 }
 
 #[test]
-fn gpt_5_6_sol_variants_use_responses_without_sampling_parameters() {
+fn package_openai_models_use_responses_without_sampling_parameters() {
     let openai = ALL_PROVIDER_MODELS
         .iter()
         .find(|provider| provider.provider == "openai")
         .expect("OpenAI provider catalog");
-    for name in ["gpt-5.6-sol", "gpt-5.6-sol:high", "gpt-5.6-sol:max"] {
+    for name in [
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.6-sol",
+        "gpt-5.6-sol:high",
+        "gpt-5.6-sol:max",
+        "gpt-6-astra",
+        "gpt-6-astra:max",
+    ] {
         let model = Model::from_config("openai", &openai.models)
             .into_iter()
             .find(|model| model.name() == name)
             .unwrap_or_else(|| panic!("missing OpenAI model alias {name}"));
         assert_eq!(model.endpoint(), Some("responses"), "{name}");
         let patched = harnx_core::jaq::eval_filters_strict(
-            model.patches().expect("GPT-5.6 Sol patch"),
+            model.patches().expect("OpenAI model patch"),
             request_envelope(&model),
         )
         .unwrap_or_else(|error| panic!("patches for {name} failed: {error:#}"));
@@ -109,6 +117,78 @@ fn gpt_5_6_sol_variants_use_responses_without_sampling_parameters() {
             assert_eq!(patched["body"]["reasoning"]["effort"], effort, "{name}");
         }
     }
+}
+
+#[test]
+fn fable_5_1_uses_adaptive_thinking_and_an_output_limit() {
+    let claude = ALL_PROVIDER_MODELS
+        .iter()
+        .find(|provider| provider.provider == "claude")
+        .expect("Claude catalog");
+    for name in ["claude-fable-5-1", "claude-fable-5-1:max"] {
+        let model = Model::from_config("claude", &claude.models)
+            .into_iter()
+            .find(|model| model.name() == name)
+            .expect("Fable model");
+        assert_eq!(model.real_name(), "claude-fable-5-1");
+        assert_eq!(model.max_tokens_param(), Some(128000));
+        let mut envelope = request_envelope(&model);
+        envelope["headers"]["anthropic-beta"] = json!("files-api-2025-04-14");
+        let patched = harnx_core::jaq::eval_filters_strict(
+            model.patches().expect("Fable request patch"),
+            envelope,
+        )
+        .expect("valid Fable patch");
+        assert_eq!(
+            patched["body"]["thinking"],
+            json!({
+                "type": "adaptive", "display": "summarized",
+                "block_binding": {"prefix_mismatch_behavior": "drop_block"}
+            })
+        );
+        assert_eq!(
+            patched["headers"]["anthropic-beta"],
+            "files-api-2025-04-14,thinking-binding-controls-2026-08-01"
+        );
+        assert_eq!(
+            patched["body"]["output_config"]["effort"],
+            if name.ends_with(":max") {
+                "max"
+            } else {
+                "high"
+            }
+        );
+        assert!(patched["body"].get("temperature").is_none());
+        assert!(patched["body"].get("top_p").is_none());
+    }
+}
+
+#[test]
+fn gemini_3_8_drops_sampling_settings_without_losing_thinking_or_output_limit() {
+    let gemini = ALL_PROVIDER_MODELS
+        .iter()
+        .find(|provider| provider.provider == "gemini")
+        .expect("Gemini catalog");
+    let model = Model::from_config("gemini", &gemini.models)
+        .into_iter()
+        .find(|model| model.name() == "gemini-3.8-flash")
+        .expect("Gemini 3.8");
+    let mut envelope = request_envelope(&model);
+    envelope["body"]["generationConfig"] = json!({
+        "temperature": 0.7, "topP": 0.9, "topK": 40, "candidateCount": 1,
+        "maxOutputTokens": 8192, "thinkingConfig": {"thinkingLevel": "high"}
+    });
+    let patched = harnx_core::jaq::eval_filters_strict(
+        model.patches().expect("Gemini request patch"),
+        envelope,
+    )
+    .expect("valid Gemini patch");
+    assert_eq!(
+        patched["body"]["generationConfig"],
+        json!({
+            "maxOutputTokens": 8192, "thinkingConfig": {"thinkingLevel": "high"}
+        })
+    );
 }
 
 /// Returns the container key (`output_config` or `reasoning`) when the patch

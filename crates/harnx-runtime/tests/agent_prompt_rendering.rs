@@ -13,6 +13,9 @@ use harnx_runtime::client::{retrieve_model, ModelType};
 use harnx_runtime::config::agent::{load_with_qualified_name, resolve_variables};
 use harnx_runtime::config::Config;
 
+#[path = "support/shipped_model_policy.rs"]
+mod shipped_model_policy;
+
 const PACKAGES: [&str; 2] = ["pantheon", "coding"];
 
 struct EnvVarGuard {
@@ -194,23 +197,31 @@ fn agent_prompt_rendering_renders_all_shipped_agents() {
     );
 }
 
-fn check_agent_models(config: &Config, qualified_name: &str) -> (usize, Vec<String>) {
+async fn check_agent_models(config: &Config, qualified_name: &str) -> (usize, Vec<String>) {
     let agent_path = Config::agent_file(qualified_name);
     let agent = match load_with_qualified_name(&agent_path, qualified_name) {
         Ok(agent) => agent,
         Err(error) => return (0, vec![format!("{qualified_name}: {error:#}")]),
     };
-    let model_ids = agent
+    let model_ids: Vec<_> = agent
         .model_id()
         .into_iter()
-        .chain(agent.model_fallbacks().iter().map(String::as_str));
+        .chain(agent.model_fallbacks().iter().map(String::as_str))
+        .collect();
     let mut checked = 0;
     let mut failures = Vec::new();
-    for model_id in model_ids {
+    for model_id in &model_ids {
         checked += 1;
         if let Err(error) = check_model_metadata(config, model_id) {
             failures.push(format!("{qualified_name}: {error}"));
         }
+    }
+    if let Err(error) = shipped_model_policy::check_chain(config, &model_ids) {
+        failures.push(format!("{qualified_name}: {error:#}"));
+    }
+    if let Err(error) = shipped_model_policy::check_single_provider_fallbacks(config, &agent).await
+    {
+        failures.push(format!("{qualified_name}: {error:#}"));
     }
     (checked, failures)
 }
@@ -218,17 +229,19 @@ fn check_agent_models(config: &Config, qualified_name: &str) -> (usize, Vec<Stri
 fn check_model_metadata(config: &Config, model_id: &str) -> Result<(), String> {
     let model = retrieve_model(&config.clients, model_id, ModelType::Chat)
         .map_err(|error| format!("model {model_id} does not resolve: {error:#}"))?;
-    if model.real_name() != "gpt-5.6-sol" {
-        return Ok(());
+    if model.max_input_tokens().is_none() || !model.supports_tool_use() {
+        return Err(format!(
+            "{model_id} lost its catalog limits or tool capabilities"
+        ));
     }
-    if model.endpoint() != Some("responses") {
+    if model.real_name().starts_with("gpt-") && model.endpoint() != Some("responses") {
         return Err(format!("{model_id} lost its Responses endpoint metadata"));
     }
     Ok(())
 }
 
-#[test]
-fn shipped_agent_models_resolve_with_required_endpoint_metadata() {
+#[tokio::test]
+async fn shipped_agent_models_resolve_with_required_endpoint_metadata() {
     harnx_core::require_nextest();
     let Some(workspace_root) = workspace_root() else {
         return;
@@ -243,7 +256,8 @@ fn shipped_agent_models_resolve_with_required_endpoint_metadata() {
         let agents_dir = workspace_root.join("packages").join(package).join("agents");
         for stem in agent_stems(&agents_dir, &mut failures) {
             let qualified_name = format!("{package}/{stem}");
-            let (agent_checked, agent_failures) = check_agent_models(&config, &qualified_name);
+            let (agent_checked, agent_failures) =
+                check_agent_models(&config, &qualified_name).await;
             checked += agent_checked;
             failures.extend(agent_failures);
         }

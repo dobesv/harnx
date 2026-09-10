@@ -38,9 +38,11 @@ fn catalog_provider_for(client_type: &str) -> &str {
 
 fn provider_catalog(client_type: &str, client_name: &str) -> Option<&'static ProviderModels> {
     let catalog_provider = catalog_provider_for(client_type);
+    // Package clients keep the same provider prefix as their bare filename.
+    let bare_name = client_name.rsplit('/').next().unwrap_or(client_name);
     ALL_PROVIDER_MODELS.iter().find(|provider| {
         provider.provider == catalog_provider
-            || (client_type == "openai-compatible" && client_name.starts_with(&provider.provider))
+            || (client_type == "openai-compatible" && bare_name.starts_with(&provider.provider))
     })
 }
 
@@ -154,6 +156,30 @@ mod tests {
                 .any(|model| model.id() == "codex:gpt-5"),
             "catalog models should be listed under the codex client name"
         );
+    }
+
+    #[test]
+    fn package_compatible_clients_inherit_catalog_and_keep_local_overrides() {
+        let mut override_model = ModelData::new("zai.glm-5");
+        override_model.max_input_tokens = Some(12345);
+        for name in ["bedrock", "pantheon/bedrock", "coding/bedrock-us"] {
+            let models = models_for_client_config(
+                "openai-compatible",
+                name,
+                &[override_model.clone()],
+                None,
+            );
+            let glm = models.iter().find(|m| m.name() == "zai.glm-5").unwrap();
+            assert_eq!(glm.client_name(), name);
+            assert_eq!(glm.max_input_tokens(), Some(12345));
+            let minimax = models
+                .iter()
+                .find(|m| m.name() == "minimax.minimax-m2.5")
+                .expect("inherited Bedrock model");
+            assert_eq!(minimax.client_name(), name);
+            assert!(minimax.supports_tool_use());
+            assert_eq!(minimax.max_input_tokens(), Some(196000));
+        }
     }
 
     #[test]
