@@ -65,6 +65,26 @@ fn map_result(result: Result<CallToolResult, ErrorData>) -> Result<Value, ToolIn
     }
 }
 
+/// Canonical specifications for the filesystem tools.
+pub fn builtin_tool_specs() -> Vec<ToolSpec> {
+    vec![
+        spec::<ReadFileParams>(
+            "read",
+            "Read a text file with line numbers, pagination, grep filtering, and smart truncation. Prefer this tool over shell commands like sed, cat, head, tail. Use offset+limit to read specific line ranges instead of sed -n. Also reads local image files (PNG, JPEG, GIF, WebP, up to 5MB) and returns them as viewable images for vision-capable models — use this to view/inspect an image file by its path.",
+            true,
+            tool_templates::READ_CALL,
+        ),
+        spec::<WriteFileParams>("write", "Write or create a file, replacing its contents.", false, tool_templates::WRITE_CALL),
+        spec::<EditFileParams>("edit", "Replace exact text within an existing file.", false, tool_templates::EDIT_CALL),
+        spec::<InsertParams>("insert", "Insert text into a file at a specific line position.      insert_line: 0 prepends before line 1; insert_line: N inserts after line N; omit insert_line (or set N = total lines) to append to the end of the file. Optional column (1-indexed byte offset within      the line, default 1 = start of line) for mid-line insertion.      For exact-text replacement use edit; for regex replacement use re_replace.", false, tool_templates::INSERT_CALL),
+        spec::<ReReplaceParams>("re_replace", "Replace text in a file using a regular expression.      Uses fancy_regex syntax (supports lookahead/lookbehind).      Use $0 for the full match, $1/$2 etc. for capture groups in replacement.      Errors if pattern matches nothing. If pattern matches more than once,      set replace_all=true; otherwise only the first match is replaced.      For exact-text replacement use edit instead.", false, tool_templates::RE_REPLACE_CALL),
+        spec::<ListDirectoryParams>("ls", "List directory contents, optionally recursively. Prefer this tool over running bash ls.", true, tool_templates::LS_CALL),
+        spec::<SearchFilesParams>("grep", "Search file contents with regex and optional context lines. Prefer this tool over running bash grep.", true, tool_templates::GREP_CALL),
+        spec::<FindFilesParams>("find", "Find files by glob pattern. Prefer this tool over running bash find.", true, tool_templates::FIND_CALL),
+        spec::<RollbackParams>("rollback_file", "Restore a repository to a prior harnx history snapshot. Pass the commit SHA from the 'commit <sha>' line at the top of a prior tool response's diff as the commit_id parameter.", false, tool_templates::ROLLBACK_FILE_CALL),
+    ]
+}
+
 #[async_trait]
 impl Toolset for FsToolset {
     fn name(&self) -> &str {
@@ -72,62 +92,7 @@ impl Toolset for FsToolset {
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
-        vec![
-            spec::<ReadFileParams>(
-                "read",
-                "Read a text file with line numbers, pagination, grep filtering, and smart truncation. Prefer this tool over shell commands like sed, cat, head, tail. Use offset+limit to read specific line ranges instead of sed -n. Also reads local image files (PNG, JPEG, GIF, WebP, up to 5MB) and returns them as viewable images for vision-capable models — use this to view/inspect an image file by its path.",
-                true,
-                tool_templates::READ_CALL,
-            ),
-            spec::<WriteFileParams>(
-                "write",
-                "Write or create a file, replacing its contents.",
-                false,
-                tool_templates::WRITE_CALL,
-            ),
-            spec::<EditFileParams>(
-                "edit",
-                "Replace exact text within an existing file.",
-                false,
-                tool_templates::EDIT_CALL,
-            ),
-            spec::<InsertParams>(
-                "insert",
-                "Insert text into a file at a specific line position.      insert_line: 0 prepends before line 1; insert_line: N inserts after line N; omit insert_line (or set N = total lines) to append to the end of the file. Optional column (1-indexed byte offset within      the line, default 1 = start of line) for mid-line insertion.      For exact-text replacement use edit; for regex replacement use re_replace.",
-                false,
-                tool_templates::INSERT_CALL,
-            ),
-            spec::<ReReplaceParams>(
-                "re_replace",
-                "Replace text in a file using a regular expression.      Uses fancy_regex syntax (supports lookahead/lookbehind).      Use $0 for the full match, $1/$2 etc. for capture groups in replacement.      Errors if pattern matches nothing. If pattern matches more than once,      set replace_all=true; otherwise only the first match is replaced.      For exact-text replacement use edit instead.",
-                false,
-                tool_templates::RE_REPLACE_CALL,
-            ),
-            spec::<ListDirectoryParams>(
-                "ls",
-                "List directory contents, optionally recursively. Prefer this tool over running bash ls.",
-                true,
-                tool_templates::LS_CALL,
-            ),
-            spec::<SearchFilesParams>(
-                "grep",
-                "Search file contents with regex and optional context lines. Prefer this tool over running bash grep.",
-                true,
-                tool_templates::GREP_CALL,
-            ),
-            spec::<FindFilesParams>(
-                "find",
-                "Find files by glob pattern. Prefer this tool over running bash find.",
-                true,
-                tool_templates::FIND_CALL,
-            ),
-            spec::<RollbackParams>(
-                "rollback_file",
-                "Restore a repository to a prior harnx history snapshot. Pass the commit SHA from the 'commit <sha>' line at the top of a prior tool response's diff as the commit_id parameter.",
-                false,
-                tool_templates::ROLLBACK_FILE_CALL,
-            ),
-        ]
+        builtin_tool_specs()
     }
 
     async fn invoke(

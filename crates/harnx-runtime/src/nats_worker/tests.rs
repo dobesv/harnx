@@ -604,7 +604,9 @@ pub(super) fn fixed_prompt_call_fn(reply: &'static str) -> crate::agent_loop::Ag
     })
 }
 
-fn echoing_call_fn(captured: Arc<AsyncMutex<Vec<String>>>) -> crate::agent_loop::AgentCallFn {
+pub(super) fn echoing_call_fn(
+    captured: Arc<AsyncMutex<Vec<String>>>,
+) -> crate::agent_loop::AgentCallFn {
     Arc::new(move |input, _config, _abort| {
         let captured = Arc::clone(&captured);
         let derived = input.text();
@@ -626,14 +628,18 @@ pub(super) async fn test_subagent_toolset(
     let client = async_nats::connect(url)
         .await
         .expect("connect sub-agent toolset to test nats");
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_metadata =
+        crate::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+            .await
+            .expect("open session metadata");
     Arc::new(super::subagent_toolset::SubagentToolset::new(
         "metis",
         super::subagent_toolset::SubagentSessionRoute::new(
             "local",
             crate::SessionActivationRoute::ClusterShared,
         ),
-        client.clone(),
-        async_nats::jetstream::new(client),
+        super::subagent_toolset::SubagentNats::new(client.clone(), jetstream, session_metadata),
     ))
 }
 
@@ -1060,94 +1066,6 @@ async fn subagent_started_reaches_parent_stream_and_durable_log() {
             invocation_id: Some(_),
         } if agent == "metis" && session_id == &child_session_id
     )));
-
-    daemon.abort();
-    let _ = daemon.await;
-    let _ = nats.kill();
-    let _ = nats.wait();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subagent_new_prompt_reuse_and_load_share_one_session_log() {
-    let _env_guard = env_lock().await;
-    let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
-        return;
-    };
-    let seeded = seed_remote_config(&url);
-    let _env = subagent_test_env(&url, &seeded);
-    let captured = Arc::new(AsyncMutex::new(Vec::new()));
-    let daemon = spawn_metis_worker_with_call_fn(&url, echoing_call_fn(Arc::clone(&captured)));
-    let toolset = test_subagent_toolset(&url).await;
-
-    let created = toolset
-        .invoke("session_new", json!({}), CancellationToken::new())
-        .await
-        .expect("create and initialize child session");
-    let session_id = created["session_id"]
-        .as_str()
-        .expect("session_new returns session_id")
-        .to_string();
-    let log = NatsSessionLog::new(
-        seeded
-            .parent_config
-            .nats_jetstream("local")
-            .await
-            .expect("child log jetstream"),
-        session_id.clone(),
-    );
-    let after_new = log
-        .load_events_async()
-        .await
-        .expect("load child log after session_new")
-        .len();
-
-    for (message, expected) in [
-        (
-            "first continuation",
-            "stub remote reply over nats: first continuation",
-        ),
-        (
-            "second continuation",
-            "stub remote reply over nats: second continuation",
-        ),
-    ] {
-        let result = toolset
-            .invoke(
-                "session_prompt",
-                json!({ "message": message, "session_id": session_id }),
-                CancellationToken::new(),
-            )
-            .await
-            .expect("continue child session");
-        assert_eq!(result["session_id"], session_id);
-        assert_eq!(result["response"], expected);
-    }
-
-    let loaded = toolset
-        .invoke(
-            "session_load",
-            json!({ "session_id": session_id }),
-            CancellationToken::new(),
-        )
-        .await
-        .expect("load child session through tool");
-    let loaded_events = loaded["events"]
-        .as_array()
-        .expect("session_load returns serialized events");
-    assert!(loaded_events.len() > after_new);
-    let final_entries = log
-        .load_events_async()
-        .await
-        .expect("load final reused child log");
-    assert!(final_entries.len() > after_new);
-    assert_eq!(
-        captured.lock().await.as_slice(),
-        [
-            "Start a new session.",
-            "first continuation",
-            "second continuation"
-        ]
-    );
 
     daemon.abort();
     let _ = daemon.await;

@@ -1,0 +1,51 @@
+[package]
+name = "harnx-k8s-sandbox-tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native Harnx gateway for Kubernetes Agent Sandbox tools"
+
+[dependencies]
+anyhow = { workspace = true }
+async-nats = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+harnx-bash-tools = { path = "../harnx-bash-tools" }
+harnx-core = { path = "../harnx-core" }
+harnx-fs-tools = { path = "../harnx-fs-tools" }
+harnx-healthz = { workspace = true }
+harnx-metrics = { workspace = true }
+harnx-nats-common = { workspace = true }
+harnx-runtime = { path = "../harnx-runtime" }
+harnx-telemetry = { workspace = true, features = ["mcp", "nats"] }
+harnx-toolset = { path = "../harnx-toolset" }
+harnx-toolset-server = { path = "../harnx-toolset-server" }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+log = { workspace = true }
+metrics = { workspace = true }
+reqwest = { workspace = true }
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+shell-words = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+parking_lot = { workspace = true }
+schemars = { workspace = true }
+tempfile = { workspace = true }
+tower = { workspace = true }
+which = { workspace = true }
+
+[[bin]]
+name = "harnx-k8s-sandbox-tools"
+path = "src/main.rs"

@@ -8,6 +8,7 @@ members = [
     "crates/harnx-session",
     "crates/harnx-aws-creds",
     "crates/harnx-k8s-creds",
+    "crates/harnx-k8s-sandbox-tools",
     "crates/harnx-fetch",
     "crates/harnx-hooks",
     "crates/harnx-bash-tools",
