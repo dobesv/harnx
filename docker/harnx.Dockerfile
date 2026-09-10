@@ -18,6 +18,7 @@ COPY linux-${TARGETARCH}/harnx-time-server /usr/local/bin/harnx-time-server
 COPY linux-${TARGETARCH}/harnx-mcp-bridge /usr/local/bin/harnx-mcp-bridge
 COPY linux-${TARGETARCH}/harnx-aws-creds /usr/local/bin/harnx-aws-creds
 COPY linux-${TARGETARCH}/harnx-k8s-creds /usr/local/bin/harnx-k8s-creds
+COPY linux-${TARGETARCH}/harnx-k8s-sandbox-tools /usr/local/bin/harnx-k8s-sandbox-tools
 COPY linux-${TARGETARCH}/harnx-pkg /usr/local/bin/harnx-pkg
 COPY linux-${TARGETARCH}/harnx-proxy-auth /usr/local/bin/harnx-proxy-auth
 COPY linux-${TARGETARCH}/harnx-sandbox-run /usr/local/bin/harnx-sandbox-run

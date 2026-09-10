@@ -125,6 +125,14 @@ pub struct SessionMetadata {
 
 impl SessionMetadata {
     pub fn new(session_id: impl Into<String>, initializer: SessionInitializer) -> Self {
+        let mut extensions = BTreeMap::new();
+        if !initializer.tool_context.is_empty() {
+            extensions.insert(
+                super::TOOL_CONTEXT_NAMESPACE.to_string(),
+                serde_json::to_value(&initializer.tool_context)
+                    .expect("tool context is JSON-serializable"),
+            );
+        }
         Self {
             schema_version: SESSION_METADATA_SCHEMA_VERSION,
             session_id: session_id.into(),
@@ -133,7 +141,7 @@ impl SessionMetadata {
             variables: initializer.variables,
             overrides: initializer.overrides,
             title: SessionTitle::default(),
-            extensions: BTreeMap::new(),
+            extensions,
             worker_fence_token: 0,
         }
     }
@@ -151,7 +159,9 @@ impl SessionMetadata {
             self.session_id
         );
         self.agent.validate()?;
-        validate_extensions(&self.extensions)
+        validate_extensions(&self.extensions)?;
+        super::tool_context(self)?;
+        Ok(())
     }
 
     pub fn validate_initializer(&self, initializer: &SessionInitializer) -> Result<()> {

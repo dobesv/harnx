@@ -15,14 +15,14 @@ Prometheus metrics operate independently from OpenTelemetry distributed tracing 
 You can enable metrics using either the CLI flag or an environment variable fallback:
 
 - `--metrics-addr <ADDR>`: CLI flag available on most binaries. **Caveat:** `harnx-claude-compatible-hook-server` rejects `--metrics-addr` as an unknown argument due to its strict clap parser. Use `HARNX_METRICS_ADDR` instead. Accepts `IP:PORT` or `:PORT`. Passing a blank host (e.g. `--metrics-addr :8456`) binds `0.0.0.0`, allowing scrapers from other containers or Kubernetes pods to reach the endpoint. Passing `127.0.0.1:9109` restricts the listener to loopback.
-- `HARNX_METRICS_ADDR`: Environment variable fallback honored by shared-entrypoint binaries: `harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-time-server`, `harnx-plans-tools` (non-HTTP mode), `harnx-claude-compatible-hook-server`, `harnx-mcp-remote`, `harnx-mcp-bridge`, `harnx-mcp-time`, and `harnx-mcp-plans-github`. If both the CLI flag and environment variable are set, the CLI flag takes precedence.
+- `HARNX_METRICS_ADDR`: Environment variable fallback honored by shared-entrypoint binaries: `harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-time-server`, `harnx-plans-tools` (non-HTTP mode), `harnx-claude-compatible-hook-server`, `harnx-mcp-remote`, `harnx-mcp-bridge`, `harnx-mcp-time`, and `harnx-mcp-plans-github`. If both the CLI flag and environment variable are set, the CLI flag takes precedence.
 
 ## Binary Coverage
 
-Metrics support is implemented across 15 long-running binaries:
+Metrics support is implemented across 16 long-running binaries:
 
 - **Core runtime & proxies**: `harnx-serve`, `harnx-worker`, `harnx-aws-creds`, `harnx-k8s-creds`, `harnx-proxy-auth`
-- **Tool & hook servers**: `harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-plans-tools`, `harnx-time-server`, `harnx-claude-compatible-hook-server`
+- **Tool & hook servers**: `harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-plans-tools`, `harnx-time-server`, `harnx-claude-compatible-hook-server`
 - **MCP bridges & servers**: `harnx-mcp-bridge`, `harnx-mcp-remote`, `harnx-mcp-time`, `harnx-mcp-plans-github`
 
 **Out of scope (unchanged)**:
@@ -43,6 +43,8 @@ All exported metrics use the `harnx_` prefix.
 | `harnx_http_request_duration_seconds` | Histogram | `method`, `route` | HTTP request latency histogram (buckets: 0.005s to 10s). | HTTP servers |
 | `harnx_tool_calls_total` | Counter | `tool`, `status` | Tool execution count (`status` is `ok` or `error`). | Tool & MCP servers |
 | `harnx_tool_call_duration_seconds` | Histogram | `tool` | Tool execution duration histogram. | Tool & MCP servers |
+| `harnx_sandbox_wakes_total` | Counter | none | Kubernetes sandboxes resumed from zero replicas. | `harnx-k8s-sandbox-tools` |
+| `harnx_sandbox_hibernations_total` | Counter | `reason` | Kubernetes sandboxes suspended explicitly or after idle timeout. | `harnx-k8s-sandbox-tools` |
 
 Histogram buckets for duration metrics use default boundaries: `[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]` seconds.
 

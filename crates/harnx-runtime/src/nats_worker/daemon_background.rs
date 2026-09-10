@@ -183,6 +183,7 @@ struct SubagentToolsetStart {
     client: async_nats::Client,
     jetstream: jetstream::Context,
     replicas: usize,
+    session_metadata: crate::nats_session_metadata::SessionMetadataStore,
 }
 
 async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandle<Result<()>>> {
@@ -193,14 +194,14 @@ async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandl
         client,
         jetstream,
         replicas,
+        session_metadata,
     } = start;
     let package = harnx_core::package_namespace::pkg_from_qualified(&agent).map(str::to_string);
     let registration_context = jetstream.clone();
     let toolset = Arc::new(SubagentToolset::new(
         agent,
         route,
-        client.clone(),
-        jetstream,
+        super::subagent_toolset::SubagentNats::new(client.clone(), jetstream, session_metadata),
     ));
     let server_name = harnx_toolset::Toolset::name(toolset.as_ref()).to_string();
     let identity_token = harnx_toolset::server_identity_token(package.as_deref(), "", &server_name);
@@ -346,6 +347,7 @@ pub(super) async fn launch_worker_services(
         slot: Arc::clone(&background),
         replicas: startup.replicas,
         background_services_attempted: background_services_tx,
+        session_metadata: session_metadata.clone(),
     });
 
     Ok(WorkerServices {
@@ -397,6 +399,7 @@ struct BackgroundServicesCtx {
     slot: Arc<Mutex<Option<BackgroundServices>>>,
     replicas: usize,
     background_services_attempted: tokio::sync::watch::Sender<bool>,
+    session_metadata: crate::nats_session_metadata::SessionMetadataStore,
 }
 
 fn spawn_background_services(ctx: BackgroundServicesCtx) {
@@ -410,6 +413,7 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
             slot,
             replicas,
             background_services_attempted,
+            session_metadata,
         } = ctx;
         // Tool servers aren't started here anymore — each session's own
         // servers start on demand through `WorkerRuntime::server_reconciler`.
@@ -425,6 +429,7 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
                 client: client.clone(),
                 jetstream: jetstream.clone(),
                 replicas,
+                session_metadata: session_metadata.clone(),
             };
             async move { (agent, start_subagent_toolset(start).await) }
         });

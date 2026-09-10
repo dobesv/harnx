@@ -15,8 +15,8 @@ use harnx_core::event::{AgentEvent, AgentSource, SubAgentProgress, TurnEvent};
 use harnx_core::package_namespace::sanitize_for_tool_name;
 use harnx_core::session::SessionLogEntry;
 use harnx_toolset::{
-    ToolInvokeError, ToolSpec, Toolset, SUBAGENT_SESSION_CANCEL_TOOL, SUBAGENT_SESSION_LOAD_TOOL,
-    SUBAGENT_SESSION_NEW_TOOL, SUBAGENT_SESSION_PROMPT_TOOL,
+    ToolInvocation, ToolInvokeError, ToolSpec, Toolset, SUBAGENT_SESSION_CANCEL_TOOL,
+    SUBAGENT_SESSION_LOAD_TOOL, SUBAGENT_SESSION_NEW_TOOL, SUBAGENT_SESSION_PROMPT_TOOL,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -62,7 +62,28 @@ pub(crate) struct SubagentToolset {
     server_name: String,
     client: async_nats::Client,
     jetstream: jetstream::Context,
+    session_metadata: crate::nats_session_metadata::SessionMetadataStore,
     progress_heartbeat: Duration,
+}
+
+pub(crate) struct SubagentNats {
+    client: async_nats::Client,
+    jetstream: jetstream::Context,
+    session_metadata: crate::nats_session_metadata::SessionMetadataStore,
+}
+
+impl SubagentNats {
+    pub(crate) fn new(
+        client: async_nats::Client,
+        jetstream: jetstream::Context,
+        session_metadata: crate::nats_session_metadata::SessionMetadataStore,
+    ) -> Self {
+        Self {
+            client,
+            jetstream,
+            session_metadata,
+        }
+    }
 }
 
 struct SubagentStart<'a> {
@@ -74,8 +95,7 @@ impl SubagentToolset {
     pub(crate) fn new(
         agent: impl Into<String>,
         route: SubagentSessionRoute,
-        client: async_nats::Client,
-        jetstream: jetstream::Context,
+        nats: SubagentNats,
     ) -> Self {
         let agent = agent.into();
         let server_name = agent
@@ -85,8 +105,9 @@ impl SubagentToolset {
             server_name: sanitize_for_tool_name(server_name),
             agent,
             route,
-            client,
-            jetstream,
+            client: nats.client,
+            jetstream: nats.jetstream,
+            session_metadata: nats.session_metadata,
             progress_heartbeat: SUBAGENT_PROGRESS_HEARTBEAT,
         }
     }
@@ -100,9 +121,29 @@ impl SubagentToolset {
     async fn create_session(
         &self,
         session_id: Option<String>,
+        parent_session_id: Option<&str>,
     ) -> Result<NatsSession, ToolInvokeError> {
+        let mut config = self.route.session_config(&self.agent, session_id.clone());
+        if session_id.is_none() {
+            if let Some(parent_session_id) = parent_session_id {
+                let context = self
+                    .session_metadata
+                    .get_tool_context(parent_session_id)
+                    .await
+                    .map_err(|error| {
+                        ToolInvokeError::Recoverable(format!(
+                            "load parent session tool context: {error:#}"
+                        ))
+                    })?;
+                // Older sessions and direct Toolset callers may have no metadata record.
+                // Treat that as an empty context so delegation remains rollout-compatible.
+                if let Some(context) = context {
+                    config.initializer = config.initializer.with_tool_context(context);
+                }
+            }
+        }
         NatsSession::new(
-            self.route.session_config(&self.agent, session_id),
+            config,
             self.client.clone(),
             self.jetstream.clone(),
             harnx_core::abort::create_abort_signal(),
@@ -398,6 +439,28 @@ impl Toolset for SubagentToolset {
                 "unknown sub-agent tool: {tool}"
             )))
         }
+    }
+
+    async fn invoke_with_context(
+        &self,
+        mut invocation: ToolInvocation,
+    ) -> Result<Value, ToolInvokeError> {
+        if matches!(
+            invocation.tool.as_str(),
+            SUBAGENT_SESSION_NEW_TOOL | SUBAGENT_SESSION_PROMPT_TOOL
+        ) {
+            if let (Some(parent), Some(object)) = (
+                invocation.context.invoking_session_id,
+                invocation.args.as_object_mut(),
+            ) {
+                object.insert(
+                    "__harnx_parent_session_id".to_string(),
+                    Value::String(parent),
+                );
+            }
+        }
+        self.invoke(&invocation.tool, invocation.args, invocation.cancel)
+            .await
     }
 }
 
