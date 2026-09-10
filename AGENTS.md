@@ -160,6 +160,38 @@ them.
 - **Dual license:** MIT OR Apache-2.0. Preserve license headers where present.
 
 
+### Reasoning-signature compatibility across providers (issue #1804)
+
+Each provider has its own opaque reasoning-signature format:
+- **Anthropic**: `thinking` block `signature` (also used by Bedrock Claude)
+- **Gemini**: `functionCall` part `thoughtSignature`
+- **OpenAI**: `reasoning` item `encrypted_content` (shared by codex)
+
+These formats are **not interchangeable**. Replaying a signature to an incompatible provider
+causes HTTP 400, which halts fallback (400 is non-retryable). The fix added
+`reasoning_provenance: Option<ReasoningProvenance>` to `ToolCall`
+(`harnx-core/src/tool.rs`), tagging each signature with its producing protocol and model.
+
+Compatibility rules (verified in `ToolCall::compatible_signature`):
+- **OpenAI**: fail-closed on model identity — `encrypted_content` is bound to both org and model.
+  Same-protocol, different-model → incompatible.
+- **Anthropic/Gemini**: protocol must match; model binding is not enforced.
+
+Import handling when signature is incompatible or unknown (legacy sessions lack provenance):
+- **Gemini**: first `functionCall` of each step must carry `thoughtSignature`. Use placeholder
+  `"skip_thought_signature_validator"` for imported/unknown history (per Google docs).
+- **Anthropic**: omit the `thinking` block entirely. Missing signature → 400.
+- **OpenAI**: omit the `reasoning` input item. Safe because harnx uses `function_call` with
+  `call_id`, not OpenAI-internal `id`/`fc_` which would trigger reasoning-pairing validation.
+
+Architecture: provenance-aware normalization lives in each provider's `build_body` (request-local,
+never mutates stored history). Each builder calls
+`tool_call.compatible_signature(dest_protocol, dest_model)` and applies destination handling.
+
+When modifying provider client code: tag provenance at capture (streaming/non-streaming extraction), check compatibility before replay, and allocate correlation IDs for imported anonymous tool calls (Gemini doesn't return IDs; use `ToolCallIdAllocator` in each `build_body`). Do NOT add a shared pre-pass — each provider knows its own
+protocol and import-handling rules.
+
+
 ### Adding a Provider Client
 
 Wire a new provider client via `register_client!` in `crates/harnx-client/src/lib.rs`:

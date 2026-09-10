@@ -467,18 +467,18 @@ fn test_orphan_partition_logic() {
 
     // Simulate orphan calls
     let calls = vec![
-        ToolCall {
-            name: "echo".to_string(),
-            arguments: json!({"message": "hello"}),
-            id: Some("call_echo_1".to_string()),
-            thought_signature: None,
-        },
-        ToolCall {
-            name: "write_file".to_string(),
-            arguments: json!({"path": "/tmp/test", "content": "data"}),
-            id: Some("call_write_1".to_string()),
-            thought_signature: None,
-        },
+        ToolCall::new(
+            "echo".to_string(),
+            json!({"message": "hello"}),
+            Some("call_echo_1".to_string()),
+            None,
+        ),
+        ToolCall::new(
+            "write_file".to_string(),
+            json!({"path": "/tmp/test", "content": "data"}),
+            Some("call_write_1".to_string()),
+            None,
+        ),
     ];
 
     // Partition based on hints

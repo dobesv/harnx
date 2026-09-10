@@ -13,6 +13,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{path::PathBuf, str::FromStr, collections::HashMap};
 
+pub const GEMINI_IMPORTED_HISTORY_PLACEHOLDER: &str = "skip_thought_signature_validator";
+
 impl VertexAIClient {
     config_get_fn!(project_id, get_project_id);
     config_get_fn!(location, get_location);
@@ -175,7 +177,7 @@ fn prepare_embeddings(self_: &VertexAIClient, data: &EmbeddingsData) -> Result<R
 
 pub async fn gemini_chat_completions(
     builder: RequestBuilder,
-    _model: &Model,
+    model: &Model,
 ) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
@@ -186,10 +188,10 @@ pub async fn gemini_chat_completions(
     }
     debug!("non-stream-data: {data}");
     harnx_core::llm_trace::response("vertexai", &data);
-    gemini_extract_chat_completions_text(&data)
+    gemini_extract_chat_completions_text(&data, model)
 }
 
-fn gemini_handle_part(handler: &mut SseHandler, part: &Value, index: usize) -> Result<()> {
+fn gemini_handle_part(handler: &mut SseHandler, part: &Value, index: usize, model: &Model) -> Result<()> {
     if let Some(text) = part["text"].as_str() {
         if index > 0 {
             handler.text("\n\n")?;
@@ -205,12 +207,23 @@ fn gemini_handle_part(handler: &mut SseHandler, part: &Value, index: usize) -> R
             .as_str()
             .or_else(|| part["thought_signature"].as_str())
             .map(|v| v.to_string());
-        handler.tool_call(ToolCall::new(
-            name.to_string(),
-            json!(args),
-            part["functionCall"]["id"].as_str().map(ToOwned::to_owned),
-            thought_signature,
-        ))?;
+        // Tag provenance for Gemini thoughtSignature (issue #1804)
+        let provenance = thought_signature.as_ref().map(|_| {
+            use harnx_core::tool::{ReasoningProtocol, ReasoningProvenance};
+            ReasoningProvenance {
+                protocol: ReasoningProtocol::GeminiThoughtSignature,
+                model: Some(model.real_name().to_string()),
+            }
+        });
+        handler.tool_call(
+            ToolCall::new(
+                name.to_string(),
+                json!(args),
+                part["functionCall"]["id"].as_str().map(ToOwned::to_owned),
+                thought_signature,
+            )
+            .with_provenance(provenance),
+        )?;
     }
     Ok(())
 }
@@ -219,13 +232,13 @@ fn gemini_handle_part(handler: &mut SseHandler, part: &Value, index: usize) -> R
 /// so per-chunk handling is testable in isolation. Unlike Claude/Bedrock
 /// /OpenAI, Gemini has no accumulator state — each chunk carries complete
 /// parts — so no state struct is needed.
-fn gemini_handle_stream_chunk(handler: &mut SseHandler, data: &Value) -> Result<()> {
+fn gemini_handle_stream_chunk(handler: &mut SseHandler, data: &Value, model: &Model) -> Result<()> {
     if let Some(_err) = data["error"].as_object() {
         return crate::catch_error(data, 500, None);
     }
     if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
         for (i, part) in parts.iter().enumerate() {
-            gemini_handle_part(handler, part, i)?;
+            gemini_handle_part(handler, part, i, model)?;
         }
     } else if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
         .as_str()
@@ -246,8 +259,9 @@ fn gemini_handle_stream_chunk(handler: &mut SseHandler, data: &Value) -> Result<
 pub async fn gemini_chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
-    _model: &Model,
+    model: &Model,
 ) -> Result<()> {
+    let model = model.clone();
     let res = builder.send().await?;
     let status = res.status();
     if !status.is_success() {
@@ -262,7 +276,7 @@ pub async fn gemini_chat_completions_streaming(
             let data: Value = serde_json::from_str(value)?;
             debug!("stream-data: {data}");
             harnx_core::llm_trace::stream_event("vertexai", &data);
-            gemini_handle_stream_chunk(handler, &data)?;
+            gemini_handle_stream_chunk(handler, &data, &model)?;
             Ok(false)
         };
         json_stream(res.bytes_stream(), handle).await?;
@@ -302,7 +316,7 @@ struct EmbeddingsResBodyPredictionEmbeddings {
     values: Vec<f32>,
 }
 
-fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsOutput> {
+fn gemini_extract_chat_completions_text(data: &Value, model: &Model) -> Result<ChatCompletionsOutput> {
     let mut text_parts = vec![];
     let mut thought_parts = vec![];
     let mut tool_calls = vec![];
@@ -322,12 +336,23 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
                     .as_str()
                     .or_else(|| part["thought_signature"].as_str())
                     .map(|v| v.to_string());
-                tool_calls.push(ToolCall::new(
-                    name.to_string(),
-                    json!(args),
-                    part["functionCall"]["id"].as_str().map(ToOwned::to_owned),
-                    thought_signature,
-                ));
+                // Tag provenance for Gemini thoughtSignature (issue #1804)
+                let provenance = thought_signature.as_ref().map(|_| {
+                    use harnx_core::tool::{ReasoningProtocol, ReasoningProvenance};
+                    ReasoningProvenance {
+                        protocol: ReasoningProtocol::GeminiThoughtSignature,
+                        model: Some(model.real_name().to_string()),
+                    }
+                });
+                tool_calls.push(
+                    ToolCall::new(
+                        name.to_string(),
+                        json!(args),
+                        part["functionCall"]["id"].as_str().map(ToOwned::to_owned),
+                        thought_signature,
+                    )
+                    .with_provenance(provenance),
+                );
             }
         }
     }
@@ -448,13 +473,23 @@ pub fn gemini_build_chat_completions_body(
                         ..
                     }) => {
                         let mut model_parts = vec![];
+                        // Only emit thought text part for native Gemini reasoning (issue #1804)
+                        // Foreign thought text must not be promoted to a native reasoning part.
+                        let is_gemini_native = tool_results.first().map(|r| {
+                            r.call.compatible_signature(
+                                harnx_core::tool::ReasoningProtocol::GeminiThoughtSignature,
+                                model.real_name(),
+                            ).is_some()
+                        }).unwrap_or(false);
                         if let Some(thought) = thought {
-                            model_parts.push(json!({ "thought": thought }));
+                            if is_gemini_native {
+                                model_parts.push(json!({ "thought": thought }));
+                            }
                         }
                         if !text.is_empty() {
                             model_parts.push(json!({ "text": text }));
                         }
-                        for tool_result in tool_results.iter() {
+                        for (idx, tool_result) in tool_results.iter().enumerate() {
                             let mut call_obj = json!({
                                 "name": tool_result.call.name,
                                 "args": tool_result.call.arguments,
@@ -463,11 +498,26 @@ pub fn gemini_build_chat_completions_body(
                                 call_obj["id"] = id.clone().into();
                             }
                             let mut part_obj = json!({ "functionCall": call_obj });
-                            if let Some(signature) = &tool_result.call.thought_signature {
+                            // Check signature compatibility (issue #1804)
+                            let compatible_sig = tool_result.call.compatible_signature(
+                                harnx_core::tool::ReasoningProtocol::GeminiThoughtSignature,
+                                model.real_name(),
+                            );
+                            if let Some(signature) = compatible_sig {
                                 if let Some(obj) = part_obj.as_object_mut() {
                                     obj.insert(
                                         "thoughtSignature".to_string(),
-                                        signature.clone().into(),
+                                        signature.to_string().into(),
+                                    );
+                                }
+                            } else if idx == 0 {
+                                // First functionCall of each step must carry a signature when
+                                // importing foreign/unknown history (Google FAQ).
+                                // Use placeholder for incompatible/unknown signatures.
+                                if let Some(obj) = part_obj.as_object_mut() {
+                                    obj.insert(
+                                        "thoughtSignature".to_string(),
+                                        GEMINI_IMPORTED_HISTORY_PLACEHOLDER.into(),
                                     );
                                 }
                             }
@@ -736,7 +786,8 @@ mod tests {
                 "cachedContentTokenCount": 30
             }
         });
-        let output = gemini_extract_chat_completions_text(&response)
+        let model = Model::new("vertexai", "gemini-2.0-flash");
+        let output = gemini_extract_chat_completions_text(&response, &model)
             .expect("non-streaming Gemini response should parse");
         let expected = CompletionTokenUsage {
             input_tokens: 100,
@@ -748,7 +799,7 @@ mod tests {
 
         let (tx, _rx) = unbounded_channel();
         let mut handler = SseHandler::new(tx, create_abort_signal());
-        gemini_handle_stream_chunk(&mut handler, &response)
+        gemini_handle_stream_chunk(&mut handler, &response, &model)
             .expect("streaming Gemini chunk should parse");
         let (_, _, _, usage) = handler.take();
         assert_usage(&usage, &expected);
@@ -898,7 +949,8 @@ mod tests {
         ];
 
         for chunk in &chunks {
-            gemini_handle_stream_chunk(&mut handler, chunk)
+            let model = Model::new("vertexai", "gemini-2.0-flash");
+            gemini_handle_stream_chunk(&mut handler, chunk, &model)
                 .expect("stream chunk should process");
         }
 
@@ -926,8 +978,8 @@ mod tests {
                 {"functionCall": {"name": "Bash", "args": {"cmd": "ls"}}}
             ]}}]
         });
-
-        gemini_handle_stream_chunk(&mut handler, &chunk).expect("stream chunk should process");
+        let model = Model::new("vertexai", "gemini-2.0-flash");
+        gemini_handle_stream_chunk(&mut handler, &chunk, &model).expect("stream chunk should process");
 
         let calls = handler.tool_calls();
         assert_eq!(calls.len(), 2);
@@ -935,21 +987,9 @@ mod tests {
         assert_eq!(calls[1].arguments, json!({"cmd": "ls"}));
     }
 
-    /// End-to-end thought + thoughtSignature round-trip for Gemini/Vertex AI.
-    ///
-    /// Gemini's protocol carries `thought: <text>` parts and a
-    /// `thoughtSignature` on functionCall parts. Dropping either on the
-    /// round-trip leaves the model's tool calls orphaned on the next turn.
-    /// The streaming code routes `part["thought"]` to `handler.thought()`
-    /// and captures `thoughtSignature` on tool_call emission; this test
-    /// pins both behaviours AND verifies the serialiser echoes them back.
-    #[test]
-    fn gemini_streaming_thought_roundtrips_into_next_request_body() {
+    fn streaming_thought_output() -> (String, Option<String>, Vec<ToolCall>, Model) {
         let (tx, _rx) = unbounded_channel();
         let mut handler = SseHandler::new(tx, create_abort_signal());
-
-        // Realistic Gemini chunk: a thought part, a text part, and a
-        // functionCall part with thoughtSignature, all in one candidate.
         let chunk = json!({
             "candidates": [{"content": {"parts": [
                 {"thought": "Plan the call."},
@@ -960,19 +1000,27 @@ mod tests {
                 }
             ]}}]
         });
-        gemini_handle_stream_chunk(&mut handler, &chunk).expect("stream chunk should process");
-
-        let (text, thought, tool_calls, _usage) = handler.take();
-        assert_eq!(tool_calls[0].id.as_deref(), Some("gemini-call-17"));
-        let non_stream = gemini_extract_chat_completions_text(&chunk).unwrap();
+        let model = Model::new("gemini", "gemini-2.5-pro");
+        gemini_handle_stream_chunk(&mut handler, &chunk, &model).unwrap();
+        let non_stream = gemini_extract_chat_completions_text(&chunk, &model).unwrap();
         assert_eq!(non_stream.tool_calls[0].id.as_deref(), Some("gemini-call-17"));
+        let (text, thought, tool_calls, _) = handler.take();
+        assert_eq!(tool_calls[0].id.as_deref(), Some("gemini-call-17"));
+        (text, thought, tool_calls, model)
+    }
+
+    fn assert_gemini_streamed_thought(
+        text: &str,
+        thought: Option<&str>,
+        tool_calls: &[ToolCall],
+    ) {
         // Gemini prepends "\n\n" for non-first parts (gemini_handle_part).
         assert!(
             text.contains("Running ls."),
             "text part flows to text buffer; got {text:?}"
         );
         assert_eq!(
-            thought.as_deref(),
+            thought,
             Some("Plan the call."),
             "thought part must reach the dedicated thought buffer (not text)"
         );
@@ -986,10 +1034,49 @@ mod tests {
             Some("sig_gemini_xyz"),
             "thoughtSignature on functionCall must reach ToolCall.thought_signature"
         );
+    }
+
+    /// End-to-end thought + thoughtSignature round-trip for Gemini/Vertex AI.
+    ///
+    /// Gemini's protocol carries `thought: <text>` parts and a
+    /// `thoughtSignature` on functionCall parts. Dropping either on the
+    /// round-trip leaves the model's tool calls orphaned on the next turn.
+    /// The streaming code routes `part["thought"]` to `handler.thought()`
+    /// and captures `thoughtSignature` on tool_call emission; this test
+    /// pins both behaviours AND verifies the serialiser echoes them back.
+    #[test]
+    fn gemini_streaming_thought_roundtrips_into_next_request_body() {
+        use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+        use harnx_core::tool::ToolResult;
+
+        let (text, thought, tool_calls, mut model) = streaming_thought_output();
+        assert_gemini_streamed_thought(&text, thought.as_deref(), &tool_calls);
 
         // Now feed it back through the serialiser and confirm the next
         // request body carries thought + thoughtSignature on the model turn.
-        let body = gemini_tool_result_request(tool_calls, text, thought);
+        let tool_result = ToolResult::new(tool_calls.into_iter().next().unwrap(), json!("ok"));
+        let messages = vec![
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text("Run a command".to_string()),
+            ),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![tool_result],
+                    text,
+                    thought,
+                )),
+            ),
+        ];
+        model.set_max_tokens(Some(4096), true);
+        let body = gemini_build_chat_completions_body(
+            test_streaming_completion_data(messages),
+            &model,
+            HashMap::new(),
+        )
+        .unwrap();
+
         let contents = body["contents"].as_array().unwrap();
         let model_turn = contents
             .iter()
@@ -1015,42 +1102,207 @@ mod tests {
         );
     }
 
-    fn gemini_tool_result_request(tool_calls: Vec<ToolCall>, text: String, thought: Option<String>) -> Value {
-        use harnx_core::api_types::ChatCompletionsData;
-        use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
-        use harnx_core::model::Model;
+
+    #[test]
+    fn gemini_producers_tag_provenance_on_streaming_and_non_streaming() {
+        use harnx_core::abort::create_abort_signal;
+        use harnx_core::tool::{ReasoningProtocol, ReasoningProvenance};
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let model = Model::new("gemini", "gemini-provenance-model");
+        let response = json!({
+            "candidates": [{"content": {"parts": [{
+                "functionCall": {"name": "Bash", "args": {"command": "pwd"}},
+                "thoughtSignature": "non-stream-sig"
+            }]}}]
+        });
+        let output = gemini_extract_chat_completions_text(&response, &model).unwrap();
+        assert_eq!(
+            output.tool_calls[0].reasoning_provenance,
+            Some(ReasoningProvenance {
+                protocol: ReasoningProtocol::GeminiThoughtSignature,
+                model: Some("gemini-provenance-model".to_string()),
+            })
+        );
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let chunk = json!({
+            "candidates": [{"content": {"parts": [{
+                "functionCall": {"name": "Bash", "args": {"command": "pwd"}},
+                "thoughtSignature": "stream-sig"
+            }]}}]
+        });
+        gemini_handle_stream_chunk(&mut handler, &chunk, &model).unwrap();
+        assert_eq!(
+            handler.tool_calls()[0].reasoning_provenance,
+            Some(ReasoningProvenance {
+                protocol: ReasoningProtocol::GeminiThoughtSignature,
+                model: Some("gemini-provenance-model".to_string()),
+            })
+        );
+    }
+
+    fn anthropic_test_call() -> ToolCall {
+        use harnx_core::tool::{ReasoningProtocol, ReasoningProvenance};
+
+        ToolCall::new(
+            "ClaudeTool".to_string(),
+            json!({"value": 1}),
+            Some("toolu_claude".to_string()),
+            Some("claude-signature".to_string()),
+        )
+        .with_provenance(Some(ReasoningProvenance {
+            protocol: ReasoningProtocol::AnthropicThinking,
+            model: Some("claude-sonnet".to_string()),
+        }))
+    }
+
+    fn reasoning_tool_message(call: ToolCall, thought: &str) -> Message {
         use harnx_core::tool::ToolResult;
 
-        let tool_results = tool_calls.into_iter().map(|call| ToolResult::new(call, json!("ok"))).collect();
-        let messages = vec![
-            Message::new(
-                MessageRole::User,
-                MessageContent::Text("Run a command".to_string()),
-            ),
-            Message::new(
-                MessageRole::Tool,
-                MessageContent::ToolCalls(MessageContentToolCalls::new(
-                    tool_results,
-                    text,
-                    thought,
-                )),
-            ),
+        Message::new(
+            MessageRole::Tool,
+            MessageContent::ToolCalls(MessageContentToolCalls::new(
+                vec![ToolResult::new(call, json!({"ok": true}))],
+                String::new(),
+                Some(thought.to_string()),
+            )),
+        )
+    }
+
+    fn test_completion_data(messages: Vec<Message>) -> ChatCompletionsData {
+        ChatCompletionsData {
+            messages,
+            temperature: None,
+            top_p: None,
+            functions: None,
+            stream: false,
+            attachments_dir: None,
+        }
+    }
+
+    fn test_streaming_completion_data(messages: Vec<Message>) -> ChatCompletionsData {
+        let mut data = test_completion_data(messages);
+        data.stream = true;
+        data
+    }
+
+    fn gemini_model_parts(body: &Value) -> Vec<&Value> {
+        body["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|content| content["role"] == "model")
+            .flat_map(|content| content["parts"].as_array().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn gemini_builder_imports_anthropic_and_legacy_history() {
+        let legacy: ToolCall = serde_json::from_str(
+            r#"{"name":"LegacyTool","arguments":{},"id":"legacy-call","thought_signature":"legacy-signature"}"#,
+        )
+        .unwrap();
+        let history = vec![
+            reasoning_tool_message(anthropic_test_call(), "claude thought"),
+            reasoning_tool_message(legacy.clone(), "legacy thought"),
         ];
-        let mut model = Model::new("gemini", "gemini-2.5-pro");
-        model.set_max_tokens(Some(4096), true);
-        gemini_build_chat_completions_body(
-            ChatCompletionsData {
-                messages,
-                temperature: None,
-                top_p: None,
-                functions: None,
-                stream: true,
-                attachments_dir: None,
-            },
-            &model,
+        let body = gemini_build_chat_completions_body(
+            test_completion_data(history),
+            &Model::new("gemini", "gemini-2.5-pro"),
             HashMap::new(),
         )
-        .unwrap()
+        .unwrap();
+        let parts = gemini_model_parts(&body);
+        assert!(parts.iter().all(|part| part.get("thought").is_none()));
+        let function_calls: Vec<&&Value> = parts
+            .iter()
+            .filter(|part| part["functionCall"].is_object())
+            .collect();
+        assert_eq!(function_calls.len(), 2);
+        assert!(function_calls.iter().all(|part| {
+            part["thoughtSignature"] == GEMINI_IMPORTED_HISTORY_PLACEHOLDER
+                && part["thoughtSignature"] != "claude-signature"
+                && part["thoughtSignature"] != "legacy-signature"
+        }));
+
+        let saved_legacy = serde_json::to_string(&legacy).unwrap();
+        assert!(!saved_legacy.contains("reasoning_provenance"));
+        let restored: ToolCall = serde_json::from_str(&saved_legacy).unwrap();
+        assert_eq!(restored.thought_signature.as_deref(), Some("legacy-signature"));
+        assert_eq!(restored.reasoning_provenance, None);
+    }
+
+    #[test]
+    fn gemini_imported_parallel_calls_placeholder_only_first_part() {
+        use harnx_core::tool::ToolResult;
+
+        let first_call = anthropic_test_call();
+        let mut second_call = anthropic_test_call();
+        second_call.name = "SecondClaudeTool".to_string();
+        let history = vec![Message::new(
+            MessageRole::Tool,
+            MessageContent::ToolCalls(MessageContentToolCalls::new(
+                vec![
+                    ToolResult::new(first_call, json!({"first": true})),
+                    ToolResult::new(second_call, json!({"second": true})),
+                ],
+                String::new(),
+                Some("claude thought".to_string()),
+            )),
+        )];
+
+        let body = gemini_build_chat_completions_body(
+            test_completion_data(history),
+            &Model::new("gemini", "gemini-2.5-pro"),
+            HashMap::new(),
+        )
+        .unwrap();
+        let function_calls: Vec<_> = gemini_model_parts(&body)
+            .into_iter()
+            .filter(|part| part["functionCall"].is_object())
+            .collect();
+
+        assert_eq!(function_calls.len(), 2);
+        assert_eq!(
+            function_calls[0]["thoughtSignature"],
+            GEMINI_IMPORTED_HISTORY_PLACEHOLDER
+        );
+        assert!(function_calls[1].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn gemini_import_build_does_not_mutate_anthropic_history() {
+        use harnx_core::tool::ReasoningProtocol;
+
+        let call = anthropic_test_call();
+        let history = vec![reasoning_tool_message(call.clone(), "claude thought")];
+        gemini_build_chat_completions_body(
+            test_completion_data(history.clone()),
+            &Model::new("gemini", "gemini-2.5-pro"),
+            HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(call.thought_signature.as_deref(), Some("claude-signature"));
+        assert_eq!(
+            call.reasoning_provenance.as_ref().map(|p| p.protocol),
+            Some(ReasoningProtocol::AnthropicThinking)
+        );
+
+        let claude_body = crate::claude::claude_build_chat_completions_body(
+            test_completion_data(history),
+            &Model::new("claude", "claude-sonnet"),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let replayed_signature = claude_body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .find_map(|part| part["signature"].as_str());
+        assert_eq!(replayed_signature, Some("claude-signature"));
     }
 }
 
@@ -1354,7 +1606,8 @@ mod attachment_emission_tests {
             }
         });
 
-        let result = gemini_handle_stream_chunk(&mut handler, &event);
+        let model = Model::new("vertexai", "gemini-2.0-flash");
+        let result = gemini_handle_stream_chunk(&mut handler, &event, &model);
         assert!(result.is_err(), "Stream error event should return an error");
         let err = result.unwrap_err();
         let llm_err = err.downcast_ref::<LlmError>().expect("Should be an LlmError");

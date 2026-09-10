@@ -127,7 +127,7 @@ impl ClaudeClient {
 
 pub async fn claude_chat_completions(
     builder: RequestBuilder,
-    _model: &Model,
+    model: &Model,
 ) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
@@ -138,7 +138,7 @@ pub async fn claude_chat_completions(
     }
     debug!("non-stream-data: {data}");
     harnx_core::llm_trace::response("claude", &data);
-    claude_extract_chat_completions(&data)
+    claude_extract_chat_completions(&data, model)
 }
 
 /// Mutable state threaded through the Claude streaming parser. Extracted
@@ -156,10 +156,30 @@ struct ClaudeStreamState {
     thinking_signature: String,
 }
 
+
+fn anthropic_reasoning_provenance(model: &Model) -> harnx_core::tool::ReasoningProvenance {
+    harnx_core::tool::ReasoningProvenance {
+        protocol: harnx_core::tool::ReasoningProtocol::AnthropicThinking,
+        model: Some(model.real_name().to_string()),
+    }
+}
+
+fn attach_anthropic_signature(calls: &mut [ToolCall], signature: Option<&str>, model: &Model) {
+    let Some(signature) = signature else {
+        return;
+    };
+    let provenance = anthropic_reasoning_provenance(model);
+    for call in calls {
+        call.thought_signature = Some(signature.to_string());
+        call.reasoning_provenance = Some(provenance.clone());
+    }
+}
+
 fn claude_emit_pending_tool_call(
     state: &mut ClaudeStreamState,
     handler: &mut SseHandler,
     empty_args_as_object: bool,
+    model: &Model,
 ) -> Result<()> {
     if state.function_name.is_empty() {
         return Ok(());
@@ -179,12 +199,18 @@ fn claude_emit_pending_tool_call(
     } else {
         Some(state.thinking_signature.clone())
     };
-    handler.tool_call(ToolCall::new(
-        state.function_name.clone(),
-        arguments,
-        Some(state.function_id.clone()),
-        thought_signature,
-    ))?;
+    let provenance = thought_signature
+        .as_ref()
+        .map(|_| anthropic_reasoning_provenance(model));
+    handler.tool_call(
+        ToolCall::new(
+            state.function_name.clone(),
+            arguments,
+            Some(state.function_id.clone()),
+            thought_signature,
+        )
+        .with_provenance(provenance),
+    )?;
     state.function_name.clear();
     state.function_arguments.clear();
     state.function_id.clear();
@@ -213,6 +239,7 @@ fn claude_handle_content_block_start(
     state: &mut ClaudeStreamState,
     handler: &mut SseHandler,
     data: &Value,
+    model: &Model,
 ) -> Result<()> {
     let (Some("tool_use"), Some(name), Some(id)) = (
         data["content_block"]["type"].as_str(),
@@ -225,7 +252,7 @@ fn claude_handle_content_block_start(
     // content_block_stop (some providers / proxy paths skip it).
     // Normally content_block_stop clears the accumulators, so this
     // path is dormant.
-    claude_emit_pending_tool_call(state, handler, false)?;
+    claude_emit_pending_tool_call(state, handler, false, model)?;
     state.function_name = name.into();
     state.function_arguments.clear();
     state.function_id = id.into();
@@ -265,12 +292,13 @@ fn claude_handle_content_block_delta(
 fn claude_handle_content_block_stop(
     state: &mut ClaudeStreamState,
     handler: &mut SseHandler,
+    model: &Model,
 ) -> Result<()> {
     claude_transition_reasoning(state, handler, false)?;
     // Emit if a tool_use block is pending, and reset accumulators so
     // the fallback emit path in content_block_start doesn't re-fire
     // this same call when the next tool_use block begins.
-    claude_emit_pending_tool_call(state, handler, true)
+    claude_emit_pending_tool_call(state, handler, true, model)
 }
 
 /// Add two optional u64 values. If both are None, returns None.
@@ -307,6 +335,7 @@ fn claude_handle_stream_event(
     state: &mut ClaudeStreamState,
     handler: &mut SseHandler,
     data: &Value,
+    model: &Model,
 ) -> Result<()> {
     let Some(typ) = data["type"].as_str() else {
         return Ok(());
@@ -320,9 +349,9 @@ fn claude_handle_stream_event(
             // Cumulative fields override message_start values when present.
             handler.set_usage(claude_usage(&data["usage"]));
         }
-        "content_block_start" => claude_handle_content_block_start(state, handler, data)?,
+        "content_block_start" => claude_handle_content_block_start(state, handler, data, model)?,
         "content_block_delta" => claude_handle_content_block_delta(state, handler, data)?,
-        "content_block_stop" => claude_handle_content_block_stop(state, handler)?,
+        "content_block_stop" => claude_handle_content_block_stop(state, handler, model)?,
         "error" => {
             let _ = data;
             return crate::catch_error(data, 500, None);
@@ -335,8 +364,9 @@ fn claude_handle_stream_event(
 pub async fn claude_chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
-    _model: &Model,
+    model: &Model,
 ) -> Result<()> {
+    let model = model.clone();
     let mut state = ClaudeStreamState::default();
     let handle = |message: SseMmessage| -> Result<bool> {
         if handler.aborted() {
@@ -345,7 +375,7 @@ pub async fn claude_chat_completions_streaming(
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
         harnx_core::llm_trace::stream_event("claude", &data);
-        claude_handle_stream_event(&mut state, handler, &data)?;
+        claude_handle_stream_event(&mut state, handler, &data, &model)?;
         Ok(false)
     };
 
@@ -418,6 +448,7 @@ pub fn claude_build_chat_completions_body(
     } = data;
 
     let system_message = extract_system_message(&mut messages);
+    let mut tool_call_ids = crate::tool_call_id::ToolCallIdAllocator::new(&messages);
 
     let mut network_image_urls = vec![];
 
@@ -462,20 +493,25 @@ pub fn claude_build_chat_completions_body(
                     let mut assistant_parts = vec![];
                     let mut user_parts = vec![];
                     if let Some(thought_text) = thought {
+                        // Check signature compatibility (issue #1804)
+                        let sig_result = tool_results.first().and_then(|r| {
+                            r.call.compatible_signature(
+                                harnx_core::tool::ReasoningProtocol::AnthropicThinking,
+                                model.real_name(),
+                            )
+                        });
                         // Echo the thinking block verbatim so the API knows
                         // this assistant turn included extended thinking.
-                        // The signature is stored on each tool call in the turn
-                        // (issue #328: omitting this caused the model to treat
-                        // its own tool calls as coming from a "previous session").
-                        let signature = tool_results
-                            .first()
-                            .and_then(|r| r.call.thought_signature.as_deref())
-                            .unwrap_or("");
-                        assistant_parts.push(json!({
-                            "type": "thinking",
-                            "thinking": thought_text,
-                            "signature": signature,
-                        }));
+                        // Only emit if signature is compatible (same-provider).
+                        if let Some(signature) = sig_result {
+                            assistant_parts.push(json!({
+                                "type": "thinking",
+                                "thinking": thought_text,
+                                "signature": signature,
+                            }));
+                        }
+                        // If signature incompatible, omit the thinking block entirely.
+                        // Foreign/placeholder signature → 400 "Invalid signature in thinking block".
                     }
                     if !text.is_empty() {
                         assistant_parts.push(json!({
@@ -484,9 +520,10 @@ pub fn claude_build_chat_completions_body(
                         }))
                     }
                     for tool_result in tool_results {
+                        let correlation_id = tool_call_ids.id_for(&tool_result.call);
                         assistant_parts.push(json!({
                             "type": "tool_use",
-                            "id": tool_result.call.id,
+                            "id": correlation_id.clone(),
                             "name": tool_result.call.name,
                             "input": tool_result.call.arguments,
                         }));
@@ -513,7 +550,7 @@ pub fn claude_build_chat_completions_body(
                         };
                         user_parts.push(json!({
                             "type": "tool_result",
-                            "tool_use_id": tool_result.call.id,
+                            "tool_use_id": correlation_id,
                             "content": tr_content,
                         }));
                     }
@@ -577,7 +614,7 @@ pub fn claude_build_chat_completions_body(
     Ok(body)
 }
 
-pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
+pub fn claude_extract_chat_completions(data: &Value, model: &Model) -> Result<ChatCompletionsOutput> {
     let mut text = String::new();
     let mut reasoning: Option<String> = None;
     let mut reasoning_signature: Option<String> = None;
@@ -620,13 +657,7 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
         }
     }
 
-    // Attach the thinking signature to every tool call in this turn.
-    // The API requires it echoed back verbatim alongside the thinking block.
-    if let Some(sig) = &reasoning_signature {
-        for call in &mut tool_calls {
-            call.thought_signature = Some(sig.clone());
-        }
-    }
+    attach_anthropic_signature(&mut tool_calls, reasoning_signature.as_deref(), model);
 
     // When there are tool calls, carry the thought on its dedicated field so
     // the serialiser can echo back the thinking block on the next request.
@@ -684,6 +715,30 @@ mod tests {
     fn assert_usage(actual: &CompletionTokenUsage, expected: &CompletionTokenUsage) {
         assert_eq!(actual, expected);
         assert!(actual.input_tokens >= actual.cached_tokens + actual.cache_write_tokens);
+    }
+
+
+    fn handle_test_stream_event(
+        state: &mut ClaudeStreamState,
+        handler: &mut SseHandler,
+        event: &Value,
+    ) -> Result<()> {
+        let model = Model::new("claude", "claude-3-5-sonnet");
+        claude_handle_stream_event(state, handler, event, &model)
+    }
+
+
+    fn assert_streamed_thinking_text(text: &str, thought: Option<&str>) {
+        assert_eq!(thought, Some("Let me think about this."));
+        assert!(!text.contains("<think>"), "thinking leaked into text: {text:?}");
+    }
+
+    fn assert_streamed_thinking_call(tool_calls: &[ToolCall]) {
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(
+            tool_calls[0].thought_signature.as_deref(),
+            Some("sig_stream_xyz")
+        );
     }
 
     #[test]
@@ -847,7 +902,7 @@ system_prompt_prefix:
         ];
 
         for event in &events {
-            claude_handle_stream_event(&mut state, &mut handler, event)
+            handle_test_stream_event(&mut state, &mut handler, event)
                 .expect("stream event should process");
         }
 
@@ -874,12 +929,10 @@ system_prompt_prefix:
         use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
         use harnx_core::tool::{ToolCall, ToolResult};
 
-        let call = ToolCall::new(
-            "Bash".to_string(),
-            json!({"command": "ls"}),
-            Some("toolu_X".to_string()),
-            None,
-        );
+        let call = ToolCall::new("Bash".to_string(), json!({"command": "ls"}), Some("toolu_X".to_string()), Some("claude-signature".to_string())).with_provenance(Some(harnx_core::tool::ReasoningProvenance {
+            protocol: harnx_core::tool::ReasoningProtocol::AnthropicThinking,
+            model: Some("claude-3-5-sonnet".to_string()),
+        }));
         let tool_result = ToolResult::new(call, json!({"output": "file.txt"}));
         let tool_calls_msg = Message::new(
             MessageRole::Tool,
@@ -936,6 +989,7 @@ system_prompt_prefix:
             content[thinking_idx]["thinking"], "I reasoned carefully",
             "thinking block must carry the thought text verbatim"
         );
+        assert_eq!(content[thinking_idx]["signature"], "claude-signature");
     }
 
     /// Regression test for issue #328 (parser side).  `claude_extract_chat_completions`
@@ -962,7 +1016,8 @@ system_prompt_prefix:
             "usage": {"input_tokens": 10, "output_tokens": 20}
         });
 
-        let output = claude_extract_chat_completions(&response)
+        let model = Model::new("claude", "claude-3-5-sonnet");
+        let output = claude_extract_chat_completions(&response, &model)
             .expect("extraction should succeed");
 
         assert_eq!(
@@ -977,37 +1032,14 @@ system_prompt_prefix:
         );
     }
 
-    /// End-to-end thinking + signature round-trip on the STREAMING path.
-    ///
-    /// The non-streaming round-trip is covered by
-    /// `claude_extract_preserves_thought_and_signature` plus
-    /// `claude_body_includes_thinking_block_when_thought_present`. The
-    /// streaming path can regress the same "previous session" symptom
-    /// independently when thinking text is delivered as
-    /// `content_block_delta` events with a trailing `signature_delta`.
-    ///
-    /// This test drives `claude_handle_stream_event` with a realistic
-    /// event sequence (thinking deltas → signature_delta → tool_use),
-    /// takes the `SseHandler` output the same way
-    /// `run_chat_completion_streaming` does, then feeds it back into
-    /// `claude_build_chat_completions_body` to verify the next request
-    /// includes the thinking block + signature. If thinking deltas land
-    /// in the text buffer instead of the thought buffer the serialiser
-    /// emits an assistant turn with no thinking block and the model sees
-    /// its tool calls as orphaned.
-    #[test]
-    fn claude_streaming_thought_roundtrips_into_next_request_body() {
+    fn drive_claude_reasoning_stream(
+    ) -> (String, Option<String>, Vec<harnx_core::tool::ToolCall>) {
         use harnx_core::abort::create_abort_signal;
-        use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
-        use harnx_core::tool::ToolResult;
         use tokio::sync::mpsc::unbounded_channel;
 
         let (tx, _rx) = unbounded_channel();
         let mut handler = SseHandler::new(tx, create_abort_signal());
         let mut state = ClaudeStreamState::default();
-
-        // Realistic Anthropic streaming sequence: thinking block (with
-        // multi-chunk text and a signature_delta), then a tool_use block.
         let events = [
             json!({
                 "type": "message_start",
@@ -1051,42 +1083,23 @@ system_prompt_prefix:
                 "usage": {"output_tokens": 42}
             }),
         ];
-
         for event in &events {
-            claude_handle_stream_event(&mut state, &mut handler, event)
+            handle_test_stream_event(&mut state, &mut handler, event)
                 .expect("stream event should process");
         }
 
-        // Drain the handler the same way run_chat_completion_streaming does.
         let (text, thought, tool_calls, _usage) = handler.take();
+        (text, thought, tool_calls)
+    }
 
-        // The thinking content must end up on the dedicated `thought` field,
-        // NOT folded into the text buffer with <think>...</think> wrappers.
-        // If it lands in `text`, the next turn's request body has no thinking
-        // block to echo back and the model treats the tool results as
-        // orphaned.
-        assert_eq!(
-            thought.as_deref(),
-            Some("Let me think about this."),
-            "streaming thought must be captured in the dedicated thought field, \
-             not the text buffer"
-        );
-        assert!(
-            !text.contains("<think>"),
-            "streaming text must not be polluted with <think> wrappers when \
-             tool calls are present — the wrapper is meant for plain-text \
-             reasoning responses; tool-call turns echo the raw thinking block. \
-             Got text: {text:?}"
-        );
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(
-            tool_calls[0].thought_signature.as_deref(),
-            Some("sig_stream_xyz"),
-            "streaming signature must reach the tool_call"
-        );
+    fn build_claude_reasoning_roundtrip_body(
+        text: String,
+        thought: Option<String>,
+        tool_calls: Vec<harnx_core::tool::ToolCall>,
+    ) -> Value {
+        use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+        use harnx_core::tool::ToolResult;
 
-        // Now simulate what the agent loop does: build a ToolCalls message
-        // from (text, thought, tool_calls), then build the next request body.
         let tool_result = ToolResult::new(tool_calls.into_iter().next().unwrap(), json!("ok"));
         let messages = vec![
             Message::new(
@@ -1102,11 +1115,9 @@ system_prompt_prefix:
                 )),
             ),
         ];
-
         let mut model = Model::new("claude", "claude-3-5-sonnet");
         model.set_max_tokens(Some(4096), true);
-
-        let body = claude_build_chat_completions_body(
+        claude_build_chat_completions_body(
             ChatCompletionsData {
                 messages,
                 temperature: None,
@@ -1118,8 +1129,22 @@ system_prompt_prefix:
             &model,
             &HashMap::new(),
         )
-        .unwrap();
+        .unwrap()
+    }
 
+    #[test]
+    fn claude_streaming_thought_reaches_tool_call_signature() {
+        let (text, thought, tool_calls) = drive_claude_reasoning_stream();
+        assert_streamed_thinking_text(&text, thought.as_deref());
+        assert_streamed_thinking_call(&tool_calls);
+    }
+
+    /// Streaming thinking text and its trailing signature must be replayed in
+    /// the next request's assistant turn.
+    #[test]
+    fn claude_streaming_thought_roundtrips_into_next_request_body() {
+        let (text, thought, tool_calls) = drive_claude_reasoning_stream();
+        let body = build_claude_reasoning_roundtrip_body(text, thought, tool_calls);
         let assistant_msg = body["messages"]
             .as_array()
             .unwrap()
@@ -1129,7 +1154,6 @@ system_prompt_prefix:
         let content = assistant_msg["content"]
             .as_array()
             .expect("assistant content array");
-
         let thinking_block = content
             .iter()
             .find(|b| b["type"] == "thinking")
@@ -1203,7 +1227,7 @@ system_prompt_prefix:
             json!({"type": "content_block_stop", "index": 2}),
         ];
         for event in &events {
-            claude_handle_stream_event(&mut state, &mut handler, event)
+            handle_test_stream_event(&mut state, &mut handler, event)
                 .expect("stream event should process");
         }
 
@@ -1237,7 +1261,8 @@ system_prompt_prefix:
             "usage": {"input_tokens": 1, "output_tokens": 1}
         });
 
-        let output = claude_extract_chat_completions(&response).unwrap();
+        let model = Model::new("claude", "claude-3-5-sonnet");
+        let output = claude_extract_chat_completions(&response, &model).unwrap();
         assert_eq!(output.tool_calls.len(), 2);
         for call in &output.tool_calls {
             assert_eq!(
@@ -1294,7 +1319,7 @@ system_prompt_prefix:
             json!({"type": "content_block_stop", "index": 1}),
         ];
         for event in &events {
-            claude_handle_stream_event(&mut state, &mut handler, event)
+            handle_test_stream_event(&mut state, &mut handler, event)
                 .expect("stream event should process");
         }
 
@@ -1325,7 +1350,7 @@ system_prompt_prefix:
             }
         });
 
-        let result = claude_handle_stream_event(&mut state, &mut handler, &event);
+        let result = handle_test_stream_event(&mut state, &mut handler, &event);
         assert!(result.is_err(), "Stream error event should return an error");
         let err = result.unwrap_err();
         let llm_err = err.downcast_ref::<LlmError>().expect("Should be an LlmError");
@@ -1399,7 +1424,8 @@ system_prompt_prefix:
             }
         });
 
-        let output = claude_extract_chat_completions(&response)
+        let model = Model::new("claude", "claude-3-5-sonnet");
+        let output = claude_extract_chat_completions(&response, &model)
             .expect("extraction should succeed");
 
         assert_output_usage(
@@ -1427,7 +1453,8 @@ system_prompt_prefix:
             }
         });
 
-        let output = claude_extract_chat_completions(&response)
+        let model = Model::new("claude", "claude-3-5-sonnet");
+        let output = claude_extract_chat_completions(&response, &model)
             .expect("extraction should succeed");
 
         assert_output_usage(
@@ -1449,6 +1476,7 @@ system_prompt_prefix:
         let (tx, _rx) = unbounded_channel();
         let mut handler = SseHandler::new(tx, create_abort_signal());
         let mut state = ClaudeStreamState::default();
+        let model = Model::new("claude", "claude-3-5-sonnet");
         let start = json!({
             "type": "message_start",
             "message": {"usage": {
@@ -1461,9 +1489,9 @@ system_prompt_prefix:
             "type": "message_delta",
             "usage": {"output_tokens": 10}
         });
-        claude_handle_stream_event(&mut state, &mut handler, &start)
+        claude_handle_stream_event(&mut state, &mut handler, &start, &model)
             .expect("message_start usage should parse");
-        claude_handle_stream_event(&mut state, &mut handler, &delta)
+        claude_handle_stream_event(&mut state, &mut handler, &delta, &model)
             .expect("message_delta usage should parse");
 
         let (_, _, _, usage) = handler.take();
@@ -1490,7 +1518,10 @@ system_prompt_prefix:
             }
         });
 
-        let output = claude_extract_chat_completions(&response)
+        let output = claude_extract_chat_completions(
+            &response,
+            &Model::new("claude", "claude-3-5-sonnet"),
+        )
             .expect("extraction should succeed");
 
         assert_eq!(output.input_tokens, Some(42));
@@ -1508,7 +1539,10 @@ system_prompt_prefix:
             }
         });
 
-        let output = claude_extract_chat_completions(&response)
+        let output = claude_extract_chat_completions(
+            &response,
+            &Model::new("claude", "claude-3-5-sonnet"),
+        )
             .expect("extraction should succeed");
 
         assert_eq!(output.input_tokens, Some(2000), "cache_creation alone becomes input_tokens");
@@ -1551,12 +1585,12 @@ system_prompt_prefix:
     fn claude_tool_result_with_image_emits_array_with_image_block() {
         use harnx_core::tool::ToolResult;
         let model = Model::new("claude", "claude-3-5-sonnet");
-        let tool_call = ToolCall {
-            id: Some("toolu_XYZ".to_string()),
-            name: "fs_read".to_string(),
-            arguments: json!({"path": "foo.png"}),
-            thought_signature: None,
-        };
+        let tool_call = ToolCall::new(
+            "fs_read".to_string(),
+            json!({"path": "foo.png"}),
+            Some("toolu_XYZ".to_string()),
+            None,
+        );
         let mut tool_result = ToolResult::new(tool_call, json!("output text"));
         tool_result.content.push(MessageContentPart::ImageUrl {
             image_url: crate::ImageUrl {
@@ -1628,12 +1662,12 @@ system_prompt_prefix:
     fn claude_tool_result_without_image_emits_string() {
         use harnx_core::tool::ToolResult;
         let model = Model::new("claude", "claude-3-5-sonnet");
-        let tool_call = ToolCall {
-            id: Some("toolu_ABC".to_string()),
-            name: "fs_read".to_string(),
-            arguments: json!({"path": "foo.txt"}),
-            thought_signature: None,
-        };
+        let tool_call = ToolCall::new(
+            "fs_read".to_string(),
+            json!({"path": "foo.txt"}),
+            Some("toolu_ABC".to_string()),
+            None,
+        );
         let tool_result = ToolResult::new(tool_call, json!({"status": "ok"}));
 
         let messages = vec![
@@ -1678,5 +1712,118 @@ system_prompt_prefix:
 
         assert!(content.is_string(), "tool_result content should be a string when no images");
         assert_eq!(content.as_str().unwrap(), "{\"status\":\"ok\"}");
+    }
+
+    #[test]
+    fn claude_producers_tag_anthropic_provenance_on_streaming_and_non_streaming() {
+        use harnx_core::abort::create_abort_signal;
+        use harnx_core::tool::{ReasoningProtocol, ReasoningProvenance};
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let model = Model::new("claude", "claude-provenance-model");
+        let response = json!({
+            "id": "msg_provenance",
+            "content": [
+                {"type": "thinking", "thinking": "plan", "signature": "non-stream-sig"},
+                {"type": "tool_use", "id": "toolu_non_stream", "name": "Bash", "input": {"command": "pwd"}}
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let output = claude_extract_chat_completions(&response, &model).unwrap();
+        assert_eq!(
+            output.tool_calls[0].reasoning_provenance,
+            Some(ReasoningProvenance {
+                protocol: ReasoningProtocol::AnthropicThinking,
+                model: Some("claude-provenance-model".to_string()),
+            })
+        );
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = ClaudeStreamState::default();
+        for event in [
+            json!({"type": "content_block_start", "content_block": {"type": "thinking"}}),
+            json!({"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "plan"}}),
+            json!({"type": "content_block_delta", "delta": {"type": "signature_delta", "signature": "stream-sig"}}),
+            json!({"type": "content_block_stop"}),
+            json!({"type": "content_block_start", "content_block": {"type": "tool_use", "id": "toolu_stream", "name": "Bash"}}),
+            json!({"type": "content_block_delta", "delta": {"partial_json": "{\"command\":\"pwd\"}"}}),
+            json!({"type": "content_block_stop"}),
+        ] {
+            claude_handle_stream_event(&mut state, &mut handler, &event, &model).unwrap();
+        }
+        assert_eq!(
+            handler.tool_calls()[0].reasoning_provenance,
+            Some(ReasoningProvenance {
+                protocol: ReasoningProtocol::AnthropicThinking,
+                model: Some("claude-provenance-model".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn claude_builder_imports_gemini_and_legacy_history_with_matching_unique_ids() {
+        use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+        use harnx_core::tool::{ReasoningProtocol, ReasoningProvenance, ToolCall, ToolResult};
+        use std::collections::HashSet;
+
+        let gemini_call = |name: &str, signature: &str| {
+            ToolCall::new(name.to_string(), json!({}), None, Some(signature.to_string())).with_provenance(Some(ReasoningProvenance {
+                protocol: ReasoningProtocol::GeminiThoughtSignature,
+                model: Some("gemini-2.5-pro".to_string()),
+            }))
+        };
+        let legacy: ToolCall = serde_yaml::from_str(
+            "name: Legacy\narguments: {}\nid: legacy-id\nthought_signature: legacy-sig\n",
+        )
+        .unwrap();
+        let tool_message = |call: ToolCall, thought: &str| {
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![ToolResult::new(call, json!({"ok": true}))],
+                    String::new(),
+                    Some(thought.to_string()),
+                )),
+            )
+        };
+        let messages = vec![
+            Message::new(MessageRole::User, MessageContent::Text("first".into())),
+            tool_message(gemini_call("First", "gemini-sig-1"), "foreign one"),
+            Message::new(MessageRole::User, MessageContent::Text("second".into())),
+            tool_message(gemini_call("Second", "gemini-sig-2"), "foreign two"),
+            Message::new(MessageRole::User, MessageContent::Text("legacy".into())),
+            tool_message(legacy, "legacy thought"),
+        ];
+        let body = claude_build_chat_completions_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+                attachments_dir: None,
+            },
+            &Model::new("claude", "claude-sonnet"),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let mut call_ids = Vec::new();
+        let mut result_ids = Vec::new();
+        for message in body["messages"].as_array().unwrap() {
+            for part in message["content"].as_array().into_iter().flatten() {
+                assert_ne!(part["type"], "thinking");
+                if part["type"] == "tool_use" {
+                    call_ids.push(part["id"].as_str().unwrap().to_string());
+                } else if part["type"] == "tool_result" {
+                    result_ids.push(part["tool_use_id"].as_str().unwrap().to_string());
+                }
+            }
+        }
+        assert_eq!(call_ids, result_ids);
+        assert!(call_ids.iter().all(|id| !id.is_empty()));
+        assert_eq!(call_ids.iter().collect::<HashSet<_>>().len(), call_ids.len());
+        assert_eq!(call_ids.last().map(String::as_str), Some("legacy-id"));
     }
 }

@@ -27,6 +27,48 @@ use harnx_core::tool::ToolResult;
 
 use serde_json::{json, Value};
 
+fn responses_tool_history_items(
+    tool_results: Vec<ToolResult>,
+    model: &Model,
+    tool_call_ids: &mut crate::tool_call_id::ToolCallIdAllocator,
+) -> Vec<Value> {
+    let mut items = Vec::new();
+    let compatible_content = tool_results.iter().find_map(|result| {
+        result.call.compatible_signature(
+            harnx_core::tool::ReasoningProtocol::OpenAiEncryptedReasoning,
+            model.real_name(),
+        )
+    });
+    if let Some(encrypted_content) = compatible_content {
+        items.push(json!({
+            "type": "reasoning",
+            "encrypted_content": encrypted_content,
+            "summary": [],
+        }));
+    }
+
+    let correlation_ids: Vec<String> = tool_results
+        .iter()
+        .map(|result| tool_call_ids.id_for(&result.call))
+        .collect();
+    for (tool_result, call_id) in tool_results.iter().zip(&correlation_ids) {
+        items.push(json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": tool_result.call.name,
+            "arguments": tool_result.call.arguments.to_string(),
+        }));
+    }
+    for (tool_result, call_id) in tool_results.into_iter().zip(correlation_ids) {
+        items.push(json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": responses_tool_result_output(&tool_result),
+        }));
+    }
+    items
+}
+
 /// Build an OpenAI Responses API request body from `ChatCompletionsData`.
 ///
 /// Transforms the standard harnx `ChatCompletionsData` into the Responses
@@ -94,6 +136,7 @@ pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> 
     // Extract leading system message -> top-level `instructions`
     let system_message = extract_system_message(&mut messages);
     let instructions = system_message.map(|parts| parts.join("\n\n"));
+    let mut tool_call_ids = crate::tool_call_id::ToolCallIdAllocator::new(&messages);
 
     // Build `input` array from remaining messages
     let input: Vec<Value> = messages
@@ -102,73 +145,8 @@ pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> 
         .flat_map(|(i, message)| {
             let Message { role, content, .. } = message;
             match content {
-                MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results,
-                    text: _,
-                    thought: _,
-                    sequence: _,
-                }) => {
-                    // Build input items for tool-call history:
-                    // 1. reasoning replay — encrypted content from prior turn's thought_signature
-                    // 2. one function_call per tool_result.call
-                    // 3. one function_call_output per tool_result
-
-                    let mut items: Vec<Value> = Vec::new();
-
-                    // Reasoning replay: emit a reasoning input item BEFORE function_call items
-                    // when any tool_result in this turn has a thought_signature.
-                    // The encrypted_content enables stateless reasoning replay across tool turns
-                    // (server-side state is not preserved with store:false).
-                    //
-                    // Wire shape (per OpenAI Responses API multi-turn docs):
-                    // { "type": "reasoning", "encrypted_content": "<blob>", "summary": [] }
-                    //
-                    // Source: first non-empty tool_result.call.thought_signature in this turn.
-                    // Mirrors Claude/Bedrock which attach one signature per tool turn.
-                    let encrypted_content = tool_results
-                        .iter()
-                        .filter_map(|r| r.call.thought_signature.as_ref())
-                        .next();
-
-                    if let Some(encrypted) = encrypted_content {
-                        items.push(json!({
-                            "type": "reasoning",
-                            "encrypted_content": encrypted,
-                            "summary": [],
-                        }));
-                    }
-
-                    // Emit function_call + function_call_output items
-                    // When `sequence` is true, each tool result represents a separate turn
-                    // (tool call + tool output). We emit paired items for each.
-                    for tool_result in &tool_results {
-                        // The call_id comes from tool_result.call.id
-                        // Responses API requires call_id at top level
-                        let call_id = tool_result.call.id.clone().unwrap_or_default();
-                        let name = tool_result.call.name.clone();
-                        let arguments = tool_result.call.arguments.to_string();
-
-                        items.push(json!({
-                            "type": "function_call",
-                            "call_id": call_id,
-                            "name": name,
-                            "arguments": arguments,
-                        }));
-                    }
-
-                    // Now emit function_call_output for each tool result
-                    for tool_result in tool_results {
-                        let call_id = tool_result.call.id.clone().unwrap_or_default();
-                        let output = responses_tool_result_output(&tool_result);
-
-                        items.push(json!({
-                            "type": "function_call_output",
-                            "call_id": call_id,
-                            "output": output,
-                        }));
-                    }
-
-                    items
+                MessageContent::ToolCalls(MessageContentToolCalls { tool_results, .. }) => {
+                    responses_tool_history_items(tool_results, model, &mut tool_call_ids)
                 }
                 MessageContent::Text(text) if role.is_assistant() && i != messages_len - 1 => {
                     // Non-final assistant text: strip think tag
@@ -367,6 +345,31 @@ fn parse_responses_tool_arguments(name: &str, arguments: &str) -> Result<Value> 
         .with_context(|| format!("Tool call '{name}' have non-JSON arguments '{arguments}'"))
 }
 
+fn openai_reasoning_provenance(model_name: &str) -> harnx_core::tool::ReasoningProvenance {
+    harnx_core::tool::ReasoningProvenance {
+        protocol: harnx_core::tool::ReasoningProtocol::OpenAiEncryptedReasoning,
+        model: Some(model_name.to_string()),
+    }
+}
+
+fn extract_responses_tool_call(
+    item: &Value,
+    encrypted_content: Option<&str>,
+    model: &Model,
+) -> Result<ToolCall> {
+    let name = item["name"].as_str().unwrap_or_default();
+    let arguments =
+        parse_responses_tool_arguments(name, item["arguments"].as_str().unwrap_or_default())?;
+    let provenance = encrypted_content.map(|_| openai_reasoning_provenance(model.real_name()));
+    Ok(ToolCall::new(
+        name.to_string(),
+        arguments,
+        item["call_id"].as_str().map(str::to_string),
+        encrypted_content.map(str::to_string),
+    )
+    .with_provenance(provenance))
+}
+
 /// Parse a non-streaming OpenAI Responses API JSON into `ChatCompletionsOutput`.
 ///
 /// Mirrors `gemini_extract_chat_completions_text` but reads the Responses `output[]` array.
@@ -451,26 +454,11 @@ pub fn openai_extract_responses(data: &Value, model: &Model) -> Result<ChatCompl
                         pending_encrypted_content = Some(encrypted.to_string());
                     }
                 }
-                "function_call" => {
-                    // Parse function call: name, arguments (JSON string), call_id
-                    let name = item["name"].as_str().unwrap_or_default();
-                    let call_id = item["call_id"].as_str().map(|s| s.to_string());
-
-                    // Arguments come as JSON string; parse to Value
-                    let args_str = item["arguments"].as_str().unwrap_or_default();
-                    let arguments = parse_responses_tool_arguments(name, args_str)?;
-
-                    // Associate pending encrypted_content as thought_signature for every
-                    // function_call in this reasoning turn.
-                    let thought_signature = pending_encrypted_content.as_ref().cloned();
-
-                    tool_calls.push(ToolCall::new(
-                        name.to_string(),
-                        arguments,
-                        call_id,
-                        thought_signature,
-                    ));
-                }
+                "function_call" => tool_calls.push(extract_responses_tool_call(
+                    item,
+                    pending_encrypted_content.as_deref(),
+                    model,
+                )?),
                 _ => {
                     // Ignore unknown item types (e.g., function_call_output in response)
                     trace!("Unknown output item type: {}", item_type);
@@ -528,6 +516,7 @@ use reqwest::RequestBuilder;
 pub struct ResponsesStreamState {
     cache_accounting: CacheAccounting,
     model_name: String,
+    model_real_name: String,
     /// Pending function calls indexed by item_id: (name, args_buffer, call_id)
     /// When `function_call_arguments.done` arrives, we finalize and emit.
     pub pending_tool_calls: HashMap<String, PendingToolCall>,
@@ -550,8 +539,13 @@ impl ResponsesStreamState {
         Self {
             cache_accounting: model.cache_accounting(),
             model_name: model.name().to_string(),
+            model_real_name: model.real_name().to_string(),
             ..Default::default()
         }
+    }
+
+    fn model_real_name(&self) -> &str {
+        &self.model_real_name
     }
 }
 
@@ -595,12 +589,15 @@ fn responses_finalize_tool_call(
         return Ok(());
     };
     let arguments = parse_responses_tool_arguments(&pending.name, &pending.arguments)?;
-    handler.tool_call(ToolCall::new(
-        pending.name,
-        arguments,
-        pending.call_id,
-        state.encrypted_content.clone(),
-    ))
+    // Tag provenance for OpenAI encrypted_content (issue #1804)
+    let thought_signature = state.encrypted_content.clone();
+    let provenance = thought_signature
+        .as_ref()
+        .map(|_| openai_reasoning_provenance(state.model_real_name()));
+    handler.tool_call(
+        ToolCall::new(pending.name, arguments, pending.call_id, thought_signature)
+            .with_provenance(provenance),
+    )
 }
 
 fn responses_output_item_done(
@@ -625,7 +622,8 @@ fn responses_output_item_done(
 
 fn responses_completed(state: &mut ResponsesStreamState, handler: &mut SseHandler, data: &Value) {
     if let Some(encrypted) = &state.encrypted_content {
-        handler.attach_thought_signature_to_pending_tool_calls(encrypted.clone());
+        let provenance = openai_reasoning_provenance(state.model_real_name());
+        handler.attach_thought_signature_to_pending_tool_calls(encrypted.clone(), provenance);
     }
     state.encrypted_content = None;
 
@@ -811,13 +809,53 @@ pub(crate) async fn responses_streaming_with_content_type(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harnx_core::message::{Message, MessageContent, MessageContentPart, MessageRole};
+    use harnx_core::message::{
+        Message, MessageContent, MessageContentPart, MessageContentToolCalls, MessageRole,
+    };
     use harnx_core::model::Model;
     use harnx_core::tool::{ToolCall, ToolResult};
 
     /// Helper to create a simple model for tests.
     fn test_model() -> Model {
         Model::new("openai", "gpt-5.6-sol")
+    }
+
+    struct TestReasoning<'a> {
+        id: Option<&'a str>,
+        signature: &'a str,
+        protocol: harnx_core::tool::ReasoningProtocol,
+        model: &'a str,
+    }
+
+    fn reasoning_call(name: &str, arguments: Value, reasoning: TestReasoning<'_>) -> ToolCall {
+        ToolCall::new(
+            name.to_string(),
+            arguments,
+            reasoning.id.map(str::to_string),
+            Some(reasoning.signature.to_string()),
+        )
+        .with_provenance(Some(harnx_core::tool::ReasoningProvenance {
+            protocol: reasoning.protocol,
+            model: Some(reasoning.model.to_string()),
+        }))
+    }
+
+    fn openai_reasoning_call(
+        name: &str,
+        arguments: Value,
+        id: Option<&str>,
+        signature: &str,
+    ) -> ToolCall {
+        reasoning_call(
+            name,
+            arguments,
+            TestReasoning {
+                id,
+                signature,
+                protocol: harnx_core::tool::ReasoningProtocol::OpenAiEncryptedReasoning,
+                model: "gpt-5.6-sol",
+            },
+        )
     }
 
     /// Helper to create a model with max_tokens_param.
@@ -2109,11 +2147,11 @@ mod tests {
     #[test]
     fn test_reasoning_replay_with_signature() {
         // Tool-call history with thought_signature -> reasoning input item emitted
-        let tool_call = ToolCall::new(
-            "get_weather".into(),
-            serde_json::json!({"location": "SF"}),
-            Some("call_123".into()),
-            Some("ENCRYPTED_BLOB_456".into()),
+        let tool_call = openai_reasoning_call(
+            "get_weather",
+            json!({"location": "SF"}),
+            Some("call_123"),
+            "ENCRYPTED_BLOB_456",
         );
         let tool_result = ToolResult::new(tool_call, serde_json::json!({"temp": 72}));
 
@@ -2227,18 +2265,10 @@ mod tests {
     #[test]
     fn test_reasoning_replay_first_signature_used() {
         // Multiple tool_results: first non-empty signature is used
-        let tool_call1 = ToolCall::new(
-            "tool1".into(),
-            serde_json::json!({}),
-            Some("call_1".into()),
-            Some("FIRST_ENCRYPTED_BLOB".into()),
-        );
-        let tool_call2 = ToolCall::new(
-            "tool2".into(),
-            serde_json::json!({}),
-            Some("call_2".into()),
-            Some("SECOND_ENCRYPTED_BLOB".into()),
-        );
+        let tool_call1 =
+            openai_reasoning_call("tool1", json!({}), Some("call_1"), "FIRST_ENCRYPTED_BLOB");
+        let tool_call2 =
+            openai_reasoning_call("tool2", json!({}), Some("call_2"), "SECOND_ENCRYPTED_BLOB");
         let tool_result1 = ToolResult::new(tool_call1, serde_json::json!({}));
         let tool_result2 = ToolResult::new(tool_call2, serde_json::json!({}));
 
@@ -2545,5 +2575,240 @@ mod tests {
             Some("ENCRYPTED_BLOB_XYZ".to_string()),
             "Tool call should have thought_signature attached at response.completed"
         );
+    }
+
+    #[test]
+    fn openai_responses_producers_tag_provenance_in_all_capture_paths() {
+        use harnx_core::abort::create_abort_signal;
+        use harnx_core::tool::{ReasoningProtocol, ReasoningProvenance};
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let model = Model::new("openai", "gpt-provenance-model");
+        let response = json!({
+            "id": "resp_provenance",
+            "output": [
+                {"type": "reasoning", "encrypted_content": "non-stream-sig"},
+                {"type": "function_call", "call_id": "call_non_stream", "name": "tool", "arguments": "{}"}
+            ]
+        });
+        let output = openai_extract_responses(&response, &model).unwrap();
+        let expected = Some(ReasoningProvenance {
+            protocol: ReasoningProtocol::OpenAiEncryptedReasoning,
+            model: Some("gpt-provenance-model".to_string()),
+        });
+        assert_eq!(output.tool_calls[0].reasoning_provenance, expected);
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = ResponsesStreamState::for_model(&model);
+        state.encrypted_content = Some("stream-sig".to_string());
+        state.pending_tool_calls.insert(
+            "fc_stream".to_string(),
+            PendingToolCall {
+                name: "tool".to_string(),
+                arguments: "{}".to_string(),
+                call_id: Some("call_stream".to_string()),
+            },
+        );
+        responses_finalize_tool_call(&mut state, &mut handler, "fc_stream").unwrap();
+        assert_eq!(handler.tool_calls()[0].reasoning_provenance, expected);
+
+        let (tx, _rx) = unbounded_channel();
+        let mut late_handler = SseHandler::new(tx, create_abort_signal());
+        late_handler
+            .tool_call(ToolCall::new(
+                "late_tool".to_string(),
+                json!({}),
+                Some("call_late".to_string()),
+                None,
+            ))
+            .unwrap();
+        let mut late_state = ResponsesStreamState::for_model(&model);
+        late_state.encrypted_content = Some("late-stream-sig".to_string());
+        responses_completed(&mut late_state, &mut late_handler, &json!({}));
+        assert_eq!(late_handler.tool_calls()[0].reasoning_provenance, expected);
+        assert_eq!(
+            late_handler.tool_calls()[0].thought_signature.as_deref(),
+            Some("late-stream-sig")
+        );
+    }
+
+    fn imported_tool_message(call: ToolCall) -> Message {
+        Message::new(
+            MessageRole::Tool,
+            MessageContent::ToolCalls(MessageContentToolCalls::new(
+                vec![ToolResult::new(call, json!({"ok": true}))],
+                String::new(),
+                Some("foreign thought".to_string()),
+            )),
+        )
+    }
+
+    fn imported_history_body(calls: Vec<ToolCall>) -> Value {
+        let messages = calls
+            .into_iter()
+            .enumerate()
+            .flat_map(|(index, call)| {
+                [
+                    Message::new(
+                        MessageRole::User,
+                        MessageContent::Text(format!("request {index}")),
+                    ),
+                    imported_tool_message(call),
+                ]
+            })
+            .collect();
+        openai_build_responses_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+                attachments_dir: None,
+            },
+            &test_model(),
+        )
+    }
+
+    fn imported_items<'a>(body: &'a Value, item_type: &str) -> Vec<&'a Value> {
+        body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == item_type)
+            .collect()
+    }
+
+    fn assert_imported_without_reasoning(body: &Value, signature: &str) {
+        assert!(imported_items(body, "reasoning").is_empty());
+        assert!(!body.to_string().contains(signature));
+    }
+
+    fn assert_matching_correlation_ids(body: &Value) -> Vec<String> {
+        let calls = imported_items(body, "function_call");
+        let outputs = imported_items(body, "function_call_output");
+        assert_eq!(calls.len(), outputs.len());
+        assert!(calls.iter().all(|call| call.get("id").is_none()));
+        let call_ids: Vec<String> = calls
+            .iter()
+            .map(|call| call["call_id"].as_str().unwrap().to_string())
+            .collect();
+        let output_ids: Vec<String> = outputs
+            .iter()
+            .map(|output| output["call_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(call_ids, output_ids);
+        assert!(call_ids.iter().all(|id| !id.is_empty()));
+        call_ids
+    }
+
+    #[test]
+    fn openai_builder_imports_anthropic_history_without_reasoning_item() {
+        let call = reasoning_call(
+            "ClaudeTool",
+            json!({}),
+            TestReasoning {
+                id: Some("claude-call"),
+                signature: "claude-signature",
+                protocol: harnx_core::tool::ReasoningProtocol::AnthropicThinking,
+                model: "claude-sonnet",
+            },
+        );
+        let body = imported_history_body(vec![call]);
+        assert_imported_without_reasoning(&body, "claude-signature");
+        assert_eq!(assert_matching_correlation_ids(&body), ["claude-call"]);
+    }
+
+    #[test]
+    fn openai_builder_synthesizes_matching_unique_ids_for_gemini_history() {
+        use std::collections::HashSet;
+
+        let gemini_call = |name, signature| {
+            reasoning_call(
+                name,
+                json!({}),
+                TestReasoning {
+                    id: None,
+                    signature,
+                    protocol: harnx_core::tool::ReasoningProtocol::GeminiThoughtSignature,
+                    model: "gemini-2.5-pro",
+                },
+            )
+        };
+        let body = imported_history_body(vec![
+            gemini_call("GeminiOne", "gemini-signature-1"),
+            gemini_call("GeminiTwo", "gemini-signature-2"),
+        ]);
+        assert_imported_without_reasoning(&body, "gemini-signature-1");
+        assert_imported_without_reasoning(&body, "gemini-signature-2");
+        let ids = assert_matching_correlation_ids(&body);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids.iter().collect::<HashSet<_>>().len(), ids.len());
+    }
+
+    #[test]
+    fn openai_builder_omits_cross_model_encrypted_reasoning() {
+        let call = reasoning_call(
+            "TerraTool",
+            json!({}),
+            TestReasoning {
+                id: Some("terra-call"),
+                signature: "terra-encrypted",
+                protocol: harnx_core::tool::ReasoningProtocol::OpenAiEncryptedReasoning,
+                model: "gpt-5.6-terra",
+            },
+        );
+        let body = imported_history_body(vec![call]);
+        assert_imported_without_reasoning(&body, "terra-encrypted");
+        assert_eq!(assert_matching_correlation_ids(&body), ["terra-call"]);
+    }
+
+    #[test]
+    fn openai_builder_imports_legacy_history_without_reasoning_item() {
+        let legacy: ToolCall = serde_json::from_str(
+            r#"{"name":"Legacy","arguments":{},"id":"legacy-call","thought_signature":"legacy-signature"}"#,
+        )
+        .unwrap();
+        let body = imported_history_body(vec![legacy]);
+        assert_imported_without_reasoning(&body, "legacy-signature");
+        assert_eq!(assert_matching_correlation_ids(&body), ["legacy-call"]);
+    }
+
+    #[test]
+    fn openai_builder_replays_same_model_reasoning_verbatim() {
+        use harnx_core::message::MessageContentToolCalls;
+
+        let call = openai_reasoning_call(
+            "NativeTool",
+            json!({}),
+            Some("native-call"),
+            "native-encrypted-content",
+        );
+        let body = openai_build_responses_body(
+            ChatCompletionsData {
+                messages: vec![Message::new(
+                    MessageRole::Tool,
+                    MessageContent::ToolCalls(MessageContentToolCalls::new(
+                        vec![ToolResult::new(call, json!({"ok": true}))],
+                        String::new(),
+                        Some("native thought".to_string()),
+                    )),
+                )],
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+                attachments_dir: None,
+            },
+            &test_model(),
+        );
+        let reasoning = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "reasoning")
+            .unwrap();
+        assert_eq!(reasoning["encrypted_content"], "native-encrypted-content");
     }
 }

@@ -14,6 +14,49 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 
+// ================================================================
+// Reasoning Protocol Provenance (issue #1804)
+// ================================================================
+
+/// The protocol that produced a `thought_signature`.
+///
+/// Each provider has its own opaque reasoning-signature format. A signature
+/// from one protocol MUST NOT be replayed to an incompatible provider —
+/// doing so causes HTTP 400 errors that halt the fallback chain.
+///
+/// This enum tags each stored signature with its producing protocol so
+/// the request builders can determine compatibility before replaying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningProtocol {
+    /// Anthropic Claude thinking-block `signature` (also used by Bedrock Claude)
+    AnthropicThinking,
+    /// Google Gemini `thoughtSignature`
+    GeminiThoughtSignature,
+    /// OpenAI Responses API `encrypted_content` (also used by Codex)
+    #[serde(rename = "openai_encrypted_reasoning")]
+    OpenAiEncryptedReasoning,
+}
+
+/// Provenance metadata for a stored `thought_signature`.
+///
+/// Captured at the point where the signature is extracted from a provider
+/// response. Used by request builders to determine whether a signature can
+/// be safely replayed to a destination provider.
+///
+/// For OpenAI `encrypted_content`, the `model` field is required because
+/// the encrypted content is bound to both org and model identity.
+/// For Anthropic and Gemini, `model` is optional but recorded for telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningProvenance {
+    /// The protocol that produced this signature.
+    pub protocol: ReasoningProtocol,
+    /// The producing model's stable API identifier (`Model::real_name()`).
+    /// Required for OpenAI; optional but recorded for Anthropic/Gemini.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ToolResult {
     pub call: ToolCall,
@@ -402,6 +445,14 @@ pub struct ToolCall {
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
+    /// Provenance metadata for `thought_signature`.
+    ///
+    /// Required to determine compatibility when replaying reasoning
+    /// signatures across provider boundaries (issue #1804).
+    /// Legacy persisted sessions have `thought_signature: Some` with
+    /// `reasoning_provenance: None`, which is treated as unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_provenance: Option<ReasoningProvenance>,
 }
 
 impl ToolCall {
@@ -435,6 +486,61 @@ impl ToolCall {
             arguments,
             id,
             thought_signature,
+            reasoning_provenance: None,
+        }
+    }
+
+    /// Attach known reasoning provenance to this tool call.
+    pub fn with_provenance(mut self, provenance: Option<ReasoningProvenance>) -> Self {
+        self.reasoning_provenance = provenance;
+        self
+    }
+
+    /// Check if the stored signature is compatible with the destination.
+    ///
+    /// Returns `Some(signature)` if the signature can be safely replayed
+    /// to the destination provider, or `None` if import handling is required.
+    ///
+    /// Compatibility rules (per issue #1804):
+    /// - Anthropic: protocol must match; model binding not required.
+    /// - Gemini: protocol must match; model binding not required.
+    /// - OpenAI: protocol must match AND model must match (fail-closed).
+    ///
+    /// Legacy signatures (provenance `None`) return `None` (unknown).
+    pub fn compatible_signature(
+        &self,
+        dest_protocol: ReasoningProtocol,
+        dest_model: &str,
+    ) -> Option<&str> {
+        let sig = self.thought_signature.as_deref()?;
+        let prov = self.reasoning_provenance.as_ref()?;
+
+        match dest_protocol {
+            ReasoningProtocol::AnthropicThinking => {
+                // Anthropic signatures are not documented as model-bound
+                if prov.protocol == ReasoningProtocol::AnthropicThinking {
+                    Some(sig)
+                } else {
+                    None
+                }
+            }
+            ReasoningProtocol::GeminiThoughtSignature => {
+                if prov.protocol == ReasoningProtocol::GeminiThoughtSignature {
+                    Some(sig)
+                } else {
+                    None
+                }
+            }
+            ReasoningProtocol::OpenAiEncryptedReasoning => {
+                // OpenAI encrypted_content is model-bound; fail closed
+                if prov.protocol == ReasoningProtocol::OpenAiEncryptedReasoning
+                    && prov.model.as_deref() == Some(dest_model)
+                {
+                    Some(sig)
+                } else {
+                    None
+                }
+            }
         }
     }
 }

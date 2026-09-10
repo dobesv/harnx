@@ -419,12 +419,12 @@ mod tests {
                 SessionLogEntry::ToolCalls {
                     text: "running it".into(),
                     thought: None,
-                    calls: vec![ToolCall {
-                        name: "bash".into(),
-                        arguments: json!({"cmd":"make"}),
-                        id: Some("c1".into()),
-                        thought_signature: None,
-                    }],
+                    calls: vec![ToolCall::new(
+                        "bash".into(),
+                        json!({"cmd":"make"}),
+                        Some("c1".into()),
+                        None,
+                    )],
                     timestamp: None,
                     fence_token: None,
                 },
