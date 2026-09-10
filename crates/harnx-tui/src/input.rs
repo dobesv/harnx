@@ -1774,21 +1774,19 @@ impl Tui {
             // File path completion for .attach
             if cmd == ".attach" {
                 let filter = args.last().copied().unwrap_or("");
-                let dir_path;
-                let prefix;
-                if filter.contains('/') || filter.contains('\\') {
+                let (dir_path, prefix) = if filter.contains('/') || filter.contains('\\') {
                     let p = std::path::Path::new(filter);
-                    dir_path = p
+                    let dir_path = p
                         .parent()
                         .unwrap_or(std::path::Path::new("."))
                         .to_path_buf();
-                    prefix = p
+                    let prefix = p
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
+                    (dir_path, prefix)
                 } else {
-                    dir_path = std::path::PathBuf::from(".");
-                    prefix = filter.to_string();
+                    (std::path::PathBuf::from("."), filter.to_string())
                 };
                 if let Ok(mut entries) = tokio::fs::read_dir(&dir_path).await {
                     let mut matches = Vec::new();

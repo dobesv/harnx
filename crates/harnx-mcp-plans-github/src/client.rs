@@ -309,7 +309,7 @@ impl GitHubClient {
                 &UpdateIssueRequest {
                     title: input.title.as_deref(),
                     body: input.body.as_deref(),
-                    state: input.state.as_deref().map(normalize_issue_state),
+                    state: input.state.as_deref(),
                 },
             )
             .await?;
@@ -697,14 +697,6 @@ impl GitHubClient {
             Self::encode_path_segment(&self.repo),
             suffix
         )
-    }
-}
-
-fn normalize_issue_state(value: &str) -> &str {
-    match value {
-        "open" => "open",
-        "closed" => "closed",
-        other => other,
     }
 }
 
