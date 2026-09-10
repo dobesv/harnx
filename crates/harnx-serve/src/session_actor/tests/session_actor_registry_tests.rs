@@ -236,6 +236,7 @@ async fn reap_predicate_rejects_buffered_mailbox_commands() {
         history_warnings: Vec::new(),
         log_entries: None,
         tokens_usage: None,
+        session_base: None,
         actor_config: SessionActorConfig {
             base_config: Config::default(),
             call_fn: Some(noop_call_fn()),

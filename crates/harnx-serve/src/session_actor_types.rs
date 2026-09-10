@@ -82,6 +82,8 @@ pub struct SubscribeResult {
     /// Session tokens usage for augmenting hydrated usage events with context fields.
     /// Captured during `refresh_history_snapshot` from the reconstructed session.
     pub tokens_usage: Option<crate::ag_ui::UsageContextSnapshot>,
+    /// Canonical metadata state used to reconstruct a fresher attached history without reloading it.
+    pub session_base: Option<harnx_core::session::Session>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

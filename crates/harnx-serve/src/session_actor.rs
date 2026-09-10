@@ -114,6 +114,8 @@ struct SessionActor {
     /// Cached session tokens usage for augmenting hydrated usage events with context fields.
     /// Captured during `refresh_history_snapshot` from the reconstructed session.
     tokens_usage: Option<crate::ag_ui::UsageContextSnapshot>,
+    /// Canonical metadata state for replaying attached history without another metadata lookup.
+    session_base: Option<harnx_core::session::Session>,
     actor_config: SessionActorConfig,
 }
 
@@ -150,6 +152,7 @@ fn spawn_session_actor(
         history_warnings: Vec::new(),
         log_entries: None,
         tokens_usage: None,
+        session_base: None,
         actor_config,
     };
     tokio::spawn(actor.run());
@@ -328,6 +331,7 @@ impl SessionActor {
                     events: self.broadcast_tx.subscribe(),
                     log_entries: self.log_entries.clone(),
                     tokens_usage: self.tokens_usage.clone(),
+                    session_base: self.session_base.clone(),
                 });
             }
             SessionCommand::Prompt {
@@ -627,7 +631,7 @@ impl SessionActor {
     }
 
     async fn refresh_history_snapshot(&mut self) {
-        let (snapshot, warnings, log_entries, session_tokens_usage) = if self
+        let (snapshot, warnings, log_entries, session_tokens_usage, session_base) = if self
             .actor_config
             .call_fn
             .is_some()
@@ -644,11 +648,15 @@ impl SessionActor {
                 .map(|session| crate::ag_ui::history_messages_for_snapshot(&session.messages))
                 .unwrap_or_default();
             // Test executor path: no NATS log entries available
-            (snapshot, Vec::new(), None, None)
+            (snapshot, Vec::new(), None, None, None)
         } else {
-            match crate::load_nats_session(&self.actor_config.base_config, &self.key.session).await
+            match crate::load_nats_session_with_base(
+                &self.actor_config.base_config,
+                &self.key.session,
+            )
+            .await
             {
-                Ok((session, entries)) if session.agent_name.as_deref() == Some(self.key.agent.as_str()) => {
+                Ok((session, entries, base_session)) if session.agent_name.as_deref() == Some(self.key.agent.as_str()) => {
                     // Capture session tokens usage for context fields on hydrated usage events
                     let (context_tokens, context_percent) = session.tokens_usage();
                     let max_context_tokens = session.model().max_input_tokens();
@@ -662,9 +670,10 @@ impl SessionActor {
                         session.replay_warnings,
                         Some(entries),
                         tokens_usage,
+                        Some(base_session),
                     )
                 }
-                Ok((session, _entries)) => (
+                Ok((session, _entries, _base_session)) => (
                     Vec::new(),
                     vec![format!(
                         "Failed to load session history: session belongs to agent '{}' rather than '{}'",
@@ -673,13 +682,15 @@ impl SessionActor {
                     )],
                     None,
                     None,
+                    None,
                 ),
                 Err(error) if error.to_string().contains("Not Found") => {
-                    (Vec::new(), Vec::new(), None, None)
+                    (Vec::new(), Vec::new(), None, None, None)
                 }
                 Err(error) => (
                     Vec::new(),
                     vec![format!("Failed to load session history: {error:#}")],
+                    None,
                     None,
                     None,
                 ),
@@ -698,6 +709,7 @@ impl SessionActor {
         self.history_warnings = warnings;
         self.log_entries = log_entries;
         self.tokens_usage = session_tokens_usage;
+        self.session_base = session_base;
     }
 }
 

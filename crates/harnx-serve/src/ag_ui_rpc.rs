@@ -262,33 +262,8 @@ async fn handle_prompt(
         }
     };
 
-    let result_json = if resume.is_empty() {
-        let result = match prompt(
-            &handle,
-            &params.text,
-            SessionPromptOptions {
-                working_dir: params.working_dir.clone(),
-                attachment_refs: params.attachment_refs.clone(),
-            },
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(message) => {
-                return json_rpc_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    json_rpc_error(id, -32003, &message, None),
-                );
-            }
-        };
-        match result {
-            PromptResult::Accepted { run_id } => {
-                json!({ "status": "accepted", "run_id": run_id })
-            }
-            PromptResult::Enqueued { run_id } => {
-                json!({ "status": "enqueued", "run_id": run_id })
-            }
-        }
+    let resume_applied = if resume.is_empty() {
+        None
     } else {
         let mut applied = false;
         for decision in resume {
@@ -312,7 +287,42 @@ async fn handle_prompt(
                 }
             }
         }
-        json!({ "status": "accepted", "applied": applied })
+        Some(applied)
+    };
+
+    let result_json = if params.text.trim().is_empty() {
+        json!({ "status": "accepted", "applied": resume_applied.unwrap_or(false) })
+    } else {
+        let result = match prompt(
+            &handle,
+            &params.text,
+            SessionPromptOptions {
+                working_dir: params.working_dir.clone(),
+                attachment_refs: params.attachment_refs.clone(),
+            },
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(message) => {
+                return json_rpc_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json_rpc_error(id, -32003, &message, None),
+                );
+            }
+        };
+        let mut result_json = match result {
+            PromptResult::Accepted { run_id } => {
+                json!({ "status": "accepted", "run_id": run_id })
+            }
+            PromptResult::Enqueued { run_id } => {
+                json!({ "status": "enqueued", "run_id": run_id })
+            }
+        };
+        if let Some(applied) = resume_applied {
+            result_json["applied"] = json!(applied);
+        }
+        result_json
     };
     json_rpc_response(
         StatusCode::OK,

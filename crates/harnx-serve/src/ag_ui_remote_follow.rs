@@ -150,6 +150,7 @@ async fn build_remote_follow_ag_ui_stream(
         run_id: params.run_id,
         thread_id: params.thread_id,
         snapshot_frame,
+        session_base: params.subscription.session_base.clone(),
     })
     .await
     .map_err(|err| AgUiError::Internal(format!("Remote follow failed: {err}")))
@@ -172,9 +173,10 @@ async fn build_remote_follow_event_stream(
     let through_seq = last_user_sequence(event_stream.history());
 
     if turn_ended(event_stream.history(), through_seq) {
-        // Idle remote session: control-state hydration from durable log
-        // Compute usage context from the reconstructed session (same as local actor path)
-        let tokens_usage = compute_usage_context(params.config, params.session_id).await;
+        // Idle remote session: control-state hydration from durable log.
+        let tokens_usage = params.session_base.as_ref().and_then(|base_session| {
+            compute_usage_context(event_stream.history(), params.session_id, base_session)
+        });
         let control_events =
             super::ag_ui::control_snapshot_events(event_stream.history(), tokens_usage.as_ref());
         let control_frames: Vec<Bytes> = control_events
@@ -208,6 +210,7 @@ struct RemoteEventStreamParams<'a> {
     run_id: &'a str,
     thread_id: &'a str,
     snapshot_frame: Option<Bytes>,
+    session_base: Option<harnx_core::session::Session>,
 }
 
 struct LiveFollowParams {
@@ -484,19 +487,18 @@ impl AgUiSink {
     }
 }
 
-/// Compute usage context snapshot by loading the session from NATS.
-///
-/// This mirrors the logic in `session_actor::refresh_history_snapshot` for the remote-follow
-/// path where we don't have a local actor. The session is reconstructed from the durable log
-/// and context tokens are computed from `session.tokens_usage()` plus `model.max_input_tokens()`.
-async fn compute_usage_context(config: &Config, session_id: &str) -> Option<UsageContextSnapshot> {
-    // Load session from NATS - same function used by session_actor
-    let session = match crate::load_nats_session(config, session_id).await {
-        Ok((s, _entries)) => s,
-        Err(_) => return None,
-    };
-
-    // Compute context exactly as session_actor does
+/// Compute usage context from the history loaded by `SessionEventStream::attach`.
+fn compute_usage_context(
+    entries: &[(u64, SessionLogEntry)],
+    session_id: &str,
+    base_session: &harnx_core::session::Session,
+) -> Option<UsageContextSnapshot> {
+    let session = harnx_runtime::nats_session_log::load_session_from_entries_with_metadata(
+        entries,
+        session_id,
+        base_session.clone(),
+    )
+    .ok()?;
     let (context_tokens, context_percent) = session.tokens_usage();
     let max_context_tokens = session.model().max_input_tokens();
 

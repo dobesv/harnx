@@ -1393,6 +1393,19 @@ pub(crate) async fn load_nats_session(
     harnx_core::session::Session,
     Vec<(u64, harnx_core::session::SessionLogEntry)>,
 )> {
+    let (loaded, entries, _base_session) = load_nats_session_with_base(config, session).await?;
+    Ok((loaded, entries))
+}
+
+/// Load session history and retain canonical metadata state for replaying a fresher log snapshot.
+pub(crate) async fn load_nats_session_with_base(
+    config: &Config,
+    session: &str,
+) -> Result<(
+    harnx_core::session::Session,
+    Vec<(u64, harnx_core::session::SessionLogEntry)>,
+    harnx_core::session::Session,
+)> {
     ensure_frontend_nats_owner().await?;
     let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
     let metadata_store =
@@ -1428,21 +1441,22 @@ pub(crate) async fn load_nats_session(
                 anyhow!("Failed to inspect worker lease for session '{session}': {err}")
             })?
     };
+    let base_session = metadata.base_session();
     let loaded = if preserve_pending {
         harnx_runtime::nats_session_log::load_session_from_entries_with_metadata_preserving_pending(
             &entries,
             session,
-            metadata.base_session(),
+            base_session.clone(),
         )
     } else {
         harnx_runtime::nats_session_log::load_session_from_entries_with_metadata(
             &entries,
             session,
-            metadata.base_session(),
+            base_session.clone(),
         )
     }
     .map_err(|err| anyhow!("Failed to reconstruct session history for '{session}': {err}"))?;
-    Ok((loaded, entries))
+    Ok((loaded, entries, base_session))
 }
 
 #[doc(hidden)]

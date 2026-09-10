@@ -1321,11 +1321,12 @@ fn build_promptless_event_stream(
     }
 
     // Running session (e.g. page reload mid-run): emit exactly one RUN_STARTED,
-    // hydrate history, then follow the live broadcast body until the real terminal event.
-    // `build_live_event_body` carries the snapshot_frame and does NOT emit its own
-    // RUN_STARTED, so the client never sees a duplicate boundary.
-    let body = build_live_event_body(run_id, thread_id_text, snapshot_frame, live_stream);
-    Box::pin(tokio_stream::StreamExt::chain(started, body))
+    // hydrate history and durable control state, then follow the live broadcast body
+    // until the real terminal event.
+    let hydrated = tokio_stream::StreamExt::chain(started, tokio_stream::iter(snapshot_frame));
+    let hydrated = tokio_stream::StreamExt::chain(hydrated, tokio_stream::iter(control_frames));
+    let body = build_live_event_body(run_id, thread_id_text, None, live_stream);
+    Box::pin(tokio_stream::StreamExt::chain(hydrated, body))
 }
 
 pub(crate) fn build_ag_ui_event_stream(
@@ -1343,6 +1344,7 @@ pub(crate) fn build_ag_ui_event_stream(
         events,
         log_entries,
         tokens_usage,
+        session_base: _,
     } = subscription;
     let interrupt_outcome = match state {
         crate::session_actor::SessionState::Interrupted { pending, .. } => Some(pending.metadata),
@@ -1736,7 +1738,10 @@ pub(crate) fn control_snapshot_events(
     tokens_usage: Option<&UsageContextSnapshot>,
 ) -> Vec<Event> {
     let mut events = Vec::new();
-    for (_seq, entry) in entries {
+    let last_turn_end_seq = entries.iter().rev().find_map(|(seq, entry)| {
+        matches!(entry, harnx_core::session::SessionLogEntry::TurnEnd { .. }).then_some(*seq)
+    });
+    for (seq, entry) in entries {
         match entry {
             harnx_core::session::SessionLogEntry::HandoffCommitted {
                 target_agent,
@@ -1769,14 +1774,16 @@ pub(crate) fn control_snapshot_events(
                     "cached": usage.cached_tokens,
                     "cache_write": usage.cache_write_tokens,
                 });
-                // Augment with context fields from reconstructed session state
-                if let Some(context) = tokens_usage {
-                    value["context_tokens"] = json!(context.context_tokens);
-                    if let Some(max) = context.max_context_tokens {
-                        value["max_context_tokens"] = json!(max);
-                    }
-                    if let Some(percent) = context.context_percent {
-                        value["context_percent"] = json!(percent);
+                // Final context belongs only with the final replayed turn.
+                if Some(*seq) == last_turn_end_seq {
+                    if let Some(context) = tokens_usage {
+                        value["context_tokens"] = json!(context.context_tokens);
+                        if let Some(max) = context.max_context_tokens {
+                            value["max_context_tokens"] = json!(max);
+                        }
+                        if let Some(percent) = context.context_percent {
+                            value["context_percent"] = json!(percent);
+                        }
                     }
                 }
                 events.push(Event::Custom(CustomEvent {

@@ -2466,6 +2466,51 @@ async fn ag_ui_run_promptless_join_forwards_live_events_when_session_active() {
 }
 
 #[tokio::test]
+async fn promptless_active_reconnect_hydrates_control_before_live_events() {
+    use harnx_core::session::SessionLogEntry;
+
+    let run_id = Uuid::new_v4();
+    let thread_id = Uuid::new_v4();
+    let entries = vec![(
+        1,
+        SessionLogEntry::HandoffCommitted {
+            target_agent: "target-agent".to_string(),
+            target_session_id: "target-session".to_string(),
+            handoff_tool_call_id: "handoff-call".to_string(),
+        },
+    )];
+    let live = tokio_stream::iter([Event::RunFinished(ag_ui_core::event::RunFinishedEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        thread_id: ThreadId::from(thread_id),
+        run_id: RunId::from(run_id),
+        result: None,
+    })]);
+    let stream = build_promptless_event_stream(
+        &run_id.to_string(),
+        &thread_id.to_string(),
+        Some(Bytes::from(
+            frame_event(&snapshot_event(vec![user_msg("persisted")])).expect("snapshot frame"),
+        )),
+        live,
+        true,
+        None,
+        Some(&entries),
+        None,
+    );
+
+    let events = decode_sse_bytes_chunks(tokio_stream::StreamExt::collect::<Vec<_>>(stream).await);
+    assert_event_type_sequence(
+        &events,
+        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "CUSTOM", "RUN_FINISHED"],
+    );
+    assert_eq!(events[2]["name"], "session_handoff");
+    assert_eq!(events[2]["value"]["handoff_tool_call_id"], "handoff-call");
+}
+
+#[tokio::test]
 async fn ag_ui_promptless_active_reconnect_synthesizes_text_start_before_unmatched_end() {
     let run_id = Uuid::new_v4();
     let thread_id = Uuid::new_v4();
@@ -3256,20 +3301,36 @@ fn control_snapshot_events_emits_usage_on_turn_end_with_usage() {
 fn control_snapshot_events_usage_includes_context_fields_when_provided() {
     use harnx_core::{api_types::CompletionTokenUsage, session::SessionLogEntry};
 
-    let entries = vec![(
-        1,
-        SessionLogEntry::TurnEnd {
-            through_seq: 5,
-            fence_token: 42,
-            timestamp: None,
-            usage: Some(CompletionTokenUsage {
-                input_tokens: 100,
-                output_tokens: 50,
-                cached_tokens: 20,
-                cache_write_tokens: 0,
-            }),
-        },
-    )];
+    let entries = vec![
+        (
+            1,
+            SessionLogEntry::TurnEnd {
+                through_seq: 5,
+                fence_token: 42,
+                timestamp: None,
+                usage: Some(CompletionTokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cached_tokens: 20,
+                    cache_write_tokens: 0,
+                }),
+            },
+        ),
+        (
+            2,
+            SessionLogEntry::TurnEnd {
+                through_seq: 9,
+                fence_token: 42,
+                timestamp: None,
+                usage: Some(CompletionTokenUsage {
+                    input_tokens: 80,
+                    output_tokens: 30,
+                    cached_tokens: 10,
+                    cache_write_tokens: 5,
+                }),
+            },
+        ),
+    ];
 
     // Provide context snapshot (as computed by compute_usage_context on remote-follow path)
     let context = super::UsageContextSnapshot {
@@ -3279,23 +3340,28 @@ fn control_snapshot_events_usage_includes_context_fields_when_provided() {
     };
 
     let events = control_snapshot_events(&entries, Some(&context));
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2);
 
-    match &events[0] {
-        Event::Custom(CustomEvent { name, value, .. }) => {
-            assert_eq!(name, "usage");
-            // Token counts from TurnEnd.usage
-            assert_eq!(value["input"], 100);
-            assert_eq!(value["output"], 50);
-            assert_eq!(value["cached"], 20);
-            assert_eq!(value["cache_write"], 0);
-            // Context fields from UsageContextSnapshot (remote-follow path)
-            assert_eq!(value["context_tokens"], 321);
-            assert_eq!(value["max_context_tokens"], 1000);
-            assert_eq!(value["context_percent"], 32.1_f32);
-        }
-        other => panic!("expected usage Custom event, got: {other:?}"),
-    }
+    let Event::Custom(first) = &events[0] else {
+        panic!("expected first usage Custom event");
+    };
+    assert_eq!(first.name, "usage");
+    assert_eq!(first.value["input"], 100);
+    assert!(first.value.get("context_tokens").is_none());
+    assert!(first.value.get("max_context_tokens").is_none());
+    assert!(first.value.get("context_percent").is_none());
+
+    let Event::Custom(final_event) = &events[1] else {
+        panic!("expected final usage Custom event");
+    };
+    assert_eq!(final_event.name, "usage");
+    assert_eq!(final_event.value["input"], 80);
+    assert_eq!(final_event.value["output"], 30);
+    assert_eq!(final_event.value["cached"], 10);
+    assert_eq!(final_event.value["cache_write"], 5);
+    assert_eq!(final_event.value["context_tokens"], 321);
+    assert_eq!(final_event.value["max_context_tokens"], 1000);
+    assert_eq!(final_event.value["context_percent"], 32.1_f32);
 }
 
 #[test]
