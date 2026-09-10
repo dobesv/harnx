@@ -759,7 +759,7 @@ fn handle_responses_sse_message(
     let event_type = message.event.as_str();
 
     // Also check data["type"] as some events may use that instead
-    let effective_event_type = if event_type.is_empty() {
+    let effective_event_type = if event_type.is_empty() || event_type == "message" {
         data["type"].as_str().unwrap_or("")
     } else {
         event_type
@@ -767,7 +767,7 @@ fn handle_responses_sse_message(
 
     openai_handle_responses_event(state, handler, effective_event_type, &data)?;
 
-    Ok(false)
+    Ok(effective_event_type == "response.completed")
 }
 
 /// Stream OpenAI Responses API output.
@@ -780,13 +780,32 @@ pub async fn openai_responses_streaming(
     handler: &mut SseHandler,
     model: &Model,
 ) -> Result<()> {
+    responses_streaming_with_content_type(builder, handler, model, SseContentType::Required).await
+}
+
+pub(crate) async fn responses_streaming_with_content_type(
+    builder: RequestBuilder,
+    handler: &mut SseHandler,
+    model: &Model,
+    content_type: SseContentType,
+) -> Result<()> {
     let mut state = ResponsesStreamState::for_model(model);
+    let mut finished = false;
 
     let handle = |message: crate::SseMmessage| -> Result<bool> {
-        handle_responses_sse_message(&mut state, handler, &message)
+        finished = handle_responses_sse_message(&mut state, handler, &message)?;
+        Ok(finished)
     };
 
-    crate::sse_stream(builder, handle).await
+    crate::sse_stream_with_content_type(builder, handle, content_type).await?;
+    if content_type == SseContentType::Required {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        finished || handler.aborted(),
+        "Codex response stream ended before response.completed"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

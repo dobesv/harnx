@@ -2,6 +2,7 @@ use crate::{catch_error, parse_retry_after, CompletionTokenUsage, ToolCall};
 use harnx_core::abort::AbortSignal;
 
 use anyhow::{anyhow, bail, Context, Result};
+use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
 use reqwest::RequestBuilder;
 use reqwest_eventsource::{Error as EventSourceError, Event, RequestBuilderExt};
@@ -213,7 +214,27 @@ pub struct SseMmessage {
     pub data: String,
 }
 
-pub async fn sse_stream<F>(builder: RequestBuilder, mut handle: F) -> Result<()>
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SseContentType {
+    Required,
+    /// Codex can omit Content-Type on successful SSE responses. Callers must
+    /// validate the protocol's terminal event, since arbitrary bodies may parse
+    /// as an empty SSE stream. Never relax an explicitly different media type.
+    AllowMissing,
+}
+
+pub async fn sse_stream<F>(builder: RequestBuilder, handle: F) -> Result<()>
+where
+    F: FnMut(SseMmessage) -> Result<bool>,
+{
+    sse_stream_with_content_type(builder, handle, SseContentType::Required).await
+}
+
+pub(crate) async fn sse_stream_with_content_type<F>(
+    builder: RequestBuilder,
+    mut handle: F,
+    content_type: SseContentType,
+) -> Result<()>
 where
     F: FnMut(SseMmessage) -> Result<bool>,
 {
@@ -231,39 +252,92 @@ where
                 }
             }
             Err(err) => {
-                match err {
-                    EventSourceError::StreamEnded => {}
-                    EventSourceError::InvalidStatusCode(status, res) => {
-                        let retry_after = parse_retry_after(res.headers());
-                        let text = res.text().await?;
-                        let data: Value = match text.parse() {
-                            Ok(data) => data,
-                            Err(_) => {
-                                bail!(
-                                    "Invalid response data: {text} (status: {})",
-                                    status.as_u16()
-                                );
-                            }
-                        };
-                        catch_error(&data, status.as_u16(), retry_after)?;
-                    }
-                    EventSourceError::InvalidContentType(header_value, res) => {
-                        let text = res.text().await?;
-                        bail!(
-                            "Invalid response event-stream. content-type: {}, data: {text}",
-                            header_value.to_str().unwrap_or_default()
-                        );
-                    }
-                    _ => {
-                        bail!("{}", err);
-                    }
-                }
                 es.close();
+                return handle_sse_error(err, content_type, handle).await;
             }
         }
     }
     Ok(())
 }
+
+async fn handle_sse_error<F>(
+    err: EventSourceError,
+    content_type: SseContentType,
+    handle: F,
+) -> Result<()>
+where
+    F: FnMut(SseMmessage) -> Result<bool>,
+{
+    match err {
+        EventSourceError::StreamEnded => Ok(()),
+        EventSourceError::InvalidStatusCode(_, res) => sse_status_error(res).await,
+        EventSourceError::InvalidContentType(header, res) => {
+            debug!(
+                "Provider SSE response: status={}, content-type={:?}",
+                res.status().as_u16(),
+                header
+            );
+            if content_type == SseContentType::AllowMissing && header.as_bytes().is_empty() {
+                // Consume this response, not a new request: retrying would discard
+                // a paid completion and can duplicate tool calls or output.
+                return sse_response_stream(res, handle).await;
+            }
+            // Do not read or print the body here: it may be an entire completion
+            // containing prompts, tool output, and encrypted reasoning.
+            bail!(
+                "Invalid provider event-stream (status: {}, content-type: {:?}); expected text/event-stream",
+                res.status().as_u16(),
+                header
+            )
+        }
+        EventSourceError::Parser(_) | EventSourceError::Utf8(_) => {
+            bail!("Failed to parse provider event-stream")
+        }
+        _ => Err(err.into()),
+    }
+}
+
+async fn sse_status_error(res: reqwest::Response) -> Result<()> {
+    let status = res.status().as_u16();
+    let retry_after = parse_retry_after(res.headers());
+    debug!(
+        "Provider SSE HTTP error: status={status}, content-type={:?}, retry-after={retry_after:?}",
+        res.headers().get(reqwest::header::CONTENT_TYPE)
+    );
+    let data: Value = res.json().await.map_err(|_| harnx_core::error::LlmError {
+        status,
+        message: "Provider returned a non-JSON error response to a streaming request".into(),
+        retry_after,
+    })?;
+    catch_error(&data, status, retry_after)?;
+    bail!("Unexpected provider event-stream status: {status}; expected 200")
+}
+
+async fn sse_response_stream<F>(res: reqwest::Response, mut handle: F) -> Result<()>
+where
+    F: FnMut(SseMmessage) -> Result<bool>,
+{
+    let mut stream = res.bytes_stream().eventsource();
+    while let Some(message) = stream.next().await {
+        let message = message.map_err(|err| match err {
+            eventsource_stream::EventStreamError::Transport(err) => {
+                anyhow!(err).context("Failed to read provider event-stream")
+            }
+            _ => anyhow!("Failed to parse provider event-stream"),
+        })?;
+        if handle(SseMmessage {
+            event: message.event,
+            data: message.data,
+        })? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "stream_sse_tests.rs"]
+mod sse_tests;
 
 pub async fn json_stream<S, F, E>(mut stream: S, mut handle: F) -> Result<()>
 where
