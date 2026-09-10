@@ -4,10 +4,20 @@ import {
   createSessionEventsStream,
   finishExchange,
   isPromptlessRun,
+  controlStates,
+  addControlState,
+  snapshots,
+  notify,
+  persistGalleryExchange,
+  broadcastLiveEvent,
   persistSubAgentExchange,
+  persistExchange,
+  
 } from './sessionUpdates';
 
 const SUB_AGENT_SESSION_ID = 'child-session-0001';
+const activeSessions = new Set<string>();
+const openRunControllers = new Map<string, Set<any>>();
 let subAgentExchangeId = 0;
 
 function subAgentProgress(invocationId: string, status: 'running' | 'done', elapsedMs: number) {
@@ -83,7 +93,8 @@ function buildSnapshot(session: string) {
         id: 'm-system',
         role: 'system',
         content: 'You are mock system prompt content that should be collapsed by default.'
-      }
+      },
+      ...additionalSnapshot(session)
     ];
   }
   if (session === 'session-restored') {
@@ -172,8 +183,27 @@ function emitSnapshot(
     type: 'MESSAGES_SNAPSHOT',
     messages: buildSnapshot(session),
   }));
-  controller.enqueue(encodeSseEvent({ type: 'RUN_FINISHED', threadId, runId }));
-  controller.close();
+  const states = controlStates.get(session) || [];
+  for (const state of states) {
+    controller.enqueue(encodeSseEvent({
+      type: 'CUSTOM',
+      threadId,
+      runId,
+      name: state.name,
+      value: state.value,
+    }));
+  }
+  if (!activeSessions.has(session)) {
+    controller.enqueue(encodeSseEvent({ type: 'RUN_FINISHED', threadId, runId }));
+    controller.close();
+  } else {
+    let listeners = openRunControllers.get(session);
+    if (!listeners) {
+      listeners = new Set();
+      openRunControllers.set(session, listeners);
+    }
+    listeners.add({ controller, threadId, runId });
+  }
 }
 
 interface MockRun {
@@ -570,6 +600,113 @@ export const happyPathHandlers = [
       if (body.method === 'session/cancel') {
         return HttpResponse.json({ jsonrpc: '2.0', result: { cancelled: true }, id: body.id });
       }
+      if (body.method === 'session/prompt') {
+        const text = body.params?.text || '';
+        const session = String(params.session);
+        
+        if (session === 'session-gallery') {
+          persistGalleryExchange(session, text);
+          addControlState(session, {
+            name: 'usage',
+            value: { input: 100, output: 200, cached: 50, cache_write: 0, context_tokens: 300, max_context_tokens: 1000, context_percent: 30 }
+          });
+          notify(session);
+        } else if (text === 'handoff now') {
+          // 1. User message
+          // The prompt says: "persist source-session handoff control state... keep HANDOFF_TARGET_SNAPSHOT for target hydration"
+          // We must persist the user message + the control state
+          const persisted = [...(snapshots.get(session) || buildSnapshot(session))];
+          persisted.push({ id: `mock-user-handoff`, role: 'user', content: text });
+          snapshots.set(session, persisted);
+          
+          addControlState(session, {
+            name: 'session_handoff',
+            value: { agent: 'assistant', session_id: 'handoff-target', handoff_tool_call_id: 'mock_handoff_id' }
+          });
+          notify(session);
+        } else if (text === 'delegate to researcher') {
+          // Staged sub-agent
+          activeSessions.add(session);
+          const ids = nextSubAgentRunIds();
+          
+          // Phase 1: start
+          const persisted = [...(snapshots.get(session) || buildSnapshot(session))];
+          persisted.push(
+            { id: `mock-user-${ids.invocationId}`, role: 'user', content: text },
+            {
+              id: ids.assistantMessageId,
+              role: 'assistant',
+              content: '',
+              toolCalls: [{
+                id: ids.toolCallId,
+                type: 'function',
+                call_type: 'function',
+                function: {
+                  name: 'researcher_session_prompt',
+                  arguments: JSON.stringify({ message: 'Research this task' }),
+                },
+              }],
+            }
+          );
+          snapshots.set(session, persisted);
+          
+          addControlState(session, {
+            name: 'sub_agent_started',
+            value: {
+              agent: 'researcher',
+              session_id: 'child-session-0001',
+              invocation_id: ids.invocationId,
+              tool_call_id: ids.toolCallId,
+              started_at: new Date().toISOString()
+            }
+          });
+          notify(session);
+          
+          // Broadcast live progress immediately after notify
+          setTimeout(() => {
+            broadcastLiveEvent(session, {
+              type: 'CUSTOM',
+              name: 'sub_agent_progress',
+              value: subAgentProgress(ids.invocationId, 'running', 200)
+            });
+          }, 50);
+          
+          // Phase 2: finish after delay
+          setTimeout(() => {
+            activeSessions.delete(session);
+            const finalPersisted = [...(snapshots.get(session) || [])];
+            finalPersisted.push(
+              {
+                id: ids.toolResultMessageId,
+                role: 'tool',
+                toolCallId: ids.toolCallId,
+                content: subAgentResultContent(ids)
+              },
+              {
+                id: ids.finalMessageId,
+                role: 'assistant',
+                content: 'Delegation complete.'
+              }
+            );
+            snapshots.set(session, finalPersisted);
+            notify(session);
+            
+            // close pending runs
+            const listeners = openRunControllers.get(session) || new Set();
+            for (const { controller, threadId, runId } of listeners) {
+              try {
+                controller.enqueue(encodeSseEvent({ type: 'RUN_FINISHED', threadId, runId }));
+                controller.close();
+              } catch (e) {}
+            }
+            openRunControllers.delete(session);
+          }, 1000);
+          
+        } else {
+          persistExchange(session, text, `Mock streamed reply to: ${text || 'empty prompt'}`);
+        }
+        return HttpResponse.json({ jsonrpc: '2.0', result: { status: 'accepted', run_id: 'mock-run-123' }, id: body.id });
+      }
       return HttpResponse.json({
         jsonrpc: '2.0',
         error: { code: -32601, message: 'method not found' },
@@ -609,6 +746,14 @@ export const sessionsFailHandlers = [
 export const sendFailHandlers = [
   http.post('/v1/agents/:agent/sessions/:session', async ({ request }) => {
     if (await isRpcRequest(request)) {
+      const body = await request.clone().json() as any;
+      if (body.method === 'session/prompt') {
+        return HttpResponse.json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Simulated sendPrompt error' },
+          id: body.id ?? null,
+        }, { status: 500 });
+      }
       return;
     }
 

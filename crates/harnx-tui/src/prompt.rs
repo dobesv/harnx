@@ -144,6 +144,7 @@ fn test_agent_loop_context(
         usage_at_start: Default::default(),
         call_fn: Some(call_fn),
         on_tool_round: Some(on_tool_round),
+        on_hitl_approval_required: None,
         on_text_response: Some(on_text_response),
         initial_with_embeddings: true,
         initial_resume_count: 0,

@@ -21,8 +21,9 @@ pub(super) fn validate_namespace(namespace: &str) -> Result<()> {
 pub(super) fn validate_mutable_namespace(namespace: &str) -> Result<()> {
     validate_namespace(namespace)?;
     anyhow::ensure!(
-        namespace != harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE,
-        "extension namespace '{namespace}' is reserved for tool-observed execution context"
+        namespace != harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE
+            && namespace != super::super::TOOL_CONTEXT_NAMESPACE,
+        "extension namespace '{namespace}' is reserved for Harnx-managed session state"
     );
     Ok(())
 }

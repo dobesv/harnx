@@ -26,6 +26,7 @@ ADAPTIVE_EFFORT_VARIANTS = ("xhigh", "max")
 OPENAI_EFFORT_VARIANTS = {
     "gpt-5.6-sol": ("high", "max"),
     "gpt-5.6-terra": ("high",),
+    "gpt-6-astra": ("max",),
 }
 OPENAI_NO_SAMPLING_PATCH = "del(.body.temperature) | del(.body.top_p)"
 
@@ -52,6 +53,10 @@ def opus_minor_version(name: str) -> int | None:
 def is_adaptive_only_opus(name: str) -> bool:
     minor = opus_minor_version(name)
     return minor is not None and minor >= ADAPTIVE_ONLY_OPUS_MIN_MINOR
+
+
+def is_adaptive_only_claude(name: str) -> bool:
+    return is_adaptive_only_opus(name) or name.startswith("claude-fable-5-1")
 
 
 def claude_requires_max_tokens(name: str) -> bool:
@@ -90,6 +95,24 @@ def claude_adaptive_patch(effort: str) -> str:
     )
 
 
+def adaptive_model_patch(name: str, effort: str, provider: str) -> str:
+    patch = claude_adaptive_patch(effort)
+    if provider == "claude" and name.startswith("claude-fable-5-1"):
+        # Harnx can compact history and rebuild dynamic system prompts. Ask the
+        # API to drop invalidated thinking rather than reject the next tool turn.
+        patch = patch.replace(
+            '{"type":"adaptive"}',
+            '{"type":"adaptive","display":"summarized",'
+            '"block_binding":{"prefix_mismatch_behavior":"drop_block"}}',
+        )
+        patch += (
+            ' | .headers += {"anthropic-beta":(['
+            '.headers["anthropic-beta"] // empty, '
+            '"thinking-binding-controls-2026-08-01"] | join(","))}'
+        )
+    return patch
+
+
 def _variant_from_base(
     base_model: dict[str, Any], suffix: str, patch: str, *, max_output_tokens: int | None
 ) -> dict[str, Any]:
@@ -123,8 +146,8 @@ def apply_base_thinking(model: dict[str, Any], provider: str) -> None:
         return
     if is_generated_variant_name(provider, name):
         return
-    if name.startswith("claude-") and is_adaptive_only_opus(name):
-        model["patches"] = [claude_adaptive_patch(BASE_EFFORT)]
+    if name.startswith("claude-") and is_adaptive_only_claude(name):
+        model["patches"] = [adaptive_model_patch(name, BASE_EFFORT, provider)]
         model["require_max_tokens"] = True
     if claude_requires_max_tokens(name):
         model["require_max_tokens"] = True
@@ -132,7 +155,9 @@ def apply_base_thinking(model: dict[str, Any], provider: str) -> None:
 
 def apply_openai_base_patches(model: dict[str, Any], provider: str) -> None:
     """Apply request rules for OpenAI base models with fixed reasoning."""
-    if provider == "openai" and model["name"] == "gpt-5.6-sol":
+    if provider == "openai" and model["name"] in (
+        "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"
+    ):
         model["patches"] = [OPENAI_NO_SAMPLING_PATCH]
 
 
@@ -140,6 +165,11 @@ def apply_base_model_rules(model: dict[str, Any], provider: str) -> None:
     """Apply provider rules to one suffix-less base model in place."""
     apply_base_thinking(model, provider)
     apply_openai_base_patches(model, provider)
+    if provider == "gemini" and model["name"] == "gemini-3.8-flash":
+        model["patches"] = [
+            ".body.generationConfig = ((.body.generationConfig // {}) | "
+            "del(.temperature) | del(.topP) | del(.topK) | del(.candidateCount))"
+        ]
 
 
 def thinking_variants(base_model: dict[str, Any], provider: str) -> list[dict[str, Any]]:
@@ -148,12 +178,12 @@ def thinking_variants(base_model: dict[str, Any], provider: str) -> list[dict[st
     if is_generated_variant_name(provider, name):
         return []
     if provider in ("claude", "vertexai") and name.startswith("claude-"):
-        if is_adaptive_only_opus(name):
+        if is_adaptive_only_claude(name):
             return [
                 _variant_from_base(
                     base_model,
                     effort,
-                    claude_adaptive_patch(effort),
+                    adaptive_model_patch(name, effort, provider),
                     max_output_tokens=base_model.get("max_output_tokens"),
                 )
                 for effort in ADAPTIVE_EFFORT_VARIANTS

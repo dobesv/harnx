@@ -761,6 +761,7 @@ async fn tui_switches_only_after_committed_handoff_and_ignores_late_source_compl
         harnx_core::event::SessionEvent::HandoffCommitted {
             agent: "target".into(),
             session_id: "target-session".into(),
+            handoff_tool_call_id: Some("call-tui-test".into()),
         },
     )))
     .await
@@ -994,4 +995,128 @@ async fn live_subagent_empty_response_omits_reply_row() {
             ..
         }
     ));
+}
+
+// ============================================================
+// Issue #948: Sub-agent monitored session jump keys (viewer 4)
+// ============================================================
+
+/// Test that sub-agent monitored session (viewer 4) jump keys work.
+/// Drills into a nested session and tests g/G/Home/End with SHIFT coverage.
+#[tokio::test]
+async fn test_subagent_session_jump_keys() {
+    // Use a smaller viewport to ensure content is scrollable
+    let mut harness = TuiTestHarness::with_size(48, 8).await;
+    harness.tui().clear_transcript();
+
+    // Create a child session with many transcript items (scrollable content)
+    let child = monitored_key("researcher", "long-child-session");
+    emit_subagent_started(harness.tui(), &child).await;
+
+    // Push enough transcript items to require scrolling (12 items for viewport height 8)
+    let transcript: Vec<TranscriptItem> = (0..12)
+        .map(|i| assistant_text(&format!("child row {i:02}\nline two of row {i:02}")))
+        .collect();
+
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::SubAgentSessionSnapshot {
+            key: child.clone(),
+            transcript,
+            status: SubAgentStatus::Completed,
+        })
+        .await
+        .unwrap();
+
+    // Open the child session fullscreen
+    open_focused_root_subagent(&mut harness).await;
+    harness.render();
+
+    // Helper: get scroll state (requires mutable borrow, but only reads)
+    let scroll_state = |h: &mut TuiTestHarness| {
+        let s = &h.tui().app.monitored_sessions[&child].scroll;
+        (s.position, s.follow, s.last_max_position)
+    };
+
+    // Helper to scroll child up N times
+    let scroll_up = |h: &mut TuiTestHarness, n: usize| {
+        let session = h.tui().app.monitored_sessions.get_mut(&child).unwrap();
+        for _ in 0..n {
+            session.scroll.scroll_up();
+        }
+    };
+
+    // Verify content is scrollable
+    let (_, _, max_pos) = scroll_state(&mut harness);
+    assert!(
+        max_pos > 0,
+        "child transcript should be scrollable, got last_max_position={}",
+        max_pos
+    );
+
+    // Scroll down a bit
+    for _ in 0..3 {
+        harness
+            .tui()
+            .app
+            .monitored_sessions
+            .get_mut(&child)
+            .unwrap()
+            .scroll
+            .scroll_down();
+    }
+    harness.render();
+    let (mid_pos, _, _) = scroll_state(&mut harness);
+    assert!(
+        mid_pos > 0,
+        "should be scrolled down, got position={}",
+        mid_pos
+    );
+
+    // Test jump-to-top with 'g' + SHIFT modifier
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::SHIFT))
+        .await
+        .unwrap();
+    let (pos, follow, _) = scroll_state(&mut harness);
+    assert_eq!(pos, 0, "Shift+g should jump to top in subagent view");
+    assert!(!follow, "jump-to-top should disable follow");
+
+    // Test jump-to-bottom with 'G' char key
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    harness.render();
+    let (pos, follow, max_pos) = scroll_state(&mut harness);
+    assert_eq!(pos, max_pos, "'G' should jump to bottom in subagent view");
+    assert!(follow, "jump-to-bottom should enable follow");
+
+    // Test Home keycode (jump-to-top)
+    scroll_up(&mut harness, 2);
+    harness.render();
+    let (before_home, _, _) = scroll_state(&mut harness);
+    assert!(before_home > 0, "should be scrolled before Home test");
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let (pos, follow, _) = scroll_state(&mut harness);
+    assert_eq!(pos, 0, "Home should jump to top in subagent view");
+    assert!(!follow, "Home should disable follow");
+
+    // Test End keycode (jump-to-bottom)
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    harness.render();
+    let (pos, follow, max_pos) = scroll_state(&mut harness);
+    assert_eq!(pos, max_pos, "End should jump to bottom in subagent view");
+    assert!(follow, "End should enable follow");
 }

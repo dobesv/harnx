@@ -79,7 +79,6 @@ fn transcript_footprint(items: &[TranscriptItem]) -> (usize, usize) {
             | TranscriptItem::ErrorText(s)
             | TranscriptItem::ThoughtText(s)
             | TranscriptItem::StatusLine(s)
-            | TranscriptItem::UsageLine(s)
             | TranscriptItem::AttachmentHeader(s)
             | TranscriptItem::AttachmentItem(s)
             | TranscriptItem::AttachmentPreviewLine(s)
@@ -116,8 +115,6 @@ fn build_initial_app(
         main_streamed_text_idx: None,
         cache_valid_width: None,
         last_ui_output_source: None,
-        last_usage_source: None,
-        last_usage_transcript_idx: None,
         pending_thought_source: None,
         pending_thought_text: String::new(),
         pending_tool_seq: None,
@@ -779,7 +776,9 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
                         );
                         let trimmed = rendered.trim_end_matches('\n');
                         if !trimmed.is_empty() {
+                            let full = crate::input::full_tool_result_detail(&r.output);
                             items.push(TranscriptItem::ToolResultMarkdown {
+                                full_detail: crate::input::full_detail_if_extra(full, trimmed),
                                 text: trimmed.to_string(),
                                 rendered_cache: None,
                             });
@@ -805,6 +804,7 @@ pub(crate) fn subagent_reply_item_from_output(
         return None;
     }
     Some(TranscriptItem::ToolResultMarkdown {
+        full_detail: None,
         text: crate::strip_ansi(trimmed).to_string(),
         rendered_cache: None,
     })
@@ -841,7 +841,6 @@ fn flatten_transcript_item_to_compaction_lines(item: &TranscriptItem, lines: &mu
         | TranscriptItem::ErrorText(text)
         | TranscriptItem::ThoughtText(text)
         | TranscriptItem::StatusLine(text)
-        | TranscriptItem::UsageLine(text)
         | TranscriptItem::AttachmentHeader(text)
         | TranscriptItem::AttachmentItem(text)
         | TranscriptItem::AttachmentPreviewLine(text)

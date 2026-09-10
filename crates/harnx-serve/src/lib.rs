@@ -7,6 +7,7 @@ mod ag_ui_remote_follow;
 pub mod ag_ui_rpc;
 mod ag_ui_sync;
 mod ag_ui_usage;
+mod interrupt_resume;
 pub mod session_actor;
 mod session_actor_types;
 mod session_routes;
@@ -786,7 +787,7 @@ impl Server {
     }
 
     async fn session_history_json(&self, agent: &str, session: &str) -> Result<AppResponse> {
-        let loaded_session = load_nats_session(&self.config, session).await?;
+        let (loaded_session, _entries) = load_nats_session(&self.config, session).await?;
         if loaded_session.agent_name.as_deref() != Some(agent) {
             bail!("Not Found");
         }
@@ -1382,10 +1383,29 @@ async fn agent_sessions_json(config: &Config, agent: &str) -> Result<Vec<Value>>
         .collect())
 }
 
+/// Load session history from NATS durable log.
+/// Returns tuple of (Session, entries) so callers can access raw log entries
+/// for control-state hydration on promptless attach.
 pub(crate) async fn load_nats_session(
     config: &Config,
     session: &str,
-) -> Result<harnx_core::session::Session> {
+) -> Result<(
+    harnx_core::session::Session,
+    Vec<(u64, harnx_core::session::SessionLogEntry)>,
+)> {
+    let (loaded, entries, _base_session) = load_nats_session_with_base(config, session).await?;
+    Ok((loaded, entries))
+}
+
+/// Load session history and retain canonical metadata state for replaying a fresher log snapshot.
+pub(crate) async fn load_nats_session_with_base(
+    config: &Config,
+    session: &str,
+) -> Result<(
+    harnx_core::session::Session,
+    Vec<(u64, harnx_core::session::SessionLogEntry)>,
+    harnx_core::session::Session,
+)> {
     ensure_frontend_nats_owner().await?;
     let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
     let metadata_store =
@@ -1421,21 +1441,22 @@ pub(crate) async fn load_nats_session(
                 anyhow!("Failed to inspect worker lease for session '{session}': {err}")
             })?
     };
+    let base_session = metadata.base_session();
     let loaded = if preserve_pending {
         harnx_runtime::nats_session_log::load_session_from_entries_with_metadata_preserving_pending(
             &entries,
             session,
-            metadata.base_session(),
+            base_session.clone(),
         )
     } else {
         harnx_runtime::nats_session_log::load_session_from_entries_with_metadata(
             &entries,
             session,
-            metadata.base_session(),
+            base_session.clone(),
         )
     }
     .map_err(|err| anyhow!("Failed to reconstruct session history for '{session}': {err}"))?;
-    Ok(loaded)
+    Ok((loaded, entries, base_session))
 }
 
 #[doc(hidden)]

@@ -15,6 +15,7 @@ extern crate log;
 pub mod access_token;
 pub mod claude_upload;
 pub mod client;
+pub mod codex_auth;
 #[macro_use]
 pub mod macros;
 pub mod gemini_upload;
@@ -66,6 +67,7 @@ register_client!(
         OpenAICompatibleConfig,
         OpenAICompatibleClient
     ),
+    (codex, "codex", CodexConfig, CodexClient),
     (gemini, "gemini", GeminiConfig, GeminiClient),
     (claude, "claude", ClaudeConfig, ClaudeClient),
     (cohere, "cohere", CohereConfig, CohereClient),
@@ -92,6 +94,7 @@ impl ClientConfig {
         match self {
             ClientConfig::OpenAIConfig(c) => &c.name,
             ClientConfig::OpenAICompatibleConfig(c) => &c.name,
+            ClientConfig::CodexConfig(c) => &c.name,
             ClientConfig::GeminiConfig(c) => &c.name,
             ClientConfig::ClaudeConfig(c) => &c.name,
             ClientConfig::CohereConfig(c) => &c.name,
@@ -110,6 +113,7 @@ impl ClientConfig {
         match self {
             ClientConfig::OpenAIConfig(c) => c.name = name,
             ClientConfig::OpenAICompatibleConfig(c) => c.name = name,
+            ClientConfig::CodexConfig(c) => c.name = name,
             ClientConfig::GeminiConfig(c) => c.name = name,
             ClientConfig::ClaudeConfig(c) => c.name = name,
             ClientConfig::CohereConfig(c) => c.name = name,
@@ -127,6 +131,7 @@ impl ClientConfig {
         match self {
             ClientConfig::OpenAIConfig(c) => c.package = package,
             ClientConfig::OpenAICompatibleConfig(c) => c.package = package,
+            ClientConfig::CodexConfig(c) => c.package = package,
             ClientConfig::GeminiConfig(c) => c.package = package,
             ClientConfig::ClaudeConfig(c) => c.package = package,
             ClientConfig::CohereConfig(c) => c.package = package,
@@ -136,5 +141,22 @@ impl ClientConfig {
             ClientConfig::LlamaServerConfig(c) => c.package = package,
             ClientConfig::Unknown => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientConfig;
+    use serde_json::json;
+
+    #[test]
+    fn client_config_type_name_matches_serde_tag() {
+        for serde_tag in ["openai", "codex", "claude", "azure-openai"] {
+            let config: ClientConfig = serde_json::from_value(json!({ "type": serde_tag }))
+                .expect("representative client config should deserialize");
+            assert_eq!(config.type_name(), serde_tag);
+        }
+
+        assert_eq!(ClientConfig::Unknown.type_name(), "");
     }
 }

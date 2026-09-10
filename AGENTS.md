@@ -36,7 +36,6 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 │   │       ├── serve.rs        # HTTP server mode
 │   │       ├── tool.rs         # Built-in tool definitions
 │   │       ├── mcp_safety.rs   # MCP tool safety classification
-│   │       ├── client/         # LLM provider clients
 │   │       ├── config/         # Configuration, agent/session management
 │   │       ├── render/         # Markdown + streaming output
 │   │       ├── tui/            # Interactive TUI (ratatui)
@@ -77,9 +76,32 @@ process isolation; `cargo test` shares one process and produces spurious
 failures. The tmux/interrupt e2e tests guard against this and will panic with a
 redirect message if run under `cargo test` (via `harnx_core::require_nextest()`).
 
+FD-redirection tests (e.g., `cli_event_sink.rs` `final_usage_is_standalone`)
+use `dup2` to capture stdout/stderr. Under `cargo test`, libtest's own capture
+intercepts writes before `dup2` sees them, yielding empty buffers and misleading
+test failures.
+
 **Do not skip any of these steps or you WILL miss problems**
 **Do not ignore clippy warnings.** CI sets `RUSTFLAGS=--deny warnings` and runs `cargo clippy -- -D warnings`, so any warning will fail the build.
 **CodeScene Health scores MUST NOT decrease as part of the change, only increase**
+
+### Web/Frontend Verification
+
+**Run all web/frontend commands from `web/`, never the repo root.** The root has no
+`package.json`, so corepack cannot resolve the pnpm version and attempts to download
+into a read-only cache, failing with `EROFS: read-only file system`. The `web/`
+directory has `web/package.json` with `packageManager: "pnpm@11.25.0"` already provisioned.
+
+```sh
+cd web
+pnpm exec tsc -b                                    # Typecheck (NOT tsc --noEmit — root tsconfig has files: [] so it always exits 0)
+pnpm exec oxlint                                    # Lint
+pnpm exec vitest run                                # Unit tests
+pnpm test:e2e                                       # Playwright end-to-end tests
+```
+
+**Use `tsc -b`, not `tsc --noEmit`.** The root tsconfig sets `files: []` so
+`--noEmit` is hollow and always exits 0; `-b` builds the actual project references.
 
 ## Commit Conventions
 
@@ -133,9 +155,32 @@ them.
 
 - **Error handling:** Use `anyhow::Result` / `anyhow::bail!` throughout.
 - **Async:** All I/O is async via Tokio. Use `async fn` and `.await`.
-- **Client modules:** Each LLM provider lives in `crates/harnx/src/client/` and follows the patterns in `client/common.rs` and `client/macros.rs`.
+- **Client modules:** Provider clients live in `crates/harnx-client/src/` and follow the patterns in `macros.rs`. Config structs live in `crates/harnx-core/src/provider_config/`.
 - **Configuration:** `config.yaml` holds global settings. Clients and MCP servers use individual YAML files; agents are Markdown files with YAML front matter in `agents/`.
 - **Dual license:** MIT OR Apache-2.0. Preserve license headers where present.
+
+
+### Adding a Provider Client
+
+Wire a new provider client via `register_client!` in `crates/harnx-client/src/lib.rs`:
+
+```rust
+register_client!(
+    (myprovider, "myprovider", MyProviderConfig, MyProviderClient),
+    // ...
+);
+```
+
+This macro expands to the module declaration, config enum variant, and client registry. Then:
+
+1. Add a config struct to `crates/harnx-core/src/provider_config/myprovider.rs` and export it in that dir's `mod.rs`.
+2. Add `ClientConfig::MyProviderConfig(_)` match arms in `lib.rs` (`effective_name`/`set_name`/`set_package`) and `crates/harnx-runtime/src/config/patches_split.rs` (`apply_client_patch`).
+3. Implement `Client`:
+   - Sync auth (API key): use `impl_client_trait!` macro (see `cohere.rs` for example).
+   - Async per-request auth (OAuth token refresh): write a manual `impl Client` like `vertexai.rs` or `codex.rs`, running token prep at the top of each `*_inner` method.
+4. For Responses API variants, key `model.endpoint()` to `"responses"` to reuse `openai_responses.rs` helpers.
+
+Env-var field access uses `config_get_fn!` — the macro generates `${STEM}_${FIELD}` lookup where STEM is the client filename (e.g. `myprovider_api_key` → `MYPROVIDER_API_KEY`).
 
 ### Tool-call argument parsing
 
@@ -155,6 +200,24 @@ propagates as an error with context naming the tool and echoing the raw argument
 This convention is consolidated across all provider parsers (`openai.rs`, `openai_responses.rs`,
 `bedrock.rs`, `claude.rs`, `cohere.rs`).
 
+### Tool result templates and undefined behavior
+
+Tool display templates are rendered by `make_template_env()` in
+`crates/harnx-core/src/tool.rs`, which MUST use `UndefinedBehavior::Chainable`
+(not `Lenient`). MiniJinja's `Lenient` mode tolerates printing an undefined
+value, but it still raises "undefined value" when accessing an attribute or
+index of an undefined intermediate — `default()` filters cannot rescue this.
+
+The canonical result template `{{ result.content[0].text | default('') }}`
+walks into `result.content`, which is absent on recoverable-error results
+(`{"is_error": true, "error": ...}` — no `content` field). Under `Lenient`,
+indexing into undefined raises before `default('')` applies (#1537).
+
+When writing result templates:
+- be null-safe for the error-result shape (`result.content` may be absent)
+- `| default(...)` only works because Chainable makes missing intermediate
+  paths evaluate to undefined; syntax errors and unknown filters still error
+
 ### Native toolset error mapping
 
 Native `Toolset` implementations' `map_result` must map **all** `ErrorData` from handlers (both
@@ -167,6 +230,64 @@ Native `Toolset` implementations' `map_result` must map **all** `ErrorData` from
 session continues and the agent can retry. The canonical pattern is
 `crates/harnx-fs-tools/src/toolset.rs:59-66`. When adding a native toolset, do not special-case
 `ErrorCode::INTERNAL_ERROR` to `Fatal`.
+
+### Session log entries and transcript protocol
+
+Adding a `SessionLogEntry` variant in `harnx-core/src/session.rs` is a **transcript-protocol
+change**. Canonical NATS replay hard-rejects `Unknown`, so older workers cannot read
+transcripts containing new variants. Deploy readers before writers in multi-instance
+clusters. Precedents: `TurnEnd` (#1490), `Error` (#1545), `SubAgentStarted` (#1604).
+
+Required match-site updates (3 compile-time exhaustive matches):
+- `config/session.rs` — reconstruction into `Session.messages`
+- `nats_session.rs` — `render_log_entry_to_sink` (usually a no-op arm with comment)
+- `session_history.rs` — `entry_type` and `entry_searchable_text`
+
+Wildcard matches elsewhere (`session_reconstruct.rs`, fence helpers, etc.) compile without
+changes but should be audited for correctness.
+
+Mid-tool entries (arriving between `ToolCalls` and `ToolResults`) must be queued in
+`messages_queued_during_tool` during reconstruction so tool_use→tool_result adjacency is
+preserved. See `SubAgentStarted` handling in `config/session.rs` for the pattern.
+
+Append to another session's log via `NatsSessionLog::new(jetstream, session_id)` with no
+`fence_token`. Used when a tool/client needs durable state visible to a session it doesn't
+hold the lease for (e.g. sub-agent start entries in parent log).
+
+Worker-written control entries (`HandoffCommitted`, `HitlApprovalRequested`,
+`HitlApprovalDecision`) use `FencedSessionLogSink`, which stamps the lease revision as
+`fence_token`. HITL entries additionally require stream-tail CAS because `is_held()` is not
+broker-authoritative—a stale worker can race after TTL expiry. See
+`nats_worker/backend.rs:FencedSessionLogSink` for the CAS + ownership-revalidation pattern.
+
+### TUI transcript items are TUI-local
+
+`TranscriptItem` (`harnx-tui/src/types.rs`) derives only `Clone + Debug` — it is **not** serialized to
+NATS. Adding a field or variant is a local TUI change, not a transcript-protocol change. Contrast
+with `SessionLogEntry` variants (previous section), which are protocol-versioned.
+
+## Usage Accounting Semantics
+
+`ModelEvent::Final.usage` (`harnx-core/src/event.rs:66-71`) is a **display-only per-turn total** that
+sums every model completion in that turn's tool loop. Session cumulative totals and status-bar
+metrics use a **separate mechanism**: `record_completion_usage` in `config/mod.rs:1082-1085` writes to
+`Session.completion_usage` per model call. These mechanisms are independent. Anyone modifying usage
+display must keep them separate or they'll double-count.
+
+### TUI printable-character keybindings with SHIFT-tolerant matching
+
+Crossterm may report shifted printable characters (`<`, `>`, `G`) with `KeyModifiers::SHIFT` set on
+some terminals. Binding these characters with strict `KeyModifiers::NONE` causes the match arm to
+silently never fire.
+
+Pattern for shift-sensitive char bindings:
+```rust
+(KeyCode::Char('g' | '<') | KeyCode::Home, KeyModifiers::NONE | KeyModifiers::SHIFT) => { ... }
+```
+
+Accept `NONE | SHIFT` on char arms (not CONTROL/ALT combinations). Home/End keycodes don't need
+SHIFT tolerance — they're not char keys. See AgentPicker in `input.rs` for the `||` guard variant,
+and jump-key handlers in `detail_view.rs`/`input.rs`/`subagent_sessions.rs` for the or-pattern form.
 
 ## Issue/task tracker
 

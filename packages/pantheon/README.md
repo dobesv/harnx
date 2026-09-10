@@ -8,45 +8,51 @@ results, and a multi-agent code review pipeline.
 ## What's included
 
 ### Orchestrators
-| Agent | Role |
-|-------|------|
-| `sisyphus` | Main assistant — persistent task executor. Breaks tasks into plans, delegates to specialists, runs quality gates. |
-| `daedalus` | Strategic planner — interviews users, researches codebases, produces implementation plans, then hands off to Atlas. |
-| `atlas` | Plan execution orchestrator — takes Daedalus plans and drives them to completion via specialist delegation. |
 
-### Specialist Workers
-| Agent | Model | Best For |
-|-------|-------|----------|
-| `hephaestus` | gpt-5.4 | Large refactors, migrations, deep implementation |
-| `iris` | gemini-3.1-pro-preview | UI, frontend, visual engineering |
-| `apollo` | gemini-3.1-pro-preview | Creative solutions, novel UX |
-| `athena` | zai.glm-5 (Bedrock) | Complex multi-file features, agent of last resort |
-| `hermes` | zai.glm-5 (Bedrock) | Quick fixes, one-liners, config tweaks |
-| `hestia` | zai.glm-5 (Bedrock) | Maintenance, dependency updates, linting |
-| `plato` | gpt-5.4 | Architecture, data modeling, complex algorithms |
-| `peitho` | gemini-3-flash-preview | Documentation, READMEs, release notes |
-
-### Research & Quality
 | Agent | Model | Role |
 |-------|-------|------|
-| `pytheas` | gemini-3-flash-preview | Reconnaissance — fast codebase + GitHub/issue context lookup |
-| `zosimus` | gpt-5.5 | Deep investigation — bug reproduction, hypothesis validation |
-| `librarian` | gemini-3.1-pro-preview | External knowledge — web search, docs, GitHub |
-| `oracle` | zai.glm-5 (Bedrock) | Architectural decisions and consultation |
-| `argus` | gemini-3-flash-preview | Independent verification — PASS/FAIL with evidence |
-| `mnemosyne` | zai.glm-5 (Bedrock) | Knowledge compounding — writes `docs/solutions/` entries |
-| `clio` | gemini-3-flash-preview | Git operations — squash, rebase, push |
+| `sisyphus` | claude-opus-4-8 | Main assistant — persistent task executor. Breaks tasks into plans, delegates to specialists, runs quality gates. |
+| `daedalus` | claude-opus-4-8 | Strategic planner — interviews users, researches codebases, produces implementation plans, then hands off to Atlas. |
+| `atlas` | gemini-3.8-flash | Plan execution orchestrator — takes Daedalus plans and drives them to completion via specialist delegation. |
+
+### Specialist Workers
+
+| Agent | Model | Best For |
+|-------|-------|----------|
+| `hephaestus` | gpt-5.6-sol:high | Large refactors, migrations, deep implementation |
+| `iris` | gemini-3.8-flash | UI, frontend, visual engineering |
+| `apollo` | gemini-3.8-flash | Creative solutions, novel UX |
+| `athena` | zai.glm-5 | Complex multi-file features, agent of last resort |
+| `hermes` | gpt-5.6-luna | Quick fixes, one-liners, config tweaks |
+| `hestia` | minimax.minimax-m2.5 | Maintenance, dependency updates, linting |
+| `plato` | gpt-6-astra:max | Architecture, data modeling, complex algorithms |
+| `peitho` | gemini-3.8-flash | Documentation, READMEs, release notes |
+
+### Research & Quality
+
+| Agent | Model | Role |
+|-------|-------|------|
+| `pytheas` | gemini-3.8-flash | Reconnaissance — fast codebase + GitHub/issue context lookup |
+| `zosimus` | gpt-5.6-sol | Deep investigation — bug reproduction, hypothesis validation |
+| `librarian` | gemini-3.8-flash | External knowledge — web search, docs, GitHub |
+| `oracle` | gpt-6-astra:max | Architectural decisions and consultation |
+| `argus` | gemini-3.8-flash | Independent verification — PASS/FAIL with evidence |
+| `mnemosyne` | zai.glm-5 | Knowledge compounding — writes `docs/solutions/` entries |
+| `clio` | gemini-3.8-flash | Git operations — squash, rebase, push |
 
 ### Code Review Pipeline (Aristarchus)
+
 `aristarchus` orchestrates a full multi-agent PR review:
+
 - **9 Muse specialists**: Calliope (quality), Euterpe (conventions), Thalia (testing), Melpomene (security), Polyhymnia (privacy), Erato (UI/a11y), Terpsichore (refactoring), Urania (architecture), Nemesis (reliability), Tyche (deployment)
 - **3 Judges**: Minos, Rhadamanthus, Aeacus — independently second-pass every finding with consensus voting
 - Produces structured reports with blocker/suggestion/highlight findings and inline PR comments
 
 ### Compaction Agents
+
 `compact-dev`, `compact-researcher`, `compact-planner`, `compact-reviewer`,
 `compact-argus`, `compact-mnemosyne`, `compact-reliability`, `compact-deploy` —
-lightweight context-compression agents (gemini-3.1-flash-lite) used to keep
+lightweight context-compression agents (gemini-3.5-flash-lite) used to keep
 long conversations within token limits.
 
 ---
@@ -59,13 +65,16 @@ Install from GHCR (replace `v0.1.0` with the current release):
 harnx-pkg add ghcr.io/dobesv/harnx-packages/pantheon v0.3.4
 ```
 
-Then set your API keys in `~/.local/share/harnx/.env`:
+Use harnx 0.34.0 or a development build containing the package model updates.
+Configure any one of the five included clients; every agent, including compaction,
+has a fallback for each provider. For a ChatGPT subscription, run `codex login`.
+For API-key access, set the applicable key in `~/.local/share/harnx/.env`:
 
 ```sh
 CLAUDE_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-...
 GEMINI_API_KEY=AIza...
-BEDROCK_API_KEY=...   # for the zai.glm-5 agents
+BEDROCK_API_KEY=...   # Amazon Bedrock API key
 ```
 
 Run Sisyphus:
@@ -84,17 +93,20 @@ harnx daedalus
 
 ## Client configs included
 
-The package ships four client configs:
+The package ships five client configs:
 
-| File | Provider | Used by |
-|------|----------|---------|
-| `clients/claude.yaml` | Anthropic Claude API | sisyphus, daedalus, atlas |
-| `clients/openai.yaml` | OpenAI API | hephaestus, plato, aristarchus, zosimus, … |
-| `clients/gemini.yaml` | Google Gemini API | argus, clio, pytheas, compaction agents, … |
-| `clients/bedrock.yaml` | AWS Bedrock | hermes, hestia, athena, metis, oracle, mnemosyne, nemesis, rhadamanthus, tyche, urania |
+| File | Access |
+|------|--------|
+| `clients/codex.yaml` | ChatGPT subscription via `codex login` and `~/.codex/auth.json` |
+| `clients/openai.yaml` | OpenAI API via `OPENAI_API_KEY` |
+| `clients/claude.yaml` | Anthropic API via `CLAUDE_API_KEY` |
+| `clients/gemini.yaml` | Gemini API via `GEMINI_API_KEY` |
+| `clients/bedrock.yaml` | Non-Anthropic Bedrock models via `BEDROCK_API_KEY` |
 
-API keys are loaded from `~/.local/share/harnx/.env` (recommended) or from the
-environment. Variable names: `CLAUDE_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `BEDROCK_API_KEY`.
+Clients inherit model metadata from harnx's shared catalog. Codex immediately
+precedes the equivalent OpenAI API model in every fallback chain.
+See [model selection and fallback policy](MODELS.md) for the complete roster,
+cost tiers, sources, and availability limits.
 
 ---
 
@@ -122,43 +134,32 @@ agents:
   - 'if .name == "zosimus" then .model = "openai:o3" end'
 ```
 
-### Use your own private/preview models
+### Use a different model
 
-If you have access to preview models, override per-agent or set all at once:
+Override per-agent or set all at once:
 
 ```yaml
 # ~/.config/harnx/packages/pantheon.patch.yaml
 agents:
-  - '.model = "openai:gpt-5.4"'   # replace every agent's model
+  - '.model = "codex:gpt-5.6-terra"'   # replace every agent's model
 ```
 
-### Using the Bedrock client for `zai.glm-5` agents
+### Using the Bedrock client
 
-Several agents (hermes, hestia, athena, metis, oracle, mnemosyne, nemesis,
-rhadamanthus, tyche, urania) use `bedrock:zai.glm-5`. The Bedrock client config
-is included in the package (`clients/bedrock.yaml`) — no manual setup needed.
+The included client uses Bedrock's OpenAI-compatible Chat Completions endpoint.
+Set `BEDROCK_API_KEY` to an Amazon Bedrock API key (bearer token).
+This client does not use the AWS SigV4 credential chain.
 
-Set your Bedrock API key in `~/.local/share/harnx/.env`:
-
-```sh
-BEDROCK_API_KEY=...
-```
-
-If you use a different AWS region, override `api_base` via the patch file:
+If you use a different region, override `api_base` in the patch file and check
+that region's model availability:
 
 ```yaml
-# ~/.config/harnx/packages/pantheon.patch.yaml
 clients:
   - 'if .name == "bedrock" then .api_base = "https://bedrock-runtime.eu-west-1.amazonaws.com/openai/v1" end'
 ```
 
-If you don't have Bedrock access, override those agents to a different model:
-
-```yaml
-# ~/.config/harnx/packages/pantheon.patch.yaml
-agents:
-  - 'if ([.name] | inside(["hermes","hestia","athena","metis","oracle","mnemosyne","nemesis","rhadamanthus","tyche","urania"])) then .model = "openai:gpt-4.1-mini" end'
-```
+Agents automatically try their configured fallbacks when credentials fail or
+retries are exhausted. No model override is needed just because you lack Bedrock.
 
 ---
 

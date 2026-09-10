@@ -57,15 +57,16 @@ The proxy is configured to be **SSE-safe**. It disables buffering for `text/even
   - Streaming text, thinking, and tool-call rendering.
   - Session switching.
   - Turn cancellation.
+  - Tool approval and session handoff confirmations (approve/deny responses and reconnect replay).
 - **Out of Scope** (Deferred to `harnx-webui-parity` backlog):
+  - General transcript message editing and history rewinding.
   - File attachments.
-  - Tool approval workflows.
-  - Message editing and rewinding.
   - Model switching.
+  - NATS single-owner-route fanout redesign for multi-client tool approvals.
 
 ### Known Cosmetic Issues
 
-- **C5**: When a user sends a message, there may be a brief flicker when the optimistic local message is reconciled with the `MESSAGES_SNAPSHOT` from the server. This is an accepted behavior for the first version.
+- **C5**: There is no optimistic rendering for out-of-band user messages. When sending to an existing session, the composer disables and shows a spinner until the backend hydrates the message into the transcript.
 
 ## Build and CI
 

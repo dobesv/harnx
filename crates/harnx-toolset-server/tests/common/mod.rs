@@ -5,11 +5,18 @@
 //! themselves, and keeping it there pushed that file's cohesion (LCOM4) over
 //! CodeScene's threshold.
 
+// Each integration-test binary includes only the subset of this shared
+// harness that it exercises.
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use harnx_core::instance::ServerScope;
 use harnx_nats_common::connect::NatsConnection;
-use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset, HDR_CALL_ID, HDR_IDEMPOTENCY_KEY};
+use harnx_toolset::{
+    ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolSpec, Toolset, HDR_CALL_ID,
+    HDR_IDEMPOTENCY_KEY,
+};
 use harnx_toolset_server::{serve_with_shutdown, ServeLifecycle};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -18,7 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const TOKEN: &str = "toolset-test-token";
@@ -130,16 +137,35 @@ fn nats_server_binary() -> Option<PathBuf> {
     which::which("nats-server").ok()
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct TestToolset {
+    server_name: &'static str,
     pub(crate) echo_invocations: Arc<AtomicUsize>,
     pub(crate) slow_started: Arc<Notify>,
+    pub(crate) last_context: Arc<Mutex<Option<ToolInvocationContext>>>,
+}
+
+impl Default for TestToolset {
+    fn default() -> Self {
+        Self::named("test")
+    }
+}
+
+impl TestToolset {
+    pub(crate) fn named(server_name: &'static str) -> Self {
+        Self {
+            server_name,
+            echo_invocations: Arc::default(),
+            slow_started: Arc::default(),
+            last_context: Arc::default(),
+        }
+    }
 }
 
 #[async_trait]
 impl Toolset for TestToolset {
     fn name(&self) -> &str {
-        "test"
+        self.server_name
     }
 
     fn tools(&self) -> Vec<ToolSpec> {
@@ -175,6 +201,15 @@ impl Toolset for TestToolset {
             }
             _ => Err(ToolInvokeError::Recoverable("unknown tool".to_string())),
         }
+    }
+
+    async fn invoke_with_context(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Value, ToolInvokeError> {
+        *self.last_context.lock().await = Some(invocation.context.clone());
+        self.invoke(&invocation.tool, invocation.args, invocation.cancel)
+            .await
     }
 }
 

@@ -126,7 +126,7 @@ OpenTelemetry distributed tracing is off unless an OTLP endpoint environment var
 
 Prometheus metrics serving is off unless `--metrics-addr` or `HARNX_METRICS_ADDR` is set. See [Prometheus Metrics](metrics.md) for full documentation.
 
-- **HARNX_METRICS_ADDR**: Environment variable fallback for `--metrics-addr` on shared-entrypoint binaries (`harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-time-server`, `harnx-plans-tools`, `harnx-claude-compatible-hook-server`, `harnx-mcp-remote`, `harnx-mcp-bridge`, `harnx-mcp-time`, `harnx-mcp-plans-github`). Address format is `IP:PORT` or `:PORT` (blank host binds `0.0.0.0`).
+- **HARNX_METRICS_ADDR**: Environment variable fallback for `--metrics-addr` on shared-entrypoint binaries (`harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-time-server`, `harnx-plans-tools`, `harnx-claude-compatible-hook-server`, `harnx-mcp-remote`, `harnx-mcp-bridge`, `harnx-mcp-time`, `harnx-mcp-plans-github`). Address format is `IP:PORT` or `:PORT` (blank host binds `0.0.0.0`).
 
 ## Tool filesystem allowlist envs
 

@@ -166,14 +166,16 @@ test('send-failure error (initial send)', async ({ page }) => {
   await expect(page).toHaveScreenshot('send-failure-error.png');
 });
 
-test('send-failure error (queued send)', async ({ page }) => {
+test('send-failure error (out-of-band send)', async ({ page }) => {
   await page.goto('/?scenario=happy');
   await page.locator('.grid-item').filter({ hasText: 'coding/coder' }).click();
   await page.locator('.new-chat-button').click();
 
   await page.locator('.aui-composer-input').fill('Start running');
   await page.locator('.aui-composer-send').click();
-  await expect(page.locator('.aui-composer-send')).toHaveText(/Queue/i, { timeout: 1000 });
+
+  // Wait for the first message to land to transition from fresh to existing session
+  await expect(page.locator('.aui-message-content').filter({ hasText: 'Start running' })).toBeVisible();
 
   await page.evaluate(() => {
     const msw = (window as any).__msw;
@@ -185,5 +187,6 @@ test('send-failure error (queued send)', async ({ page }) => {
 
   const errorEl = page.getByTestId('send-error');
   await expect(errorEl).toBeVisible();
-  await expect(errorEl).toHaveText(/HTTP 500/i);
+  await expect(errorEl).toHaveText(/Simulated sendPrompt error/i);
+  await expect(page.locator('.aui-composer-input')).toHaveValue('Queue this failure');
 });

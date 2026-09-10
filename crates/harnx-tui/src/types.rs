@@ -181,8 +181,6 @@ pub(super) struct App {
     pub(super) main_streamed_text_idx: Option<usize>,
     pub(super) cache_valid_width: Option<u16>,
     pub(super) last_ui_output_source: Option<AgentSource>,
-    pub(super) last_usage_source: Option<AgentSource>,
-    pub(super) last_usage_transcript_idx: Option<usize>,
     pub(super) pending_thought_source: Option<AgentSource>,
     pub(super) pending_thought_text: String,
     pub(super) pending_tool_seq: Option<usize>,
@@ -477,6 +475,10 @@ pub enum TranscriptItem {
     /// inline emphasis from a `result_template` both display correctly.
     ToolResultMarkdown {
         text: String,
+        /// Full, untruncated, all-audience tool output ("what the agent sees").
+        /// `Some` only when it differs from `text` (i.e. there is genuinely more
+        /// than the collapsed user-facing view). Rendered by the detail overlay.
+        full_detail: Option<String>,
         rendered_cache: RenderedCache,
     },
     StatusLine(String),
@@ -488,7 +490,6 @@ pub enum TranscriptItem {
         detail_text: String,
     },
     Plan(Vec<PlanEntry>),
-    UsageLine(String),
     ToolCall {
         tool_name: String,
         body: Option<ToolCallBody>,
@@ -510,6 +511,18 @@ pub enum TranscriptItem {
 }
 
 impl TranscriptItem {
+    /// Text to show for a `ToolResultMarkdown` in the detail overlay: the
+    /// full, untruncated `full_detail` when present, else the collapsed
+    /// `text`. Returns `None` for other variants.
+    pub(crate) fn tool_result_detail_text(&self) -> Option<&str> {
+        match self {
+            TranscriptItem::ToolResultMarkdown {
+                text, full_detail, ..
+            } => Some(full_detail.as_deref().unwrap_or(text)),
+            _ => None,
+        }
+    }
+
     /// Get the seq number of this transcript item, if available.
     pub(crate) fn seq(&self) -> Option<usize> {
         match self {

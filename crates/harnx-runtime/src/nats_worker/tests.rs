@@ -604,7 +604,9 @@ pub(super) fn fixed_prompt_call_fn(reply: &'static str) -> crate::agent_loop::Ag
     })
 }
 
-fn echoing_call_fn(captured: Arc<AsyncMutex<Vec<String>>>) -> crate::agent_loop::AgentCallFn {
+pub(super) fn echoing_call_fn(
+    captured: Arc<AsyncMutex<Vec<String>>>,
+) -> crate::agent_loop::AgentCallFn {
     Arc::new(move |input, _config, _abort| {
         let captured = Arc::clone(&captured);
         let derived = input.text();
@@ -626,14 +628,18 @@ pub(super) async fn test_subagent_toolset(
     let client = async_nats::connect(url)
         .await
         .expect("connect sub-agent toolset to test nats");
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_metadata =
+        crate::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+            .await
+            .expect("open session metadata");
     Arc::new(super::subagent_toolset::SubagentToolset::new(
         "metis",
         super::subagent_toolset::SubagentSessionRoute::new(
             "local",
             crate::SessionActivationRoute::ClusterShared,
         ),
-        client.clone(),
-        async_nats::jetstream::new(client),
+        super::subagent_toolset::SubagentNats::new(client.clone(), jetstream, session_metadata),
     ))
 }
 
@@ -868,13 +874,15 @@ async fn call_registered_agent(
     provider: Arc<crate::nats_tool_provider::NatsToolProvider>,
     tool: String,
     message: String,
+    tool_call_id: Option<String>,
     early_event: Option<(&mut async_nats::Subscriber, &str)>,
 ) -> (serde_json::Value, Option<String>) {
     let prompt_call = tokio::spawn(async move {
         provider
-            .call_tool(
+            .call_tool_with_id(
                 &tool,
                 json!({ "message": message }),
+                tool_call_id.as_deref(),
                 &harnx_core::abort::create_abort_signal(),
             )
             .await
@@ -982,6 +990,7 @@ async fn worker_registers_and_delegates_to_every_configured_agent() {
             format!("{agent}_session_prompt"),
             format!("delegate to {agent}"),
             None,
+            None,
         )
         .await;
         assert_eq!(
@@ -997,7 +1006,7 @@ async fn worker_registers_and_delegates_to_every_configured_agent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subagent_started_reaches_parent_stream_before_prompt_result() {
+async fn subagent_started_reaches_parent_stream_and_durable_log() {
     let _env_guard = env_lock().await;
     let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
         return;
@@ -1035,10 +1044,13 @@ async fn subagent_started_reaches_parent_stream_before_prompt_result() {
     let jetstream = async_nats::jetstream::new(client);
     let (_, provider, _) =
         registered_agent_provider(&jetstream, &seeded.parent_config, &["metis"], None).await;
+    let parent_tool_call_id = "parent-tool-call-123";
+    let before_start = chrono::Utc::now();
     let (result, child_session_id) = call_registered_agent(
         provider,
         "metis_session_prompt".to_string(),
         "emit start before finishing".to_string(),
+        Some(parent_tool_call_id.to_string()),
         Some((&mut parent_events, "metis")),
     )
     .await;
@@ -1047,93 +1059,35 @@ async fn subagent_started_reaches_parent_stream_before_prompt_result() {
     assert_eq!(result["sub_agent"]["agent"], "metis");
     assert_eq!(result["sub_agent"]["session_id"], child_session_id);
 
-    daemon.abort();
-    let _ = daemon.await;
-    let _ = nats.kill();
-    let _ = nats.wait();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subagent_new_prompt_reuse_and_load_share_one_session_log() {
-    let _env_guard = env_lock().await;
-    let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
-        return;
-    };
-    let seeded = seed_remote_config(&url);
-    let _env = subagent_test_env(&url, &seeded);
-    let captured = Arc::new(AsyncMutex::new(Vec::new()));
-    let daemon = spawn_metis_worker_with_call_fn(&url, echoing_call_fn(Arc::clone(&captured)));
-    let toolset = test_subagent_toolset(&url).await;
-
-    let created = toolset
-        .invoke("session_new", json!({}), CancellationToken::new())
-        .await
-        .expect("create and initialize child session");
-    let session_id = created["session_id"]
-        .as_str()
-        .expect("session_new returns session_id")
-        .to_string();
-    let log = NatsSessionLog::new(
-        seeded
-            .parent_config
-            .nats_jetstream("local")
-            .await
-            .expect("child log jetstream"),
-        session_id.clone(),
-    );
-    let after_new = log
+    let parent_log = NatsSessionLog::new(jetstream, parent_session_id);
+    let parent_entries = parent_log
         .load_events_async()
         .await
-        .expect("load child log after session_new")
-        .len();
-
-    for (message, expected) in [
-        (
-            "first continuation",
-            "stub remote reply over nats: first continuation",
-        ),
-        (
-            "second continuation",
-            "stub remote reply over nats: second continuation",
-        ),
-    ] {
-        let result = toolset
-            .invoke(
-                "session_prompt",
-                json!({ "message": message, "session_id": session_id }),
-                CancellationToken::new(),
+        .expect("load parent log after sub-agent start");
+    let (_, start_entry) = parent_entries
+        .iter()
+        .find(|(_, entry)| {
+            matches!(
+                entry,
+                SessionLogEntry::SubAgentStarted { session_id, .. }
+                    if session_id == &child_session_id
             )
-            .await
-            .expect("continue child session");
-        assert_eq!(result["session_id"], session_id);
-        assert_eq!(result["response"], expected);
-    }
-
-    let loaded = toolset
-        .invoke(
-            "session_load",
-            json!({ "session_id": session_id }),
-            CancellationToken::new(),
-        )
-        .await
-        .expect("load child session through tool");
-    let loaded_events = loaded["events"]
-        .as_array()
-        .expect("session_load returns serialized events");
-    assert!(loaded_events.len() > after_new);
-    let final_entries = log
-        .load_events_async()
-        .await
-        .expect("load final reused child log");
-    assert!(final_entries.len() > after_new);
-    assert_eq!(
-        captured.lock().await.as_slice(),
-        [
-            "Start a new session.",
-            "first continuation",
-            "second continuation"
-        ]
-    );
+        })
+        .expect("parent log contains durable sub-agent start");
+    let SessionLogEntry::SubAgentStarted {
+        agent,
+        invocation_id,
+        tool_call_id,
+        started_at,
+        ..
+    } = start_entry
+    else {
+        unreachable!("entry was matched as SubAgentStarted")
+    };
+    assert_eq!(agent, "metis");
+    assert!(invocation_id.as_ref().is_some_and(|id| !id.is_empty()));
+    assert_eq!(tool_call_id.as_deref(), Some(parent_tool_call_id));
+    assert!(started_at.is_some_and(|timestamp| timestamp >= before_start));
 
     daemon.abort();
     let _ = daemon.await;

@@ -36,6 +36,10 @@ pub struct SwitchAgentData {
     pub prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The tool call ID that triggered this handoff.
+    /// Used as marker identity for deduplication between live and hydrated events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ToolResult {
@@ -131,6 +135,19 @@ pub trait ToolProvider: Send + Sync {
         arguments: Value,
         abort: &AbortSignal,
     ) -> Result<ToolProviderOutput, ToolError>;
+
+    /// Dispatches a tool with its parent model tool-call ID. Providers that
+    /// don't need call identity can use the default `call_tool` path.
+    async fn call_tool_with_id(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        tool_call_id: Option<&str>,
+        abort: &AbortSignal,
+    ) -> Result<ToolProviderOutput, ToolError> {
+        let _ = tool_call_id;
+        self.call_tool(tool_name, arguments, abort).await
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -235,7 +252,16 @@ pub fn strip_shebang_line(command: &str) -> &str {
 
 fn make_template_env<'a>() -> Environment<'a> {
     let mut env = Environment::new();
-    env.set_undefined_behavior(UndefinedBehavior::Lenient);
+    // Chainable, not Lenient: Lenient tolerates *printing* an undefined value
+    // but still raises "undefined value" when you access an attribute/index of
+    // an undefined intermediate. Result templates like
+    // `{{ result.content[0].text | default('') }}` walk into `result.content`,
+    // which is absent on recoverable-error results (`{"is_error": true,
+    // "error": ...}` — no `content` field). Under Lenient that raised before
+    // `default('')` could apply, spamming `warn!("template error ...")` (#1537).
+    // Chainable makes each missing hop evaluate to undefined so the `default`
+    // filter is honored. Syntax errors and other hard failures still error.
+    env.set_undefined_behavior(UndefinedBehavior::Chainable);
     // `truncate` is not a minijinja built-in; register it so templates can do
     // `{{ args.message | truncate(60) }}` or `{{ args.id | truncate(8, end='') }}`.
     env.add_filter(
@@ -413,6 +439,23 @@ impl ToolCall {
     }
 }
 
+/// Like `extract_user_display_text` but includes ALL content text parts
+/// regardless of `annotations.audience` — the full text the agent sees.
+pub fn extract_all_display_text(result: &Value) -> Option<String> {
+    let content = result.get("content")?.as_array()?;
+    let mut parts: Vec<&str> = Vec::new();
+    for item in content {
+        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+            parts.push(text);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
 /// Extracts user-visible text from an MCP `CallToolResult` value.
 ///
 /// The result value has the shape:
@@ -454,6 +497,31 @@ pub fn extract_user_display_text(result: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_extract_all_display_text() {
+        let result = json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "User text",
+                    "annotations": { "audience": ["user"] }
+                },
+                {
+                    "type": "text",
+                    "text": "Assistant text",
+                    "annotations": { "audience": ["assistant"] }
+                }
+            ]
+        });
+        assert_eq!(
+            extract_all_display_text(&result).unwrap(),
+            "User text\nAssistant text"
+        );
+
+        let no_content = json!({ "something_else": "true" });
+        assert_eq!(extract_all_display_text(&no_content), None);
+    }
 
     #[test]
     fn test_extract_user_display_text_basic() {
@@ -695,7 +763,8 @@ mod tests {
 
     #[test]
     fn test_render_tool_call_template_missing_var() {
-        // Lenient mode: missing variable renders as empty string, not an error
+        // A missing variable prints as empty string, not an error, under the
+        // env's undefined behavior (see `make_template_env`).
         let result =
             render_tool_call_template("{{ args.missing }}", &serde_json::json!({}), "fallback");
         assert!(result.is_ok());
@@ -770,6 +839,43 @@ mod tests {
             "raw fallback",
         );
         assert_eq!(rendered.unwrap(), "ERROR: boom");
+    }
+
+    /// Issue #1537: recoverable-error tool results have shape
+    /// `{"is_error": true, "error": ...}` with no `content` field. The shared
+    /// plans result template indexes into `result.content[0].text`, so a
+    /// missing `content` must not raise "undefined value" — the `default('')`
+    /// filter has to be honored (Chainable undefined behavior), not defeated
+    /// by an error on the intermediate access (the old Lenient behavior).
+    #[test]
+    fn test_render_result_template_error_shape_no_content_does_not_raise() {
+        // The exact template every plans tool shares (tool_templates::RESULT).
+        let template = "{{ result.content[0].text | default('') }}";
+        let error_result = serde_json::json!({
+            "is_error": true,
+            "error": "note note-1 not found in plan 'p'",
+        });
+        let rendered = render_tool_result_template(template, &error_result, "raw fallback");
+        assert_eq!(
+            rendered.expect("error-shape result must render without error"),
+            ""
+        );
+
+        // Empty content array is the same missing-index case one hop deeper.
+        let empty_content = serde_json::json!({ "content": [] });
+        let rendered = render_tool_result_template(template, &empty_content, "raw fallback");
+        assert_eq!(
+            rendered.expect("empty-content result must render without error"),
+            ""
+        );
+
+        // Success shape still renders its text.
+        let ok_result = serde_json::json!({ "content": [{"text": "hello"}] });
+        let rendered = render_tool_result_template(template, &ok_result, "raw fallback");
+        assert_eq!(
+            rendered.expect("success-shape result must render its text"),
+            "hello"
+        );
     }
 
     /// Issue #434: the bash exec call_template must always close its code

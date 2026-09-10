@@ -91,6 +91,67 @@ api_key: "sk-..."
 
 ---
 
+## Codex (ChatGPT subscription)
+
+Authenticate with an existing ChatGPT Pro/Plus/Team subscription instead of a metered OpenAI API key. Requests go to OpenAI's Codex backend using the Responses API.
+
+### Setup
+
+1. Install the official `codex` CLI (OpenAI's Codex command-line tool).
+2. Run `codex login` and complete the browser sign-in. This writes credentials to `~/.codex/auth.json`.
+3. Create `clients/codex.yaml` with `type: codex` (see example below).
+4. Select a model with the client prefix, e.g. `codex:gpt-5`.
+
+| Field | Description | Env Var Override |
+|-------|-------------|------------------|
+| `auth_file` | Path to the Codex CLI auth file. Defaults to `~/.codex/auth.json`. | `CODEX_AUTH_FILE` |
+| `api_base` | Override the Codex backend base URL (advanced/testing). Must be `https://` — harnx rejects a non-HTTPS `api_base` so the subscription token isn't sent over plaintext. Defaults to `https://chatgpt.com/backend-api/codex`. | `CODEX_API_BASE` |
+
+**Example:**
+```yaml
+type: codex
+```
+
+The `codex` client reuses OpenAI's built-in model catalog, so you don't need a
+`models` list — updating harnx keeps the model list (context sizes, capabilities,
+the Responses API endpoint) current automatically. Select a model with the client
+prefix, e.g. `codex:gpt-5`. Add a `models` list only to override metadata or to
+declare a model the catalog doesn't ship yet (for example `gpt-5-codex`, which
+isn't in the base OpenAI catalog):
+
+```yaml
+type: codex
+models:
+  - name: gpt-5-codex
+    max_input_tokens: 400000
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_tool_use: true
+    endpoint: responses
+```
+
+**How Auth Works:**
+harnx reads the OAuth access token from the configured auth file — `auth_file` (or `CODEX_AUTH_FILE`) when set, otherwise `~/.codex/auth.json` — and refreshes it automatically against OpenAI's token endpoint when it expires, so no API key is needed. Refreshed tokens are held in memory only; harnx does not modify the auth file (so it won't interfere with the `codex` CLI).
+
+**Notes and Limitations:**
+- Only Responses-API models offered by your subscription work here (e.g. `gpt-5-codex`, `gpt-5`).
+- Server-side conversation storage is disabled (`store: false`).
+- This uses the same first-party client path as the Codex CLI and depends on endpoints OpenAI hasn't published as a stable public API; treat it as best-effort for personal subscription use, and make sure your usage complies with OpenAI's terms.
+- If you see authentication errors, re-run `codex login` to refresh your saved credentials.
+
+**Streaming diagnostics:** Codex can return a successful SSE response without a
+`Content-Type` header. Harnx accepts a missing or empty header specifically for
+Codex, but still requires `response.completed`; an empty or interrupted stream
+is not a successful completion. An explicitly different content type remains an
+error, and other providers still require `text/event-stream`.
+
+Retry warnings include the underlying request error, not just the client/model
+wrapper. Debug logs record HTTP status, content type, and retry hints for rejected
+SSE responses. Content-type errors omit the response body because it can contain
+an entire completion, including prompts and encrypted reasoning.
+
+---
+
 ## Claude (Anthropic)
 
 Integration for Anthropic's Claude models.

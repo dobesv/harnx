@@ -216,6 +216,47 @@ Intentionally dropped today:
 - `Notice::Info` / `Notice::Warning` — not currently emitted in server flows worth surfacing; omitted to avoid custom-event spam.
 ## Operational Notes
 
+### Tool Approval Interrupts
+
+When a `PreToolUse` hook returns `{"permissionDecision": "ask"}`, the session actor
+enters `Interrupted` state and awaits a resume decision. This works the same way on
+both the SSE subscription and JSON-RPC control planes, but the wire format differs:
+
+#### Wire format
+
+- **SSE path**: The client sends a prompted run with `resume: [{interruptId, status, payload: {approved}}]`
+  in the AG-UI input. Interrupt IDs are typically `run_<uuid>:toolu_<uuid>`; the run prefix is
+  validated but bare IDs without the prefix are accepted (useful for test fixtures).
+- **JSON-RPC path**: Same resume field in `session/prompt` params. Both paths parse via
+  `interrupt_resume.rs::parse_resume_params`.
+
+Status/payload pairs:
+- `"resolved"` or `"approved"` + `approved: true` → approved
+- `"cancelled"`, `"denied"`, or `"rejected"` + `approved: false` → denied
+
+Validation (`interrupt_resume.rs::validate_resume`):
+- All interrupt IDs must be from the pending batch (unknown IDs rejected)
+- If an ID has a `run_` prefix, it must match the interrupted run
+- Resume must cover every pending interrupt (partial coverage rejected)
+
+On resume, the session reuses the saved `pending.text` prompt from the interrupted turn.
+
+#### Framing for reconnect
+
+When a promptless subscribe joins a session in `Interrupted` state, the server synthesizes
+a terminal `RUN_FINISHED` with `outcome` at the top level of the framed SSE event:
+
+```json
+{"type":"RUN_FINISHED","threadId":"...","runId":"...","outcome":{...interrupt metadata...}}
+```
+
+This is visible to the `@assistant-ui/react-ag-ui` event parser, which reads `payload.outcome`
+and ignores `result`. The client's `BatchInterruptUI` renders the approval gate, and the
+decision is submitted as a new resume run. The outcome is NOT nested under `result`.
+
+The `SubscribeResult` from `SessionCommand::Subscribe` atomically carries `state: SessionState`
+so a reconnecting client sees the correct interrupt snapshot without a subscribe/get-info race.
+
 - **Persistence and `--dry-run`:** NATS transcript writes are skipped in `--dry-run` mode. A generated session ID is still reserved with canonical NATS session metadata.
 - **Durable Refresh:** History reflects the latest durably appended log entries.
   Live notifications are advisory; clients reload the authoritative transcript

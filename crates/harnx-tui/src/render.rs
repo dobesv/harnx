@@ -4,7 +4,7 @@ use crate::types::{
     App, ModalState, ToolCallBody, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT,
     SPINNER_FRAMES,
 };
-use crate::types::{RenderEntryState, Tui};
+use crate::types::{RenderEntryState, RenderedCache, Tui};
 use harnx_core::event::{AgentEvent, SessionEvent, TurnEvent};
 use harnx_runtime::config::GlobalConfig;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -53,6 +53,17 @@ struct ListModalOpts<'a> {
     query: Option<&'a str>,
 }
 
+/// Viewport-dependent inputs for rendering a single `ToolResultMarkdown` row.
+/// Bundled so the render helper stays under the argument-count threshold.
+struct RenderToolResultCtx<'a> {
+    show_seq: bool,
+    show_ts: bool,
+    use_utc: bool,
+    width: u16,
+    skip_cache: bool,
+    theme: Option<&'a Theme>,
+}
+
 impl Tui {
     pub(super) fn render_model_source_change(&mut self, event: &AgentEvent) -> bool {
         let model = match event {
@@ -64,7 +75,7 @@ impl Tui {
             source.model = Some(model.clone());
             source
         });
-        self.render_ui_output_heading(source.as_ref(), false);
+        self.render_ui_output_heading(source.as_ref());
         true
     }
 
@@ -165,6 +176,27 @@ impl Tui {
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
         ))
+    }
+
+    /// Render a `ToolResultMarkdown` transcript row, reusing the per-entry
+    /// cache when the viewport-dependent inputs are unchanged.
+    fn render_tool_result_entry(
+        text: &str,
+        rendered_cache: &mut RenderedCache,
+        ctx: RenderToolResultCtx<'_>,
+    ) -> RenderedEntry {
+        let key = (ctx.width, ctx.show_seq, ctx.show_ts, ctx.use_utc);
+        if let Some((w, ss, sts, utc, cached)) = rendered_cache.as_ref() {
+            if (*w, *ss, *sts, *utc) == key {
+                return cached.clone();
+            }
+        }
+        let body_base = Style::default().add_modifier(Modifier::DIM);
+        let entry = crate::markdown_render::render_markdown(text, body_base, ctx.width, ctx.theme);
+        if !ctx.skip_cache {
+            *rendered_cache = Some((key.0, key.1, key.2, key.3, entry.clone()));
+        }
+        entry
     }
 
     pub(super) fn render_entry(
@@ -320,19 +352,19 @@ impl Tui {
             TranscriptItem::ToolResultMarkdown {
                 text,
                 rendered_cache,
-            } => {
-                if let Some((w, ss, sts, utc, cached)) = rendered_cache.as_ref() {
-                    if *w == width && *ss == show_seq && *sts == show_ts && *utc == use_utc {
-                        return cached.clone();
-                    }
-                }
-                let body_base = Style::default().add_modifier(Modifier::DIM);
-                let entry = crate::markdown_render::render_markdown(text, body_base, width, theme);
-                if !state.skip_cache {
-                    *rendered_cache = Some((width, show_seq, show_ts, use_utc, entry.clone()));
-                }
-                entry
-            }
+                ..
+            } => Self::render_tool_result_entry(
+                text,
+                rendered_cache,
+                RenderToolResultCtx {
+                    show_seq,
+                    show_ts,
+                    use_utc,
+                    width,
+                    skip_cache: state.skip_cache,
+                    theme,
+                },
+            ),
             TranscriptItem::StatusLine(text) => {
                 let lines = Self::render_text_entry(
                     "",
@@ -363,17 +395,6 @@ impl Tui {
                         false,
                     ));
                 }
-                RenderedEntry::from_lines(lines, width)
-            }
-            TranscriptItem::UsageLine(text) => {
-                let lines = Self::render_text_entry(
-                    "",
-                    text,
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                    false,
-                );
                 RenderedEntry::from_lines(lines, width)
             }
             TranscriptItem::ToolCall {
@@ -1157,9 +1178,9 @@ impl Tui {
                 }
                 push_field!("text", text);
             }
-            TranscriptItem::ToolResultMarkdown { text, .. } => {
+            item @ TranscriptItem::ToolResultMarkdown { .. } => {
                 lines.push(Line::from(Span::styled("── tool result ──", label_style)));
-                push_field!("result", text);
+                push_field!("result", item.tool_result_detail_text().unwrap_or(""));
             }
             TranscriptItem::SourceHeading(source) => {
                 lines.push(Line::from(Span::styled("── source ──", label_style)));
@@ -1202,10 +1223,6 @@ impl Tui {
             TranscriptItem::StatusLine(text) => {
                 lines.push(Line::from(Span::styled("── status ──", label_style)));
                 push_field!("status", text);
-            }
-            TranscriptItem::UsageLine(text) => {
-                lines.push(Line::from(Span::styled("── usage ──", label_style)));
-                push_field!("usage", text);
             }
             TranscriptItem::Plan(plan) => lines.extend(plan_detail_lines(plan, label_style)),
             TranscriptItem::AttachmentHeader(text) => {

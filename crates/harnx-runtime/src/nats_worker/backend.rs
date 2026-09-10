@@ -3,11 +3,19 @@
 use crate::nats_lease::NatsSessionLease;
 use crate::nats_metrics;
 use anyhow::{Context, Result};
-use async_nats::jetstream;
+use async_nats::jetstream::{self, context::PublishErrorKind};
 use harnx_core::execution_context::ExecutionContextObservation;
 use std::sync::Arc;
 
 const APPEND_ATTEMPTS: usize = 3;
+
+fn is_stream_advanced_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<jetstream::context::PublishError>()
+            .is_some_and(|error| error.kind() == PublishErrorKind::WrongLastSequence)
+    })
+}
 const APPEND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 enum MetadataReplacement {
@@ -107,11 +115,29 @@ impl crate::config::session::SessionAppendSink for NatsSessionLogBackend {
 /// Fence-guarded append sink for HA worker writes (P2.2).
 ///
 /// Wraps a [`NatsSessionLogBackend`] with the holding [`NatsSessionLease`].
-/// Before EVERY worker-originated append it verifies `lease.is_held()` (mutual
-/// exclusion: a worker that has lost its lease must not write), and it stamps
-/// `fence_token = lease.fence_token()` on entries that carry one
-/// (`Message`/`ToolCalls`). A stale worker therefore cannot append, and a newer
-/// worker can detect stale entries via the fence on resume.
+/// Every worker-originated append checks local lease state and stamps
+/// `fence_token = lease.fence_token()` on entries that carry one.
+///
+/// # HITL single-winner (CAS + ownership revalidation)
+///
+/// HITL control entries MUST use stream-tail CAS via
+/// [`Self::append_hitl_event_cas`] because local `is_held()` checks are NOT
+/// broker-authoritative. After TTL expiry, a stale worker's `is_held()` returns
+/// true until its next renewal attempt fails, creating a window where two
+/// workers can both believe they hold the lease. The fence token is only an
+/// audit field—it is NOT checked by the broker on append. Without CAS, a stale
+/// worker racing a fresh lease-holder can successfully append conflicting
+/// decisions, and replay accepts the later physical entry as authoritative.
+///
+/// CAS alone is insufficient: the stale worker can still win if it publishes
+/// first after expiry. To close double-execution, `run_hitl_continuation_segment`
+/// must call [`NatsSessionLease::revalidate_ownership`] after deriving the
+/// durable decision and immediately before invoking the approved tool. Lost
+/// ownership aborts before side effects.
+///
+/// **Do not** relax this to `is_held()` + unconditional append: the original
+/// design assumed "lease+fence = CAS" and was wrong (see `hitl-toctou-actual-impact`,
+/// `durable-session-events` plan).
 #[derive(Clone)]
 pub struct FencedSessionLogSink {
     backend: NatsSessionLogBackend,
@@ -129,6 +155,37 @@ impl FencedSessionLogSink {
     ) -> Self {
         self.backend = self.backend.with_metadata_store(store);
         self
+    }
+
+    /// Append one HITL control entry only if the session log tail still matches
+    /// the snapshot used to derive it. `None` means another writer advanced the
+    /// stream and won the race.
+    pub async fn append_hitl_event_cas(
+        &self,
+        entry: &harnx_core::session::SessionLogEntry,
+        expected_last_sequence: u64,
+    ) -> Result<Option<u64>> {
+        let mut fenced = entry.clone();
+        fenced.set_fence_token(self.lease.fence_token());
+        self.backend
+            .append_event_with_expected_last_sequence_and_lease(
+                &fenced,
+                expected_last_sequence,
+                &self.lease,
+            )
+            .await
+    }
+
+    /// Blocking form used by the synchronous agent-loop approval callback.
+    pub fn append_hitl_event_cas_blocking(
+        &self,
+        entry: &harnx_core::session::SessionLogEntry,
+        expected_last_sequence: u64,
+    ) -> Result<Option<u64>> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(self.append_hitl_event_cas(entry, expected_last_sequence))
+        })
     }
 
     fn persist_metadata(&self, replacement: MetadataReplacement) -> Result<()> {
@@ -334,6 +391,70 @@ impl NatsSessionLogBackend {
         self.append_event_with_lease(entry, None).await
     }
 
+    pub(crate) async fn append_event_with_expected_last_sequence_and_lease(
+        &self,
+        entry: &harnx_core::session::SessionLogEntry,
+        expected_last_sequence: u64,
+        lease: &NatsSessionLease,
+    ) -> Result<Option<u64>> {
+        let log = crate::nats_session_log::NatsSessionLog::new(
+            self.jetstream.clone(),
+            self.session_id.clone(),
+        );
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let mut last_error = None;
+        for attempt in 1..=APPEND_ATTEMPTS {
+            self.ensure_lease_held(lease, entry)?;
+            match log
+                .append_event_with_expected_last_sequence_and_message_id_async(
+                    entry,
+                    expected_last_sequence,
+                    message_id.clone(),
+                )
+                .await
+            {
+                Ok(seq) => {
+                    self.observe_append(seq);
+                    return Ok(Some(seq));
+                }
+                Err(error) if is_stream_advanced_error(&error) => return Ok(None),
+                Err(error) => {
+                    if attempt < APPEND_ATTEMPTS {
+                        warn!(
+                            "retrying conditional session append: session_id={} entry_type={} attempt={}/{} error={error:#}",
+                            self.session_id(),
+                            crate::session_history::entry_type(entry),
+                            attempt,
+                            APPEND_ATTEMPTS,
+                        );
+                        tokio::time::sleep(APPEND_RETRY_DELAY).await;
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.expect("at least one conditional append attempt must record an error"))
+    }
+
+    fn ensure_lease_held(
+        &self,
+        lease: &NatsSessionLease,
+        entry: &harnx_core::session::SessionLogEntry,
+    ) -> Result<()> {
+        if lease.is_held() {
+            return Ok(());
+        }
+        nats_metrics::fenced_write_rejected();
+        warn!(
+            "fenced write rejected: session_id={} worker_id={} revision={} entry_type={}",
+            self.session_id(),
+            lease.worker_id(),
+            lease.fence_token(),
+            crate::session_history::entry_type(entry)
+        );
+        anyhow::bail!("refusing worker-originated append: session lease not held (fenced out)")
+    }
+
     async fn append_event_with_lease(
         &self,
         entry: &harnx_core::session::SessionLogEntry,
@@ -347,18 +468,8 @@ impl NatsSessionLogBackend {
         let mut last_error = None;
         let mut appended_seq = None;
         for attempt in 1..=APPEND_ATTEMPTS {
-            if let Some(lease) = lease.filter(|lease| !lease.is_held()) {
-                nats_metrics::fenced_write_rejected();
-                warn!(
-                    "fenced write rejected: session_id={} worker_id={} revision={} entry_type={}",
-                    self.session_id(),
-                    lease.worker_id(),
-                    lease.fence_token(),
-                    crate::session_history::entry_type(entry)
-                );
-                anyhow::bail!(
-                    "refusing worker-originated append: session lease not held (fenced out)"
-                );
+            if let Some(lease) = lease {
+                self.ensure_lease_held(lease, entry)?;
             }
 
             match log
@@ -463,5 +574,25 @@ impl NatsSessionLogBackend {
             self.session_id.clone(),
         );
         log.load_events_latest_async().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_stream_advanced_error;
+    use async_nats::jetstream::context::{PublishError, PublishErrorKind};
+
+    #[test]
+    fn stream_advanced_detection_uses_wrapped_publish_error_kind() {
+        let wrong_sequence =
+            anyhow::Error::new(PublishError::new(PublishErrorKind::WrongLastSequence))
+                .context("wrapped publish failure");
+        assert!(is_stream_advanced_error(&wrong_sequence));
+
+        let textual_match = anyhow::anyhow!("wrong last sequence");
+        assert!(!is_stream_advanced_error(&textual_match));
+
+        let other_publish_error = anyhow::Error::new(PublishError::new(PublishErrorKind::Other));
+        assert!(!is_stream_advanced_error(&other_publish_error));
     }
 }

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 mod test_support;
 
 pub use tool_template::ToolTemplate;
-pub use toolset::BashToolset;
+pub use toolset::{builtin_tool_specs, BashToolset};
 
 pub fn discover_tool_templates(
     package_dir: Option<&Path>,

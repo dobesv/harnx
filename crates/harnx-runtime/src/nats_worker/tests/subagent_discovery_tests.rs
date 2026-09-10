@@ -126,6 +126,7 @@ async fn package_agent_sees_bare_same_package_delegation_tool() {
         "pytheas_session_prompt".to_string(),
         "assemble review context".to_string(),
         None,
+        None,
     )
     .await;
     assert_eq!(

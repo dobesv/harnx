@@ -10,7 +10,7 @@
 
 use super::*;
 
-use harnx_core::message::MessageRole;
+use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
 
 /// Result of attempting to resolve a title agent from configuration.
 ///
@@ -120,34 +120,90 @@ fn first_and_last_user_text(session: &Session) -> (String, Option<String>) {
     (first_text, last_text)
 }
 
-/// The concatenated assistant replies that follow the last user message.
-fn assistant_after_last_user(session: &Session) -> String {
-    let messages = &session.messages;
-    let Some(last) = messages.iter().rposition(|m| m.role == MessageRole::User) else {
+/// Summarize a single message for the in-progress transcript.
+///
+/// Returns `None` for non-Assistant/Tool roles or empty content.
+fn summarize_message(msg: &Message) -> Option<String> {
+    if !matches!(msg.role, MessageRole::Assistant | MessageRole::Tool) {
+        return None;
+    }
+    match &msg.content {
+        MessageContent::Text(_) | MessageContent::Array(_) => {
+            let text = msg.content.to_text();
+            (!text.trim().is_empty()).then_some(text)
+        }
+        MessageContent::ToolCalls(calls) => format_tool_calls_content(calls),
+    }
+}
+
+/// Build a compact textual summary of in-progress activity after the last user
+/// message, including thinking, assistant text, and tool-call names.
+fn response_after_last_user(session: &Session) -> String {
+    let Some(last_user_idx) = session
+        .messages
+        .iter()
+        .rposition(|m| m.role == MessageRole::User)
+    else {
         return String::new();
     };
-    messages
+
+    session
+        .messages
         .iter()
-        .skip(last + 1)
-        .filter(|m| m.role == MessageRole::Assistant)
-        .map(|m| m.content.to_text())
-        .filter(|t| !t.trim().is_empty())
+        .skip(last_user_idx + 1)
+        .filter_map(summarize_message)
         .collect::<Vec<_>>()
         .join("\n\n")
 }
 
+/// Extract thinking, assistant text, and tool names from `ToolCalls` content.
+///
+/// Returns `None` if all fields are empty (no dangling labels).
+fn format_tool_calls_content(calls: &MessageContentToolCalls) -> Option<String> {
+    let thought_line = calls
+        .thought
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("Thinking: {t}"));
+
+    let text_line = (!calls.text.trim().is_empty()).then(|| calls.text.trim().to_string());
+
+    // Tool names, de-duping consecutive duplicates.
+    let mut deduped_names: Vec<&str> = Vec::new();
+    let mut prev: Option<&str> = None;
+    for result in &calls.tool_results {
+        let name = result.call.name.as_str();
+        if prev != Some(name) {
+            deduped_names.push(name);
+        }
+        prev = Some(name);
+    }
+    let tool_lines: Vec<String> = deduped_names
+        .into_iter()
+        .map(|name| format!("Tool: {name}"))
+        .collect();
+
+    let lines: Vec<String> = thought_line
+        .into_iter()
+        .chain(text_line)
+        .chain(tool_lines)
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 /// Build a compact transcript for title generation. Mirrors the TUI exit
 /// summary heuristic (`select_breakdown_sections` in `crates/harnx/src/main.rs`):
-/// first user message + last user message (if different) + assistant replies
-/// after the last user message. Deterministic and cheap — no extra LLM call.
+/// first user message + last user message (if different) + in-progress
+/// response after the last user message. Deterministic and cheap — no extra LLM call.
 pub fn build_title_transcript(session: &Session) -> String {
     let (first_user, last_user) = first_and_last_user_text(session);
-    let assistant = assistant_after_last_user(session);
+    let response = response_after_last_user(session);
 
     let sections: Vec<String> = [
         labeled_section("First user message", &first_user),
         labeled_section("Latest user message", last_user.as_deref().unwrap_or("")),
-        labeled_section("Latest assistant response", &assistant),
+        labeled_section("Latest assistant response", &response),
     ]
     .into_iter()
     .flatten()
@@ -320,6 +376,17 @@ impl Config {
             return;
         }
 
+        Self::spawn_title_generation(config);
+    }
+
+    pub fn maybe_generate_title_mid_loop(config: GlobalConfig) {
+        if !Self::claim_titling_mid_loop(&config) {
+            return;
+        }
+        Self::spawn_title_generation(config);
+    }
+
+    fn spawn_title_generation(config: GlobalConfig) {
         // Capture the id of the session whose titling flag we just claimed, so
         // every cleanup path (including the no-agent early return) targets that
         // exact session even if the active session were to change.
@@ -368,6 +435,44 @@ impl Config {
             return false;
         }
         session.set_titling(true);
+        true
+    }
+
+    /// Claim the `titling` flag for mid-loop title generation.
+    ///
+    /// Gate ordering (all must pass):
+    /// 1. `title_update_threshold == 0` → master disable
+    /// 2. `session.titling()` already true → single-flight guard
+    /// 3. `title_last_updated_tokens == usize::MAX` → manual freeze
+    /// 4. `session.tokens() == 0` → no content to title
+    /// 5. Token growth (`need_generate_title`) OR time
+    ///    (`mid_loop_title_interval_elapsed`)
+    fn claim_titling_mid_loop(config: &GlobalConfig) -> bool {
+        let mut guard = config.write();
+        let threshold = guard.title_update_threshold;
+        let interval = guard.title_update_interval_secs;
+        let Some(session) = guard.session.as_mut() else {
+            return false;
+        };
+        if threshold == 0 {
+            return false;
+        }
+        if session.titling() {
+            return false;
+        }
+        if session.title_last_updated_tokens() == usize::MAX {
+            return false;
+        }
+        if session.tokens() == 0 {
+            return false;
+        }
+        let token_ready = session.need_generate_title(threshold);
+        let time_ready = session.mid_loop_title_interval_elapsed(interval);
+        if !token_ready && !time_ready {
+            return false;
+        }
+        session.set_titling(true);
+        session.set_title_last_updated_at(std::time::Instant::now());
         true
     }
 
@@ -501,7 +606,8 @@ mod tests {
     use harnx_core::event::{AgentEvent, AgentEventSink, NoticeEvent, SessionEvent};
     use harnx_core::message::{Message, MessageContent};
     use harnx_core::session::Session;
-    use std::sync::Mutex;
+    use parking_lot::RwLock;
+    use std::sync::{Arc, Mutex};
 
     // --- title-agent name resolution (#103) ---
 
@@ -640,11 +746,173 @@ mod tests {
             MessageContent::Text(text.to_string()),
         )
     }
+    struct AssistantToolCallMessage<'a> {
+        text: &'a str,
+        thought: Option<&'a str>,
+        tool_names: &'a [&'a str],
+    }
+
+    fn assistant_tool_calls(input: AssistantToolCallMessage<'_>) -> Message {
+        use harnx_core::tool::{ToolCall, ToolResult};
+        let tool_results: Vec<ToolResult> = input
+            .tool_names
+            .iter()
+            .map(|name| {
+                ToolResult::new(
+                    ToolCall {
+                        name: (*name).to_string(),
+                        ..ToolCall::default()
+                    },
+                    serde_json::Value::Null,
+                )
+            })
+            .collect();
+        Message::new(
+            MessageRole::Assistant,
+            MessageContent::ToolCalls(MessageContentToolCalls::new(
+                tool_results,
+                input.text.to_string(),
+                input.thought.map(str::to_string),
+            )),
+        )
+    }
     fn session_with(messages: Vec<Message>) -> Session {
         Session {
             messages,
             ..Session::default()
         }
+    }
+
+    struct TranscriptExpectation<'a> {
+        transcript: &'a str,
+        fragments: &'a [&'a str],
+    }
+
+    fn assert_all_contained(expectation: TranscriptExpectation<'_>) {
+        for fragment in expectation.fragments {
+            assert!(
+                expectation.transcript.contains(fragment),
+                "expected to find '{fragment}' in transcript:\n{}",
+                expectation.transcript
+            );
+        }
+    }
+
+    fn config_with_session() -> GlobalConfig {
+        let mut config = Config::default();
+        let mut session = crate::config::session::new(&config, "title-test", None).unwrap();
+        crate::config::session::attach_memory_log(&mut session);
+        config.session = Some(session);
+        Arc::new(RwLock::new(config))
+    }
+
+    fn assert_mid_loop_claim_guards(config: &GlobalConfig) {
+        // Threshold zero is the master disable, even when the time trigger is ready.
+        {
+            let mut guard = config.write();
+            guard.title_update_threshold = 0;
+            guard.title_update_interval_secs = 60;
+            guard.session.as_mut().unwrap().tokens = 1;
+        }
+        assert!(!Config::claim_titling_mid_loop(config));
+
+        // An in-flight title generation keeps the claim single-flight.
+        {
+            let mut guard = config.write();
+            guard.title_update_threshold = 10;
+            guard.session.as_mut().unwrap().set_titling(true);
+        }
+        assert!(!Config::claim_titling_mid_loop(config));
+
+        // A manual title is frozen regardless of token or time readiness.
+        {
+            let mut guard = config.write();
+            let session = guard.session.as_mut().unwrap();
+            session.set_titling(false);
+            session.set_title_last_updated_tokens(usize::MAX);
+        }
+        assert!(!Config::claim_titling_mid_loop(config));
+
+        // Keep this guard before the OR check: the title-less time path is ready.
+        {
+            let mut guard = config.write();
+            let session = guard.session.as_mut().unwrap();
+            session.set_title_last_updated_tokens(0);
+            session.tokens = 0;
+            session.title = None;
+        }
+        assert!(!Config::claim_titling_mid_loop(config));
+    }
+
+    fn assert_mid_loop_token_trigger(config: &GlobalConfig) {
+        // Interval zero disables time only, not token-based claims.
+        {
+            let mut guard = config.write();
+            guard.title_update_interval_secs = 0;
+            let session = guard.session.as_mut().unwrap();
+            session.tokens = 1;
+            session.title = None;
+        }
+        let before_token_claim = std::time::Instant::now();
+        assert!(Config::claim_titling_mid_loop(config));
+        {
+            let guard = config.read();
+            let session = guard.session.as_ref().unwrap();
+            assert!(session.titling());
+            assert!(session
+                .title_last_updated_at()
+                .is_some_and(|updated_at| updated_at >= before_token_claim));
+        }
+
+        // A titled session waits for the configured token growth.
+        {
+            let mut guard = config.write();
+            let session = guard.session.as_mut().unwrap();
+            session.set_titling(false);
+            session.set_title("Current title".to_string());
+            session.tokens = 100;
+            session.set_title_last_updated_tokens(100);
+            session.set_title_last_updated_at(std::time::Instant::now());
+        }
+        assert!(!Config::claim_titling_mid_loop(config));
+
+        config.write().session.as_mut().unwrap().tokens = 110;
+        assert!(Config::claim_titling_mid_loop(config));
+    }
+
+    fn assert_mid_loop_time_trigger(config: &GlobalConfig) {
+        // Elapsed time claims even below the token threshold.
+        {
+            let mut guard = config.write();
+            guard.title_update_interval_secs = 60;
+            let session = guard.session.as_mut().unwrap();
+            session.set_titling(false);
+            session.tokens = 110;
+            session.set_title_last_updated_tokens(110);
+            session.set_title_last_updated_at(
+                std::time::Instant::now() - std::time::Duration::from_secs(120),
+            );
+        }
+        assert!(Config::claim_titling_mid_loop(config));
+
+        // No claim when token growth is below threshold and the interval is recent.
+        {
+            let mut guard = config.write();
+            let session = guard.session.as_mut().unwrap();
+            session.set_titling(false);
+            session.tokens = 115;
+            session.set_title_last_updated_tokens(110);
+            session.set_title_last_updated_at(std::time::Instant::now());
+        }
+        assert!(!Config::claim_titling_mid_loop(config));
+    }
+
+    #[test]
+    fn claim_titling_mid_loop_gates() {
+        let config = config_with_session();
+        assert_mid_loop_claim_guards(&config);
+        assert_mid_loop_token_trigger(&config);
+        assert_mid_loop_time_trigger(&config);
     }
 
     #[tokio::test]
@@ -700,9 +968,14 @@ mod tests {
             assistant("answer two"),
         ]);
         let t = build_title_transcript(&session);
-        assert!(t.contains("first question about postgres"));
-        assert!(t.contains("later question about pooling"));
-        assert!(t.contains("answer two"));
+        assert_all_contained(TranscriptExpectation {
+            transcript: &t,
+            fragments: &[
+                "first question about postgres",
+                "later question about pooling",
+                "answer two",
+            ],
+        });
         // Assistant reply before the last user message is not the "latest response".
         assert!(!t.contains("answer one"));
     }
@@ -711,6 +984,68 @@ mod tests {
     fn transcript_empty_session_is_empty() {
         let session = Session::default();
         assert!(build_title_transcript(&session).trim().is_empty());
+    }
+
+    #[test]
+    fn transcript_includes_in_progress_tool_calls_and_thinking() {
+        let session = session_with(vec![
+            user("Please check the config"),
+            assistant_tool_calls(AssistantToolCallMessage {
+                text: "Looking into it",
+                thought: Some("Checking the config"),
+                tool_names: &["bash", "read_file"],
+            }),
+        ]);
+        let t = build_title_transcript(&session);
+        assert_all_contained(TranscriptExpectation {
+            transcript: &t,
+            fragments: &[
+                "Thinking: Checking the config",
+                "Looking into it",
+                "Tool: bash",
+                "Tool: read_file",
+            ],
+        });
+    }
+
+    #[test]
+    fn transcript_skips_dangling_labels_for_empty_fields() {
+        let session = session_with(vec![
+            user("Do something"),
+            assistant_tool_calls(AssistantToolCallMessage {
+                text: "",
+                thought: Some("   "),
+                tool_names: &[],
+            }),
+        ]);
+        let t = build_title_transcript(&session);
+        assert!(!t.contains("Thinking:"), "{t}");
+        assert!(
+            !t.contains("Latest assistant response")
+                || !t.contains("Latest assistant response:\n\n"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn transcript_dedups_consecutive_identical_tool_names() {
+        let session = session_with(vec![
+            user("Run tasks"),
+            assistant_tool_calls(AssistantToolCallMessage {
+                text: "",
+                thought: None,
+                tool_names: &["bash", "bash", "bash", "read_file"],
+            }),
+        ]);
+        let t = build_title_transcript(&session);
+        assert!(t.contains("Tool: bash"), "{t}");
+        assert!(t.contains("Tool: read_file"), "{t}");
+        // Count occurrences - should have exactly 1 bash, then 1 read_file
+        let bash_count = t.matches("Tool: bash").count();
+        assert_eq!(
+            bash_count, 1,
+            "should have exactly one 'Tool: bash', got {bash_count}: {t}"
+        );
     }
 
     #[test]

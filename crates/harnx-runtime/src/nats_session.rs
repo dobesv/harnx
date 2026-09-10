@@ -51,9 +51,9 @@ use crate::nats_event_sink::SessionEventStream;
 use crate::nats_session_log::NatsSessionLog;
 use crate::nats_session_metadata::{SessionInitializer, SessionMetadata, SessionMetadataStore};
 use crate::nats_worker::{
-    new_remote_session_id, publish_control_command, publish_session_activate,
-    publish_targeted_session_activate, request_control_command, ControlCommand, LocalWorkerTarget,
-    SessionActivate, SessionActivationRoute,
+    publish_control_command, publish_session_activate, publish_targeted_session_activate,
+    request_control_command, ControlCommand, LocalWorkerTarget, SessionActivate,
+    SessionActivationRoute,
 };
 use crate::utils::AbortSignal;
 
@@ -341,6 +341,12 @@ impl NatsSession {
     ///
     /// Connects to the NATS cluster and generates/reuses a session ID.
     ///
+    /// Session ID resolution:
+    /// - If `config.session_id` is set and non-empty, uses that ID unchanged
+    ///   (supports both short IDs and legacy UUID v7).
+    /// - Otherwise, reserves a new short ID via `reserve_short_session_id`
+    ///   against the canonical session metadata store.
+    ///
     /// This function takes the NATS connection components directly to avoid
     /// Send issues with GlobalConfig's parking_lot lock guard across await points.
     pub async fn new(
@@ -349,15 +355,19 @@ impl NatsSession {
         jetstream: jetstream::Context,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
-        // Resolve session ID (new or existing)
-        let session_id = config
-            .session_id
-            .clone()
-            .unwrap_or_else(new_remote_session_id);
-
         let metadata_store = SessionMetadataStore::ensure(&jetstream, 1)
             .await
             .context("failed to open canonical session metadata store")?;
+        let session_id = match config.session_id.as_ref() {
+            Some(id) if !id.trim().is_empty() => id.clone(),
+            _ => {
+                crate::utils::session_name::reserve_short_session_id(
+                    &metadata_store,
+                    &config.initializer,
+                )
+                .await?
+            }
+        };
         ensure_session_metadata(
             &metadata_store,
             &jetstream,
@@ -630,6 +640,70 @@ impl NatsSession {
                 anyhow::bail!(
                     "timed out waiting for worker to durably cancel session '{}'",
                     self.session_id
+                );
+            }
+            tokio::time::sleep(CONTROL_ACK_RETRY_DELAY).await;
+        }
+    }
+
+    /// Route a tool-approval decision to the lease holder and wait until its
+    /// fenced durable decision entry has been applied.
+    pub async fn decide_hitl_approval(
+        &self,
+        tool_call_id: &str,
+        approved: bool,
+        note: Option<String>,
+    ) -> Result<bool> {
+        let entries = self.load_durable_entries().await?;
+        let pending = crate::nats_worker::derive_pending_hitl_approvals(&entries)?;
+        if !pending
+            .iter()
+            .any(|approval| approval.tool_call_id == tool_call_id)
+        {
+            return Ok(false);
+        }
+        let Some(_) = self.activate_pending_turn().await? else {
+            let entries = self.load_durable_entries().await?;
+            let still_pending = crate::nats_worker::derive_pending_hitl_approvals(&entries)?
+                .iter()
+                .any(|approval| approval.tool_call_id == tool_call_id);
+            if !still_pending {
+                return Ok(false);
+            }
+            anyhow::bail!(
+                "pending HITL approval '{}' has no activatable durable turn",
+                tool_call_id
+            );
+        };
+        let command = ControlCommand::HitlApprovalDecision {
+            tool_call_id: tool_call_id.to_string(),
+            approved,
+            note,
+        };
+        let deadline = tokio::time::Instant::now() + CANCEL_RECOVERY_TIMEOUT;
+        loop {
+            if request_control_command(
+                &self.client,
+                &self.session_id,
+                &command,
+                CONTROL_ACK_ATTEMPT_TIMEOUT,
+            )
+            .await
+            .is_ok()
+            {
+                return Ok(true);
+            }
+            let entries = self.load_durable_entries().await?;
+            let still_pending = crate::nats_worker::derive_pending_hitl_approvals(&entries)?
+                .iter()
+                .any(|approval| approval.tool_call_id == tool_call_id);
+            if !still_pending {
+                return Ok(false);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for worker to apply HITL approval '{}'",
+                    tool_call_id
                 );
             }
             tokio::time::sleep(CONTROL_ACK_RETRY_DELAY).await;
@@ -1236,7 +1310,14 @@ impl NatsSession {
                 ))
             },
         );
+        let awaiting_hitl =
+            crate::nats_worker::derive_pending_hitl_approvals(entries).is_ok_and(|pending| {
+                pending
+                    .iter()
+                    .any(|approval| approval.tool_round_seq > user_msg_seq)
+            });
         status == Some(RequestedSeqStatus::Covered)
+            || awaiting_hitl
             || (saw_turn_ended && Self::has_durable_assistant_response(entries, user_msg_seq))
     }
 
@@ -1365,6 +1446,13 @@ fn render_log_entry_to_sink(
             render_error_entry(message, &sink);
             false
         }
+        // Production replay path is currently unused. Live advisory events are
+        // emitted at creation; later hydration paths replay durable control state.
+        // Rendering these here would duplicate live events on reattach.
+        SessionLogEntry::SubAgentStarted { .. }
+        | SessionLogEntry::HandoffCommitted { .. }
+        | SessionLogEntry::HitlApprovalRequested { .. }
+        | SessionLogEntry::HitlApprovalDecision { .. } => false,
         SessionLogEntry::DataUrls { .. }
         | SessionLogEntry::Compress { .. }
         | SessionLogEntry::TurnEnd { .. }
@@ -1702,6 +1790,7 @@ mod tests {
                 through_seq: 1,
                 fence_token: 7,
                 timestamp: None,
+                usage: None,
             },
         ));
         assert!(NatsSession::is_turn_completion_visible(
@@ -1741,12 +1830,70 @@ mod tests {
                     through_seq: 1,
                     fence_token: 7,
                     timestamp: None,
+                    usage: None,
                 },
             ),
         ];
         assert!(!NatsSession::is_turn_completion_visible(
             &entries, None, 2, false
         ));
+    }
+
+    #[test]
+    fn pending_hitl_only_completes_user_messages_in_its_tool_round() {
+        let entries = vec![
+            (
+                1,
+                SessionLogEntry::Message {
+                    id: None,
+                    role: MessageRole::User,
+                    content: MessageContent::Text("approval turn".to_string()),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                2,
+                SessionLogEntry::ToolCalls {
+                    text: "needs approval".to_string(),
+                    thought: None,
+                    calls: vec![harnx_core::tool::ToolCall::new(
+                        "search".to_string(),
+                        serde_json::json!({}),
+                        Some("approval-call".to_string()),
+                        None,
+                    )],
+                    timestamp: None,
+                    fence_token: Some(7),
+                },
+            ),
+            (
+                3,
+                SessionLogEntry::Message {
+                    id: None,
+                    role: MessageRole::User,
+                    content: MessageContent::Text("queued later turn".to_string()),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                4,
+                SessionLogEntry::HitlApprovalRequested {
+                    tool_call_id: "approval-call".to_string(),
+                    summary: "Approve search".to_string(),
+                    fence_token: 7,
+                },
+            ),
+        ];
+
+        assert!(NatsSession::is_turn_completion_visible(
+            &entries, None, 1, false
+        ));
+        assert!(
+            !NatsSession::is_turn_completion_visible(&entries, None, 3, false),
+            "an approval requested after a queued user still belongs to the earlier tool round"
+        );
     }
 
     #[test]

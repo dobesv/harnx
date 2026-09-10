@@ -14,10 +14,17 @@ use tokio_util::sync::CancellationToken;
 const CANCEL_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 const CANCEL_RELEASE_POLL: Duration = Duration::from_millis(10);
 
+pub(super) fn subagent_error_message(prefix: impl std::fmt::Display, session_id: &str) -> String {
+    format!(
+        "{prefix} (session_id: {session_id}; resume with session_prompt using this exact session_id, inspect with session_load)"
+    )
+}
+
 pub(super) struct PromptParams<'a> {
     pub message: &'a str,
     pub session_id: Option<String>,
     pub parent_session_id: Option<String>,
+    pub tool_call_id: Option<String>,
     pub timeout_secs: Option<u64>,
     pub token_budget: Option<u64>,
     pub cancel: CancellationToken,
@@ -27,10 +34,15 @@ pub(super) async fn run_prompt(
     toolset: &SubagentToolset,
     params: PromptParams<'_>,
 ) -> Result<CompletedSubagentTurn, ToolInvokeError> {
-    let session = toolset.create_session(params.session_id).await?;
+    let session = toolset
+        .create_session(
+            params.session_id.clone(),
+            params.parent_session_id.as_deref(),
+        )
+        .await?;
     let child_session_id = session.session_id().to_string();
     let reporter = toolset
-        .start_progress_reporter(&child_session_id, params.parent_session_id)
+        .start_progress_reporter(&child_session_id, &params)
         .await?;
     let buffering_sink = Arc::new(InvocationBufferingSink::new(reporter.sink()));
     let turn = await_prompt_turn(
@@ -97,7 +109,10 @@ async fn await_prompt_turn(
 
     let turn = tokio::select! {
         result = &mut run_turn => PromptTurn::Completed(result.map_err(|error| {
-            ToolInvokeError::Recoverable(format!("run sub-agent turn: {error:#}"))
+            ToolInvokeError::Recoverable(subagent_error_message(
+                format_args!("run sub-agent turn: {error:#}"),
+                session.session_id(),
+            ))
         })),
         _ = params.cancel.cancelled() => {
             let _ = cancel_tx.send(()).await;
@@ -226,9 +241,10 @@ async fn finish_completed_turn(
     let status = completed_progress_status(&params.result, cancelled, budget_terminal.is_some());
     let progress = finish_progress(&params.reporter, status).await?;
     if cancelled {
-        return Err(ToolInvokeError::Recoverable(
-            "sub-agent turn was cancelled".to_string(),
-        ));
+        return Err(ToolInvokeError::Recoverable(subagent_error_message(
+            "sub-agent turn was cancelled",
+            &params.child_session_id,
+        )));
     }
     let termination = budget_terminal.map(|terminal| {
         synthesize_termination(
@@ -331,6 +347,41 @@ enum PromptTurn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recoverable_subagent_errors_include_session_resume_guidance() {
+        let child_session_id = "child-error-session";
+        assert_eq!(
+            subagent_error_message("sub-agent turn was cancelled", child_session_id),
+            "sub-agent turn was cancelled (session_id: child-error-session; resume with session_prompt using this exact session_id, inspect with session_load)"
+        );
+
+        for (worker_error, expected_prefix) in [
+            (
+                Some("worker failed"),
+                "sub-agent turn failed: worker failed",
+            ),
+            (None, "sub-agent turn returned no final response"),
+        ] {
+            let result = NatsTurnResult {
+                response: None,
+                session_id: child_session_id.to_string(),
+                was_cancelled: false,
+                error: worker_error.map(str::to_string),
+                user_msg_seq: 1,
+                user_msg_id: "user-message".to_string(),
+            };
+            let error = super::super::require_response(&result).unwrap_err();
+            let ToolInvokeError::Recoverable(message) = error else {
+                panic!("expected recoverable tool error");
+            };
+
+            assert!(message.contains(expected_prefix));
+            assert!(message.contains(child_session_id));
+            assert!(message.contains("resume with session_prompt"));
+            assert!(message.contains("inspect with session_load"));
+        }
+    }
 
     #[tokio::test]
     async fn timeout_cancellation_failure_is_recoverable_and_finishes_reporter() {

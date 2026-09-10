@@ -119,6 +119,26 @@ impl fmt::Display for ToolInvokeError {
 
 impl std::error::Error for ToolInvokeError {}
 
+/// Transport-provided facts about one tool invocation.
+///
+/// These values are trusted infrastructure context, not model-controlled tool
+/// arguments. Toolsets that do not need them can continue implementing
+/// [`Toolset::invoke`] only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolInvocationContext {
+    pub call_id: String,
+    pub invoking_session_id: Option<String>,
+    pub capabilities: BTreeSet<String>,
+}
+
+/// One tool invocation, including its transport-attested context and cancellation signal.
+pub struct ToolInvocation {
+    pub tool: String,
+    pub args: Value,
+    pub context: ToolInvocationContext,
+    pub cancel: CancellationToken,
+}
+
 /// Collection of tools hosted by one tool server.
 #[async_trait]
 pub trait Toolset: Send + Sync {
@@ -130,6 +150,15 @@ pub trait Toolset: Send + Sync {
         args: Value,
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError>;
+
+    /// Invoke a tool with transport-attested invocation context.
+    async fn invoke_with_context(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Value, ToolInvokeError> {
+        self.invoke(&invocation.tool, invocation.args, invocation.cancel)
+            .await
+    }
 }
 
 /// Request body for one tool invocation.
@@ -140,6 +169,8 @@ pub struct ToolRequest {
     pub args: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     /// Additive capabilities understood by the caller. An absent field means
     /// private result metadata must not be returned.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -339,6 +370,7 @@ mod tests {
             tool: "time_now".to_string(),
             args: json!({ "timezone": "UTC" }),
             parent_session_id: Some("parent-session".to_string()),
+            tool_call_id: None,
             capabilities: BTreeSet::new(),
         });
         assert_round_trip(ToolReply {

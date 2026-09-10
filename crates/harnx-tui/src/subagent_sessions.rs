@@ -214,7 +214,10 @@ impl Tui {
         event: &AgentEvent,
         is_sub_agent: bool,
     ) -> bool {
-        if let AgentEvent::Session(SessionEvent::HandoffCommitted { agent, session_id }) = event {
+        if let AgentEvent::Session(SessionEvent::HandoffCommitted {
+            agent, session_id, ..
+        }) = event
+        {
             if !is_sub_agent {
                 self.handle_handoff_committed(agent.clone(), session_id.clone())
                     .await;
@@ -359,6 +362,12 @@ fn navigate_child_transcript(state: &mut MonitoredSessionState, key: KeyEvent) {
         }
         (KeyCode::PageUp, KeyModifiers::NONE) => scroll_child(state, true, 10),
         (KeyCode::PageDown, KeyModifiers::NONE) => scroll_child(state, false, 10),
+        (KeyCode::Char('g' | '<') | KeyCode::Home, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            state.scroll.scroll_to_top();
+        }
+        (KeyCode::Char('G' | '>') | KeyCode::End, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            state.scroll.scroll_to_bottom();
+        }
         _ => {}
     }
 }

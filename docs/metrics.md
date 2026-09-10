@@ -15,14 +15,14 @@ Prometheus metrics operate independently from OpenTelemetry distributed tracing 
 You can enable metrics using either the CLI flag or an environment variable fallback:
 
 - `--metrics-addr <ADDR>`: CLI flag available on most binaries. **Caveat:** `harnx-claude-compatible-hook-server` rejects `--metrics-addr` as an unknown argument due to its strict clap parser. Use `HARNX_METRICS_ADDR` instead. Accepts `IP:PORT` or `:PORT`. Passing a blank host (e.g. `--metrics-addr :8456`) binds `0.0.0.0`, allowing scrapers from other containers or Kubernetes pods to reach the endpoint. Passing `127.0.0.1:9109` restricts the listener to loopback.
-- `HARNX_METRICS_ADDR`: Environment variable fallback honored by shared-entrypoint binaries: `harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-time-server`, `harnx-plans-tools` (non-HTTP mode), `harnx-claude-compatible-hook-server`, `harnx-mcp-remote`, `harnx-mcp-bridge`, `harnx-mcp-time`, and `harnx-mcp-plans-github`. If both the CLI flag and environment variable are set, the CLI flag takes precedence.
+- `HARNX_METRICS_ADDR`: Environment variable fallback honored by shared-entrypoint binaries: `harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-time-server`, `harnx-plans-tools` (non-HTTP mode), `harnx-claude-compatible-hook-server`, `harnx-mcp-remote`, `harnx-mcp-bridge`, `harnx-mcp-time`, and `harnx-mcp-plans-github`. If both the CLI flag and environment variable are set, the CLI flag takes precedence.
 
 ## Binary Coverage
 
-Metrics support is implemented across 15 long-running binaries:
+Metrics support is implemented across 16 long-running binaries:
 
 - **Core runtime & proxies**: `harnx-serve`, `harnx-worker`, `harnx-aws-creds`, `harnx-k8s-creds`, `harnx-proxy-auth`
-- **Tool & hook servers**: `harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-plans-tools`, `harnx-time-server`, `harnx-claude-compatible-hook-server`
+- **Tool & hook servers**: `harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-plans-tools`, `harnx-time-server`, `harnx-claude-compatible-hook-server`
 - **MCP bridges & servers**: `harnx-mcp-bridge`, `harnx-mcp-remote`, `harnx-mcp-time`, `harnx-mcp-plans-github`
 
 **Out of scope (unchanged)**:
@@ -37,18 +37,21 @@ All exported metrics use the `harnx_` prefix.
 
 | Metric Name | Type | Labels | Description | Binaries |
 |-------------|------|--------|-------------|----------|
-| `harnx_llm_tokens_total` | Counter | `agent`, `client`, `model`, `type` | Chat-completion token count (`type` is `input`, `output`, `cache_read`, `cache_write`, or deprecated alias `cached`). | `harnx-worker` |
-| `harnx_llm_cost_dollars` | Gauge | `agent`, `client`, `model` | Cumulative estimated LLM cost in USD. Monotonically increases over process lifetime. | `harnx-worker` |
+| `harnx_llm_tokens_total` | Counter | `agent`, `client`, `provider`, `model`, `type` | Chat-completion token count (`type` is `input`, `output`, `cache_read`, `cache_write`, or deprecated alias `cached`). | `harnx-worker` |
+| `harnx_llm_cost_dollars` | Gauge | `agent`, `client`, `provider`, `model` | Cumulative estimated LLM cost in USD. Monotonically increases over process lifetime. | `harnx-worker` |
 | `harnx_http_requests_total` | Counter | `method`, `route`, `status` | HTTP request count. `route` uses template patterns or static names. | HTTP servers (`harnx-serve`, `aws-creds`, `k8s-creds`, `proxy-auth`, rmcp `--http` servers) |
 | `harnx_http_request_duration_seconds` | Histogram | `method`, `route` | HTTP request latency histogram (buckets: 0.005s to 10s). | HTTP servers |
 | `harnx_tool_calls_total` | Counter | `tool`, `status` | Tool execution count (`status` is `ok` or `error`). | Tool & MCP servers |
 | `harnx_tool_call_duration_seconds` | Histogram | `tool` | Tool execution duration histogram. | Tool & MCP servers |
+| `harnx_sandbox_wakes_total` | Counter | none | Kubernetes sandboxes resumed from zero replicas. | `harnx-k8s-sandbox-tools` |
+| `harnx_sandbox_hibernations_total` | Counter | `reason` | Kubernetes sandboxes suspended explicitly or after idle timeout. | `harnx-k8s-sandbox-tools` |
 
 Histogram buckets for duration metrics use default boundaries: `[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]` seconds.
 
 ## Design & Label Details
 
 - **`client` label semantics**: The `client` label matches the configured client name (`model.client_name()`). This may be a package-qualified alias like `mypkg/openai` rather than a canonical backend name.
+- **`provider` label semantics**: The `provider` label is the canonical backend kind (`openai`, `claude`, `bedrock`, `openai-compatible`, …) resolved from the model's configured client. It is empty (`""`) when the client cannot be resolved. Unlike `client`, it is never package-qualified.
 - **Chat completions only**: Token usage and cost metrics apply exclusively to chat completions. Embeddings and reranker requests do not emit token metrics.
 - **Cost metric mechanics**: `harnx_llm_cost_dollars` is exported as a gauge because the underlying metrics facade does not support floating-point counters. It increases monotonically per process and is emitted only when required unit prices are configured for the model. If a request includes cached tokens (cache-read or cache-write) but the matching cache price is missing, the cost calculation returns `None` and the gauge is not incremented for that call.
 - **Cached token pricing**: Cost calculations include cache-read (`cache_read_price`) and cache-write (`cache_write_price`) pricing using a uniform formula: `(uncached_input × input_price + cache_read × cache_read_price + cache_write × cache_write_price + output × output_price) / 1,000,000`. `harnx_llm_tokens_total` emits `cache_read` and `cache_write` series in addition to `input` and `output`. The `cached` type is retained as a deprecated alias of `cache_read` for dashboard backward compatibility.
@@ -97,15 +100,15 @@ Example output:
 ```text
 # HELP harnx_llm_tokens_total Chat-completion token count
 # TYPE harnx_llm_tokens_total counter
-harnx_llm_tokens_total{agent="coding",client="openai",model="gpt-4o",type="input"} 1420
-harnx_llm_tokens_total{agent="coding",client="openai",model="gpt-4o",type="output"} 385
-harnx_llm_tokens_total{agent="coding",client="openai",model="gpt-4o",type="cache_read"} 512
-harnx_llm_tokens_total{agent="coding",client="openai",model="gpt-4o",type="cache_write"} 0
-harnx_llm_tokens_total{agent="coding",client="openai",model="gpt-4o",type="cached"} 512
+harnx_llm_tokens_total{agent="coding",client="openai",provider="openai",model="gpt-4o",type="input"} 1420
+harnx_llm_tokens_total{agent="coding",client="openai",provider="openai",model="gpt-4o",type="output"} 385
+harnx_llm_tokens_total{agent="coding",client="openai",provider="openai",model="gpt-4o",type="cache_read"} 512
+harnx_llm_tokens_total{agent="coding",client="openai",provider="openai",model="gpt-4o",type="cache_write"} 0
+harnx_llm_tokens_total{agent="coding",client="openai",provider="openai",model="gpt-4o",type="cached"} 512
 
 # HELP harnx_llm_cost_dollars Cumulative estimated LLM cost in USD
 # TYPE harnx_llm_cost_dollars gauge
-harnx_llm_cost_dollars{agent="coding",client="openai",model="gpt-4o"} 0.0074
+harnx_llm_cost_dollars{agent="coding",client="openai",provider="openai",model="gpt-4o"} 0.0074
 ```
 
 ### HTTP Server Metrics
@@ -139,4 +142,4 @@ harnx_http_request_duration_seconds_count{method="GET",route="/v1/models"} 12
 
 ## Follow-ups
 
-- **Canonical provider label** ([#1592](https://github.com/dobesv/harnx/issues/1592)): Add a distinct `provider` label alongside `client` to reflect the underlying provider backend.
+- **Canonical provider label** ([#1592](https://github.com/dobesv/harnx/issues/1592)): Added a distinct `provider` label alongside `client` to reflect the underlying provider backend.

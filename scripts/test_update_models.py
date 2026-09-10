@@ -292,6 +292,11 @@ class TestAdaptiveEffortVariants(unittest.TestCase):
 
 
 class TestIsValidBedrockModelName(unittest.TestCase):
+    def test_direct_open_weight_model_ids_accepted(self) -> None:
+        for name in ("zai.glm-5", "zai.glm-4.7-flash", "minimax.minimax-m2.5"):
+            with self.subTest(name=name):
+                self.assertTrue(um.is_valid_bedrock_model_name(name))
+
     def test_canonical_us_format_accepted(self) -> None:
         self.assertTrue(um.is_valid_bedrock_model_name("us.anthropic.claude-opus-4-7"))
 

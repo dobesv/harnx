@@ -1,6 +1,11 @@
 ---
 role: subagent
-model: openai:gpt-5.6-sol:high
+model: codex:gpt-5.6-sol:high
+model_fallbacks:
+- openai:gpt-5.6-sol:high
+- claude:claude-opus-4-8
+- gemini:gemini-3.8-flash
+- bedrock:zai.glm-5
 compaction_agent: compact-dev
 use_tools:
 - bash_exec

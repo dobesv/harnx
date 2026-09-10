@@ -156,6 +156,26 @@ pub(super) fn tool_call_body(
 /// `result_template`, and plain text alike. Strips ANSI escapes from
 /// string outputs before extraction so pre-dimmed test inputs render
 /// cleanly.
+pub(crate) fn full_tool_result_detail(output: &serde_json::Value) -> String {
+    let raw = match output {
+        serde_json::Value::String(s) => serde_json::Value::String(strip_ansi(s)),
+        _ => output.clone(),
+    };
+    let text = harnx_core::tool::extract_all_display_text(&raw).unwrap_or_else(|| match &raw {
+        serde_json::Value::String(s) => s.clone(),
+        _ => harnx_runtime::utils::pretty_yaml_block(&raw),
+    });
+    strip_ansi(&text).trim_end_matches('\n').to_string()
+}
+
+pub(crate) fn full_detail_if_extra(full: String, text: &str) -> Option<String> {
+    if full.trim().is_empty() || full.trim() == text.trim() {
+        None
+    } else {
+        Some(full)
+    }
+}
+
 pub(super) fn tool_completed_to_transcript_items(
     output: &serde_json::Value,
     markdown: Option<&str>,
@@ -169,7 +189,9 @@ pub(super) fn tool_completed_to_transcript_items(
     if clean.is_empty() {
         return vec![];
     }
+    let full = full_tool_result_detail(output);
     vec![TranscriptItem::ToolResultMarkdown {
+        full_detail: full_detail_if_extra(full, &clean),
         text: clean,
         rendered_cache: None,
     }]
@@ -264,6 +286,15 @@ impl Tui {
             }
             (KeyCode::Char('r'), KeyModifiers::NONE) => {
                 self.handle_transcript_rewind();
+            }
+            (
+                KeyCode::Char('g' | '<') | KeyCode::Home,
+                KeyModifiers::NONE | KeyModifiers::SHIFT,
+            ) => {
+                self.app.browsing_view_scroll.scroll_to_top();
+            }
+            (KeyCode::Char('G' | '>') | KeyCode::End, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                self.app.browsing_view_scroll.scroll_to_bottom();
             }
             _ => {} // consume all other keys to prevent bleed to input
         }
@@ -438,6 +469,17 @@ impl Tui {
                     key: Key::Enter,
                     ..Default::default()
                 });
+            }
+            (
+                KeyCode::Char('g' | '<') | KeyCode::Home,
+                KeyModifiers::NONE | KeyModifiers::SHIFT,
+            ) if self.app.transcript_focus.is_some() => {
+                self.app.scroll_state.scroll_to_top();
+            }
+            (KeyCode::Char('G' | '>') | KeyCode::End, KeyModifiers::NONE | KeyModifiers::SHIFT)
+                if self.app.transcript_focus.is_some() =>
+            {
+                self.app.scroll_state.scroll_to_bottom();
             }
             _ => {
                 // While a transcript item is focused all unhandled keys are
@@ -854,7 +896,6 @@ impl Tui {
             return;
         }
         let is_thought = matches!(&event, AgentEvent::Model(ModelEvent::ThoughtChunk { .. }));
-        let is_usage = matches!(&event, AgentEvent::Model(ModelEvent::Usage { .. }));
         // No streaming-run bookkeeping is needed here: any event that renders a
         // visible transcript item (tool call, tool result, notice, plan, …)
         // becomes the trailing item, which ends the open streaming run on its
@@ -915,7 +956,7 @@ impl Tui {
         if !is_thought {
             self.flush_pending_thought();
         }
-        self.render_ui_output_heading(source.as_ref(), is_usage);
+        self.render_ui_output_heading(source.as_ref());
 
         let rendered_entries = match event {
             AgentEvent::Notice(NoticeEvent::Info(text)) => {
@@ -1010,9 +1051,6 @@ impl Tui {
                 }
             }
             AgentEvent::Plan { entries } => vec![TranscriptItem::Plan(entries)],
-            AgentEvent::Model(event @ ModelEvent::Usage { .. }) => {
-                self.render_usage_event(source.as_ref(), event)
-            }
             AgentEvent::Tool(ToolEvent::Started {
                 name,
                 markdown,
@@ -1072,7 +1110,6 @@ impl Tui {
                 // source. Without this, the first post-compaction message would
                 // render without an agent label.
                 self.app.last_ui_output_source = None;
-                self.clear_usage_tracking();
                 // The transcript is entirely rebuilt, so any prior focus/anchor
                 // indices reference now-different items even when still in
                 // bounds. Clear selection/detail state unconditionally.
@@ -1099,16 +1136,9 @@ impl Tui {
         };
 
         if !rendered_entries.is_empty() {
-            let start_idx = self.app.transcript.len();
             self.app.transcript.extend(rendered_entries);
-            if is_usage {
-                self.app.last_usage_source = source.clone();
-                self.app.last_usage_transcript_idx = Some(start_idx);
-            } else {
-                self.clear_usage_tracking();
-            }
             self.pin_transcript_to_bottom();
-        } else if is_thought || is_usage {
+        } else if is_thought {
             self.pin_transcript_to_bottom();
         }
     }
@@ -1238,11 +1268,7 @@ impl Tui {
         self.pin_transcript_to_bottom();
     }
 
-    pub(super) fn render_ui_output_heading(
-        &mut self,
-        source: Option<&AgentSource>,
-        is_usage: bool,
-    ) {
+    pub(super) fn render_ui_output_heading(&mut self, source: Option<&AgentSource>) {
         let source = source.cloned();
         if source != self.app.last_ui_output_source {
             if let Some(source) = &source {
@@ -1261,41 +1287,6 @@ impl Tui {
             // producing a single run-on paragraph that mixes content from
             // multiple agents on the top-level row.
             self.app.streaming_open = false;
-        }
-        if !is_usage {
-            self.clear_usage_tracking();
-        }
-    }
-
-    fn clear_usage_tracking(&mut self) {
-        self.app.last_usage_source = None;
-        self.app.last_usage_transcript_idx = None;
-    }
-
-    pub(super) fn update_existing_usage_line(
-        &mut self,
-        source: Option<&AgentSource>,
-        line: &str,
-    ) -> bool {
-        if self.app.last_usage_source.as_ref() != source {
-            return false;
-        }
-        let Some(idx) = self.app.last_usage_transcript_idx else {
-            return false;
-        };
-        let Some(entry) = self.app.transcript.get_mut(idx) else {
-            self.clear_usage_tracking();
-            return false;
-        };
-        match entry {
-            TranscriptItem::UsageLine(existing) => {
-                *existing = line.to_string();
-                true
-            }
-            _ => {
-                self.clear_usage_tracking();
-                false
-            }
         }
     }
 

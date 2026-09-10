@@ -1,8 +1,9 @@
 use crate::ag_ui::AppResponse;
+use crate::interrupt_resume::{parse_resume_params, InterruptResumeParam};
 use crate::load_nats_session;
 use crate::session_actor::{
-    InterruptResume, InterruptResumePayload, InterruptResumeStatus, PromptResult, SessionCommand,
-    SessionHandle, SessionInfo, SessionKey, SessionPromptOptions, SessionRegistry, SessionState,
+    PromptResult, SessionCommand, SessionHandle, SessionInfo, SessionKey, SessionPromptOptions,
+    SessionRegistry, SessionState,
 };
 use bytes::Bytes;
 use http::{Method, Response, StatusCode};
@@ -49,45 +50,11 @@ struct PromptParams {
 }
 
 #[derive(Debug, Deserialize)]
-struct InterruptResumeParam {
-    interrupt_id: String,
-    status: String,
-    payload: InterruptResumePayloadParam,
-}
-
-#[derive(Debug, Deserialize)]
-struct InterruptResumePayloadParam {
+struct HitlDecisionParams {
+    tool_call_id: String,
     approved: bool,
     #[serde(default)]
-    reason: Option<String>,
-}
-
-fn parse_resume_params(params: &[InterruptResumeParam]) -> anyhow::Result<Vec<InterruptResume>> {
-    params
-        .iter()
-        .map(|p| {
-            let status = match p.status.as_str() {
-                "approved" | "resolved" if p.payload.approved => InterruptResumeStatus::Approved,
-                "denied" | "rejected" if !p.payload.approved => InterruptResumeStatus::Denied,
-                other => {
-                    anyhow::bail!(
-                        "invalid resume status/payload for interrupt {}: status={}, approved={}",
-                        p.interrupt_id,
-                        other,
-                        p.payload.approved
-                    )
-                }
-            };
-            Ok(InterruptResume {
-                interrupt_id: p.interrupt_id.clone(),
-                status,
-                payload: InterruptResumePayload {
-                    approved: p.payload.approved,
-                    reason: p.payload.reason.clone(),
-                },
-            })
-        })
-        .collect()
+    note: Option<String>,
 }
 
 pub async fn handle_ag_ui_rpc(
@@ -162,6 +129,9 @@ pub async fn handle_ag_ui_rpc_bytes(
     match rpc.method.as_str() {
         "session/get" => handle_get(rpc.id, config, registry, key, persistence).await,
         "session/prompt" => handle_prompt(rpc.id, rpc.params, config, registry, key).await,
+        "session/hitl_decision" => {
+            handle_hitl_decision(rpc.id, rpc.params, config, registry, key).await
+        }
         "session/cancel" => handle_cancel(rpc.id, config, registry, key).await,
         _ => json_rpc_response(
             StatusCode::OK,
@@ -277,16 +247,6 @@ async fn handle_prompt(
     }
 
     let handle = registry.get_or_spawn(key.clone());
-    let info = match get_info(&handle).await {
-        Ok(info) => info,
-        Err(message) => {
-            return json_rpc_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                json_rpc_error(id, -32003, &message, None),
-            );
-        }
-    };
-
     let resume = match parse_resume_params(&params.resume) {
         Ok(resume) => resume,
         Err(err) => {
@@ -302,134 +262,143 @@ async fn handle_prompt(
         }
     };
 
-    if !resume.is_empty() {
-        let SessionState::Interrupted {
-            run_id, pending, ..
-        } = &info.state
-        else {
-            return json_rpc_response(
-                StatusCode::BAD_REQUEST,
-                json_rpc_error(
-                    id,
-                    -32602,
-                    "invalid params",
-                    Some(json!({ "detail": "resume requires interrupted session state" })),
-                ),
-            );
-        };
-        let pending_ids: std::collections::BTreeSet<&str> = pending
-            .interrupts
-            .iter()
-            .map(|entry| entry.id.as_str())
-            .collect();
-        let resume_ids: std::collections::BTreeSet<&str> = resume
-            .iter()
-            .map(|entry| entry.interrupt_id.as_str())
-            .collect();
-        if !resume_ids.is_subset(&pending_ids) {
-            let invalid_ids: Vec<&str> = resume
-                .iter()
-                .filter_map(|entry| {
-                    (!pending_ids.contains(entry.interrupt_id.as_str()))
-                        .then_some(entry.interrupt_id.as_str())
-                })
-                .collect();
-            return json_rpc_response(
-                StatusCode::BAD_REQUEST,
-                json_rpc_error(
-                    id,
-                    -32602,
-                    "invalid params",
-                    Some(json!({
-                        "detail": "resume interrupt ids do not match pending batch",
-                        "invalid_interrupt_ids": invalid_ids,
-                    })),
-                ),
-            );
-        }
-        let mismatched_run_ids: Vec<&str> = resume
-            .iter()
-            .filter_map(|entry| {
-                entry
-                    .interrupt_id
-                    .split(':')
-                    .next()
-                    .filter(|prefix| prefix.starts_with("run_") && *prefix != run_id)
-            })
-            .collect();
-        if !mismatched_run_ids.is_empty() {
-            return json_rpc_response(
-                StatusCode::BAD_REQUEST,
-                json_rpc_error(
-                    id,
-                    -32602,
-                    "invalid params",
-                    Some(json!({
-                        "detail": "resume run_id does not match interrupted run",
-                        "expected_run_id": run_id,
-                        "actual_run_ids": mismatched_run_ids,
-                    })),
-                ),
-            );
-        }
-        if resume_ids != pending_ids {
-            let missing_interrupt_ids: Vec<&str> = pending
-                .interrupts
-                .iter()
-                .filter_map(|entry| {
-                    (!resume_ids.contains(entry.id.as_str())).then_some(entry.id.as_str())
-                })
-                .collect();
-            return json_rpc_response(
-                StatusCode::BAD_REQUEST,
-                json_rpc_error(
-                    id,
-                    -32602,
-                    "invalid params",
-                    Some(json!({
-                        "detail": "resume decisions must cover every pending interrupt",
-                        "missing_interrupt_ids": missing_interrupt_ids,
-                    })),
-                ),
-            );
-        }
-    }
-
-    let prompt_text = if resume.is_empty() {
-        params.text.as_str()
-    } else if let SessionState::Interrupted { pending, .. } = &info.state {
-        pending.text.as_str()
+    let resume_applied = if resume.is_empty() {
+        None
     } else {
-        params.text.as_str()
+        let mut applied = false;
+        for decision in resume {
+            match route_hitl_decision(
+                &handle,
+                decision.interrupt_id,
+                matches!(
+                    decision.status,
+                    crate::interrupt_resume::InterruptResumeStatus::Approved
+                ),
+                decision.payload.reason,
+            )
+            .await
+            {
+                Ok(decision_applied) => applied |= decision_applied,
+                Err(message) => {
+                    return json_rpc_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        json_rpc_error(id, -32003, &message, None),
+                    );
+                }
+            }
+        }
+        Some(applied)
     };
 
-    let result = match prompt(
-        &handle,
-        prompt_text,
-        SessionPromptOptions {
-            working_dir: params.working_dir.clone(),
-            attachment_refs: params.attachment_refs.clone(),
-            resume,
-        },
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(message) => {
-            return json_rpc_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                json_rpc_error(id, -32003, &message, None),
-            );
+    let result_json = if params.text.trim().is_empty() {
+        json!({ "status": "accepted", "applied": resume_applied.unwrap_or(false) })
+    } else {
+        let result = match prompt(
+            &handle,
+            &params.text,
+            SessionPromptOptions {
+                working_dir: params.working_dir.clone(),
+                attachment_refs: params.attachment_refs.clone(),
+            },
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(message) => {
+                return json_rpc_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json_rpc_error(id, -32003, &message, None),
+                );
+            }
+        };
+        let mut result_json = match result {
+            PromptResult::Accepted { run_id } => {
+                json!({ "status": "accepted", "run_id": run_id })
+            }
+            PromptResult::Enqueued { run_id } => {
+                json!({ "status": "enqueued", "run_id": run_id })
+            }
+        };
+        if let Some(applied) = resume_applied {
+            result_json["applied"] = json!(applied);
         }
-    };
-    let result_json = match result {
-        PromptResult::Accepted { run_id } => json!({ "status": "accepted", "run_id": run_id }),
-        PromptResult::Enqueued { run_id } => json!({ "status": "enqueued", "run_id": run_id }),
+        result_json
     };
     json_rpc_response(
         StatusCode::OK,
         json!({ "jsonrpc": "2.0", "id": id, "result": result_json }),
     )
+}
+
+async fn handle_hitl_decision(
+    id: Value,
+    params: Option<Value>,
+    config: &harnx_runtime::config::Config,
+    registry: &SessionRegistry,
+    key: SessionKey,
+) -> anyhow::Result<AppResponse> {
+    let params: HitlDecisionParams = match params
+        .and_then(|value| serde_json::from_value(value).ok())
+        .filter(|params: &HitlDecisionParams| !params.tool_call_id.trim().is_empty())
+    {
+        Some(params) => params,
+        None => {
+            return json_rpc_response(
+                StatusCode::BAD_REQUEST,
+                json_rpc_error(
+                    id,
+                    -32602,
+                    "invalid params",
+                    Some(json!({
+                        "expected": {
+                            "tool_call_id": "non-empty string",
+                            "approved": "boolean",
+                            "note": "optional string"
+                        }
+                    })),
+                ),
+            );
+        }
+    };
+    if !registry.has_session(&key) && !session_exists(config, &key).await {
+        return json_rpc_response(
+            StatusCode::NOT_FOUND,
+            json_rpc_error(id, JSON_RPC_UNKNOWN_SESSION_CODE, "session not found", None),
+        );
+    }
+    let handle = registry.get_or_spawn(key);
+    match route_hitl_decision(&handle, params.tool_call_id, params.approved, params.note).await {
+        Ok(applied) => json_rpc_response(
+            StatusCode::OK,
+            json!({ "jsonrpc": "2.0", "id": id, "result": { "applied": applied } }),
+        ),
+        Err(message) => json_rpc_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json_rpc_error(id, -32003, &message, None),
+        ),
+    }
+}
+
+pub(crate) async fn route_hitl_decision(
+    handle: &SessionHandle,
+    tool_call_id: String,
+    approved: bool,
+    note: Option<String>,
+) -> Result<bool, String> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    handle
+        .tx
+        .send(SessionCommand::HitlApprovalDecision {
+            tool_call_id,
+            approved,
+            note,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "session actor unavailable".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "session actor unavailable".to_string())?
 }
 
 async fn handle_cancel(
@@ -490,7 +459,9 @@ async fn handle_cancel(
 
 async fn session_exists(config: &harnx_runtime::config::Config, key: &SessionKey) -> bool {
     match load_nats_session(config, &key.session).await {
-        Ok(session) => return session.agent_name.as_deref() == Some(key.agent.as_str()),
+        Ok((session, _entries)) => {
+            return session.agent_name.as_deref() == Some(key.agent.as_str())
+        }
         Err(error) if error.to_string() == "Not Found" => {}
         Err(_) => return false,
     }
@@ -513,14 +484,8 @@ fn session_state_json(state: &SessionState) -> Value {
             "run_id": run_id,
             "started_at": started_at,
         }),
-        SessionState::Interrupted {
-            run_id,
-            started_at,
-            pending,
-        } => json!({
+        SessionState::Interrupted { pending } => json!({
             "status": "interrupted",
-            "run_id": run_id,
-            "started_at": started_at,
             "pending_interrupts": pending.metadata,
         }),
     }
@@ -578,6 +543,7 @@ fn json_rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> V
             "code": code,
             "message": message,
             "data": data,
+
         }
     })
 }
@@ -591,6 +557,39 @@ fn json_rpc_response(status: StatusCode, data: Value) -> anyhow::Result<AppRespo
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn hitl_submit_routes_to_session_actor_worker_command() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let handle = SessionHandle { tx, actor_id: 1 };
+        let receiver = tokio::spawn(async move {
+            let command = rx.recv().await.expect("HITL command");
+            let SessionCommand::HitlApprovalDecision {
+                tool_call_id,
+                approved,
+                note,
+                reply,
+            } = command
+            else {
+                panic!("expected HITL decision command");
+            };
+            assert_eq!(tool_call_id, "tool-42");
+            assert!(!approved);
+            assert_eq!(note.as_deref(), Some("denied by operator"));
+            reply.send(Ok(true)).expect("decision acknowledgement");
+        });
+
+        let applied = route_hitl_decision(
+            &handle,
+            "tool-42".to_string(),
+            false,
+            Some("denied by operator".to_string()),
+        )
+        .await
+        .expect("route HITL decision");
+        assert!(applied);
+        receiver.await.expect("command receiver");
+    }
     use super::*;
     use crate::{
         session_actor::{SessionKey, SessionRegistry},
@@ -806,240 +805,153 @@ mod tests {
             .any(|msg| msg.role.is_user() && msg.content.to_text() == "run me"));
     }
 
-    fn single_interrupt_call_fn() -> AgentCallFn {
-        let round = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        Arc::new(move |_input, _config, _abort| {
-            let round = Arc::clone(&round);
-            Box::pin(async move {
-                let turn = round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(match turn {
-                    0 => (
-                        "approval required".to_string(),
-                        None,
-                        vec![harnx_core::tool::ToolCall::new(
-                            "harnx_agent_session_history_read".to_string(),
-                            json!({}),
-                            Some("rpc-call-1".to_string()),
-                            None,
-                        )],
-                        harnx_runtime::client::CompletionTokenUsage::default(),
-                    ),
-                    1 => (
-                        "approved by rpc".to_string(),
-                        None,
-                        vec![],
-                        harnx_runtime::client::CompletionTokenUsage::default(),
-                    ),
-                    other => panic!("unexpected rpc round {other}"),
-                })
-            })
-        })
-    }
+    #[tokio::test]
+    async fn rpc_session_prompt_with_text_and_resume_routes_both_commands() {
+        let _guard = TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = crate::session_actor::load_base_config_for_tests();
+        let registry = SessionRegistry::new(config.clone());
+        let key = SessionKey {
+            agent: "plain".into(),
+            session: "rpc-prompt-resume".into(),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        registry.insert_handle_for_tests(key, SessionHandle { tx, actor_id: 1 });
 
-    async fn resume_rpc(
-        registry: &SessionRegistry,
-        id: u64,
-        text: &str,
-        resume: Value,
-    ) -> AppResponse {
-        handle_ag_ui_rpc_bytes(
+        let actor = tokio::spawn(async move {
+            let SessionCommand::HitlApprovalDecision {
+                tool_call_id,
+                approved,
+                note,
+                reply,
+            } = rx.recv().await.expect("resume decision command")
+            else {
+                panic!("resume decision must be routed before prompt");
+            };
+            assert_eq!(tool_call_id, "tool-99");
+            assert!(approved);
+            assert_eq!(note.as_deref(), Some("approved in test"));
+            reply.send(Ok(true)).expect("decision acknowledgement");
+
+            let SessionCommand::Prompt {
+                text,
+                options,
+                reply,
+            } = rx.recv().await.expect("prompt command")
+            else {
+                panic!("prompt must follow resume decision");
+            };
+            assert_eq!(text, "continue with this request");
+            assert_eq!(options, SessionPromptOptions::default());
+            reply
+                .send(PromptResult::Accepted {
+                    run_id: "combined-run".to_string(),
+                })
+                .expect("prompt acknowledgement");
+        });
+
+        let response = handle_ag_ui_rpc_bytes(
             Method::POST,
             "plain",
-            "rpc-resume",
+            "rpc-prompt-resume",
             Bytes::from(
                 json!({
                     "jsonrpc": "2.0",
-                    "id": id,
+                    "id": 8,
                     "method": "session/prompt",
-                    "params": { "text": text, "resume": resume }
+                    "params": {
+                        "text": "continue with this request",
+                        "resume": [{
+                            "interruptId": "tool-99",
+                            "status": "resolved",
+                            "payload": {
+                                "approved": true,
+                                "reason": "approved in test"
+                            }
+                        }]
+                    }
                 })
                 .to_string(),
             ),
-            &crate::session_actor::load_base_config_for_tests(),
-            registry,
+            &config,
+            &registry,
             PersistenceKind::Nats,
         )
         .await
-        .expect("resume response")
+        .expect("combined prompt and resume response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["result"]["status"], "accepted");
+        assert_eq!(body["result"]["run_id"], "combined-run");
+        assert_eq!(body["result"]["applied"], true);
+        actor.await.expect("mock session actor");
     }
 
-    async fn start_interrupted_rpc_session(registry: &SessionRegistry) -> SessionHandle {
-        let start = handle_ag_ui_rpc_bytes(
-            Method::POST,
-            "plain",
-            "rpc-resume",
-            Bytes::from(json!({"jsonrpc":"2.0","id":20,"method":"session/prompt","params":{"text":"resume me"}}).to_string()),
-            &crate::session_actor::load_base_config_for_tests(),
-            registry,
-            PersistenceKind::Nats,
-        )
-        .await
-        .expect("start response");
-        assert_eq!(start.status(), StatusCode::NOT_FOUND);
-        let start_body = response_json(start).await;
-        assert_eq!(start_body["error"]["code"], JSON_RPC_UNKNOWN_SESSION_CODE);
-
-        let handle = registry.get_or_spawn(SessionKey {
+    #[tokio::test]
+    async fn rpc_session_prompt_with_text_stops_when_resume_routing_fails() {
+        let _guard = TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = crate::session_actor::load_base_config_for_tests();
+        let registry = SessionRegistry::new(config.clone());
+        let key = SessionKey {
             agent: "plain".into(),
-            session: "rpc-resume".into(),
-        });
-        let start = prompt(&handle, "resume me", SessionPromptOptions::default()).await;
-        assert!(matches!(start, Ok(PromptResult::Accepted { .. })));
-        wait_for_state(&handle, "interrupted", |state| {
-            matches!(state, SessionState::Interrupted { .. })
-        })
-        .await;
-        handle
-    }
-
-    #[tokio::test]
-    async fn rpc_resume_validates_interrupt_ids_and_status_payload() {
-        let _guard = TestStateGuard::new(None).await;
-        let sandbox = TestConfigSandbox::new();
-        sandbox.write_agent_with_front_matter(
-            "plain",
-            "model: openai:gpt-4o\nuse_tools: harnx_agent_session_history_read\nhooks:\n  entries:\n    - command: |\n        harnx-claude-compatible-hook-server --event PreToolUse --matcher '^harnx_agent_session_history_read$' -- printf '\"'\"'{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"approval required\"}}'\"'\"''",
-            "You are plain.",
-        );
-
-        let registry = registry_with_call_fn(single_interrupt_call_fn());
-
-        let handle = start_interrupted_rpc_session(&registry).await;
-
-        let bad_id = resume_rpc(
-            &registry,
-            21,
-            "",
-            json!([{"interrupt_id":"wrong-id","status":"approved","payload":{"approved":true}}]),
-        )
-        .await;
-        assert_eq!(bad_id.status(), StatusCode::BAD_REQUEST);
-        let bad_id_body = response_json(bad_id).await;
-        assert_eq!(bad_id_body["error"]["code"], -32602);
-        let bad_id_detail = bad_id_body["error"]["data"]["detail"].as_str().unwrap();
-        assert!(bad_id_detail.contains("resume interrupt ids do not match pending batch"));
-
-        let bad_status = resume_rpc(
-            &registry,
-            22,
-            "resume me",
-            json!([{"interrupt_id":"rpc-call-1","status":"approved","payload":{"approved":false}}]),
-        )
-        .await;
-        assert_eq!(bad_status.status(), StatusCode::BAD_REQUEST);
-        let bad_status_body = response_json(bad_status).await;
-        assert_eq!(bad_status_body["error"]["code"], -32602);
-        assert!(bad_status_body["error"]["data"]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("invalid resume status/payload"));
-
-        let ok = resume_rpc(
-            &registry,
-            23,
-            "",
-            json!([{"interrupt_id":"rpc-call-1","status":"approved","payload":{"approved":true}}]),
-        )
-        .await;
-        assert_eq!(ok.status(), StatusCode::OK);
-        let ok_body = response_json(ok).await;
-        assert_eq!(ok_body["result"]["status"], "accepted");
-        wait_for_state(&handle, "idle after resume", |state| {
-            *state == SessionState::Idle
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn rpc_resume_rejects_partial_interrupt_batch() {
-        let _guard = TestStateGuard::new(None).await;
-        let sandbox = TestConfigSandbox::new();
-        sandbox.write_agent_with_front_matter(
-            "plain",
-            "model: openai:gpt-4o\nuse_tools: harnx_agent_session_history_read\nhooks:\n  entries:\n    - command: |\n        harnx-claude-compatible-hook-server --event PreToolUse --matcher '^harnx_agent_session_history_read$' -- printf '\"'\"'{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"approval required\"}}'\"'\"''",
-            "You are plain.",
-        );
-
-        let round = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let call_fn: AgentCallFn = {
-            let round = Arc::clone(&round);
-            Arc::new(move |_input, _config, _abort| {
-                let round = Arc::clone(&round);
-                Box::pin(async move {
-                    let turn = round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(match turn {
-                        0 => (
-                            "approval required".to_string(),
-                            None,
-                            vec![
-                                harnx_core::tool::ToolCall::new(
-                                    "harnx_agent_session_history_read".to_string(),
-                                    json!({}),
-                                    Some("rpc-call-a".to_string()),
-                                    None,
-                                ),
-                                harnx_core::tool::ToolCall::new(
-                                    "harnx_agent_session_history_read".to_string(),
-                                    json!({}),
-                                    Some("rpc-call-b".to_string()),
-                                    None,
-                                ),
-                            ],
-                            harnx_runtime::client::CompletionTokenUsage::default(),
-                        ),
-                        1 => (
-                            "approved by rpc".to_string(),
-                            None,
-                            vec![],
-                            harnx_runtime::client::CompletionTokenUsage::default(),
-                        ),
-                        other => panic!("unexpected rpc round {other}"),
-                    })
-                })
-            })
+            session: "rpc-prompt-resume-failure".into(),
         };
-        let registry = registry_with_call_fn(call_fn);
-        let handle = registry.get_or_spawn(SessionKey {
-            agent: "plain".into(),
-            session: "rpc-partial".into(),
-        });
-        let start = prompt(&handle, "resume me", SessionPromptOptions::default()).await;
-        assert!(matches!(start, Ok(PromptResult::Accepted { .. })));
-        wait_for_state(&handle, "interrupted", |state| {
-            matches!(state, SessionState::Interrupted { .. })
-        })
-        .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        registry.insert_handle_for_tests(key, SessionHandle { tx, actor_id: 2 });
 
-        let partial = handle_ag_ui_rpc_bytes(
+        let actor = tokio::spawn(async move {
+            let SessionCommand::HitlApprovalDecision { reply, .. } =
+                rx.recv().await.expect("resume decision command")
+            else {
+                panic!("resume decision must be routed before prompt");
+            };
+            reply
+                .send(Err("decision routing failed".to_string()))
+                .expect("decision failure acknowledgement");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                    .await
+                    .is_err(),
+                "prompt must not be submitted after decision failure"
+            );
+        });
+
+        let response = handle_ag_ui_rpc_bytes(
             Method::POST,
             "plain",
-            "rpc-partial",
-            Bytes::from(json!({
-                "jsonrpc":"2.0",
-                "id":24,
-                "method":"session/prompt",
-                "params":{
-                    "text":"",
-                    "resume":[{"interrupt_id":"rpc-call-a","status":"approved","payload":{"approved":true}}]
-                }
-            }).to_string()),
-            &crate::session_actor::load_base_config_for_tests(),
+            "rpc-prompt-resume-failure",
+            Bytes::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 9,
+                    "method": "session/prompt",
+                    "params": {
+                        "text": "must not run",
+                        "resume": [{
+                            "interruptId": "tool-failure",
+                            "status": "resolved",
+                            "payload": { "approved": true }
+                        }]
+                    }
+                })
+                .to_string(),
+            ),
+            &config,
             &registry,
             PersistenceKind::Nats,
         )
         .await
-        .expect("partial response");
-        assert_eq!(partial.status(), StatusCode::BAD_REQUEST);
-        let body = response_json(partial).await;
-        assert_eq!(body["error"]["code"], -32602);
-        assert_eq!(
-            body["error"]["data"]["detail"],
-            "resume decisions must cover every pending interrupt"
-        );
-        assert_eq!(
-            body["error"]["data"]["missing_interrupt_ids"],
-            json!(["rpc-call-b"])
-        );
+        .expect("failed resume response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["code"], -32003);
+        assert_eq!(body["error"]["message"], "decision routing failed");
+        actor.await.expect("mock session actor");
     }
 
     #[tokio::test]

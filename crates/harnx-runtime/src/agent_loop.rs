@@ -78,6 +78,10 @@ pub type OnTextResponseFn = Arc<
     dyn Fn(String, CompletionTokenUsage) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
 >;
 
+/// Worker callback that durably records the first deferred tool call.
+pub type OnHitlApprovalRequiredFn =
+    Arc<dyn Fn(&crate::tool::DeferredToolCall) -> Result<String> + Send + Sync>;
+
 /// Context for running the unified agent loop.
 ///
 /// Construct one and pass to [`run_agent_loop`]. All fields are `Send` so
@@ -95,6 +99,9 @@ pub struct AgentLoopContext {
     /// Optional callback after each tool round. TUI uses this to emit
     /// `ToolRoundComplete` and inject pending messages.
     pub on_tool_round: Option<OnToolRoundFn>,
+    /// Worker-only callback for converting a deferred confirmation into a
+    /// durable request and clean end-of-activation outcome.
+    pub on_hitl_approval_required: Option<OnHitlApprovalRequiredFn>,
     /// Optional callback on text-only turn end. TUI uses this to emit
     /// `ModelEvent::Final`.
     pub on_text_response: Option<OnTextResponseFn>,
@@ -107,6 +114,23 @@ pub struct AgentLoopContext {
     /// Optional per-session working directory. When unset, runtime falls back
     /// to process cwd for CLI compatibility.
     pub working_dir: Option<PathBuf>,
+}
+
+fn defer_tool_approval(ctx: &AgentLoopContext, error: anyhow::Error) -> Result<LoopResult> {
+    let Some(callback) = &ctx.on_hitl_approval_required else {
+        return Err(error);
+    };
+    let Some(interrupt) = crate::tool::ToolApprovalInterrupt::from_error(&error) else {
+        return Err(error);
+    };
+    let Some(first) = interrupt.deferred_calls.first() else {
+        return Err(error);
+    };
+    if interrupt.deferred_calls.len() > 1 {
+        log::warn!("multiple tool calls requested approval in one round; deferring only the first");
+    }
+    let tool_call_id = callback(first)?;
+    Ok(LoopResult::AwaitingHitlApproval { tool_call_id })
 }
 
 /// Resume a tool round that was interrupted for approval.
@@ -127,8 +151,6 @@ pub async fn continue_agent_loop_from_tool_round(
     decisions: Vec<ToolApprovalDecision>,
     pending_interrupt_ids: std::collections::BTreeSet<String>,
 ) -> Result<LoopResult> {
-    use crate::tool::ToolApprovalInterrupt;
-
     let config = &ctx.config;
 
     // Build a preseeded confirm function that returns decisions for known call IDs.
@@ -160,14 +182,14 @@ pub async fn continue_agent_loop_from_tool_round(
         },
     );
 
-    // Install the override for this resumption
+    let previous_confirmation = config.read().tui_confirm_tool_use.clone();
     config
         .write()
         .set_tui_confirm_tool_use(Some(confirm_override));
 
     // Execute full pending tool round using normal helper. Deferred calls resolve via
     // preseeded confirm function; already-approved calls execute normally.
-    let tool_results = match crate::tool::execute_tool_round_with_persistence(
+    let tool_round = crate::tool::execute_tool_round_with_persistence(
         ctx.tool_round_params(
             config,
             &input,
@@ -179,17 +201,13 @@ pub async fn continue_agent_loop_from_tool_round(
         tool_calls,
         crate::tool::ToolRoundPersistence::REUSE_EXISTING_CALLS,
     )
-    .await
-    {
+    .await;
+    config
+        .write()
+        .set_tui_confirm_tool_use(previous_confirmation);
+    let tool_results = match tool_round {
         Ok(results) => results,
-        Err(err) => {
-            // If we hit another interrupt, propagate it (shouldn't happen with preseeded decisions)
-            if ToolApprovalInterrupt::from_error(&err).is_some() {
-                return Err(err);
-            }
-            // Other errors: propagate
-            return Err(err);
-        }
+        Err(error) => return defer_tool_approval(ctx, error),
     };
 
     // Merge tool results into input for the next round
@@ -203,8 +221,14 @@ pub async fn continue_agent_loop_from_tool_round(
             cb(&mut merged_input, &tool_results).await?;
         }
 
-        if switch_agent.is_some() {
-            return run_agent_loop(ctx, merged_input).await;
+        if let Some(switch) = switch_agent {
+            emit_handoff_request(ctx, &switch);
+            return Ok(LoopResult::HandoffRequested {
+                agent: switch.agent,
+                session_id: switch.session_id,
+                prompt: switch.prompt,
+                tool_call_id: switch.tool_call_id,
+            });
         }
 
         input = merged_input;
@@ -227,10 +251,14 @@ pub struct ToolApprovalDecision {
 
 pub enum LoopResult {
     Completed,
+    AwaitingHitlApproval {
+        tool_call_id: String,
+    },
     HandoffRequested {
         agent: String,
         session_id: Option<String>,
         prompt: String,
+        tool_call_id: Option<String>,
     },
 }
 
@@ -331,11 +359,12 @@ pub async fn run_agent_loop_with_local_handoff(
     with_turn_lifecycle(ctx, async move {
         loop {
             match run_agent_loop_inner(ctx, input).await? {
-                LoopResult::Completed => return Ok(()),
+                LoopResult::Completed | LoopResult::AwaitingHitlApproval { .. } => return Ok(()),
                 LoopResult::HandoffRequested {
                     agent,
                     session_id,
                     prompt,
+                    tool_call_id: _,
                 } => {
                     apply_local_handoff(ctx, &agent, session_id.as_deref(), &prompt).await?;
                     input = crate::config::input::from_str(&ctx.config, &prompt, None);
@@ -721,8 +750,12 @@ async fn advance_tool_round(
             agent: switch.agent,
             session_id: switch.session_id,
             prompt: switch.prompt,
+            tool_call_id: switch.tool_call_id,
         }));
     }
+    // Mid-loop title generation fires after each tool round on the continue path.
+    // Kept out of run_agent_loop_inner to avoid adding LoC to that already-complex method.
+    Config::maybe_generate_title_mid_loop(Arc::clone(&ctx.config));
     Ok(ToolRoundAdvance::Continue(Box::new(merged_input)))
 }
 
@@ -861,6 +894,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
     let mut resume_count: u32 = ctx.initial_resume_count;
     let mut with_embeddings = ctx.initial_with_embeddings;
     let mut emitted_text_turns: u32 = 0;
+    let mut turn_usage = CompletionTokenUsage::default();
 
     loop {
         if input.is_empty() {
@@ -895,8 +929,9 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
                 .await;
             }
         };
+        turn_usage.accumulate(&usage);
 
-        let tool_results = complete_model_turn(
+        let tool_results = match complete_model_turn(
             ctx,
             &input,
             CompletionOutput {
@@ -906,7 +941,11 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
                 usage: &usage,
             },
         )
-        .await?;
+        .await
+        {
+            Ok(results) => results,
+            Err(error) => return defer_tool_approval(ctx, error),
+        };
 
         // `injected_user_text` is a one-shot field — it was written to the
         // session by `begin_turn` (inside `add_assistant_text` /
@@ -969,7 +1008,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
             ResumeAction::None => {}
         }
 
-        emit_final_text_response(ctx, output, usage).await;
+        emit_final_text_response(ctx, output, turn_usage).await;
 
         // Done.
         break;
@@ -981,7 +1020,9 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{ChatCompletionsOutput, MessageRole, Model, ModelData, TestStateGuard};
+    use crate::client::{
+        ChatCompletionsOutput, ClientConfig, MessageRole, Model, ModelData, TestStateGuard,
+    };
     use crate::test_utils::{MockClient, MockTurn, MockTurnBuilder};
     use crate::utils::create_abort_signal;
     use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, NoticeEvent, TurnEvent};
@@ -1039,6 +1080,7 @@ mod tests {
                 ("agent", "metrics-agent"),
                 ("client", "mypkg/openai"),
                 ("model", "metrics-model"),
+                ("provider", ""),
                 ("type", usage_type),
             ],
         )
@@ -1112,6 +1154,151 @@ mod tests {
         config.session = Some(session);
         Arc::new(RwLock::new(config))
     }
+
+    fn usage(input: u64, output: u64, cached: u64, cache_write: u64) -> CompletionTokenUsage {
+        CompletionTokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: cached,
+            cache_write_tokens: cache_write,
+        }
+    }
+
+    fn final_usages(sink: &CollectingSink) -> Vec<CompletionTokenUsage> {
+        sink.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(event, source)| match (event, source) {
+                (AgentEvent::Model(harnx_core::event::ModelEvent::Final { usage, .. }), None) => {
+                    Some(usage.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn no_op_tool_round() -> OnToolRoundFn {
+        Arc::new(|_, _| Box::pin(async { Ok(()) }))
+    }
+
+    #[tokio::test]
+    async fn final_usage_sums_every_completion_in_tool_loop() {
+        let _sink_guard = SINK_LOCK.lock().await;
+        let _client_guard = crate::client::TestStateGuard::new(None).await;
+        let tmp = TempDir::new().unwrap();
+        let config = replay_test_config(&tmp);
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&call_count);
+        let call_fn: AgentCallFn = Arc::new(move |_, _, _| {
+            let count = Arc::clone(&count);
+            Box::pin(async move {
+                match count.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok((
+                        "calling tool".to_owned(),
+                        None,
+                        vec![ToolCall::new(
+                            "noop".to_owned(),
+                            json!({}),
+                            Some("call-1".to_owned()),
+                            None,
+                        )],
+                        usage(10, 5, 2, 1),
+                    )),
+                    1 => Ok(("all done".to_owned(), None, vec![], usage(20, 7, 4, 3))),
+                    round => panic!("unexpected model round {round}"),
+                }
+            })
+        });
+        let ctx = make_test_context(config, call_fn, no_op_tool_round());
+        let input = crate::config::input::from_str(&ctx.config, "do work", None);
+        let sink = Arc::new(CollectingSink::default());
+
+        let result = harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+            run_agent_loop(&ctx, input).await
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(result, LoopResult::Completed));
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(final_usages(&sink), [usage(30, 12, 6, 4)]);
+    }
+
+    #[tokio::test]
+    async fn final_usage_matches_single_non_streaming_completion() {
+        let _sink_guard = SINK_LOCK.lock().await;
+        let model = priced_metrics_model();
+        let mock = Arc::new(
+            MockClient::builder()
+                .model(model.clone())
+                .add_turn(metrics_mock_turn("all done", None, (13, 8, 3, 2)))
+                .build(),
+        );
+        let config = Arc::new(RwLock::new(Config {
+            data: harnx_core::config_data::ConfigData {
+                stream: false,
+                ..Default::default()
+            },
+            model: model.clone(),
+            ..Default::default()
+        }));
+        let mut input = crate::config::input::from_str(&config, "do work", None);
+        input.agent_mut().set_model(model);
+        let ctx = metrics_loop_context(config);
+        let sink = Arc::new(CollectingSink::default());
+        let _client_guard = TestStateGuard::new(Some(mock.clone())).await;
+
+        let result = harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+            run_agent_loop(&ctx, input).await
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(result, LoopResult::Completed));
+        assert_eq!(mock.conversation_history().conversation_history.len(), 1);
+        assert_eq!(final_usages(&sink), [usage(13, 8, 3, 2)]);
+    }
+
+    #[tokio::test]
+    async fn final_usage_resets_between_turns() {
+        let _sink_guard = SINK_LOCK.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let config = replay_test_config(&tmp);
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&call_count);
+        let call_fn: AgentCallFn = Arc::new(move |_, _, _| {
+            let count = Arc::clone(&count);
+            Box::pin(async move {
+                let result = match count.fetch_add(1, Ordering::SeqCst) {
+                    0 => ("first turn".to_owned(), None, vec![], usage(11, 3, 2, 1)),
+                    1 => ("second turn".to_owned(), None, vec![], usage(7, 5, 1, 0)),
+                    round => panic!("unexpected model round {round}"),
+                };
+                Ok(result)
+            })
+        });
+        let ctx = make_test_context(config, call_fn, no_op_tool_round());
+        let first_input = crate::config::input::from_str(&ctx.config, "first", None);
+        let second_input = crate::config::input::from_str(&ctx.config, "second", None);
+        let sink = Arc::new(CollectingSink::default());
+
+        harnx_core::sink::with_agent_event_sink(sink.clone(), async {
+            assert!(matches!(
+                run_agent_loop(&ctx, first_input).await.unwrap(),
+                LoopResult::Completed
+            ));
+            assert!(matches!(
+                run_agent_loop(&ctx, second_input).await.unwrap(),
+                LoopResult::Completed
+            ));
+        })
+        .await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(final_usages(&sink), [usage(11, 3, 2, 1), usage(7, 5, 1, 0)]);
+    }
+
     /// Regression test for the user-message-replay bug: a user message typed
     /// during a running tool round (delivered via `on_tool_round` setting
     /// `Input::injected_user_text`) must not be re-emitted on every
@@ -1264,6 +1451,7 @@ mod tests {
             usage_at_start: CompletionTokenUsage::default(),
             call_fn: None,
             on_tool_round: None,
+            on_hitl_approval_required: None,
             on_text_response: None,
             initial_with_embeddings: false,
             initial_resume_count: 0,
@@ -1274,13 +1462,18 @@ mod tests {
         }
     }
 
-    fn run_metrics_tool_loop(model: &Model, mock: Arc<MockClient>) -> Vec<DebugMetric> {
+    fn run_metrics_tool_loop(
+        model: &Model,
+        mock: Arc<MockClient>,
+        clients: Vec<ClientConfig>,
+    ) -> Vec<DebugMetric> {
         let global_config = Arc::new(RwLock::new(Config {
             data: harnx_core::config_data::ConfigData {
                 stream: false,
                 ..Default::default()
             },
             model: model.clone(),
+            clients,
             ..Default::default()
         }));
         let mut input = crate::config::input::from_str(&global_config, "do work", None);
@@ -1311,7 +1504,7 @@ mod tests {
         harnx_core::require_nextest();
         let model = priced_metrics_model();
         let mock = metrics_mock_client(&model);
-        let snapshot = run_metrics_tool_loop(&model, mock.clone());
+        let snapshot = run_metrics_tool_loop(&model, mock.clone(), vec![]);
         assert_eq!(
             mock.conversation_history().conversation_history.len(),
             3,
@@ -1348,6 +1541,7 @@ mod tests {
                 ("agent", "metrics-agent"),
                 ("client", "mypkg/openai"),
                 ("model", "metrics-model"),
+                ("provider", ""),
             ],
         );
         let DebugValue::Gauge(actual_cost) = cost_value else {
@@ -1366,6 +1560,41 @@ mod tests {
             (actual_cost.into_inner() - expected_cost).abs() < 1e-12,
             "cost should equal sum of three calls"
         );
+    }
+
+    #[test]
+    fn configured_client_records_canonical_provider_label() {
+        harnx_core::require_nextest();
+        let model = priced_metrics_model();
+        let mock = metrics_mock_client(&model);
+        let mut client = ClientConfig::OpenAIConfig(Default::default());
+        client.set_name("mypkg/openai".to_owned());
+
+        let snapshot = run_metrics_tool_loop(&model, mock, vec![client]);
+
+        for (usage_type, expected_total) in [
+            ("input", 60),
+            ("output", 23),
+            ("cached", 14),
+            ("cache_read", 14),
+            ("cache_write", 9),
+        ] {
+            assert_eq!(
+                metric_value(
+                    &snapshot,
+                    MetricKind::Counter,
+                    harnx_metrics::LLM_TOKENS_TOTAL,
+                    &[
+                        ("agent", "metrics-agent"),
+                        ("client", "mypkg/openai"),
+                        ("model", "metrics-model"),
+                        ("provider", "openai"),
+                        ("type", usage_type),
+                    ],
+                ),
+                &DebugValue::Counter(expected_total),
+            );
+        }
     }
 
     fn handoff_on_tool_round() -> OnToolRoundFn {
@@ -1393,6 +1622,7 @@ mod tests {
             usage_at_start: CompletionTokenUsage::default(),
             call_fn: Some(call_fn),
             on_tool_round: Some(on_tool_round),
+            on_hitl_approval_required: None,
             on_text_response: None,
             working_dir: None,
             initial_with_embeddings: false,
@@ -1478,6 +1708,7 @@ user prompt"
             agent: "delegate-agent".to_string(),
             prompt: "finish delegated work".to_string(),
             session_id: Some("handoff-target-session".to_string()),
+            tool_call_id: None,
         });
 
         let sink = Arc::new(CollectingSink::default());
@@ -1500,6 +1731,7 @@ user prompt"
             agent,
             session_id,
             prompt,
+            tool_call_id: _,
         }) = result
         else {
             panic!("expected handoff advance");

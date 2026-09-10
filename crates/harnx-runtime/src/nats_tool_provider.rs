@@ -293,6 +293,7 @@ impl NatsToolProvider {
         &self,
         arguments: Value,
         route: &RegisteredTool,
+        tool_call_id: Option<&str>,
     ) -> Result<PendingToolRequest, ToolError> {
         let call_id = Uuid::new_v4().to_string();
         let request = ToolRequest {
@@ -300,6 +301,7 @@ impl NatsToolProvider {
             tool: route.raw_name.clone(),
             args: arguments,
             parent_session_id: self.parent_session_id.clone(),
+            tool_call_id: tool_call_id.map(str::to_string),
             capabilities: BTreeSet::from([EXECUTION_CONTEXT_NAMESPACE.to_string()]),
         };
         let mut headers = async_nats::HeaderMap::new();
@@ -323,6 +325,52 @@ impl NatsToolProvider {
                 .payload(payload.into())
                 .timeout(route.request_timeout),
         })
+    }
+
+    async fn call_registered_tool(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        tool_call_id: Option<&str>,
+        abort: &AbortSignal,
+    ) -> Result<ToolProviderOutput, ToolError> {
+        let Some(route) = self.resolve_route(tool_name) else {
+            return Err(ToolError::Recoverable(anyhow!(
+                "NATS tool is not registered: {tool_name}"
+            )));
+        };
+        let pending = self.prepare_request(arguments, &route, tool_call_id)?;
+        let call_id = pending.call_id.clone();
+        let message = self.await_response(pending, abort).await?;
+        let reply: ToolReply = serde_json::from_slice(&message.payload).map_err(|error| {
+            ToolError::Recoverable(anyhow!("invalid reply from tool server: {error}"))
+        })?;
+        if reply.call_id != call_id {
+            return Err(ToolError::Recoverable(anyhow!(
+                "tool server returned a mismatched call ID"
+            )));
+        }
+        match reply.result {
+            Ok(mut value) => {
+                let execution_context = extract_execution_context(
+                    &mut value,
+                    ToolObservationProvenance::new(
+                        self.instance_id.to_string(),
+                        route.server,
+                        route.raw_name,
+                        call_id,
+                    ),
+                );
+                Ok(ToolProviderOutput {
+                    value,
+                    execution_context,
+                })
+            }
+            Err(ToolErrorPayload::Recoverable(message)) => {
+                Err(ToolError::Recoverable(anyhow!(message)))
+            }
+            Err(ToolErrorPayload::Fatal(message)) => Err(ToolError::Fatal(anyhow!(message))),
+        }
     }
 
     async fn wait_for_registration_loss(&self, key: &str) -> String {
@@ -535,43 +583,19 @@ impl ToolProvider for NatsToolProvider {
         arguments: Value,
         abort: &AbortSignal,
     ) -> Result<ToolProviderOutput, ToolError> {
-        let Some(route) = self.resolve_route(tool_name) else {
-            return Err(ToolError::Recoverable(anyhow!(
-                "NATS tool is not registered: {tool_name}"
-            )));
-        };
-        let pending = self.prepare_request(arguments, &route)?;
-        let call_id = pending.call_id.clone();
-        let message = self.await_response(pending, abort).await?;
-        let reply: ToolReply = serde_json::from_slice(&message.payload).map_err(|error| {
-            ToolError::Recoverable(anyhow!("invalid reply from tool server: {error}"))
-        })?;
-        if reply.call_id != call_id {
-            return Err(ToolError::Recoverable(anyhow!(
-                "tool server returned a mismatched call ID"
-            )));
-        }
-        match reply.result {
-            Ok(mut value) => {
-                let execution_context = extract_execution_context(
-                    &mut value,
-                    ToolObservationProvenance::new(
-                        self.instance_id.to_string(),
-                        route.server.clone(),
-                        route.raw_name.clone(),
-                        call_id.clone(),
-                    ),
-                );
-                Ok(ToolProviderOutput {
-                    value,
-                    execution_context,
-                })
-            }
-            Err(ToolErrorPayload::Recoverable(message)) => {
-                Err(ToolError::Recoverable(anyhow!(message)))
-            }
-            Err(ToolErrorPayload::Fatal(message)) => Err(ToolError::Fatal(anyhow!(message))),
-        }
+        self.call_registered_tool(tool_name, arguments, None, abort)
+            .await
+    }
+
+    async fn call_tool_with_id(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        tool_call_id: Option<&str>,
+        abort: &AbortSignal,
+    ) -> Result<ToolProviderOutput, ToolError> {
+        self.call_registered_tool(tool_name, arguments, tool_call_id, abort)
+            .await
     }
 }
 
@@ -766,7 +790,7 @@ mod tests {
                 .trace_id();
             assert_ne!(expected_trace_id, opentelemetry::trace::TraceId::INVALID);
 
-            let pending = match provider.prepare_request(json!({ "value": 1 }), &route) {
+            let pending = match provider.prepare_request(json!({ "value": 1 }), &route, None) {
                 Ok(pending) => pending,
                 Err(
                     harnx_core::tool::ToolError::Recoverable(error)

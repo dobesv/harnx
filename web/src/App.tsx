@@ -1,9 +1,10 @@
-import { useEffect, useRef, useContext, useState, useCallback } from 'react';
+import { useEffect, useRef, useContext, useState, useCallback, useMemo } from 'react';
 import {
   ThreadPrimitive,
   MessagePrimitive,
   ComposerPrimitive,
   AttachmentPrimitive,
+  type Attachment,
   useAui,
   useAuiState,
 } from '@assistant-ui/react';
@@ -13,22 +14,18 @@ import remarkGfm from 'remark-gfm';
 
 const SyntaxHighlighter = makeLightAsyncSyntaxHighlighter({ useInlineStyles: false });
 import { ToolCallCard } from './ToolCallCard';
-import { useAgUiInterrupts, useAgUiSubmitInterruptResponses } from '@assistant-ui/react-ag-ui';
-import { ChatProvider } from './ChatProvider';
+import { useAgUiInterrupts } from '@assistant-ui/react-ag-ui';
+import { ChatProvider, attachmentToMessageParts } from './ChatProvider';
 import { PendingContext } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { SubAgentSessionNotes } from './SubAgentSessionNotes';
-import { cancel } from './api';
+import { cancel, sendPrompt, uploadAttachment, submitHitlDecision } from './api';
 import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
 import { AttachIcon, SendIcon } from './icons';
 import { AgentDropdown, SessionDropdown, AgentSessionMenu } from './composer/AgentSessionMenu';
 import './chat.css';
-
-interface QueuedMessage {
-  text: string;
-}
 
 // Activate a click-like handler from keyboard (Enter / Space) so div-based
 // "button" affordances (picker cards) are usable without mouse.
@@ -132,9 +129,11 @@ const MyAttachment = () => (
   </AttachmentPrimitive.Root>
 );
 
-const MyComposer = ({
+export const MyComposer = ({
   agentName,
   sessionId,
+  isFreshSession,
+  markSessionNotFresh,
   onSwitchAgent,
   onSwitchSession,
   switchAgentHref,
@@ -142,33 +141,25 @@ const MyComposer = ({
 }: {
   agentName: string;
   sessionId: string;
+  isFreshSession: boolean;
+  markSessionNotFresh: (sessionId: string) => void;
   onSwitchAgent: () => void;
   onSwitchSession: () => void;
   switchAgentHref: string;
   switchSessionHref: string;
 }) => {
   const { setErrorText } = useContext(PendingContext);
-  const isRunning = useAuiState(s => s.thread.isRunning);
   const composerRuntime = useAui().composer;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const [queuedMessage, setQueuedMessage] = useState<QueuedMessage | null>(null);
+  const [isSending, setIsSending] = useState(false);
+  const userMessageCount = useAuiState(s => s.thread.messages.filter(m => m.role === 'user').length);
+  const prevUserMessageCount = useRef(userMessageCount);
 
-  // Monitor run state to flush queued message
-  const wasRunning = useRef(isRunning);
   useEffect(() => {
-    if (wasRunning.current && !isRunning) {
-      if (queuedMessage?.text.trim()) {
-        try {
-          composerRuntime.setText(queuedMessage.text);
-          composerRuntime.send();
-          setQueuedMessage(null);
-        } catch (err) {
-          console.error('Failed to send queued message', err);
-        }
-      }
+    if (isSending && userMessageCount > prevUserMessageCount.current) {
+      setIsSending(false);
     }
-    wasRunning.current = isRunning;
-  }, [isRunning, composerRuntime, queuedMessage]);
+  }, [isSending, userMessageCount]);
 
   const resizeTextarea = useCallback((el: HTMLTextAreaElement | null) => {
     if (!el) return;
@@ -210,49 +201,98 @@ const MyComposer = ({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSending) return;
     setErrorText(null);
 
     const state = composerRuntime.getState();
     const text = state.text.trim();
     if (!text && state.attachments.length === 0) return;
-    if (state.attachments.some((a: any) => a.status?.type !== 'complete')) return;
 
-    if (isRunning) {
-      setQueuedMessage((current) => {
-        if (!current) return { text };
-        return { text: current.text.trim() ? `${current.text}\n${text}` : text };
-      });
+    if (isFreshSession) {
+      // Fresh session: streaming POST via runAgent (composerRuntime.send).
+      // Only the first message follows this path; subsequent messages go out-of-band
+      // via session/prompt while RuntimeSessionSubscriber passively follows the stream.
+      // See design note (#1761 Option A) for why we must NOT optimistically append
+      // the user row to the thread — RuntimeSessionSubscriber.startRun({parentId})
+      // would resend it and the server would treat an unknown client id as a new turn.
+      if (state.attachments.some((a: Attachment) => a.status?.type !== 'complete')) return;
+      composerRuntime.send();
+      markSessionNotFresh(sessionId);
+      collapseTextarea();
+    } else {
+      // Existing session: JSON-RPC session/prompt (no runAgent).
+      // Attaches to the existing stream via RuntimeSessionSubscriber.startRun({parentId}),
+      // which hydrates the server-authored user row without re-execution.
+      setIsSending(true);
+      prevUserMessageCount.current = userMessageCount;
+      const savedText = text;
+      const savedAttachments = state.attachments;
+
       resetComposerInput();
-      return;
-    }
 
-    composerRuntime.send();
-    collapseTextarea();
+      // assistant-ui (0.15.18) only uploads attachments inside composerRuntime.send().
+      // addAttachment() merely marks them as 'running' — the adapter.send() call that
+      // produces the CID happens during send(). Since this out-of-band path deliberately
+      // avoids composerRuntime.send(), we must upload fresh attachments ourselves.
+      // Attachments retained from a previous send already have CIDs in .content.
+      const doSend = async () => {
+        const attachmentRefs: string[] = [];
+        for (const att of savedAttachments) {
+          const parts = attachmentToMessageParts(att);
+          let hasCid = false;
+          for (const p of parts) {
+            if (p.type === 'image' && typeof p.image === 'string') {
+              attachmentRefs.push(p.image);
+              hasCid = true;
+            } else if (p.type === 'file' && typeof p.data === 'string') {
+              attachmentRefs.push(p.data);
+              hasCid = true;
+            }
+          }
+
+          if (!hasCid && att.file) {
+            const refs = await uploadAttachment(agentName, sessionId, att.file as File);
+            attachmentRefs.push(...refs);
+          }
+        }
+
+        await sendPrompt(agentName, sessionId, { text, attachmentRefs });
+      };
+
+      doSend().catch(err => {
+        console.error('Failed to send prompt or upload attachments out of band', err);
+        setErrorText(err instanceof Error ? err.message : String(err));
+        // Restore input
+        composerRuntime.setText(savedText);
+        savedAttachments.forEach((att: Attachment) => {
+          if (att.file) void composerRuntime.addAttachment(att.file);
+        });
+        setIsSending(false);
+        requestAnimationFrame(() => {
+          textareaRef.current?.focus();
+          resizeTextarea(textareaRef.current);
+        });
+      });
+    }
   };
 
-  const queueCountLabel = queuedMessage ? '1 message queued' : null;
-  const placeholder = queuedMessage
-    ? 'Current run in progress. Next message queued.'
-    : isRunning
-      ? 'Type a message to queue after this run...'
-      : 'Type a message...';
-
+  
+  const placeholder = 'Type a message...';
   const menuProps = { agentName, sessionId, switchAgentHref, switchSessionHref, onSwitchAgent, onSwitchSession };
-  const sendLabel = queuedMessage ? 'Queued' : isRunning ? 'Queue' : 'Send';
+  const sendLabel = 'Send';
 
   return (
     <ComposerPrimitive.Root className="aui-composer" onSubmit={handleSubmit}>
-      {queueCountLabel ? <div className="aui-composer-queue-hint">{queueCountLabel}</div> : null}
       <div className="aui-composer-attachments">
         <ComposerPrimitive.Attachments components={{ Attachment: MyAttachment }} />
       </div>
       <ComposerPrimitive.Input
         className="aui-composer-input"
         placeholder={placeholder}
-        render={<textarea ref={setTextareaRef} rows={1} onInput={(e) => resizeTextarea(e.currentTarget)} />}
+        render={<textarea disabled={isSending} ref={setTextareaRef} rows={1} onInput={(e) => resizeTextarea(e.currentTarget)} />}
       />
       <div className="aui-composer-controls">
-        <ComposerPrimitive.AddAttachment className="aui-composer-add-attachment aui-composer-icon-btn" aria-label="Attach file" title="Attach file">
+        <ComposerPrimitive.AddAttachment disabled={isSending} className="aui-composer-add-attachment aui-composer-icon-btn" aria-label="Attach file" title="Attach file">
           <AttachIcon />
           <span className="aui-visually-hidden">Attach file</span>
         </ComposerPrimitive.AddAttachment>
@@ -265,8 +305,8 @@ const MyComposer = ({
           <AgentSessionMenu {...menuProps} />
         </div>
         
-        <button type="submit" className="aui-composer-send aui-composer-icon-btn" aria-label={sendLabel} title={sendLabel}>
-          <SendIcon />
+        <button disabled={isSending} type="submit" className="aui-composer-send aui-composer-icon-btn" aria-label={sendLabel} title={sendLabel}>
+          {isSending ? <span className="aui-spinner"><span></span></span> : <SendIcon />}
           <span className="aui-visually-hidden">{sendLabel}</span>
         </button>
         <CancelButton agentName={agentName} sessionId={sessionId} />
@@ -343,56 +383,120 @@ const SendErrorIndicator = () => {
   const { errorText } = useContext(PendingContext);
   if (!errorText) return null;
   return (
-    <div className="aui-error" data-testid="send-error">
+    <div role="alert" className="aui-error" data-testid="send-error">
       {errorText}
     </div>
   );
 };
 
-const BatchInterruptUI = () => {
+export const BatchInterruptUI = ({ agentName, sessionId }: { agentName: string; sessionId: string }) => {
   const interrupts = useAgUiInterrupts();
-  const submitResponses = useAgUiSubmitInterruptResponses();
-  const [responses, setResponses] = useState<Record<string, 'resolved' | 'cancelled'>>({});
+  const { setStatusText, setErrorText, hydratedApprovals, removeHydratedApproval } = useContext(PendingContext);
+  const [submitting, setSubmitting] = useState(false);
+  const [note, setNote] = useState('');
+  const [resolvedToolCallIds, setResolvedToolCallIds] = useState<Set<string>>(() => new Set());
 
-  if (!interrupts.length) return null;
+  const pendingItems = useMemo(() => {
+    const items: Array<{ toolCallId: string; summary: string }> = [];
+    const seen = new Set<string>();
 
-  const handleSubmit = () => {
-    const payload = interrupts.map(i => ({
-      interruptId: i.id,
-      status: responses[i.id] || 'cancelled'
-    }));
-    submitResponses(payload);
+    for (const a of hydratedApprovals) {
+      if (!resolvedToolCallIds.has(a.toolCallId)) {
+        items.push(a);
+        seen.add(a.toolCallId);
+      }
+    }
+
+    for (const i of interrupts) {
+      if (i.toolCallId && !seen.has(i.toolCallId) && !resolvedToolCallIds.has(i.toolCallId)) {
+        items.push({ toolCallId: i.toolCallId, summary: i.message || i.reason || i.toolCallId });
+        seen.add(i.toolCallId);
+      }
+    }
+
+    return items;
+  }, [hydratedApprovals, interrupts, resolvedToolCallIds]);
+
+  if (pendingItems.length === 0) return null;
+
+  const currentItem = pendingItems[0];
+
+  const handleDecision = async (approved: boolean) => {
+    setErrorText(null);
+    setSubmitting(true);
+    try {
+      const result = await submitHitlDecision(agentName, sessionId, {
+        toolCallId: currentItem.toolCallId,
+        approved,
+        note: note.trim() || undefined
+      });
+      if (result && result.applied === false) {
+        setStatusText('This approval was already resolved elsewhere.');
+      }
+      removeHydratedApproval(currentItem.toolCallId);
+      setResolvedToolCallIds((prev) => new Set(prev).add(currentItem.toolCallId));
+      setNote('');
+    } catch (err) {
+      console.error('Failed to submit decision', err);
+      setErrorText(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
     <div className="aui-interrupts-batch">
-      <h4 className="aui-interrupts-title">Action Required: Approve Tool Calls</h4>
-      {interrupts.map((interrupt) => (
-        <div key={interrupt.id} className="aui-interrupt">
-          <p className="aui-interrupt-tool-name">Tool: <strong>{interrupt.toolCallId || interrupt.reason}</strong></p>
-          {interrupt.message && <pre className="aui-interrupt-message">{interrupt.message}</pre>}
-          <div className="aui-interrupt-actions">
-            <label>
-              <input type="radio" name={`action-${interrupt.id}`} checked={responses[interrupt.id] === 'resolved'} onChange={() => setResponses((prev: Record<string, 'resolved' | 'cancelled'>) => ({ ...prev, [interrupt.id]: 'resolved' }))} /> Approve
-            </label>
-            <label>
-              <input type="radio" name={`action-${interrupt.id}`} checked={responses[interrupt.id] === 'cancelled'} onChange={() => setResponses((prev: Record<string, 'resolved' | 'cancelled'>) => ({ ...prev, [interrupt.id]: 'cancelled' }))} /> Deny
-            </label>
-          </div>
+      <h4 className="aui-interrupts-title">Action Required: Approve Tool Call</h4>
+      <div className="aui-interrupt" data-testid="hydrated-pending-approval">
+        <p className="aui-interrupt-tool-name">
+          Tool: <strong>{currentItem.summary}</strong>
+        </p>
+        
+        <div style={{ marginTop: '10px' }}>
+          <label htmlFor="hitl-optional-note" style={{ display: 'block', fontSize: '0.9em', marginBottom: '4px' }}>
+            Optional Note:
+          </label>
+          <input
+            id="hitl-optional-note"
+            type="text"
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            disabled={submitting}
+            placeholder="Reason for approval or denial..."
+            style={{ width: '100%', padding: '6px', boxSizing: 'border-box' }}
+          />
         </div>
-      ))}
-      <button
-        disabled={Object.keys(responses).length !== interrupts.length}
-        onClick={handleSubmit}
-        className="aui-interrupt-submit"
-      >
-        Submit Decisions
-      </button>
+
+        <div className="aui-interrupt-actions" style={{ marginTop: '10px', display: 'flex', gap: '10px' }}>
+          <button
+            disabled={submitting}
+            onClick={() => handleDecision(true)}
+            className="aui-interrupt-submit"
+            style={{ backgroundColor: '#2e7d32', color: 'white', padding: '6px 12px', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
+          >
+            Approve
+          </button>
+          <button
+            disabled={submitting}
+            onClick={() => handleDecision(false)}
+            className="aui-interrupt-submit"
+            style={{ backgroundColor: '#c62828', color: 'white', padding: '6px 12px', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
+          >
+            Deny
+          </button>
+        </div>
+        
+        {pendingItems.length > 1 && (
+          <p className="aui-interrupt-note" style={{ fontSize: '0.85em', color: '#666', marginTop: '10px' }}>
+            {pendingItems.length - 1} more tool call{pendingItems.length - 1 !== 1 ? 's' : ''} awaiting approval
+          </p>
+        )}
+      </div>
     </div>
   );
 };
 
-const MyThread = ({ agentName, sessionId, onRunFinish, onSwitchAgent, onSwitchSession, switchAgentHref, switchSessionHref }: { agentName: string, sessionId: string, onRunFinish: () => void, onSwitchAgent: () => void, onSwitchSession: () => void, switchAgentHref: string, switchSessionHref: string }) => {
+const MyThread = ({ agentName, sessionId, isFreshSession, markSessionNotFresh, onRunFinish, onSwitchAgent, onSwitchSession, switchAgentHref, switchSessionHref }: { agentName: string, sessionId: string, isFreshSession: boolean, markSessionNotFresh: (sessionId: string) => void, onRunFinish: () => void, onSwitchAgent: () => void, onSwitchSession: () => void, switchAgentHref: string, switchSessionHref: string }) => {
   const isEmpty = useAuiState(s => s.thread.messages.length === 0);
 
   return (
@@ -407,12 +511,14 @@ const MyThread = ({ agentName, sessionId, onRunFinish, onSwitchAgent, onSwitchSe
 
       <div className="aui-thread-bottom">
         <StatusBar />
-        <BatchInterruptUI />
+        <BatchInterruptUI agentName={agentName} sessionId={sessionId} />
         <SendErrorIndicator />
         <div className="aui-composer-container">
           <MyComposer
             agentName={agentName}
             sessionId={sessionId}
+            isFreshSession={isFreshSession}
+            markSessionNotFresh={markSessionNotFresh}
             onSwitchAgent={onSwitchAgent}
             onSwitchSession={onSwitchSession}
             switchAgentHref={switchAgentHref}
@@ -529,6 +635,7 @@ export default function App() {
     clearAgent,
     clearSession,
     isFreshSession,
+    markSessionNotFresh,
     navigateSession,
   } = useAgentSessions();
 
@@ -569,6 +676,8 @@ export default function App() {
               <MyThread
                 agentName={selectedAgent}
                 sessionId={selectedSessionId}
+                isFreshSession={isFreshSession}
+                markSessionNotFresh={markSessionNotFresh}
                 onRunFinish={refreshSessions}
                 onSwitchAgent={clearAgent}
                 onSwitchSession={clearSession}

@@ -180,11 +180,11 @@ fn replay_log_entries_into_session(
     let effective_entries = build_effective_log_entries(raw_entries, name);
 
     // Pending ToolCalls entry awaiting a matching ToolResults entry. User
-    // messages may be appended while the tool is still running, so buffer
-    // them until the result arrives and replay the valid conversation order:
-    // assistant tool call -> tool result -> injected user message.
+    // messages and runtime notes may be appended while the tool is still running,
+    // so buffer them until the result arrives and replay the valid conversation
+    // order: assistant tool call -> tool result -> queued message.
     let mut pending: Option<PendingToolCalls> = None;
-    let mut users_queued_during_tool = Vec::new();
+    let mut messages_queued_during_tool = Vec::new();
     let mut completed_tool_call_ids = std::collections::HashSet::new();
 
     for (seq, entry) in effective_entries {
@@ -213,16 +213,33 @@ fn replay_log_entries_into_session(
                     message = message.with_log_timestamp(timestamp);
                 }
                 if role.is_user() && pending.is_some() {
-                    users_queued_during_tool.push(message);
+                    messages_queued_during_tool.push(message);
                     continue;
                 }
                 finish_orphaned_tool_round(
                     &mut session,
                     &mut pending,
-                    &mut users_queued_during_tool,
+                    &mut messages_queued_during_tool,
                     name,
                 )?;
                 session.messages.push(message);
+            }
+            SessionLogEntry::SubAgentStarted {
+                agent, session_id, ..
+            } => {
+                let note = Message::new(
+                    MessageRole::User,
+                    MessageContent::Text(format!(
+                        "[Runtime note] Started sub-agent '{agent}' in session {session_id}. \
+                         Resume with session_prompt using this exact session_id; inspect with session_load."
+                    )),
+                )
+                .with_log_seq(seq);
+                if pending.is_some() {
+                    messages_queued_during_tool.push(note);
+                } else {
+                    session.messages.push(note);
+                }
             }
             SessionLogEntry::ToolCalls {
                 text,
@@ -234,7 +251,7 @@ fn replay_log_entries_into_session(
                 finish_orphaned_tool_round(
                     &mut session,
                     &mut pending,
-                    &mut users_queued_during_tool,
+                    &mut messages_queued_during_tool,
                     name,
                 )?;
                 for call in &calls {
@@ -289,7 +306,7 @@ fn replay_log_entries_into_session(
                     message = message.with_log_timestamp(timestamp);
                 }
                 session.messages.push(message);
-                session.messages.append(&mut users_queued_during_tool);
+                session.messages.append(&mut messages_queued_during_tool);
             }
             SessionLogEntry::DataUrls { urls } => {
                 session.data_urls.extend(urls);
@@ -298,7 +315,7 @@ fn replay_log_entries_into_session(
                 finish_orphaned_tool_round(
                     &mut session,
                     &mut pending,
-                    &mut users_queued_during_tool,
+                    &mut messages_queued_during_tool,
                     name,
                 )?;
                 session.compressed_messages.append(&mut session.messages);
@@ -306,7 +323,7 @@ fn replay_log_entries_into_session(
             }
             SessionLogEntry::Clear => {
                 pending = None;
-                users_queued_during_tool.clear();
+                messages_queued_during_tool.clear();
                 completed_tool_call_ids.clear();
                 session.messages.clear();
                 session.compressed_messages.clear();
@@ -317,6 +334,11 @@ fn replay_log_entries_into_session(
             SessionLogEntry::Error { .. } => {}
             SessionLogEntry::TurnEnd { .. } => {}
             SessionLogEntry::Cancel { .. } => {}
+            // Durable control state is hydrated separately from model messages.
+            // Ignoring it here preserves any pending tool-call/result adjacency.
+            SessionLogEntry::HandoffCommitted { .. }
+            | SessionLogEntry::HitlApprovalRequested { .. }
+            | SessionLogEntry::HitlApprovalDecision { .. } => {}
             SessionLogEntry::EditEntries { .. } | SessionLogEntry::Rewind { .. } => {}
             SessionLogEntry::Unknown => anyhow::ensure!(
                 allow_embedded_metadata,
@@ -332,7 +354,7 @@ fn replay_log_entries_into_session(
         };
         session.messages.push(message);
     }
-    session.messages.append(&mut users_queued_during_tool);
+    session.messages.append(&mut messages_queued_during_tool);
 
     Ok(session)
 }
@@ -340,7 +362,7 @@ fn replay_log_entries_into_session(
 fn finish_orphaned_tool_round(
     session: &mut Session,
     pending: &mut Option<PendingToolCalls>,
-    users_queued_during_tool: &mut Vec<Message>,
+    messages_queued_during_tool: &mut Vec<Message>,
     name: &str,
 ) -> Result<()> {
     if let Some(pending) = pending.take() {
@@ -348,7 +370,7 @@ fn finish_orphaned_tool_round(
             .messages
             .push(repair_orphan_tool_calls(pending, name)?);
     }
-    session.messages.append(users_queued_during_tool);
+    session.messages.append(messages_queued_during_tool);
     Ok(())
 }
 
@@ -1168,6 +1190,66 @@ mod tests {
     }
 
     #[test]
+    fn canonical_nats_replay_accepts_pre_schema_change_transcript() {
+        let content = r#"---
+type: message
+role: user
+content: delegate this
+---
+type: tool_calls
+text: delegating
+calls:
+  - name: plato_session_prompt
+    arguments: {}
+    id: call-1
+---
+type: sub_agent_started
+agent: pantheon/plato
+session_id: child-old
+invocation_id: invocation-old
+---
+type: tool_results
+results:
+  - id: call-1
+    name: plato_session_prompt
+    output:
+      response: done
+---
+type: message
+role: assistant
+content: delegation complete
+---
+type: turn_end
+through_seq: 1
+fence_token: 7
+"#;
+        let raw_entries = collect_raw_log_entries(content, "pre-schema-session")
+            .expect("pre-schema rows should deserialize");
+
+        let loaded = replay_nats_entries_into_session(
+            &raw_entries,
+            "pre-schema-session",
+            Session::default(),
+        )
+        .expect("canonical replay should accept pre-schema variants");
+
+        assert_eq!(
+            loaded
+                .messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            vec![
+                MessageRole::User,
+                MessageRole::Tool,
+                MessageRole::User,
+                MessageRole::Assistant,
+            ]
+        );
+        assert!(loaded.replay_warnings.is_empty());
+    }
+
+    #[test]
     fn load_from_log_enumerates_document_sequence_numbers() {
         let content = r#"---
 type: message
@@ -1605,6 +1687,195 @@ results:
             serde_json::json!({"answer": "found"})
         );
         assert!(loaded.replay_warnings.is_empty());
+    }
+
+    #[test]
+    fn replay_ignores_durable_control_entries_inside_tool_round() {
+        let content = r#"---
+type: message
+role: user
+content: perform controlled work
+---
+type: tool_calls
+text: working
+calls:
+  - name: write
+    arguments: {}
+    id: call-1
+---
+type: handoff_committed
+target_agent: pantheon/plato
+target_session_id: target-123
+handoff_tool_call_id: handoff-call
+---
+type: hitl_approval_requested
+tool_call_id: call-1
+summary: Approve write
+fence_token: 7
+---
+type: hitl_approval_decision
+tool_call_id: call-1
+approved: true
+fence_token: 7
+---
+type: tool_results
+results:
+  - id: call-1
+    name: write
+    output:
+      status: done
+---
+type: message
+role: assistant
+content: work complete
+"#;
+
+        let loaded = load_from_log_for_test(content);
+
+        assert_eq!(
+            loaded
+                .messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            vec![MessageRole::User, MessageRole::Tool, MessageRole::Assistant,]
+        );
+        let MessageContent::ToolCalls(tool_calls) = &loaded.messages[1].content else {
+            panic!("expected reconstructed tool message");
+        };
+        assert_eq!(tool_calls.text, "working");
+        assert_eq!(tool_calls.tool_results[0].output["status"], "done");
+        assert!(loaded.replay_warnings.is_empty());
+    }
+
+    fn sub_agent_start_entries(child_session_id: &str) -> Vec<(usize, SessionLogEntry)> {
+        vec![
+            (
+                0,
+                SessionLogEntry::ToolCalls {
+                    text: "delegating".to_string(),
+                    thought: None,
+                    calls: vec![crate::tool::ToolCall::new(
+                        "plato_session_prompt".to_string(),
+                        serde_json::json!({}),
+                        Some("call-1".to_string()),
+                        None,
+                    )],
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                1,
+                SessionLogEntry::SubAgentStarted {
+                    agent: "pantheon/plato".to_string(),
+                    session_id: child_session_id.to_string(),
+                    invocation_id: Some("invocation-456".to_string()),
+                    tool_call_id: None,
+                    started_at: None,
+                },
+            ),
+        ]
+    }
+
+    fn assert_sub_agent_start_replay(
+        loaded: &Session,
+        child_session_id: &str,
+        expected_output: serde_json::Value,
+    ) {
+        let roles = loaded
+            .messages
+            .iter()
+            .map(|message| message.role)
+            .collect::<Vec<_>>();
+        let MessageContent::ToolCalls(tool_calls) = &loaded.messages[0].content else {
+            panic!("expected reconstructed tool message");
+        };
+        assert_eq!(
+            (
+                roles,
+                tool_calls.tool_results[0].call.id.as_deref(),
+                tool_calls.tool_results[0].output.clone(),
+                loaded.messages[1].content.to_text(),
+                loaded.messages[1].log_seq,
+            ),
+            (
+                vec![MessageRole::Tool, MessageRole::User],
+                Some("call-1"),
+                expected_output,
+                format!(
+                    "[Runtime note] Started sub-agent 'pantheon/plato' in session {child_session_id}. Resume with session_prompt using this exact session_id; inspect with session_load."
+                ),
+                Some(1),
+            )
+        );
+    }
+
+    #[test]
+    fn replay_queues_sub_agent_start_note_after_completed_tool_result() {
+        let mut entries = sub_agent_start_entries("child-123");
+        entries.push((
+            2,
+            SessionLogEntry::ToolResults {
+                results: vec![harnx_core::session::ToolOutput {
+                    id: Some("call-1".to_string()),
+                    name: "plato_session_prompt".to_string(),
+                    output: serde_json::json!({"response": "done"}),
+                    markdown: None,
+                    content: Vec::new(),
+                    switch_agent: None,
+                }],
+                timestamp: None,
+            },
+        ));
+
+        let loaded = replay_log_entries_for_external(&entries, "completed-parent").unwrap();
+
+        assert_sub_agent_start_replay(
+            &loaded,
+            "child-123",
+            serde_json::json!({"response": "done"}),
+        );
+    }
+
+    #[test]
+    fn external_replay_queues_sub_agent_start_note_after_interrupted_tool_result() {
+        let entries = sub_agent_start_entries("child-interrupted");
+
+        let loaded = replay_log_entries_for_external(&entries, "interrupted-parent").unwrap();
+
+        assert_sub_agent_start_replay(
+            &loaded,
+            "child-interrupted",
+            serde_json::json!({"error": LOST_TOOL_RESPONSE_ERROR}),
+        );
+    }
+
+    #[test]
+    fn replay_renders_sub_agent_start_note_without_pending_tool_round() {
+        let content = r#"---
+type: message
+role: user
+content: original request
+---
+type: sub_agent_started
+agent: pantheon/plato
+session_id: child-direct
+invocation_id: invocation-direct
+"#;
+
+        let loaded = load_from_log_for_test(content);
+
+        assert_eq!(
+            message_view(&loaded.messages),
+            vec![
+                (MessageRole::User, "original request".to_string()),
+                (
+                    MessageRole::User,
+                    "[Runtime note] Started sub-agent 'pantheon/plato' in session child-direct. Resume with session_prompt using this exact session_id; inspect with session_load.".to_string(),
+                ),
+            ]
+        );
     }
 
     #[test]

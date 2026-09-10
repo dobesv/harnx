@@ -15,8 +15,8 @@ use harnx_core::event::{AgentEvent, AgentSource, SubAgentProgress, TurnEvent};
 use harnx_core::package_namespace::sanitize_for_tool_name;
 use harnx_core::session::SessionLogEntry;
 use harnx_toolset::{
-    ToolInvokeError, ToolSpec, Toolset, SUBAGENT_SESSION_CANCEL_TOOL, SUBAGENT_SESSION_LOAD_TOOL,
-    SUBAGENT_SESSION_NEW_TOOL, SUBAGENT_SESSION_PROMPT_TOOL,
+    ToolInvocation, ToolInvokeError, ToolSpec, Toolset, SUBAGENT_SESSION_CANCEL_TOOL,
+    SUBAGENT_SESSION_LOAD_TOOL, SUBAGENT_SESSION_NEW_TOOL, SUBAGENT_SESSION_PROMPT_TOOL,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -62,15 +62,41 @@ pub(crate) struct SubagentToolset {
     server_name: String,
     client: async_nats::Client,
     jetstream: jetstream::Context,
+    session_metadata: crate::nats_session_metadata::SessionMetadataStore,
     progress_heartbeat: Duration,
+}
+
+pub(crate) struct SubagentNats {
+    client: async_nats::Client,
+    jetstream: jetstream::Context,
+    session_metadata: crate::nats_session_metadata::SessionMetadataStore,
+}
+
+impl SubagentNats {
+    pub(crate) fn new(
+        client: async_nats::Client,
+        jetstream: jetstream::Context,
+        session_metadata: crate::nats_session_metadata::SessionMetadataStore,
+    ) -> Self {
+        Self {
+            client,
+            jetstream,
+            session_metadata,
+        }
+    }
+}
+
+struct SubagentStart<'a> {
+    child_session_id: &'a str,
+    invocation_id: &'a str,
+    tool_call_id: Option<&'a str>,
 }
 
 impl SubagentToolset {
     pub(crate) fn new(
         agent: impl Into<String>,
         route: SubagentSessionRoute,
-        client: async_nats::Client,
-        jetstream: jetstream::Context,
+        nats: SubagentNats,
     ) -> Self {
         let agent = agent.into();
         let server_name = agent
@@ -80,8 +106,9 @@ impl SubagentToolset {
             server_name: sanitize_for_tool_name(server_name),
             agent,
             route,
-            client,
-            jetstream,
+            client: nats.client,
+            jetstream: nats.jetstream,
+            session_metadata: nats.session_metadata,
             progress_heartbeat: SUBAGENT_PROGRESS_HEARTBEAT,
         }
     }
@@ -95,9 +122,29 @@ impl SubagentToolset {
     async fn create_session(
         &self,
         session_id: Option<String>,
+        parent_session_id: Option<&str>,
     ) -> Result<NatsSession, ToolInvokeError> {
+        let mut config = self.route.session_config(&self.agent, session_id.clone());
+        if session_id.is_none() {
+            if let Some(parent_session_id) = parent_session_id {
+                let context = self
+                    .session_metadata
+                    .get_tool_context(parent_session_id)
+                    .await
+                    .map_err(|error| {
+                        ToolInvokeError::Recoverable(format!(
+                            "load parent session tool context: {error:#}"
+                        ))
+                    })?;
+                // Older sessions and direct Toolset callers may have no metadata record.
+                // Treat that as an empty context so delegation remains rollout-compatible.
+                if let Some(context) = context {
+                    config.initializer = config.initializer.with_tool_context(context);
+                }
+            }
+        }
         NatsSession::new(
-            self.route.session_config(&self.agent, session_id),
+            config,
             self.client.clone(),
             self.jetstream.clone(),
             harnx_core::abort::create_abort_signal(),
@@ -118,19 +165,27 @@ impl SubagentToolset {
     async fn start_progress_reporter(
         &self,
         child_session_id: &str,
-        parent_session_id: Option<String>,
+        params: &termination::PromptParams<'_>,
     ) -> Result<SubagentProgressReporter, ToolInvokeError> {
         let invocation_id = uuid::Uuid::new_v4().to_string();
-        let parent_sink = match parent_session_id {
-            Some(parent_session_id) => {
+        let parent_sink = match params.parent_session_id {
+            Some(ref parent_session_id) => {
                 let sink = NatsEventSink::new(
                     self.client.clone(),
                     self.jetstream.clone(),
-                    parent_session_id,
+                    parent_session_id.clone(),
                 )
                 .await;
-                self.emit_parent_subagent_started(&sink, child_session_id, &invocation_id)
-                    .await?;
+                self.emit_parent_subagent_started(
+                    &sink,
+                    parent_session_id,
+                    SubagentStart {
+                        child_session_id,
+                        invocation_id: &invocation_id,
+                        tool_call_id: params.tool_call_id.as_deref(),
+                    },
+                )
+                .await?;
                 Some(sink)
             }
             None => None,
@@ -147,9 +202,14 @@ impl SubagentToolset {
     async fn emit_parent_subagent_started(
         &self,
         parent_sink: &NatsEventSink,
-        child_session_id: &str,
-        invocation_id: &str,
+        parent_session_id: &str,
+        start: SubagentStart<'_>,
     ) -> Result<(), ToolInvokeError> {
+        let SubagentStart {
+            child_session_id,
+            invocation_id,
+            tool_call_id,
+        } = start;
         let source = AgentSource {
             agent: self.agent.clone(),
             session_id: Some(child_session_id.to_string()),
@@ -168,7 +228,25 @@ impl SubagentToolset {
             ToolInvokeError::Recoverable(format!(
                 "publish sub-agent start event to parent session: {error:#}"
             ))
-        })
+        })?;
+
+        let entry = SessionLogEntry::SubAgentStarted {
+            agent: self.agent.clone(),
+            session_id: child_session_id.to_string(),
+            invocation_id: Some(invocation_id.to_string()),
+            tool_call_id: tool_call_id.map(str::to_string),
+            started_at: Some(chrono::Utc::now()),
+        };
+        if let Err(error) =
+            NatsSessionLog::new(self.jetstream.clone(), parent_session_id.to_string())
+                .append_event_async(&entry)
+                .await
+        {
+            log::warn!(
+                "failed to append durable sub-agent start entry to parent session '{parent_session_id}': {error:#}"
+            );
+        }
+        Ok(())
     }
 
     async fn turn_has_cancel(&self, result: &NatsTurnResult) -> bool {
@@ -193,6 +271,7 @@ impl SubagentToolset {
                 message: SESSION_NEW_INITIAL_PROMPT,
                 session_id: None,
                 parent_session_id: args.parent_session_id,
+                tool_call_id: args.tool_call_id,
                 timeout_secs: None,
                 token_budget: None,
                 cancel,
@@ -217,6 +296,7 @@ impl SubagentToolset {
                 message: &args.message,
                 session_id: normalize_session_id(args.session_id),
                 parent_session_id: args.parent_session_id,
+                tool_call_id: args.tool_call_id,
                 timeout_secs: args.timeout_secs,
                 token_budget: args.token_budget,
                 cancel,
@@ -279,12 +359,18 @@ fn subagent_turn_failed(result: &NatsTurnResult, cancelled: bool) -> bool {
 
 fn require_response(result: &NatsTurnResult) -> Result<&str, ToolInvokeError> {
     if let Some(error) = &result.error {
-        return Err(ToolInvokeError::Recoverable(format!(
-            "sub-agent turn failed: {error}"
-        )));
+        return Err(ToolInvokeError::Recoverable(
+            termination::subagent_error_message(
+                format_args!("sub-agent turn failed: {error}"),
+                &result.session_id,
+            ),
+        ));
     }
     result.response.as_deref().ok_or_else(|| {
-        ToolInvokeError::Recoverable("sub-agent turn returned no final response".to_string())
+        ToolInvokeError::Recoverable(termination::subagent_error_message(
+            "sub-agent turn returned no final response",
+            &result.session_id,
+        ))
     })
 }
 
@@ -311,6 +397,8 @@ fn parse_args<T: for<'de> Deserialize<'de>>(tool: &str, args: Value) -> Result<T
 struct NewSessionArgs {
     #[serde(default, rename = "__harnx_parent_session_id")]
     parent_session_id: Option<String>,
+    #[serde(default, rename = "__harnx_tool_call_id")]
+    tool_call_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -324,6 +412,8 @@ struct PromptArgs {
     token_budget: Option<u64>,
     #[serde(default, rename = "__harnx_parent_session_id")]
     parent_session_id: Option<String>,
+    #[serde(default, rename = "__harnx_tool_call_id")]
+    tool_call_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -360,6 +450,28 @@ impl Toolset for SubagentToolset {
                 "unknown sub-agent tool: {tool}"
             )))
         }
+    }
+
+    async fn invoke_with_context(
+        &self,
+        mut invocation: ToolInvocation,
+    ) -> Result<Value, ToolInvokeError> {
+        if matches!(
+            invocation.tool.as_str(),
+            SUBAGENT_SESSION_NEW_TOOL | SUBAGENT_SESSION_PROMPT_TOOL
+        ) {
+            if let (Some(parent), Some(object)) = (
+                invocation.context.invoking_session_id,
+                invocation.args.as_object_mut(),
+            ) {
+                object.insert(
+                    "__harnx_parent_session_id".to_string(),
+                    Value::String(parent),
+                );
+            }
+        }
+        self.invoke(&invocation.tool, invocation.args, invocation.cancel)
+            .await
     }
 }
 

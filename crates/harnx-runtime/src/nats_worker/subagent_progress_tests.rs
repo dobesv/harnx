@@ -14,6 +14,11 @@ async fn progress_toolset(url: &str) -> Arc<super::subagent_toolset::SubagentToo
     let client = async_nats::connect(url)
         .await
         .expect("connect sub-agent toolset to test nats");
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_metadata =
+        crate::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+            .await
+            .expect("open session metadata");
     Arc::new(
         super::subagent_toolset::SubagentToolset::new(
             "metis",
@@ -21,8 +26,7 @@ async fn progress_toolset(url: &str) -> Arc<super::subagent_toolset::SubagentToo
                 "local",
                 super::SessionActivationRoute::ClusterShared,
             ),
-            client.clone(),
-            async_nats::jetstream::new(client),
+            super::subagent_toolset::SubagentNats::new(client.clone(), jetstream, session_metadata),
         )
         .with_progress_heartbeat(Duration::from_millis(50)),
     )

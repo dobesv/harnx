@@ -17,25 +17,25 @@ The response returns only HTTP status codes with no response body. The healthz l
 
 You can enable the healthz listener using either the CLI flag or an environment variable fallback:
 
-- `--healthz-addr <ADDR>`: Available as a CLI argument on all 15 in-scope binaries. Accepts `IP:PORT` or `:PORT`. Passing a blank host (e.g. `--healthz-addr :8081`) binds `0.0.0.0`, allowing scrapers or Kubernetes probes to reach the endpoint. Passing `127.0.0.1:8081` restricts the listener to loopback.
-- `HARNX_HEALTHZ_ADDR`: Environment variable fallback honored by shared-entrypoint binaries: `harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-time-server`, `harnx-plans-tools` (non-HTTP mode), `harnx-claude-compatible-hook-server`, `harnx-mcp-remote`, `harnx-mcp-bridge`, `harnx-mcp-time`, and `harnx-mcp-plans-github`. If both the CLI flag and environment variable are set, the CLI flag takes precedence.
+- `--healthz-addr <ADDR>`: Available as a CLI argument on all 16 in-scope binaries. Accepts `IP:PORT` or `:PORT`. Passing a blank host (e.g. `--healthz-addr :8081`) binds `0.0.0.0`, allowing scrapers or Kubernetes probes to reach the endpoint. Passing `127.0.0.1:8081` restricts the listener to loopback.
+- `HARNX_HEALTHZ_ADDR`: Environment variable fallback honored by shared-entrypoint binaries: `harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-time-server`, `harnx-plans-tools` (non-HTTP mode), `harnx-claude-compatible-hook-server`, `harnx-mcp-remote`, `harnx-mcp-bridge`, `harnx-mcp-time`, and `harnx-mcp-plans-github`. If both the CLI flag and environment variable are set, the CLI flag takes precedence.
 
 ## Binary Coverage
 
-Healthz support is available across 15 long-running binaries:
+Healthz support is available across 16 long-running binaries:
 
 - **Core runtime & proxies**: `harnx-serve`, `harnx-worker`, `harnx-aws-creds`, `harnx-k8s-creds`, `harnx-proxy-auth`
-- **Tool & hook servers**: `harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-plans-tools`, `harnx-time-server`, `harnx-claude-compatible-hook-server`
+- **Tool & hook servers**: `harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-plans-tools`, `harnx-time-server`, `harnx-claude-compatible-hook-server`
 - **MCP bridges & servers**: `harnx-mcp-bridge`, `harnx-mcp-remote`, `harnx-mcp-time`, `harnx-mcp-plans-github`
 
-Unlike `--metrics-addr` (where CLI flag support varied on `harnx-claude-compatible-hook-server`), `--healthz-addr` is supported as a CLI flag across all 15 binaries.
+Unlike `--metrics-addr` (where CLI flag support varied on `harnx-claude-compatible-hook-server`), `--healthz-addr` is supported as a CLI flag across all 16 binaries.
 
 ## Readiness Semantics & Lifecycle
 
 Readiness is tracked per process and transitions from `503` to `200` once initialization completes:
 
 - **HTTP servers** (`harnx-serve`, `harnx-aws-creds`, `harnx-k8s-creds`, `harnx-proxy-auth`, `harnx-plans-tools` HTTP mode, `harnx-mcp-time` HTTP mode): Become ready as soon as their HTTP listener binds.
-- **NATS-consumer servers** (`harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-time-server`, `harnx-claude-compatible-hook-server`): Become ready after NATS subscriptions connect and initial queue requests are flushed.
+- **NATS-consumer servers** (`harnx-bash-tools`, `harnx-fs-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-time-server`, `harnx-claude-compatible-hook-server`): Become ready after NATS subscriptions connect and initial queue requests are flushed. The Kubernetes sandbox gateway waits until all three of its toolset registrations are visible.
 - **Worker daemon** (`harnx-worker`): Becomes ready once NATS worker services and activation streams are live.
 - **Stdio MCP bridge & remote** (`harnx-mcp-bridge`, `harnx-mcp-remote`): Become ready once their transport setup finishes.
 

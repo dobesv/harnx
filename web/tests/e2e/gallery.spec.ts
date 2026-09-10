@@ -97,21 +97,17 @@ test.describe('Gallery', () => {
 
     await expect(page.locator('.aui-message')).toHaveCount(1);
 
-    // The session-pending mock starts a run (RUN_STARTED) that never finishes,
-    // so the composer enters its "running" state. We MUST wait for that state to
-    // be established before typing/clicking; otherwise the click can land while
-    // isRunning is still false and submit a new run instead of queuing, leaving
-    // the button on "Queue" instead of "Queued". Gate on the running-status text
-    // (emitted right after RUN_STARTED) AND the button flipping to "Queue".
+    // The session-pending mock starts a run (RUN_STARTED) that never finishes.
+    // We MUST wait for the "Running task..." state to be established before typing.
     await expect(page.locator('.aui-status-bar')).toBeVisible({ timeout: 30000 });
     await expect(page.locator('text=Running task...')).toBeVisible({ timeout: 30000 });
-    await expect(page.locator('.aui-composer-send')).toHaveText('Queue', { timeout: 30000 });
 
     await page.locator('.aui-composer-input').fill('Start a slow task');
     await page.locator('.aui-composer-send').click();
 
-    // Clicking Send while a run is active queues the message → button "Queued".
-    await expect(page.locator('.aui-composer-send')).toHaveText('Queued', { timeout: 30000 });
+    // Clicking Send while a run is active now disables the composer and shows a spinner.
+    await expect(page.locator('.aui-composer-input')).toBeDisabled({ timeout: 30000 });
+    await expect(page.locator('.aui-spinner').last()).toBeVisible({ timeout: 30000 });
 
     await expect(page.locator('text=Working on it')).toBeVisible();
 

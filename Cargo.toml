@@ -8,6 +8,7 @@ members = [
     "crates/harnx-session",
     "crates/harnx-aws-creds",
     "crates/harnx-k8s-creds",
+    "crates/harnx-k8s-sandbox-tools",
     "crates/harnx-fetch",
     "crates/harnx-hooks",
     "crates/harnx-bash-tools",
@@ -86,7 +87,8 @@ anyhow = "1.0.69"
 bytes = "1.4.0"
 axum = "0.8"
 clap = { version = "4.4.8", features = ["derive"] }
-dirs = "6.0.0"
+dirs = "7.0.0"
+eventsource-stream = "0.2.3"
 futures-util = "0.3.29"
 inquire = "0.9.0"
 is-terminal = "0.4.9"
@@ -115,7 +117,7 @@ textwrap = "0.16.0"
 ansi_colours = "1.2.2"
 reqwest-eventsource = { git = "https://github.com/jpopesculian/reqwest-eventsource", rev = "356e2f61827b193bd5ab389c38059bcc2eed90aa" }
 log = { version = "0.4.20", features = ["std"] }
-gix = { version = "0.86.0", features = ["blob-diff", "worktree-mutation", "tree-editor", "blocking-network-client"] }
+gix = { version = "0.87.0", features = ["blob-diff", "worktree-mutation", "blocking-network-client"] }
 oci-client = "0.17"
 semver = { version = "1.0", features = ["serde"] }
 mockall = "0.15"

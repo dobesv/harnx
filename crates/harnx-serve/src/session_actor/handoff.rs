@@ -4,10 +4,13 @@ use super::{
     base_event, registry::get_or_spawn_in, test_log, PendingPrompt, PromptResult, RunFinished,
     SessionActor, SessionCommand, SessionHandle, SessionKey, SessionPromptOptions, SessionState,
 };
+use crate::agent_scoped_config;
 use ag_ui_core::event::{Event, RunErrorEvent};
 use anyhow::{anyhow, bail, Result};
 use harnx_core::event::{AgentEvent, AgentEventSink, SessionEvent};
-use std::time::Duration;
+use harnx_runtime::config::Config;
+use parking_lot::RwLock;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::oneshot;
 
 const HANDOFF_ACK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -16,6 +19,7 @@ pub(super) struct HandoffRequest {
     pub(super) agent: String,
     pub(super) session_id: Option<String>,
     pub(super) prompt: String,
+    pub(super) handoff_tool_call_id: Option<String>,
 }
 
 impl SessionActor {
@@ -28,8 +32,9 @@ impl SessionActor {
             agent,
             session_id,
             prompt,
+            handoff_tool_call_id,
         } = request;
-        let target_session_id = match self.resolve_handoff_session_id(&agent, session_id) {
+        let target_session_id = match self.resolve_handoff_session_id(&agent, session_id).await {
             Ok(session_id) => session_id,
             Err(error) => {
                 self.fail_handoff(done, error);
@@ -46,16 +51,17 @@ impl SessionActor {
             self.fail_handoff(done, error);
             return;
         }
-        self.commit_handoff(done, agent, target_session_id);
+        self.commit_handoff(done, agent, target_session_id, handoff_tool_call_id);
     }
 
-    fn resolve_handoff_session_id(
+    async fn resolve_handoff_session_id(
         &self,
         agent: &str,
         session_id: Option<String>,
     ) -> Result<String> {
         let Some(session_id) = session_id.filter(|id| !id.trim().is_empty()) else {
-            return Ok(harnx_runtime::nats_worker::new_remote_session_id());
+            let scoped = agent_scoped_config(&self.actor_config.base_config, agent)?;
+            return Config::reserve_new_session_id(&Arc::new(RwLock::new(scoped))).await;
         };
         let owner = self
             .registry
@@ -93,11 +99,18 @@ impl SessionActor {
         wait_for_handoff_ack(reply_rx, target_key, HANDOFF_ACK_TIMEOUT).await
     }
 
-    fn commit_handoff(&mut self, done: &RunFinished, agent: String, session_id: String) {
+    fn commit_handoff(
+        &mut self,
+        done: &RunFinished,
+        agent: String,
+        session_id: String,
+        handoff_tool_call_id: Option<String>,
+    ) {
         done.sink
             .emit(AgentEvent::Session(SessionEvent::HandoffCommitted {
                 agent,
                 session_id,
+                handoff_tool_call_id,
             }));
         self.finish_run(done, None);
         self.state = SessionState::Idle;

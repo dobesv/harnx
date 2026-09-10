@@ -550,12 +550,6 @@ body {
   outline-offset: -1px;
 }
 
-.aui-composer-queue-hint {
-  margin: 0 auto 0.4rem;
-  width: 100%;
-  font-size: 0.78rem;
-  color: var(--text);
-}
 
 .aui-composer-input {
   width: 100%;

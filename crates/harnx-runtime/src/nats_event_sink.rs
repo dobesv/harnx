@@ -240,6 +240,27 @@ impl NatsEventSink {
             delivery,
         });
     }
+
+    /// Publish a session-updated wake-up advisory carrying the current `after_seq`.
+    ///
+    /// This is used after appending durable control entries (HandoffCommitted,
+    /// TurnEnd, HitlApprovalRequested, HitlApprovalDecision) to wake attached
+    /// clients that are blocked waiting for advisory events on the `/events` SSE
+    /// endpoint. The published event is a `SessionEvent::Generic` with text
+    /// "session-updated", which the `/events` handler recognizes and converts to
+    /// a `session-updated` SSE event.
+    ///
+    /// Best-effort delivery is acceptable — the 250ms debounce on the client
+    /// provides batching, and clients can call `refresh_history()` to poll if
+    /// no advisory arrives. This is a wake-up, not the authoritative signal.
+    pub fn publish_session_updated(&self) {
+        let after_seq = self.after_seq.load(Ordering::Relaxed);
+        let event = AgentEvent::Session(harnx_core::event::SessionEvent::Generic {
+            text: format!("session-updated:{}", after_seq),
+        });
+        // Best-effort: wake-up advisory doesn't need Required delivery semantics
+        self.enqueue(event, DeliveryMode::BestEffort);
+    }
 }
 
 fn remember_publish_error(

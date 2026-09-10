@@ -83,7 +83,13 @@ pub struct ConfigData {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_agent: Option<String>,
+    /// Token-growth threshold for title regeneration at turn end and mid-loop;
+    /// 0 disables all title generation.
     pub title_update_threshold: usize,
+    /// Minimum seconds between time-triggered mid-loop title regenerations;
+    /// 0 disables only the time trigger. Token-triggered mid-loop regeneration
+    /// still uses `title_update_threshold`, whose 0 value is the master disable.
+    pub title_update_interval_secs: u64,
 }
 
 impl Default for ConfigData {
@@ -132,6 +138,7 @@ impl Default for ConfigData {
 
             title_agent: None,
             title_update_threshold: 50_000,
+            title_update_interval_secs: 0,
         }
     }
 }

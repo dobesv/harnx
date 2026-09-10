@@ -2378,6 +2378,9 @@ async fn ag_ui_run_promptless_join_forwards_live_events_when_session_active() {
             |event| event,
         ),
         true,
+        None,
+        None, // no log entries for unit test
+        None, // tokens_usage
     );
 
     let sender = tokio::spawn(async move {
@@ -2463,6 +2466,51 @@ async fn ag_ui_run_promptless_join_forwards_live_events_when_session_active() {
 }
 
 #[tokio::test]
+async fn promptless_active_reconnect_hydrates_control_before_live_events() {
+    use harnx_core::session::SessionLogEntry;
+
+    let run_id = Uuid::new_v4();
+    let thread_id = Uuid::new_v4();
+    let entries = vec![(
+        1,
+        SessionLogEntry::HandoffCommitted {
+            target_agent: "target-agent".to_string(),
+            target_session_id: "target-session".to_string(),
+            handoff_tool_call_id: Some("handoff-call".to_string()),
+        },
+    )];
+    let live = tokio_stream::iter([Event::RunFinished(ag_ui_core::event::RunFinishedEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        thread_id: ThreadId::from(thread_id),
+        run_id: RunId::from(run_id),
+        result: None,
+    })]);
+    let stream = build_promptless_event_stream(
+        &run_id.to_string(),
+        &thread_id.to_string(),
+        Some(Bytes::from(
+            frame_event(&snapshot_event(vec![user_msg("persisted")])).expect("snapshot frame"),
+        )),
+        live,
+        true,
+        None,
+        Some(&entries),
+        None,
+    );
+
+    let events = decode_sse_bytes_chunks(tokio_stream::StreamExt::collect::<Vec<_>>(stream).await);
+    assert_event_type_sequence(
+        &events,
+        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "CUSTOM", "RUN_FINISHED"],
+    );
+    assert_eq!(events[2]["name"], "session_handoff");
+    assert_eq!(events[2]["value"]["handoff_tool_call_id"], "handoff-call");
+}
+
+#[tokio::test]
 async fn ag_ui_promptless_active_reconnect_synthesizes_text_start_before_unmatched_end() {
     let run_id = Uuid::new_v4();
     let thread_id = Uuid::new_v4();
@@ -2479,6 +2527,9 @@ async fn ag_ui_promptless_active_reconnect_synthesizes_text_start_before_unmatch
             |event| event,
         ),
         true,
+        None,
+        None, // no log entries for unit test
+        None, // tokens_usage
     );
     let message_id = MessageId::random();
 
@@ -2536,6 +2587,9 @@ async fn ag_ui_promptless_active_reconnect_drops_unmatched_tool_call_events() {
             |event| event,
         ),
         true,
+        None,
+        None, // no log entries for unit test
+        None, // tokens_usage
     );
     let tool_call_id = ToolCallId::random();
     let message_id = MessageId::random();
@@ -2608,6 +2662,9 @@ async fn ag_ui_promptless_active_reconnect_forwards_started_tool_call_lifecycle(
             |event| event,
         ),
         true,
+        None,
+        None, // no log entries for unit test
+        None, // tokens_usage
     );
     let tool_call_id = ToolCallId::random();
     let result_message_id = MessageId::random();
@@ -2695,6 +2752,9 @@ async fn ag_ui_promptless_active_reconnect_synthesizes_step_start_before_unmatch
             |event| event,
         ),
         true,
+        None,
+        None, // no log entries for unit test
+        None, // tokens_usage
     );
     let step_name = "turn-99".to_string();
 
@@ -2752,6 +2812,9 @@ async fn ag_ui_promptless_active_reconnect_synthesizes_thinking_start_before_unm
             |event| event,
         ),
         true,
+        None,
+        None, // no log entries for unit test
+        None, // tokens_usage
     );
 
     tx.send(Event::ThinkingEnd(ThinkingEndEvent {
@@ -2806,6 +2869,9 @@ async fn ag_ui_promptless_active_reconnect_synthesizes_thinking_start_and_text_s
             |event| event,
         ),
         true,
+        None,
+        None, // no log entries for unit test
+        None, // tokens_usage
     );
 
     tx.send(Event::ThinkingTextMessageEnd(ThinkingTextMessageEndEvent {
@@ -2868,6 +2934,9 @@ async fn ag_ui_promptless_active_reconnect_synthesizes_thinking_start_and_text_s
             |event| event,
         ),
         true,
+        None,
+        None, // no log entries for unit test
+        None, // tokens_usage
     );
 
     tx.send(Event::ThinkingTextMessageContent(
@@ -2918,7 +2987,7 @@ async fn ag_ui_promptless_active_reconnect_synthesizes_thinking_start_and_text_s
 
 #[test]
 fn session_state_is_active_treats_running_and_interrupted_as_live() {
-    use crate::session_actor::{PendingInterruptBatch, SessionState};
+    use crate::session_actor::{PendingInterrupt, SessionState};
 
     let now = chrono::Utc::now();
 
@@ -2931,21 +3000,12 @@ fn session_state_is_active_treats_running_and_interrupted_as_live() {
         started_at: now,
     }));
 
-    // Interrupted (awaiting tool approval): active. A reload here must follow the
-    // live broadcast so the pending approval prompt reappears, not close the stream.
-    let pending = PendingInterruptBatch {
-        interrupt_run_id: "run-1".into(),
-        text: "approve?".into(),
-        attachment_refs: Vec::new(),
-        completion_output: String::new(),
-        completion_thought: None,
-        tool_calls: Vec::new(),
-        interrupts: Vec::new(),
+    // Interrupted remains active for routing, but promptless replay closes with the
+    // saved interrupt outcome instead of following the non-replaying broadcast.
+    let pending = PendingInterrupt {
         metadata: serde_json::Value::Null,
     };
     assert!(session_state_is_active(&SessionState::Interrupted {
-        run_id: "run-1".into(),
-        started_at: now,
         pending: Box::new(pending),
     }));
 }
@@ -3067,5 +3127,864 @@ async fn ag_ui_run_empty_last_user_message_joins_only_and_does_not_start_run() {
     assert!(
         load_session_messages(&config, "plain", "empty-last-user").is_empty(),
         "join-only empty prompt should not persist history"
+    );
+}
+
+#[test]
+fn live_run_finished_frames_interrupt_outcome_at_top_level_and_omits_empty_result() {
+    let thread_id = ThreadId::random();
+    let run_id = RunId::random();
+    let interrupt_outcome = json!({
+        "type": "interrupt",
+        "interrupts": [{ "id": "call-1" }],
+    });
+    let interrupt_event = Event::RunFinished(ag_ui_core::event::RunFinishedEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        thread_id: thread_id.clone(),
+        run_id: run_id.clone(),
+        result: Some(json!({ "outcome": interrupt_outcome })),
+    });
+    let mut state = FirstRunState::Active;
+    let mut guard = LiveStreamGuard::default();
+    let interrupt_frame = frame_live_event(
+        interrupt_event,
+        &mut state,
+        &mut guard,
+        &thread_id.to_string(),
+        &run_id.to_string(),
+    )
+    .expect("interrupt terminal frame");
+    let interrupt_wire = parse_sse_frame(
+        String::from_utf8(interrupt_frame.to_vec())
+            .expect("utf8 frame")
+            .trim(),
+    );
+    assert_eq!(interrupt_wire["outcome"]["type"], "interrupt");
+    assert!(interrupt_wire.get("result").is_none());
+
+    let completed_event = Event::RunFinished(ag_ui_core::event::RunFinishedEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        thread_id: thread_id.clone(),
+        run_id: run_id.clone(),
+        result: None,
+    });
+    let mut state = FirstRunState::Active;
+    let completed_frame = frame_live_event(
+        completed_event,
+        &mut state,
+        &mut guard,
+        &thread_id.to_string(),
+        &run_id.to_string(),
+    )
+    .expect("completion terminal frame");
+    let completed_wire = parse_sse_frame(
+        String::from_utf8(completed_frame.to_vec())
+            .expect("utf8 frame")
+            .trim(),
+    );
+    assert!(completed_wire.get("result").is_none());
+    assert!(completed_wire.get("outcome").is_none());
+}
+
+#[tokio::test]
+async fn promptless_interrupted_reconnect_replays_outcome_and_terminates() {
+    let run_id = Uuid::new_v4().to_string();
+    let thread_id = Uuid::new_v4().to_string();
+    let snapshot_frame = Some(Bytes::from(
+        frame_event(&snapshot_event(vec![user_msg("approve this call")])).expect("snapshot frame"),
+    ));
+    let entries = vec![(
+        1,
+        harnx_core::session::SessionLogEntry::HitlApprovalRequested {
+            tool_call_id: "call-1".to_string(),
+            summary: "Approve tool call".to_string(),
+            fence_token: 1,
+        },
+    )];
+    let outcome = derive_hitl_interrupt_outcome(&entries).expect("derived interrupt outcome");
+    let stream = build_promptless_event_stream(
+        &run_id,
+        &thread_id,
+        snapshot_frame,
+        tokio_stream::empty(),
+        true,
+        Some(outcome),
+        Some(&entries),
+        None,
+    );
+
+    let frames = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio_stream::StreamExt::collect::<Vec<_>>(stream),
+    )
+    .await
+    .expect("interrupted reconnect stream should terminate");
+    let events = decode_sse_bytes_chunks(frames);
+    assert_event_type_sequence(
+        &events,
+        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "CUSTOM", "RUN_FINISHED"],
+    );
+    assert_eq!(events[2]["name"], "hitl_pending_approval");
+    assert_eq!(events[2]["value"]["tool_call_id"], "call-1");
+    assert_eq!(events[3]["outcome"]["type"], "interrupt");
+    assert!(events[3].get("result").is_none());
+}
+
+#[test]
+fn control_snapshot_events_emits_handoff_with_marker_identity() {
+    use harnx_core::session::SessionLogEntry;
+
+    let entries = vec![(
+        1,
+        SessionLogEntry::HandoffCommitted {
+            target_agent: "target-agent".to_string(),
+            target_session_id: "target-session-123".to_string(),
+            handoff_tool_call_id: Some("call-abc".to_string()),
+        },
+    )];
+
+    let events = control_snapshot_events(&entries, None);
+    assert_eq!(events.len(), 1);
+
+    match &events[0] {
+        Event::Custom(CustomEvent { name, value, .. }) => {
+            assert_eq!(name, "session_handoff");
+            assert_eq!(value["agent"], "target-agent");
+            assert_eq!(value["session_id"], "target-session-123");
+            // Marker identity for dedupe
+            assert_eq!(value["handoff_tool_call_id"], "call-abc");
+        }
+        other => panic!("expected Custom event, got: {other:?}"),
+    }
+}
+
+#[test]
+fn control_snapshot_events_omits_missing_handoff_identity() {
+    use harnx_core::session::SessionLogEntry;
+
+    let entries = vec![(
+        1,
+        SessionLogEntry::HandoffCommitted {
+            target_agent: "target-agent".to_string(),
+            target_session_id: "target-session-123".to_string(),
+            handoff_tool_call_id: None,
+        },
+    )];
+
+    let events = control_snapshot_events(&entries, None);
+    let Event::Custom(CustomEvent { value, .. }) = &events[0] else {
+        panic!("expected Custom event")
+    };
+    assert!(value.get("handoff_tool_call_id").is_none());
+}
+
+#[test]
+fn control_snapshot_events_emits_usage_on_turn_end_with_usage() {
+    use harnx_core::{api_types::CompletionTokenUsage, session::SessionLogEntry};
+
+    let entries = vec![(
+        1,
+        SessionLogEntry::TurnEnd {
+            through_seq: 5,
+            fence_token: 42,
+            timestamp: None,
+            usage: Some(CompletionTokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cached_tokens: 20,
+                cache_write_tokens: 0,
+            }),
+        },
+    )];
+
+    let events = control_snapshot_events(&entries, None);
+    assert_eq!(events.len(), 1);
+
+    match &events[0] {
+        Event::Custom(CustomEvent { name, value, .. }) => {
+            assert_eq!(name, "usage");
+            assert_eq!(value["input"], 100);
+            assert_eq!(value["output"], 50);
+            assert_eq!(value["cached"], 20);
+        }
+        other => panic!("expected usage Custom event, got: {other:?}"),
+    }
+}
+
+#[test]
+fn control_snapshot_events_usage_includes_context_fields_when_provided() {
+    use harnx_core::{api_types::CompletionTokenUsage, session::SessionLogEntry};
+
+    let entries = vec![
+        (
+            1,
+            SessionLogEntry::TurnEnd {
+                through_seq: 5,
+                fence_token: 42,
+                timestamp: None,
+                usage: Some(CompletionTokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cached_tokens: 20,
+                    cache_write_tokens: 0,
+                }),
+            },
+        ),
+        (
+            2,
+            SessionLogEntry::TurnEnd {
+                through_seq: 9,
+                fence_token: 42,
+                timestamp: None,
+                usage: Some(CompletionTokenUsage {
+                    input_tokens: 80,
+                    output_tokens: 30,
+                    cached_tokens: 10,
+                    cache_write_tokens: 5,
+                }),
+            },
+        ),
+    ];
+
+    // Provide context snapshot (as computed by compute_usage_context on remote-follow path)
+    let context = super::UsageContextSnapshot {
+        context_tokens: 321,
+        max_context_tokens: Some(1000),
+        context_percent: Some(32.1),
+    };
+
+    let events = control_snapshot_events(&entries, Some(&context));
+    assert_eq!(events.len(), 2);
+
+    let Event::Custom(first) = &events[0] else {
+        panic!("expected first usage Custom event");
+    };
+    assert_eq!(first.name, "usage");
+    assert_eq!(first.value["input"], 100);
+    assert!(first.value.get("context_tokens").is_none());
+    assert!(first.value.get("max_context_tokens").is_none());
+    assert!(first.value.get("context_percent").is_none());
+
+    let Event::Custom(final_event) = &events[1] else {
+        panic!("expected final usage Custom event");
+    };
+    assert_eq!(final_event.name, "usage");
+    assert_eq!(final_event.value["input"], 80);
+    assert_eq!(final_event.value["output"], 30);
+    assert_eq!(final_event.value["cached"], 10);
+    assert_eq!(final_event.value["cache_write"], 5);
+    assert_eq!(final_event.value["context_tokens"], 321);
+    assert_eq!(final_event.value["max_context_tokens"], 1000);
+    assert_eq!(final_event.value["context_percent"], 32.1_f32);
+}
+
+#[test]
+fn control_snapshot_events_skips_turn_end_without_usage() {
+    use harnx_core::session::SessionLogEntry;
+
+    let entries = vec![(
+        1,
+        SessionLogEntry::TurnEnd {
+            through_seq: 5,
+            fence_token: 42,
+            timestamp: None,
+            usage: None,
+        },
+    )];
+
+    let events = control_snapshot_events(&entries, None);
+    assert!(
+        events.is_empty(),
+        "TurnEnd without usage should not emit events"
+    );
+}
+
+#[test]
+fn control_snapshot_events_emits_structured_sub_agent_start() {
+    use chrono::{DateTime, Utc};
+    use harnx_core::session::SessionLogEntry;
+
+    let started_at = "2026-09-09T05:15:30Z"
+        .parse::<DateTime<Utc>>()
+        .expect("valid start timestamp");
+    let entries = vec![(
+        1,
+        SessionLogEntry::SubAgentStarted {
+            agent: "sub-agent".to_string(),
+            session_id: "child-session-456".to_string(),
+            invocation_id: Some("invocation-789".to_string()),
+            tool_call_id: Some("tool-call-def".to_string()),
+            started_at: Some(started_at),
+        },
+    )];
+
+    let events = control_snapshot_events(&entries, None);
+    assert_eq!(events.len(), 1);
+
+    match &events[0] {
+        Event::Custom(CustomEvent { name, value, .. }) => {
+            assert_eq!(name, "sub_agent_started");
+            assert_eq!(value["agent"], "sub-agent");
+            assert_eq!(value["session_id"], "child-session-456");
+            assert_eq!(value["invocation_id"], "invocation-789");
+            assert_eq!(value["tool_call_id"], "tool-call-def");
+            assert_eq!(value["started_at"], "2026-09-09T05:15:30+00:00");
+        }
+        other => panic!("expected Custom event, got: {other:?}"),
+    }
+}
+
+#[test]
+fn control_snapshot_events_hydrates_legacy_sub_agent_start_with_null_optionals() {
+    use harnx_core::session::SessionLogEntry;
+
+    let entries = vec![(
+        1,
+        SessionLogEntry::SubAgentStarted {
+            agent: "legacy-agent".to_string(),
+            session_id: "legacy-child".to_string(),
+            invocation_id: None,
+            tool_call_id: None,
+            started_at: None,
+        },
+    )];
+
+    let events = control_snapshot_events(&entries, None);
+    match events.as_slice() {
+        [Event::Custom(CustomEvent { name, value, .. })] => {
+            assert_eq!(name, "sub_agent_started");
+            assert_eq!(value["agent"], "legacy-agent");
+            assert_eq!(value["session_id"], "legacy-child");
+            assert!(value["invocation_id"].is_null());
+            assert!(value["tool_call_id"].is_null());
+            assert!(value["started_at"].is_null());
+        }
+        other => panic!("expected one Custom event, got: {other:?}"),
+    }
+}
+
+#[test]
+fn control_snapshot_events_ignores_message_entries() {
+    use harnx_core::{message::MessageContent, message::MessageRole, session::SessionLogEntry};
+
+    let entries = vec![(
+        1,
+        SessionLogEntry::Message {
+            role: MessageRole::User,
+            content: MessageContent::Text("hello".to_string()),
+            id: None,
+            timestamp: None,
+            fence_token: Some(0),
+        },
+    )];
+
+    let events = control_snapshot_events(&entries, None);
+    assert!(
+        events.is_empty(),
+        "Message entries should not emit control events"
+    );
+}
+
+#[test]
+fn control_snapshot_events_processes_multiple_control_entries_in_order() {
+    use harnx_core::{api_types::CompletionTokenUsage, session::SessionLogEntry};
+
+    let entries = vec![
+        (
+            1,
+            SessionLogEntry::HandoffCommitted {
+                target_agent: "agent-1".to_string(),
+                target_session_id: "session-1".to_string(),
+                handoff_tool_call_id: Some("call-1".to_string()),
+            },
+        ),
+        (
+            2,
+            SessionLogEntry::TurnEnd {
+                through_seq: 5,
+                fence_token: 42,
+                timestamp: None,
+                usage: Some(CompletionTokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cached_tokens: 10,
+                    cache_write_tokens: 0,
+                }),
+            },
+        ),
+    ];
+
+    let events = control_snapshot_events(&entries, None);
+    assert_eq!(events.len(), 2);
+
+    // First: handoff
+    match &events[0] {
+        Event::Custom(CustomEvent { name, .. }) => {
+            assert_eq!(name, "session_handoff");
+        }
+        other => panic!("expected handoff Custom event, got: {other:?}"),
+    }
+
+    // Second: usage
+    match &events[1] {
+        Event::Custom(CustomEvent { name, .. }) => {
+            assert_eq!(name, "usage");
+        }
+        other => panic!("expected usage Custom event, got: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// t5a: HITL pending approval hydration tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn control_snapshot_events_emits_pending_approval_for_unmatched_request() {
+    use harnx_core::session::SessionLogEntry;
+
+    let entries = vec![(
+        1u64,
+        SessionLogEntry::HitlApprovalRequested {
+            tool_call_id: "tool-1".to_string(),
+            summary: "Approve tool call: write_file".to_string(),
+            fence_token: 1,
+        },
+    )];
+
+    let events = control_snapshot_events(&entries, None);
+    assert_eq!(events.len(), 1);
+
+    match &events[0] {
+        Event::Custom(CustomEvent { name, value, .. }) => {
+            assert_eq!(name, "hitl_pending_approval");
+            assert_eq!(
+                value,
+                &json!({
+                    "tool_call_id": "tool-1",
+                    "summary": "Approve tool call: write_file",
+                })
+            );
+        }
+        other => panic!("expected hitl_pending_approval Custom event, got: {other:?}"),
+    }
+}
+
+#[test]
+fn control_snapshot_events_skips_pending_approval_when_decision_exists() {
+    use harnx_core::session::SessionLogEntry;
+
+    let entries = vec![
+        (
+            1u64,
+            SessionLogEntry::HitlApprovalRequested {
+                tool_call_id: "tool-1".to_string(),
+                summary: "Approve tool call".to_string(),
+                fence_token: 1,
+            },
+        ),
+        (
+            2u64,
+            SessionLogEntry::HitlApprovalDecision {
+                tool_call_id: "tool-1".to_string(),
+                approved: true,
+                note: None,
+                fence_token: 1,
+            },
+        ),
+    ];
+
+    let events = control_snapshot_events(&entries, None);
+    assert!(events.is_empty());
+}
+
+#[test]
+fn control_snapshot_reused_tool_call_id_keeps_latest_request_pending() {
+    use harnx_core::session::SessionLogEntry;
+
+    let entries = vec![
+        (
+            1,
+            SessionLogEntry::HitlApprovalRequested {
+                tool_call_id: "reused-id".to_string(),
+                summary: "Historical request".to_string(),
+                fence_token: 1,
+            },
+        ),
+        (
+            2,
+            SessionLogEntry::HitlApprovalDecision {
+                tool_call_id: "reused-id".to_string(),
+                approved: true,
+                note: None,
+                fence_token: 1,
+            },
+        ),
+        (
+            3,
+            SessionLogEntry::HitlApprovalRequested {
+                tool_call_id: "reused-id".to_string(),
+                summary: "Current request".to_string(),
+                fence_token: 2,
+            },
+        ),
+    ];
+
+    let events = control_snapshot_events(&entries, None);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        &events[0],
+        Event::Custom(CustomEvent { name, value, .. })
+            if name == "hitl_pending_approval"
+                && value["tool_call_id"] == "reused-id"
+                && value["summary"] == "Current request"
+    ));
+}
+#[test]
+fn control_snapshot_events_emits_pending_for_one_tool_call_with_decision_for_another() {
+    use harnx_core::session::SessionLogEntry;
+
+    let entries = vec![
+        (
+            1u64,
+            SessionLogEntry::HitlApprovalRequested {
+                tool_call_id: "tool-1".to_string(),
+                summary: "Approve first tool call".to_string(),
+                fence_token: 1,
+            },
+        ),
+        (
+            2u64,
+            SessionLogEntry::HitlApprovalRequested {
+                tool_call_id: "tool-2".to_string(),
+                summary: "Approve second tool call".to_string(),
+                fence_token: 1,
+            },
+        ),
+        (
+            3u64,
+            SessionLogEntry::HitlApprovalDecision {
+                tool_call_id: "tool-2".to_string(),
+                approved: true,
+                note: None,
+                fence_token: 1,
+            },
+        ),
+    ];
+
+    let events = control_snapshot_events(&entries, None);
+    assert_eq!(events.len(), 1);
+
+    match &events[0] {
+        Event::Custom(CustomEvent { name, value, .. }) => {
+            assert_eq!(name, "hitl_pending_approval");
+            assert_eq!(value["tool_call_id"], "tool-1");
+        }
+        other => panic!("expected hitl_pending_approval Custom event, got: {other:?}"),
+    }
+}
+
+#[test]
+fn control_snapshot_events_emits_multiple_pending_approvals() {
+    use harnx_core::session::SessionLogEntry;
+
+    let entries = vec![
+        (
+            1u64,
+            SessionLogEntry::HitlApprovalRequested {
+                tool_call_id: "tool-1".to_string(),
+                summary: "First approval".to_string(),
+                fence_token: 1,
+            },
+        ),
+        (
+            2u64,
+            SessionLogEntry::HitlApprovalRequested {
+                tool_call_id: "tool-2".to_string(),
+                summary: "Second approval".to_string(),
+                fence_token: 1,
+            },
+        ),
+    ];
+
+    let events = control_snapshot_events(&entries, None);
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        &events[0],
+        Event::Custom(CustomEvent { name, value, .. })
+            if name == "hitl_pending_approval" && value["tool_call_id"] == "tool-1"
+    ));
+    assert!(matches!(
+        &events[1],
+        Event::Custom(CustomEvent { name, value, .. })
+            if name == "hitl_pending_approval" && value["tool_call_id"] == "tool-2"
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Part A subscriber tests (t1-delivery acceptance #1)
+// ---------------------------------------------------------------------------
+
+/// Test that session-updated advisory is correctly formatted for SSE emission.
+/// This exercises the logic in session_routes::session_updates that formats the
+/// advisory as an SSE event.
+///
+/// Validates that the `session-updated` event carries the correct `after_seq`
+/// value and uses the proper SSE format with event type and data fields.
+#[test]
+fn session_updated_advisory_formats_as_sse_event() {
+    use harnx_core::event::AgentEvent;
+    use harnx_core::event::SessionEvent;
+
+    // Create the session-updated advisory envelope (as published by publish_session_updated)
+    let session_updated_event = AgentEvent::Session(SessionEvent::Generic {
+        text: "session-updated:42".to_string(),
+    });
+    let envelope = harnx_runtime::nats_event_sink::AdvisoryEnvelope::new(42, session_updated_event);
+
+    // Verify the envelope is correctly formed
+    assert_eq!(envelope.after_seq, 42);
+
+    // Verify round-trip serialization (used by NATS publishing)
+    let bytes = envelope.to_bytes().expect("envelope should serialize");
+    let decoded =
+        harnx_runtime::nats_event_sink::AdvisoryEnvelope::from_bytes(&bytes).expect("decode");
+    assert_eq!(decoded.after_seq, 42);
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests for promptless attach hydration (t1-delivery acceptance #2)
+// ---------------------------------------------------------------------------
+
+/// Test that promptless local attach emits hydrated handoff CUSTOM event.
+/// Seeds a durable log with HandoffCommitted, builds an idle promptless stream,
+/// and asserts session_handoff appears after MESSAGES_SNAPSHOT with correct marker identity.
+#[tokio::test]
+async fn promptless_idle_attach_emits_hydrated_handoff() {
+    use harnx_core::session::SessionLogEntry;
+
+    let run_id = Uuid::new_v4().to_string();
+    let thread_id = Uuid::new_v4().to_string();
+
+    // Seed durable log with a HandoffCommitted entry
+    let log_entries = vec![(
+        1u64,
+        SessionLogEntry::HandoffCommitted {
+            target_agent: "target-agent".to_string(),
+            target_session_id: "target-session-123".to_string(),
+            handoff_tool_call_id: Some("call-abc".to_string()),
+        },
+    )];
+
+    // Build snapshot frame (idle session needs MESSAGES_SNAPSHOT)
+    let snapshot = vec![user_msg("test message")];
+    let snapshot_frame = Some(Bytes::from(
+        frame_event(&snapshot_event(snapshot)).expect("snapshot frame"),
+    ));
+
+    // Build idle promptless stream (is_active = false)
+    let stream = build_promptless_event_stream(
+        &run_id,
+        &thread_id,
+        snapshot_frame,
+        tokio_stream::empty(),
+        false, // idle session
+        None,  // no interrupt outcome
+        Some(&log_entries),
+        None, // tokens_usage
+    );
+
+    // Collect frames and parse as SSE events
+    let frames = tokio_stream::StreamExt::collect::<Vec<_>>(stream).await;
+    let events = decode_sse_bytes_chunks(frames);
+
+    // Assert event sequence: RUN_STARTED, MESSAGES_SNAPSHOT, CUSTOM (handoff), RUN_FINISHED
+    assert_event_type_sequence(
+        &events,
+        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "CUSTOM", "RUN_FINISHED"],
+    );
+
+    // Assert the CUSTOM event is session_handoff with correct marker identity
+    let handoff_event = &events[2];
+    assert_eq!(handoff_event["name"], "session_handoff");
+    assert_eq!(handoff_event["value"]["agent"], "target-agent");
+    assert_eq!(handoff_event["value"]["session_id"], "target-session-123");
+    assert_eq!(handoff_event["value"]["handoff_tool_call_id"], "call-abc");
+}
+
+/// Test that promptless local attach emits hydrated turn_outcome with usage.
+/// Seeds a durable log with TurnEnd containing usage, builds an idle promptless stream,
+/// and asserts turn_outcome CUSTOM event appears with correct usage data.
+#[tokio::test]
+async fn promptless_idle_attach_emits_hydrated_usage() {
+    use harnx_core::{api_types::CompletionTokenUsage, session::SessionLogEntry};
+
+    let run_id = Uuid::new_v4().to_string();
+    let thread_id = Uuid::new_v4().to_string();
+
+    // Seed durable log with TurnEnd containing usage
+    let log_entries = vec![(
+        2u64,
+        SessionLogEntry::TurnEnd {
+            through_seq: 5,
+            fence_token: 42,
+            timestamp: None,
+            usage: Some(CompletionTokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cached_tokens: 20,
+                cache_write_tokens: 0,
+            }),
+        },
+    )];
+
+    let snapshot = vec![user_msg("test message")];
+    let snapshot_frame = Some(Bytes::from(
+        frame_event(&snapshot_event(snapshot)).expect("snapshot frame"),
+    ));
+
+    let stream = build_promptless_event_stream(
+        &run_id,
+        &thread_id,
+        snapshot_frame,
+        tokio_stream::empty(),
+        false,
+        None,
+        Some(&log_entries),
+        None, // tokens_usage
+    );
+
+    let frames = tokio_stream::StreamExt::collect::<Vec<_>>(stream).await;
+    let events = decode_sse_bytes_chunks(frames);
+
+    // Assert sequence: RUN_STARTED, MESSAGES_SNAPSHOT, CUSTOM (usage), RUN_FINISHED
+    assert_event_type_sequence(
+        &events,
+        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "CUSTOM", "RUN_FINISHED"],
+    );
+
+    // Assert usage CUSTOM event carries usage fields in web-consumable shape
+    let outcome_event = &events[2];
+    assert_eq!(outcome_event["name"], "usage");
+    assert_eq!(outcome_event["value"]["input"], 100);
+    assert_eq!(outcome_event["value"]["output"], 50);
+    assert_eq!(outcome_event["value"]["cached"], 20);
+}
+
+#[tokio::test]
+async fn promptless_idle_attach_emits_fully_structured_sub_agent_start() {
+    use chrono::{DateTime, Utc};
+    use harnx_core::session::SessionLogEntry;
+
+    let started_at = "2026-09-09T05:15:30Z"
+        .parse::<DateTime<Utc>>()
+        .expect("valid start timestamp");
+    let log_entries = vec![(
+        3u64,
+        SessionLogEntry::SubAgentStarted {
+            agent: "researcher".to_string(),
+            session_id: "child-session-123".to_string(),
+            invocation_id: Some("invocation-456".to_string()),
+            tool_call_id: Some("tool-call-789".to_string()),
+            started_at: Some(started_at),
+        },
+    )];
+    let run_id = Uuid::new_v4().to_string();
+    let thread_id = Uuid::new_v4().to_string();
+    let snapshot_frame = Some(Bytes::from(
+        frame_event(&snapshot_event(vec![user_msg("test message")])).expect("snapshot frame"),
+    ));
+
+    let stream = build_promptless_event_stream(
+        &run_id,
+        &thread_id,
+        snapshot_frame,
+        tokio_stream::empty(),
+        false,
+        None,
+        Some(&log_entries),
+        None,
+    );
+    let events = decode_sse_bytes_chunks(tokio_stream::StreamExt::collect::<Vec<_>>(stream).await);
+
+    assert_event_type_sequence(
+        &events,
+        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "CUSTOM", "RUN_FINISHED"],
+    );
+    let start_event = &events[2];
+    assert_eq!(start_event["name"], "sub_agent_started");
+    assert_eq!(start_event["value"]["agent"], "researcher");
+    assert_eq!(start_event["value"]["session_id"], "child-session-123");
+    assert_eq!(start_event["value"]["invocation_id"], "invocation-456");
+    assert_eq!(start_event["value"]["tool_call_id"], "tool-call-789");
+    assert_eq!(
+        start_event["value"]["started_at"],
+        "2026-09-09T05:15:30+00:00"
+    );
+}
+
+/// Test that idle-remote path emits hydrated control events.
+/// Uses completed_remote_stream (the idle-remote builder) directly with seeded control frames.
+#[tokio::test]
+async fn idle_remote_path_emits_hydrated_control_events() {
+    use harnx_core::session::SessionLogEntry;
+
+    let thread_id = Uuid::new_v4().to_string();
+    let run_id = Uuid::new_v4().to_string();
+
+    // Seed durable log with HandoffCommitted
+    let log_entries = vec![(
+        1u64,
+        SessionLogEntry::HandoffCommitted {
+            target_agent: "remote-agent".to_string(),
+            target_session_id: "remote-session-456".to_string(),
+            handoff_tool_call_id: Some("call-remote".to_string()),
+        },
+    )];
+
+    // Generate control frames using the hydration function
+    let control_events = control_snapshot_events(&log_entries, None);
+    let control_frames: Vec<Bytes> = control_events
+        .into_iter()
+        .filter_map(|e| frame_event(&e).ok().map(Bytes::from))
+        .collect();
+
+    // Build the idle-remote stream using completed_remote_stream
+    let started_frame = Bytes::from(frame_run_boundary_event("RUN_STARTED", &thread_id, &run_id));
+    let snapshot_frame = Some(Bytes::from(
+        frame_event(&snapshot_event(vec![user_msg("remote test")])).expect("snapshot frame"),
+    ));
+
+    let stream = crate::ag_ui_remote_follow::completed_remote_stream(
+        started_frame,
+        snapshot_frame,
+        control_frames,
+        &thread_id,
+        &run_id,
+    );
+
+    // Collect and parse
+    let frames = tokio_stream::StreamExt::collect::<Vec<_>>(stream).await;
+    let events = decode_sse_bytes_chunks(frames);
+
+    // Assert sequence: RUN_STARTED, MESSAGES_SNAPSHOT, CUSTOM (handoff), RUN_FINISHED
+    assert_event_type_sequence(
+        &events,
+        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "CUSTOM", "RUN_FINISHED"],
+    );
+
+    // Assert handoff CUSTOM event carries marker identity
+    let handoff_event = &events[2];
+    assert_eq!(handoff_event["name"], "session_handoff");
+    assert_eq!(handoff_event["value"]["agent"], "remote-agent");
+    assert_eq!(handoff_event["value"]["session_id"], "remote-session-456");
+    assert_eq!(
+        handoff_event["value"]["handoff_tool_call_id"],
+        "call-remote"
     );
 }

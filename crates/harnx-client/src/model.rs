@@ -20,10 +20,29 @@ pub fn models_for_client_config(
     models
 }
 
+/// Map a client type to the catalog block it should inherit models from.
+///
+/// Most clients use the block whose `provider` matches their type. Two
+/// exceptions borrow another provider's catalog so users get the full model
+/// list (context sizes, pricing, capabilities, the `responses` endpoint)
+/// automatically as `models.yaml` is regenerated, with no per-user upkeep:
+/// - `openai-compatible` clients match by provider-name prefix.
+/// - `codex` (ChatGPT subscription) reuses the `openai` catalog, since it
+///   speaks the same OpenAI Responses API and serves the same models.
+fn catalog_provider_for(client_type: &str) -> &str {
+    match client_type {
+        "codex" => "openai",
+        other => other,
+    }
+}
+
 fn provider_catalog(client_type: &str, client_name: &str) -> Option<&'static ProviderModels> {
+    let catalog_provider = catalog_provider_for(client_type);
+    // Package clients keep the same provider prefix as their bare filename.
+    let bare_name = client_name.rsplit('/').next().unwrap_or(client_name);
     ALL_PROVIDER_MODELS.iter().find(|provider| {
-        provider.provider == client_type
-            || (client_type == "openai-compatible" && client_name.starts_with(&provider.provider))
+        provider.provider == catalog_provider
+            || (client_type == "openai-compatible" && bare_name.starts_with(&provider.provider))
     })
 }
 
@@ -104,7 +123,7 @@ pub fn retrieve_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{list_all_models, ClientConfig, OpenAIConfig};
+    use crate::{list_all_models, ClientConfig, CodexConfig, OpenAIConfig};
     use harnx_core::model::ModelData;
 
     fn openai_with_models(names: &[&str]) -> ClientConfig {
@@ -113,6 +132,54 @@ mod tests {
             models: names.iter().map(|name| ModelData::new(name)).collect(),
             ..OpenAIConfig::default()
         })
+    }
+
+    #[test]
+    fn codex_client_inherits_openai_model_catalog() {
+        // No models declared: the codex client should still resolve OpenAI
+        // catalog models (with the responses endpoint + capabilities) so users
+        // get new models automatically from harnx updates, not manual config.
+        let clients = vec![ClientConfig::CodexConfig(CodexConfig {
+            name: "codex".to_string(),
+            ..CodexConfig::default()
+        })];
+
+        let model = retrieve_model(&clients, "codex:gpt-5", ModelType::Chat)
+            .expect("codex client should resolve gpt-5 from the OpenAI catalog");
+
+        assert_eq!(model.endpoint(), Some("responses"));
+        assert!(model.supports_tool_use());
+        assert!(model.max_input_tokens().is_some());
+        assert!(
+            list_all_models(&clients)
+                .iter()
+                .any(|model| model.id() == "codex:gpt-5"),
+            "catalog models should be listed under the codex client name"
+        );
+    }
+
+    #[test]
+    fn package_compatible_clients_inherit_catalog_and_keep_local_overrides() {
+        let mut override_model = ModelData::new("zai.glm-5");
+        override_model.max_input_tokens = Some(12345);
+        for name in ["bedrock", "pantheon/bedrock", "coding/bedrock-us"] {
+            let models = models_for_client_config(
+                "openai-compatible",
+                name,
+                &[override_model.clone()],
+                None,
+            );
+            let glm = models.iter().find(|m| m.name() == "zai.glm-5").unwrap();
+            assert_eq!(glm.client_name(), name);
+            assert_eq!(glm.max_input_tokens(), Some(12345));
+            let minimax = models
+                .iter()
+                .find(|m| m.name() == "minimax.minimax-m2.5")
+                .expect("inherited Bedrock model");
+            assert_eq!(minimax.client_name(), name);
+            assert!(minimax.supports_tool_use());
+            assert_eq!(minimax.max_input_tokens(), Some(196000));
+        }
     }
 
     #[test]

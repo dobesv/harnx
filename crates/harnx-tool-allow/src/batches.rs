@@ -96,6 +96,11 @@ fn add_home_dev_rules(rules: &mut Vec<AllowRule>, env: &AllowEnv) {
         ".local/share/opencode",
         ".local/share/pipx",
         ".rustup",
+        // Corepack spawns the pinned pnpm/yarn release straight out of this
+        // cache, and since pnpm 12 that release is a native binary rather than a
+        // script run via node. Exec-only keeps it runnable while revoking the
+        // write it would otherwise inherit from ~/.cache.
+        ".cache/node/corepack",
     ];
     const HOME_WRITE: &[&str] = &[
         ".cache",
@@ -382,6 +387,23 @@ mod tests {
             "/home/tester/.config/go",
             Permission::ReadWriteExec
         ));
+    }
+
+    /// Corepack runs the pinned package manager out of this cache, so it needs
+    /// exec; granting write too would let sandboxed code replace a binary the host
+    /// runs later.
+    #[cfg(unix)]
+    #[test]
+    fn dev_tools_grants_corepack_cache_exec_without_write() {
+        let env = AllowEnv {
+            home: Some(PathBuf::from("/home/tester")),
+            ..Default::default()
+        };
+        let rules = dev_tools(&env);
+        let corepack = "/home/tester/.cache/node/corepack";
+        assert!(has(&rules, corepack, Permission::ReadExec));
+        assert!(!has(&rules, corepack, Permission::ReadWrite));
+        assert!(!has(&rules, corepack, Permission::ReadWriteExec));
     }
 
     #[cfg(unix)]

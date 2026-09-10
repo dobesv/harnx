@@ -374,9 +374,15 @@ fn completed_tool_result(
     content: Vec<harnx_core::message::MessageContentPart>,
     execution_context: Option<harnx_core::execution_context::ExecutionContextObservation>,
 ) -> ToolResult {
+    let tool_call_id = call.id.clone();
     let mut result = ToolResult::new(call, output);
     result.content = content;
     result.switch_agent = detect_switch_agent(&result.output);
+    if let Some(switch_agent) = &mut result.switch_agent {
+        if switch_agent.tool_call_id.is_none() {
+            switch_agent.tool_call_id = tool_call_id;
+        }
+    }
     result.execution_context = execution_context;
     result
 }
@@ -396,6 +402,11 @@ fn detect_switch_agent(output: &Value) -> Option<SwitchAgentData> {
             .and_then(|v| v.as_str())
             .filter(|session_id| !session_id.trim().is_empty())
             .map(ToString::to_string),
+        tool_call_id: obj
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.trim().is_empty())
+            .map(ToString::to_string),
     })
 }
 
@@ -403,6 +414,7 @@ async fn call_tool_with_tracing(
     provider: &dyn ToolProvider,
     tool_name: &str,
     json_data: Value,
+    tool_call_id: Option<&str>,
     abort_signal: &AbortSignal,
 ) -> Result<ToolProviderOutput, ToolError> {
     let span = tracing::info_span!(
@@ -419,7 +431,7 @@ async fn call_tool_with_tracing(
         span.record("harnx.tool.arguments_bytes", arguments_bytes);
     }
     let result = provider
-        .call_tool(tool_name, json_data, abort_signal)
+        .call_tool_with_id(tool_name, json_data, tool_call_id, abort_signal)
         .instrument(span.clone())
         .await;
     if result.is_err() {
@@ -482,6 +494,7 @@ async fn dispatch_tool_call(
             "agent": agent,
             "prompt": prompt,
             "session_id": session_id,
+            "tool_call_id": call.id,
         })
         .into());
     }
@@ -495,6 +508,7 @@ async fn dispatch_tool_call(
             provider.as_ref(),
             &tool_name,
             json_data.clone(),
+            call.id.as_deref(),
             abort_signal,
         )
         .await;
@@ -1281,6 +1295,65 @@ mod tests {
                 panic!("handoff dispatch should succeed: {err:#}")
             }
         }
+    }
+
+    #[test]
+    fn provider_handoff_inherits_tool_call_id_when_result_omits_it() {
+        let call = ToolCall::new(
+            "remote_handoff".to_string(),
+            json!({}),
+            Some("provider-call-123".to_string()),
+            None,
+        );
+        let result = completed_tool_result(
+            call,
+            json!({
+                "action": "switch_agent",
+                "agent": "target-agent",
+                "prompt": "continue work"
+            }),
+            Vec::new(),
+            None,
+        );
+
+        assert_eq!(
+            result
+                .switch_agent
+                .expect("handoff result")
+                .tool_call_id
+                .as_deref(),
+            Some("provider-call-123")
+        );
+    }
+
+    #[test]
+    fn provider_handoff_keeps_result_tool_call_id() {
+        let call = ToolCall::new(
+            "remote_handoff".to_string(),
+            json!({}),
+            Some("request-call-123".to_string()),
+            None,
+        );
+        let result = completed_tool_result(
+            call,
+            json!({
+                "action": "switch_agent",
+                "agent": "target-agent",
+                "prompt": "continue work",
+                "tool_call_id": "result-call-456"
+            }),
+            Vec::new(),
+            None,
+        );
+
+        assert_eq!(
+            result
+                .switch_agent
+                .expect("handoff result")
+                .tool_call_id
+                .as_deref(),
+            Some("result-call-456")
+        );
     }
 
     #[tokio::test]
