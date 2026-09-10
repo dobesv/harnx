@@ -217,7 +217,7 @@ impl Client for BedrockClient {
     ) -> Result<ChatCompletionsOutput> {
         let creds = self.resolve_credentials().await?;
         let builder = self.chat_completions_builder(client, data, &creds)?;
-        chat_completions(builder).await
+        chat_completions(builder, &self.model).await
     }
 
     async fn chat_completions_streaming_inner(
@@ -228,7 +228,7 @@ impl Client for BedrockClient {
     ) -> Result<()> {
         let creds = self.resolve_credentials().await?;
         let builder = self.chat_completions_builder(client, data, &creds)?;
-        chat_completions_streaming(builder, handler).await
+        chat_completions_streaming(builder, handler, &self.model).await
     }
 
     async fn embeddings_inner(
@@ -242,7 +242,7 @@ impl Client for BedrockClient {
     }
 }
 
-async fn chat_completions(builder: RequestBuilder) -> Result<ChatCompletionsOutput> {
+async fn chat_completions(builder: RequestBuilder, model: &Model) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
     let retry_after = parse_retry_after(res.headers());
@@ -254,7 +254,7 @@ async fn chat_completions(builder: RequestBuilder) -> Result<ChatCompletionsOutp
 
     debug!("non-stream-data: {data}");
     harnx_core::llm_trace::response("bedrock", &data);
-    extract_chat_completions(&data)
+    extract_chat_completions(&data, model)
 }
 
 /// Mutable accumulator state for the Bedrock streaming parser.
@@ -264,12 +264,23 @@ struct BedrockStreamState {
     function_name: String,
     function_arguments: String,
     function_id: String,
+    model_real_name: String,
     /// Accumulated signature from `reasoningContent.signature` deltas for
     /// the current reasoning block. Passed to each toolUse emitted in the
     /// same turn so the serialiser can echo it back verbatim on the next
     /// request — Bedrock (and the underlying Anthropic API) rejects
     /// reasoning round-trips whose signature is missing or modified.
     thinking_signature: String,
+}
+
+
+impl BedrockStreamState {
+    fn for_model(model: &Model) -> Self {
+        Self {
+            model_real_name: model.real_name().to_string(),
+            ..Default::default()
+        }
+    }
 }
 
 fn bedrock_emit_pending_tool_call(
@@ -293,12 +304,23 @@ fn bedrock_emit_pending_tool_call(
     } else {
         Some(state.thinking_signature.clone())
     };
-    handler.tool_call(ToolCall::new(
-        state.function_name.clone(),
-        arguments,
-        Some(state.function_id.clone()),
-        thought_signature,
-    ))?;
+    // Tag provenance for Anthropic thinking signatures via Bedrock (issue #1804)
+    let provenance = thought_signature.as_ref().map(|_| {
+        use harnx_core::tool::{ReasoningProtocol, ReasoningProvenance};
+        ReasoningProvenance {
+            protocol: ReasoningProtocol::AnthropicThinking,
+            model: Some(state.model_real_name.clone()),
+        }
+    });
+    handler.tool_call(
+        ToolCall::new(
+            state.function_name.clone(),
+            arguments,
+            Some(state.function_id.clone()),
+            thought_signature,
+        )
+        .with_provenance(provenance),
+    )?;
     state.function_name.clear();
     state.function_arguments.clear();
     state.function_id.clear();
@@ -361,16 +383,7 @@ fn bedrock_handle_content_block_stop(
     state: &mut BedrockStreamState,
     handler: &mut SseHandler,
 ) -> Result<()> {
-    // Emit if a toolUse block is pending, and reset accumulators so the
-    // fallback emit path in contentBlockStart doesn't re-fire this same
-    // call when the next toolUse block begins. Same bug that affected
-    // the Claude streaming parser (both follow Anthropic's content-block
-    // protocol).
-    //
-    // Reasoning-block close brackets are no longer emitted here — the
-    // SseHandler's `thought()` / `text()` / `tool_call()` / `done()`
-    // methods manage `<think>...</think>` display framing themselves now
-    // that reasoning text flows through `thought_buffer`.
+    // Emit if a toolUse block is pending. Same bug fix as Claude.
     bedrock_emit_pending_tool_call(state, handler)
 }
 
@@ -414,6 +427,7 @@ fn bedrock_handle_stream_event(
 async fn chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
+    model: &Model,
 ) -> Result<()> {
     let res = builder.send().await?;
     let status = res.status();
@@ -424,7 +438,7 @@ async fn chat_completions_streaming(
         bail!("Invalid response data: {data}");
     }
 
-    let mut state = BedrockStreamState::default();
+    let mut state = BedrockStreamState::for_model(model);
 
     let mut stream = res.bytes_stream();
     let mut buffer = BytesMut::new();
@@ -496,6 +510,7 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
     } = data;
 
     let system_message = extract_system_message(&mut messages);
+    let mut tool_call_ids = crate::tool_call_id::ToolCallIdAllocator::new(&messages);
 
     let mut network_image_urls = vec![];
 
@@ -560,28 +575,30 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
                     let mut assistant_parts = vec![];
                     let mut user_parts = vec![];
                     if let Some(thought_text) = thought {
+                        // Check signature compatibility (issue #1804)
+                        let sig_result = tool_results.first().and_then(|r| {
+                            r.call.compatible_signature(
+                                harnx_core::tool::ReasoningProtocol::AnthropicThinking,
+                                model.real_name(),
+                            )
+                        });
                         // Echo the reasoningContent block verbatim so
                         // Bedrock knows this assistant turn included
-                        // extended thinking. The signature is stored on
-                        // each tool call in the turn — omitting it
-                        // causes the model to treat its own tool calls
-                        // as coming from a "previous session" and
-                        // produce replay-confusion hallucinations.
-                        let signature = tool_results
-                            .first()
-                            .and_then(|r| r.call.thought_signature.as_deref())
-                            .unwrap_or("");
-                        let mut reasoning_text = json!({ "text": thought_text });
-                        if !signature.is_empty() {
-                            if let Some(obj) = reasoning_text.as_object_mut() {
-                                obj.insert("signature".to_string(), signature.into());
-                            }
+                        // extended thinking. Only emit if signature is
+                        // compatible (same-provider).
+                        if let Some(signature) = sig_result {
+                            let reasoning_text = json!({
+                                "text": thought_text,
+                                "signature": signature
+                            });
+                            assistant_parts.push(json!({
+                                "reasoningContent": {
+                                    "reasoningText": reasoning_text,
+                                }
+                            }));
                         }
-                        assistant_parts.push(json!({
-                            "reasoningContent": {
-                                "reasoningText": reasoning_text,
-                            }
-                        }));
+                        // If signature incompatible, omit the reasoningContent block entirely.
+                        // Foreign/placeholder signature → 400.
                     }
                     if !text.is_empty() {
                         assistant_parts.push(json!({
@@ -589,9 +606,10 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
                         }))
                     }
                     for tool_result in tool_results {
+                        let correlation_id = tool_call_ids.id_for(&tool_result.call);
                         assistant_parts.push(json!({
                             "toolUse": {
-                                "toolUseId": tool_result.call.id,
+                                "toolUseId": correlation_id.clone(),
                                 "name": tool_result.call.name,
                                 "input": tool_result.call.arguments,
                             }
@@ -620,7 +638,7 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
                         }
                         user_parts.push(json!({
                             "toolResult": {
-                                "toolUseId": tool_result.call.id,
+                                "toolUseId": correlation_id,
                                 "content": tr_content,
                             }
                         }));
@@ -690,7 +708,7 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
     Ok(body)
 }
 
-fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
+fn extract_chat_completions(data: &Value, model: &Model) -> Result<ChatCompletionsOutput> {
     let mut text = String::new();
     let mut reasoning: Option<String> = None;
     let mut reasoning_signature: Option<String> = None;
@@ -731,9 +749,15 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     // Attach the reasoning signature to every tool call in this turn.
     // Bedrock requires the signature echoed back verbatim alongside the
     // reasoningContent block.
+    // Tag provenance for Anthropic thinking signatures via Bedrock (issue #1804).
     if let Some(sig) = &reasoning_signature {
+        let provenance = harnx_core::tool::ReasoningProvenance {
+            protocol: harnx_core::tool::ReasoningProtocol::AnthropicThinking,
+            model: Some(model.real_name().to_string()),
+        };
         for call in &mut tool_calls {
             call.thought_signature = Some(sig.clone());
+            call.reasoning_provenance = Some(provenance.clone());
         }
     }
 
@@ -922,7 +946,8 @@ mod tests {
                 "cacheWriteInputTokens": 20
             }
         });
-        let output = extract_chat_completions(&response)
+        let model = Model::new("bedrock", "anthropic.claude-3-5-sonnet");
+        let output = extract_chat_completions(&response, &model)
             .expect("non-streaming Bedrock response should parse");
         let expected = CompletionTokenUsage {
             input_tokens: 100,
@@ -935,12 +960,7 @@ mod tests {
         let (tx, _rx) = unbounded_channel();
         let mut handler = SseHandler::new(tx, create_abort_signal());
         let mut state = BedrockStreamState::default();
-        bedrock_handle_stream_event(
-            &mut state,
-            &mut handler,
-            "metadata",
-            &json!({"usage": response["usage"].clone()}),
-        )
+        bedrock_handle_stream_event(&mut state, &mut handler, "metadata", &json!({"usage": response["usage"].clone()}))
         .expect("streaming Bedrock metadata should parse");
         let (_, _, _, usage) = handler.take();
         assert_usage(&usage, &expected);
@@ -1183,19 +1203,14 @@ mod tests {
         AWS_CREDENTIALS.write().shift_remove(client_name);
     }
 
-    #[test]
-    fn bedrock_streaming_thought_roundtrips_into_next_request_body() {
-        use harnx_core::api_types::ChatCompletionsData;
-        use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+    fn drive_bedrock_reasoning_stream(
+    ) -> (String, Option<String>, Vec<harnx_core::tool::ToolCall>) {
         use harnx_core::model::Model;
-        use harnx_core::tool::ToolResult;
 
         let (tx, _rx) = unbounded_channel();
         let mut handler = SseHandler::new(tx, create_abort_signal());
-        let mut state = BedrockStreamState::default();
-
-        // Realistic Bedrock Converse Stream sequence: reasoning block
-        // (multi-chunk text + trailing signature delta) then a toolUse.
+        let model = Model::new("bedrock", "anthropic.claude-3-5-sonnet");
+        let mut state = BedrockStreamState::for_model(&model);
         let events: Vec<(&str, Value)> = vec![
             ("contentBlockStart", json!({"start": {}})),
             (
@@ -1227,6 +1242,53 @@ mod tests {
         }
 
         let (text, thought, tool_calls, _usage) = handler.take();
+        (text, thought, tool_calls)
+    }
+
+    fn build_bedrock_reasoning_roundtrip_body(
+        text: String,
+        thought: Option<String>,
+        tool_calls: Vec<harnx_core::tool::ToolCall>,
+    ) -> Value {
+        use harnx_core::api_types::ChatCompletionsData;
+        use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+        use harnx_core::model::Model;
+        use harnx_core::tool::ToolResult;
+
+        let tool_result = ToolResult::new(tool_calls.into_iter().next().unwrap(), json!("ok"));
+        let messages = vec![
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text("Run a command".to_string()),
+            ),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![tool_result],
+                    text,
+                    thought,
+                )),
+            ),
+        ];
+        let mut model = Model::new("bedrock", "us.anthropic.claude-sonnet-4-6");
+        model.set_max_tokens(Some(4096), true);
+        build_chat_completions_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: true,
+                attachments_dir: None,
+            },
+            &model,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bedrock_streaming_thought_reaches_tool_call_signature() {
+        let (text, thought, tool_calls) = drive_bedrock_reasoning_stream();
 
         assert_eq!(
             thought.as_deref(),
@@ -1246,39 +1308,12 @@ mod tests {
             "Bedrock streaming reasoningContent.signature must reach \
              ToolCall.thought_signature"
         );
+    }
 
-        // Now simulate what the agent loop does: build a ToolCalls message
-        // from (text, thought, tool_calls), then build the next request body.
-        let tool_result = ToolResult::new(tool_calls.into_iter().next().unwrap(), json!("ok"));
-        let messages = vec![
-            Message::new(
-                MessageRole::User,
-                MessageContent::Text("Run a command".to_string()),
-            ),
-            Message::new(
-                MessageRole::Tool,
-                MessageContent::ToolCalls(MessageContentToolCalls::new(
-                    vec![tool_result],
-                    text,
-                    thought,
-                )),
-            ),
-        ];
-        let mut model = Model::new("bedrock", "us.anthropic.claude-sonnet-4-6");
-        model.set_max_tokens(Some(4096), true);
-        let body = build_chat_completions_body(
-            ChatCompletionsData {
-                messages,
-                temperature: None,
-                top_p: None,
-                functions: None,
-                stream: true,
-                attachments_dir: None,
-            },
-            &model,
-        )
-        .unwrap();
-
+    #[test]
+    fn bedrock_streaming_thought_roundtrips_into_next_request_body() {
+        let (text, thought, tool_calls) = drive_bedrock_reasoning_stream();
+        let body = build_bedrock_reasoning_roundtrip_body(text, thought, tool_calls);
         let assistant_msg = body["messages"]
             .as_array()
             .unwrap()
@@ -1288,9 +1323,6 @@ mod tests {
         let content = assistant_msg["content"]
             .as_array()
             .expect("assistant content array");
-
-        // Find the reasoningContent block — it must exist and precede the
-        // toolUse so Bedrock can verify the reasoning matches the request.
         let reasoning_idx = content
             .iter()
             .position(|b| b["reasoningContent"].is_object())
@@ -1396,7 +1428,8 @@ mod tests {
             "usage": {"inputTokens": 1, "outputTokens": 1}
         });
 
-        let output = extract_chat_completions(&response).unwrap();
+        let model = Model::new("bedrock", "anthropic.claude-3-5-sonnet");
+        let output = extract_chat_completions(&response, &model).unwrap();
         assert_eq!(
             output.thought.as_deref(),
             Some("two calls"),
@@ -1459,12 +1492,7 @@ mod tests {
     fn bedrock_tool_result_with_image_appends_image_block() {
         use harnx_core::tool::ToolResult;
         let model = Model::new("bedrock", "us.anthropic.claude-sonnet-4-6");
-        let tool_call = ToolCall {
-            id: Some("toolu_XYZ".to_string()),
-            name: "fs_read".to_string(),
-            arguments: json!({"path": "foo.png"}),
-            thought_signature: None,
-        };
+        let tool_call = ToolCall::new("fs_read".to_string(), json!({"path": "foo.png"}), Some("toolu_XYZ".to_string()), None);
         let mut tool_result = ToolResult::new(tool_call, json!("output text"));
         tool_result.content.push(MessageContentPart::ImageUrl {
             image_url: crate::ImageUrl {
@@ -1529,5 +1557,112 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn bedrock_producers_tag_anthropic_provenance_on_streaming_and_non_streaming() {
+        use harnx_core::tool::{ReasoningProtocol, ReasoningProvenance};
+
+        let model = Model::new("bedrock", "bedrock-provenance-model");
+        let response = json!({
+            "output": {"message": {"content": [
+                {"reasoningContent": {"reasoningText": {"text": "plan", "signature": "non-stream-sig"}}},
+                {"toolUse": {"toolUseId": "toolu_non_stream", "name": "Bash", "input": {"command": "pwd"}}}
+            ]}},
+            "usage": {"inputTokens": 1, "outputTokens": 1}
+        });
+        let output = extract_chat_completions(&response, &model).unwrap();
+        assert_eq!(
+            output.tool_calls[0].reasoning_provenance,
+            Some(ReasoningProvenance {
+                protocol: ReasoningProtocol::AnthropicThinking,
+                model: Some("bedrock-provenance-model".to_string()),
+            })
+        );
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = BedrockStreamState::for_model(&model);
+        for (kind, event) in [
+            ("contentBlockStart", json!({"start": {}})),
+            ("contentBlockDelta", json!({"delta": {"reasoningContent": {"text": "plan"}}})),
+            ("contentBlockDelta", json!({"delta": {"reasoningContent": {"signature": "stream-sig"}}})),
+            ("contentBlockStop", json!({})),
+            ("contentBlockStart", json!({"start": {"toolUse": {"toolUseId": "toolu_stream", "name": "Bash"}}})),
+            ("contentBlockDelta", json!({"delta": {"toolUse": {"input": "{\"command\":\"pwd\"}"}}})),
+            ("contentBlockStop", json!({})),
+        ] {
+            bedrock_handle_stream_event(&mut state, &mut handler, kind, &event).unwrap();
+        }
+        assert_eq!(
+            handler.tool_calls()[0].reasoning_provenance,
+            Some(ReasoningProvenance {
+                protocol: ReasoningProtocol::AnthropicThinking,
+                model: Some("bedrock-provenance-model".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn bedrock_builder_imports_legacy_history_and_synthesizes_matching_ids() {
+        use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+        use harnx_core::tool::{ToolCall, ToolResult};
+
+        let legacy: ToolCall = serde_yaml::from_str(
+            "name: Legacy\narguments: {}\nthought_signature: legacy-sig\n",
+        )
+        .unwrap();
+        let messages = vec![
+            Message::new(MessageRole::User, MessageContent::Text("run".into())),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![ToolResult::new(legacy, json!({"ok": true}))],
+                    String::new(),
+                    Some("legacy thought".to_string()),
+                )),
+            ),
+        ];
+        let body = build_chat_completions_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+                attachments_dir: None,
+            },
+            &Model::new("bedrock", "anthropic.claude-sonnet"),
+        )
+        .unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        let assistant = messages.iter().find(|message| message["role"] == "assistant").unwrap();
+        let user = messages
+            .iter()
+            .find(|message| {
+                message["content"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|part| part["toolResult"].is_object()))
+            })
+            .unwrap();
+        assert!(assistant["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|part| !part["reasoningContent"].is_object()));
+        let call_id = assistant["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|part| part["toolUse"]["toolUseId"].as_str())
+            .unwrap();
+        let result_id = user["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|part| part["toolResult"]["toolUseId"].as_str())
+            .unwrap();
+        assert!(!call_id.is_empty());
+        assert_eq!(call_id, result_id);
     }
 }

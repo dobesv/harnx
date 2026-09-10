@@ -414,12 +414,12 @@ summarize\n";
                     thought: None,
                     sequence: false,
                     tool_results: vec![ToolResult {
-                        call: ToolCall {
-                            name: "bash".into(),
-                            arguments: json!({"cmd": "ls"}),
-                            id: Some("c1".into()),
-                            thought_signature: None,
-                        },
+                        call: ToolCall::new(
+                            "bash".into(),
+                            json!({"cmd": "ls"}),
+                            Some("c1".into()),
+                            None,
+                        ),
                         output: json!({"_meta": {"harnx.dev/compaction": "3 files"}}),
                         markdown: None,
                         content: vec![],

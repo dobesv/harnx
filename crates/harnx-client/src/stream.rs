@@ -169,13 +169,18 @@ impl SseHandler {
     /// Attach thought_signature to tool calls that were emitted before
     /// reasoning.encrypted_content arrived. This supports the streaming case
     /// where function_call_arguments.done arrives before reasoning.output_item.done.
-    pub fn attach_thought_signature_to_pending_tool_calls(&mut self, signature: String) {
-        // Attach to all tool calls that don't already have a thought_signature
-        for call in &mut self.tool_calls {
-            if call.thought_signature.is_none() {
+    pub fn attach_thought_signature_to_pending_tool_calls(
+        &mut self,
+        signature: String,
+        provenance: harnx_core::tool::ReasoningProvenance,
+    ) {
+        self.tool_calls
+            .iter_mut()
+            .filter(|call| call.thought_signature.is_none())
+            .for_each(|call| {
                 call.thought_signature = Some(signature.clone());
-            }
-        }
+                call.reasoning_provenance = Some(provenance.clone());
+            });
     }
 
     pub fn set_usage(&mut self, usage: StreamingUsage) {

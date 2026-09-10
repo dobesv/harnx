@@ -1469,12 +1469,12 @@ prompt: summary
         // an interrupted session or one resumed after Ctrl-C).
         let input1 =
             crate::config::input::from_str(&global_config, "original query", Some(agent.clone()));
-        let call = ToolCall {
-            name: "Bash".to_string(),
-            arguments: json!({"command": "ls"}),
-            id: Some("c1".to_string()),
-            thought_signature: None,
-        };
+        let call = ToolCall::new(
+            "Bash".to_string(),
+            json!({"command": "ls"}),
+            Some("c1".to_string()),
+            None,
+        );
         let result = ToolResult::new(call.clone(), json!({"stdout": "file1\n"}));
         super::add_tool_calls(&mut session, &input1, "running bash", None, &[call]).unwrap();
         super::add_tool_results(&mut session, &[result])
@@ -1528,12 +1528,12 @@ prompt: summary
         // Build a session ending in a Tool message.
         let input1 =
             crate::config::input::from_str(&global_config, "original query", Some(agent.clone()));
-        let call = ToolCall {
-            name: "Bash".to_string(),
-            arguments: json!({"command": "ls"}),
-            id: Some("c2".to_string()),
-            thought_signature: None,
-        };
+        let call = ToolCall::new(
+            "Bash".to_string(),
+            json!({"command": "ls"}),
+            Some("c2".to_string()),
+            None,
+        );
         let result = ToolResult::new(call.clone(), json!({"stdout": "file1\n"}));
         super::add_tool_calls(&mut session, &input1, "running bash", None, &[call]).unwrap();
         super::add_tool_results(&mut session, &[result])
@@ -2436,12 +2436,12 @@ replacements:
             crate::config::input::from_str(&global_config, "do work", Some(agent.clone()));
         input.set_injected_user_text("queued message".to_string());
 
-        let call_a = ToolCall {
-            name: "tool_a".to_string(),
-            arguments: json!({}),
-            id: Some("a1".to_string()),
-            thought_signature: None,
-        };
+        let call_a = ToolCall::new(
+            "tool_a".to_string(),
+            json!({}),
+            Some("a1".to_string()),
+            None,
+        );
         super::add_tool_calls(
             &mut session,
             &input,
@@ -2454,12 +2454,12 @@ replacements:
 
         // Without the agent_loop clearing `injected_user_text` between rounds,
         // the SAME `input` reused for round 2 reapplies the injection.
-        let call_b = ToolCall {
-            name: "tool_b".to_string(),
-            arguments: json!({}),
-            id: Some("b1".to_string()),
-            thought_signature: None,
-        };
+        let call_b = ToolCall::new(
+            "tool_b".to_string(),
+            json!({}),
+            Some("b1".to_string()),
+            None,
+        );
         super::add_tool_calls(
             &mut session,
             &input,
@@ -2485,12 +2485,12 @@ replacements:
         // restores the desired one-copy-per-injection behavior.
         let mut input_cleared = input.clone();
         input_cleared.injected_user_text = None;
-        let call_c = ToolCall {
-            name: "tool_c".to_string(),
-            arguments: json!({}),
-            id: Some("c1".to_string()),
-            thought_signature: None,
-        };
+        let call_c = ToolCall::new(
+            "tool_c".to_string(),
+            json!({}),
+            Some("c1".to_string()),
+            None,
+        );
         super::add_tool_calls(
             &mut session,
             &input_cleared,
@@ -2543,12 +2543,12 @@ replacements:
         let input = crate::config::input::from_str(&global_config, &user_text, Some(agent));
 
         // Round 1: save a tool round to the session as the agent loop would.
-        let call = ToolCall {
-            name: "Read".to_string(),
-            arguments: json!({"path": "/tmp/x"}),
-            id: Some("toolu_round1".to_string()),
-            thought_signature: None,
-        };
+        let call = ToolCall::new(
+            "Read".to_string(),
+            json!({"path": "/tmp/x"}),
+            Some("toolu_round1".to_string()),
+            None,
+        );
         super::add_tool_calls(
             &mut session,
             &input,
@@ -2571,12 +2571,12 @@ replacements:
         assert_eq!(session.messages.last().unwrap().role, MessageRole::Tool);
 
         let result = ToolResult::new(
-            ToolCall {
-                name: "Read".to_string(),
-                arguments: json!({"path": "/tmp/x"}),
-                id: Some("toolu_round1".to_string()),
-                thought_signature: None,
-            },
+            ToolCall::new(
+                "Read".to_string(),
+                json!({"path": "/tmp/x"}),
+                Some("toolu_round1".to_string()),
+                None,
+            ),
             json!({"content": "file body"}),
         );
         let merged_input = input.merge_tool_results(

@@ -192,12 +192,12 @@ mod tests {
     }
 
     fn tool_call(id: &str) -> ToolCall {
-        ToolCall {
-            name: "fs_read".to_string(),
-            arguments: json!({"path": "/workspace/README.md"}),
-            id: Some(id.to_string()),
-            thought_signature: None,
-        }
+        ToolCall::new(
+            "fs_read".to_string(),
+            json!({"path": "/workspace/README.md"}),
+            Some(id.to_string()),
+            None,
+        )
     }
 
     fn result_with_context(call: ToolCall, provenance_call_id: &str) -> ToolResult {

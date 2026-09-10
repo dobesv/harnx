@@ -22,6 +22,7 @@ pub mod gemini_upload;
 pub mod model;
 pub(crate) mod openai_responses;
 pub mod stream;
+mod tool_call_id;
 // Flat re-exports so that the `register_client!` macro — which expands
 // into this module — can resolve `Client`, `Model`, `SseHandler`, etc.
 // via bare names, and so that downstream crates can use

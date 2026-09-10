@@ -18,6 +18,20 @@ use harnx::test_utils::mock_openai_server::{
     MockOpenAiScript, MockOpenAiServer, MockOpenAiToolCall, MockOpenAiTurn,
 };
 
+fn wait_for_completed_turn(mut child: std::process::Child, budget: Duration) -> Result<()> {
+    if let Err(error) = wait_for_exit(&mut child, budget) {
+        let output = child.wait_with_output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stdout.contains("Done!") || !stderr.contains("Usage:") {
+            return Err(error).context(format!(
+                "harnx did not finish the scripted turn\nstdout: {stdout}\nstderr: {stderr}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn write_time_tool_server(harnx_config_dir: &Path, mcp_time_bin: &Path) -> Result<()> {
     let tool_servers_dir = harnx_config_dir.join("tool_servers");
     std::fs::create_dir_all(&tool_servers_dir).context("failed to create tool_servers dir")?;
@@ -298,8 +312,8 @@ fn reasoning_replay_round_trips() -> Result<()> {
         &mcp_time_bin,
     )?;
 
-    let mut child = spawn_oneshot(&paths, &harnx_bin, "please wait one second")?;
-    let _exit_status = wait_for_exit(&mut child, Duration::from_secs(60))?;
+    let child = spawn_oneshot(&paths, &harnx_bin, "please wait one second")?;
+    wait_for_completed_turn(child, Duration::from_secs(15))?;
 
     // VERIFY: Request log is NON-empty (real requests were made)
     let requests = mock.get_request_log();

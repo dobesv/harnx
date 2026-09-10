@@ -436,12 +436,12 @@ mod tests {
         config.session = Some(sess);
         let global_config: GlobalConfig = Arc::new(RwLock::new(config));
 
-        let call = ToolCall {
-            name: "Edit".to_string(),
-            arguments: json!({"file_path": "/tmp/x", "old_string": "a", "new_string": "b"}),
-            id: Some("toolu_round1".to_string()),
-            thought_signature: None,
-        };
+        let call = ToolCall::new(
+            "Edit".to_string(),
+            json!({"file_path": "/tmp/x", "old_string": "a", "new_string": "b"}),
+            Some("toolu_round1".to_string()),
+            None,
+        );
         let result = ToolResult::new(
             call.clone(),
             json!({"content": [{"type": "text", "text": "edited"}]}),
