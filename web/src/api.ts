@@ -1,4 +1,4 @@
-import type { Agent, SessionRef, AgentDetail, JsonRpcResponse, CancelResult, PromptResult } from './types';
+import type { Agent, SessionRef, AgentDetail, JsonRpcResponse, PromptResult } from './types';
 
 const API_BASE = '/v1';
 
@@ -38,43 +38,6 @@ export async function getAgent(agent: string): Promise<AgentDetail> {
   if (!res.ok) throw new Error(`Failed to get agent ${agent}: ${res.statusText}`);
   const json = await res.json() as AgentDetail;
   return json;
-}
-
-export async function cancel(agent: string, session: string): Promise<CancelResult> {
-  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'session/cancel'
-    })
-  });
-
-  // Parse the JSON-RPC body BEFORE checking res.ok: the backend returns
-  // HTTP 400 for an idle-session cancel with a JSON-RPC error body carrying
-  // code -32002, which we treat as a successful no-op. Throwing on !res.ok
-  // first would make that branch unreachable.
-  let json: JsonRpcResponse<CancelResult> | undefined;
-  try {
-    json = await res.json() as JsonRpcResponse<CancelResult>;
-  } catch {
-    json = undefined;
-  }
-
-  if (json?.error) {
-    if (json.error.code === -32002) {
-      // Cancelling an already-idle session is a benign no-op.
-      return { cancelled: true };
-    }
-    throw new Error(`RPC Error: ${json.error.message || json.error.code}`);
-  }
-
-  if (!res.ok) throw new Error(`RPC call failed with HTTP ${res.status}`);
-
-  return json?.result as CancelResult;
 }
 
 export async function uploadAttachment(agent: string, session: string, file: File): Promise<string[]> {
@@ -140,33 +103,23 @@ export async function submitHitlDecision(
 ): Promise<{ applied: boolean }> {
   const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       jsonrpc: '2.0',
       id: 1,
       method: 'session/hitl_decision',
-      params: {
-        tool_call_id: toolCallId,
-        approved,
-        note
-      }
+      params: { tool_call_id: toolCallId, approved, note }
     })
   });
-
   let json: JsonRpcResponse<{ applied: boolean }> | undefined;
   try {
     json = await res.json() as JsonRpcResponse<{ applied: boolean }>;
   } catch {
     json = undefined;
   }
-
-  if (json?.error) {
-    throw new Error(`RPC Error: ${json.error.message || json.error.code}`);
-  }
-
+  if (json?.error) throw new Error(`RPC Error: ${json.error.message || json.error.code}`);
   if (!res.ok) throw new Error(`RPC call failed with HTTP ${res.status}`);
-
   return json?.result || { applied: false };
 }
+
+export { cancel, sessionControl } from './cancellationApi';

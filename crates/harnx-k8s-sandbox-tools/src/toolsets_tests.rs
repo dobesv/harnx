@@ -245,6 +245,7 @@ async fn bound_sandbox(
 #[test]
 fn proxy_schema_adds_an_optional_sandbox_override() {
     let spec = proxy_spec(ToolSpec {
+        cancellation_guarantee: Default::default(),
         name: "read".to_string(),
         description: String::new(),
         input_schema: json!({
@@ -348,6 +349,7 @@ async fn proxy_requires_or_resolves_an_ambient_session_binding() -> Result<()> {
             tool: "exec".to_string(),
             args: json!({"command": "pwd"}),
             context: ToolInvocationContext {
+                operation: None,
                 call_id: "call-1".to_string(),
                 invoking_session_id: Some("session-1".to_string()),
                 capabilities: BTreeSet::from([
@@ -390,6 +392,7 @@ async fn proxy_explicit_override_is_one_call_and_not_forwarded() -> Result<()> {
             tool: "exec".to_string(),
             args: json!({"command": "pwd", "sandbox_id": "claim-explicit"}),
             context: ToolInvocationContext {
+                operation: None,
                 call_id: "call-explicit".to_string(),
                 invoking_session_id: Some("session-1".to_string()),
                 capabilities: BTreeSet::new(),
@@ -424,6 +427,7 @@ async fn proxy_forwards_cancellation_after_the_mcp_call_starts() -> Result<()> {
             tool: "exec".to_string(),
             args: json!({"command": "sleep 30"}),
             context: ToolInvocationContext {
+                operation: None,
                 call_id: "call-cancel".to_string(),
                 invoking_session_id: Some("session-cancel".to_string()),
                 capabilities: BTreeSet::new(),
@@ -455,6 +459,7 @@ async fn release_uses_and_clears_the_ambient_binding() -> Result<()> {
             tool: "release".to_string(),
             args: json!({}),
             context: ToolInvocationContext {
+                operation: None,
                 call_id: "call-2".to_string(),
                 invoking_session_id: Some("session-1".to_string()),
                 capabilities: BTreeSet::new(),
@@ -478,6 +483,7 @@ async fn release_uses_and_clears_the_ambient_binding() -> Result<()> {
             tool: "release".to_string(),
             args: json!({"destroy": true}),
             context: ToolInvocationContext {
+                operation: None,
                 call_id: "call-3".to_string(),
                 invoking_session_id: Some("session-1".to_string()),
                 capabilities: BTreeSet::new(),
@@ -521,6 +527,7 @@ async fn connect_clones_after_a_retry_and_binds_the_session() -> Result<()> {
                 "repos": [{"repo_url": "https://github.com/acme/widgets.git"}]
             }),
             context: ToolInvocationContext {
+                operation: None,
                 call_id: "call-clone".to_string(),
                 invoking_session_id: Some("session-clone".to_string()),
                 capabilities: BTreeSet::new(),
@@ -566,6 +573,7 @@ async fn connect_binds_before_a_cancelled_clone_returns() -> Result<()> {
                 "repos": [{"repo_url": "https://github.com/acme/widgets.git"}]
             }),
             context: ToolInvocationContext {
+                operation: None,
                 call_id: "call-cancelled-clone".to_string(),
                 invoking_session_id: Some("session-cancelled-clone".to_string()),
                 capabilities: BTreeSet::new(),

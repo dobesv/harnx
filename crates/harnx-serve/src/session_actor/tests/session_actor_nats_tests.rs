@@ -444,11 +444,10 @@ async fn assert_first_turn_streamed_and_finished(
 async fn wait_for_cancelled_run(events: &mut tokio::sync::broadcast::Receiver<Event>) {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            if matches!(
-                events.recv().await.expect("cancel turn event"),
-                Event::RunFinished(_)
-            ) {
-                return;
+            match events.recv().await.expect("cancel turn event") {
+                Event::RunFinished(_) => return,
+                Event::RunError(error) => panic!("cancelled run failed: {}", error.message),
+                _ => {}
             }
         }
     })

@@ -111,7 +111,13 @@ fn spawn_subagent_monitor(
     event_tx: UnboundedSender<TuiEvent>,
     key: MonitoredSessionKey,
 ) -> JoinHandle<()> {
-    tokio::spawn(monitor_subagent_session(config, event_tx, key))
+    tokio::spawn(async move {
+        let target = (key.session_id.clone(), key.cluster.clone());
+        tokio::join!(
+            crate::cancellation::monitor_execution(&config, &event_tx, &target),
+            monitor_subagent_session(config.clone(), event_tx.clone(), key)
+        );
+    })
 }
 
 async fn monitor_subagent_session(
@@ -197,7 +203,7 @@ async fn monitor_subagent_attachment(
                         Some(SubAgentStatus::Completed | SubAgentStatus::Failed) => {
                             AttachmentOutcome::Terminal
                         }
-                        Some(SubAgentStatus::Running) | None => AttachmentOutcome::Disconnected,
+                        Some(_) | None => AttachmentOutcome::Disconnected,
                     };
                 }
             }

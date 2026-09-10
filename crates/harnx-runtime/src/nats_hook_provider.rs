@@ -1,3 +1,4 @@
+mod controlled_request;
 use crate::config::{Config, LOCAL_CLUSTER_KEY};
 use anyhow::{Context, Result};
 use async_nats::jetstream::{context::GetStreamErrorKind, ErrorCode};
@@ -23,6 +24,7 @@ const DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// Session data needed to serialize a hook event for a remote hook server.
 #[derive(Clone, Debug)]
 pub struct HookDispatchMeta {
+    pub execution: Option<harnx_execution_control::OperationRef>,
     pub session_id: String,
     pub cwd: PathBuf,
     pub resume_count: u32,
@@ -104,10 +106,7 @@ impl HookRequestDispatcher for NatsHookRequester {
         payload: Vec<u8>,
         timeout: Duration,
     ) -> Result<HookOutcome> {
-        let message = tokio::time::timeout(timeout, self.client.request(subject, payload.into()))
-            .await
-            .context("hook request timed out")??;
-        serde_json::from_slice(&message.payload).context("deserialize hook reply")
+        controlled_request::request(&self.client, subject, payload, timeout).await
     }
 }
 
@@ -305,6 +304,7 @@ impl NatsHookProvider {
                 hook_event: event.clone(),
             };
             let params = BestEffortHookDispatch {
+                execution: meta.execution.clone(),
                 subject,
                 payload,
                 hook: hook.clone(),
@@ -405,7 +405,7 @@ async fn dispatch_pre_tool_use_with(params: PreHookDispatch<'_>, event: &HookEve
             resume_count: params.meta.resume_count,
             hook_event: running_event.clone(),
         };
-        let payload = match serde_json::to_vec(&payload) {
+        let payload = match encode_hook_payload(&payload, params.meta.execution.as_ref()) {
             Ok(payload) => payload,
             Err(error) => {
                 return unavailable_outcome(hook, hook.spec.fail_policy, error);
@@ -464,7 +464,7 @@ async fn dispatch_blocking_event_with(params: EventDispatch<'_>, event: &HookEve
             resume_count: params.meta.resume_count,
             hook_event: event.clone(),
         };
-        let payload = match serde_json::to_vec(&payload) {
+        let payload = match encode_hook_payload(&payload, params.meta.execution.as_ref()) {
             Ok(payload) => payload,
             Err(error) => {
                 return unavailable_outcome(hook, hook.spec.fail_policy, error);
@@ -511,6 +511,7 @@ async fn dispatch_blocking_event_with(params: EventDispatch<'_>, event: &HookEve
 }
 
 struct BestEffortHookDispatch {
+    execution: Option<harnx_execution_control::OperationRef>,
     subject: String,
     payload: HookPayload,
     hook: DiscoveredHook,
@@ -530,7 +531,7 @@ async fn dispatch_one_best_effort_hook(
         .timeout_secs
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_HOOK_TIMEOUT);
-    let payload = match serde_json::to_vec(&params.payload) {
+    let payload = match encode_hook_payload(&params.payload, params.execution.as_ref()) {
         Ok(payload) => payload,
         Err(error) => {
             emit_post_notice(
@@ -796,6 +797,17 @@ async fn bucket_snapshot(
     Ok(hooks)
 }
 
+fn encode_hook_payload(
+    payload: &HookPayload,
+    execution: Option<&harnx_execution_control::OperationRef>,
+) -> serde_json::Result<Vec<u8>> {
+    let mut value = serde_json::to_value(payload)?;
+    if let Some(execution) = execution {
+        value["_harnx_execution"] = serde_json::to_value(execution)?;
+    }
+    serde_json::to_vec(&value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -985,6 +997,7 @@ mod tests {
 
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
+            execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
             resume_count: 0,
@@ -1021,6 +1034,7 @@ mod tests {
 
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
+            execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
             resume_count: 0,
@@ -1050,6 +1064,7 @@ mod tests {
     async fn every_non_tool_event_dispatches_to_its_nats_subject() {
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
+            execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
             resume_count: 0,
@@ -1093,6 +1108,7 @@ mod tests {
         ];
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
+            execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
             resume_count: 0,
@@ -1129,6 +1145,7 @@ mod tests {
         let hooks = vec![hook("server", "Stop", None, 0)];
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
+            execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
             resume_count: 0,
@@ -1187,6 +1204,7 @@ mod tests {
         tokio::spawn(dispatch_one_best_effort_hook(
             dispatcher,
             BestEffortHookDispatch {
+                execution: None,
                 subject: "test.hook.server.SessionStart".to_string(),
                 payload,
                 hook: hook("server", "SessionStart", None, 0),
@@ -1236,6 +1254,7 @@ mod tests {
         tokio::spawn(dispatch_one_best_effort_hook(
             dispatcher,
             BestEffortHookDispatch {
+                execution: None,
                 subject: "subject".to_string(),
                 payload,
                 hook: hook("server", "PostToolUse", None, 0),
@@ -1261,6 +1280,7 @@ mod tests {
             },
             provider: None,
             meta: HookDispatchMeta {
+                execution: None,
                 session_id: "session".to_string(),
                 cwd: PathBuf::from("/tmp"),
                 resume_count: 0,
@@ -1313,6 +1333,7 @@ mod tests {
                 pre_event(json!({"initial": true})),
                 Some(Arc::clone(&pending)),
                 HookDispatchMeta {
+                    execution: None,
                     session_id: "session".to_string(),
                     cwd: PathBuf::from("/tmp"),
                     resume_count: 0,
@@ -1366,6 +1387,7 @@ mod tests {
                 },
                 None,
                 HookDispatchMeta {
+                    execution: None,
                     session_id: "session".to_string(),
                     cwd: PathBuf::from("/tmp"),
                     resume_count: 4,
@@ -1389,6 +1411,7 @@ mod tests {
         let instance_id = ServerScope::from_string("test");
         let hooks = vec![hook("server", "PreToolUse", Some("exec"), 0)];
         let meta = HookDispatchMeta {
+            execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
             resume_count: 7,
@@ -1419,6 +1442,7 @@ mod tests {
         let hooks = vec![hook("approval", "PreToolUse", Some("exec"), 0)];
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
+            execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
             resume_count: 0,
@@ -1450,6 +1474,7 @@ mod tests {
         let provider =
             NatsHookProvider::from_dispatcher(ServerScope::from_string("test"), hooks, dispatcher);
         let meta = || HookDispatchMeta {
+            execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
             resume_count: 0,

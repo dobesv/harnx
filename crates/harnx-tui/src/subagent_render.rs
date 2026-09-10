@@ -193,7 +193,14 @@ impl Tui {
         if !state.scroll.follow {
             state.scroll.position = state.scroll.position.min(state.scroll.last_max_position);
         }
-        render_child_footer(frame, chunks[2]);
+        let can_stop = matches!(
+            view.status,
+            SubAgentStatus::Running | SubAgentStatus::Unconfirmed
+        ) && view
+            .progress
+            .as_ref()
+            .is_some_and(|p| state.execution_id.as_deref() == Some(&p.snapshot.invocation_id));
+        render_child_footer(frame, chunks[2], can_stop);
     }
 }
 
@@ -212,10 +219,13 @@ fn scroll_focused_child_into_view(state: &mut MonitoredSessionState, area: Rect)
     state.scroll_to_focused_item = false;
 }
 
-fn render_child_footer(frame: &mut Frame<'_>, area: Rect) {
+fn render_child_footer(frame: &mut Frame<'_>, area: Rect, can_stop: bool) {
+    let stop = if can_stop { "  Ctrl+C/Stop" } else { "" };
     frame.render_widget(
-        Paragraph::new(" ↑↓/browse  ENTER/open  PgUp/PgDn/scroll  g/G top/bot  ESC/back")
-            .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(format!(
+            " ↑↓/browse  ENTER/open  PgUp/PgDn/scroll  g/G top/bot  ESC/back{stop}"
+        ))
+        .style(Style::default().fg(Color::DarkGray)),
         area,
     );
 }
@@ -313,5 +323,8 @@ fn status_icon(status: &SubAgentStatus, spinner_index: usize) -> (&'static str, 
         ),
         SubAgentStatus::Completed => ("✓", Color::Green),
         SubAgentStatus::Failed => ("✗", Color::Red),
+        SubAgentStatus::Cancelling => ("…", Color::Yellow),
+        SubAgentStatus::Cancelled => ("■", Color::DarkGray),
+        SubAgentStatus::Unconfirmed => ("!", Color::Yellow),
     }
 }

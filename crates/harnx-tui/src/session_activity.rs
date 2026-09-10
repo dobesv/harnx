@@ -245,7 +245,12 @@ fn spawn_session_activity_monitor(
     event_tx: UnboundedSender<TuiEvent>,
     target: SessionTarget,
 ) -> JoinHandle<()> {
-    tokio::spawn(monitor_session_activity(config, event_tx, target))
+    tokio::spawn(async move {
+        tokio::join!(
+            crate::cancellation::monitor_execution(&config, &event_tx, &target),
+            monitor_session_activity(config.clone(), event_tx.clone(), target.clone())
+        );
+    })
 }
 
 async fn monitor_session_activity(

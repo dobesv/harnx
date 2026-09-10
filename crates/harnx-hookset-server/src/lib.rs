@@ -1,5 +1,6 @@
 //! Server-side adapter for hosting a [`harnx_hookset::Hook`] over Core NATS.
 
+mod execution;
 mod lifecycle;
 
 pub use lifecycle::ServeLifecycle;
@@ -246,6 +247,13 @@ async fn handle_hook_request(
     specs: &[HookSpec],
     message: async_nats::Message,
 ) -> Result<()> {
+    if message
+        .headers
+        .as_ref()
+        .is_some_and(|headers| headers.get("Harnx-Hook-Operation").is_some())
+    {
+        return execution::handle(client, hook, message).await;
+    }
     let Some(reply_subject) = message.reply else {
         log::warn!("hook request missing reply subject");
         return Ok(());

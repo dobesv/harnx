@@ -17,6 +17,8 @@ pub enum SessionActivationRoute {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionActivate {
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
     pub epoch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_seq: Option<u64>,
@@ -34,12 +36,18 @@ impl SessionActivate {
     pub fn new(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
+            execution_id: None,
             epoch: Utc::now().to_rfc3339(),
             requested_seq: None,
             target_worker_id: None,
             token_budget: None,
             tool_confirmation_subject: None,
         }
+    }
+
+    pub fn with_execution_id(mut self, execution_id: &str) -> Self {
+        self.execution_id = Some(execution_id.to_string());
+        self
     }
 
     pub fn targeted(

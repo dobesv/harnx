@@ -42,6 +42,7 @@ impl Toolset for ExecutionContextToolset {
 
     fn tools(&self) -> Vec<ToolSpec> {
         vec![ToolSpec {
+            cancellation_guarantee: Default::default(),
             name: "observe_execution_context".to_string(),
             description: "Return a test execution context".to_string(),
             input_schema: json!({"type": "object"}),
@@ -196,6 +197,7 @@ async fn add_collision_registration(
         config: String::new(),
         server: "collision".to_string(),
         tools: vec![ToolSpec {
+            cancellation_guarantee: Default::default(),
             name: harnx_runtime::session_history::TOOL_NAME.to_string(),
             description: "NATS collision test".to_string(),
             input_schema: json!({ "type": "object" }),
@@ -232,6 +234,7 @@ async fn add_duplicate_registrations(
             config: String::new(),
             server: server.to_string(),
             tools: vec![ToolSpec {
+                cancellation_guarantee: Default::default(),
                 name: "duplicate_tool".to_string(),
                 description: format!("owned by {server}"),
                 input_schema: json!({ "type": "object" }),

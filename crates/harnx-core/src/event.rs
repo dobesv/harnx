@@ -296,6 +296,9 @@ pub struct SubAgentProgress {
 #[serde(rename_all = "snake_case")]
 pub enum SubAgentProgressStatus {
     Running,
+    Cancelling,
+    Cancelled,
+    Unconfirmed,
     Done,
     Failed,
 }

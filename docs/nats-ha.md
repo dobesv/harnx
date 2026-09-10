@@ -443,15 +443,116 @@ agents:
 
 ## Control Plane
 
-Clients communicate with the active worker over specific NATS subjects:
-- **Cancel**: `sessions.{id}.control` — Deliver a cancel command to the worker.
-  Interactive cancellation re-activates a pending session when necessary and
-  uses request/reply confirmation; the worker acknowledges only after its
-  fenced `Cancel` entry is durable. Plain fire-and-forget publish remains
-  available to compatible callers.
-- **Set Pending**: Update the pending user message without triggering execution.
+Cancellation is coordinated by `harnx-execution-control`, shared by the runtime,
+tool servers, and hook servers. Its file-backed, replica-aware JetStream KV bucket
+`harnx_execution_control` is authoritative; `sessions.{id}.control` is only a
+latency hint. Losing that Core NATS message must not lose cancellation.
 
-Semantics are consistent because the authoritative state is derived from the durable JetStream log.
+### Operation graph and generations
+
+`sessions/{session_id}/current` points to the active execution record at
+`sessions/{session_id}/operations/{execution_id}`. A worker activation includes
+all queued continuations it consumes. Tool and hook calls are child operations;
+a sub-agent session execution is a child of its invoking tool operation. The
+transport-attested tool call ID is also the sub-agent invocation ID.
+
+Registration creates a preparing child, then CAS-adds its reference to an
+accepting parent. Work starts only after registration and an ancestor preflight.
+Cancellation CAS freezes new children and prompt reservations. Owners watch the
+operation and ancestor chain, so cancellation survives a requester or
+intermediate owner disappearing. Direct child cancellation only travels down;
+the parent receives a recoverable cancelled-tool result.
+
+Every activation and cancellation latency hint carries an execution ID. A stale
+child row supplies `expected_execution_id` and cannot cancel a later invocation
+that reuses the same session. Terminal generations never reopen. Retry preserves
+the execution and cancellation IDs, increments the attempt, and refreshes the
+five-second progress deadline. Missing ancestors or graph cycles fail closed.
+Session owners use the lease fence; tool and hook owners use fresh invocation
+owner identities. A replacement server's routing name alone cannot authorize
+it to claim or acknowledge an invocation still owned by another process.
+
+### Acceptance versus shutdown
+
+`NatsSession::request_cancel` bounds durable acceptance to two seconds without
+waiting for shutdown. `cancel_status` and `wait_for_cancel` report convergence;
+`cancel_pending_turn` remains the blocking compatibility wrapper. An idle cancel
+succeeds without appending a transcript entry.
+
+The state machine is preparing → running → completed for normal completion, or
+cancel_requested → quiescing → cancelled for cancellation. Five seconds without
+progress produces **unconfirmed**, which remains nonterminal and blocks prompts.
+It may later converge to cancelled. Retry can move unconfirmed back to requested.
+Closing normal prompt admission does not itself cancel already-registered work.
+
+The worker signals local abort immediately, writes the existing fenced
+`SessionLogEntry::Cancel`, drains owned work, releases its lease, and confirms cancellation only when
+all registered children are terminal. The transcript marker alone is not proof
+of shutdown. Recovery requires a covering marker from the execution's lease fence
+and no active lease; unresolved prompt reservations still prevent confirmation.
+
+Prompt IDs are allocated before append. A CAS reservation decides whether a
+concurrent prompt belongs to the cancelling execution. An admitted message is
+appended with that ID and its sequence committed to the reservation. Recovery
+looks up unresolved IDs in the log. Frontends must not acknowledge an unreserved
+local queue as durable prompt acceptance. A late append beyond an earlier Cancel
+marker requires another fenced recovery pass.
+
+Admission subscribes to advisory events before appending and publishing activation.
+Its receipt retains that subscription until the frontend follows the admitted
+prompt. A fast worker can finish before the frontend's follow task starts;
+durable completion must drain already-buffered events before closing that turn.
+
+### Tool and hook shutdown
+
+The internal tool protocol is v2 and requires an atomic frontend/worker/server
+upgrade. Registrations using v1 are rejected. `ToolRequest.operation_id` and
+control acknowledgements identify the invocation; a cancellation acknowledgement
+is sent only after invocation cleanup and registered-child completion.
+
+`CancellationGuarantee::Cooperative` is the default. A handler that ignores its
+token remains owned and can become unconfirmed. `HardOnDrop` is reserved for
+implementations whose future owns and stops all per-call work on drop. Foreground
+bash cancellation kills its process group and waits for the child and output
+readers. Controlled hook requests retain their handler future through cancellation.
+The MCP bridge cancels the individual request and waits for its response; it does
+not restart a shared MCP server to force cancellation.
+
+RMCP's typed cancellation notification resolves its local response waiter when
+the notification is sent. That local result is not proof of remote shutdown.
+The bridge uses the raw notification variant with the same MCP wire payload to
+retain the real response waiter. Preserve this distinction when updating RMCP;
+the shared-call cancellation regression test exercises a handler that ignores
+its cancellation token while another call continues on the same server.
+An MCP server that suppresses the cancelled call's response supplies no shutdown
+acknowledgement; that operation remains unconfirmed even if its handler may have
+finished. The bridge must not infer completion from the notification or restart
+shared infrastructure to force it.
+The Kubernetes gateway follows the same rule for remote sandbox MCP calls and
+retains in-flight sandbox lifecycle operations until their futures settle.
+
+Completed background commands, sandbox resources, committed handoffs, and
+completed side effects retain their existing lifecycle. Terminal child records
+are removed after their parent observes them. The current session record remains
+until replacement; session deletion purges its entire control prefix.
+
+### Frontend behavior
+
+The TUI replaces the composer with a cancellation tray for root cancellation.
+Unconfirmed state is static and offers retry. Child Ctrl+C targets the viewed or
+focused invocation only when its monitored execution ID matches. While requesting
+interrupt-and-exit, Esc stays in the TUI and keeps cancellation running, Ctrl+D
+exits immediately, and durable acceptance triggers automatic exit. Persistence
+failure keeps an actionable tray.
+
+`session/cancel` accepts optional `expected_execution_id`. Its response retains
+`cancelled` and adds `disposition`, `cancellation_id`, `execution_id`,
+`requested_at`, and `unconfirmed_after_ms`. Dispositions include idle, requested,
+already_requested, quiescing, cancelled, and unconfirmed. Idle is HTTP success.
+`session/get` reports `cancelling` or `cancel_unconfirmed`, disables `canPrompt`,
+and retains `canCancel` for retry. AG-UI `CUSTOM` events named `cancellation_state`
+carry operational updates without changing the transcript protocol. Clients also
+hydrate from `session/get`; missing live events must not imply idle.
 
 ## Multi-Client Support
 
@@ -556,6 +657,11 @@ Harnx tracks internal counters (exported to logs and future metrics endpoints):
 - `lease_acquisitions` / `lease_losses`: Lease churn.
 - `fenced_writes_rejected`: Safety triggers.
 - `interrupt_errors_synthesized`: Data points on failover impact.
+
+Cancellation transition and quiescence metrics are described in
+[Prometheus metrics](metrics.md#cancellation-progress). Inspect the current KV
+operation's owner, admissions, children, and blocker when cancellation remains
+unconfirmed; an absent lease or a transcript Cancel alone is insufficient.
 
 ### Tracing
 Workers participate in OpenTelemetry distributed tracing when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Trace context propagates across process boundaries over NATS message headers for sub-agent activations and tool executions. See [OpenTelemetry Tracing](tracing.md).

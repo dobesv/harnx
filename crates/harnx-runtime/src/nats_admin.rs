@@ -36,6 +36,18 @@ pub async fn delete_remote_session(
 ) -> Result<SessionDeleteResult> {
     let jetstream = config.nats_jetstream(cluster).await?;
     let lease_bucket = load_optional_lease_bucket(config, cluster).await?;
+    match jetstream
+        .get_key_value(harnx_execution_control::BUCKET)
+        .await
+    {
+        Ok(store) => {
+            harnx_execution_control::ExecutionStore::from_store(store)
+                .purge_session(session_id)
+                .await?
+        }
+        Err(error) if kv_bucket_missing(&error) => {}
+        Err(error) => return Err(error.into()),
+    }
     let stream_deleted = delete_session_stream(&jetstream, session_id).await?;
     let lease_deleted = delete_session_lease(lease_bucket, session_id).await?;
     let metadata_keys_deleted = purge_session_metadata(&jetstream, session_id).await?;
@@ -139,7 +151,7 @@ fn delete_stream_missing(kind: &DeleteStreamErrorKind) -> bool {
 }
 
 /// Check if an async_nats KeyValueError indicates a missing bucket (stream not found).
-pub(crate) fn kv_bucket_missing(error: &async_nats::jetstream::context::KeyValueError) -> bool {
+pub fn kv_bucket_missing(error: &async_nats::jetstream::context::KeyValueError) -> bool {
     match error.kind() {
         KeyValueErrorKind::GetBucket => error
             .source()

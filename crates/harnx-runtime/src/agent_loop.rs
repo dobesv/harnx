@@ -402,10 +402,17 @@ async fn dispatch_agent_loop_hook(params: AgentHookDispatch<'_>) -> harnx_core::
         cwd,
         resume_count,
     } = params;
+    let execution = ctx
+        .config
+        .read()
+        .execution_control
+        .as_ref()
+        .map(|(_, reference)| reference.clone());
     dispatch_hook_event(HookEventDispatch {
         event,
         provider: ctx.nats_hook_provider.as_deref(),
         meta: HookDispatchMeta {
+            execution,
             session_id: session_id.to_string(),
             cwd: cwd.to_path_buf(),
             resume_count,

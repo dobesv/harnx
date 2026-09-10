@@ -1,3 +1,5 @@
+import { CancellationContext } from './CancellationContext';
+import { useCancellation } from './useCancellation';
 import React, { useCallback, useEffect, useMemo, useReducer, useState } from 'react';
 import { AssistantRuntimeProvider } from '@assistant-ui/react';
 import type { AttachmentAdapter } from '@assistant-ui/react';
@@ -201,6 +203,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
   onOpenSubAgent,
   children,
 }) => {
+  const cancellation = useCancellation(agentName, sessionId);
   const [statusText, setStatusText] = useState<string | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [usage, setUsage] = useState<UsageData | null>(null);
@@ -275,6 +278,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     async remove() {}
   }), [agentName, sessionId]);
 
+  const observeCancellation = cancellation.observe;
   const agent = useMemo(() => new HarnxHttpAgent({
     url: `/v1/agents/${encodeURIComponent(agentName)}/sessions/${encodeURIComponent(sessionId)}`,
     onStatus: (text) => setStatusText(text),
@@ -290,9 +294,13 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
       }
     },
     onHandoff,
-    onSubAgentEvent: dispatchSubAgentEvent,
-    onHitlPendingApproval: (toolCallId, summary) => addHydratedApproval({ toolCallId, summary }),
-  }), [agentName, sessionId, onHandoff, addHydratedApproval]);
+    onHitlPendingApproval: (toolCallId, summary) =>
+      addHydratedApproval({ toolCallId, summary }),
+    onSubAgentEvent: (event: any) => {
+      dispatchSubAgentEvent(event);
+      if (event?.type === 'CUSTOM' && event.name === 'cancellation_state') observeCancellation(event.value.cancellation);
+    },
+  }), [agentName, sessionId, onHandoff, addHydratedApproval, observeCancellation]);
 
   const runtime = useAgUiRuntime({
     agent,
@@ -315,6 +323,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
   }), [onOpenSubAgent, subAgentState.notes, dispatchSubAgentEvent]);
 
   return (
+    <CancellationContext.Provider value={cancellation}>
     <SubAgentNotesContext.Provider value={subAgentContext}>
       <PendingContext.Provider value={{ 
         statusText, setStatusText, errorText, setErrorText,
@@ -334,5 +343,6 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
         </UsageContext.Provider>
       </PendingContext.Provider>
     </SubAgentNotesContext.Provider>
+    </CancellationContext.Provider>
   );
 };

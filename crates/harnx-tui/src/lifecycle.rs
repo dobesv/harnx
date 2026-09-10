@@ -235,6 +235,8 @@ impl Tui {
             active_remote_session: None,
             exit_cancel_factory: crate::remote_session::default_exit_cancel_factory(),
             pending_exit_cancel: None,
+            cancellation: None,
+            exit_after_cancel: false,
             exit_interrupt_error: None,
             tool_confirmation_route: Arc::new(parking_lot::Mutex::new(None)),
             pending_remote_activations: HashSet::new(),

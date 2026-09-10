@@ -1,6 +1,9 @@
-import { fireEvent, render, screen } from '@testing-library/react';
-import { describe, expect, it, vi, afterEach } from 'vitest';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SubAgentSessionNotes } from './SubAgentSessionNotes';
+import { cancel, sessionControl } from './api';
+vi.mock('./api', () => ({ cancel: vi.fn(), sessionControl: vi.fn() }));
+
 import type { SubAgentNote } from './subAgentNotes';
 import { HarnxHttpAgent } from './ChatProvider';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
@@ -38,6 +41,7 @@ const note = (
 
 describe('SubAgentSessionNotes', () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.clearAllMocks();
   });
 
@@ -79,11 +83,11 @@ describe('SubAgentSessionNotes', () => {
   });
 
   describe('ChildMetricsSubscriber', () => {
-    it('dispatches CHILD_TERMINAL with status done when RUN_FINISHED is received after grace period cleanly', () => {
+    it('dispatches CHILD_TERMINAL with status done when RUN_FINISHED is received', () => {
       const dispatch = vi.fn();
       const runningNote: SubAgentNote = {
         ...note('running', 'live-child'),
-        startedAtMs: Date.now() - 12000, // 12s ago, past 5s grace
+        startedAtMs: Date.now() - 12000,
       };
 
       render(
@@ -100,11 +104,11 @@ describe('SubAgentSessionNotes', () => {
       );
     });
 
-    it('dispatches CHILD_TERMINAL with status failed when RUN_ERROR is received after grace period', () => {
+    it('dispatches CHILD_TERMINAL with status failed when RUN_ERROR is received', () => {
       const dispatch = vi.fn();
       const runningNote: SubAgentNote = {
         ...note('running', 'live-child'),
-        startedAtMs: Date.now() - 10000, // 10s ago, well past 5s grace
+        startedAtMs: Date.now() - 10000,
       };
 
       render(
@@ -121,11 +125,13 @@ describe('SubAgentSessionNotes', () => {
       );
     });
 
-    it('ignores RUN_FINISHED when received during startup grace period', () => {
+    it('defers rather than loses RUN_FINISHED received during startup', () => {
+      vi.useFakeTimers();
+      const now = Date.now();
       const dispatch = vi.fn();
       const runningNote: SubAgentNote = {
         ...note('running', 'live-child'),
-        startedAtMs: Date.now() - 1000, // 1s ago, within 5s grace
+        startedAtMs: now - 4_999,
       };
 
       render(
@@ -139,6 +145,10 @@ describe('SubAgentSessionNotes', () => {
 
       expect(dispatch).not.toHaveBeenCalledWith(
         expect.objectContaining({ type: 'CHILD_TERMINAL' })
+      );
+      act(() => vi.advanceTimersByTime(1));
+      expect(dispatch).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'CHILD_TERMINAL', status: 'done' })
       );
     });
 
@@ -299,5 +309,34 @@ describe('SubAgentSessionNotes', () => {
       const elapsedAttr = Number(button.getAttribute('data-elapsed-ms'));
       expect(elapsedAttr).toBeGreaterThanOrEqual(3900);
     });
+  });
+});
+
+
+describe('child cancellation', () => {
+  it('stops the attested invocation without opening the session', async () => {
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' }, execution_id: 'invocation', execution_state: 'running' });
+    vi.mocked(cancel).mockResolvedValue({ cancelled: true, disposition: 'requested', execution_id: 'invocation' });
+    const onOpen = vi.fn();
+    render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={onOpen} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop researcher sub-agent session child-session-running' }));
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledWith('researcher', 'child-session-running', 'invocation');
+    expect(screen.getByText('Cancelling')).toBeVisible();
+    expect(screen.queryByRole('button', { name: /^Stop / })).not.toBeInTheDocument();
+  });
+
+  it.each(['completed', 'cancelled', 'stale'] as const)('hides Stop for a %s execution', async (state) => {
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'idle' }, execution_id: state === 'stale' ? 'new-invocation' : 'invocation', execution_state: state === 'stale' ? 'running' : state });
+    render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
+    await waitFor(() => expect(sessionControl).toHaveBeenCalled());
+    expect(screen.queryByRole('button', { name: /^Stop / })).not.toBeInTheDocument();
+  });
+
+  it('hydrates an unconfirmed cancellation with an actionable retry', async () => {
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'cancel_unconfirmed', cancellation: { cancelled: true, disposition: 'unconfirmed' } }, execution_id: 'invocation', execution_state: 'unconfirmed' });
+    render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
+    expect(await screen.findByText('Unconfirmed')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Retry stopping researcher' })).toBeEnabled();
   });
 });

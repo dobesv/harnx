@@ -234,9 +234,6 @@ impl Tui {
         // Exit paths that quit must use cancel_sequencing via start_exit_cancel.
         self.cancel_active_remote_session();
 
-        self.app.transcript.push(TranscriptItem::SystemText(
-            "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),
-        ));
         // Discard any queued message — Ctrl+C means "cancel
         // everything", including the message you typed while the
         // task was running.
@@ -514,6 +511,9 @@ impl Tui {
     }
 
     async fn handle_exclusive_view_key(&mut self, key: KeyEvent) -> Option<Result<()>> {
+        if self.handle_cancellation_or_child_key(key) {
+            return Some(Ok(()));
+        }
         if self.app.modal.is_some() {
             return Some(self.handle_modal_key(key).await);
         }
@@ -733,6 +733,9 @@ impl Tui {
             }
             TuiEvent::PromptTaskFinished { task, error } => {
                 self.finish_prompt_task(task, error).await;
+            }
+            TuiEvent::ExecutionState { cluster, operation } => {
+                self.hydrate_execution_state(cluster, operation)
             }
             TuiEvent::SessionActivity {
                 session_id,
@@ -2191,43 +2194,6 @@ fn format_usage(usage: &harnx_core::api_types::CompletionTokenUsage) -> String {
 }
 
 impl Tui {
-    fn handle_confirm_exit_key(&mut self, phase: ExitPhase, key: KeyEvent) {
-        if phase == ExitPhase::Prompting && !self.app.llm_busy {
-            self.app.modal = None;
-            self.app.should_quit = true;
-            return;
-        }
-
-        match phase {
-            ExitPhase::Prompting => match (key.code, key.modifiers) {
-                (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                    self.app.modal = None;
-                    self.abort_signal.set_ctrld();
-                    self.app.should_quit = true;
-                }
-                (KeyCode::Esc, KeyModifiers::NONE) => {
-                    self.app.modal = None;
-                }
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                    if self.active_remote_session.is_none() {
-                        self.app.modal = None;
-                        self.app.should_quit = true;
-                        return;
-                    }
-                    if let Some(ModalState::ConfirmExit { phase, .. }) = self.app.modal.as_mut() {
-                        *phase = ExitPhase::Interrupting;
-                    }
-                    if !self.start_exit_cancel() {
-                        self.app.modal = None;
-                        self.app.should_quit = true;
-                    }
-                }
-                _ => {}
-            },
-            ExitPhase::Interrupting => {}
-        }
-    }
-
     /// Handle keystrokes while a modal is open. Each specialized modal owns
     /// its key bindings; delete and rewind confirmations use the y/n fallback.
     pub(super) async fn handle_modal_key(&mut self, key: KeyEvent) -> Result<()> {

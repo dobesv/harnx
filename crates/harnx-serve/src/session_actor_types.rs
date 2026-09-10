@@ -37,6 +37,7 @@ pub(crate) struct PendingPrompt {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionPromptOptions {
+    pub(crate) admitted: Option<harnx_runtime::nats_session::AppendedPrompt>,
     pub working_dir: Option<std::path::PathBuf>,
     pub attachment_refs: Vec<String>,
 }
@@ -51,7 +52,8 @@ pub enum SessionCommand {
         reply: oneshot::Sender<PromptResult>,
     },
     Cancel {
-        reply: oneshot::Sender<()>,
+        expected_execution_id: Option<String>,
+        reply: oneshot::Sender<Result<harnx_execution_control::CancelReceipt, String>>,
     },
     HitlApprovalDecision {
         tool_call_id: String,
@@ -90,6 +92,7 @@ pub struct SubscribeResult {
 pub enum PromptResult {
     Accepted { run_id: String },
     Enqueued { run_id: String },
+    Rejected { reason: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,6 +104,8 @@ pub struct SessionCapabilities {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionInfo {
+    pub execution_state: Option<harnx_execution_control::OperationState>,
+    pub execution_id: Option<String>,
     pub state: SessionState,
     pub history_snapshot: Vec<AgUiMessage>,
     pub history_warnings: Vec<String>,
@@ -110,6 +115,8 @@ pub struct SessionInfo {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionState {
     Idle,
+    Cancelling(harnx_execution_control::CancelReceipt),
+    CancelUnconfirmed(harnx_execution_control::CancelReceipt),
     Running {
         run_id: String,
         started_at: DateTime<Utc>,

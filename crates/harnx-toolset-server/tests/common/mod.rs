@@ -142,6 +142,8 @@ pub(crate) struct TestToolset {
     server_name: &'static str,
     pub(crate) echo_invocations: Arc<AtomicUsize>,
     pub(crate) slow_started: Arc<Notify>,
+    pub(crate) slow_cancelled: Arc<Notify>,
+    pub(crate) allow_cleanup: Arc<Notify>,
     pub(crate) last_context: Arc<Mutex<Option<ToolInvocationContext>>>,
 }
 
@@ -157,6 +159,8 @@ impl TestToolset {
             server_name,
             echo_invocations: Arc::default(),
             slow_started: Arc::default(),
+            slow_cancelled: Arc::default(),
+            allow_cleanup: Arc::default(),
             last_context: Arc::default(),
         }
     }
@@ -170,6 +174,7 @@ impl Toolset for TestToolset {
 
     fn tools(&self) -> Vec<ToolSpec> {
         vec![ToolSpec {
+            cancellation_guarantee: Default::default(),
             name: "echo".to_string(),
             description: "echo input".to_string(),
             input_schema: json!({ "type": "object" }),
@@ -197,6 +202,10 @@ impl Toolset for TestToolset {
             "slow" => {
                 self.slow_started.notify_one();
                 cancel.cancelled().await;
+                self.slow_cancelled.notify_one();
+                if args.get("gate_cleanup").and_then(Value::as_bool) == Some(true) {
+                    self.allow_cleanup.notified().await;
+                }
                 Err(ToolInvokeError::Fatal("cancelled".to_string()))
             }
             _ => Err(ToolInvokeError::Recoverable("unknown tool".to_string())),

@@ -41,7 +41,8 @@ impl Config {
             harnx_core::event::SessionEvent::CompactingStarted,
         ));
         tokio::spawn(async move {
-            let result = Config::compact_session(&config).await;
+            let result =
+                Config::with_maintenance_abort(&config, Config::compact_session(&config)).await;
             if let Some(compacting_session_id) = compacting_session_id.as_deref() {
                 if let Some(session) = config.write().session.as_mut() {
                     if session.id == compacting_session_id {
@@ -218,4 +219,21 @@ fn append_recovery_note(summary: String, covered: (Option<usize>, Option<usize>,
 The full pre-compaction transcript remains in this session's log; use the \
 `harnx_agent_session_history_read` tool to search it by entry index, type, tool name, or text.]"
     )
+}
+
+impl Config {
+    pub(crate) async fn with_maintenance_abort<T>(
+        config: &GlobalConfig,
+        future: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let signal = config.read().maintenance_abort.clone();
+        let Some(signal) = signal else {
+            return future.await;
+        };
+        tokio::select! {
+            biased;
+            _ = harnx_core::abort::wait_abort_signal(&signal) => anyhow::bail!("session maintenance cancelled"),
+            result = future => result,
+        }
+    }
 }

@@ -124,7 +124,7 @@ fn assert_timeout_result(stopped: &serde_json::Value, session_id: &str) {
             json!("timeout"),
             json!(session_id),
             json!(0),
-            json!("done"),
+            json!("cancelled"),
         )
     );
     let response = stopped["response"]

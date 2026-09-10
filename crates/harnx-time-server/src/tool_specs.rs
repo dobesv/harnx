@@ -10,6 +10,7 @@ pub(crate) fn all() -> Vec<ToolSpec> {
 
 fn get_current_time() -> ToolSpec {
     ToolSpec {
+        cancellation_guarantee: harnx_toolset::CancellationGuarantee::HardOnDrop,
         name: "get_current_time".to_string(),
         description: "Get current time in a specific timezone".to_string(),
         input_schema: json!({
@@ -26,6 +27,7 @@ fn get_current_time() -> ToolSpec {
 
 fn convert_time() -> ToolSpec {
     ToolSpec {
+        cancellation_guarantee: harnx_toolset::CancellationGuarantee::HardOnDrop,
         name: "convert_time".to_string(),
         description: "Convert timestamps, timezones, and time offsets".to_string(),
         input_schema: json!({
@@ -52,6 +54,7 @@ fn convert_time() -> ToolSpec {
 
 fn wait() -> ToolSpec {
     ToolSpec {
+        cancellation_guarantee: harnx_toolset::CancellationGuarantee::HardOnDrop,
         name: "wait".to_string(),
         description: "Wait for a specified number of seconds".to_string(),
         input_schema: json!({
@@ -69,6 +72,7 @@ fn wait() -> ToolSpec {
 
 fn wait_until() -> ToolSpec {
     ToolSpec {
+        cancellation_guarantee: harnx_toolset::CancellationGuarantee::HardOnDrop,
         name: "wait_until".to_string(),
         description: "Wait until a target time, up to 24 hours".to_string(),
         input_schema: json!({

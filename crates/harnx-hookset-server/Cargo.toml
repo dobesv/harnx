@@ -8,6 +8,7 @@ repository.workspace = true
 description = "NATS server runtime for harnx hooks"
 
 [dependencies]
+harnx-execution-control.workspace = true
 anyhow = { workspace = true }
 async-nats = { workspace = true }
 futures-util = { workspace = true }

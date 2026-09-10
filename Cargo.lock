@@ -3689,6 +3689,7 @@ dependencies = [
  "clap",
  "dirs 7.0.0",
  "fancy-regex 0.19.1",
+ "futures-util",
  "hmac",
  "indexmap",
  "jaq-core",
@@ -3729,6 +3730,24 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+]
+
+[[package]]
+name = "harnx-execution-control"
+version = "0.33.4"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "chrono",
+ "futures-util",
+ "harnx-nats-common",
+ "metrics",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "which",
 ]
 
 [[package]]
@@ -3847,6 +3866,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "harnx-core",
+ "harnx-execution-control",
  "harnx-healthz",
  "harnx-hookset",
  "harnx-metrics",
@@ -4261,6 +4281,7 @@ dependencies = [
  "harnx-client",
  "harnx-core",
  "harnx-engine",
+ "harnx-execution-control",
  "harnx-fetch",
  "harnx-healthz",
  "harnx-hooks",
@@ -4359,6 +4380,7 @@ dependencies = [
  "futures",
  "futures-util",
  "harnx-core",
+ "harnx-execution-control",
  "harnx-healthz",
  "harnx-hooks",
  "harnx-hookset",
@@ -4487,6 +4509,7 @@ name = "harnx-toolset"
 version = "0.33.4"
 dependencies = [
  "async-trait",
+ "harnx-execution-control",
  "serde",
  "serde_json",
  "tokio-util",
@@ -4501,6 +4524,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "harnx-core",
+ "harnx-execution-control",
  "harnx-healthz",
  "harnx-metrics",
  "harnx-nats-common",
@@ -4532,6 +4556,7 @@ dependencies = [
  "fancy-regex 0.19.1",
  "futures-util",
  "harnx-core",
+ "harnx-execution-control",
  "harnx-render",
  "harnx-runtime",
  "indexmap",

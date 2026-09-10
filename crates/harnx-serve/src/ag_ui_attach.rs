@@ -40,11 +40,13 @@ pub(crate) fn initial_attach_frame(
     snapshot: Vec<AgUiMessage>,
     history_warnings: Vec<String>,
     include_snapshot: bool,
+    additional_event: Option<Event>,
 ) -> Option<Bytes> {
     let frames = include_snapshot
         .then(|| snapshot_event(snapshot))
         .into_iter()
         .chain(history_warnings.into_iter().map(history_warning_event))
+        .chain(additional_event)
         .filter_map(|event| {
             frame_event(&event)
                 .map_err(|err| log::warn!("failed to serialize initial AG-UI frame: {err}"))

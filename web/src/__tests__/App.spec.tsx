@@ -6,7 +6,14 @@ class MockEventSource {
 
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
-import { BatchInterruptUI, MyComposer, SendErrorIndicator, StatusBar } from '../App';
+import {
+  BatchInterruptUI,
+  CancelButton,
+  MyComposer,
+  SendErrorIndicator,
+  StatusBar,
+  StatusIndicator,
+} from '../App';
 import { sendPrompt, uploadAttachment, submitHitlDecision } from '../api';
 import { PendingContext } from '../PendingContext';
 import { UsageContext } from '../UsageContext';
@@ -14,6 +21,8 @@ import * as agUi from '@assistant-ui/react-ag-ui';
 import * as aui from '@assistant-ui/react';
 import { vi } from 'vitest';
 import { ChatProvider } from '../ChatProvider';
+import { CancellationContext, type CancellationControl } from '../CancellationContext';
+import { useCancellation } from '../useCancellation';
 
 const defaultPendingContext = {
   statusText: null,
@@ -34,6 +43,7 @@ vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>();
   return { ...actual, sendPrompt: vi.fn(), uploadAttachment: vi.fn(), submitHitlDecision: vi.fn() };
 });
+vi.mock('../useCancellation', () => ({ useCancellation: vi.fn() }));
 vi.mock('@assistant-ui/react', async (importOriginal) => {
   const actual = await importOriginal<typeof aui>();
   return { 
@@ -41,6 +51,97 @@ vi.mock('@assistant-ui/react', async (importOriginal) => {
     useAuiState: vi.fn(), 
     useAui: vi.fn(),
   };
+});
+
+const cancellationControl = (
+  phase: CancellationControl['phase'],
+  stop = vi.fn(async () => {}),
+): CancellationControl => ({ phase, stop, observe: vi.fn() });
+
+describe('cancellation UI', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(aui.useAuiState).mockImplementation((selector: any) =>
+      selector({ thread: { isRunning: false, messages: [] } }),
+    );
+  });
+
+  it('shows Stop only for an active run and invokes cancellation', () => {
+    const stop = vi.fn(async () => {});
+    const { rerender } = render(
+      <CancellationContext.Provider value={cancellationControl('idle', stop)}>
+        <CancelButton />
+      </CancellationContext.Provider>,
+    );
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument();
+
+    vi.mocked(aui.useAuiState).mockImplementation((selector: any) =>
+      selector({ thread: { isRunning: true, messages: [] } }),
+    );
+    rerender(
+      <CancellationContext.Provider value={cancellationControl('idle', stop)}>
+        <CancelButton />
+      </CancellationContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
+  it('disables cancellation while the request is being accepted or work is stopping', () => {
+    const { rerender } = render(
+      <CancellationContext.Provider value={cancellationControl('requesting')}>
+        <CancelButton />
+      </CancellationContext.Provider>,
+    );
+    expect(screen.getByRole('button', { name: 'Requesting cancellation…' })).toBeDisabled();
+
+    rerender(
+      <CancellationContext.Provider value={cancellationControl('stopping')}>
+        <CancelButton />
+      </CancellationContext.Provider>,
+    );
+    expect(screen.getByRole('button', { name: 'Stopping…' })).toBeDisabled();
+  });
+
+  it('offers retry after cancellation becomes unconfirmed or the request fails', () => {
+    const stop = vi.fn(async () => {});
+    const { rerender } = render(
+      <CancellationContext.Provider value={cancellationControl('unconfirmed', stop)}>
+        <CancelButton />
+      </CancellationContext.Provider>,
+    );
+    const unconfirmed = screen.getByRole('button', { name: 'Cancellation unconfirmed — Retry' });
+    expect(unconfirmed).toBeEnabled();
+    fireEvent.click(unconfirmed);
+
+    rerender(
+      <CancellationContext.Provider value={cancellationControl('failed', stop)}>
+        <CancelButton />
+      </CancellationContext.Provider>,
+    );
+    const failed = screen.getByRole('button', { name: 'Cancellation request failed — Retry' });
+    expect(failed).toBeEnabled();
+    fireEvent.click(failed);
+    expect(stop).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses a static warning instead of a spinner when cancellation is unconfirmed', () => {
+    const { rerender, container } = render(
+      <CancellationContext.Provider value={cancellationControl('stopping')}>
+        <StatusIndicator isRunning statusText={null} />
+      </CancellationContext.Provider>,
+    );
+    expect(screen.getByText('Cancelling')).toBeInTheDocument();
+    expect(container.querySelector('.aui-spinner')).toBeInTheDocument();
+
+    rerender(
+      <CancellationContext.Provider value={cancellationControl('unconfirmed')}>
+        <StatusIndicator isRunning statusText={null} />
+      </CancellationContext.Provider>,
+    );
+    expect(screen.getByText('Cancellation unconfirmed')).toBeInTheDocument();
+    expect(container.querySelector('.aui-spinner')).not.toBeInTheDocument();
+  });
 });
 
 
@@ -258,6 +359,7 @@ describe('MyComposer', () => {
     vi.clearAllMocks();
     setErrorText = vi.fn();
     markSessionNotFresh = vi.fn();
+    vi.mocked(useCancellation).mockReturnValue(cancellationControl('idle'));
 
     // Default useAuiState mock (not running, 0 user messages)
     vi.mocked(aui.useAuiState).mockImplementation((selector: any) => {
@@ -306,6 +408,18 @@ describe('MyComposer', () => {
     expect(composerRuntime.send).toHaveBeenCalled();
     expect(markSessionNotFresh).toHaveBeenCalledWith('bar');
     expect(sendPrompt).not.toHaveBeenCalled();
+  });
+
+  it('blocks composer controls and submission throughout cancellation', () => {
+    vi.mocked(useCancellation).mockReturnValue(cancellationControl('stopping'));
+    renderComposer(false);
+
+    expect(screen.getByRole('textbox')).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Attach file' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+    fireEvent.submit(document.querySelector('form')!);
+    expect(sendPrompt).not.toHaveBeenCalled();
+    expect(composerRuntime.send).not.toHaveBeenCalled();
   });
 
   it('routes existing session submit via sendPrompt (no second run)', async () => {

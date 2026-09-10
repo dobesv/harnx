@@ -2549,11 +2549,9 @@ async fn test_ctrl_c_cancels_streaming() {
     harness.render();
     let screen = harness.screen_contents();
 
-    // The transcript should show the abort message and busy state should be cleared.
-    assert!(
-        screen.contains("aborted") || screen.contains("Ctrl+C"),
-        "Screen should show abort message, got: {screen}"
-    );
+    // This turn already completed: idle Ctrl+C must not claim a new cancellation.
+    assert!(!screen.contains("operation aborted"));
+    assert!(harness.tui().cancellation.is_none());
     assert!(!harness.tui().app.llm_busy, "Ctrl+C should clear llm_busy");
 
     harness.drain_and_settle().await.unwrap();
@@ -4469,17 +4467,6 @@ async fn test_ctrl_c_interrupts_in_flight_streaming() {
 
     gate_release.notify_one();
 
-    if harness
-        .wait_until_screen_contains("aborted", Duration::from_secs(5))
-        .await
-        .is_err()
-    {
-        harness
-            .wait_until_screen_contains("Ctrl+C", Duration::from_secs(5))
-            .await
-            .unwrap();
-    }
-
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while harness.tui().app.llm_busy {
         assert!(
@@ -4499,8 +4486,8 @@ async fn test_ctrl_c_interrupts_in_flight_streaming() {
         "stream should be interrupted before gate release chunk appears: {screen}"
     );
     assert!(
-        screen.contains("aborted") || screen.contains("Ctrl+C"),
-        "screen should show abort message, got: {screen}"
+        screen.contains("Requesting cancellation"),
+        "screen should show cancellation acceptance pending, got: {screen}"
     );
     assert!(
         !harness.tui().app.llm_busy,
@@ -4593,8 +4580,7 @@ async fn ctrl_c_during_in_flight_task_does_not_clear_llm_busy_or_spawn_new_task(
     );
     assert!(harness.tui().app.pending_message.is_none());
 
-    // User types a new message and presses Enter while Task A is still
-    // running. With llm_busy still true, this must queue (not spawn).
+    // Submission remains blocked while cancellation is nonterminal.
     harness.tui().set_input_text("second message");
     harness
         .tui()
@@ -4602,12 +4588,12 @@ async fn ctrl_c_during_in_flight_task_does_not_clear_llm_busy_or_spawn_new_task(
         .await
         .unwrap();
 
-    // The new message must be QUEUED, not running. The same Task A
+    // The new message must be rejected. The same Task A
     // handle / abort signal must still be present — no Task B was
     // spawned alongside.
     assert!(
-        harness.tui().app.pending_message.is_some(),
-        "the typed message must queue while Task A is still in flight"
+        harness.tui().app.pending_message.is_none(),
+        "new prompts must remain blocked while cancellation is pending"
     );
     let task_a_abort_after = harness
         .tui()
@@ -4638,22 +4624,19 @@ async fn ctrl_c_during_in_flight_task_does_not_clear_llm_busy_or_spawn_new_task(
         "the JoinHandle slot must still hold Task A's handle"
     );
 
-    // Release Task A so the test can clean up. After Final propagates,
-    // submit_pending_message_inner will spawn the queued Task B; both
-    // tasks must drain before the harness shuts down or the spawned
-    // tokio task can outlive its TestStateGuard.
+    // Release Task A and verify no follow-up task consumes the second turn.
     gate_release.notify_one();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         while let Ok(event) = harness.tui().event_rx.try_recv() {
             harness.tui().handle_tui_event(event).await.unwrap();
         }
-        if mock_client.remaining_turns() == 0 && !harness.tui().app.llm_busy {
+        if mock_client.remaining_turns() == 1 && !harness.tui().app.llm_busy {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "timed out waiting for both prompts to drain"
+            "timed out waiting for cancelled task to drain"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -4748,16 +4731,14 @@ async fn ctrl_c_resubmit_does_not_consume_a_second_mock_turn_while_task_a_is_in_
          in flight — Bug 2 spawned Task B here, which would pop turn 2"
     );
 
-    // Release Task A so the test can clean up. After Final/Error
-    // propagates, the queued message becomes Task B and consumes
-    // turn 2.
+    // Release Task A. Rejected input must not consume the second turn.
     gate_release.notify_one();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         while let Ok(event) = harness.tui().event_rx.try_recv() {
             harness.tui().handle_tui_event(event).await.unwrap();
         }
-        if mock_client.remaining_turns() == 0 && !harness.tui().app.llm_busy {
+        if mock_client.remaining_turns() == 1 && !harness.tui().app.llm_busy {
             break;
         }
         assert!(

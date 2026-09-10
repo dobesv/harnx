@@ -33,6 +33,12 @@ async fn cancel_control_command_serializes_and_is_publishable() -> Result<()> {
         ))
         .await?;
 
+    let store = harnx_execution_control::ExecutionStore::ensure(
+        &async_nats::jetstream::new(client.clone()),
+        1,
+    )
+    .await?;
+    store.session("control-cancel-only", None, None).await?;
     publish_control_command(&client, "control-cancel-only", &ControlCommand::Cancel).await?;
 
     use futures_util::StreamExt;
@@ -41,7 +47,7 @@ async fn cancel_control_command_serializes_and_is_publishable() -> Result<()> {
         .expect("should receive control message");
 
     let cmd: ControlCommand = serde_json::from_slice(&msg.payload)?;
-    assert!(matches!(cmd, ControlCommand::Cancel));
+    assert!(matches!(cmd, ControlCommand::CancelExecution { .. }));
     Ok(())
 }
 

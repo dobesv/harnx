@@ -74,28 +74,26 @@ pub(super) async fn nats_session_for_target(
     .await
 }
 
-async fn cancel_remote_session(
-    config: &GlobalConfig,
-    local_worker: &Arc<Mutex<Option<harnx_runtime::local_orchestrator::LocalWorkerSupervisor>>>,
-    session_id: String,
-    cluster: String,
-) -> Result<()> {
-    let session = nats_session_for_target(config, local_worker, session_id.clone(), cluster)
-        .await
-        .with_context(|| format!("prepare NATS session {session_id} for cancellation"))?;
-    session
-        .cancel_pending_turn()
-        .await
-        .with_context(|| format!("durably cancel NATS session {session_id}"))?;
-    Ok(())
-}
-
 pub(crate) fn default_exit_cancel_factory() -> ExitCancelFactory {
-    Arc::new(|config, local_worker, session_id, cluster| {
-        Box::pin(
-            async move { cancel_remote_session(&config, &local_worker, session_id, cluster).await },
-        )
-    })
+    Arc::new(
+        |config, local_worker, session_id, cluster, expected_execution_id| {
+            Box::pin(async move {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    let session =
+                        nats_session_for_target(&config, &local_worker, session_id, cluster)
+                            .await?;
+                    session
+                        .request_cancel(harnx_execution_control::CancelRequest {
+                            expected_execution_id,
+                            retry: true,
+                        })
+                        .await
+                })
+                .await
+                .context("timed out preparing cancellation request; retry to reconcile")?
+            })
+        },
+    )
 }
 
 impl Tui {
@@ -140,24 +138,13 @@ impl Tui {
         let Some((session_id, cluster)) = self.active_remote_session.clone() else {
             return false;
         };
-        let cancel = (self.exit_cancel_factory)(
-            self.config.clone(),
-            self.local_worker.clone(),
-            session_id,
-            cluster,
-        );
-        self.exit_interrupt_error = None;
-        self.pending_exit_cancel = Some(cancel);
+        self.exit_after_cancel = true;
+        self.start_cancellation(session_id, cluster, None);
         true
     }
 
-    /// Poll the in-flight cancel future, completing exit only if ready.
-    ///
-    /// Uses `now_or_never` for a single non-blocking poll. A pending future is
-    /// preserved (not dropped) so the cancel continues across event-loop ticks.
-    /// Once complete, clears the modal and sets `should_quit`, recording any
-    /// error for post-exit warning.
     pub(crate) async fn poll_pending_exit_cancel(&mut self) {
+        self.poll_cancellation_status();
         let result = self
             .pending_exit_cancel
             .as_mut()
@@ -165,13 +152,29 @@ impl Tui {
         let Some(result) = result else {
             return;
         };
-
         self.pending_exit_cancel = None;
-        if let Err(error) = result {
-            self.exit_interrupt_error = Some(format!("{error:#}"));
+        match result {
+            Ok(receipt) => {
+                if self.exit_after_cancel {
+                    self.app.modal = None;
+                    self.app.should_quit = true;
+                } else {
+                    self.monitor_cancellation(receipt);
+                }
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                self.exit_interrupt_error = Some(error.clone());
+                if let Some(tray) = &mut self.cancellation {
+                    tray.phase = crate::cancellation::CancellationPhase::Failed(error);
+                }
+                if let Some(crate::types::ModalState::ConfirmExit { phase, .. }) =
+                    &mut self.app.modal
+                {
+                    *phase = crate::types::ExitPhase::RequestFailed;
+                }
+            }
         }
-        self.app.modal = None;
-        self.app.should_quit = true;
     }
 
     #[cfg(test)]
@@ -180,27 +183,11 @@ impl Tui {
         self.exit_cancel_factory = factory;
     }
 
-    /// Fire-and-forget cancel for in-TUI Ctrl+C that stays in the event loop.
-    ///
-    /// This detached-spawn path is ONLY appropriate when the TUI remains alive
-    /// after cancel (Ctrl+C interrupts but keeps the session open). Exit paths
-    /// that quit afterward MUST use `start_exit_cancel` + `poll_pending_exit_cancel`
-    /// to await completion before shutting down the `LocalWorkerSupervisor`.
-    /// Process exit drops the supervisor, which kills the worker and can race
-    /// the cancel request, losing the durable `Cancel` tombstone.
-    pub(super) fn cancel_active_remote_session(&self) {
+    pub(super) fn cancel_active_remote_session(&mut self) {
         self.clear_tool_confirmation_route();
-        let Some((session_id, cluster)) = self.active_remote_session.clone() else {
-            return;
-        };
-        let config = self.config.clone();
-        let local_worker = self.local_worker.clone();
-        tokio::spawn(async move {
-            if let Err(error) =
-                cancel_remote_session(&config, &local_worker, session_id, cluster).await
-            {
-                log::warn!("Failed to cancel active NATS session: {error:#}");
-            }
-        });
+        if let Some((session_id, cluster)) = self.active_remote_session.clone() {
+            self.exit_after_cancel = false;
+            self.start_cancellation(session_id, cluster, None);
+        }
     }
 }

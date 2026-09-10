@@ -4,7 +4,9 @@
 //! Config/Input/Client/tool and dispatches via AgentEventSink.
 
 pub mod agent_event_sink;
+mod cancellation;
 pub mod event_source;
+mod exit_confirmation;
 pub mod input;
 pub mod lifecycle;
 pub mod markdown_render;

@@ -2,6 +2,8 @@
 //!
 //! Validates end-to-end persistence of a full turn via NatsSessionLog.
 
+#[path = "nats_worker/cancellation.rs"]
+mod cancellation;
 mod common;
 #[path = "nats_worker/multi_round_resume.rs"]
 mod multi_round_resume;
@@ -1831,8 +1833,8 @@ fn injection_decision_points_use_leader_authoritative_read() {
             .lines()
             .filter(|line| line.contains("load_events_latest_async()"))
             .count(),
-        4,
-        "the daemon family's turn and HITL decision logic must use load_events_latest_async at exactly 4 decision points"
+        5,
+        "turn decisions and failure coverage must use leader-authoritative reads"
     );
     assert_eq!(
         daemon_family
@@ -2022,12 +2024,16 @@ async fn cancel_immediately_after_activation_ack_is_not_lost() -> Result<()> {
     .await?;
 
     activate_session(&jetstream, session_id).await?;
-    // WorkQueue retention removes the activation after worker ack. Publish cancel
-    // immediately after observing that ack; worker must already be subscribed.
-    let mut notify_stream = jetstream.get_stream("WORK_NOTIFY_local").await?;
+    // The activation remains durable until shutdown. Observe ownership instead
+    // of waiting for the final acknowledgement, which now requires quiescence.
+    let store = harnx_execution_control::ExecutionStore::ensure(&jetstream, 1).await?;
     tokio::time::timeout(CI_SAFE_TIMEOUT, async {
         loop {
-            if notify_stream.info().await?.state.messages == 0 {
+            if store
+                .current(session_id)
+                .await?
+                .is_some_and(|op| op.owner.is_some())
+            {
                 return Ok::<_, anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

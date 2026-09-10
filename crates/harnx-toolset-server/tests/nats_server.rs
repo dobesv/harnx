@@ -28,6 +28,7 @@ async fn assert_registration(harness: &TestHarness) -> Result<()> {
 async fn assert_idempotent_replay(harness: &TestHarness) -> Result<()> {
     let invocations_before = harness.toolset.echo_invocations.load(Ordering::SeqCst);
     let request = ToolRequest {
+        operation_id: "call-echo".to_string(),
         call_id: "call-echo".to_string(),
         tool: "echo".to_string(),
         args: json!({ "value": 42 }),
@@ -59,6 +60,7 @@ async fn assert_idempotent_replay(harness: &TestHarness) -> Result<()> {
 
 async fn assert_invocation_context(harness: &TestHarness) -> Result<()> {
     let request = ToolRequest {
+        operation_id: "call-invocation-context".to_string(),
         call_id: "call-invocation-context".to_string(),
         tool: "echo".to_string(),
         args: json!({}),
@@ -77,6 +79,10 @@ async fn assert_invocation_context(harness: &TestHarness) -> Result<()> {
     assert_eq!(
         harness.toolset.last_context.lock().await.as_ref(),
         Some(&harnx_toolset::ToolInvocationContext {
+            operation: Some(harnx_execution_control::OperationRef::new(
+                "session-123",
+                &request.operation_id
+            )),
             call_id: request.call_id,
             invoking_session_id: request.parent_session_id,
             capabilities: request.capabilities,
@@ -95,6 +101,7 @@ async fn assert_execution_context_capability_is_per_request(harness: &TestHarnes
         }
     });
     let opted_in = ToolRequest {
+        operation_id: "call-context-enabled".to_string(),
         call_id: "call-context-enabled".to_string(),
         tool: "echo".to_string(),
         args: args.clone(),
@@ -117,6 +124,7 @@ async fn assert_execution_context_capability_is_per_request(harness: &TestHarnes
     assert_eq!(provenance["call_id"], opted_in.call_id);
 
     let opted_out = ToolRequest {
+        operation_id: "call-context-disabled".to_string(),
         call_id: "call-context-disabled".to_string(),
         tool: "echo".to_string(),
         args,
@@ -145,6 +153,7 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
     let invocations_before = harness.toolset.echo_invocations.load(Ordering::SeqCst);
     let args = json!({ "value": 43, "delay_ms": 100 });
     let first = ToolRequest {
+        operation_id: "call-concurrent-a".to_string(),
         call_id: "call-concurrent-a".to_string(),
         tool: "echo".to_string(),
         args: args.clone(),
@@ -153,6 +162,7 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
         capabilities: Default::default(),
     };
     let second = ToolRequest {
+        operation_id: "call-concurrent-b".to_string(),
         call_id: "call-concurrent-b".to_string(),
         tool: "echo".to_string(),
         args: args.clone(),
@@ -222,6 +232,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
     )
     .await?;
     let mismatched = ToolRequest {
+        operation_id: "payload-call".to_string(),
         call_id: "payload-call".to_string(),
         tool: "echo".to_string(),
         args: json!({}),
@@ -237,6 +248,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
     )
     .await?;
     let missing_key = ToolRequest {
+        operation_id: "call-missing-key".to_string(),
         call_id: "call-missing-key".to_string(),
         tool: "echo".to_string(),
         args: json!({}),
@@ -257,6 +269,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
 
 async fn assert_cancellation(harness: &TestHarness) -> Result<()> {
     let request = ToolRequest {
+        operation_id: "call-slow".to_string(),
         call_id: "call-slow".to_string(),
         tool: "slow".to_string(),
         args: json!({}),
@@ -275,6 +288,8 @@ async fn assert_cancellation(harness: &TestHarness) -> Result<()> {
         result = &mut slow_request => anyhow::bail!("slow request completed before cancellation: {result:?}"),
     }
     let control = ControlMessage {
+        operation_id: request.call_id.clone(),
+        cancellation_id: "cancel-test".into(),
         call_id: request.call_id.clone(),
         kind: ControlKind::Cancel,
     };
@@ -458,6 +473,7 @@ async fn shutdown_drains_in_flight_requests_before_deregistering() -> Result<()>
     assert_registration(&harness).await?;
 
     let request = ToolRequest {
+        operation_id: "call-drain".to_string(),
         call_id: "call-drain".to_string(),
         tool: "echo".to_string(),
         args: json!({"delay_ms": 500}),

@@ -1328,6 +1328,20 @@ fn build_promptless_event_stream(
     Box::pin(tokio_stream::StreamExt::chain(hydrated, body))
 }
 
+fn cancellation_state_event(state: &crate::session_actor::SessionState) -> Option<Event> {
+    match state {
+        crate::session_actor::SessionState::Cancelling(receipt)
+        | crate::session_actor::SessionState::CancelUnconfirmed(receipt) => {
+            Some(Event::Custom(ag_ui_core::event::CustomEvent {
+                base: AgUiSink::base_event(),
+                name: "cancellation_state".into(),
+                value: json!({ "cancellation": receipt }),
+            }))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn build_ag_ui_event_stream(
     handle: &SessionHandle,
     run_id: &str,
@@ -1349,12 +1363,20 @@ pub(crate) fn build_ag_ui_event_stream(
         .as_deref()
         .and_then(|entries| entries.last().map(|(seq, _)| *seq))
         .unwrap_or(0);
+    let cancellation = cancellation_state_event(&state);
     let interrupt_outcome = match state {
         crate::session_actor::SessionState::Interrupted { pending, .. } => Some(pending.metadata),
         crate::session_actor::SessionState::Idle
-        | crate::session_actor::SessionState::Running { .. } => None,
+        | crate::session_actor::SessionState::Running { .. }
+        | crate::session_actor::SessionState::Cancelling(_)
+        | crate::session_actor::SessionState::CancelUnconfirmed(_) => None,
     };
-    let initial_frame = initial_attach_frame(snapshot, history_warnings, has_prompt.is_none());
+    let initial_frame = initial_attach_frame(
+        snapshot,
+        history_warnings,
+        has_prompt.is_none(),
+        cancellation,
+    );
     let handle_for_lag = handle.clone();
     let live_stream = tokio_stream::StreamExt::then(BroadcastStream::new(events), move |item| {
         let handle = handle_for_lag.clone();

@@ -226,6 +226,8 @@ async fn reap_predicate_rejects_buffered_mailbox_commands() {
         broadcast_tx,
         subscribers: 0,
         state: SessionState::Idle,
+        execution_id: None,
+        execution_state: None,
         pending: VecDeque::new(),
         active_run: None,
         run_done_tx,

@@ -132,7 +132,7 @@ pub async fn handle_ag_ui_rpc_bytes(
         "session/hitl_decision" => {
             handle_hitl_decision(rpc.id, rpc.params, config, registry, key).await
         }
-        "session/cancel" => handle_cancel(rpc.id, config, registry, key).await,
+        "session/cancel" => handle_cancel((rpc.id, rpc.params), config, registry, key).await,
         _ => json_rpc_response(
             StatusCode::OK,
             json_rpc_error(rpc.id, -32601, "method not found", None),
@@ -176,6 +176,10 @@ async fn handle_get(
             "id": id,
             "result": {
                 "state": session_state_json(&info.state),
+                "execution_id": info.execution_id,
+                "execution_state": info.execution_state,
+                "canPrompt": info.capabilities.can_prompt,
+                "canCancel": info.capabilities.can_cancel,
                 "history_snapshot": info.history_snapshot,
                 "history_warnings": info.history_warnings,
                 "capabilities": {
@@ -290,40 +294,57 @@ async fn handle_prompt(
         Some(applied)
     };
 
-    let result_json = if params.text.trim().is_empty() {
-        json!({ "status": "accepted", "applied": resume_applied.unwrap_or(false) })
-    } else {
-        let result = match prompt(
-            &handle,
-            &params.text,
-            SessionPromptOptions {
-                working_dir: params.working_dir.clone(),
-                attachment_refs: params.attachment_refs.clone(),
-            },
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(message) => {
-                return json_rpc_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    json_rpc_error(id, -32003, &message, None),
-                );
-            }
-        };
-        let mut result_json = match result {
-            PromptResult::Accepted { run_id } => {
-                json!({ "status": "accepted", "run_id": run_id })
-            }
-            PromptResult::Enqueued { run_id } => {
-                json!({ "status": "enqueued", "run_id": run_id })
-            }
-        };
-        if let Some(applied) = resume_applied {
-            result_json["applied"] = json!(applied);
+    if params.text.trim().is_empty() {
+        return json_rpc_response(
+            StatusCode::OK,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "status": "accepted", "applied": resume_applied.unwrap_or(false) }
+            }),
+        );
+    }
+    submit_prompt(id, &handle, &params, resume_applied).await
+}
+
+async fn submit_prompt(
+    id: Value,
+    handle: &SessionHandle,
+    params: &PromptParams,
+    resume_applied: Option<bool>,
+) -> anyhow::Result<AppResponse> {
+    let result = match prompt(
+        handle,
+        &params.text,
+        SessionPromptOptions {
+            working_dir: params.working_dir.clone(),
+            attachment_refs: params.attachment_refs.clone(),
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(message) => {
+            return json_rpc_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json_rpc_error(id, -32003, &message, None),
+            );
         }
-        result_json
     };
+    let mut result_json = match result {
+        PromptResult::Accepted { run_id } => json!({ "status": "accepted", "run_id": run_id }),
+        PromptResult::Enqueued { run_id } => json!({ "status": "enqueued", "run_id": run_id }),
+        PromptResult::Rejected { reason } => {
+            return json_rpc_response(
+                StatusCode::CONFLICT,
+                json_rpc_error(id, -32004, &reason, None),
+            );
+        }
+    };
+    if let Some(applied) = resume_applied {
+        result_json["applied"] = json!(applied);
+    }
     json_rpc_response(
         StatusCode::OK,
         json!({ "jsonrpc": "2.0", "id": id, "result": result_json }),
@@ -402,11 +423,12 @@ pub(crate) async fn route_hitl_decision(
 }
 
 async fn handle_cancel(
-    id: Value,
+    request: (Value, Option<Value>),
     config: &harnx_runtime::config::Config,
     registry: &SessionRegistry,
     key: SessionKey,
 ) -> anyhow::Result<AppResponse> {
+    let (id, params) = request;
     if !registry.has_session(&key) && !session_exists(config, &key).await {
         return json_rpc_response(
             StatusCode::NOT_FOUND,
@@ -420,41 +442,26 @@ async fn handle_cancel(
     }
 
     let handle = registry.get_or_spawn(key);
-    let info = match get_info(&handle).await {
-        Ok(info) => info,
-        Err(message) => {
-            return json_rpc_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                json_rpc_error(id, -32003, &message, None),
-            );
-        }
-    };
-    if matches!(info.state, SessionState::Idle) {
-        return json_rpc_response(
-            StatusCode::BAD_REQUEST,
-            json_rpc_error(
-                id,
-                JSON_RPC_IDLE_CANCEL_CODE,
-                "session is not running",
-                None,
-            ),
-        );
-    }
-
-    if let Err(message) = cancel(&handle).await {
-        return json_rpc_response(
+    let request: harnx_execution_control::CancelRequest =
+        match serde_json::from_value(params.unwrap_or_else(|| json!({}))) {
+            Ok(request) => request,
+            Err(error) => {
+                return json_rpc_response(
+                    StatusCode::BAD_REQUEST,
+                    json_rpc_error(id, -32602, &error.to_string(), None),
+                )
+            }
+        };
+    match cancel(&handle, request.expected_execution_id).await {
+        Ok(receipt) => json_rpc_response(
+            StatusCode::OK,
+            json!({ "jsonrpc": "2.0", "id": id, "result": receipt }),
+        ),
+        Err(message) => json_rpc_response(
             StatusCode::SERVICE_UNAVAILABLE,
             json_rpc_error(id, -32003, &message, None),
-        );
+        ),
     }
-    json_rpc_response(
-        StatusCode::OK,
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": { "cancelled": true }
-        }),
-    )
 }
 
 async fn session_exists(config: &harnx_runtime::config::Config, key: &SessionKey) -> bool {
@@ -479,6 +486,12 @@ async fn session_exists(config: &harnx_runtime::config::Config, key: &SessionKey
 fn session_state_json(state: &SessionState) -> Value {
     match state {
         SessionState::Idle => json!({ "status": "idle" }),
+        SessionState::Cancelling(receipt) => {
+            json!({ "status": "cancelling", "cancellation": receipt })
+        }
+        SessionState::CancelUnconfirmed(receipt) => {
+            json!({ "status": "cancel_unconfirmed", "cancellation": receipt })
+        }
         SessionState::Running { run_id, started_at } => json!({
             "status": "running",
             "run_id": run_id,
@@ -511,16 +524,22 @@ async fn prompt(
         .map_err(|_| "session actor dropped prompt reply".to_string())
 }
 
-async fn cancel(handle: &SessionHandle) -> Result<(), String> {
+async fn cancel(
+    handle: &SessionHandle,
+    expected_execution_id: Option<String>,
+) -> Result<harnx_execution_control::CancelReceipt, String> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     handle
         .tx
-        .send(SessionCommand::Cancel { reply: reply_tx })
+        .send(SessionCommand::Cancel {
+            reply: reply_tx,
+            expected_execution_id,
+        })
         .await
         .map_err(|_| "session actor unavailable".to_string())?;
     reply_rx
         .await
-        .map_err(|_| "session actor dropped cancel reply".to_string())
+        .map_err(|_| "session actor dropped cancel reply".to_string())?
 }
 
 async fn get_info(handle: &SessionHandle) -> Result<SessionInfo, String> {
@@ -1029,7 +1048,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_prompt_accepts_attachment_refs_param() {
+    async fn rpc_prompt_rejects_unresolvable_attachments_before_acceptance() {
         let _guard = TestStateGuard::new(None).await;
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
@@ -1063,12 +1082,10 @@ mod tests {
         )
         .await
         .expect("rpc response");
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = response_json(response).await;
-        assert!(matches!(
-            body["result"]["status"].as_str(),
-            Some("accepted") | Some("enqueued")
-        ));
+        assert_eq!(body["error"]["code"], -32004);
+        assert!(body["result"].is_null());
     }
 
     #[tokio::test]
@@ -1154,10 +1171,11 @@ mod extra_rpc_tests {
         )
         .await
         .expect("idle cancel response");
-        assert_eq!(idle_cancel.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(idle_cancel.status(), StatusCode::OK);
         let idle_body = response_json(idle_cancel).await;
         assert_eq!(idle_body["id"], "idle");
-        assert_eq!(idle_body["error"]["code"], JSON_RPC_IDLE_CANCEL_CODE);
+        assert_eq!(idle_body["result"]["disposition"], "idle");
+        assert_eq!(idle_body["result"]["cancelled"], false);
 
         let missing_params = handle_ag_ui_rpc_bytes(
             Method::POST,

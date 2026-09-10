@@ -475,6 +475,16 @@ impl Tui {
                 .confirm_tool_modal_height(input_width, modal)
                 .clamp(6, max_height);
         }
+        if let Some(modal @ ModalState::ConfirmExit { .. }) = &self.app.modal {
+            let max_height = (screen_height / 2).max(5);
+            return self
+                .exit_confirm_modal_height(input_width, modal)
+                .clamp(5, max_height);
+        }
+
+        if self.has_root_cancellation() {
+            return 5;
+        }
 
         let input_height = self
             .input_height(input_width)
@@ -486,6 +496,15 @@ impl Tui {
     fn render_bottom_region(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
         if let Some(modal @ ModalState::ConfirmToolUse { .. }) = self.app.modal.clone() {
             self.render_tool_confirm_modal(frame, area, &modal);
+            return;
+        }
+        if let Some(modal @ ModalState::ConfirmExit { .. }) = self.app.modal.clone() {
+            self.render_exit_confirm_modal(frame, area, &modal);
+            return;
+        }
+
+        if self.has_root_cancellation() {
+            self.render_cancellation_tray(frame, area);
             return;
         }
 
@@ -524,7 +543,10 @@ impl Tui {
 
     fn render_overlay_modal(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
         if let Some(modal) = &self.app.modal {
-            if !matches!(modal, ModalState::ConfirmToolUse { .. }) {
+            if !matches!(
+                modal,
+                ModalState::ConfirmToolUse { .. } | ModalState::ConfirmExit { .. }
+            ) {
                 self.render_modal(frame, area, modal);
             }
         }
@@ -756,7 +778,7 @@ impl Tui {
         let config_read = self.config.read();
         let mut spans = vec![];
 
-        let spinner = if self.app.llm_busy {
+        let spinner = if self.app.llm_busy && !self.cancellation_unconfirmed() {
             SPINNER_FRAMES[self.app.spinner_index]
         } else {
             "•"
@@ -877,11 +899,8 @@ impl Tui {
             ModalState::ConfirmToolUse { .. } => {
                 self.render_tool_confirm_overlay(frame, screen_size, modal);
             }
-            ModalState::ConfirmExit {
-                worker_state,
-                phase,
-            } => {
-                self.render_exit_confirm_modal(frame, screen_size, *worker_state, *phase);
+            ModalState::ConfirmExit { .. } => {
+                self.render_exit_confirm_overlay(frame, screen_size, modal);
             }
             ModalState::AgentPicker {
                 agents,
@@ -931,60 +950,6 @@ impl Tui {
                 );
             }
         }
-    }
-    fn render_exit_confirm_modal(
-        &self,
-        frame: &mut Frame<'_>,
-        screen_size: ratatui::layout::Rect,
-        worker_state: crate::types::ExitWorkerState,
-        phase: crate::types::ExitPhase,
-    ) {
-        let title = "Agent is still working";
-        let body = exit_body_copy(worker_state);
-        let action_line = match phase {
-            crate::types::ExitPhase::Prompting => {
-                "Ctrl+D — exit without interrupting    Ctrl+C — interrupt and exit    Esc — stay"
-            }
-            crate::types::ExitPhase::Interrupting => "Interrupting…",
-        };
-
-        let desired_width = 83u16 + 4; // Action line width (83) + borders
-        let modal_width = desired_width.min(screen_size.width.saturating_sub(4));
-
-        let body_wrapped = textwrap::wrap(body, modal_width.saturating_sub(4) as usize);
-        let action_wrapped = textwrap::wrap(action_line, modal_width.saturating_sub(4) as usize);
-
-        let modal_height = (2 + body_wrapped.len() + 1 + action_wrapped.len()) as u16;
-
-        let modal_x = (screen_size.width.saturating_sub(modal_width)) / 2;
-        let modal_y = (screen_size.height.saturating_sub(modal_height)) / 2;
-        let modal_area = ratatui::layout::Rect::new(modal_x, modal_y, modal_width, modal_height);
-
-        frame.render_widget(ratatui::widgets::Clear, modal_area);
-
-        let mut lines = Vec::new();
-        for line in body_wrapped {
-            lines.push(Line::from(Span::styled(
-                line.into_owned(),
-                Style::default().fg(Color::Reset),
-            )));
-        }
-        lines.push(Line::from("")); // blank line
-        for line in action_wrapped {
-            lines.push(Line::from(Span::styled(
-                line.into_owned(),
-                Style::default().fg(Color::Reset),
-            )));
-        }
-
-        let modal = Paragraph::new(lines).block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Reset)),
-        );
-
-        frame.render_widget(modal, modal_area);
     }
     fn render_simple_modal(
         &self,
@@ -1478,16 +1443,6 @@ pub(crate) fn session_picker_highlight_index(selected: usize, has_error: bool) -
         selected + 1
     } else {
         selected
-    }
-}
-
-pub(crate) fn exit_body_copy(state: crate::types::ExitWorkerState) -> &'static str {
-    use crate::types::ExitWorkerState;
-    match state {
-        ExitWorkerState::Remote => "Runs on a remote worker. Exit without interrupting and it keeps running there; reopening the session resumes it.",
-        ExitWorkerState::LocalOwnedHere => "Runs on a local worker owned by this client. Exit without interrupting and the work stops; reopening the session resumes it from where it stopped.",
-        ExitWorkerState::LocalOwnedElsewhere => "Runs on a local worker owned by another client. Exit without interrupting and it keeps running there; reopening the session resumes it.",
-        ExitWorkerState::Unknown => "May keep running after you exit. If still in progress when you reopen, it resumes.",
     }
 }
 

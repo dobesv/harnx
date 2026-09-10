@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+#[path = "bridge_roundtrip/shared_cancellation.rs"]
+mod shared_cancellation;
+
 use anyhow::{Context, Result};
 use harnx_core::instance::ServerScope;
 use harnx_mcp_bridge::BridgeToolset;
@@ -187,6 +190,18 @@ async fn wait_for_registration(
     }
 }
 
+fn tool_request(call_id: &str, tool: &str) -> ToolRequest {
+    ToolRequest {
+        operation_id: call_id.to_owned(),
+        call_id: call_id.to_owned(),
+        tool: tool.to_owned(),
+        args: json!({}),
+        parent_session_id: None,
+        tool_call_id: None,
+        capabilities: Default::default(),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn bridge_registers_plans_and_round_trips_an_invoke() -> Result<()> {
     let Some(server) = spawn_nats_server().await? else {
@@ -230,14 +245,7 @@ async fn bridge_registers_plans_and_round_trips_an_invoke() -> Result<()> {
         .all(|tool| !tool.name.starts_with("plans_")));
 
     let call_id = "bridge-plans-list";
-    let request = ToolRequest {
-        call_id: call_id.to_owned(),
-        tool: "list_plans".to_owned(),
-        args: json!({}),
-        parent_session_id: None,
-        tool_call_id: None,
-        capabilities: Default::default(),
-    };
+    let request = tool_request(call_id, "list_plans");
     let mut headers = async_nats::HeaderMap::new();
     headers.insert(HDR_CALL_ID, call_id);
     headers.insert(HDR_IDEMPOTENCY_KEY, "bridge-plans-list-idempotency");

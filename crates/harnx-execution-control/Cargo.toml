@@ -1,0 +1,21 @@
+[package]
+name = "harnx-execution-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-nats.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+harnx-nats-common.workspace = true
+metrics.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+which.workspace = true

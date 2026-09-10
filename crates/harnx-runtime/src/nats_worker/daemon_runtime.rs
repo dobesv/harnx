@@ -2,10 +2,13 @@
 //! acquisition, this session's tool-server refcount, control-plane
 //! subscription, and handing the claimed session off to execution.
 
+mod activation_preflight;
+
 use super::backend::NatsSessionLogBackend;
 use super::control::{control_subject, SessionControlHandler};
 use super::daemon::{SessionActivate, SessionActivationRoute, WorkerActivationMode};
 use super::daemon_background::BackgroundServices;
+use super::execution_control::WorkerExecution;
 use super::server_reconciler::{tool_servers_for_activation, ServerReconciler};
 use crate::config::GlobalConfig;
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
@@ -35,13 +38,14 @@ use tracing::Instrument;
 pub(super) const SESSION_TOOL_SERVER_START_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Borrowed parameters for [`WorkerRuntime::spawn_control_listener`].
-struct ControlListenerCtx<'a> {
-    client: &'a async_nats::Client,
-    jetstream: &'a jetstream::Context,
-    session_id: &'a str,
-    lease: &'a Arc<NatsSessionLease>,
-    backend: &'a NatsSessionLogBackend,
-    abort_signal: &'a crate::utils::AbortSignal,
+pub(super) struct ControlListenerCtx<'a> {
+    pub(super) client: &'a async_nats::Client,
+    pub(super) jetstream: &'a jetstream::Context,
+    pub(super) session_id: &'a str,
+    pub(super) lease: &'a Arc<NatsSessionLease>,
+    pub(super) backend: &'a NatsSessionLogBackend,
+    pub(super) abort_signal: &'a crate::utils::AbortSignal,
+    pub(super) execution: &'a WorkerExecution,
 }
 
 struct PreparedControl {
@@ -55,6 +59,7 @@ struct ActivationAckCtx<'a> {
     message: &'a async_nats::jetstream::Message,
     lease: &'a Arc<NatsSessionLease>,
     abort_signal: &'a crate::utils::AbortSignal,
+    execution: &'a WorkerExecution,
 }
 
 struct ClaimedActivation {
@@ -68,6 +73,8 @@ struct PreparedActivation {
     lease: Arc<NatsSessionLease>,
     abort_signal: crate::utils::AbortSignal,
     control: PreparedControl,
+    execution: WorkerExecution,
+    message: async_nats::jetstream::Message,
     span: tracing::Span,
 }
 
@@ -312,12 +319,7 @@ impl WorkerRuntime {
         &self,
         message: &async_nats::jetstream::Message,
     ) -> Result<()> {
-        if self.uses_targeted_activation() {
-            Self::delayed_nak(message).await
-        } else {
-            let _ = message.ack().await;
-            Ok(())
-        }
+        Self::delayed_nak(message).await
     }
 
     async fn acquire_or_defer_activation(
@@ -327,11 +329,10 @@ impl WorkerRuntime {
     ) -> Result<Option<Arc<NatsSessionLease>>> {
         match self.acquire_activation_lease(activation).await {
             Ok(Some(lease)) => Ok(Some(lease)),
-            Ok(None) if self.uses_targeted_activation() => {
+            Ok(None) => {
                 Self::delayed_nak(message).await?;
                 Ok(None)
             }
-            Ok(None) => Ok(None),
             Err(error) if self.uses_targeted_activation() => {
                 log::warn!(
                     "targeted activation lease attempt failed for session '{}': {error:#}",
@@ -346,10 +347,15 @@ impl WorkerRuntime {
 
     async fn prepare_activation_control(
         &self,
-        activation: &SessionActivate,
-        lease: &Arc<NatsSessionLease>,
-        abort_signal: &crate::utils::AbortSignal,
+        ctx: &ActivationAckCtx<'_>,
     ) -> Result<PreparedControl> {
+        let ActivationAckCtx {
+            activation,
+            lease,
+            abort_signal,
+            execution,
+            ..
+        } = *ctx;
         let backend = NatsSessionLogBackend::new(self.jetstream.clone(), &activation.session_id);
         match Self::spawn_control_listener(ControlListenerCtx {
             client: &self.client,
@@ -358,10 +364,11 @@ impl WorkerRuntime {
             lease,
             backend: &backend,
             abort_signal,
+            execution,
         })
         .await
         {
-            Ok(task) => Ok(task),
+            Ok(control) => Ok(control),
             Err(error) => {
                 let _ = lease.release().await;
                 Err(error)
@@ -380,18 +387,15 @@ impl WorkerRuntime {
         &self,
         ctx: ActivationAckCtx<'_>,
     ) -> Result<PreparedControl> {
-        let control = match self
-            .prepare_activation_control(ctx.activation, ctx.lease, ctx.abort_signal)
-            .await
-        {
-            Ok(task) => task,
+        let control = match self.prepare_activation_control(&ctx).await {
+            Ok(control) => control,
             Err(error) => {
                 self.end_session_tool_servers(&ctx.activation.session_id)
                     .await;
                 return Err(error);
             }
         };
-        if let Err(error) = ctx.message.ack().await {
+        if let Err(error) = ctx.message.ack_with(AckKind::Progress).await {
             control.task.abort();
             let _ = ctx.lease.release().await;
             self.end_session_tool_servers(&ctx.activation.session_id)
@@ -407,15 +411,21 @@ impl WorkerRuntime {
         message: &async_nats::jetstream::Message,
     ) -> Result<PreparedActivation> {
         let ClaimedActivation {
-            activation,
+            mut activation,
             lease,
             span,
         } = claimed;
-        self.start_session_tool_servers(&activation).await;
-        super::daemon_background::await_initial_background_services(
-            &self.background_services_attempted,
-        )
-        .await;
+        let store =
+            harnx_execution_control::ExecutionStore::ensure(&self.jetstream, self.lease.replicas)
+                .await?;
+        let execution =
+            match WorkerExecution::claim(store, &mut activation, &lease, &self.jetstream).await {
+                Ok(execution) => execution,
+                Err(error) => {
+                    let _ = lease.release().await;
+                    return Err(error);
+                }
+            };
         log::info!(
             "session activate claimed: session_id={} worker_id={} worker_pid={} build={} activation_route={:?} revision={} epoch={}",
             activation.session_id,
@@ -434,9 +444,26 @@ impl WorkerRuntime {
                 message,
                 lease: &lease,
                 abort_signal: &abort_signal,
+                execution: &execution,
             })
             .await?;
+        if execution
+            .store
+            .check_ancestors(&execution.reference)
+            .await
+            .is_ok()
+        {
+            self.start_session_tool_servers(&activation).await;
+            super::daemon_background::await_initial_background_services(
+                &self.background_services_attempted,
+            )
+            .await;
+        } else {
+            abort_signal.set_ctrlc();
+        }
         Ok(PreparedActivation {
+            execution,
+            message: message.clone(),
             activation,
             lease,
             abort_signal,
@@ -451,6 +478,8 @@ impl WorkerRuntime {
             lease,
             abort_signal,
             control,
+            execution,
+            message,
             span,
         } = prepared;
         let worker = Arc::clone(self);
@@ -474,9 +503,17 @@ impl WorkerRuntime {
                         abort_signal,
                         control.task,
                         control.hitl_decision_rx,
+                        execution,
                     )
                     .await;
-                worker.end_session_tool_servers(&task_session_id).await;
+                if result.as_ref().is_ok_and(|terminal| *terminal) {
+                    let _ = message.ack().await;
+                } else { let _ = Self::delayed_nak(&message).await; }
+                // A cooperative call may still own work. Keep its shared server
+                // alive until durable reconciliation observes the whole subtree.
+                if result.as_ref().is_ok_and(|terminal| *terminal) {
+                    worker.end_session_tool_servers(&task_session_id).await;
+                }
                 nats_metrics::active_session_finished();
                 let snapshot = nats_metrics::snapshot();
                 log::info!(
@@ -495,52 +532,6 @@ impl WorkerRuntime {
         self.active.lock().await.insert(session_id, handle);
     }
 
-    async fn metadata_preflight_passes(
-        &self,
-        message: &async_nats::jetstream::Message,
-        activation: &SessionActivate,
-    ) -> Result<bool> {
-        match self.session_metadata.get(&activation.session_id).await {
-            Ok(Some(_)) => Ok(true),
-            Ok(None) => {
-                log::warn!(
-                    "terminating SessionActivate without canonical metadata: session_id={}",
-                    activation.session_id
-                );
-                Self::terminate_activation(message, "metadata-less").await?;
-                Ok(false)
-            }
-            Err(error) => {
-                log::warn!(
-                    "session metadata preflight failed for '{}': {error:#}",
-                    activation.session_id
-                );
-                if self.uses_targeted_activation() {
-                    Self::delayed_nak(message).await?;
-                    Ok(false)
-                } else {
-                    Err(error)
-                }
-            }
-        }
-    }
-
-    async fn targeted_route_preflight_passes(
-        &self,
-        message: &async_nats::jetstream::Message,
-        activation: &SessionActivate,
-    ) -> Result<bool> {
-        if !self.uses_targeted_activation() {
-            return Ok(true);
-        }
-        if let Err(error) = self.validate_targeted_activation(activation) {
-            log::warn!("terminating misrouted targeted SessionActivate: {error:#}");
-            Self::terminate_activation(message, "misrouted targeted").await?;
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
     pub(super) async fn handle_activation(
         self: &Arc<Self>,
         message: async_nats::jetstream::Message,
@@ -549,31 +540,7 @@ impl WorkerRuntime {
             return Ok(());
         };
         let span = agent_activation_span(message.headers.as_ref(), &activation.session_id);
-        if !self
-            .metadata_preflight_passes(&message, &activation)
-            .await?
-        {
-            return Ok(());
-        }
-        if !self
-            .targeted_route_preflight_passes(&message, &activation)
-            .await?
-        {
-            return Ok(());
-        }
-
-        // A targeted re-activation stays durable until the active loop's tool
-        // boundary or final drain has covered the requested sequence.
-        if self.already_running(&activation.session_id).await {
-            self.settle_running_activation(&message).await?;
-            return Ok(());
-        }
-
-        if self.uses_targeted_activation()
-            && self
-                .targeted_status_preflight_finished(&message, &activation)
-                .await?
-        {
+        if !self.activation_is_ready(&message, &activation).await? {
             return Ok(());
         }
 
@@ -622,18 +589,20 @@ impl WorkerRuntime {
         // A request/reply acknowledgement is sent only after the worker has
         // written the fenced Cancel entry. It is published before firing abort
         // so execute_session cannot tear down this listener in between.
+        let watch = ctx.execution.store.watch().await?;
+        if ctx
+            .execution
+            .store
+            .check_ancestors(&ctx.execution.reference)
+            .await
+            .is_err()
+        {
+            ctx.abort_signal.set_ctrlc();
+        }
         let (hitl_decision_tx, hitl_decision_rx) = tokio::sync::mpsc::unbounded_channel();
-        let handler = SessionControlHandler::new(
-            ctx.client,
-            ctx.jetstream,
-            ctx.session_id,
-            ctx.lease,
-            ctx.backend,
-            ctx.abort_signal,
-            hitl_decision_tx,
-        );
+        let handler = SessionControlHandler::new(&ctx, hitl_decision_tx);
         Ok(PreparedControl {
-            task: tokio::spawn(handler.listen(subscriber)),
+            task: tokio::spawn(handler.listen(subscriber, watch)),
             hitl_decision_rx,
         })
     }

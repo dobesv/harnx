@@ -34,15 +34,18 @@ pub(crate) enum ExitWorkerState {
 pub(crate) enum ExitPhase {
     Prompting,
     Interrupting,
+    RequestFailed,
 }
 
-pub(crate) type ExitCancelFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
+pub(crate) type ExitCancelFuture =
+    Pin<Box<dyn Future<Output = anyhow::Result<harnx_execution_control::CancelReceipt>> + Send>>;
 pub(crate) type ExitCancelFactory = Arc<
     dyn Fn(
             GlobalConfig,
             Arc<Mutex<Option<LocalWorkerSupervisor>>>,
             String,
             String,
+            Option<String>,
         ) -> ExitCancelFuture
         + Send
         + Sync,
@@ -85,6 +88,8 @@ pub struct Tui {
     /// does not race the cancel request. Polling via `now_or_never` preserves the
     /// future across ticks — dropping/consuming it would lose the cancel.
     pub(crate) pending_exit_cancel: Option<ExitCancelFuture>,
+    pub(crate) cancellation: Option<crate::cancellation::CancellationTray>,
+    pub(crate) exit_after_cancel: bool,
     /// Deferred warning text emitted after terminal restoration.
     pub(crate) exit_interrupt_error: Option<String>,
     /// Confirmation route retained for the frontend's current session. Prompt
@@ -282,6 +287,9 @@ pub(super) struct SubAgentView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SubAgentStatus {
     Running,
+    Cancelling,
+    Cancelled,
+    Unconfirmed,
     Completed,
     Failed,
 }
@@ -290,6 +298,9 @@ impl SubAgentStatus {
     pub(super) fn label(&self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Cancelling => "cancelling",
+            Self::Cancelled => "cancelled",
+            Self::Unconfirmed => "unconfirmed",
             Self::Completed => "done",
             Self::Failed => "failed",
         }
@@ -298,6 +309,9 @@ impl SubAgentStatus {
     pub(super) fn from_progress(status: SubAgentProgressStatus) -> Self {
         match status {
             SubAgentProgressStatus::Running => Self::Running,
+            SubAgentProgressStatus::Cancelling => Self::Cancelling,
+            SubAgentProgressStatus::Cancelled => Self::Cancelled,
+            SubAgentProgressStatus::Unconfirmed => Self::Unconfirmed,
             SubAgentProgressStatus::Done => Self::Completed,
             SubAgentProgressStatus::Failed => Self::Failed,
         }
@@ -329,6 +343,7 @@ impl SubAgentInvocationProgress {
 }
 
 pub(super) struct MonitoredSessionState {
+    pub execution_id: Option<String>,
     pub transcript: Vec<TranscriptItem>,
     pub status: SubAgentStatus,
     pub transcript_focus: Option<usize>,
@@ -343,6 +358,7 @@ impl MonitoredSessionState {
         scroll.follow = true;
         Self {
             transcript: Vec::new(),
+            execution_id: None,
             status,
             transcript_focus: None,
             scroll,
@@ -577,6 +593,10 @@ pub(crate) enum ToolConfirmationEvent {
 }
 
 pub(crate) enum TuiEvent {
+    ExecutionState {
+        cluster: String,
+        operation: harnx_execution_control::Operation,
+    },
     Agent(harnx_core::event::AgentEvent),
     /// The locally-owned prompt task has exited. `Turn::Ended` normally closes
     /// busy state; this is the fallback for a lossy advisory or setup failure.

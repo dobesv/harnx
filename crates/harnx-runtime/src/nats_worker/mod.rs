@@ -77,3 +77,5 @@ pub use diagnostics::diagnose_tool_servers;
 pub use hook_crash::{publish_crash_rejector, RejectorTarget};
 pub use hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 pub use tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
+
+mod execution_control;

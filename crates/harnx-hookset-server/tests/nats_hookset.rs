@@ -20,6 +20,9 @@ use tokio_util::sync::CancellationToken;
 
 const TOKEN: &str = "hookset-server-test-token";
 
+#[path = "nats_hookset/cancellation.rs"]
+mod cancellation;
+
 struct NatsServerHandle {
     url: String,
     _store_dir: TempDir,

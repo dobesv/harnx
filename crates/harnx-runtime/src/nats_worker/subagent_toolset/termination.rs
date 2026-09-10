@@ -1,4 +1,4 @@
-use super::{CompletedSubagentTurn, SubagentToolset};
+use super::{CompletedSubagentTurn, ProgressReporterStart, SubagentToolset};
 use crate::nats_session::{NatsSession, NatsTurnResult};
 use crate::{
     parse_budget_terminal, synthesize_terminated_result, InvocationBufferingSink, RunTurnOptions,
@@ -10,9 +10,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-
-const CANCEL_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
-const CANCEL_RELEASE_POLL: Duration = Duration::from_millis(10);
 
 pub(super) fn subagent_error_message(prefix: impl std::fmt::Display, session_id: &str) -> String {
     format!(
@@ -28,6 +25,7 @@ pub(super) struct PromptParams<'a> {
     pub timeout_secs: Option<u64>,
     pub token_budget: Option<u64>,
     pub cancel: CancellationToken,
+    pub context: harnx_toolset::ToolInvocationContext,
 }
 
 pub(super) async fn run_prompt(
@@ -40,9 +38,18 @@ pub(super) async fn run_prompt(
             params.parent_session_id.as_deref(),
         )
         .await?;
+    let session = match params.context.operation {
+        Some(parent) => session.with_execution_parent(parent, params.context.call_id.clone()),
+        None => session,
+    };
     let child_session_id = session.session_id().to_string();
     let reporter = toolset
-        .start_progress_reporter(&child_session_id, &params)
+        .start_progress_reporter(ProgressReporterStart {
+            child_session_id: child_session_id.clone(),
+            parent_session_id: params.parent_session_id,
+            invocation_id: params.context.call_id,
+            tool_call_id: params.tool_call_id,
+        })
         .await?;
     let buffering_sink = Arc::new(InvocationBufferingSink::new(reporter.sink()));
     let turn = await_prompt_turn(
@@ -117,6 +124,7 @@ async fn await_prompt_turn(
         _ = params.cancel.cancelled() => {
             let _ = cancel_tx.send(()).await;
             let _ = (&mut run_turn).await;
+            let _ = ensure_timeout_cancellation(toolset, session).await;
             PromptTurn::Aborted(ToolInvokeError::Fatal(
                 "sub-agent tool call aborted".to_string(),
             ))
@@ -139,7 +147,7 @@ async fn invocation_deadline(timeout_secs: Option<u64>) {
 }
 
 async fn ensure_timeout_cancellation(
-    toolset: &SubagentToolset,
+    _toolset: &SubagentToolset,
     session: &NatsSession,
 ) -> Result<(), ToolInvokeError> {
     let session_id = session.session_id();
@@ -149,37 +157,13 @@ async fn ensure_timeout_cancellation(
             format!("cancellation request failed: {error:#}"),
         )
     })?;
-    wait_for_session_lease_release(toolset, session_id)
-        .await
-        .map_err(|error| timeout_cancellation_error(session_id, error))
+    Ok(())
 }
 
 fn timeout_cancellation_error(session_id: &str, reason: impl std::fmt::Display) -> ToolInvokeError {
     ToolInvokeError::Recoverable(format!(
         "sub-agent timeout: durable cancellation could not be confirmed for session '{session_id}'; not safe to retry: {reason}"
     ))
-}
-
-async fn wait_for_session_lease_release(
-    toolset: &SubagentToolset,
-    session_id: &str,
-) -> Result<(), String> {
-    let deadline = tokio::time::Instant::now() + CANCEL_RELEASE_TIMEOUT;
-    loop {
-        match crate::nats_lease::session_has_active_lease(&toolset.jetstream, session_id).await {
-            Ok(false) => return Ok(()),
-            Ok(true) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(CANCEL_RELEASE_POLL).await;
-            }
-            Ok(true) => {
-                return Err(format!(
-                    "session lease was still active after {} seconds",
-                    CANCEL_RELEASE_TIMEOUT.as_secs()
-                ));
-            }
-            Err(error) => return Err(format!("session lease check failed: {error:#}")),
-        }
-    }
 }
 
 async fn finish_timed_out_turn(
@@ -191,9 +175,9 @@ async fn finish_timed_out_turn(
     // A timeout result promises same-session retry. Finish reporting first, but
     // don't emit that result unless durable cancellation and lease release were confirmed.
     let status = if cancellation.is_ok() {
-        SubAgentProgressStatus::Done
+        SubAgentProgressStatus::Cancelled
     } else {
-        SubAgentProgressStatus::Failed
+        SubAgentProgressStatus::Unconfirmed
     };
     let progress = finish_progress(reporter, status).await;
     if let Err(error) = cancellation {
@@ -270,7 +254,9 @@ fn completed_progress_status(
     cancelled: bool,
     budget_exceeded: bool,
 ) -> SubAgentProgressStatus {
-    if budget_exceeded {
+    if cancelled {
+        SubAgentProgressStatus::Cancelled
+    } else if budget_exceeded {
         SubAgentProgressStatus::Done
     } else if super::subagent_turn_failed(result, cancelled) {
         SubAgentProgressStatus::Failed

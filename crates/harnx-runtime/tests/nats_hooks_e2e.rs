@@ -160,6 +160,7 @@ async fn nats_hooks_deny_mutate_and_deliver_post_results() -> Result<()> {
     }
     let provider = NatsHookProvider::discover(&Config::default(), instance_id).await?;
     let meta = HookDispatchMeta {
+        execution: None,
         session_id: "nats-hooks-e2e".to_string(),
         cwd: std::env::current_dir()?,
         resume_count: 0,

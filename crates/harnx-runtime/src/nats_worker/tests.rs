@@ -746,10 +746,15 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
         .await
         .expect("worker never entered in-flight call_fn before cancel publish");
 
-    assert!(session
-        .cancel_pending_turn()
+    let receipt = session
+        .request_cancel(crate::nats_session::CancelRequest::default())
         .await
-        .expect("durably cancel pending turn"));
+        .expect("durably request cancellation");
+    assert!(receipt.cancelled);
+    assert_ne!(
+        session.cancel_status(&receipt).await.unwrap().disposition,
+        harnx_execution_control::CancelDisposition::Cancelled
+    );
     assert!(
         wait_for_condition(NATS_TEST_CONDITION_TIMEOUT, || worker_saw_abort
             .load(Ordering::SeqCst))

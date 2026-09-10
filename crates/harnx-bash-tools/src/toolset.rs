@@ -12,6 +12,11 @@ use rmcp::schemars::JsonSchema;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
+tokio::task_local! {
+    /// Per-invocation token; foreground commands kill and reap before returning.
+    pub(crate) static INVOCATION_CANCEL: CancellationToken;
+}
+
 /// Native toolset for sandboxed command execution and process management.
 #[derive(Clone)]
 pub struct BashToolset {
@@ -48,6 +53,7 @@ fn spec<T: JsonSchema + 'static>(
     timeout_secs: Option<u64>,
 ) -> ToolSpec {
     ToolSpec {
+        cancellation_guarantee: Default::default(),
         name: name.to_string(),
         description: description.to_string(),
         input_schema: input_schema::<T>(),
@@ -123,6 +129,7 @@ impl Toolset for BashToolset {
         let mut tools = builtin_tool_specs();
         tools.extend(self.server.tool_templates().map(|(name, registered)| {
             ToolSpec {
+                cancellation_guarantee: Default::default(),
                 name: name.clone(),
                 description: registered.description.clone(),
                 input_schema: Value::Object(registered.input_schema.clone()),
@@ -142,9 +149,23 @@ impl Toolset for BashToolset {
         args: Value,
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
-        tokio::select! {
-            result = self.server.invoke_tool_value(tool, args) => map_result(result),
-            _ = cancel.cancelled() => Err(ToolInvokeError::Fatal("tool call cancelled".to_string())),
+        if cancel.is_cancelled() {
+            return Err(ToolInvokeError::Fatal("tool call cancelled".into()));
+        }
+        let invocation =
+            INVOCATION_CANCEL.scope(cancel.clone(), self.server.invoke_tool_value(tool, args));
+        let result = if matches!(tool, "wait" | "read_exec_log") {
+            tokio::select! {
+                result = invocation => result,
+                _ = cancel.cancelled() => return Err(ToolInvokeError::Fatal("tool call cancelled".into())),
+            }
+        } else {
+            invocation.await
+        };
+        if cancel.is_cancelled() {
+            Err(ToolInvokeError::Fatal("tool call cancelled".into()))
+        } else {
+            map_result(result)
         }
     }
 }
@@ -284,7 +305,7 @@ mod tests {
             let toolset = toolset.clone();
             let cancel = cancel.clone();
             let command = format!(
-                "touch {}; sleep 30; touch {}",
+                "sleep 30 & printf '%s\\n' \"$$\" \"$!\" > {}; wait; touch {}",
                 started.display(),
                 finished.display()
             );
@@ -314,6 +335,8 @@ mod tests {
         })
         .await
         .expect("command should start");
+        let pids = tokio::fs::read_to_string(&started).await.unwrap();
+        assert_eq!(pids.lines().count(), 2, "shell and child must both start");
         cancel.cancel();
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), invocation)
             .await
@@ -321,6 +344,9 @@ mod tests {
             .expect("invocation task should not panic");
 
         assert!(matches!(result, Err(ToolInvokeError::Fatal(_))));
+        for pid in pids.lines() {
+            assert_process_stopped(pid.parse().unwrap());
+        }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
             !tokio::fs::try_exists(&finished)
@@ -328,6 +354,59 @@ mod tests {
                 .expect("query finished marker"),
             "cancelled command continued running"
         );
+        let _ = toolset.cleanup_log_dir().await;
+    }
+
+    #[cfg(unix)]
+    fn assert_process_stopped(pid: i32) {
+        // An orphaned descendant may briefly await init's reaper on Linux;
+        // zombies are stopped and cannot perform further per-call work.
+        #[cfg(target_os = "linux")]
+        if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            assert_eq!(
+                status.rsplit_once(')').unwrap().1.split_whitespace().next(),
+                Some("Z")
+            );
+            return;
+        }
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "process {pid} survived cancellation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_spawn_retains_its_background_process_after_cancel() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("background-finished");
+        let toolset = test_toolset(
+            vec![root.path().to_path_buf()],
+            sandbox_config(false),
+            false,
+        )
+        .await;
+        let cancel = CancellationToken::new();
+        toolset
+            .invoke(
+                "spawn",
+                json!({
+                    "command": format!("sleep 0.2; touch {}", marker.display()),
+                    "working_dir": root.path(),
+                }),
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !tokio::fs::try_exists(&marker).await.unwrap() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completed spawn resource must survive token cancellation");
         let _ = toolset.cleanup_log_dir().await;
     }
 

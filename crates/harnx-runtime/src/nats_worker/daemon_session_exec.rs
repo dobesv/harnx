@@ -28,7 +28,8 @@ impl WorkerRuntime {
         mut hitl_decision_rx: tokio::sync::mpsc::UnboundedReceiver<
             super::control::AppliedHitlDecision,
         >,
-    ) -> Result<()> {
+        execution: super::execution_control::WorkerExecution,
+    ) -> Result<bool> {
         let metadata = self
             .session_metadata
             .get(&activation.session_id)
@@ -43,7 +44,9 @@ impl WorkerRuntime {
         // Per-session config clone with the canonical session agent loaded
         // fresh from the worker's configuration.
         let per_session = {
-            let base = self.config.read().clone();
+            let mut base = self.config.read().clone();
+            base.execution_control = Some((execution.store.clone(), execution.reference.clone()));
+            base.maintenance_abort = Some(abort_signal.clone());
             Arc::new(parking_lot::RwLock::new(base))
         };
         if let Some(subject) = activation.tool_confirmation_subject.as_ref() {
@@ -93,7 +96,7 @@ impl WorkerRuntime {
             let mut activation_high_water: Option<u64> = None;
 
             loop {
-                if !lease.is_held() {
+                if !lease.is_held() || abort_signal.aborted() {
                     break Ok(());
                 }
 
@@ -142,7 +145,9 @@ impl WorkerRuntime {
                         "execute_session has no durable turn to run: session_id={}",
                         activation.session_id,
                     );
-                    break Ok(());
+                    if execution.store.seal(&execution.reference, &execution.owner).await? { break Ok(()); }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
                 }
                 if input.is_empty() {
                     anyhow::bail!("refusing to complete a durable worker turn with empty input");
@@ -224,14 +229,23 @@ impl WorkerRuntime {
                     activation_high_water = Some(activation_high_water.map_or(turn_cursor_val, |h| h.max(turn_cursor_val)));
                 }
 
-                let usage = per_session.read().session.as_ref().map(|s| s.completion_usage().clone()).unwrap_or_default();
-                Self::record_session_turn_end(
-                    &backend,
-                    &lease,
-                    Some(&*event_sink_for_loop),
-                    turn_cursor_val,
-                    usage,
-                ).await?;
+                if !abort_signal.aborted() {
+                    let usage = per_session
+                        .read()
+                        .session
+                        .as_ref()
+                        .map(|session| session.completion_usage().clone())
+                        .unwrap_or_default();
+                    Self::record_session_turn_end(
+                        &backend,
+                        &lease,
+                        Some(&*event_sink_for_loop),
+                        turn_cursor_val,
+                        usage,
+                    )
+                    .await?;
+                    execution.cover_turn(turn_cursor_val).await?;
+                }
 
                 // The activation carries a frontend-scoped route, not a
                 // turn-scoped responder. Keep it while this activation drains
@@ -245,7 +259,7 @@ impl WorkerRuntime {
                     activation_high_water,
                 );
 
-                if !lease.is_held() {
+                if !lease.is_held() || abort_signal.aborted() {
                     break Ok(());
                 }
 
@@ -293,7 +307,8 @@ impl WorkerRuntime {
                 // the messages consumed before the turn runs, so the continuation
                 // turn would derive an empty input and never answer them.
                 if new_messages.is_empty() && !has_resumable {
-                    break Ok(());
+                    if execution.store.seal(&execution.reference, &execution.owner).await? { break Ok(()); }
+                    tokio::task::yield_now().await;
                 }
             }
         })
@@ -316,13 +331,38 @@ impl WorkerRuntime {
             );
         }
 
+        Self::wait_for_post_turn_maintenance(&per_session, &lease).await;
+
         watch_task.abort();
         control_task.abort();
         let _ = tokio::time::timeout(std::time::Duration::from_millis(100), watch_task).await;
         let _ = tokio::time::timeout(std::time::Duration::from_millis(100), control_task).await;
 
-        let _ = lease.release().await;
-        result
+        if abort_signal.aborted() && lease.is_held() {
+            execution.record_cancel(&backend, &lease).await?;
+        }
+        if result.is_err() && lease.is_held() {
+            // A durable Error covers all prompts already present in the log.
+            let entries = backend.load_events_latest_async().await?;
+            execution
+                .cover_turn(entries.last().map_or(0, |(seq, _)| *seq))
+                .await?;
+            execution
+                .store
+                .seal(&execution.reference, &execution.owner)
+                .await?;
+        }
+        if result.is_err() {
+            let operation = execution.store.status(&execution.reference).await?;
+            if !operation.children.is_empty() {
+                execution
+                    .store
+                    .cancel_operation(&execution.reference, None, false)
+                    .await?;
+            }
+        }
+        let terminal = execution.finish(&backend, &lease).await?;
+        result.map(|()| terminal)
     }
 
     async fn wait_for_post_turn_maintenance(
