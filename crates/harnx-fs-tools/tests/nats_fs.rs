@@ -162,6 +162,7 @@ async fn invoke(
         tool: tool.to_string(),
         args,
         parent_session_id: None,
+        tool_call_id: None,
         capabilities: Default::default(),
     };
     let message = client

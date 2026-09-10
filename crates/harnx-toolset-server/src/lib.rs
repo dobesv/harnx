@@ -476,7 +476,12 @@ async fn invoke_uncached_tool(
         invoking_session_id: request.parent_session_id.clone(),
         capabilities: request.capabilities.clone(),
     };
-    add_parent_session_id_arg(&request.tool, request.parent_session_id.take(), &mut args);
+    add_parent_context_args(
+        &request.tool,
+        request.parent_session_id.take(),
+        request.tool_call_id.take(),
+        &mut args,
+    );
     let metric_tool = metric_tool_name(context.toolset.as_ref(), &request.tool);
     let start = Instant::now();
     let result = context
@@ -577,18 +582,30 @@ fn finalize_execution_context_value(
     }
 }
 
-fn add_parent_session_id_arg(tool: &str, parent_session_id: Option<String>, args: &mut Value) {
+fn add_parent_context_args(
+    tool: &str,
+    parent_session_id: Option<String>,
+    tool_call_id: Option<String>,
+    args: &mut Value,
+) {
     let Some(args) = args.as_object_mut() else {
         return;
     };
-    // This is a transport-owned argument. Always discard a model-supplied
-    // value before optionally replacing it with the session from ToolRequest.
+    // These are transport-owned arguments. Always discard model-supplied
+    // values before optionally replacing them with context from ToolRequest.
     args.remove("__harnx_parent_session_id");
+    args.remove("__harnx_tool_call_id");
     if let Some(parent_session_id) = parent_session_id.filter(|_| accepts_parent_session_id(tool)) {
         args.insert(
             "__harnx_parent_session_id".to_string(),
             Value::String(parent_session_id),
         );
+        if let Some(tool_call_id) = tool_call_id {
+            args.insert(
+                "__harnx_tool_call_id".to_string(),
+                Value::String(tool_call_id),
+            );
+        }
     }
 }
 
@@ -1042,13 +1059,18 @@ mod tests {
 
     #[test]
     fn parent_session_argument_only_uses_transport_context() {
-        let mut untrusted = serde_json::json!({"__harnx_parent_session_id": "other-session"});
-        add_parent_session_id_arg(SUBAGENT_SESSION_NEW_TOOL, None, &mut untrusted);
-        assert_eq!(untrusted, serde_json::json!({}));
+        let mut untrusted = serde_json::json!({
+            "__harnx_parent_session_id": "other-session",
+            "__harnx_tool_call_id": "model-supplied-call",
+        });
+        add_parent_context_args(SUBAGENT_SESSION_NEW_TOOL, None, None, &mut untrusted);
+        assert!(untrusted.get("__harnx_parent_session_id").is_none());
+        assert!(untrusted.get("__harnx_tool_call_id").is_none());
 
-        add_parent_session_id_arg(
+        add_parent_context_args(
             SUBAGENT_SESSION_NEW_TOOL,
             Some("attested-session".to_string()),
+            None,
             &mut untrusted,
         );
         assert_eq!(
@@ -1204,6 +1226,21 @@ mod tests {
         assert!(!accepts_parent_session_id("session_load"));
         assert!(!accepts_parent_session_id("prompt"));
         assert!(!accepts_parent_session_id("agent_session_prompt"));
+    }
+
+    #[test]
+    fn parent_context_args_include_parent_tool_call_id() {
+        let mut args = serde_json::json!({ "message": "delegate" });
+
+        add_parent_context_args(
+            SUBAGENT_SESSION_PROMPT_TOOL,
+            Some("parent-session".to_string()),
+            Some("parent-tool-call".to_string()),
+            &mut args,
+        );
+
+        assert_eq!(args["__harnx_parent_session_id"], "parent-session");
+        assert_eq!(args["__harnx_tool_call_id"], "parent-tool-call");
     }
 
     struct MetricsTestToolset;

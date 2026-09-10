@@ -468,6 +468,7 @@ mod tests {
                 through_seq: 1,
                 fence_token: 7,
                 timestamp: None,
+                usage: None,
             },
         ));
         assert!(!history_has_pending_turn(&completed));
@@ -484,6 +485,7 @@ mod tests {
                     through_seq: 1,
                     fence_token: 7,
                     timestamp: None,
+                    usage: None,
                 },
             ),
         ];

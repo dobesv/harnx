@@ -2,6 +2,74 @@ use super::*;
 use futures_util::StreamExt;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_state_is_reconstructed_from_durable_hitl_entries() {
+    harnx_core::require_nextest();
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent("plain", "Watch the approval state.");
+    let config = sandbox.config();
+    let session_id = format!("serve-derived-hitl-{}", uuid::Uuid::new_v4());
+    let user = harnx_core::message::Message::new(
+        harnx_core::message::MessageRole::User,
+        harnx_core::message::MessageContent::Text("approve work".to_string()),
+    );
+    if !crate::test_support::seed_nats_session(
+        &config,
+        crate::test_support::NatsSessionSeed {
+            agent: "plain",
+            session_id: &session_id,
+            messages: &[user],
+        },
+    )
+    .await
+    {
+        return;
+    }
+
+    let jetstream = config
+        .nats_jetstream(LOCAL_CLUSTER_KEY)
+        .await
+        .expect("local JetStream");
+    let log = harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, session_id.clone());
+    log.append_event_async(
+        &harnx_core::session::SessionLogEntry::HitlApprovalRequested {
+            tool_call_id: "derived-call".to_string(),
+            summary: "Approve derived call".to_string(),
+            fence_token: 7,
+        },
+    )
+    .await
+    .expect("append approval request");
+
+    for _ in 0..2 {
+        let registry = SessionRegistry::new(config.clone());
+        let handle = registry.get_or_spawn(key("plain", &session_id));
+        let info = get_info(&handle).await;
+        let SessionState::Interrupted { pending } = info.state else {
+            panic!("expected interrupted state reconstructed from log");
+        };
+        assert_eq!(pending.metadata["type"], "interrupt");
+        assert_eq!(
+            pending.metadata["interrupts"][0]["toolCallId"],
+            "derived-call"
+        );
+    }
+
+    log.append_event_async(
+        &harnx_core::session::SessionLogEntry::HitlApprovalDecision {
+            tool_call_id: "derived-call".to_string(),
+            approved: true,
+            note: None,
+            fence_token: 8,
+        },
+    )
+    .await
+    .expect("append approval decision");
+    let replacement = SessionRegistry::new(config);
+    let handle = replacement.get_or_spawn(key("plain", &session_id));
+    assert_eq!(get_info(&handle).await.state, SessionState::Idle);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn history_load_uses_worker_lease_to_keep_tool_call_pending() {
     harnx_core::require_nextest();
     let sandbox = TestConfigSandbox::new();
@@ -12,7 +80,7 @@ async fn history_load_uses_worker_lease_to_keep_tool_call_pending() {
         return;
     };
 
-    let active = crate::load_nats_session(&config, &session_id)
+    let (active, _entries) = crate::load_nats_session(&config, &session_id)
         .await
         .expect("load active session");
     let active_tool = active.messages.last().expect("pending tool message");
@@ -29,7 +97,7 @@ async fn history_load_uses_worker_lease_to_keep_tool_call_pending() {
     );
 
     lease.release().await.expect("release test lease");
-    let interrupted = crate::load_nats_session(&config, &session_id)
+    let (interrupted, _entries) = crate::load_nats_session(&config, &session_id)
         .await
         .expect("load interrupted session");
     let harnx_core::message::MessageContent::ToolCalls(interrupted_calls) = &interrupted

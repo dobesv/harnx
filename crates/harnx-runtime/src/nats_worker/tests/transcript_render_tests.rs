@@ -40,6 +40,7 @@ async fn append_completed_transcript_fixture(config: &Config, session_id: &str) 
         through_seq: 2,
         fence_token: 1,
         timestamp: None,
+        usage: None,
     })
     .await
     .expect("append fixture turn end");

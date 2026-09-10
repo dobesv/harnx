@@ -160,13 +160,63 @@ async fn finish_remote_turn(session: RemoteTurnHandle) {
         through_seq: user_msg_seq,
         fence_token: 1,
         timestamp: None,
+        usage: None,
     })
     .await
     .expect("append turn end");
 }
 
+/// Finishes the remote turn with usage data for feature testing.
+async fn finish_remote_turn_with_usage(
+    session: RemoteTurnHandle,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+) {
+    let log = NatsSessionLog::new(session.jetstream, session.session_id);
+    let entries = log.load_events_async().await.expect("load entries");
+    let user_msg_seq = entries
+        .iter()
+        .rev()
+        .find(|(_, entry)| {
+            matches!(
+                entry,
+                SessionLogEntry::Message { role, .. } if *role == MessageRole::User
+            )
+        })
+        .map(|(seq, _)| *seq)
+        .unwrap_or(1);
+    session.lease.release().await.expect("lease release");
+    log.append_event_async(&SessionLogEntry::TurnEnd {
+        through_seq: user_msg_seq,
+        fence_token: 1,
+        timestamp: None,
+        usage: Some(harnx_core::api_types::CompletionTokenUsage {
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+            cache_write_tokens: 0,
+        }),
+    })
+    .await
+    .expect("append turn end with usage");
+}
+
 fn has_event(events: &[serde_json::Value], event_type: &str) -> bool {
     events.iter().any(|event| event["type"] == event_type)
+}
+
+fn has_custom_event(events: &[serde_json::Value], name: &str) -> bool {
+    events
+        .iter()
+        .any(|event| event["type"] == "CUSTOM" && event["name"] == name)
+}
+
+fn get_custom_event(events: &[serde_json::Value], name: &str) -> Option<serde_json::Value> {
+    events
+        .iter()
+        .find(|event| event["type"] == "CUSTOM" && event["name"] == name)
+        .cloned()
 }
 
 /// One promptless stream stays busy, then finishes when its remote turn ends live.
@@ -284,4 +334,65 @@ async fn e2e_remote_lease_after_turn_ends_shows_idle() {
         has_event(&read.events, "RUN_FINISHED"),
         "should emit RUN_FINISHED after turn ended"
     );
+}
+
+/// Idle remote-follow attach emits hydrated usage event with context fields.
+/// This test verifies the fix for the gap where idle-remote path was passing `None`
+/// for `tokens_usage`, causing the status bar to miss context info.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_remote_attach_emits_hydrated_usage_with_context() {
+    let Some(session) = seed_in_progress_leased_session().await else {
+        return;
+    };
+
+    // Finish the turn WITH usage data BEFORE opening the stream.
+    finish_remote_turn_with_usage(session.remote_turn_handle(), 100, 50, 20).await;
+
+    // Open a promptless AG-UI run stream.
+    let response = open_promptless_sse(&session).await;
+
+    // Read until RUN_FINISHED
+    let read = read_sse_until(response, Duration::from_secs(5), |read| {
+        has_event(&read.events, "RUN_FINISHED")
+    })
+    .await;
+
+    // Should have the usage CUSTOM event
+    assert!(
+        has_custom_event(&read.events, "usage"),
+        "should emit usage CUSTOM event on idle remote attach"
+    );
+
+    let usage_event = get_custom_event(&read.events, "usage").expect("usage event exists");
+    let value = &usage_event["value"];
+
+    // Verify raw usage fields from TurnEnd.usage
+    assert_eq!(value["input"], 100, "input tokens should match");
+    assert_eq!(value["output"], 50, "output tokens should match");
+    assert_eq!(value["cached"], 20, "cached tokens should match");
+
+    // Verify context fields recomputed server-side from session state
+    // NOTE: context_tokens can be 0 for a fresh session with minimal messages,
+    // so we check for presence rather than non-zero.
+    // NOTE: max_context_tokens may be None for older models that don't expose
+    // max_input_tokens (e.g., claude-3-5-haiku-latest in test config), so we
+    // check for presence of context_tokens only and make max_context_tokens optional.
+    assert!(
+        value.get("context_tokens").is_some(),
+        "context_tokens should be computed (may be 0 for minimal session)"
+    );
+    // max_context_tokens is Optional< usize> - may be None for models without max_input_tokens
+    // The key presence check verifies the snapshot was computed; the value can be null
+    // context_percent should be present when max_context_tokens exists
+    if value
+        .get("max_context_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        > 0
+    {
+        assert!(
+            value.get("context_percent").is_some(),
+            "context_percent should be present when max_context_tokens is set"
+        );
+    }
 }

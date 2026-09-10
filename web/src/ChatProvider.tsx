@@ -1,10 +1,10 @@
-import React, { useEffect, useMemo, useReducer, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useReducer, useState } from 'react';
 import { AssistantRuntimeProvider } from '@assistant-ui/react';
 import type { AttachmentAdapter } from '@assistant-ui/react';
 import { useAgUiRuntime } from '@assistant-ui/react-ag-ui';
 import { HttpAgent } from '@ag-ui/client';
 import type { AgentSubscriber, Message } from '@ag-ui/client';
-import { PendingContext } from './PendingContext';
+import { PendingContext, type HydratedPendingApproval } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { uploadAttachment } from './api';
 import { RuntimeSessionSubscriber } from './RuntimeSessionSubscriber';
@@ -91,6 +91,7 @@ export interface HarnxHttpAgentOptions {
   onToolSummary: (id: string, summary: string) => void;
   onHandoff?: (agent: string, sessionId: string) => void;
   onSubAgentEvent: (event: unknown) => void;
+  onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
@@ -101,7 +102,9 @@ export class HarnxHttpAgent extends HttpAgent {
   private readonly onToolSummaryCb: (id: string, summary: string) => void;
   private readonly onHandoff?: (agent: string, sessionId: string) => void;
   private readonly onSubAgentEvent: (event: unknown) => void;
+  private readonly onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
   private isRunActive = false;
+  private sourceSessionId?: string;
 
   constructor(options: HarnxHttpAgentOptions) {
     super({ url: options.url });
@@ -111,6 +114,12 @@ export class HarnxHttpAgent extends HttpAgent {
     this.onToolSummaryCb = options.onToolSummary;
     this.onHandoff = options.onHandoff;
     this.onSubAgentEvent = options.onSubAgentEvent;
+    this.onHitlPendingApproval = options.onHitlPendingApproval;
+  }
+
+  /** Set the source session ID for handoff deduplication. */
+  setSourceSessionId(sessionId: string): void {
+    this.sourceSessionId = sessionId;
   }
 
   private handleCustomEvent(name: string, value: unknown) {
@@ -120,7 +129,9 @@ export class HarnxHttpAgent extends HttpAgent {
       onUsage: this.onUsageCb,
       onToolSummary: this.onToolSummaryCb,
       onHandoff: this.onHandoff,
+      onHitlPendingApproval: this.onHitlPendingApproval,
       isRunActive: this.isRunActive,
+      sourceSessionId: this.sourceSessionId,
     });
   }
 
@@ -202,6 +213,24 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     reduceSubAgentNotes,
     INITIAL_SUB_AGENT_NOTES_STATE,
   );
+  // Hydrated HITL pending approvals from durable log (hitl_pending_approval CUSTOM events)
+  const [hydratedApprovals, setHydratedApprovals] = useState<HydratedPendingApproval[]>([]);
+  
+  const addHydratedApproval = useCallback((approval: HydratedPendingApproval) => {
+    setHydratedApprovals((prev) => {
+      // Each tool call has at most one hydrated pending approval.
+      if (prev.some((a) => a.toolCallId === approval.toolCallId)) return prev;
+      return [...prev, approval];
+    });
+  }, []);
+  
+  const clearHydratedApprovals = useCallback(() => {
+    setHydratedApprovals([]);
+  }, []);
+
+  const removeHydratedApproval = useCallback((toolCallId: string) => {
+    setHydratedApprovals((prev) => prev.filter(a => a.toolCallId !== toolCallId));
+  }, []);
 
   // assistant-ui 0.15.18 attachment lifecycle (verified against base-composer-runtime-core.ts):
   // - addAttachment() calls adapter.add() → status 'running', NO upload yet
@@ -266,7 +295,13 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     },
     onHandoff,
     onSubAgentEvent: dispatchSubAgentEvent,
-  }), [agentName, sessionId, onHandoff]);
+    onHitlPendingApproval: (toolCallId, summary) => addHydratedApproval({ toolCallId, summary }),
+  }), [agentName, sessionId, onHandoff, addHydratedApproval]);
+
+  // Provide source session ID for handoff deduplication
+  useEffect(() => {
+    agent.setSourceSessionId(sessionId);
+  }, [agent, sessionId]);
 
   const runtime = useAgUiRuntime({
     agent,
@@ -279,16 +314,21 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     setStatusText(null);
     setErrorText(null);
     dispatchSubAgentEvent({ type: 'RESET' });
-  }, [agentName, sessionId]);
+    clearHydratedApprovals();
+  }, [agentName, sessionId, clearHydratedApprovals]);
 
   const subAgentContext = useMemo(() => ({
     notes: subAgentState.notes,
     openSession: onOpenSubAgent,
-  }), [onOpenSubAgent, subAgentState.notes]);
+    dispatch: dispatchSubAgentEvent,
+  }), [onOpenSubAgent, subAgentState.notes, dispatchSubAgentEvent]);
 
   return (
     <SubAgentNotesContext.Provider value={subAgentContext}>
-      <PendingContext.Provider value={{ statusText, setStatusText, errorText, setErrorText }}>
+      <PendingContext.Provider value={{ 
+        statusText, setStatusText, errorText, setErrorText,
+        hydratedApprovals, addHydratedApproval, clearHydratedApprovals, removeHydratedApproval
+      }}>
         <UsageContext.Provider value={{ usage, toolSummaries }}>
           <AssistantRuntimeProvider key={`${agentName}:${sessionId}`} runtime={runtime}>
             {/* Passive listener for existing sessions: when !isFreshSession, we follow the

@@ -60,6 +60,218 @@ impl<'a> RunAgentLoopArgs<'a> {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingHitlApproval {
+    pub seq: u64,
+    pub tool_round_seq: u64,
+    pub tool_call_id: String,
+    pub summary: String,
+}
+
+pub(crate) fn derive_pending_hitl_approvals(
+    entries: &[(u64, SessionLogEntry)],
+) -> Result<Vec<PendingHitlApproval>> {
+    let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(entries)?;
+    let Some(orphan) = find_orphan_tool_calls(&effective).into_iter().last() else {
+        return Ok(Vec::new());
+    };
+    let round_entries = tool_round_entries(&effective, orphan.seq);
+    Ok(round_entries
+        .iter()
+        .filter_map(|(request_seq, entry)| match entry {
+            SessionLogEntry::HitlApprovalRequested {
+                tool_call_id,
+                summary,
+                ..
+            } if orphan
+                .calls
+                .iter()
+                .any(|call| call.id.as_deref() == Some(tool_call_id.as_str()))
+                && !round_entries.iter().any(|(decision_seq, decision)| {
+                    decision_seq > request_seq
+                        && matches!(
+                            decision,
+                            SessionLogEntry::HitlApprovalDecision {
+                                tool_call_id: decided_id,
+                                ..
+                            } if decided_id == tool_call_id
+                        )
+                }) =>
+            {
+                Some(PendingHitlApproval {
+                    seq: *request_seq,
+                    tool_round_seq: orphan.seq,
+                    tool_call_id: tool_call_id.clone(),
+                    summary: summary.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+fn tool_round_entries(
+    entries: &[(u64, SessionLogEntry)],
+    tool_calls_seq: u64,
+) -> &[(u64, SessionLogEntry)] {
+    let start = entries.partition_point(|(seq, _)| *seq <= tool_calls_seq);
+    let end = entries[start..]
+        .iter()
+        .position(|(_, entry)| {
+            matches!(
+                entry,
+                SessionLogEntry::ToolCalls { .. } | SessionLogEntry::ToolResults { .. }
+            )
+        })
+        .map_or(entries.len(), |offset| start + offset);
+    &entries[start..end]
+}
+
+fn hitl_managed_tool_call_ids(
+    entries: &[(u64, SessionLogEntry)],
+    tool_calls_seq: u64,
+) -> std::collections::HashSet<&str> {
+    tool_round_entries(entries, tool_calls_seq)
+        .iter()
+        .filter_map(|(_, entry)| match entry {
+            SessionLogEntry::HitlApprovalRequested { tool_call_id, .. } => {
+                Some(tool_call_id.as_str())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct HitlToolRoundContinuation {
+    output: String,
+    thought: Option<String>,
+    tool_calls: Vec<harnx_core::tool::ToolCall>,
+    decisions: Vec<crate::agent_loop::ToolApprovalDecision>,
+}
+
+fn derive_hitl_tool_round_continuation(
+    entries: &[(u64, SessionLogEntry)],
+) -> Result<Option<HitlToolRoundContinuation>> {
+    use std::collections::HashMap;
+
+    let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(entries)?;
+    let Some(orphan) = find_orphan_tool_calls(&effective).into_iter().last() else {
+        return Ok(None);
+    };
+    let round_entries = tool_round_entries(&effective, orphan.seq);
+    let request_ids = hitl_managed_tool_call_ids(&effective, orphan.seq);
+    if !orphan.calls.iter().any(|call| {
+        call.id
+            .as_deref()
+            .is_some_and(|id| request_ids.contains(id))
+    }) {
+        return Ok(None);
+    }
+    let mut seen_requests = std::collections::HashSet::new();
+    let mut decisions: HashMap<&str, (bool, Option<String>)> = HashMap::new();
+    for (_, entry) in round_entries {
+        match entry {
+            SessionLogEntry::HitlApprovalRequested { tool_call_id, .. } => {
+                seen_requests.insert(tool_call_id.as_str());
+            }
+            SessionLogEntry::HitlApprovalDecision {
+                tool_call_id,
+                approved,
+                note,
+                ..
+            } if seen_requests.contains(tool_call_id.as_str()) => {
+                decisions.insert(tool_call_id.as_str(), (*approved, note.clone()));
+            }
+            _ => {}
+        }
+    }
+    let decisions = orphan
+        .calls
+        .iter()
+        .filter_map(|call| {
+            let id = call.id.as_deref()?;
+            let (approved, note) = decisions.get(id)?.clone();
+            Some(crate::agent_loop::ToolApprovalDecision {
+                tool_call_id: id.to_string(),
+                approved,
+                reason: note,
+            })
+        })
+        .collect();
+    Ok(Some(HitlToolRoundContinuation {
+        output: orphan.text,
+        thought: orphan.thought,
+        tool_calls: orphan.calls,
+        decisions,
+    }))
+}
+fn build_hitl_approval_request_callback(
+    jetstream: &jetstream::Context,
+    session_id: &str,
+    lease: &Arc<NatsSessionLease>,
+    event_sink: Option<&Arc<NatsEventSink>>,
+    after_seq_observer: Option<&Arc<AtomicU64>>,
+) -> crate::agent_loop::OnHitlApprovalRequiredFn {
+    let backend = NatsSessionLogBackend::new(jetstream.clone(), session_id)
+        .with_after_seq_observer(
+            after_seq_observer
+                .cloned()
+                .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
+        );
+    let sink = FencedSessionLogSink::new(backend.clone(), Arc::clone(lease));
+    let lease = Arc::clone(lease);
+    let event_sink = event_sink.cloned();
+    Arc::new(move |deferred| {
+        anyhow::ensure!(
+            lease.is_held(),
+            "session lease lost before HITL approval request"
+        );
+        let tool_call_id = deferred
+            .call
+            .id
+            .clone()
+            .context("deferred tool call has no tool_call_id")?;
+        let summary = deferred
+            .reason
+            .clone()
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or_else(|| format!("Approve tool call `{}`", deferred.call.name));
+        let entry = SessionLogEntry::HitlApprovalRequested {
+            tool_call_id: tool_call_id.clone(),
+            summary,
+            fence_token: lease.fence_token(),
+        };
+        for _ in 0..3 {
+            anyhow::ensure!(
+                lease.is_held(),
+                "session lease lost before HITL approval request"
+            );
+            let entries = backend.load_events_blocking()?;
+            let pending = derive_pending_hitl_approvals(&entries)?;
+            if let Some(oldest) = pending.first() {
+                log::warn!(
+                    "session already has pending HITL approval; retaining oldest request: tool_call_id={} seq={}",
+                    oldest.tool_call_id,
+                    oldest.seq
+                );
+                return Ok(oldest.tool_call_id.clone());
+            }
+            let expected_last_sequence = entries.last().map_or(0, |(seq, _)| *seq);
+            if sink
+                .append_hitl_event_cas_blocking(&entry, expected_last_sequence)?
+                .is_some()
+            {
+                if let Some(event_sink) = &event_sink {
+                    event_sink.publish_session_updated();
+                }
+                return Ok(tool_call_id);
+            }
+        }
+        anyhow::bail!("HITL approval request lost repeated concurrent append races")
+    })
+}
+
 fn fold_user_messages(messages: &[Message]) -> String {
     messages
         .iter()
@@ -177,6 +389,7 @@ pub async fn run_agent_loop_with_nats(args: RunAgentLoopArgs<'_>) -> Result<()> 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NatsAgentLoopOutcome {
     Completed,
+    AwaitingHitlApproval,
     HandoffDispatched,
 }
 
@@ -218,7 +431,7 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
             instance_id: &instance_id,
             abort_signal: &abort_signal,
             lease: lease.as_ref(),
-            after_seq_observer,
+            after_seq_observer: after_seq_observer.clone(),
             session_metadata,
         })
         .await?;
@@ -235,6 +448,15 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
     )
     .await;
 
+    let on_hitl_approval_required = lease.as_ref().map(|lease| {
+        build_hitl_approval_request_callback(
+            &jetstream_ctx,
+            session_id,
+            lease,
+            event_sink.as_ref(),
+            after_seq_observer.as_ref(),
+        )
+    });
     let ctx = build_agent_loop_context(AgentContextParams {
         config: config.clone(),
         instance_id,
@@ -242,6 +464,7 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
         token_budget,
         call_fn,
         on_tool_round,
+        on_hitl_approval_required,
         working_dir,
     })
     .await;
@@ -250,9 +473,9 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
     // both global and agent hook servers.
     dispatch_context_session_start(&ctx, session_origin, session_id).await;
 
-    // Run unified agent loop
-    // Persistence goes through shared Config.save_message entry construction; append_event routes sink
-    let result = run_agent_loop_segment(AgentLoopSegmentArgs {
+    let backend = NatsSessionLogBackend::new(jetstream_ctx.clone(), session_id);
+    let hitl_continuation = derive_hitl_tool_round_continuation(&backend.load_events_blocking()?)?;
+    let segment_args = AgentLoopSegmentArgs {
         source_session_id: session_id,
         cluster_key,
         config: config.clone(),
@@ -262,8 +485,13 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
         jetstream_ctx: jetstream_ctx.clone(),
         activation_route,
         event_sink,
-    })
-    .await;
+        lease,
+    };
+    let result = if let Some(continuation) = hitl_continuation {
+        run_hitl_continuation_segment(segment_args, continuation).await
+    } else {
+        run_agent_loop_segment(segment_args).await
+    };
     finish_agent_loop(hook_supervisor, attachment_sync, result).await
 }
 
@@ -338,6 +566,7 @@ struct AgentContextParams {
     token_budget: Option<u64>,
     call_fn: Option<crate::agent_loop::AgentCallFn>,
     on_tool_round: Option<OnToolRoundFn>,
+    on_hitl_approval_required: Option<crate::agent_loop::OnHitlApprovalRequiredFn>,
     working_dir: Option<std::path::PathBuf>,
 }
 
@@ -370,6 +599,7 @@ async fn build_agent_loop_context(
         usage_at_start,
         call_fn: params.call_fn,
         on_tool_round: params.on_tool_round,
+        on_hitl_approval_required: params.on_hitl_approval_required,
         on_text_response: None,
         initial_with_embeddings: false,
         initial_resume_count: 0,
@@ -463,6 +693,7 @@ struct AgentLoopSegmentArgs<'a> {
     jetstream_ctx: jetstream::Context,
     activation_route: super::SessionActivationRoute,
     event_sink: Option<Arc<NatsEventSink>>,
+    lease: Option<Arc<NatsSessionLease>>,
 }
 
 /// Resolve the active agent's hooks and hand them to [`agent_hook_start_config`].
@@ -529,16 +760,24 @@ async fn run_agent_loop_segment(args: AgentLoopSegmentArgs<'_>) -> Result<NatsAg
         args.input.clone(),
         |result| {
             let handoff = match result {
-                crate::agent_loop::LoopResult::Completed => None,
+                crate::agent_loop::LoopResult::Completed
+                | crate::agent_loop::LoopResult::AwaitingHitlApproval { .. } => None,
                 crate::agent_loop::LoopResult::HandoffRequested {
                     agent,
                     session_id,
                     prompt,
-                } => Some((agent.clone(), session_id.clone(), prompt.clone())),
+                    tool_call_id,
+                } => Some((
+                    agent.clone(),
+                    session_id.clone(),
+                    prompt.clone(),
+                    tool_call_id.clone(),
+                )),
             };
             async move {
-                if let Some((agent, session_id, prompt)) = handoff {
-                    dispatch_nats_handoff(args_ref, agent, session_id, prompt).await?;
+                if let Some((agent, session_id, prompt, tool_call_id)) = handoff {
+                    dispatch_nats_handoff(args_ref, agent, session_id, prompt, tool_call_id)
+                        .await?;
                 }
                 Ok(())
             }
@@ -547,6 +786,61 @@ async fn run_agent_loop_segment(args: AgentLoopSegmentArgs<'_>) -> Result<NatsAg
     .await?;
     Ok(match result {
         crate::agent_loop::LoopResult::Completed => NatsAgentLoopOutcome::Completed,
+        crate::agent_loop::LoopResult::AwaitingHitlApproval { .. } => {
+            NatsAgentLoopOutcome::AwaitingHitlApproval
+        }
+        crate::agent_loop::LoopResult::HandoffRequested { .. } => {
+            NatsAgentLoopOutcome::HandoffDispatched
+        }
+    })
+}
+
+async fn run_hitl_continuation_segment(
+    args: AgentLoopSegmentArgs<'_>,
+    continuation: HitlToolRoundContinuation,
+) -> Result<NatsAgentLoopOutcome> {
+    if let Some(lease) = &args.lease {
+        anyhow::ensure!(
+            lease.revalidate_ownership().await?,
+            "session lease lost before approved HITL tool execution"
+        );
+    }
+    let pending_interrupt_ids = continuation
+        .tool_calls
+        .iter()
+        .filter_map(|call| call.id.clone())
+        .collect();
+    let result = crate::agent_loop::continue_agent_loop_from_tool_round(
+        &args.ctx,
+        args.input.clone(),
+        continuation.output,
+        continuation.thought,
+        continuation.tool_calls,
+        continuation.decisions,
+        pending_interrupt_ids,
+    )
+    .await?;
+    if let crate::agent_loop::LoopResult::HandoffRequested {
+        agent,
+        session_id,
+        prompt,
+        tool_call_id,
+    } = &result
+    {
+        dispatch_nats_handoff(
+            &args,
+            agent.clone(),
+            session_id.clone(),
+            prompt.clone(),
+            tool_call_id.clone(),
+        )
+        .await?;
+    }
+    Ok(match result {
+        crate::agent_loop::LoopResult::Completed => NatsAgentLoopOutcome::Completed,
+        crate::agent_loop::LoopResult::AwaitingHitlApproval { .. } => {
+            NatsAgentLoopOutcome::AwaitingHitlApproval
+        }
         crate::agent_loop::LoopResult::HandoffRequested { .. } => {
             NatsAgentLoopOutcome::HandoffDispatched
         }
@@ -558,6 +852,7 @@ async fn dispatch_nats_handoff(
     agent: String,
     session_id: Option<String>,
     prompt: String,
+    handoff_tool_call_id: Option<String>,
 ) -> Result<()> {
     let requested_session_id = session_id.filter(|session_id| !session_id.trim().is_empty());
     let destination = resolve_handoff_destination(args, &agent).await?;
@@ -595,6 +890,7 @@ async fn dispatch_nats_handoff(
         &agent,
         destination.committed_agent,
         enqueued.session_id,
+        handoff_tool_call_id,
     )
     .await
 }
@@ -659,6 +955,7 @@ async fn emit_handoff_committed(
     requested_agent: &str,
     committed_agent: String,
     session_id: String,
+    handoff_tool_call_id: Option<String>,
 ) -> Result<()> {
     use harnx_core::event::{AgentEvent, SessionEvent};
 
@@ -673,9 +970,33 @@ async fn emit_handoff_committed(
             .await,
         ),
     };
+    // Append durable HandoffCommitted entry to the source session's log
+    // so that clients attaching after the handoff can navigate to the target.
+    let backend = crate::nats_worker::backend::NatsSessionLogBackend::new(
+        args.jetstream_ctx.clone(),
+        args.source_session_id,
+    );
+    backend
+        .append_event(&harnx_core::session::SessionLogEntry::HandoffCommitted {
+            target_agent: committed_agent.clone(),
+            target_session_id: session_id.clone(),
+            handoff_tool_call_id: handoff_tool_call_id.clone(),
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "handoff target '{requested_agent}' session '{session_id}' was activated, but durable commit failed; the handoff will not survive reconnect"
+            )
+        })?;
+
+    // Wake attached clients after durable control append
+    event_sink.publish_session_updated();
+
+    // Also emit advisory for real-time clients
     event_sink.emit_required(AgentEvent::Session(SessionEvent::HandoffCommitted {
         agent: committed_agent,
         session_id: session_id.clone(),
+        handoff_tool_call_id: handoff_tool_call_id.clone(),
     }));
     event_sink.flush().await.with_context(|| {
         format!(
@@ -804,6 +1125,15 @@ async fn load_or_repair_session(
     let mut entries_vec = backend.load_events_blocking()?;
     let effective_entries =
         harnx_core::session_reconstruct::apply_log_mutations_nats(&entries_vec)?;
+    let preserve_hitl_pending = find_orphan_tool_calls(&effective_entries)
+        .iter()
+        .any(|orphan| {
+            let hitl_ids = hitl_managed_tool_call_ids(&effective_entries, orphan.seq);
+            orphan
+                .calls
+                .iter()
+                .any(|call| call.id.as_deref().is_some_and(|id| hitl_ids.contains(id)))
+        });
     repair_orphan_tool_calls_if_any(RepairOrphanCallsParams {
         backend,
         config,
@@ -829,11 +1159,19 @@ async fn load_or_repair_session(
     } else {
         metadata.title.last_updated_tokens
     };
-    let session = crate::nats_session_log::load_session_from_entries_with_metadata(
-        &entries_vec,
-        session_id,
-        session,
-    )?;
+    let session = if preserve_hitl_pending {
+        crate::nats_session_log::load_session_from_entries_with_metadata_preserving_pending(
+            &entries_vec,
+            session_id,
+            session,
+        )?
+    } else {
+        crate::nats_session_log::load_session_from_entries_with_metadata(
+            &entries_vec,
+            session_id,
+            session,
+        )?
+    };
     store.mark_activated(session_id).await?;
     Ok((session, origin))
 }
@@ -864,7 +1202,16 @@ async fn repair_orphan_tool_calls_if_any(params: RepairOrphanCallsParams<'_>) ->
         effective_entries,
         entries_vec,
     } = params;
-    let orphan_calls = find_orphan_tool_calls(effective_entries);
+    let orphan_calls: Vec<_> = find_orphan_tool_calls(effective_entries)
+        .into_iter()
+        .filter(|orphan| {
+            let hitl_ids = hitl_managed_tool_call_ids(effective_entries, orphan.seq);
+            !orphan
+                .calls
+                .iter()
+                .any(|call| call.id.as_deref().is_some_and(|id| hitl_ids.contains(id)))
+        })
+        .collect();
     if orphan_calls.is_empty() {
         return Ok(());
     }
@@ -1198,8 +1545,9 @@ fn rerun_failure_output(
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_resolved_hooks, dispatch_session_start, find_orphan_tool_calls,
-        fold_new_user_messages_since, SessionOrigin, SessionStartDispatch,
+        agent_resolved_hooks, derive_hitl_tool_round_continuation, derive_pending_hitl_approvals,
+        dispatch_session_start, find_orphan_tool_calls, fold_new_user_messages_since,
+        SessionOrigin, SessionStartDispatch,
     };
     use crate::config::Config;
     use crate::nats_hook_provider::{DiscoveredHook, NatsHookProvider};
@@ -1320,6 +1668,53 @@ mod tests {
             }],
             timestamp: None,
         }
+    }
+
+    #[test]
+    fn reused_tool_call_id_requires_fresh_approval_in_current_tool_round() {
+        let entries = vec![
+            (1, tool_calls_entry("reused-call")),
+            (
+                2,
+                SessionLogEntry::HitlApprovalRequested {
+                    tool_call_id: "reused-call".to_string(),
+                    summary: "Approve historical call".to_string(),
+                    fence_token: 7,
+                },
+            ),
+            (
+                3,
+                SessionLogEntry::HitlApprovalDecision {
+                    tool_call_id: "reused-call".to_string(),
+                    approved: true,
+                    note: None,
+                    fence_token: 7,
+                },
+            ),
+            (4, tool_results_entry("reused-call")),
+            (5, tool_calls_entry("reused-call")),
+            (
+                6,
+                SessionLogEntry::HitlApprovalRequested {
+                    tool_call_id: "reused-call".to_string(),
+                    summary: "Approve current call".to_string(),
+                    fence_token: 8,
+                },
+            ),
+        ];
+
+        let pending = derive_pending_hitl_approvals(&entries).expect("derive pending approval");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].seq, 6);
+        assert_eq!(pending[0].summary, "Approve current call");
+
+        let continuation = derive_hitl_tool_round_continuation(&entries)
+            .expect("derive HITL continuation")
+            .expect("current orphan is HITL-managed");
+        assert!(
+            continuation.decisions.is_empty(),
+            "historical approval must not authorize current tool round"
+        );
     }
 
     #[test]

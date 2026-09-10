@@ -13,6 +13,7 @@ use super::daemon_turn_input::TurnInputCtx;
 use crate::nats_lease::NatsSessionLease;
 use crate::OnToolRoundFn;
 use anyhow::{Context, Result};
+use harnx_core::api_types::CompletionTokenUsage;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -24,6 +25,9 @@ impl WorkerRuntime {
         lease: Arc<NatsSessionLease>,
         abort_signal: crate::utils::AbortSignal,
         control_task: JoinHandle<()>,
+        mut hitl_decision_rx: tokio::sync::mpsc::UnboundedReceiver<
+            super::control::AppliedHitlDecision,
+        >,
     ) -> Result<()> {
         let metadata = self
             .session_metadata
@@ -50,6 +54,10 @@ impl WorkerRuntime {
                 abort_signal.clone(),
             );
             per_session.write().set_tui_confirm_tool_use(Some(confirm));
+        } else {
+            per_session.write().set_tui_confirm_tool_use(Some(Arc::new(
+                |_call, _arguments, _reason| crate::tool::ToolUseConfirmation::Defer,
+            )));
         }
         let agent_setup = super::daemon::install_session_metadata_agent(&per_session, &metadata);
 
@@ -87,6 +95,34 @@ impl WorkerRuntime {
             loop {
                 if !lease.is_held() {
                     break Ok(());
+                }
+
+                let pending_hitl = super::agent_loop::derive_pending_hitl_approvals(
+                    &backend.load_events_latest_async().await?,
+                )?;
+                if !pending_hitl.is_empty() {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        hitl_decision_rx.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Some(decision)) => {
+                            log::debug!(
+                                "received durable HITL decision: session_id={} tool_call_id={} approved={}",
+                                activation.session_id,
+                                decision.tool_call_id,
+                                decision.approved
+                            );
+                        }
+                        Ok(None) | Err(_) => {
+                            log::debug!(
+                                "ending activation while HITL approval remains pending: session_id={}",
+                                activation.session_id
+                            );
+                            break Ok(());
+                        }
+                    }
                 }
 
                 let (input, seed_cursor) = self
@@ -173,6 +209,12 @@ impl WorkerRuntime {
                 // either task can still append to this session.
                 Self::wait_for_post_turn_maintenance(&per_session, &lease).await;
 
+                // HITL ends this activation without a TurnEnd. The unmatched
+                // request keeps the durable tool round pending for reactivation.
+                if loop_outcome == NatsAgentLoopOutcome::AwaitingHitlApproval {
+                    break Ok(());
+                }
+
                 // After turn completes, update activation high-water from turn_cursor.
                 // turn_cursor covers everything this turn consumed: the seed
                 // messages and any mid-round injection during multi-round
@@ -182,7 +224,14 @@ impl WorkerRuntime {
                     activation_high_water = Some(activation_high_water.map_or(turn_cursor_val, |h| h.max(turn_cursor_val)));
                 }
 
-                Self::record_session_turn_end(&backend, &lease, turn_cursor_val).await?;
+                let usage = per_session.read().session.as_ref().map(|s| s.completion_usage().clone()).unwrap_or_default();
+                Self::record_session_turn_end(
+                    &backend,
+                    &lease,
+                    Some(&*event_sink_for_loop),
+                    turn_cursor_val,
+                    usage,
+                ).await?;
 
                 // The activation carries a frontend-scoped route, not a
                 // turn-scoped responder. Keep it while this activation drains
@@ -325,7 +374,9 @@ impl WorkerRuntime {
     async fn record_session_turn_end(
         backend: &NatsSessionLogBackend,
         lease: &NatsSessionLease,
+        event_sink: Option<&crate::nats_event_sink::NatsEventSink>,
         through_seq: u64,
+        usage: CompletionTokenUsage,
     ) -> Result<()> {
         if through_seq == 0 {
             anyhow::bail!("refusing to persist a zero-sequence turn boundary");
@@ -338,8 +389,13 @@ impl WorkerRuntime {
                 through_seq,
                 fence_token: lease.fence_token(),
                 timestamp: Some(chrono::Utc::now()),
+                usage: Some(usage),
             })
             .await?;
+        // Wake attached clients after durable control append
+        if let Some(sink) = event_sink {
+            sink.publish_session_updated();
+        }
         Ok(())
     }
 
