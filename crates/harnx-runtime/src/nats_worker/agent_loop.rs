@@ -63,6 +63,7 @@ impl<'a> RunAgentLoopArgs<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PendingHitlApproval {
     pub seq: u64,
+    pub tool_round_seq: u64,
     pub tool_call_id: String,
     pub summary: String,
 }
@@ -99,6 +100,7 @@ pub(crate) fn derive_pending_hitl_approvals(
             {
                 Some(PendingHitlApproval {
                     seq: *request_seq,
+                    tool_round_seq: orphan.seq,
                     tool_call_id: tool_call_id.clone(),
                     summary: summary.clone(),
                 })

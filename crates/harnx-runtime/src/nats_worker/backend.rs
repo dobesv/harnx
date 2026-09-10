@@ -3,7 +3,7 @@
 use crate::nats_lease::NatsSessionLease;
 use crate::nats_metrics;
 use anyhow::{Context, Result};
-use async_nats::jetstream;
+use async_nats::jetstream::{self, context::PublishErrorKind};
 use harnx_core::execution_context::ExecutionContextObservation;
 use std::sync::Arc;
 
@@ -11,9 +11,9 @@ const APPEND_ATTEMPTS: usize = 3;
 
 fn is_stream_advanced_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause.to_string().contains("wrong last sequence")
-            || cause.to_string().contains("expected last sequence")
-            || cause.to_string().contains("stream sequence does not match")
+        cause
+            .downcast_ref::<jetstream::context::PublishError>()
+            .is_some_and(|error| error.kind() == PublishErrorKind::WrongLastSequence)
     })
 }
 const APPEND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
@@ -401,11 +401,16 @@ impl NatsSessionLogBackend {
             self.jetstream.clone(),
             self.session_id.clone(),
         );
+        let message_id = uuid::Uuid::new_v4().to_string();
         let mut last_error = None;
         for attempt in 1..=APPEND_ATTEMPTS {
             self.ensure_lease_held(lease, entry)?;
             match log
-                .append_event_with_expected_last_sequence_async(entry, expected_last_sequence)
+                .append_event_with_expected_last_sequence_and_message_id_async(
+                    entry,
+                    expected_last_sequence,
+                    message_id.clone(),
+                )
                 .await
             {
                 Ok(seq) => {
@@ -569,5 +574,25 @@ impl NatsSessionLogBackend {
             self.session_id.clone(),
         );
         log.load_events_latest_async().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_stream_advanced_error;
+    use async_nats::jetstream::context::{PublishError, PublishErrorKind};
+
+    #[test]
+    fn stream_advanced_detection_uses_wrapped_publish_error_kind() {
+        let wrong_sequence =
+            anyhow::Error::new(PublishError::new(PublishErrorKind::WrongLastSequence))
+                .context("wrapped publish failure");
+        assert!(is_stream_advanced_error(&wrong_sequence));
+
+        let textual_match = anyhow::anyhow!("wrong last sequence");
+        assert!(!is_stream_advanced_error(&textual_match));
+
+        let other_publish_error = anyhow::Error::new(PublishError::new(PublishErrorKind::Other));
+        assert!(!is_stream_advanced_error(&other_publish_error));
     }
 }

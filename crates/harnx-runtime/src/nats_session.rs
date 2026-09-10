@@ -663,6 +663,13 @@ impl NatsSession {
             return Ok(false);
         }
         let Some(_) = self.activate_pending_turn().await? else {
+            let entries = self.load_durable_entries().await?;
+            let still_pending = crate::nats_worker::derive_pending_hitl_approvals(&entries)?
+                .iter()
+                .any(|approval| approval.tool_call_id == tool_call_id);
+            if !still_pending {
+                return Ok(false);
+            }
             anyhow::bail!(
                 "pending HITL approval '{}' has no activatable durable turn",
                 tool_call_id
@@ -1303,8 +1310,12 @@ impl NatsSession {
                 ))
             },
         );
-        let awaiting_hitl = crate::nats_worker::derive_pending_hitl_approvals(entries)
-            .is_ok_and(|pending| !pending.is_empty());
+        let awaiting_hitl =
+            crate::nats_worker::derive_pending_hitl_approvals(entries).is_ok_and(|pending| {
+                pending
+                    .iter()
+                    .any(|approval| approval.tool_round_seq > user_msg_seq)
+            });
         status == Some(RequestedSeqStatus::Covered)
             || awaiting_hitl
             || (saw_turn_ended && Self::has_durable_assistant_response(entries, user_msg_seq))
@@ -1826,6 +1837,63 @@ mod tests {
         assert!(!NatsSession::is_turn_completion_visible(
             &entries, None, 2, false
         ));
+    }
+
+    #[test]
+    fn pending_hitl_only_completes_user_messages_in_its_tool_round() {
+        let entries = vec![
+            (
+                1,
+                SessionLogEntry::Message {
+                    id: None,
+                    role: MessageRole::User,
+                    content: MessageContent::Text("approval turn".to_string()),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                2,
+                SessionLogEntry::ToolCalls {
+                    text: "needs approval".to_string(),
+                    thought: None,
+                    calls: vec![harnx_core::tool::ToolCall::new(
+                        "search".to_string(),
+                        serde_json::json!({}),
+                        Some("approval-call".to_string()),
+                        None,
+                    )],
+                    timestamp: None,
+                    fence_token: Some(7),
+                },
+            ),
+            (
+                3,
+                SessionLogEntry::Message {
+                    id: None,
+                    role: MessageRole::User,
+                    content: MessageContent::Text("queued later turn".to_string()),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                4,
+                SessionLogEntry::HitlApprovalRequested {
+                    tool_call_id: "approval-call".to_string(),
+                    summary: "Approve search".to_string(),
+                    fence_token: 7,
+                },
+            ),
+        ];
+
+        assert!(NatsSession::is_turn_completion_visible(
+            &entries, None, 1, false
+        ));
+        assert!(
+            !NatsSession::is_turn_completion_visible(&entries, None, 3, false),
+            "an approval requested after a queued user still belongs to the earlier tool round"
+        );
     }
 
     #[test]

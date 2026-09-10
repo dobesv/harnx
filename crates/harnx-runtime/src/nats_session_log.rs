@@ -55,10 +55,24 @@ impl NatsSessionLog {
         entry: &SessionLogEntry,
         expected_last_sequence: u64,
     ) -> Result<u64> {
+        self.append_event_with_expected_last_sequence_and_message_id_async(
+            entry,
+            expected_last_sequence,
+            new_message_id(),
+        )
+        .await
+    }
+
+    pub async fn append_event_with_expected_last_sequence_and_message_id_async(
+        &self,
+        entry: &SessionLogEntry,
+        expected_last_sequence: u64,
+        message_id: impl Into<String>,
+    ) -> Result<u64> {
         self.append_event_with_publish_message_async(
             entry,
             PublishMessage::build()
-                .message_id(new_message_id())
+                .message_id(message_id.into())
                 .expected_last_sequence(expected_last_sequence),
         )
         .await

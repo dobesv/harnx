@@ -638,7 +638,12 @@ async fn durable_hitl_duplicate_approval_has_one_decision_and_executes_after_it(
             .source
             .decide_hitl_approval("hook-approval-handoff", true, None)
     );
-    assert!(first? || second?);
+    let first = first?;
+    let second = second?;
+    assert_ne!(
+        first, second,
+        "exactly one concurrent approval must report that it applied"
+    );
     let entries = wait_for_source_entry(&harness.jetstream, |entry| {
         matches!(entry, SessionLogEntry::ToolResults { .. })
     })
