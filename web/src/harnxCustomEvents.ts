@@ -109,25 +109,19 @@ const handlers: Record<string, CustomEventHandler> = {
     const target = handoffTarget(value);
     if (!target) return;
 
-    // On hydrated replay (!isRunActive), require both a non-blank toolCallId and sourceSessionId.
-    // If either is missing, ignore to prevent spurious re-navigation on replay.
-    if (!callbacks.isRunActive) {
-      if (!target.toolCallId || !callbacks.sourceSessionId) {
-        return;
-      }
+    const hasMarker = Boolean(target.toolCallId && callbacks.sourceSessionId);
+
+    // On hydrated replay (!isRunActive), require both a non-blank toolCallId and
+    // sourceSessionId. Without them we can't dedupe, so ignore to prevent
+    // spurious re-navigation. Live events (isRunActive) always navigate.
+    if (!callbacks.isRunActive && !hasMarker) return;
+
+    // With a marker, dedupe: skip if already navigated, else record it.
+    if (hasMarker) {
+      if (isHandoffConsumed(callbacks.sourceSessionId!, target.toolCallId!)) return;
+      markHandoffConsumed(callbacks.sourceSessionId!, target.toolCallId!);
     }
 
-    // If we have a marker id and source session, check deduplication state
-    if (target.toolCallId && callbacks.sourceSessionId) {
-      if (isHandoffConsumed(callbacks.sourceSessionId, target.toolCallId)) {
-        // Already navigated for this handoff
-        return;
-      }
-      // Mark as consumed before navigating
-      markHandoffConsumed(callbacks.sourceSessionId, target.toolCallId);
-    }
-
-    // Fire for both live (isRunActive=true) and hydrated (isRunActive=false) events
     callbacks.onHandoff?.(target.agent, target.sessionId);
   },
   hitl_pending_approval: (callbacks, value) => {
