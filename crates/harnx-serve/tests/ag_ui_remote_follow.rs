@@ -219,6 +219,27 @@ fn get_custom_event(events: &[serde_json::Value], name: &str) -> Option<serde_js
         .cloned()
 }
 
+fn assert_remote_attach_order(events: &[serde_json::Value], durable_tail: u64) {
+    let position = |event_type: &str, name: Option<&str>| {
+        events
+            .iter()
+            .position(|event| {
+                event["type"] == event_type
+                    && name.is_none_or(|name| event["name"].as_str() == Some(name))
+            })
+            .unwrap_or_else(|| panic!("missing {event_type} {name:?}"))
+    };
+    let started = position("RUN_STARTED", None);
+    let boundary = position("CUSTOM", Some("session_attach_boundary"));
+    let snapshot = position("MESSAGES_SNAPSHOT", None);
+    let finished = position("RUN_FINISHED", None);
+
+    assert_eq!(events[boundary]["value"]["attached_seq"], durable_tail);
+    assert!(started < boundary);
+    assert!(boundary < snapshot);
+    assert!(snapshot < finished);
+}
+
 /// One promptless stream stays busy, then finishes when its remote turn ends live.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_remote_lease_active_shows_busy_until_turn_ends() {
@@ -226,6 +247,13 @@ async fn e2e_remote_lease_active_shows_busy_until_turn_ends() {
         return;
     };
 
+    let durable_tail = NatsSessionLog::new(session.jetstream.clone(), session.session_id.clone())
+        .load_events_async()
+        .await
+        .expect("load durable tail")
+        .last()
+        .map(|(seq, _)| *seq)
+        .unwrap_or(0);
     let response = open_promptless_sse(&session).await;
     let run_started = Arc::new(tokio::sync::Notify::new());
     let run_finished = Arc::new(AtomicBool::new(false));
@@ -262,7 +290,7 @@ async fn e2e_remote_lease_active_shows_busy_until_turn_ends() {
     .await;
 
     finish_handle.await.expect("finish task should complete");
-    assert!(has_event(&read.events, "RUN_STARTED"));
+    assert_remote_attach_order(&read.events, durable_tail);
     assert_eq!(
         read.events
             .iter()

@@ -114,12 +114,14 @@ Provides AG-UI events for a run. The body's **last message** selects the mode:
 
 - **Prompted run** (last message is a non-empty `user` message whose ID is not
   already present in the authoritative snapshot): a pure delta
-  stream — `RUN_STARTED` → `STEP_*`/`TEXT_MESSAGE_*`/`THINKING_*`/`TOOL_CALL_*`/
-  `CUSTOM` → `RUN_FINISHED` (or `RUN_ERROR`). The stream **terminates** after the
+  stream — `RUN_STARTED` → `session_attach_boundary` →
+  `STEP_*`/`TEXT_MESSAGE_*`/`THINKING_*`/`TOOL_CALL_*`/`CUSTOM` → `RUN_FINISHED`
+  (or `RUN_ERROR`). The stream **terminates** after the
   terminal event so the client's `runAgent()` promise resolves. No
   `MESSAGES_SNAPSHOT` is emitted (it would predate the just-sent user message).
 - **Promptless join** (no non-empty trailing user message): hydrates with a
-  synthetic `RUN_STARTED` → `MESSAGES_SNAPSHOT`. For an idle session it appends
+  synthetic `RUN_STARTED` → `session_attach_boundary` → `MESSAGES_SNAPSHOT`.
+  For an idle session it appends
   a synthetic `RUN_FINISHED` and closes; for a running or interrupted session it
   follows that run's live events through the real terminal event.
 
@@ -200,7 +202,8 @@ Cross-process live synchronization and durable session persistence use NATS.
 | `Turn::Started` / `Turn::Ended` | `STEP_STARTED` / `STEP_FINISHED` | Step names use `turn-N`. |
 | `Turn::SubAgentStarted` / `SubAgentProgress` | `CUSTOM` | Names: `sub_agent_started`, `sub_agent_progress`. The optional invocation ID correlates reused child sessions; progress carries running/done/failed status, elapsed milliseconds, direct token usage, and direct tool-call count. |
 | `Turn::RetryAttempt` / `ModelFallback` / `HandoffRequested` | `CUSTOM` | Names: `turn_retry_attempt`, `turn_model_fallback`, `turn_handoff_requested`. A handoff request is informational and may carry no session ID; clients must not navigate on it. |
-| `Session::HandoffCommitted` | `CUSTOM` | Name: `session_handoff`. Emitted only after the target prompt is accepted for dispatch, with nonempty `agent` and resolved `session_id`; Web uses this live, non-replayed signal for navigation. |
+| `Session::HandoffCommitted` | `CUSTOM` | Name: `session_handoff`. Emitted only after the target prompt is accepted for dispatch, with nonempty `agent`, resolved `session_id`, optional `handoff_tool_call_id`, and optional durable `after_seq`. Hydration always sets `after_seq` from the handoff log entry's sequence. |
+| Attach boundary | `CUSTOM` | Name: `session_attach_boundary`. Emitted immediately after `RUN_STARTED` with `attached_seq` set to the durable log tail observed at attach time, before snapshot, hydrated control, or live events. |
 | `Session::Compacting*` | `CUSTOM` (+ `MESSAGES_SNAPSHOT` on completed) | Names: `session_compacting_started`, `session_compacting_completed`, `session_compacting_failed`. Completion re-snapshots transcript because compaction mutates history. |
 | `Session::TitleUpdated` / `TitleGenerationFailed` | `CUSTOM` | Names: `session_title_updated`, `session_title_generation_failed`. |
 | `Session::Saved` / `AgentInitializing` / `ModelChanged` / `RagIndexing` / `Generic` | `CUSTOM` | Stable names prefixed with `session_...`. |

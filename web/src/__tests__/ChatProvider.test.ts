@@ -214,14 +214,34 @@ describe('toAgUiMessages', () => {
       });
       expect(onToolSummary).toHaveBeenCalledWith('call_1', 'md');
 
-      // Simulate onCustomEvent status
-      await subscriber.onCustomEvent({
+      // Simulate onEvent CUSTOM status
+      await subscriber.onEvent({
         event: {
+          type: 'CUSTOM',
           name: 'status',
           value: { text: 'Running' }
         }
       });
       expect(onStatus).toHaveBeenCalledWith('Running');
+
+      // Verify no double-dispatch if onCustomEvent is also called
+      onStatus.mockClear();
+      await subscriber.onEvent({
+        event: {
+          type: 'CUSTOM',
+          name: 'status',
+          value: { text: 'Running Again' }
+        }
+      });
+      await subscriber.onCustomEvent?.({
+        event: {
+          type: 'CUSTOM',
+          name: 'status',
+          value: { text: 'Running Again' }
+        }
+      });
+      expect(onStatus).toHaveBeenCalledTimes(1);
+      expect(onStatus).toHaveBeenCalledWith('Running Again');
 
       // Simulate onEvent CUSTOM session_title_updated
       await subscriber.onEvent({
@@ -262,7 +282,6 @@ describe('toAgUiMessages', () => {
         onRunFailed: vi.fn(),
         onUsage,
         onToolSummary,
-        isRunActive: true
       };
 
       handleHarnxCustomEvent('usage', { input: 'not-a-number', output: 2 }, callbacks);
@@ -276,7 +295,7 @@ describe('toAgUiMessages', () => {
       expect(onToolSummary).not.toHaveBeenCalled();
     });
     
-    it('should route session_handoff custom event only if run is active', async () => {
+    it('should gate session_handoff navigation on attach sequence boundary', async () => {
       const onStatus = vi.fn();
       const onUsage = vi.fn();
       const onToolSummary = vi.fn();
@@ -302,34 +321,37 @@ describe('toAgUiMessages', () => {
 
       await agent.runAgent({});
 
-      // A markerless handoff during hydrated replay (!isRunActive) is ignored
+      // Wire order: RUN_STARTED, then session_attach_boundary
+      await dispatchAgentEvent(subscriber, { type: 'RUN_STARTED' });
+      await dispatchAgentEvent(subscriber, {
+        type: 'CUSTOM',
+        name: 'session_attach_boundary',
+        value: { attached_seq: 10 }
+      });
+
+      // Replayed session_handoff (seq <= boundary) is skipped
       await dispatchAgentEvent(subscriber, {
         type: 'CUSTOM',
         name: 'session_handoff',
-        value: { agent: 'targetAgent', session_id: '1234' }
+        value: { agent: 'targetAgent', session_id: '1234', after_seq: 10 }
       });
       expect(onHandoff).not.toHaveBeenCalled();
 
-      // Hydrated handoff with marker identity navigates
-      agent.setSourceSessionId('source-session');
+      // Strictly-newer live session_handoff (seq > boundary) navigates
       await dispatchAgentEvent(subscriber, {
         type: 'CUSTOM',
         name: 'session_handoff',
-        value: { agent: 'targetAgent', session_id: '1234', handoff_tool_call_id: 'call-handoff-1' }
+        value: { agent: 'targetAgent', session_id: '1234', after_seq: 11 }
       });
       expect(onHandoff).toHaveBeenCalledWith('targetAgent', '1234');
 
-      // Simulate RUN_STARTED to set isRunActive true
-      await dispatchAgentEvent(subscriber, { type: 'RUN_STARTED' });
-
-      // Subsequent live handoff should still fire (dedup uses marker id, not isRunActive)
-      onHandoff.mockClear();
+      // Duplicated session_handoff frame navigates at most once
       await dispatchAgentEvent(subscriber, {
         type: 'CUSTOM',
         name: 'session_handoff',
-        value: { agent: 'targetAgent2', session_id: '5678' }
+        value: { agent: 'targetAgent', session_id: '1234', after_seq: 11 }
       });
-      expect(onHandoff).toHaveBeenCalledWith('targetAgent2', '5678');
+      expect(onHandoff).toHaveBeenCalledTimes(1);
 
       onHandoff.mockClear();
 
@@ -337,43 +359,44 @@ describe('toAgUiMessages', () => {
       await dispatchAgentEvent(subscriber, {
         type: 'CUSTOM',
         name: 'session_handoff',
-        value: { agent: 'targetAgent', session_id: null }
+        value: { agent: 'targetAgent', session_id: null, after_seq: 12 }
       });
       expect(onHandoff).not.toHaveBeenCalled();
 
       await dispatchAgentEvent(subscriber, {
         type: 'CUSTOM',
         name: 'session_handoff',
-        value: { agent: 'targetAgent', session_id: '   ' }
+        value: { agent: 'targetAgent', session_id: '   ', after_seq: 12 }
       });
       expect(onHandoff).not.toHaveBeenCalled();
 
       await dispatchAgentEvent(subscriber, {
         type: 'CUSTOM',
         name: 'turn_handoff_requested',
-        value: { agent: 'targetAgent', session_id: 'request-only' }
+        value: { agent: 'targetAgent', session_id: 'request-only', after_seq: 12 }
       });
       expect(onHandoff).not.toHaveBeenCalled();
 
-      onHandoff.mockClear();
-
-      // Simulate RUN_FINISHED to set isRunActive false
-      await dispatchAgentEvent(subscriber, { type: 'RUN_FINISHED' });
-
-      // Markerless handoff during replay/inactive must be ignored
-      onHandoff.mockClear();
+      // Missing afterSeq or non-integer must never navigate
       await dispatchAgentEvent(subscriber, {
         type: 'CUSTOM',
         name: 'session_handoff',
-        value: { agent: 'targetAgent3', session_id: '9999' }
+        value: { agent: 'targetAgent', session_id: '9999' }
       });
       expect(onHandoff).not.toHaveBeenCalled();
 
-      // Handoff with marker identity during replay/inactive should fire
       await dispatchAgentEvent(subscriber, {
         type: 'CUSTOM',
         name: 'session_handoff',
-        value: { agent: 'targetAgent3', session_id: '9999', handoff_tool_call_id: 'call-handoff-2' }
+        value: { agent: 'targetAgent', session_id: '9999', after_seq: 'invalid' }
+      });
+      expect(onHandoff).not.toHaveBeenCalled();
+
+      // Strictly newer live handoff afterSeq 12 navigates
+      await dispatchAgentEvent(subscriber, {
+        type: 'CUSTOM',
+        name: 'session_handoff',
+        value: { agent: 'targetAgent3', session_id: '9999', after_seq: 12 }
       });
       expect(onHandoff).toHaveBeenCalledWith('targetAgent3', '9999');
     });

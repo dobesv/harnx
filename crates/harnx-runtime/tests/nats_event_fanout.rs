@@ -465,6 +465,7 @@ async fn control_event_flush_preserves_fifo_delivery() -> Result<()> {
         agent: "atlas".into(),
         session_id: "atlas-session".into(),
         handoff_tool_call_id: Some("call-test-fanout".into()),
+        after_seq: Some(42),
     }));
     sink.flush().await?;
 
@@ -481,8 +482,12 @@ async fn control_event_flush_preserves_fifo_delivery() -> Result<()> {
     ));
     assert!(matches!(
         &received[1],
-        AgentEvent::Session(SessionEvent::HandoffCommitted { agent, session_id, .. })
-            if agent == "atlas" && session_id == "atlas-session"
+        AgentEvent::Session(SessionEvent::HandoffCommitted {
+            agent,
+            session_id,
+            after_seq: Some(42),
+            ..
+        }) if agent == "atlas" && session_id == "atlas-session"
     ));
     Ok(())
 }

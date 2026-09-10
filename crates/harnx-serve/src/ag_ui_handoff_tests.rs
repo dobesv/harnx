@@ -35,6 +35,7 @@ fn splits_requested_and_committed_handoff_events() {
         agent: "target-agent".to_string(),
         session_id: "target-session-123".to_string(),
         handoff_tool_call_id: Some("call-test-1".to_string()),
+        after_seq: Some(42),
     }));
     sink.emit(AgentEvent::Turn(TurnEvent::Ended {
         outcome: harnx_core::event::TurnOutcome::default(),
@@ -42,22 +43,26 @@ fn splits_requested_and_committed_handoff_events() {
 
     let events = collect_events(&mut rx);
     assert_eq!(events.len(), 1, "parent turn end adds no AG-UI step");
-    assert_handoff_payload(find_custom_event(&events, "session_handoff"));
+    let handoff = find_custom_event(&events, "session_handoff");
+    assert_handoff_payload(handoff);
+    assert_eq!(handoff.value["after_seq"], 42);
 }
 
 #[test]
-fn live_handoff_omits_missing_tool_call_id() {
+fn live_handoff_omits_missing_optional_fields() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let sink = AgUiSink::with_snapshot(tx, MessageId::random(), false, None);
     sink.emit(AgentEvent::Session(SessionEvent::HandoffCommitted {
         agent: "target-agent".to_string(),
         session_id: "target-session-123".to_string(),
         handoff_tool_call_id: None,
+        after_seq: None,
     }));
 
     let events = collect_events(&mut rx);
     let event = find_custom_event(&events, "session_handoff");
     assert!(event.value.get("handoff_tool_call_id").is_none());
+    assert!(event.value.get("after_seq").is_none());
 }
 
 #[test]
@@ -70,6 +75,7 @@ fn nested_handoff_commit_does_not_navigate() {
             agent: "nested-target".to_string(),
             session_id: "nested-session".to_string(),
             handoff_tool_call_id: Some("call-nested-1".to_string()),
+            after_seq: Some(43),
         })),
     });
     assert!(

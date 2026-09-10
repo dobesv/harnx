@@ -7,9 +7,11 @@ use std::time::Duration;
 
 use serde_json::json;
 
+use crate::ag_ui_attach::{
+    initial_attach_frame, keep_alive_frame, session_attach_boundary_frame, snapshot_event,
+};
 use crate::ag_ui_sync::{
-    frame_run_boundary_event, frame_run_error_event, history_warning_event, pending_user_prompt,
-    wire_message_id,
+    frame_run_boundary_event, frame_run_error_event, pending_user_prompt, wire_message_id,
 };
 use crate::ag_ui_usage::UsagePayloadInput;
 use crate::interrupt_resume::{parse_resume_params, InterruptResumeParam};
@@ -22,7 +24,7 @@ use crate::session_actor::{
 use ag_ui_core::event::RunStartedEvent;
 use ag_ui_core::{
     event::{
-        BaseEvent, CustomEvent, Event, MessagesSnapshotEvent, StepFinishedEvent, StepStartedEvent,
+        BaseEvent, CustomEvent, Event, StepFinishedEvent, StepStartedEvent,
         TextMessageContentEvent, TextMessageEndEvent, TextMessageStartEvent, ThinkingEndEvent,
         ThinkingStartEvent, ThinkingTextMessageContentEvent, ThinkingTextMessageEndEvent,
         ThinkingTextMessageStartEvent, ToolCallArgsEvent, ToolCallEndEvent, ToolCallResultEvent,
@@ -685,10 +687,14 @@ impl AgUiSink {
                 agent,
                 session_id,
                 handoff_tool_call_id,
+                after_seq,
             } => {
                 let mut value = json!({ "agent": agent, "session_id": session_id });
                 if let Some(tool_call_id) = handoff_tool_call_id {
                     value["handoff_tool_call_id"] = json!(tool_call_id);
+                }
+                if let Some(after_seq) = after_seq {
+                    value["after_seq"] = json!(after_seq);
                 }
                 self.emit_custom("session_handoff", value);
             }
@@ -767,10 +773,6 @@ pub fn frame_event(event: &Event) -> Result<String, AgUiError> {
     let json = serde_json::to_string(event)
         .map_err(|err| AgUiError::Internal(format!("failed to serialize AG-UI event: {err}")))?;
     Ok(format!("data: {json}\n\n"))
-}
-
-fn keep_alive_frame() -> &'static str {
-    ": keep-alive\n\n"
 }
 
 fn keep_alive_stream(interval: Duration) -> impl tokio_stream::Stream<Item = Bytes> {
@@ -1123,15 +1125,6 @@ fn frame_live_event(
     }
 }
 
-pub(crate) fn snapshot_event(messages: Vec<AgUiMessage>) -> Event {
-    Event::MessagesSnapshot(MessagesSnapshotEvent {
-        base: BaseEvent {
-            timestamp: None,
-            raw_event: None,
-        },
-        messages,
-    })
-}
 async fn subscribe(handle: &SessionHandle) -> SubscribeResult {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     handle
@@ -1251,20 +1244,23 @@ fn build_live_event_body(
 fn build_prompted_event_stream(
     run_id: &str,
     thread_id_text: &str,
-    snapshot_frame: Option<Bytes>,
+    initial_attach: (Option<Bytes>, u64),
     live_stream: impl tokio_stream::Stream<Item = Event> + Send + Sync + 'static,
 ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Bytes> + Send + Sync + 'static>> {
+    let (snapshot_frame, attached_seq) = initial_attach;
     let body = build_live_event_body(run_id, thread_id_text, snapshot_frame, live_stream);
+    let started = tokio_stream::once(Bytes::from(frame_run_boundary_event(
+        "RUN_STARTED",
+        thread_id_text,
+        run_id,
+    )));
+    let attached = tokio_stream::StreamExt::chain(
+        started,
+        tokio_stream::once(session_attach_boundary_frame(attached_seq)),
+    );
     // No keep_alive for prompted runs — the stream must terminate so the client's
     // runAgent() promise resolves. Multiplayer/persistent watch is a separate endpoint.
-    Box::pin(tokio_stream::StreamExt::chain(
-        tokio_stream::once(Bytes::from(frame_run_boundary_event(
-            "RUN_STARTED",
-            thread_id_text,
-            run_id,
-        ))),
-        body,
-    ))
+    Box::pin(tokio_stream::StreamExt::chain(attached, body))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1278,6 +1274,9 @@ fn build_promptless_event_stream(
     log_entries: Option<&[(u64, harnx_core::session::SessionLogEntry)]>,
     tokens_usage: Option<UsageContextSnapshot>,
 ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Bytes> + Send + Sync + 'static>> {
+    let attached_seq = log_entries
+        .and_then(|entries| entries.last().map(|(seq, _)| *seq))
+        .unwrap_or(0);
     // Control-state hydration: emit hydrated CUSTOM events for control entries
     let control_events = log_entries
         .map(|entries| control_snapshot_events(entries, tokens_usage.as_ref()))
@@ -1292,11 +1291,15 @@ fn build_promptless_event_stream(
         thread_id_text,
         run_id,
     )));
+    let attached = tokio_stream::StreamExt::chain(
+        started,
+        tokio_stream::once(session_attach_boundary_frame(attached_seq)),
+    );
 
     if let Some(outcome) = interrupt_outcome {
         // An approval interrupt is terminal for this AG-UI run. Replay durable pending
         // events before RUN_FINISHED so reconnecting clients can render the gate.
-        let hydrated = tokio_stream::StreamExt::chain(started, tokio_stream::iter(snapshot_frame));
+        let hydrated = tokio_stream::StreamExt::chain(attached, tokio_stream::iter(snapshot_frame));
         return Box::pin(tokio_stream::StreamExt::chain(
             tokio_stream::StreamExt::chain(hydrated, tokio_stream::iter(control_frames)),
             tokio_stream::once(frame_run_finished_event(
@@ -1310,7 +1313,7 @@ fn build_promptless_event_stream(
     if !is_active {
         // Idle session: hydrate history then emit a synthetic RUN_FINISHED so the
         // client's stream terminates cleanly.
-        let hydrated = tokio_stream::StreamExt::chain(started, tokio_stream::iter(snapshot_frame));
+        let hydrated = tokio_stream::StreamExt::chain(attached, tokio_stream::iter(snapshot_frame));
         return Box::pin(tokio_stream::StreamExt::chain(
             tokio_stream::StreamExt::chain(hydrated, tokio_stream::iter(control_frames)),
             tokio_stream::once(Bytes::from(frame_run_boundary_event(
@@ -1324,7 +1327,7 @@ fn build_promptless_event_stream(
     // Running session (e.g. page reload mid-run): emit exactly one RUN_STARTED,
     // hydrate history and durable control state, then follow the live broadcast body
     // until the real terminal event.
-    let hydrated = tokio_stream::StreamExt::chain(started, tokio_stream::iter(snapshot_frame));
+    let hydrated = tokio_stream::StreamExt::chain(attached, tokio_stream::iter(snapshot_frame));
     let hydrated = tokio_stream::StreamExt::chain(hydrated, tokio_stream::iter(control_frames));
     let body = build_live_event_body(run_id, thread_id_text, None, live_stream);
     Box::pin(tokio_stream::StreamExt::chain(hydrated, body))
@@ -1347,24 +1350,16 @@ pub(crate) fn build_ag_ui_event_stream(
         tokens_usage,
         session_base: _,
     } = subscription;
+    let attached_seq = log_entries
+        .as_deref()
+        .and_then(|entries| entries.last().map(|(seq, _)| *seq))
+        .unwrap_or(0);
     let interrupt_outcome = match state {
         crate::session_actor::SessionState::Interrupted { pending, .. } => Some(pending.metadata),
         crate::session_actor::SessionState::Idle
         | crate::session_actor::SessionState::Running { .. } => None,
     };
-    let initial_events = has_prompt
-        .is_none()
-        .then(|| snapshot_event(snapshot))
-        .into_iter()
-        .chain(history_warnings.into_iter().map(history_warning_event));
-    let initial_frames = initial_events
-        .filter_map(|event| {
-            frame_event(&event)
-                .map_err(|err| log::warn!("failed to serialize initial AG-UI frame: {err}"))
-                .ok()
-        })
-        .collect::<String>();
-    let initial_frame = (!initial_frames.is_empty()).then(|| Bytes::from(initial_frames));
+    let initial_frame = initial_attach_frame(snapshot, history_warnings, has_prompt.is_none());
     let handle_for_lag = handle.clone();
     let live_stream = tokio_stream::StreamExt::then(BroadcastStream::new(events), move |item| {
         let handle = handle_for_lag.clone();
@@ -1387,7 +1382,12 @@ pub(crate) fn build_ag_ui_event_stream(
         // (assistant-ui's applyExternalMessages is a full replace) would wipe the
         // optimistically-appended user message and the streaming reply. Clients
         // hydrate via their own promptless subscribe stream instead (multiplayer-safe).
-        Some(_) => build_prompted_event_stream(run_id, thread_id_text, initial_frame, live_stream),
+        Some(_) => build_prompted_event_stream(
+            run_id,
+            thread_id_text,
+            (initial_frame, attached_seq),
+            live_stream,
+        ),
         None => build_promptless_event_stream(
             run_id,
             thread_id_text,
@@ -1756,6 +1756,7 @@ pub(crate) fn control_snapshot_events(
                 if let Some(tool_call_id) = handoff_tool_call_id {
                     value["handoff_tool_call_id"] = json!(tool_call_id);
                 }
+                value["after_seq"] = json!(*seq);
                 events.push(Event::Custom(CustomEvent {
                     base: BaseEvent {
                         timestamp: None,
