@@ -213,6 +213,40 @@ mod tests {
         crate::config::input::from_str(config, "hello", None)
     }
 
+    fn provider_switch_context() -> TurnContext {
+        let clients = ["claude", "gemini"]
+            .into_iter()
+            .map(|provider| {
+                let yaml = format!("type: {provider}\napi_key: test-key\n");
+                let mut client: ClientConfig = serde_yaml::from_str(&yaml).unwrap();
+                client.set_name(provider.to_string());
+                client
+            })
+            .collect();
+        TurnContext {
+            default_model_id: "claude:claude-sonnet".to_string(),
+            clients,
+            model_cooldowns: Arc::new(parking_lot::Mutex::new(Default::default())),
+            warn_fn: Arc::new(|_| {}),
+            event_fn: Arc::new(|_| {}),
+            init_client_fn: Arc::new(|_, model| {
+                Ok(Box::new(MockClient::builder().model(model.clone()).build()))
+            }),
+            select_model_fn: Arc::new(|input, model| input.agent_mut().set_model(model.clone())),
+        }
+    }
+
+    fn provider_switch_input(config: &GlobalConfig) -> Input {
+        let mut agent = harnx_core::agent_config::AgentConfig::from_markdown(
+            "provider-switch-test",
+            "---\nretry:\n  attempts: 1\n  initial_delay_ms: 0\n  max_delay_ms: 0\n---\ntest",
+        )
+        .unwrap();
+        agent.set_model(Model::new("claude", "claude-sonnet"));
+        agent.set_model_fallbacks(vec!["gemini:gemini-2.5-pro".to_string()]);
+        crate::config::input::from_str(config, "continue", Some(crate::config::Agent::new(agent)))
+    }
+
     /// Test-support wrapper around the engine's inner retry loop that
     /// builds a `TurnContext` from `GlobalConfig` so test code can keep
     /// its existing `&GlobalConfig` calling style. Uses the same
@@ -602,5 +636,180 @@ mod tests {
                 .is_on_cooldown("nonexistent-client:bogus-model"),
             "Invalid fallback model should be on cooldown"
         );
+    }
+
+    fn provider_switch_history() -> Arc<Vec<harnx_core::message::Message>> {
+        use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+        use harnx_core::tool::{ReasoningProtocol, ReasoningProvenance, ToolResult};
+
+        let call = ToolCall::new(
+            "ClaudeTool".to_string(),
+            serde_json::json!({}),
+            Some("toolu_claude".to_string()),
+            Some("claude-signature".to_string()),
+        )
+        .with_provenance(Some(ReasoningProvenance {
+            protocol: ReasoningProtocol::AnthropicThinking,
+            model: Some("claude-sonnet".to_string()),
+        }));
+        Arc::new(vec![
+            Message::new(MessageRole::User, MessageContent::Text("run".into())),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![ToolResult::new(call, serde_json::json!({"ok": true}))],
+                    String::new(),
+                    Some("claude thought".to_string()),
+                )),
+            ),
+        ])
+    }
+
+    fn build_provider_switch_body(
+        client: &dyn Client,
+        messages: Vec<harnx_core::message::Message>,
+    ) -> Result<serde_json::Value> {
+        use harnx_core::api_types::ChatCompletionsData;
+        use std::collections::HashMap;
+
+        let data = ChatCompletionsData {
+            messages,
+            temperature: None,
+            top_p: None,
+            functions: None,
+            stream: false,
+            attachments_dir: None,
+        };
+        match client.model().client_name() {
+            "claude" => harnx_client::claude::claude_build_chat_completions_body(
+                data,
+                client.model(),
+                &HashMap::new(),
+            ),
+            "gemini" => harnx_client::vertexai::gemini_build_chat_completions_body(
+                data,
+                client.model(),
+                HashMap::new(),
+            ),
+            other => anyhow::bail!("unexpected provider {other}"),
+        }
+    }
+
+    type RetryResult = Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)>;
+    type BuiltBodies = Arc<parking_lot::Mutex<Vec<(String, serde_json::Value)>>>;
+
+    async fn run_rate_limit_fallback(input: &mut Input) -> (RetryResult, BuiltBodies) {
+        let history = provider_switch_history();
+        let built_bodies: BuiltBodies = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let closure_bodies = built_bodies.clone();
+        let result = harnx_engine::retry::call_with_retry_and_fallback_custom(
+            input,
+            &provider_switch_context(),
+            create_abort_signal(),
+            move |_, client, _| {
+                let history = history.clone();
+                let built_bodies = closure_bodies.clone();
+                Box::pin(async move {
+                    let provider = client.model().client_name().to_string();
+                    let body = build_provider_switch_body(client, history.as_ref().clone())?;
+                    built_bodies.lock().push((provider.clone(), body));
+                    if provider == "claude" {
+                        Err(LlmError {
+                            status: 429,
+                            message: "rate limited".to_string(),
+                            retry_after: None,
+                        }
+                        .into())
+                    } else {
+                        Ok((
+                            "ok".to_string(),
+                            None,
+                            Vec::new(),
+                            CompletionTokenUsage::default(),
+                        ))
+                    }
+                })
+            },
+        )
+        .await;
+        (result, built_bodies)
+    }
+    #[tokio::test]
+    async fn rate_limit_fallback_builds_import_handled_body_with_nonempty_history() {
+        let config = make_config();
+        let mut input = provider_switch_input(&config);
+        let (result, built_bodies) = run_rate_limit_fallback(&mut input).await;
+        assert!(result.is_ok());
+
+        let bodies = built_bodies.lock();
+        assert_eq!(bodies.len(), 2);
+        let primary = &bodies[0].1;
+        assert!(primary.to_string().contains("claude-signature"));
+        let fallback = &bodies[1].1;
+        assert_eq!(bodies[1].0, "gemini");
+        assert!(!fallback.to_string().contains("claude-signature"));
+        assert!(!fallback.to_string().contains("claude thought"));
+        let function_call = fallback["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|content| content["parts"].as_array().unwrap())
+            .find(|part| part["functionCall"].is_object())
+            .unwrap();
+        assert_eq!(
+            function_call["thoughtSignature"],
+            harnx_client::vertexai::GEMINI_IMPORTED_HISTORY_PLACEHOLDER
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_bad_request_stops_before_fallback_builder() {
+        use harnx_core::api_types::ChatCompletionsData;
+        use harnx_core::message::{Message, MessageContent, MessageRole};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let config = make_config();
+        let mut input = provider_switch_input(&config);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let closure_attempts = attempts.clone();
+        let result = harnx_engine::retry::call_with_retry_and_fallback_custom(
+            &mut input,
+            &provider_switch_context(),
+            create_abort_signal(),
+            move |_, client, _| {
+                let attempts = closure_attempts.clone();
+                Box::pin(async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let data = ChatCompletionsData {
+                        messages: vec![Message::new(
+                            MessageRole::User,
+                            MessageContent::Text("request".into()),
+                        )],
+                        temperature: None,
+                        top_p: None,
+                        functions: None,
+                        stream: false,
+                        attachments_dir: None,
+                    };
+                    let _body = harnx_client::claude::claude_build_chat_completions_body(
+                        data,
+                        client.model(),
+                        &HashMap::new(),
+                    )?;
+                    Err(LlmError {
+                        status: 400,
+                        message: "unrelated malformed parameter".to_string(),
+                        retry_after: None,
+                    }
+                    .into())
+                })
+            },
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert_eq!(find_llm_error(&error).unwrap().status, 400);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(input.agent().model().client_name(), "claude");
     }
 }

@@ -175,12 +175,12 @@ async fn after_chat_completion_saves_intermediate_tool_rounds() {
     let input = crate::config::input::from_str(&global_config, "do something", None);
 
     let tool_results = vec![ToolResult::new(
-        ToolCall {
-            name: "my_tool".to_string(),
-            arguments: json!({"key": "val"}),
-            id: Some("tc1".to_string()),
-            thought_signature: None,
-        },
+        ToolCall::new(
+            "my_tool".to_string(),
+            json!({"key": "val"}),
+            Some("tc1".to_string()),
+            None,
+        ),
         json!("tool output"),
     )];
 
