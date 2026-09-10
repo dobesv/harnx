@@ -1,6 +1,11 @@
 ---
 role: compaction
 model: gemini:gemini-3.5-flash-lite
+model_fallbacks:
+- codex:gpt-5.6-luna
+- openai:gpt-5.6-luna
+- claude:claude-sonnet-5
+- bedrock:zai.glm-4.7-flash
 version: '0.3.4'
 ---
 You are summarizing a conversation between a user and an AI deployment verification agent that assesses deployment readiness and produces Go/No-Go checklists for pull requests.

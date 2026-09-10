@@ -1,0 +1,4 @@
+type: codex
+# Uses the ChatGPT subscription credentials written by `codex login`.
+# Defaults to ~/.codex/auth.json; override auth_file in a package patch if needed.
+# The matching openai fallback uses OPENAI_API_KEY instead.

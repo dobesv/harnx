@@ -8,8 +8,8 @@ multi-agent orchestration overhead.
 
 | Agent | Model | Role |
 |-------|-------|------|
-| `coder` | claude-sonnet-4-6 | Main coding assistant |
-| `compact-coder` | gpt-4.1-mini | Context compaction for long sessions |
+| `coder` | claude-sonnet-5 | Main coding assistant |
+| `compact-coder` | gemini-3.5-flash-lite | Context compaction for long sessions |
 
 ## Quick start
 
@@ -19,11 +19,16 @@ Install from GHCR (replace `v0.1.0` with the current release):
 harnx-pkg add ghcr.io/dobesv/harnx-packages/coding v0.3.4
 ```
 
-Set your API keys in `~/.local/share/harnx/.env`:
+Use harnx 0.34.0 or a development build containing the package model updates.
+Configure any one of Gemini, Claude, Codex, OpenAI API, or Bedrock; both agents
+have fallbacks for every provider. For a ChatGPT subscription, run `codex login`.
+For API-key access, set the applicable key in `~/.local/share/harnx/.env`:
 
 ```sh
 CLAUDE_API_KEY=sk-ant-...
-OPENAI_API_KEY=sk-...    # for fallback and compaction
+OPENAI_API_KEY=sk-...
+GEMINI_API_KEY=AIza...
+BEDROCK_API_KEY=...     # Amazon Bedrock API key
 ```
 
 Run the coder:
@@ -31,6 +36,31 @@ Run the coder:
 ```sh
 harnx coder
 ```
+
+## Model fallbacks
+
+Both chains prefer Codex subscription access immediately before the equivalent
+OpenAI API model:
+
+| Agent | Ordered model chain |
+|-------|---------------------|
+| `coder` | Sonnet 5 → Codex Terra → OpenAI Terra → Gemini 3.8 Flash → Bedrock GLM 5 |
+| `compact-coder` | Gemini 3.5 Flash-Lite → Codex Luna → OpenAI Luna → Sonnet 5 → Bedrock GLM 4.7 Flash |
+
+Terra balances everyday coding cost and quality; Luna and Flash-Lite keep
+compaction inexpensive. Sonnet 5 is the Claude compaction fallback because its
+1M context window can summarize long coding sessions. Opus overrides should
+remain pinned to 4.8; newer Opus versions are deliberately excluded.
+
+The five `clients/*.yaml` files inherit model metadata from harnx's shared
+catalog. The Bedrock client uses the OpenAI-compatible endpoint in `us-east-1`
+and an API key, not the AWS SigV4 credential chain. Region, model entitlement,
+context limits, and subscription quotas still apply. Fallback handles missing
+credentials, authentication errors, and exhausted retries; request errors such
+as HTTP 400/404 stop the turn.
+
+For the dated selection rationale and provider sources, see the
+[Pantheon model policy](https://github.com/dobesv/harnx/blob/main/packages/pantheon/MODELS.md).
 
 ## What the coder can do
 
@@ -51,8 +81,8 @@ update), use a patch file placed next to the installed package directory:
 
 ```yaml
 agents:
-  - 'if .name == "coder" then .model = "openai:gpt-4.1" end'
-  - 'if .name == "compact-coder" then .model = "gemini:gemini-2.5-flash" end'
+  - 'if .name == "coder" then .model = "codex:gpt-5.6-terra" end'
+  - 'if .name == "compact-coder" then .model = "gemini:gemini-3.5-flash-lite" end'
 ```
 
 To use Claude Opus for harder problems:

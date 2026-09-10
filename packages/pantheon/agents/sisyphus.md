@@ -1,9 +1,12 @@
 ---
 role: assistant
 model: claude:claude-opus-4-8
-compaction_agent: compact-dev
 model_fallbacks:
-- openai:gpt-5.4
+- codex:gpt-5.6-sol
+- openai:gpt-5.6-sol
+- gemini:gemini-3.8-flash
+- bedrock:zai.glm-5
+compaction_agent: compact-dev
 use_tools:
 - bash_exec
 - bash_read_exec_log

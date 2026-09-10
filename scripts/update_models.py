@@ -426,7 +426,7 @@ def provider_prefix_and_model_name(
 
 
 def is_valid_bedrock_model_name(model_name: str) -> bool:
-    if not model_name.startswith("us."):
+    if not model_name.startswith(("us.", "zai.", "minimax.")):
         return False
     if "/" in model_name:
         return False
