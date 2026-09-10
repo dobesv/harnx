@@ -1,11 +1,99 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useMemo, useContext, useRef } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { SubAgentNote } from './subAgentNotes';
+import { HarnxHttpAgent } from './ChatProvider';
+import { SubAgentNotesContext } from './SubAgentNotesContext';
 
 export interface SubAgentSessionNotesProps {
   notes: SubAgentNote[];
   onOpen: (agent: string, sessionId: string) => void;
 }
+
+import { useAgUiRuntime } from '@assistant-ui/react-ag-ui';
+import { AssistantRuntimeProvider } from '@assistant-ui/react';
+import { RuntimeSessionSubscriber } from './RuntimeSessionSubscriber';
+
+function ChildMetricsSubscriber({ note, dispatch }: { note: SubAgentNote, dispatch: (event: unknown) => void }) {
+  const noteRef = useRef(note);
+  const dispatchRef = useRef(dispatch);
+  const toolCallCountRef = useRef(note.toolCallCount || 0);
+
+  useEffect(() => {
+    noteRef.current = note;
+    dispatchRef.current = dispatch;
+    if (note.toolCallCount > toolCallCountRef.current) {
+      toolCallCountRef.current = note.toolCallCount;
+    }
+  }, [note, dispatch]);
+
+  const agent = useMemo(() => {
+    return new HarnxHttpAgent({
+      url: `/v1/agents/${encodeURIComponent(note.agent)}/sessions/${encodeURIComponent(note.sessionId)}`,
+      onStatus: () => {},
+      onRunFailed: () => {},
+      onUsage: (usage) => {
+        const currentNote = noteRef.current;
+        const elapsed = currentNote.startedAtMs
+          ? Math.max(0, Date.now() - currentNote.startedAtMs)
+          : currentNote.elapsedMs + Math.max(0, Date.now() - currentNote.updatedAtMs);
+
+        dispatchRef.current({
+          type: 'CUSTOM',
+          name: 'sub_agent_progress',
+          value: {
+            invocation_id: currentNote.invocationId,
+            tool_call_id: currentNote.toolCallId,
+            agent: currentNote.agent,
+            session_id: currentNote.sessionId,
+            started_at: currentNote.startedAtMs,
+            elapsed_ms: elapsed,
+            tool_call_count: toolCallCountRef.current,
+            status: currentNote.status,
+            usage: {
+              input_tokens: usage.input,
+              output_tokens: usage.output,
+              cached_tokens: usage.cached ?? 0,
+            }
+          }
+        });
+      },
+      onToolSummary: () => {
+        toolCallCountRef.current++;
+      },
+      onSubAgentEvent: (event: any) => {
+        if (event?.type === 'RUN_FINISHED' || event?.type === 'RUN_ERROR') {
+          const now = Date.now();
+          const graceMs = 5000;
+          const currentNote = noteRef.current;
+          if (currentNote.startedAtMs && (now - currentNote.startedAtMs < graceMs)) {
+            return; // within grace period
+          }
+          
+          const isError = event.type === 'RUN_ERROR' || event.result?.status === 'failed';
+
+          dispatchRef.current({
+            type: 'CHILD_TERMINAL',
+            invocationId: currentNote.invocationId,
+            toolCallId: currentNote.toolCallId,
+            status: isError ? 'failed' : 'done',
+          });
+        }
+      },
+    });
+  }, [note.agent, note.sessionId]);
+
+  const runtime = useAgUiRuntime({ agent });
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <RuntimeSessionSubscriber
+        enabled={true}
+        eventsUrl={`/v1/agents/${encodeURIComponent(note.agent)}/sessions/${encodeURIComponent(note.sessionId)}/events`}
+      />
+    </AssistantRuntimeProvider>
+  );
+}
+
 
 const STATUS_LABEL = {
   running: 'Running',
@@ -24,9 +112,12 @@ function activateOnKey(
 }
 
 function elapsedMs(note: SubAgentNote, nowMs: number) {
-  return note.status === 'running'
-    ? note.elapsedMs + Math.max(0, nowMs - note.updatedAtMs)
-    : note.elapsedMs;
+  if (note.status !== 'running') {
+    return note.elapsedMs;
+  }
+  return note.startedAtMs
+    ? Math.max(0, nowMs - note.startedAtMs)
+    : note.elapsedMs + Math.max(0, nowMs - note.updatedAtMs);
 }
 
 function formatElapsed(value: number) {
@@ -39,6 +130,7 @@ function formatTokens(value: number) {
 }
 
 export function SubAgentSessionNotes({ notes, onOpen }: SubAgentSessionNotesProps) {
+  const { dispatch } = useContext(SubAgentNotesContext);
   const [clockMs, setClockMs] = useState(0);
   const hasRunning = notes.some((note) => note.status === 'running');
   useEffect(() => {
@@ -84,6 +176,9 @@ export function SubAgentSessionNotes({ notes, onOpen }: SubAgentSessionNotesProp
               <span className="aui-sub-agent-status-icon" aria-hidden="true" />
               {statusLabel}
             </span>
+            {note.status === 'running' && (
+              <ChildMetricsSubscriber note={note} dispatch={dispatch} />
+            )}
           </button>
         );
       })}

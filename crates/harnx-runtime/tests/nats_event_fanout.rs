@@ -179,6 +179,7 @@ async fn attached_stream_refreshes_delayed_turn_end() -> Result<()> {
         through_seq: user_seq,
         fence_token: 1,
         timestamp: None,
+        usage: None,
     })?;
 
     assert!(stream.refresh_history().await?);
@@ -463,6 +464,7 @@ async fn control_event_flush_preserves_fifo_delivery() -> Result<()> {
     sink.emit_required(AgentEvent::Session(SessionEvent::HandoffCommitted {
         agent: "atlas".into(),
         session_id: "atlas-session".into(),
+        handoff_tool_call_id: Some("call-test-fanout".into()),
     }));
     sink.flush().await?;
 
@@ -479,7 +481,7 @@ async fn control_event_flush_preserves_fifo_delivery() -> Result<()> {
     ));
     assert!(matches!(
         &received[1],
-        AgentEvent::Session(SessionEvent::HandoffCommitted { agent, session_id })
+        AgentEvent::Session(SessionEvent::HandoffCommitted { agent, session_id, .. })
             if agent == "atlas" && session_id == "atlas-session"
     ));
     Ok(())

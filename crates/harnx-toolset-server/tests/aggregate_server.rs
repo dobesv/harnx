@@ -125,6 +125,7 @@ async fn invoke_named(client: &async_nats::Client, scope: &ServerScope, name: &s
         tool: "echo".to_string(),
         args: json!({"server": name}),
         parent_session_id: Some("session-1".to_string()),
+        tool_call_id: None,
         capabilities: Default::default(),
     };
     let message = client

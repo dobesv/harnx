@@ -36,6 +36,10 @@ pub struct SwitchAgentData {
     pub prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The tool call ID that triggered this handoff.
+    /// Used as marker identity for deduplication between live and hydrated events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ToolResult {
@@ -131,6 +135,19 @@ pub trait ToolProvider: Send + Sync {
         arguments: Value,
         abort: &AbortSignal,
     ) -> Result<ToolProviderOutput, ToolError>;
+
+    /// Dispatches a tool with its parent model tool-call ID. Providers that
+    /// don't need call identity can use the default `call_tool` path.
+    async fn call_tool_with_id(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        tool_call_id: Option<&str>,
+        abort: &AbortSignal,
+    ) -> Result<ToolProviderOutput, ToolError> {
+        let _ = tool_call_id;
+        self.call_tool(tool_name, arguments, abort).await
+    }
 }
 
 #[derive(Debug, Clone, Default)]

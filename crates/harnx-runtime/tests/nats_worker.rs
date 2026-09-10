@@ -1831,8 +1831,8 @@ fn injection_decision_points_use_leader_authoritative_read() {
             .lines()
             .filter(|line| line.contains("load_events_latest_async()"))
             .count(),
-        3,
-        "the daemon family's turn-decision logic must use load_events_latest_async at exactly 3 decision points"
+        4,
+        "the daemon family's turn and HITL decision logic must use load_events_latest_async at exactly 4 decision points"
     );
     assert_eq!(
         daemon_family

@@ -19,6 +19,7 @@ pub(super) struct HandoffRequest {
     pub(super) agent: String,
     pub(super) session_id: Option<String>,
     pub(super) prompt: String,
+    pub(super) handoff_tool_call_id: Option<String>,
 }
 
 impl SessionActor {
@@ -31,6 +32,7 @@ impl SessionActor {
             agent,
             session_id,
             prompt,
+            handoff_tool_call_id,
         } = request;
         let target_session_id = match self.resolve_handoff_session_id(&agent, session_id).await {
             Ok(session_id) => session_id,
@@ -49,7 +51,7 @@ impl SessionActor {
             self.fail_handoff(done, error);
             return;
         }
-        self.commit_handoff(done, agent, target_session_id);
+        self.commit_handoff(done, agent, target_session_id, handoff_tool_call_id);
     }
 
     async fn resolve_handoff_session_id(
@@ -97,11 +99,18 @@ impl SessionActor {
         wait_for_handoff_ack(reply_rx, target_key, HANDOFF_ACK_TIMEOUT).await
     }
 
-    fn commit_handoff(&mut self, done: &RunFinished, agent: String, session_id: String) {
+    fn commit_handoff(
+        &mut self,
+        done: &RunFinished,
+        agent: String,
+        session_id: String,
+        handoff_tool_call_id: Option<String>,
+    ) {
         done.sink
             .emit(AgentEvent::Session(SessionEvent::HandoffCommitted {
                 agent,
                 session_id,
+                handoff_tool_call_id,
             }));
         self.finish_run(done, None);
         self.state = SessionState::Idle;

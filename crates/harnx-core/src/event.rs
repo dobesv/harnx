@@ -155,6 +155,8 @@ pub enum SessionEvent {
     HandoffCommitted {
         agent: String,
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handoff_tool_call_id: Option<String>,
     },
     Saved {
         path: PathBuf,

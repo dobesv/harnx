@@ -214,6 +214,7 @@ async fn reap_predicate_rejects_buffered_mailbox_commands() {
     let (tx, rx) = mpsc::channel(COMMAND_BUFFER);
     let (broadcast_tx, _) = broadcast::channel(BROADCAST_BUFFER);
     let (run_done_tx, run_done_rx) = mpsc::channel(COMMAND_BUFFER);
+    let (hitl_approval_done_tx, hitl_approval_done_rx) = mpsc::channel(COMMAND_BUFFER);
     tx.send(SessionCommand::Unsubscribe)
         .await
         .expect("buffer command");
@@ -229,11 +230,16 @@ async fn reap_predicate_rejects_buffered_mailbox_commands() {
         active_run: None,
         run_done_tx,
         run_done_rx,
+        hitl_approval_done_tx,
+        hitl_approval_done_rx,
         run_done_task: None,
         reap_ttl: Duration::from_millis(50),
         reap_deadline: Some(Instant::now() - Duration::from_millis(1)),
         history_snapshot: Vec::new(),
         history_warnings: Vec::new(),
+        log_entries: None,
+        tokens_usage: None,
+        session_base: None,
         actor_config: SessionActorConfig {
             base_config: Config::default(),
             call_fn: Some(noop_call_fn()),

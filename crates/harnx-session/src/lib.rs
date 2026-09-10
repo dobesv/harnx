@@ -36,6 +36,7 @@ pub fn build_context(
         usage_at_start: Default::default(),
         call_fn,
         on_tool_round,
+        on_hitl_approval_required: None,
         on_text_response: None,
         initial_with_embeddings: true,
         initial_resume_count: 0,

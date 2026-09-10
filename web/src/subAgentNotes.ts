@@ -3,6 +3,7 @@ export type SubAgentNoteStatus = 'running' | 'done' | 'failed';
 export interface SubAgentNote {
   id: string;
   invocationId?: string;
+  toolCallId?: string;
   agent: string;
   sessionId: string;
   parentMessageId: string;
@@ -13,17 +14,20 @@ export interface SubAgentNote {
   cachedTokens: number;
   toolCallCount: number;
   updatedAtMs: number;
+  startedAtMs?: number;
 }
 
 export interface SubAgentNotesState {
   notes: SubAgentNote[];
   latestParentMessageId: string | null;
+  parentByToolCall: Map<string, string>;
   nextId: number;
 }
 
 export const INITIAL_SUB_AGENT_NOTES_STATE: SubAgentNotesState = {
   notes: [],
   latestParentMessageId: null,
+  parentByToolCall: new Map(),
   nextId: 0,
 };
 
@@ -33,6 +37,8 @@ interface SubAgentIdentity {
   agent: string;
   sessionId: string;
   invocationId?: string;
+  toolCallId?: string;
+  startedAtMs?: number;
 }
 
 interface SubAgentProgressValue extends SubAgentIdentity {
@@ -84,15 +90,27 @@ function subAgentIdentity(
   agentValue: unknown,
   sessionIdValue: unknown,
   invocationIdValue?: unknown,
+  toolCallIdValue?: unknown,
+  startedAtValue?: unknown,
 ): SubAgentIdentity | undefined {
   const agent = nonBlankString(agentValue);
   if (!agent) return undefined;
   const sessionId = nonBlankString(sessionIdValue);
   if (!sessionId) return undefined;
+  
+  const startedAtString = nonBlankString(startedAtValue);
+  const startedAtMs = typeof startedAtValue === 'number' && Number.isFinite(startedAtValue)
+    ? startedAtValue
+    : startedAtString
+      ? new Date(startedAtString).getTime()
+      : undefined;
+
   return {
     agent,
     sessionId,
     invocationId: nonBlankString(invocationIdValue),
+    toolCallId: nonBlankString(toolCallIdValue),
+    startedAtMs: startedAtMs && !isNaN(startedAtMs) ? startedAtMs : undefined,
   };
 }
 
@@ -128,6 +146,8 @@ function subAgentProgress(value: unknown): SubAgentProgressValue | undefined {
     progress.agent,
     progress.session_id,
     progress.invocation_id,
+    progress.tool_call_id,
+    progress.started_at ?? progress.started_at_ms,
   );
   if (!identity?.invocationId) return undefined;
   const status = progressStatus(progress.status);
@@ -195,6 +215,7 @@ function snapshotNote(
   return {
     id: `snapshot:${context.parentMessageId}:${context.callId}`,
     invocationId: progress?.invocationId,
+    toolCallId: context.callId,
     agent: marker.agent,
     sessionId: marker.sessionId,
     parentMessageId: context.parentMessageId,
@@ -231,18 +252,24 @@ function uniqueNotes(notes: SubAgentNote[]): SubAgentNote[] {
   return [...byId.values()];
 }
 
-function notesFromSnapshot(messages: unknown): SubAgentNote[] {
+function notesFromSnapshot(messages: unknown): { notes: SubAgentNote[]; parentByToolCall: Map<string, string> } {
   const entries = eventRecords(messages);
   const parentByToolCall = new Map(entries.flatMap(parentEntries));
   const notes = entries.flatMap((message) => (
     optionalNote(snapshotNote(message, parentByToolCall))
   ));
-  return uniqueNotes(notes);
+  return { notes: uniqueNotes(notes), parentByToolCall };
 }
 
 function startedIdentity(value: unknown): SubAgentIdentity | undefined {
   const marker = record(value);
-  return subAgentIdentity(marker?.agent, marker?.session_id, marker?.invocation_id);
+  return subAgentIdentity(
+    marker?.agent,
+    marker?.session_id,
+    marker?.invocation_id,
+    marker?.tool_call_id,
+    marker?.started_at
+  );
 }
 
 function sameIdentity(note: SubAgentNote, identity: SubAgentIdentity): boolean {
@@ -256,7 +283,8 @@ function isDuplicateNote(
   parentMessageId: string,
 ): boolean {
   if (note.parentMessageId !== parentMessageId) return false;
-  if (identity.invocationId) return note.invocationId === identity.invocationId;
+  if (identity.toolCallId && note.toolCallId === identity.toolCallId) return true;
+  if (identity.invocationId && note.invocationId === identity.invocationId) return true;
   if (note.status !== 'running') return false;
   return sameIdentity(note, identity);
 }
@@ -279,6 +307,7 @@ function runningNote(
   return {
     id: identity.invocationId ? `live:${identity.invocationId}` : `live:${state.nextId}`,
     invocationId: identity.invocationId,
+    toolCallId: identity.toolCallId,
     agent: identity.agent,
     sessionId: identity.sessionId,
     parentMessageId,
@@ -289,13 +318,14 @@ function runningNote(
     cachedTokens: 0,
     toolCallCount: 0,
     updatedAtMs: Date.now(),
+    startedAtMs: identity.startedAtMs,
   };
 }
 
 function startNote(state: SubAgentNotesState, value: unknown): SubAgentNotesState {
   const identity = startedIdentity(value);
   if (!identity) return state;
-  const parentMessageId = state.latestParentMessageId;
+  const parentMessageId = state.latestParentMessageId ?? (identity.toolCallId ? state.parentByToolCall.get(identity.toolCallId) : null);
   if (!parentMessageId) return state;
   if (hasDuplicateNote(state, identity, parentMessageId)) return state;
 
@@ -306,11 +336,10 @@ function startNote(state: SubAgentNotesState, value: unknown): SubAgentNotesStat
   };
 }
 
-function isMatchingRunningNote(
+function isMatchingNote(
   note: SubAgentNote,
   identity: SubAgentIdentity,
 ): boolean {
-  if (note.status !== 'running') return false;
   if (identity.invocationId) return note.invocationId === identity.invocationId;
   return sameIdentity(note, identity);
 }
@@ -318,10 +347,12 @@ function isMatchingRunningNote(
 function noteFromProgress(
   progress: SubAgentProgressValue,
   parentMessageId: string,
+  existingNote?: SubAgentNote,
 ): SubAgentNote {
   return {
-    id: `live:${progress.invocationId}`,
+    id: existingNote?.id ?? `live:${progress.invocationId}`,
     invocationId: progress.invocationId,
+    toolCallId: progress.toolCallId ?? existingNote?.toolCallId,
     agent: progress.agent,
     sessionId: progress.sessionId,
     parentMessageId,
@@ -332,6 +363,7 @@ function noteFromProgress(
     cachedTokens: progress.cachedTokens,
     toolCallCount: progress.toolCallCount,
     updatedAtMs: Date.now(),
+    startedAtMs: progress.startedAtMs ?? existingNote?.startedAtMs,
   };
 }
 
@@ -343,12 +375,14 @@ function applyProgress(
   if (!progress) return state;
   const index = state.notes.findIndex((note) => note.invocationId === progress.invocationId);
   if (index >= 0) {
-    if (state.notes[index].status !== 'running') return state;
+    if (state.notes[index].status !== 'running' && progress.status !== 'done') {
+      return state;
+    }
     return {
       ...state,
       notes: state.notes.map((note, noteIndex) => (
         noteIndex === index
-          ? { ...note, ...noteFromProgress(progress, note.parentMessageId), id: note.id }
+          ? noteFromProgress(progress, note.parentMessageId, note)
           : note
       )),
     };
@@ -381,7 +415,7 @@ function completeNote(state: SubAgentNotesState, content: unknown): SubAgentNote
   if (!marker) return state;
 
   const index = state.notes.findLastIndex((note) => (
-    isMatchingRunningNote(note, marker)
+    isMatchingNote(note, marker)
   ));
   if (index < 0) return state;
 
@@ -395,12 +429,14 @@ function completeNote(state: SubAgentNotesState, content: unknown): SubAgentNote
 
 function freezeNote(note: SubAgentNote, status: Exclude<SubAgentNoteStatus, 'running'>): SubAgentNote {
   const localElapsed = note.status === 'running'
-    ? Math.max(0, Date.now() - note.updatedAtMs)
-    : 0;
+    ? (note.startedAtMs
+        ? Math.max(0, Date.now() - note.startedAtMs)
+        : note.elapsedMs + Math.max(0, Date.now() - note.updatedAtMs))
+    : note.elapsedMs;
   return {
     ...note,
     status,
-    elapsedMs: note.elapsedMs + localElapsed,
+    elapsedMs: localElapsed,
     updatedAtMs: Date.now(),
   };
 }
@@ -462,12 +498,36 @@ function restoreSnapshot(
   _state: SubAgentNotesState,
   event: EventRecord,
 ): SubAgentNotesState {
-  const notes = notesFromSnapshot(event.messages);
+  const { notes, parentByToolCall } = notesFromSnapshot(event.messages);
   return {
     notes,
     latestParentMessageId: null,
+    parentByToolCall,
     nextId: notes.length,
   };
+}
+
+function childTerminal(state: SubAgentNotesState, event: EventRecord): SubAgentNotesState {
+  const invocationId = event.invocationId as string | undefined;
+  const toolCallId = event.toolCallId as string | undefined;
+  
+  let targetIndex = -1;
+  if (invocationId) {
+    targetIndex = state.notes.findIndex((n) => n.invocationId === invocationId && n.status === 'running');
+  }
+  if (targetIndex === -1 && toolCallId) {
+    targetIndex = state.notes.findIndex((n) => n.toolCallId === toolCallId && n.status === 'running');
+  }
+
+  if (targetIndex === -1) return state;
+
+  const terminalStatus: Exclude<SubAgentNoteStatus, 'running'> =
+    event.status === 'failed' ? 'failed' : 'done';
+
+  const newNotes = [...state.notes];
+  newNotes[targetIndex] = freezeNote(newNotes[targetIndex], terminalStatus);
+
+  return { ...state, notes: newNotes };
 }
 
 const EVENT_REDUCERS: Record<string, EventReducer> = {
@@ -479,6 +539,7 @@ const EVENT_REDUCERS: Record<string, EventReducer> = {
   MESSAGES_SNAPSHOT: restoreSnapshot,
   RUN_FINISHED: failUnresolvedNotes,
   RUN_ERROR: failUnresolvedNotes,
+  CHILD_TERMINAL: childTerminal,
 };
 
 export function reduceSubAgentNotes(

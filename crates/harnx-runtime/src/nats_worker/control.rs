@@ -26,6 +26,12 @@ pub enum ControlCommand {
     /// Worker-originated: carries the fence token for tombstone.
     /// The worker appends a Cancel entry BEFORE firing the AbortSignal.
     Cancel,
+    /// Resolve one durable pending tool approval.
+    HitlApprovalDecision {
+        tool_call_id: String,
+        approved: bool,
+        note: Option<String>,
+    },
 }
 
 impl ControlCommand {
@@ -40,36 +46,64 @@ impl ControlCommand {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AppliedHitlDecision {
+    pub tool_call_id: String,
+    pub approved: bool,
+    pub note: Option<String>,
+}
 pub(super) struct SessionControlHandler {
     client: async_nats::Client,
+    jetstream: async_nats::jetstream::Context,
+    session_id: String,
     lease: Arc<NatsSessionLease>,
     backend: NatsSessionLogBackend,
     abort_signal: crate::utils::AbortSignal,
+    hitl_decision_tx: tokio::sync::mpsc::UnboundedSender<AppliedHitlDecision>,
 }
 
 impl SessionControlHandler {
     pub(super) fn new(
         client: &async_nats::Client,
+        jetstream: &async_nats::jetstream::Context,
+        session_id: &str,
         lease: &Arc<NatsSessionLease>,
         backend: &NatsSessionLogBackend,
         abort_signal: &crate::utils::AbortSignal,
+        hitl_decision_tx: tokio::sync::mpsc::UnboundedSender<AppliedHitlDecision>,
     ) -> Self {
         Self {
             client: client.clone(),
+            jetstream: jetstream.clone(),
+            session_id: session_id.to_string(),
             lease: Arc::clone(lease),
             backend: backend.clone(),
             abort_signal: abort_signal.clone(),
+            hitl_decision_tx,
         }
     }
 
     pub(super) async fn listen(self, mut subscriber: async_nats::Subscriber) {
         use futures_util::StreamExt;
         while let Some(message) = subscriber.next().await {
-            let Ok(ControlCommand::Cancel) = ControlCommand::from_bytes(&message.payload) else {
-                log::debug!("invalid control command payload, ignoring");
-                continue;
+            let command = match ControlCommand::from_bytes(&message.payload) {
+                Ok(command) => command,
+                Err(error) => {
+                    log::debug!("invalid control command payload, ignoring: {error}");
+                    continue;
+                }
             };
-            self.cancel(message.reply).await;
+            match command {
+                ControlCommand::Cancel => self.cancel(message.reply).await,
+                ControlCommand::HitlApprovalDecision {
+                    tool_call_id,
+                    approved,
+                    note,
+                } => {
+                    self.apply_hitl_decision(tool_call_id, approved, note, message.reply)
+                        .await;
+                }
+            }
         }
     }
 
@@ -81,6 +115,93 @@ impl SessionControlHandler {
         self.abort_signal.set_ctrlc();
     }
 
+    async fn apply_hitl_decision(
+        &self,
+        tool_call_id: String,
+        approved: bool,
+        note: Option<String>,
+        reply: Option<async_nats::Subject>,
+    ) {
+        if !should_append_control_log_entry(&self.lease) {
+            return;
+        }
+        let entries = match self.backend.load_events_latest_async().await {
+            Ok(entries) => entries,
+            Err(error) => {
+                log::warn!("failed to load pending HITL approvals: {error:#}");
+                return;
+            }
+        };
+        let pending = match super::agent_loop::derive_pending_hitl_approvals(&entries) {
+            Ok(pending) => pending,
+            Err(error) => {
+                log::warn!("failed to derive pending HITL approvals: {error:#}");
+                return;
+            }
+        };
+        if !pending
+            .iter()
+            .any(|approval| approval.tool_call_id == tool_call_id)
+        {
+            return;
+        }
+        if !self.lease.is_held() {
+            return;
+        }
+        let entry = harnx_core::session::SessionLogEntry::HitlApprovalDecision {
+            tool_call_id: tool_call_id.clone(),
+            approved,
+            note: note.clone(),
+            fence_token: self.lease.fence_token(),
+        };
+        let expected_last_sequence = entries.last().map_or(0, |(seq, _)| *seq);
+        let sink = super::backend::FencedSessionLogSink::new(
+            self.backend.clone(),
+            Arc::clone(&self.lease),
+        );
+        match sink
+            .append_hitl_event_cas(&entry, expected_last_sequence)
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                match self.backend.load_events_latest_async().await {
+                    Ok(reloaded) => {
+                        if let Err(error) =
+                            super::agent_loop::derive_pending_hitl_approvals(&reloaded)
+                        {
+                            log::warn!(
+                                "failed to re-derive HITL approvals after decision CAS loss: {error:#}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "failed to reload HITL approvals after decision CAS loss: {error:#}"
+                        );
+                    }
+                }
+                return;
+            }
+            Err(error) => {
+                log::warn!("failed to append HITL approval decision: {error:#}");
+                return;
+            }
+        }
+        let event_sink = crate::nats_event_sink::NatsEventSink::new(
+            self.client.clone(),
+            self.jetstream.clone(),
+            self.session_id.clone(),
+        )
+        .await;
+        event_sink.publish_session_updated();
+        let _ = self.hitl_decision_tx.send(AppliedHitlDecision {
+            tool_call_id,
+            approved,
+            note,
+        });
+        self.acknowledge(reply).await;
+    }
     fn append_cancel(&self) -> bool {
         if !should_append_control_log_entry(&self.lease) {
             return false;

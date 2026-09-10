@@ -214,7 +214,10 @@ impl Tui {
         event: &AgentEvent,
         is_sub_agent: bool,
     ) -> bool {
-        if let AgentEvent::Session(SessionEvent::HandoffCommitted { agent, session_id }) = event {
+        if let AgentEvent::Session(SessionEvent::HandoffCommitted {
+            agent, session_id, ..
+        }) = event
+        {
             if !is_sub_agent {
                 self.handle_handoff_committed(agent.clone(), session_id.clone())
                     .await;

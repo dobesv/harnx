@@ -344,6 +344,7 @@ async fn append_prior_turn(log: &NatsSessionLog) -> Result<()> {
         through_seq: 1,
         fence_token: 1,
         timestamp: None,
+        usage: None,
     })
     .await?;
     Ok(())
@@ -379,7 +380,9 @@ async fn observe_source_handoff(mut stream: SessionEventStream) -> Result<Observ
                 observed.order.push("requested");
                 observed.requested = Some((agent, session_id));
             }
-            AgentEvent::Session(SessionEvent::HandoffCommitted { agent, session_id }) => {
+            AgentEvent::Session(SessionEvent::HandoffCommitted {
+                agent, session_id, ..
+            }) => {
                 observed.order.push("committed");
                 observed.committed = Some((agent, session_id));
             }

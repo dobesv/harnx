@@ -93,6 +93,7 @@ struct LeaseState {
     ttl: Duration,
     held: AtomicBool,
     fence_token: AtomicU64,
+    renew_lock: Mutex<()>,
     status_tx: watch::Sender<bool>,
 }
 
@@ -132,6 +133,7 @@ impl NatsSessionLease {
             ttl: config.ttl,
             held: AtomicBool::new(true),
             fence_token: AtomicU64::new(revision),
+            renew_lock: Mutex::new(()),
             status_tx,
         });
         info!(
@@ -162,6 +164,34 @@ impl NatsSessionLease {
 
     pub fn is_held(&self) -> bool {
         self.state.held.load(Ordering::SeqCst)
+    }
+
+    /// Perform a broker-authoritative ownership check by renewing with the
+    /// lease's current KV revision. Failure marks the local lease lost so an
+    /// approved tool can't start after broker expiry or handoff.
+    pub async fn revalidate_ownership(&self) -> Result<bool> {
+        if !self.is_held() {
+            return Ok(false);
+        }
+        let _renew_guard = self.state.renew_lock.lock().await;
+        if !self.is_held() {
+            return Ok(false);
+        }
+        match renew_once(&self.jetstream, &self.bucket, &self.key, &self.state).await {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                warn!(
+                    "nats lease ownership revalidation failed: worker_id={} generation={} revision={} reason={error:#}",
+                    self.worker_id(),
+                    self.generation(),
+                    self.fence_token()
+                );
+                if self.state.mark_lost() {
+                    nats_metrics::lease_lost();
+                }
+                Ok(false)
+            }
+        }
     }
 
     pub fn fence_token(&self) -> u64 {
@@ -420,6 +450,10 @@ fn spawn_renew_task(params: RenewTaskParams) -> JoinHandle<()> {
         let mut activity_refresh: Option<JoinHandle<()>> = None;
         loop {
             ticker.tick().await;
+            if !state.held.load(Ordering::SeqCst) {
+                break;
+            }
+            let _renew_guard = state.renew_lock.lock().await;
             if !state.held.load(Ordering::SeqCst) {
                 break;
             }

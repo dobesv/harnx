@@ -44,8 +44,7 @@ test('happy path: picker flow to chat with slash-named agent', async ({ page }) 
   await expect(page).toHaveScreenshot('happy-path.png');
 });
 
-// SKIP: blocked by #1775 (handoff/live-progress events are advisory-only; not recoverable on the passive session/prompt path). Re-enable after the durability fix.
-test.skip('committed handoff navigates and hydrates the durable target session', async ({ page }) => {
+test('committed handoff navigates and hydrates the durable target session', async ({ page }) => {
   await page.goto('/agents/coding%2Fcoder/sessions/session-1?scenario=happy');
   await expect(page.locator('.aui-assistant-message')).toContainText('Hello from mock session');
 
@@ -62,8 +61,7 @@ test.skip('committed handoff navigates and hydrates the durable target session',
   await expect(page.locator('.aui-composer-send')).toHaveText('Send');
 });
 
-// SKIP: blocked by #1775 (handoff/live-progress events are advisory-only; not recoverable on the passive session/prompt path). Re-enable after the durability fix.
-test.skip('sub-agent row transitions, opens the child, and browser Back returns to the parent', async ({ page }) => {
+test('sub-agent row transitions, opens the child, and browser Back returns to the parent', async ({ page }) => {
   await page.goto('/agents/coding%2Fcoder/sessions/session-1?scenario=happy');
   await expect(page.locator('.aui-assistant-message')).toContainText('Hello from mock session');
   await expect(page.locator('.aui-composer-send')).toHaveText('Send');

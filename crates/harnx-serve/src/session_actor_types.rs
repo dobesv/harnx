@@ -39,26 +39,6 @@ pub(crate) struct PendingPrompt {
 pub struct SessionPromptOptions {
     pub working_dir: Option<std::path::PathBuf>,
     pub attachment_refs: Vec<String>,
-    pub resume: Vec<InterruptResume>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InterruptResume {
-    pub interrupt_id: String,
-    pub status: InterruptResumeStatus,
-    pub payload: InterruptResumePayload,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InterruptResumeStatus {
-    Approved,
-    Denied,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InterruptResumePayload {
-    pub approved: bool,
-    pub reason: Option<String>,
 }
 
 pub enum SessionCommand {
@@ -72,6 +52,12 @@ pub enum SessionCommand {
     },
     Cancel {
         reply: oneshot::Sender<()>,
+    },
+    HitlApprovalDecision {
+        tool_call_id: String,
+        approved: bool,
+        note: Option<String>,
+        reply: oneshot::Sender<Result<bool, String>>,
     },
     Get {
         reply: oneshot::Sender<SessionInfo>,
@@ -90,6 +76,14 @@ pub struct SubscribeResult {
     pub history_warnings: Vec<String>,
     pub state: SessionState,
     pub events: broadcast::Receiver<Event>,
+    /// Durable log entries for control-state hydration (promptless attach).
+    /// Populated by the session actor when refreshing history from NATS.
+    pub log_entries: Option<Vec<(u64, harnx_core::session::SessionLogEntry)>>,
+    /// Session tokens usage for augmenting hydrated usage events with context fields.
+    /// Captured during `refresh_history_snapshot` from the reconstructed session.
+    pub tokens_usage: Option<crate::ag_ui::UsageContextSnapshot>,
+    /// Canonical metadata state used to reconstruct a fresher attached history without reloading it.
+    pub session_base: Option<harnx_core::session::Session>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,70 +107,21 @@ pub struct SessionInfo {
     pub capabilities: SessionCapabilities,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SessionState {
     Idle,
     Running {
         run_id: String,
         started_at: DateTime<Utc>,
     },
+    /// Durable HITL gate derived from unmatched approval requests in the session log.
     Interrupted {
-        run_id: String,
-        started_at: DateTime<Utc>,
-        pending: Box<PendingInterruptBatch>,
+        pending: Box<PendingInterrupt>,
     },
 }
 
-impl PartialEq for SessionState {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Idle, Self::Idle) => true,
-            (
-                Self::Running {
-                    run_id: left_run_id,
-                    started_at: left_started_at,
-                },
-                Self::Running {
-                    run_id: right_run_id,
-                    started_at: right_started_at,
-                },
-            ) => left_run_id == right_run_id && left_started_at == right_started_at,
-            (
-                Self::Interrupted {
-                    run_id: left_run_id,
-                    started_at: left_started_at,
-                    ..
-                },
-                Self::Interrupted {
-                    run_id: right_run_id,
-                    started_at: right_started_at,
-                    ..
-                },
-            ) => left_run_id == right_run_id && left_started_at == right_started_at,
-            _ => false,
-        }
-    }
-}
-
-/// Pending interrupt batch for tool approval HITL.
-#[derive(Clone, Debug)]
-pub struct PendingInterruptBatch {
-    pub interrupt_run_id: String,
-    pub text: String,
-    pub attachment_refs: Vec<String>,
-    pub completion_output: String,
-    pub completion_thought: Option<String>,
-    pub tool_calls: Vec<harnx_core::tool::ToolCall>,
-    pub interrupts: Vec<ToolApprovalInterruptEntry>,
+/// Minimal AG-UI interrupt view. Worker continuation state remains in the durable log.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingInterrupt {
     pub metadata: serde_json::Value,
-}
-
-#[derive(Clone, Debug)]
-pub struct ToolApprovalInterruptEntry {
-    pub id: String,
-    pub tool_call_id: String,
-    pub name: String,
-    pub arguments: serde_json::Value,
-    pub message: String,
-    pub reason: Option<String>,
 }

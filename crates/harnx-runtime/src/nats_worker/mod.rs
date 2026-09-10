@@ -54,6 +54,7 @@ mod subagent_tool_context_tests;
 pub(crate) mod tests;
 
 // Re-export public items to preserve the `crate::nats_worker::X` path
+pub(crate) use agent_loop::derive_pending_hitl_approvals;
 pub use agent_loop::{
     reconcile_hook_supervisor, run_agent_loop_with_nats, run_agent_loop_with_nats_inner,
     RunAgentLoopArgs,

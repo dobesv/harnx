@@ -874,13 +874,15 @@ async fn call_registered_agent(
     provider: Arc<crate::nats_tool_provider::NatsToolProvider>,
     tool: String,
     message: String,
+    tool_call_id: Option<String>,
     early_event: Option<(&mut async_nats::Subscriber, &str)>,
 ) -> (serde_json::Value, Option<String>) {
     let prompt_call = tokio::spawn(async move {
         provider
-            .call_tool(
+            .call_tool_with_id(
                 &tool,
                 json!({ "message": message }),
+                tool_call_id.as_deref(),
                 &harnx_core::abort::create_abort_signal(),
             )
             .await
@@ -988,6 +990,7 @@ async fn worker_registers_and_delegates_to_every_configured_agent() {
             format!("{agent}_session_prompt"),
             format!("delegate to {agent}"),
             None,
+            None,
         )
         .await;
         assert_eq!(
@@ -1041,10 +1044,13 @@ async fn subagent_started_reaches_parent_stream_and_durable_log() {
     let jetstream = async_nats::jetstream::new(client);
     let (_, provider, _) =
         registered_agent_provider(&jetstream, &seeded.parent_config, &["metis"], None).await;
+    let parent_tool_call_id = "parent-tool-call-123";
+    let before_start = chrono::Utc::now();
     let (result, child_session_id) = call_registered_agent(
         provider,
         "metis_session_prompt".to_string(),
         "emit start before finishing".to_string(),
+        Some(parent_tool_call_id.to_string()),
         Some((&mut parent_events, "metis")),
     )
     .await;
@@ -1058,14 +1064,30 @@ async fn subagent_started_reaches_parent_stream_and_durable_log() {
         .load_events_async()
         .await
         .expect("load parent log after sub-agent start");
-    assert!(parent_entries.iter().any(|(_, entry)| matches!(
-        entry,
-        SessionLogEntry::SubAgentStarted {
-            agent,
-            session_id,
-            invocation_id: Some(_),
-        } if agent == "metis" && session_id == &child_session_id
-    )));
+    let (_, start_entry) = parent_entries
+        .iter()
+        .find(|(_, entry)| {
+            matches!(
+                entry,
+                SessionLogEntry::SubAgentStarted { session_id, .. }
+                    if session_id == &child_session_id
+            )
+        })
+        .expect("parent log contains durable sub-agent start");
+    let SessionLogEntry::SubAgentStarted {
+        agent,
+        invocation_id,
+        tool_call_id,
+        started_at,
+        ..
+    } = start_entry
+    else {
+        unreachable!("entry was matched as SubAgentStarted")
+    };
+    assert_eq!(agent, "metis");
+    assert!(invocation_id.as_ref().is_some_and(|id| !id.is_empty()));
+    assert_eq!(tool_call_id.as_deref(), Some(parent_tool_call_id));
+    assert!(started_at.is_some_and(|timestamp| timestamp >= before_start));
 
     daemon.abort();
     let _ = daemon.await;
