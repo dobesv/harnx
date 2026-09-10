@@ -10,11 +10,11 @@ retry-agent
 ⚠ Retryable error (status 500, Internal Server Error (type: server_error)), attempt 1/3. Retrying in 10ms...
 ⚠ Retryable error (status 500, Internal Server Error (type: server_error)), attempt 2/3. Retrying in 20ms...
 ⚠ Model 'mock-llm:primary' exhausted retries (error: Failed to call chat-completions api (client: mock-llm, model:
-mock-llm:primary)), cooldown 60s. Trying next fallback.
+mock-llm:primary): Internal Server Error (type: server_error) (status: 500)), cooldown 60s. Trying next fallback.
 ⚠ Retryable error (status 500, Internal Server Error (type: server_error)), attempt 1/3. Retrying in 10ms...
 ⚠ Retryable error (status 500, Internal Server Error (type: server_error)), attempt 2/3. Retrying in 20ms...
 ⚠ Model 'mock-llm:fallback' exhausted retries (error: Failed to call chat-completions api (client: mock-llm, model:
-mock-llm:fallback)), cooldown 60s. Trying next fallback.
+mock-llm:fallback): Internal Server Error (type: server_error) (status: 500)), cooldown 60s. Trying next fallback.
 error: Failed to call chat-completions api (client: mock-llm, model: mock-llm:fallback)
 
 Caused by:
