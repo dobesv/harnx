@@ -388,9 +388,7 @@ pub fn gemini_build_chat_completions_body(
 
     let attachment_placeholder = |_url: &str| {
         json!({
-            "text": format!(
-                "[attachment unavailable: missing expanded attachment]"
-            )
+            "text": "[attachment unavailable: missing expanded attachment]"
         })
     };
     let attachment_part = |url: &str| {
