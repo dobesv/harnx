@@ -47,7 +47,13 @@ impl Client for CodexClient {
         let api_base = self.get_api_base().ok();
         let request_data = build_codex_request(api_base.as_deref(), &model, &creds, data)?;
         let builder = self.request_builder(client, request_data)?;
-        crate::openai::openai_chat_completions_streaming(builder, handler, &model).await
+        crate::openai_responses::responses_streaming_with_content_type(
+            builder,
+            handler,
+            &model,
+            SseContentType::AllowMissing,
+        )
+        .await
     }
 }
 
