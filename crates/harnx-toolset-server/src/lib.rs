@@ -1,5 +1,6 @@
 //! Server-side adapters for hosting a [`harnx_toolset::Toolset`].
 
+mod aggregate;
 pub mod content;
 mod drain;
 mod lifecycle;
@@ -7,6 +8,7 @@ mod registration_identity;
 pub mod schema;
 mod subscriptions;
 
+pub use aggregate::serve_many_with_shutdown;
 pub use lifecycle::ServeLifecycle;
 pub use registration_identity::RegistrationIdentity;
 
@@ -22,8 +24,8 @@ use harnx_core::instance::ServerScope;
 use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{
     server_identity_token, ControlKind, ControlMessage, Registration, ToolErrorPayload,
-    ToolInvokeError, ToolReply, ToolRequest, Toolset, HDR_CALL_ID, HDR_IDEMPOTENCY_KEY,
-    SUBAGENT_SESSION_NEW_TOOL, SUBAGENT_SESSION_PROMPT_TOOL,
+    ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolReply, ToolRequest, Toolset,
+    HDR_CALL_ID, HDR_IDEMPOTENCY_KEY, SUBAGENT_SESSION_NEW_TOOL, SUBAGENT_SESSION_PROMPT_TOOL,
 };
 use opentelemetry::Context as OtelContext;
 use rmcp::model::{
@@ -112,6 +114,7 @@ struct ServeSettings {
     connection: NatsConnection,
     lifecycle: ServeLifecycle,
     identity: RegistrationIdentity,
+    started: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// Everything `serve_requests` needs to keep the KV registration alive, bundled
@@ -210,6 +213,7 @@ pub async fn serve_with_client_and_identity(
             connection,
             lifecycle: ServeLifecycle::new(CancellationToken::new(), None),
             identity,
+            started: None,
         },
     )
     .await
@@ -231,6 +235,7 @@ pub async fn serve_with_shutdown(
             connection,
             lifecycle,
             identity: RegistrationIdentity::from_env(),
+            started: None,
         },
     )
     .await
@@ -247,6 +252,7 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
         connection,
         lifecycle,
         identity,
+        started,
     } = settings;
     let (shutdown, readiness) = lifecycle.into_parts();
     let NatsConnection { client, replicas } = connection;
@@ -272,6 +278,7 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
     let jetstream = jetstream::new(client.clone());
     let registry = ensure_registry_bucket(&jetstream, replicas).await?;
     let mut revision = publish_registration(&registry, &instance_id, &registration).await?;
+    signal_started(started);
 
     let (active_requests, active_requests_rx) = InFlightRequests::new();
     let request_context = ToolRequestContext {
@@ -318,6 +325,12 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
     let key = registration_key(&instance_id, &identity_token);
     delete_own_registration(&registry, &key, revision).await;
     outcome
+}
+
+fn signal_started(started: Option<tokio::sync::oneshot::Sender<()>>) {
+    if let Some(started) = started {
+        let _ = started.send(());
+    }
 }
 
 /// Delete `key` on shutdown, but only if `revision` (our own last-published
@@ -458,6 +471,11 @@ async fn invoke_uncached_tool(
         .await
         .insert(request.call_id.clone(), cancel.clone());
     let mut args = std::mem::take(&mut request.args);
+    let invocation_context = ToolInvocationContext {
+        call_id: request.call_id.clone(),
+        invoking_session_id: request.parent_session_id.clone(),
+        capabilities: request.capabilities.clone(),
+    };
     add_parent_context_args(
         &request.tool,
         request.parent_session_id.take(),
@@ -468,7 +486,12 @@ async fn invoke_uncached_tool(
     let start = Instant::now();
     let result = context
         .toolset
-        .invoke(&request.tool, args, cancel)
+        .invoke_with_context(ToolInvocation {
+            tool: request.tool.clone(),
+            args,
+            context: invocation_context,
+            cancel,
+        })
         .instrument(tool_exec_span(&request.tool, parent_cx))
         .await;
     context.in_flight.lock().await.remove(&request.call_id);
@@ -508,6 +531,20 @@ fn finalize_execution_context_for_attestation(
     let Ok(result) = &mut reply.result else {
         return;
     };
+    finalize_execution_context_value(
+        context.server_scope.as_str(),
+        &context.server_identity,
+        request,
+        result,
+    );
+}
+
+fn finalize_execution_context_value(
+    server_scope: &str,
+    server_identity: &str,
+    request: &RequestAttestation,
+    result: &mut Value,
+) {
     let raw_context = take_result_execution_context(result);
     if !request.capabilities.contains(EXECUTION_CONTEXT_NAMESPACE) {
         return;
@@ -520,22 +557,22 @@ fn finalize_execution_context_for_attestation(
         Err(error) => {
             log::warn!(
                 "stripping malformed execution context from tool result: server={} tool={} error={error}",
-                context.server_identity,
+                server_identity,
                 request.tool
             );
             return;
         }
     };
     observation.provenance = Some(ToolObservationProvenance::new(
-        context.server_scope.to_string(),
-        context.server_identity.clone(),
+        server_scope,
+        server_identity,
         request.tool.clone(),
         request.call_id.clone(),
     ));
     if let Err(error) = observation.validate() {
         log::warn!(
             "stripping invalid execution context from tool result: server={} tool={} error={error:#}",
-            context.server_identity,
+            server_identity,
             request.tool
         );
         return;
@@ -551,18 +588,23 @@ fn add_parent_context_args(
     tool_call_id: Option<String>,
     args: &mut Value,
 ) {
-    if accepts_parent_session_id(tool) {
-        if let (Some(parent_session_id), Some(args)) = (parent_session_id, args.as_object_mut()) {
+    let Some(args) = args.as_object_mut() else {
+        return;
+    };
+    // These are transport-owned arguments. Always discard model-supplied
+    // values before optionally replacing them with context from ToolRequest.
+    args.remove("__harnx_parent_session_id");
+    args.remove("__harnx_tool_call_id");
+    if let Some(parent_session_id) = parent_session_id.filter(|_| accepts_parent_session_id(tool)) {
+        args.insert(
+            "__harnx_parent_session_id".to_string(),
+            Value::String(parent_session_id),
+        );
+        if let Some(tool_call_id) = tool_call_id {
             args.insert(
-                "__harnx_parent_session_id".to_string(),
-                Value::String(parent_session_id),
+                "__harnx_tool_call_id".to_string(),
+                Value::String(tool_call_id),
             );
-            if let Some(tool_call_id) = tool_call_id {
-                args.insert(
-                    "__harnx_tool_call_id".to_string(),
-                    Value::String(tool_call_id),
-                );
-            }
         }
     }
 }
@@ -949,35 +991,63 @@ impl McpToolsetAdapter {
     ///
     /// Tool dispatch forks: `run_toolset_main` has two mutually exclusive paths:
     /// NATS → `invoke_uncached_tool`, and MCP stdio → this method (calls
-    /// `toolset.invoke` directly). Any cross-cutting concern (metrics, tracing, auth)
+    /// `toolset.invoke_with_context` directly). Any cross-cutting concern (metrics, tracing, auth)
     /// added at one seam does NOT automatically cover the other. rmcp `--http` servers
     /// use their own `ServerHandler::call_tool`, a third seam.
     async fn dispatch_call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let tool_name = request.name.clone();
         let args = Value::Object(request.arguments.unwrap_or_default());
+        let capabilities = context
+            .meta
+            .contains_key(EXECUTION_CONTEXT_NAMESPACE)
+            .then(|| EXECUTION_CONTEXT_NAMESPACE.to_string())
+            .into_iter()
+            .collect();
+        let invocation_context = ToolInvocationContext {
+            call_id: format!("{:?}", context.id),
+            invoking_session_id: None,
+            capabilities,
+        };
+        let attestation = RequestAttestation {
+            call_id: invocation_context.call_id.clone(),
+            tool: tool_name.to_string(),
+            capabilities: invocation_context.capabilities.clone(),
+        };
         let metric_tool = metric_tool_name(self.toolset.as_ref(), &tool_name);
         let started = Instant::now();
-        let result = self
+        let mut result = self
             .toolset
-            .invoke(&tool_name, args, CancellationToken::new())
+            .invoke_with_context(ToolInvocation {
+                tool: tool_name.to_string(),
+                args,
+                context: invocation_context.clone(),
+                cancel: CancellationToken::new(),
+            })
             .await;
         harnx_metrics::record_tool_call(metric_tool, result.is_ok(), started.elapsed());
 
+        if let Ok(value) = &mut result {
+            finalize_execution_context_value("mcp", self.toolset.name(), &attestation, value);
+        }
         match result {
-            Ok(value) => {
-                let text =
-                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
-            }
+            Ok(value) => Ok(call_tool_result_from_value(value)),
             Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(
                 error.to_string(),
             )])),
         }
     }
+}
+
+fn call_tool_result_from_value(value: Value) -> CallToolResult {
+    if let Ok(result) = serde_json::from_value::<CallToolResult>(value.clone()) {
+        return result;
+    }
+    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+    CallToolResult::success(vec![ContentBlock::text(text)])
 }
 
 #[cfg(test)]
@@ -986,6 +1056,102 @@ mod tests {
     use rmcp::model::RequestParamsMeta;
 
     use super::*;
+
+    #[test]
+    fn parent_session_argument_only_uses_transport_context() {
+        let mut untrusted = serde_json::json!({
+            "__harnx_parent_session_id": "other-session",
+            "__harnx_tool_call_id": "model-supplied-call",
+        });
+        add_parent_context_args(SUBAGENT_SESSION_NEW_TOOL, None, None, &mut untrusted);
+        assert!(untrusted.get("__harnx_parent_session_id").is_none());
+        assert!(untrusted.get("__harnx_tool_call_id").is_none());
+
+        add_parent_context_args(
+            SUBAGENT_SESSION_NEW_TOOL,
+            Some("attested-session".to_string()),
+            None,
+            &mut untrusted,
+        );
+        assert_eq!(
+            untrusted,
+            serde_json::json!({"__harnx_parent_session_id": "attested-session"})
+        );
+    }
+
+    #[test]
+    fn mcp_adapter_preserves_serialized_call_tool_results() {
+        let value = serde_json::json!({
+            "content": [{"type": "text", "text": "hello"}],
+            "structuredContent": {"answer": 42},
+            "isError": true,
+            "_meta": {"private": "value"}
+        });
+        let result = call_tool_result_from_value(value.clone());
+        assert_eq!(serde_json::to_value(result).unwrap(), value);
+    }
+
+    #[test]
+    fn mcp_adapter_wraps_raw_json_values_as_text() {
+        let result = call_tool_result_from_value(serde_json::json!({"answer": 42}));
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(result.content.len(), 1);
+        assert!(serde_json::to_value(&result.content[0]).unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"answer\": 42"));
+    }
+
+    fn result_with_execution_context() -> Value {
+        let observation = ExecutionContextObservation::observe(
+            std::path::Path::new("/workspace"),
+            std::path::Path::new("/workspace"),
+        );
+        serde_json::json!({
+            "content": [],
+            "_meta": {EXECUTION_CONTEXT_NAMESPACE: observation}
+        })
+    }
+
+    #[test]
+    fn mcp_adapter_strips_unrequested_execution_context() {
+        let mut result = result_with_execution_context();
+        finalize_execution_context_value(
+            "mcp",
+            "bash",
+            &RequestAttestation {
+                call_id: "request-1".to_string(),
+                tool: "exec".to_string(),
+                capabilities: Default::default(),
+            },
+            &mut result,
+        );
+
+        assert!(result.get("_meta").is_none());
+    }
+
+    #[test]
+    fn mcp_adapter_attests_requested_execution_context() {
+        let mut result = result_with_execution_context();
+        finalize_execution_context_value(
+            "mcp",
+            "bash",
+            &RequestAttestation {
+                call_id: "request-1".to_string(),
+                tool: "exec".to_string(),
+                capabilities: std::collections::BTreeSet::from([
+                    EXECUTION_CONTEXT_NAMESPACE.to_string()
+                ]),
+            },
+            &mut result,
+        );
+
+        let provenance = &result["_meta"][EXECUTION_CONTEXT_NAMESPACE]["provenance"];
+        assert_eq!(provenance["server_scope"], "mcp");
+        assert_eq!(provenance["server_identity"], "bash");
+        assert_eq!(provenance["tool_name"], "exec");
+        assert_eq!(provenance["call_id"], "request-1");
+    }
 
     const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
     const PARENT_SPAN_ID: &str = "00f067aa0ba902b7";

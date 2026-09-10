@@ -10,7 +10,8 @@ use harnx_core::execution_context::{
 use harnx_core::require_nextest;
 use harnx_runtime::nats_session_metadata::{
     read_cursor_key, SessionExtensionUpdate, SessionInitializer, SessionMetadata,
-    SessionMetadataPatch, SessionMetadataStore, SessionOverrideUpdate,
+    SessionMetadataPatch, SessionMetadataStore, SessionOverrideUpdate, ToolContextEntry,
+    TOOL_CONTEXT_NAMESPACE,
 };
 use serde_json::json;
 
@@ -472,5 +473,76 @@ async fn execution_context_namespace_is_reserved_and_fenced() -> Result<()> {
         .await
         .expect_err("stale context writer must be fenced");
     assert!(error.to_string().contains("stale session metadata writer"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn private_tool_context_updates_are_reserved_and_merge_concurrently() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client);
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let session_id = format!("metadata-tool-context-{}", uuid::Uuid::new_v4());
+    store
+        .create(&SessionMetadata::new(
+            &session_id,
+            SessionInitializer::named("metis", Default::default()),
+        ))
+        .await?;
+
+    assert!(store
+        .replace_extension(&session_id, TOOL_CONTEXT_NAMESPACE, json!({}))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("reserved"));
+
+    let sandbox_store = store.clone();
+    let sandbox_session = session_id.clone();
+    let sandbox = tokio::spawn(async move {
+        sandbox_store
+            .replace_tool_context_value(
+                ToolContextEntry {
+                    session_id: &sandbox_session,
+                    key: "sandbox",
+                },
+                json!({"version": 1, "sandbox_id": "sandbox-1"}),
+            )
+            .await
+    });
+    let workspace_store = store.clone();
+    let workspace_session = session_id.clone();
+    let workspace = tokio::spawn(async move {
+        workspace_store
+            .replace_tool_context_value(
+                ToolContextEntry {
+                    session_id: &workspace_session,
+                    key: "workspace",
+                },
+                json!({"root": "/workspace"}),
+            )
+            .await
+    });
+    sandbox.await??;
+    workspace.await??;
+
+    let context = store
+        .get_tool_context(&session_id)
+        .await?
+        .expect("session metadata exists");
+    assert_eq!(context.values.len(), 2);
+    assert_eq!(context.values["sandbox"]["sandbox_id"], "sandbox-1");
+    store
+        .remove_tool_context_value(ToolContextEntry {
+            session_id: &session_id,
+            key: "sandbox",
+        })
+        .await?;
+    let context = store.get_tool_context(&session_id).await?.unwrap();
+    assert!(!context.values.contains_key("sandbox"));
+    assert!(context.values.contains_key("workspace"));
     Ok(())
 }

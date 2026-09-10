@@ -27,6 +27,7 @@ what you need:
 | `harnx-sandbox-exec`    | Low-level birdcage sandbox wrapper with explicit path allow-lists               | [README](crates/harnx-sandbox-common/README.md)  |
 | `harnx-aws-creds`       | Bearer-protected helper that serves AWS credentials to tools                    | [AWS Creds](docs/aws-creds.md)                   |
 | `harnx-k8s-creds`       | Persistent hook that injects scoped Kubernetes credentials into sandboxed tools | [README](crates/harnx-k8s-creds/README.md)       |
+| `harnx-k8s-sandbox-tools` | Native NATS gateway routing bash and filesystem tools into Kubernetes Agent Sandboxes | [Guide](docs/kubernetes-sandbox-tools.md)       |
 | `harnx-proxy-auth`      | TLS-intercepting auth proxy that injects credentials and runs hooks             | [README](crates/harnx-proxy-auth/README.md)      |
 
 Install whichever you need. Most users want `harnx` plus `harnx-worker`:
@@ -248,6 +249,7 @@ Harnx supports custom dark and light themes, which highlight response text and c
 - [RAG Guide](docs/rag-guide.md)
 - [Environment Variables](docs/environment-variables.md)
 - [NATS HA Deployment Guide](docs/nats-ha.md)
+- [Kubernetes Sandbox Tool Gateway](docs/kubernetes-sandbox-tools.md)
 - [OpenTelemetry Tracing](docs/tracing.md)
 - [Prometheus Metrics](docs/metrics.md)
 - [Health & Readiness Endpoint](docs/healthz.md)
