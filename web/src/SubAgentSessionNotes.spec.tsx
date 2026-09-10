@@ -14,6 +14,7 @@ vi.mock('./ChatProvider', async (importOriginal) => {
       this.runAgent = vi.fn();
       this.simulateEvent = (event: unknown) => options.onSubAgentEvent(event);
       this.simulateUsage = (usage: unknown) => options.onUsage(usage);
+      this.simulateToolSummary = (id = 'call-1', summary = 'tool-summary') => options.onToolSummary(id, summary);
     }),
   };
 });
@@ -215,6 +216,88 @@ describe('SubAgentSessionNotes', () => {
       // Must be computed from startedAtMs (~3500ms)
       expect(call.value.elapsed_ms).toBeGreaterThanOrEqual(3400);
       expect(call.value.started_at).toBe(startTime);
+    });
+
+    it('preserves counters and elapsed across successive usage ticks without recreating subscriber', () => {
+      const dispatch = vi.fn();
+      const startTime = Date.now() - 2000;
+      let runningNote: SubAgentNote = {
+        ...note('running', 'live-child'),
+        elapsedMs: 2000,
+        updatedAtMs: Date.now() - 500,
+        startedAtMs: startTime,
+        toolCallCount: 1,
+      };
+
+      const { rerender } = render(
+        <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch }}>
+          <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
+        </SubAgentNotesContext.Provider>
+      );
+
+      const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
+      expect(vi.mocked(HarnxHttpAgent).mock.instances).toHaveLength(1);
+
+      // Simulate a tool call occurring
+      agentInstance.simulateToolSummary();
+
+      // First usage tick
+      agentInstance.simulateUsage({ input: 50, output: 25, cached: 10 });
+
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      const firstCall = dispatch.mock.calls[0][0];
+      expect(firstCall.value.tool_call_count).toBe(2);
+      expect(firstCall.value.elapsed_ms).toBeGreaterThanOrEqual(1950);
+
+      // Simulate parent component updating state and re-rendering with new note
+      runningNote = {
+        ...runningNote,
+        elapsedMs: firstCall.value.elapsed_ms,
+        toolCallCount: firstCall.value.tool_call_count,
+        updatedAtMs: Date.now(),
+      };
+
+      rerender(
+        <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch }}>
+          <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
+        </SubAgentNotesContext.Provider>
+      );
+
+      // HarnxHttpAgent instance must NOT have been recreated
+      expect(vi.mocked(HarnxHttpAgent).mock.instances).toHaveLength(1);
+
+      // Another tool call occurring
+      agentInstance.simulateToolSummary();
+
+      // Second usage tick
+      agentInstance.simulateUsage({ input: 80, output: 40, cached: 20 });
+
+      expect(dispatch).toHaveBeenCalledTimes(2);
+      const secondCall = dispatch.mock.calls[1][0];
+      // Counter must be 3 (accumulated across ticks, not reset to 0 or 1)
+      expect(secondCall.value.tool_call_count).toBe(3);
+      // Elapsed must be >= first call's elapsed (preserved and progressing, not reset)
+      expect(secondCall.value.elapsed_ms).toBeGreaterThanOrEqual(firstCall.value.elapsed_ms);
+    });
+
+    it('uses startedAtMs consistently in displayed elapsed time when running', () => {
+      const startTime = Date.now() - 4000;
+      const runningNote: SubAgentNote = {
+        ...note('running', 'live-child'),
+        elapsedMs: 1000, // Stale/initial elapsedMs
+        updatedAtMs: Date.now(),
+        startedAtMs: startTime,
+      };
+
+      render(
+        <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
+      );
+
+      // Displayed elapsed time must reflect startedAtMs (~4s), not stale elapsedMs (1s)
+      const button = screen.getByRole('button');
+      expect(button).toHaveAttribute('data-elapsed-ms');
+      const elapsedAttr = Number(button.getAttribute('data-elapsed-ms'));
+      expect(elapsedAttr).toBeGreaterThanOrEqual(3900);
     });
   });
 });

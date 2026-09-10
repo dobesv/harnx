@@ -391,7 +391,7 @@ const SendErrorIndicator = () => {
 
 export const BatchInterruptUI = ({ agentName, sessionId }: { agentName: string; sessionId: string }) => {
   const interrupts = useAgUiInterrupts();
-  const { setErrorText, hydratedApprovals, removeHydratedApproval } = useContext(PendingContext);
+  const { setStatusText, setErrorText, hydratedApprovals, removeHydratedApproval } = useContext(PendingContext);
   const [submitting, setSubmitting] = useState(false);
   const [note, setNote] = useState('');
   const [resolvedToolCallIds, setResolvedToolCallIds] = useState<Set<string>>(() => new Set());
@@ -425,11 +425,14 @@ export const BatchInterruptUI = ({ agentName, sessionId }: { agentName: string; 
     setErrorText(null);
     setSubmitting(true);
     try {
-      await submitHitlDecision(agentName, sessionId, {
+      const result = await submitHitlDecision(agentName, sessionId, {
         toolCallId: currentItem.toolCallId,
         approved,
         note: note.trim() || undefined
       });
+      if (result && result.applied === false) {
+        setStatusText('This approval was already resolved elsewhere.');
+      }
       removeHydratedApproval(currentItem.toolCallId);
       setResolvedToolCallIds((prev) => new Set(prev).add(currentItem.toolCallId));
       setNote('');

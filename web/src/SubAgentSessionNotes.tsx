@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo, useContext } from 'react';
+import { useEffect, useState, useMemo, useContext, useRef } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { SubAgentNote } from './subAgentNotes';
 import { HarnxHttpAgent } from './ChatProvider';
@@ -14,28 +14,41 @@ import { AssistantRuntimeProvider } from '@assistant-ui/react';
 import { RuntimeSessionSubscriber } from './RuntimeSessionSubscriber';
 
 function ChildMetricsSubscriber({ note, dispatch }: { note: SubAgentNote, dispatch: (event: unknown) => void }) {
+  const noteRef = useRef(note);
+  const dispatchRef = useRef(dispatch);
+  const toolCallCountRef = useRef(note.toolCallCount || 0);
+
+  useEffect(() => {
+    noteRef.current = note;
+    dispatchRef.current = dispatch;
+    if (note.toolCallCount > toolCallCountRef.current) {
+      toolCallCountRef.current = note.toolCallCount;
+    }
+  }, [note, dispatch]);
+
   const agent = useMemo(() => {
-    let toolCallCount = 0;
     return new HarnxHttpAgent({
       url: `/v1/agents/${encodeURIComponent(note.agent)}/sessions/${encodeURIComponent(note.sessionId)}`,
       onStatus: () => {},
       onRunFailed: () => {},
       onUsage: (usage) => {
-        const elapsed = note.startedAtMs
-          ? Math.max(0, Date.now() - note.startedAtMs)
-          : note.elapsedMs + Math.max(0, Date.now() - note.updatedAtMs);
+        const currentNote = noteRef.current;
+        const elapsed = currentNote.startedAtMs
+          ? Math.max(0, Date.now() - currentNote.startedAtMs)
+          : currentNote.elapsedMs + Math.max(0, Date.now() - currentNote.updatedAtMs);
 
-        dispatch({
+        dispatchRef.current({
           type: 'CUSTOM',
           name: 'sub_agent_progress',
           value: {
-            invocation_id: note.invocationId,
-            tool_call_id: note.toolCallId,
-            agent: note.agent,
-            session_id: note.sessionId,
-            started_at: note.startedAtMs,
+            invocation_id: currentNote.invocationId,
+            tool_call_id: currentNote.toolCallId,
+            agent: currentNote.agent,
+            session_id: currentNote.sessionId,
+            started_at: currentNote.startedAtMs,
             elapsed_ms: elapsed,
-            tool_call_count: toolCallCount,
+            tool_call_count: toolCallCountRef.current,
+            status: currentNote.status,
             usage: {
               input_tokens: usage.input,
               output_tokens: usage.output,
@@ -45,28 +58,29 @@ function ChildMetricsSubscriber({ note, dispatch }: { note: SubAgentNote, dispat
         });
       },
       onToolSummary: () => {
-        toolCallCount++;
+        toolCallCountRef.current++;
       },
       onSubAgentEvent: (event: any) => {
         if (event?.type === 'RUN_FINISHED' || event?.type === 'RUN_ERROR') {
           const now = Date.now();
           const graceMs = 5000;
-          if (note.startedAtMs && (now - note.startedAtMs < graceMs)) {
+          const currentNote = noteRef.current;
+          if (currentNote.startedAtMs && (now - currentNote.startedAtMs < graceMs)) {
             return; // within grace period
           }
           
           const isError = event.type === 'RUN_ERROR' || event.result?.status === 'failed';
 
-          dispatch({
+          dispatchRef.current({
             type: 'CHILD_TERMINAL',
-            invocationId: note.invocationId,
-            toolCallId: note.toolCallId,
+            invocationId: currentNote.invocationId,
+            toolCallId: currentNote.toolCallId,
             status: isError ? 'failed' : 'done',
           });
         }
       },
     });
-  }, [note.agent, note.sessionId, note.invocationId, note.toolCallId, note.startedAtMs, note.elapsedMs, note.updatedAtMs, dispatch]);
+  }, [note.agent, note.sessionId]);
 
   const runtime = useAgUiRuntime({ agent });
 
@@ -98,9 +112,12 @@ function activateOnKey(
 }
 
 function elapsedMs(note: SubAgentNote, nowMs: number) {
-  return note.status === 'running'
-    ? note.elapsedMs + Math.max(0, nowMs - note.updatedAtMs)
-    : note.elapsedMs;
+  if (note.status !== 'running') {
+    return note.elapsedMs;
+  }
+  return note.startedAtMs
+    ? Math.max(0, nowMs - note.startedAtMs)
+    : note.elapsedMs + Math.max(0, nowMs - note.updatedAtMs);
 }
 
 function formatElapsed(value: number) {

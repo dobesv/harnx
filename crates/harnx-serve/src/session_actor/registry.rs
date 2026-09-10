@@ -62,6 +62,11 @@ impl SessionRegistry {
         Arc::clone(&self.actor_config.local_worker)
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_handle_for_tests(&self, key: SessionKey, handle: SessionHandle) {
+        self.map.insert(key, handle);
+    }
+
     // Only used by the Unix-only NATS serve tests (`nats_tests`).
     #[cfg(all(test, unix))]
     pub(super) fn new_with_local_worker_for_tests(

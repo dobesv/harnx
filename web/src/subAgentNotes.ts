@@ -429,12 +429,14 @@ function completeNote(state: SubAgentNotesState, content: unknown): SubAgentNote
 
 function freezeNote(note: SubAgentNote, status: Exclude<SubAgentNoteStatus, 'running'>): SubAgentNote {
   const localElapsed = note.status === 'running'
-    ? Math.max(0, Date.now() - note.updatedAtMs)
-    : 0;
+    ? (note.startedAtMs
+        ? Math.max(0, Date.now() - note.startedAtMs)
+        : note.elapsedMs + Math.max(0, Date.now() - note.updatedAtMs))
+    : note.elapsedMs;
   return {
     ...note,
     status,
-    elapsedMs: note.elapsedMs + localElapsed,
+    elapsedMs: localElapsed,
     updatedAtMs: Date.now(),
   };
 }

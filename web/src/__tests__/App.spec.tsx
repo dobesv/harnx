@@ -68,7 +68,33 @@ describe('BatchInterruptUI', () => {
       expect(removeHydratedApproval).toHaveBeenCalledWith('tool-1');
     });
 
+    expect(defaultPendingContext.setStatusText).not.toHaveBeenCalled();
     // After approval, the live interrupt gate clears and returns null
+    expect(screen.queryByTestId('hydrated-pending-approval')).not.toBeInTheDocument();
+  });
+
+  it('handles applied: false by setting status notice and clearing live gate', async () => {
+    const setStatusText = vi.fn();
+    const setErrorText = vi.fn();
+    const removeHydratedApproval = vi.fn();
+    vi.mocked(agUi.useAgUiInterrupts).mockReturnValue([{ id: 'int-1', toolCallId: 'tool-1', reason: '', message: 'live interrupt' } as any]);
+    vi.mocked(submitHitlDecision).mockResolvedValue({ applied: false });
+
+    render(
+      <PendingContext.Provider value={{ ...defaultPendingContext, setStatusText, setErrorText, removeHydratedApproval }}>
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    fireEvent.click(screen.getByText('Approve'));
+
+    await waitFor(() => {
+      expect(submitHitlDecision).toHaveBeenCalledWith('test-agent', 'test-session', { toolCallId: 'tool-1', approved: true, note: undefined });
+      expect(setStatusText).toHaveBeenCalledWith('This approval was already resolved elsewhere.');
+      expect(removeHydratedApproval).toHaveBeenCalledWith('tool-1');
+    });
+
+    // Gate clears locally even when applied is false
     expect(screen.queryByTestId('hydrated-pending-approval')).not.toBeInTheDocument();
   });
 

@@ -806,6 +806,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_session_prompt_with_text_and_resume_routes_both_commands() {
+        let _guard = TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = crate::session_actor::load_base_config_for_tests();
+        let registry = SessionRegistry::new(config.clone());
+        let key = SessionKey {
+            agent: "plain".into(),
+            session: "rpc-prompt-resume".into(),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        registry.insert_handle_for_tests(key, SessionHandle { tx, actor_id: 1 });
+
+        let actor = tokio::spawn(async move {
+            let SessionCommand::HitlApprovalDecision {
+                tool_call_id,
+                approved,
+                note,
+                reply,
+            } = rx.recv().await.expect("resume decision command")
+            else {
+                panic!("resume decision must be routed before prompt");
+            };
+            assert_eq!(tool_call_id, "tool-99");
+            assert!(approved);
+            assert_eq!(note.as_deref(), Some("approved in test"));
+            reply.send(Ok(true)).expect("decision acknowledgement");
+
+            let SessionCommand::Prompt {
+                text,
+                options,
+                reply,
+            } = rx.recv().await.expect("prompt command")
+            else {
+                panic!("prompt must follow resume decision");
+            };
+            assert_eq!(text, "continue with this request");
+            assert_eq!(options, SessionPromptOptions::default());
+            reply
+                .send(PromptResult::Accepted {
+                    run_id: "combined-run".to_string(),
+                })
+                .expect("prompt acknowledgement");
+        });
+
+        let response = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "plain",
+            "rpc-prompt-resume",
+            Bytes::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 8,
+                    "method": "session/prompt",
+                    "params": {
+                        "text": "continue with this request",
+                        "resume": [{
+                            "interruptId": "tool-99",
+                            "status": "resolved",
+                            "payload": {
+                                "approved": true,
+                                "reason": "approved in test"
+                            }
+                        }]
+                    }
+                })
+                .to_string(),
+            ),
+            &config,
+            &registry,
+            PersistenceKind::Nats,
+        )
+        .await
+        .expect("combined prompt and resume response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["result"]["status"], "accepted");
+        assert_eq!(body["result"]["run_id"], "combined-run");
+        assert_eq!(body["result"]["applied"], true);
+        actor.await.expect("mock session actor");
+    }
+
+    #[tokio::test]
+    async fn rpc_session_prompt_with_text_stops_when_resume_routing_fails() {
+        let _guard = TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = crate::session_actor::load_base_config_for_tests();
+        let registry = SessionRegistry::new(config.clone());
+        let key = SessionKey {
+            agent: "plain".into(),
+            session: "rpc-prompt-resume-failure".into(),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        registry.insert_handle_for_tests(key, SessionHandle { tx, actor_id: 2 });
+
+        let actor = tokio::spawn(async move {
+            let SessionCommand::HitlApprovalDecision { reply, .. } =
+                rx.recv().await.expect("resume decision command")
+            else {
+                panic!("resume decision must be routed before prompt");
+            };
+            reply
+                .send(Err("decision routing failed".to_string()))
+                .expect("decision failure acknowledgement");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                    .await
+                    .is_err(),
+                "prompt must not be submitted after decision failure"
+            );
+        });
+
+        let response = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "plain",
+            "rpc-prompt-resume-failure",
+            Bytes::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 9,
+                    "method": "session/prompt",
+                    "params": {
+                        "text": "must not run",
+                        "resume": [{
+                            "interruptId": "tool-failure",
+                            "status": "resolved",
+                            "payload": { "approved": true }
+                        }]
+                    }
+                })
+                .to_string(),
+            ),
+            &config,
+            &registry,
+            PersistenceKind::Nats,
+        )
+        .await
+        .expect("failed resume response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["code"], -32003);
+        assert_eq!(body["error"]["message"], "decision routing failed");
+        actor.await.expect("mock session actor");
+    }
+
+    #[tokio::test]
     async fn rpc_session_cancel_while_running_returns_ack() {
         let _guard = TestStateGuard::new(None).await;
         let sandbox = TestConfigSandbox::new();
