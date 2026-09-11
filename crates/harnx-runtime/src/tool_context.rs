@@ -82,6 +82,7 @@ impl AgentLoopContext {
 }
 
 const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const DISCOVERY_CACHE_MAX_ENTRIES: usize = 256;
 
 type HookDiscoveryCache = std::sync::Mutex<HashMap<ServerScope, CachedDiscovery<NatsHookProvider>>>;
 /// `NatsToolProvider` captures the invoking session and execution parent, so
@@ -135,22 +136,43 @@ fn cached_discovery<K: Eq + std::hash::Hash, T>(
     cache.get(key).map(|entry| entry.provider.clone())
 }
 
-fn cache_discovery<K: Eq + std::hash::Hash, T>(
+fn cache_discovery<K: Clone + Eq + std::hash::Hash, T>(
     cache: &std::sync::Mutex<HashMap<K, CachedDiscovery<T>>>,
     key: K,
     provider: Option<Arc<T>>,
     discovered_at: Instant,
 ) {
-    cache
+    let mut cache = cache
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(
-            key,
-            CachedDiscovery {
-                provider,
-                discovered_at,
-            },
-        );
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache
+        .get(&key)
+        .is_some_and(|entry| entry.discovered_at > discovered_at)
+    {
+        return;
+    }
+    // Execution-scoped keys may never be read again after completion, so writes
+    // must prune stale entries too. The capacity also bounds short-lived bursts;
+    // refreshing an existing execution never evicts another provider.
+    cache.retain(|_, entry| {
+        discovered_at.saturating_duration_since(entry.discovered_at) < REGISTRATION_REFRESH_INTERVAL
+    });
+    if !cache.contains_key(&key) && cache.len() >= DISCOVERY_CACHE_MAX_ENTRIES {
+        let oldest_key = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.discovered_at)
+            .map(|(key, _)| key.clone());
+        if let Some(oldest_key) = oldest_key {
+            cache.remove(&oldest_key);
+        }
+    }
+    cache.insert(
+        key,
+        CachedDiscovery {
+            provider,
+            discovered_at,
+        },
+    );
 }
 
 async fn discover_cached<'a, K: Eq + std::hash::Hash, T>(
@@ -428,6 +450,96 @@ mod tests {
             REGISTRATION_REFRESH_INTERVAL,
         )
         .is_none());
+    }
+
+    #[test]
+    fn discovery_cache_prunes_expired_entries_during_insert() {
+        let cache = std::sync::Mutex::new(HashMap::<String, CachedDiscovery<()>>::new());
+        let discovered_at = Instant::now();
+        cache_discovery(&cache, "expired".into(), None, discovered_at);
+        cache_discovery(
+            &cache,
+            "fresh".into(),
+            None,
+            discovered_at + REGISTRATION_REFRESH_INTERVAL - Duration::from_millis(1),
+        );
+
+        cache_discovery(
+            &cache,
+            "new".into(),
+            None,
+            discovered_at + REGISTRATION_REFRESH_INTERVAL,
+        );
+
+        let cache = cache.lock().expect("cache lock");
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.contains_key("expired"));
+        assert!(cache.contains_key("fresh"));
+        assert!(cache.contains_key("new"));
+    }
+
+    #[test]
+    fn discovery_cache_evicts_oldest_entry_at_capacity() {
+        let cache = std::sync::Mutex::new(HashMap::new());
+        let discovered_at = Instant::now();
+        let refreshed_provider = Arc::new("refreshed");
+        for key in 0..DISCOVERY_CACHE_MAX_ENTRIES {
+            cache_discovery(
+                &cache,
+                key,
+                None::<Arc<&str>>,
+                discovered_at + Duration::from_millis(key as u64),
+            );
+        }
+        cache_discovery(
+            &cache,
+            0,
+            Some(Arc::clone(&refreshed_provider)),
+            discovered_at + Duration::from_millis(DISCOVERY_CACHE_MAX_ENTRIES as u64),
+        );
+
+        cache_discovery(
+            &cache,
+            DISCOVERY_CACHE_MAX_ENTRIES,
+            None,
+            discovered_at + Duration::from_millis(DISCOVERY_CACHE_MAX_ENTRIES as u64 + 1),
+        );
+
+        let cache = cache.lock().expect("cache lock");
+        assert_eq!(cache.len(), DISCOVERY_CACHE_MAX_ENTRIES);
+        assert!(cache.contains_key(&0));
+        assert!(!cache.contains_key(&1));
+        assert!(cache.contains_key(&DISCOVERY_CACHE_MAX_ENTRIES));
+        assert!(Arc::ptr_eq(
+            &refreshed_provider,
+            cache
+                .get(&0)
+                .and_then(|entry| entry.provider.as_ref())
+                .expect("refreshed entry retained")
+        ));
+    }
+
+    #[test]
+    fn discovery_cache_rejects_out_of_order_refresh() {
+        let cache = std::sync::Mutex::new(HashMap::new());
+        let discovered_at = Instant::now();
+        let newer_provider = Arc::new("newer");
+        cache_discovery(
+            &cache,
+            "key",
+            Some(Arc::clone(&newer_provider)),
+            discovered_at + Duration::from_secs(1),
+        );
+
+        cache_discovery(&cache, "key", Some(Arc::new("older")), discovered_at);
+
+        let cache = cache.lock().expect("cache lock");
+        let entry = cache.get("key").expect("newer entry retained");
+        assert_eq!(entry.discovered_at, discovered_at + Duration::from_secs(1));
+        assert!(Arc::ptr_eq(
+            &newer_provider,
+            entry.provider.as_ref().expect("newer provider retained")
+        ));
     }
 
     #[test]
