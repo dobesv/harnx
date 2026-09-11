@@ -70,6 +70,42 @@ fn write_registration_race_agents(seeded: &SeededRemoteParentConfig) {
     );
 }
 
+fn repeated_delegation_call_fn() -> crate::agent_loop::AgentCallFn {
+    const FIRST_PROMPT: &str = "complete the first delegated task";
+    const SECOND_PROMPT: &str = "complete the second delegated task";
+    let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    Arc::new(move |input, _config, _abort| {
+        let call = call_count.fetch_add(1, Ordering::SeqCst);
+        let prompt = input.text();
+        Box::pin(async move {
+            let (text, tools) = match call {
+                0 => ("first delegation", vec![(FIRST_PROMPT, "first-call")]),
+                1 if prompt == FIRST_PROMPT => ("first child complete", vec![]),
+                2 => ("second delegation", vec![(SECOND_PROMPT, "second-call")]),
+                3 if prompt == SECOND_PROMPT => ("second child complete", vec![]),
+                4 => ("parent complete", vec![]),
+                _ => panic!("unexpected model call {call} with prompt {prompt:?}"),
+            };
+            Ok((
+                text.to_string(),
+                None,
+                tools
+                    .into_iter()
+                    .map(|(message, id)| {
+                        ToolCall::new(
+                            "metis_session_prompt".to_string(),
+                            json!({ "message": message }),
+                            Some(id.to_string()),
+                            None,
+                        )
+                    })
+                    .collect(),
+                crate::client::CompletionTokenUsage::default(),
+            ))
+        })
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn package_agent_sees_bare_same_package_delegation_tool() {
     harnx_core::require_nextest();
@@ -196,6 +232,48 @@ async fn first_package_agent_turn_waits_for_delegation_registrations() {
     assert_eq!(
         selected_tools.lock().await.as_slice(),
         ["zzz-reviewer_session_prompt"]
+    );
+
+    daemon.abort();
+    let _ = daemon.await;
+    let _ = nats.kill();
+    let _ = nats.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parent_can_delegate_again_after_nested_subagent_completes() {
+    harnx_core::require_nextest();
+    let _env_guard = env_lock().await;
+    let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
+        return;
+    };
+    let seeded = seed_remote_config(&url);
+    let _env = subagent_test_env(&url, &seeded);
+    let daemon = spawn_metis_worker_with_call_fn(&url, repeated_delegation_call_fn());
+    let client = async_nats::connect(&url)
+        .await
+        .expect("connect parent session");
+    let session = NatsSession::new(
+        cluster_shared_session_config("local", crate::nats_worker::new_remote_session_id()),
+        client.clone(),
+        async_nats::jetstream::new(client),
+        harnx_core::abort::create_abort_signal(),
+    )
+    .await
+    .expect("create parent session");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        session.run_turn("delegate twice", Arc::new(NoopEventSink), None),
+    )
+    .await
+    .expect("parent turn timed out")
+    .expect("parent turn failed");
+    assert_eq!(
+        result.response.as_deref(),
+        Some("parent complete"),
+        "parent error: {:?}",
+        result.error
     );
 
     daemon.abort();
