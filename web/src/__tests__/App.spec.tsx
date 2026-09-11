@@ -6,9 +6,10 @@ class MockEventSource {
 
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
-import { BatchInterruptUI, MyComposer } from '../App';
+import { BatchInterruptUI, MyComposer, SendErrorIndicator, StatusBar } from '../App';
 import { sendPrompt, uploadAttachment, submitHitlDecision } from '../api';
 import { PendingContext } from '../PendingContext';
+import { UsageContext } from '../UsageContext';
 import * as agUi from '@assistant-ui/react-ag-ui';
 import * as aui from '@assistant-ui/react';
 import { vi } from 'vitest';
@@ -60,6 +61,9 @@ describe('BatchInterruptUI', () => {
         <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
       </PendingContext.Provider>
     );
+
+    expect(screen.getByRole('button', { name: 'Approve' })).toHaveAttribute('type', 'button');
+    expect(screen.getByRole('button', { name: 'Deny' })).toHaveAttribute('type', 'button');
 
     fireEvent.click(screen.getByText('Approve'));
 
@@ -214,6 +218,37 @@ describe('BatchInterruptUI', () => {
     expect(screen.queryByText(/more tool call/)).not.toBeInTheDocument();
   });
 });
+
+describe('status announcements', () => {
+  it('keeps status notices in a polite atomic live region', () => {
+    vi.mocked(aui.useAuiState).mockImplementation((selector: any) =>
+      selector({ thread: { isRunning: false } }),
+    );
+
+    render(
+      <PendingContext.Provider value={{ ...defaultPendingContext, statusText: 'This approval was already resolved elsewhere.' }}>
+        <UsageContext.Provider value={{ usage: null, toolSummaries: new Map() }}>
+          <StatusBar />
+        </UsageContext.Provider>
+      </PendingContext.Provider>,
+    );
+
+    expect(screen.getByRole('status')).toHaveAttribute('aria-live', 'polite');
+    expect(screen.getByRole('status')).toHaveAttribute('aria-atomic', 'true');
+    expect(screen.getByText('This approval was already resolved elsewhere.')).toBeVisible();
+  });
+
+  it('announces send errors assertively', () => {
+    render(
+      <PendingContext.Provider value={{ ...defaultPendingContext, errorText: 'The decision could not be sent.' }}>
+        <SendErrorIndicator />
+      </PendingContext.Provider>,
+    );
+
+    expect(screen.getByRole('alert')).toHaveAttribute('aria-live', 'assertive');
+  });
+});
+
 describe('MyComposer', () => {
   let composerRuntime: any;
   let setErrorText: any;

@@ -133,9 +133,19 @@ Customize agents to tailor LLM behavior, enhancing interaction efficiency and bo
 
 ### Session
 
-Maintain context-aware conversations through sessions, ensuring continuity in interactions.
+Sessions preserve conversation history in a durable NATS log. Handoffs, sub-agent
+activity, per-turn token usage, and tool approval requests and decisions are replayed
+alongside messages, so clients recover state after reconnects or server restarts.
 
-> The left side uses a session, while the right side does not use a session.
+Human-in-the-loop (HITL) approvals are written by the worker holding the session
+lease. Lease fencing and a compare-and-set check on the log tail ensure concurrent
+decisions cannot apply the same approval twice. Cancel stops the active run and
+clears queued prompts; an approval already being routed completes independently
+and a committed decision is not revoked. See the
+[server session and approval protocol](crates/harnx-serve/README.md#tool-approval-interrupts).
+
+When upgrading a cluster, deploy readers that understand new session-log entry
+types before enabling writers that emit them; older readers reject unknown entries.
 
 ### Macro
 

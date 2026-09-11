@@ -237,12 +237,7 @@ pub struct AgUiSink {
     turn_counter: std::sync::atomic::AtomicUsize,
 }
 
-#[derive(Debug, Clone)]
-pub struct UsageContextSnapshot {
-    pub(crate) context_tokens: usize,
-    pub(crate) max_context_tokens: Option<usize>,
-    pub(crate) context_percent: Option<f32>,
-}
+pub use crate::ag_ui_usage::UsageContextSnapshot;
 
 impl AgUiSink {
     pub fn new(tx: UnboundedSender<Event>, message_id: MessageId) -> Self {
