@@ -78,11 +78,12 @@ faster compile) and an optional list of bin names to restrict the install. It
 always builds with the committed `Cargo.lock` for a reproducible result and
 overwrites any existing bins.
 
-It also builds the web UI (via `pnpm install` + `pnpm build` in `web/`) and
-copies the compiled assets into the default directory `harnx serve` loads from
-(`<data_dir>/web-assets`, i.e. `~/.local/share/harnx/web-assets` on Linux). This
-requires [pnpm](https://pnpm.io/) on your `PATH`. Pass `--skip-web` to install
-only the Rust binaries and skip the web UI.
+It also builds the web UI (via `corepack install`, `pnpm install`, and
+`pnpm build` in `web/`) and copies the compiled assets into the default
+directory `harnx serve` loads from (`<data_dir>/web-assets`, i.e.
+`~/.local/share/harnx/web-assets` on Linux). This requires
+[Corepack](https://github.com/nodejs/corepack) and its pnpm shim on your `PATH`.
+Pass `--skip-web` to install only the Rust binaries and skip the web UI.
 
 ### Pre-built Binaries
 
