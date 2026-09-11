@@ -4,6 +4,7 @@ import { listAgents } from './api';
 import type { Agent } from './types';
 import { setDocumentTitle } from './sessionTitle';
 import { useSessionDiscovery } from './useSessionDiscovery';
+import { isAbortError } from './httpClient';
 
 function selectionFromLocation() {
   if (typeof window === 'undefined') return { agent: '', session: '' };
@@ -29,28 +30,32 @@ function useRouteSynchronization(
   setSelectedSessionId: Dispatch<SetStateAction<string>>,
 ) {
   useEffect(() => {
-    let newPath = '/';
-    if (selectedAgent && selectedSessionId) {
-      newPath = `/agents/${encodeURIComponent(selectedAgent)}/sessions/${encodeURIComponent(selectedSessionId)}`;
-    } else if (selectedAgent) {
-      newPath = `/agents/${encodeURIComponent(selectedAgent)}`;
-    }
+    const handlePopState = () => {
+      const current = selectionFromLocation();
+      setSelectedAgent((previous) => (previous === current.agent ? previous : current.agent));
+      setSelectedSessionId((previous) => (previous === current.session ? previous : current.session));
+    };
 
-    const currentUrl = new URL(window.location.href);
-    if (currentUrl.pathname !== newPath) {
-      window.history.pushState(null, '', newPath + currentUrl.search);
-    }
-  }, [selectedAgent, selectedSessionId]);
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [setSelectedAgent, setSelectedSessionId]);
 
   useEffect(() => {
-    const onPopState = () => {
-      const state = selectionFromLocation();
-      setSelectedAgent(state.agent);
-      setSelectedSessionId(state.session);
-    };
-    window.addEventListener('popstate', onPopState);
-    return () => window.removeEventListener('popstate', onPopState);
-  }, [setSelectedAgent, setSelectedSessionId]);
+    const current = selectionFromLocation();
+    if (current.agent === selectedAgent && current.session === selectedSessionId) {
+      return;
+    }
+
+    const nextPath = selectedAgent
+      ? selectedSessionId
+        ? `/agents/${encodeURIComponent(selectedAgent)}/sessions/${encodeURIComponent(selectedSessionId)}`
+        : `/agents/${encodeURIComponent(selectedAgent)}`
+      : '/';
+
+    if (window.location.pathname !== nextPath) {
+      window.history.pushState({}, '', nextPath);
+    }
+  }, [selectedAgent, selectedSessionId]);
 }
 
 export function useAgentSessions() {
@@ -58,6 +63,7 @@ export function useAgentSessions() {
 
   const [agents, setAgents] = useState<Agent[]>([]);
   const [agentsError, setAgentsError] = useState<string | null>(null);
+  const [hasLoadedAgents, setHasLoadedAgents] = useState(false);
   const [selectedAgent, setSelectedAgent] = useState<string>(initial.agent);
   const [selectedSessionId, setSelectedSessionId] = useState<string>(initial.session);
   const discovery = useSessionDiscovery({
@@ -74,13 +80,29 @@ export function useAgentSessions() {
   );
 
   useEffect(() => {
+    let active = true;
+    const controller = new AbortController();
     setAgentsError(null);
-    listAgents().then(data => {
-      setAgents(data);
-    }).catch((err) => {
-      console.error(err);
-      setAgentsError(err.message || 'Failed to fetch agents');
-    });
+
+    listAgents({ signal: controller.signal })
+      .then((data) => {
+        if (!active) return;
+        setAgents(data);
+        setHasLoadedAgents(true);
+      })
+      .catch((err: unknown) => {
+        if (!active) return;
+        if (isAbortError(err)) return;
+        console.error(err);
+        setAgentsError(
+          err instanceof Error && err.message ? err.message : 'Failed to fetch agents'
+        );
+      });
+
+    return () => {
+      active = false;
+      controller.abort();
+    };
   }, []);
 
   const clearSession = useCallback(() => {
@@ -108,12 +130,15 @@ export function useAgentSessions() {
       : undefined;
     setDocumentTitle(session?.title);
   }, [selectedSessionId, discovery.sessions]);
+
   return {
     agents,
     agentsError,
+    hasLoadedAgents,
     sessions: discovery.sessions,
     sessionsError: discovery.sessionsError,
     sessionsLoading: discovery.sessionsLoading,
+    hasLoadedSessions: discovery.hasLoadedSessions,
     selectedAgent,
     selectedSessionId,
     isFreshSession: discovery.isFreshSession,

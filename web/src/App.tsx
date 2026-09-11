@@ -26,6 +26,8 @@ import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
 import { AttachIcon, SendIcon } from './icons';
 import { AgentDropdown, SessionDropdown, AgentSessionMenu } from './composer/AgentSessionMenu';
+import { ConnectionBanner } from './ConnectionBanner';
+import { useConnectionStatus, useRetryCountdownSeconds } from './useConnectionStatus';
 import './chat.css';
 
 // Activate a click-like handler from keyboard (Enter / Space) so div-based
@@ -536,19 +538,42 @@ const MyThread = ({ agentName, sessionId, isFreshSession, markSessionNotFresh, o
   );
 };
 
-const AgentPicker = ({
+export const AgentPickerConnecting = () => {
+  const { nextRetryAt } = useConnectionStatus();
+  const countdown = useRetryCountdownSeconds(nextRetryAt);
+
+  const message =
+    nextRetryAt != null && countdown != null
+      ? `Reconnecting… retrying in ${countdown}s`
+      : 'Connecting to server…';
+
+  return (
+    <div className="agents-connecting" role="status" data-testid="agents-connecting">
+      <div className="aui-spinner" aria-hidden="true"><span /></div>
+      <span>{message}</span>
+    </div>
+  );
+};
+
+export const AgentPicker = ({
   agents,
   agentsError,
+  hasLoadedAgents,
   onSelect
 }: {
   agents: Agent[];
   agentsError: string | null;
+  hasLoadedAgents: boolean;
   onSelect: (agent: string) => void;
 }) => (
   <div className="picker-container">
     <h2>Select an Agent</h2>
     {agentsError ? (
       <div role="alert" className="aui-error" data-testid="agents-error">{agentsError}</div>
+    ) : !hasLoadedAgents ? (
+      <AgentPickerConnecting />
+    ) : agents.length === 0 ? (
+      <p className="no-agents-msg">No agents found.</p>
     ) : (
       <div className="grid-list">
         {agents.map(a => (
@@ -574,6 +599,7 @@ const SessionPicker = ({
   sessions,
   sessionsError,
   sessionsLoading,
+  hasLoadedSessions,
   onRetry,
   onSelect,
   onNewChat,
@@ -583,6 +609,7 @@ const SessionPicker = ({
   sessions: SessionRef[];
   sessionsError: string | null;
   sessionsLoading: boolean;
+  hasLoadedSessions: boolean;
   onRetry: () => void;
   onSelect: (id: string) => void;
   onNewChat: () => void;
@@ -594,7 +621,7 @@ const SessionPicker = ({
     <div className="actions-bar">
       <button className="new-chat-button" onClick={onNewChat}>New Chat</button>
     </div>
-    {sessionsLoading ? (
+    {sessionsLoading && !hasLoadedSessions ? (
       <p className="sessions-loading" role="status">Loading sessions…</p>
     ) : sessionsError ? (
       <div role="alert" className="aui-error" data-testid="sessions-error">
@@ -629,9 +656,11 @@ export default function App() {
   const {
     agents,
     agentsError,
+    hasLoadedAgents,
     sessions,
     sessionsError,
     sessionsLoading,
+    hasLoadedSessions,
     selectedAgent,
     selectedSessionId,
     refreshSessions,
@@ -649,12 +678,17 @@ export default function App() {
     navigateSession(agent, sessionId);
   }, [navigateSession]);
 
+  // Suppress banner on initial AgentPicker without loaded data (blocking state handles it)
+  const suppressBanner = !selectedAgent && !hasLoadedAgents;
+
   return (
     <div className="app-container">
+      <ConnectionBanner suppress={suppressBanner} />
       {!selectedAgent ? (
         <AgentPicker
           agents={agents}
           agentsError={agentsError}
+          hasLoadedAgents={hasLoadedAgents}
           onSelect={selectAgent}
         />
       ) : !selectedSessionId ? (
@@ -663,6 +697,7 @@ export default function App() {
           sessions={sessions}
           sessionsError={sessionsError}
           sessionsLoading={sessionsLoading}
+          hasLoadedSessions={hasLoadedSessions}
           onRetry={refreshSessions}
           onSelect={selectSession}
           onNewChat={newChat}

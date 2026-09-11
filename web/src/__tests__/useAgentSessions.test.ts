@@ -60,6 +60,7 @@ describe('useAgentSessions', () => {
     const { result } = renderHook(() => useAgentSessions());
     expect(result.current.selectedAgent).toBe('');
     expect(result.current.selectedSessionId).toBe('');
+    expect(result.current.hasLoadedAgents).toBe(false);
   });
 
   it('parses agent from url', () => {
@@ -76,17 +77,20 @@ describe('useAgentSessions', () => {
     expect(result.current.selectedSessionId).toBe('sess+1');
   });
 
-  it('fetches agents on mount', async () => {
+  it('fetches agents on mount and tracks hasLoadedAgents', async () => {
     vi.mocked(api.listAgents).mockResolvedValue([{ name: 'agent1' } as any]);
     const { result } = renderHook(() => useAgentSessions());
+    expect(result.current.hasLoadedAgents).toBe(false);
     await waitFor(() => {
       expect(result.current.agents).toEqual([{ name: 'agent1' }]);
+      expect(result.current.hasLoadedAgents).toBe(true);
     });
   });
 
-  it('fetches sessions when agent is selected', async () => {
+  it('fetches sessions when agent is selected and tracks hasLoadedSessions', async () => {
     vi.mocked(api.listSessions).mockResolvedValue([{ session_id: 's1', updated_at: '2023-01-01' } as any]);
     const { result } = renderHook(() => useAgentSessions());
+    expect(result.current.hasLoadedSessions).toBe(false);
     
     act(() => {
       result.current.selectAgent('agent2');
@@ -95,7 +99,82 @@ describe('useAgentSessions', () => {
     await waitFor(() => {
       expect(result.current.selectedAgent).toBe('agent2');
       expect(result.current.sessions).toEqual([{ session_id: 's1', updated_at: '2023-01-01' }]);
+      expect(result.current.hasLoadedSessions).toBe(true);
     });
+  });
+
+  it('resets sessions and hasLoadedSessions immediately when switching agents', async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([{ session_id: 's1' } as any]);
+    const { result } = renderHook(() => useAgentSessions());
+
+    act(() => {
+      result.current.selectAgent('agent-a');
+    });
+
+    await waitFor(() => {
+      expect(result.current.hasLoadedSessions).toBe(true);
+      expect(result.current.sessions).toHaveLength(1);
+    });
+
+    // Switch to agent-b before mock returns
+    const slowSessions = deferred<any[]>();
+    vi.mocked(api.listSessions).mockReturnValue(slowSessions.promise);
+
+    act(() => {
+      result.current.selectAgent('agent-b');
+    });
+
+    // Should immediately reset to empty and not loaded
+    expect(result.current.sessions).toEqual([]);
+    expect(result.current.hasLoadedSessions).toBe(false);
+
+    slowSessions.resolve([{ session_id: 's2' }]);
+    await waitFor(() => {
+      expect(result.current.hasLoadedSessions).toBe(true);
+      expect(result.current.sessions).toEqual([{ session_id: 's2' }]);
+    });
+  });
+
+  it('aborts listAgents on unmount', () => {
+    const pending = deferred<any[]>();
+    vi.mocked(api.listAgents).mockImplementation((options?: { signal?: AbortSignal }) => {
+      options?.signal?.addEventListener('abort', () => {
+        pending.reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      });
+      return pending.promise;
+    });
+
+    const { unmount } = renderHook(() => useAgentSessions());
+    const abortSignal = vi.mocked(api.listAgents).mock.calls[0]?.[0]?.signal;
+    expect(abortSignal?.aborted).toBe(false);
+
+    unmount();
+    expect(abortSignal?.aborted).toBe(true);
+  });
+
+  it('aborts listSessions on agent switch', async () => {
+    const signals: AbortSignal[] = [];
+    vi.mocked(api.listSessions).mockImplementation((_agent, options?: { signal?: AbortSignal }) => {
+      if (options?.signal) signals.push(options.signal);
+      return new Promise(() => {}); // never resolves
+    });
+
+    const { result } = renderHook(() => useAgentSessions());
+
+    act(() => {
+      result.current.selectAgent('agent-x');
+    });
+
+    expect(signals).toHaveLength(1);
+    expect(signals[0].aborted).toBe(false);
+
+    act(() => {
+      result.current.selectAgent('agent-y');
+    });
+
+    expect(signals[0].aborted).toBe(true);
+    expect(signals).toHaveLength(2);
+    expect(signals[1].aborted).toBe(false);
   });
 
   it('keeps the session picker loading until discovery completes', async () => {
@@ -226,4 +305,5 @@ describe('useAgentSessions', () => {
     });
 
     expect(result.current.isFreshSession).toBe(false);
-  });});
+  });
+});

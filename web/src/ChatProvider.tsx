@@ -13,6 +13,8 @@ import { RuntimeSessionSubscriber } from './RuntimeSessionSubscriber';
 import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS } from './harnxCustomEvents';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { INITIAL_SUB_AGENT_NOTES_STATE, reduceSubAgentNotes } from './subAgentNotes';
+import { observedFetch } from './httpClient';
+import { connection } from './connection';
 
 export interface ChatProviderProps {
   agentName: string;
@@ -108,7 +110,7 @@ export class HarnxHttpAgent extends HttpAgent {
   private handoffBoundarySeq?: number;
 
   constructor(options: HarnxHttpAgentOptions) {
-    super({ url: options.url });
+    super({ url: options.url, fetch: observedFetch });
     this.onStatus = options.onStatus;
     this.onRunFailedCb = options.onRunFailed;
     this.onUsageCb = options.onUsage;
@@ -144,9 +146,30 @@ export class HarnxHttpAgent extends HttpAgent {
     }
   }
 
-  private handleRunFailure(message: string) {
+  private handleRunFailure(message: string, error?: unknown) {
     this.onSubAgentEvent({ type: 'RUN_ERROR' });
     this.onRunFailedCb(message || 'Failed to send message');
+
+    const isTransportError =
+      error instanceof TypeError ||
+      (error instanceof Error &&
+        (/Failed to fetch/i.test(error.message) ||
+          /NetworkError/i.test(error.message) ||
+          /net::ERR_/i.test(error.message) ||
+          /connection refused/i.test(error.message) ||
+          /connection reset/i.test(error.message) ||
+          /socket/i.test(error.message) ||
+          /HTTP 5\d\d/i.test(error.message))) ||
+      /Failed to fetch/i.test(message) ||
+      /NetworkError/i.test(message) ||
+      /net::ERR_/i.test(message) ||
+      /connection refused/i.test(message) ||
+      /connection reset/i.test(message) ||
+      /HTTP 5\d\d/i.test(message);
+
+    if (isTransportError) {
+      connection.noteTransientTrouble();
+    }
   }
 
   // Navigation control events are handled via onEvent (see handleAgentEvent) and
@@ -171,7 +194,7 @@ export class HarnxHttpAgent extends HttpAgent {
         return subscriber?.onCustomEvent?.(payload as any);
       },
       onRunFailed: async (payload) => {
-        this.handleRunFailure(payload.error.message);
+        this.handleRunFailure(payload.error.message, payload.error);
         return subscriber?.onRunFailed?.(payload as any);
       },
     };
@@ -189,7 +212,7 @@ export class HarnxHttpAgent extends HttpAgent {
     try {
       return await super.runAgent(nextParams, wrappedSubscriber);
     } catch (err: any) {
-      this.handleRunFailure(err.message);
+      this.handleRunFailure(err.message, err);
       throw err;
     }
   }

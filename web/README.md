@@ -89,3 +89,37 @@ The web client is integrated into the `.github/workflows/web-ci.yml` lane. It ru
 ## Future: Release Embedding
 
 Single-binary embedding via `rust-embed` (embedding the `web/dist` assets into the `harnx-serve` binary) is deferred and does not gate the v1 release. See the `harnx-webui-parity` backlog for details. Currently, the web client is served exclusively via the Vite dev server or a standalone static host.
+
+## HTTP Layer Architecture
+
+HTTP calls span two modules, not one: `web/src/api.ts` and `web/src/cancellationApi.ts` (added in PR #1817). Shared primitives live in `web/src/httpClient.ts` to avoid circular imports.
+
+### Retry Behavior
+
+- **Reads auto-retry:** `listAgents`, `listSessions`, `getAgent` use `fetchJsonWithRetry` with capped exponential backoff (initial ~0.5–1.5s, steady-state mean 60s) and jitter. Backend outages show a connecting state during initial load or a non-blocking banner for background failures.
+- **Writes do not replay:** `createSession`, `uploadAttachment`, `sendPrompt`, `submitHitlDecision`, and observe-only calls (`sessionControl`, `cancel`) use `observedFetch` — they notify connection status but never auto-retry. The caller (or polling interval) manages retry timing.
+
+### Status Classification Order
+
+**Status classification happens BEFORE body parsing.** This is critical:
+
+- HTTP 5xx responses (including 502/504 from proxy or ingress with HTML bodies) are classified as `TransientError` and enter the retry loop.
+- HTTP 4xx responses are classified as `PermanentError` and fail immediately.
+- Malformed JSON on 2xx is a `PermanentError`.
+
+A 502 Bad Gateway with an HTML error page must retry, not fail permanently as "malformed JSON."
+
+### Cancel Semantics (from PR #1817)
+
+`cancel()` in `cancellationApi.ts` preserves its original contract:
+- Parses JSON body before checking `res.ok`, so a JSON-RPC error (e.g., `-32002` idle session) can be inspected.
+- Treats `-32002` as benign success (session already idle).
+- Uses a 2-second `AbortSignal.timeout`.
+
+### DEV Test Seam
+
+In development mode (`import.meta.env.DEV`), `window.__harnxConnection = { initialDelayMs, maxDelayMs }` compresses backoff delays for E2E tests. Production ignores this override. Tests set this via `page.addInitScript()` before page load.
+
+### Connection Coordinator
+
+`web/src/connection.ts` is a React-free module-level singleton implementing the retry round scheduler with frozen snapshots. React integration uses `useSyncExternalStore` in `web/src/useConnectionStatus.ts`. Do not import React in `connection.ts` — it must remain UI-agnostic for potential non-React consumers.
