@@ -206,11 +206,26 @@ All flags have environment-variable equivalents:
 | `--idle-timeout-minutes` | `IDLE_TIMEOUT_MINUTES` | `15` |
 | `--auto-extend-threshold-hours` | `AUTO_EXTEND_THRESHOLD_HOURS` | `48` |
 | `--auto-extend-ttl-hours` | `AUTO_EXTEND_TTL_HOURS` | `72` |
+| `--k8s-request-timeout-secs` | `K8S_REQUEST_TIMEOUT_SECS` | `30` |
+| `--k8s-operation-timeout-secs` | `K8S_OPERATION_TIMEOUT_SECS` | `60` |
+| `--mcp-pre-dispatch-timeout-secs` | `MCP_PRE_DISPATCH_TIMEOUT_SECS` | `30` |
+| `--mcp-response-timeout-secs` | `MCP_RESPONSE_TIMEOUT_SECS` | `90000` (25 hours; `0` disables) |
+| `--retry-backoff-base-ms` | `RETRY_BACKOFF_BASE_MS` | `250` |
+| `--retry-backoff-cap-ms` | `RETRY_BACKOFF_CAP_MS` | `10000` |
+| `--retry-max-attempts` | `RETRY_MAX_ATTEMPTS` | `5` (includes initial attempt) |
 
 The binary also accepts the shared `--metrics-addr` / `HARNX_METRICS_ADDR` and
 `--healthz-addr` / `HARNX_HEALTHZ_ADDR` options. In addition to the standard
-tool metrics it emits `harnx_sandbox_wakes_total` and
-`harnx_sandbox_hibernations_total{reason="release|idle"}`.
+tool metrics it emits:
+
+- `harnx_sandbox_wakes_total`
+- `harnx_sandbox_hibernations_total{reason="release|idle"}`
+- `harnx_sandbox_gateway_operation_total{boundary,operation,outcome}`, where
+  `outcome` is `success`, `timeout`, `cancelled`, `transport_error`,
+  `permanent_error`, `retry_exhausted`, or `sandbox_error`
+- `harnx_sandbox_gateway_retries_total{boundary,operation,reason}`
+
+Gateway metrics don't include sandbox IDs, endpoints, or command text.
 
 ## Kubernetes permissions
 
@@ -250,9 +265,40 @@ remain the security boundary.
 
 ## Failure and retry semantics
 
-The gateway retries MCP connection establishment after waking a sandbox, but
-does not automatically replay a tool call after it may have been submitted.
-Handler and Kubernetes errors are recoverable tool results so the agent can
-inspect or retry them. A failed stateful MCP connection is discarded before the
-error is returned, so a later agent-directed retry establishes a clean session.
-Cancellation remains fatal to the current tool invocation.
+Each Kubernetes request has a 30-second default deadline, including response
+body decoding. Composite `get` and `list` operations also have a 60-second
+budget, so a list containing many claims can't multiply the per-request limit
+without bound. Activation, pod-IP, status, and idle-watcher waits poll
+concurrently with their cancellation token and deadline.
+
+The gateway classifies Kubernetes validation and authorization responses (400,
+401, 403, and 422) as permanent and fails without retrying. Request timeout,
+429, and server responses are transient. A claim lookup returning 404 means the
+claim is absent, while other missing-resource cases remain errors. Create
+`AlreadyExists` and delete-not-found converge on the intended state. Transient
+retries use bounded exponential full jitter, honor Kubernetes
+`retryAfterSeconds`, and stop at the configured attempt or operation budget.
+The configured attempt count includes the initial request.
+
+MCP retries have one owner: the MCP caller retries transient connection failures
+before dispatch. It never automatically replays a tool call after submission,
+because a transport failure doesn't show whether a bash or filesystem mutation
+already ran. Slot-lock acquisition, connection establishment, and request
+submission share the short pre-dispatch budget. MCP `isError: true` results are
+returned unchanged for the agent to inspect and are counted as `sandbox_error`.
+
+The MCP response budget defaults to 25 hours so it doesn't shorten
+`bash_exec`'s documented 24-hour foreground default. Setting the response
+budget to `0` disables it. When the budget expires, the gateway stops waiting
+successfully and sends `notifications/cancelled` to request cooperative
+cancellation. This timeout is **not proof that sandbox execution stopped**. The
+gateway retains its local response waiter; if the connection is lost before
+completion can be confirmed, the invocation remains pending rather than
+falsely acknowledging a stop. Cancellation uses the same waiter-preserving
+path and remains fatal to the current invocation.
+
+Permanent handler errors remain recoverable tool results when the agent can
+correct its request. Transport lifecycle death and result serialization are
+fatal because the stateful bridge can't safely continue. A failed stateful MCP
+connection is discarded before a later agent-directed retry establishes a new
+session.
