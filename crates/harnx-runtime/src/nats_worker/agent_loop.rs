@@ -976,7 +976,7 @@ async fn emit_handoff_committed(
         args.jetstream_ctx.clone(),
         args.source_session_id,
     );
-    backend
+    let after_seq = backend
         .append_event(&harnx_core::session::SessionLogEntry::HandoffCommitted {
             target_agent: committed_agent.clone(),
             target_session_id: session_id.clone(),
@@ -997,6 +997,7 @@ async fn emit_handoff_committed(
         agent: committed_agent,
         session_id: session_id.clone(),
         handoff_tool_call_id: handoff_tool_call_id.clone(),
+        after_seq: Some(after_seq),
     }));
     event_sink.flush().await.with_context(|| {
         format!(

@@ -1,242 +1,289 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import {
-  isHandoffConsumed,
-  markHandoffConsumed,
-  handleHarnxCustomEvent,
-} from '../harnxCustomEvents';
+import { describe, it, expect, vi } from 'vitest';
+import { HarnxHttpAgent } from '../ChatProvider';
+import { handleHarnxCustomEvent, type HarnxCustomEventCallbacks } from '../harnxCustomEvents';
 
-describe('handoff deduplication', () => {
-  // Helper to track handoff calls
-  let handoffCalls: Array<{ agent: string; sessionId: string }> = [];
-  
-  const makeCallbacks = (sourceSessionId?: string) => ({
-    onStatus: () => {},
-    onRunFailed: () => {},
-    onUsage: () => {},
-    onToolSummary: () => {},
-    onHandoff: (agent: string, sessionId: string) => {
-      handoffCalls.push({ agent, sessionId });
-    },
-    isRunActive: true,
-    sourceSessionId,
+function createAgent(onHandoff = vi.fn()) {
+  const agent = new HarnxHttpAgent({
+    url: '/test-agent',
+    onStatus: vi.fn(),
+    onRunFailed: vi.fn(),
+    onUsage: vi.fn(),
+    onToolSummary: vi.fn(),
+    onHandoff,
+    onSubAgentEvent: vi.fn(),
   });
 
-  beforeEach(() => {
-    handoffCalls = [];
-    // Clear consumed handoffs by re-importing - since module state persists,
-    // we use unique IDs per test to avoid interference
-  });
+  let capturedSubscriber: any;
+  vi.spyOn(Object.getPrototypeOf(Object.getPrototypeOf(agent)), 'runAgent').mockImplementation(
+    (_params: any, subscriber: any) => {
+      capturedSubscriber = subscriber;
+      return Promise.resolve();
+    }
+  );
+  agent.runAgent({});
 
-  it('marks handoff consumed and prevents re-navigation', () => {
-    const sourceSessionId = 'test-session-1';
-    const toolCallId = 'call-handoff-123';
+  return {
+    agent,
+    onHandoff,
+    dispatch: (event: { type: string; name?: string; value?: unknown }) =>
+      capturedSubscriber.onEvent({ event }),
+  };
+}
 
-    expect(isHandoffConsumed(sourceSessionId, toolCallId)).toBe(false);
+describe('handoff attach-seq gating', () => {
+  it('gates handoffs purely by sequence relative to boundary', async () => {
+    const { dispatch, onHandoff } = createAgent();
 
-    markHandoffConsumed(sourceSessionId, toolCallId);
-
-    expect(isHandoffConsumed(sourceSessionId, toolCallId)).toBe(true);
-  });
-
-  it('different sessions can have same tool call id without interference', () => {
-    const toolCallId = 'call-shared-id';
-
-    expect(isHandoffConsumed('session-a', toolCallId)).toBe(false);
-    expect(isHandoffConsumed('session-b', toolCallId)).toBe(false);
-
-    markHandoffConsumed('session-a', toolCallId);
-
-    expect(isHandoffConsumed('session-a', toolCallId)).toBe(true);
-    expect(isHandoffConsumed('session-b', toolCallId)).toBe(false);
-  });
-
-  it('same session can have multiple different handoffs', () => {
-    const sourceSessionId = 'session-multi';
-
-    expect(isHandoffConsumed(sourceSessionId, 'call-1')).toBe(false);
-    expect(isHandoffConsumed(sourceSessionId, 'call-2')).toBe(false);
-
-    markHandoffConsumed(sourceSessionId, 'call-1');
-
-    expect(isHandoffConsumed(sourceSessionId, 'call-1')).toBe(true);
-    expect(isHandoffConsumed(sourceSessionId, 'call-2')).toBe(false);
-
-    markHandoffConsumed(sourceSessionId, 'call-2');
-
-    expect(isHandoffConsumed(sourceSessionId, 'call-2')).toBe(true);
-  });
-
-  it('skips handoff callback when marker already consumed', () => {
-    const sourceSessionId = 'session-dedup';
-    const toolCallId = 'call-dedup';
-
-    // First, mark as consumed
-    markHandoffConsumed(sourceSessionId, toolCallId);
-
-    // Now try to emit the handoff event
-    handleHarnxCustomEvent('session_handoff', {
-      agent: 'target-agent',
-      session_id: 'target-session',
-      handoff_tool_call_id: toolCallId,
-    }, makeCallbacks(sourceSessionId));
-
-    // Should not call the handoff callback
-    expect(handoffCalls).toHaveLength(0);
-  });
-
-  it('fires handoff callback when marker not yet consumed', () => {
-    const sourceSessionId = 'session-first';
-    const toolCallId = 'call-first';
-
-    handleHarnxCustomEvent('session_handoff', {
-      agent: 'target-agent',
-      session_id: 'target-session',
-      handoff_tool_call_id: toolCallId,
-    }, makeCallbacks(sourceSessionId));
-
-    expect(handoffCalls).toHaveLength(1);
-    expect(handoffCalls[0]).toEqual({
-      agent: 'target-agent',
-      sessionId: 'target-session',
+    await dispatch({
+      type: 'CUSTOM',
+      name: 'session_attach_boundary',
+      value: { attached_seq: 7 },
     });
 
-    // After firing, should be marked consumed
-    expect(isHandoffConsumed(sourceSessionId, toolCallId)).toBe(true);
-  });
-
-  it('fires handoff without marker id (legacy compatibility)', () => {
-    const sourceSessionId = 'session-legacy';
-
-    handleHarnxCustomEvent('session_handoff', {
-      agent: 'legacy-agent',
-      session_id: 'legacy-session',
-    }, makeCallbacks(sourceSessionId));
-
-    expect(handoffCalls).toHaveLength(1);
-    expect(handoffCalls[0]).toEqual({
-      agent: 'legacy-agent',
-      sessionId: 'legacy-session',
+    // seq == boundary => no nav
+    await dispatch({
+      type: 'CUSTOM',
+      name: 'session_handoff',
+      value: { agent: 'target', session_id: 's1', after_seq: 7 },
     });
-  });
+    expect(onHandoff).not.toHaveBeenCalled();
 
-  it('fires handoff when sourceSessionId not provided', () => {
-    // When sourceSessionId is undefined, deduplication is skipped
-    handleHarnxCustomEvent('session_handoff', {
-      agent: 'agent-no-source',
-      session_id: 'session-no-source',
-      handoff_tool_call_id: 'call-no-source',
-    }, makeCallbacks());
-
-    expect(handoffCalls).toHaveLength(1);
-  });
-
-  it('works for hydrated events (isRunActive false)', () => {
-    const sourceSessionId = 'session-hydrated';
-    const toolCallId = 'call-hydrated';
-
-    // Hydrated events arrive with isRunActive: false
-    const hydratedCallbacks = {
-      ...makeCallbacks(sourceSessionId),
-      isRunActive: false,
-    };
-
-    handleHarnxCustomEvent('session_handoff', {
-      agent: 'hydrated-agent',
-      session_id: 'hydrated-session',
-      handoff_tool_call_id: toolCallId,
-    }, hydratedCallbacks as any);
-
-    expect(handoffCalls).toHaveLength(1);
-    expect(isHandoffConsumed(sourceSessionId, toolCallId)).toBe(true);
-
-    // Subsequent live event with same marker should be deduped
-    handoffCalls = [];
-    handleHarnxCustomEvent('session_handoff', {
-      agent: 'hydrated-agent',
-      session_id: 'hydrated-session',
-      handoff_tool_call_id: toolCallId,
-    }, makeCallbacks(sourceSessionId));
-
-    expect(handoffCalls).toHaveLength(0);
-  });
-
-  it('live-then-hydrated fires onHandoff exactly once', () => {
-    const sourceSessionId = 'session-live-then-hydrated';
-    const toolCallId = 'call-live-hydrated';
-
-    // First: live event arrives (isRunActive: true)
-    handleHarnxCustomEvent('session_handoff', {
-      agent: 'live-agent',
-      session_id: 'live-session',
-      handoff_tool_call_id: toolCallId,
-    }, makeCallbacks(sourceSessionId));
-
-    expect(handoffCalls).toHaveLength(1);
-    expect(handoffCalls[0]).toEqual({
-      agent: 'live-agent',
-      sessionId: 'live-session',
+    // seq < boundary => no nav
+    await dispatch({
+      type: 'CUSTOM',
+      name: 'session_handoff',
+      value: { agent: 'target', session_id: 's1', after_seq: 6 },
     });
-    expect(isHandoffConsumed(sourceSessionId, toolCallId)).toBe(true);
+    expect(onHandoff).not.toHaveBeenCalled();
 
-    // Second: hydrated event arrives (isRunActive: false) - same marker
-    handoffCalls = [];
-    const hydratedCallbacks = {
-      ...makeCallbacks(sourceSessionId),
-      isRunActive: false,
-    };
-    handleHarnxCustomEvent('session_handoff', {
-      agent: 'live-agent',
-      session_id: 'live-session',
-      handoff_tool_call_id: toolCallId,
-    }, hydratedCallbacks as any);
+    // seq > boundary => nav once
+    await dispatch({
+      type: 'CUSTOM',
+      name: 'session_handoff',
+      value: { agent: 'target', session_id: 's1', after_seq: 8 },
+    });
+    expect(onHandoff).toHaveBeenCalledTimes(1);
+    expect(onHandoff).toHaveBeenCalledWith('target', 's1');
 
-    // Should NOT fire again - marker already consumed
-    expect(handoffCalls).toHaveLength(0);
+    // deliver 8 again => still no additional nav
+    await dispatch({
+      type: 'CUSTOM',
+      name: 'session_handoff',
+      value: { agent: 'target', session_id: 's1', after_seq: 8 },
+    });
+    expect(onHandoff).toHaveBeenCalledTimes(1);
+
+    // then seq=9 => nav again
+    await dispatch({
+      type: 'CUSTOM',
+      name: 'session_handoff',
+      value: { agent: 'target2', session_id: 's2', after_seq: 9 },
+    });
+    expect(onHandoff).toHaveBeenCalledTimes(2);
+    expect(onHandoff).toHaveBeenLastCalledWith('target2', 's2');
   });
 
-  it('ignores hydrated replay when marker is missing or blank', () => {
-    const sourceSessionId = 'session-replay-no-marker';
-    const hydratedCallbacks = {
-      ...makeCallbacks(sourceSessionId),
-      isRunActive: false,
-    };
+  it('fails closed when handoff arrives before any session_attach_boundary', async () => {
+    const { dispatch, onHandoff } = createAgent();
 
-    // 1. handoff_tool_call_id completely omitted
-    handleHarnxCustomEvent('session_handoff', {
-      agent: 'target-agent',
-      session_id: 'target-session',
-    }, hydratedCallbacks as any);
-    expect(handoffCalls).toHaveLength(0);
-
-    // 2. handoff_tool_call_id is empty string
-    handleHarnxCustomEvent('session_handoff', {
-      agent: 'target-agent',
-      session_id: 'target-session',
-      handoff_tool_call_id: '',
-    }, hydratedCallbacks as any);
-    expect(handoffCalls).toHaveLength(0);
-
-    // 3. handoff_tool_call_id is blank string
-    handleHarnxCustomEvent('session_handoff', {
-      agent: 'target-agent',
-      session_id: 'target-session',
-      handoff_tool_call_id: '   ',
-    }, hydratedCallbacks as any);
-    expect(handoffCalls).toHaveLength(0);
+    await dispatch({
+      type: 'CUSTOM',
+      name: 'session_handoff',
+      value: { agent: 'target', session_id: 's1', after_seq: 10 },
+    });
+    expect(onHandoff).not.toHaveBeenCalled();
   });
 
-  it('ignores hydrated replay when sourceSessionId is missing', () => {
-    const hydratedCallbacks = {
-      ...makeCallbacks(), // sourceSessionId undefined
-      isRunActive: false,
-    };
+  it('fails closed on invalid afterSeq values', async () => {
+    const { dispatch, onHandoff } = createAgent();
 
-    handleHarnxCustomEvent('session_handoff', {
-      agent: 'target-agent',
-      session_id: 'target-session',
-      handoff_tool_call_id: 'tool-call-123',
-    }, hydratedCallbacks as any);
+    await dispatch({
+      type: 'CUSTOM',
+      name: 'session_attach_boundary',
+      value: { attached_seq: 5 },
+    });
 
-    expect(handoffCalls).toHaveLength(0);
+    const invalidValues = [
+      undefined,
+      null,
+      -1,
+      -10,
+      6.5,
+      Number.MAX_SAFE_INTEGER + 100,
+      '8',
+      NaN,
+      Infinity,
+      -Infinity,
+      {},
+      [],
+    ];
+
+    for (const invalidSeq of invalidValues) {
+      await dispatch({
+        type: 'CUSTOM',
+        name: 'session_handoff',
+        value: { agent: 'target', session_id: 's1', after_seq: invalidSeq },
+      });
+      expect(onHandoff).not.toHaveBeenCalled();
+    }
+  });
+
+  it('prevents re-navigation on reload (issue #1803)', async () => {
+    const onHandoffA = vi.fn();
+    const clientA = createAgent(onHandoffA);
+
+    await clientA.dispatch({
+      type: 'CUSTOM',
+      name: 'session_attach_boundary',
+      value: { attached_seq: 7 },
+    });
+
+    // Live handoff arrives
+    await clientA.dispatch({
+      type: 'CUSTOM',
+      name: 'session_handoff',
+      value: { agent: 'target', session_id: 'target-session', after_seq: 8 },
+    });
+    expect(onHandoffA).toHaveBeenCalledWith('target', 'target-session');
+
+    // Reload creates a fresh agent instance for the source session view
+    const onHandoffB = vi.fn();
+    const clientB = createAgent(onHandoffB);
+
+    // After commit, durable tail is at least 8 (here attach boundary is 9)
+    await clientB.dispatch({
+      type: 'CUSTOM',
+      name: 'session_attach_boundary',
+      value: { attached_seq: 9 },
+    });
+
+    // Replayed handoff arrives from history
+    await clientB.dispatch({
+      type: 'CUSTOM',
+      name: 'session_handoff',
+      value: { agent: 'target', session_id: 'target-session', after_seq: 8 },
+    });
+    expect(onHandoffB).not.toHaveBeenCalled();
+  });
+
+  it('prevents navigation for second client attaching to already-handed-off session', async () => {
+    const { dispatch, onHandoff } = createAgent();
+
+    // Client attaches when durable tail is 8 (the handoff has already been committed)
+    await dispatch({
+      type: 'CUSTOM',
+      name: 'session_attach_boundary',
+      value: { attached_seq: 8 },
+    });
+
+    // Replayed handoff with after_seq 8
+    await dispatch({
+      type: 'CUSTOM',
+      name: 'session_handoff',
+      value: { agent: 'target', session_id: 'target-session', after_seq: 8 },
+    });
+    expect(onHandoff).not.toHaveBeenCalled();
+  });
+
+  it('gates markerless handoff purely on seq', async () => {
+    const { dispatch, onHandoff } = createAgent();
+
+    await dispatch({
+      type: 'CUSTOM',
+      name: 'session_attach_boundary',
+      value: { attached_seq: 10 },
+    });
+
+    // Markerless handoff with seq <= boundary => no nav
+    await dispatch({
+      type: 'CUSTOM',
+      name: 'session_handoff',
+      value: { agent: 'target', session_id: 'target-session', after_seq: 10 },
+    });
+    expect(onHandoff).not.toHaveBeenCalled();
+
+    // Markerless handoff with seq > boundary => navigates
+    await dispatch({
+      type: 'CUSTOM',
+      name: 'session_handoff',
+      value: { agent: 'target', session_id: 'target-session', after_seq: 11 },
+    });
+    expect(onHandoff).toHaveBeenCalledWith('target', 'target-session');
+  });
+
+  describe('handleHarnxCustomEvent handler units', () => {
+    const makeCallbacks = (overrides?: Partial<HarnxCustomEventCallbacks>): HarnxCustomEventCallbacks => ({
+      onStatus: vi.fn(),
+      onRunFailed: vi.fn(),
+      onUsage: vi.fn(),
+      onToolSummary: vi.fn(),
+      ...overrides,
+    });
+
+    it('dispatches session_attach_boundary when attached_seq is valid', () => {
+      const onAttachBoundary = vi.fn();
+      const callbacks = makeCallbacks({ onAttachBoundary });
+
+      handleHarnxCustomEvent('session_attach_boundary', { attached_seq: 42 }, callbacks);
+      expect(onAttachBoundary).toHaveBeenCalledWith(42);
+
+      handleHarnxCustomEvent('session_attach_boundary', { attached_seq: 0 }, callbacks);
+      expect(onAttachBoundary).toHaveBeenCalledWith(0);
+    });
+
+    it('ignores session_attach_boundary when attached_seq is invalid or missing', () => {
+      const onAttachBoundary = vi.fn();
+      const callbacks = makeCallbacks({ onAttachBoundary });
+
+      handleHarnxCustomEvent('session_attach_boundary', {}, callbacks);
+      handleHarnxCustomEvent('session_attach_boundary', { attached_seq: -1 }, callbacks);
+      handleHarnxCustomEvent('session_attach_boundary', { attached_seq: 1.5 }, callbacks);
+      handleHarnxCustomEvent('session_attach_boundary', { attached_seq: '42' }, callbacks);
+      handleHarnxCustomEvent('session_attach_boundary', { attached_seq: null }, callbacks);
+      expect(onAttachBoundary).not.toHaveBeenCalled();
+    });
+
+    it('dispatches session_handoff when after_seq is valid', () => {
+      const onHandoff = vi.fn();
+      const callbacks = makeCallbacks({ onHandoff });
+
+      handleHarnxCustomEvent(
+        'session_handoff',
+        { agent: 'agent1', session_id: 'sess1', after_seq: 15 },
+        callbacks
+      );
+      expect(onHandoff).toHaveBeenCalledWith('agent1', 'sess1', 15);
+    });
+
+    it('ignores session_handoff when after_seq or target is invalid', () => {
+      const onHandoff = vi.fn();
+      const callbacks = makeCallbacks({ onHandoff });
+
+      // Missing after_seq
+      handleHarnxCustomEvent(
+        'session_handoff',
+        { agent: 'agent1', session_id: 'sess1' },
+        callbacks
+      );
+      // Negative after_seq
+      handleHarnxCustomEvent(
+        'session_handoff',
+        { agent: 'agent1', session_id: 'sess1', after_seq: -1 },
+        callbacks
+      );
+      // Blank agent
+      handleHarnxCustomEvent(
+        'session_handoff',
+        { agent: '   ', session_id: 'sess1', after_seq: 5 },
+        callbacks
+      );
+      // Blank session_id
+      handleHarnxCustomEvent(
+        'session_handoff',
+        { agent: 'agent1', session_id: '', after_seq: 5 },
+        callbacks
+      );
+      expect(onHandoff).not.toHaveBeenCalled();
+    });
   });
 });

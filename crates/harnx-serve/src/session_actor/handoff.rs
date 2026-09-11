@@ -111,6 +111,7 @@ impl SessionActor {
                 agent,
                 session_id,
                 handoff_tool_call_id,
+                after_seq: None,
             }));
         self.finish_run(done, None);
         self.state = SessionState::Idle;

@@ -145,7 +145,13 @@ impl HandoffFixture {
             .await?;
         let source_entries = self.log(&source).load_events_async().await?;
         assert_explicit_source(&source_entries);
-        assert_explicit_events(observe_source_handoff(stream).await?);
+        let handoff_seq = source_entries
+            .iter()
+            .find_map(|(seq, entry)| {
+                matches!(entry, SessionLogEntry::HandoffCommitted { .. }).then_some(*seq)
+            })
+            .expect("source log must contain durable handoff commit");
+        assert_explicit_events(observe_source_handoff(stream).await?, handoff_seq);
 
         let entries = wait_for_handoff_target(explicit_log, "finish explicit work").await?;
         assert_handoff_target_log(&entries, "finish explicit work");
@@ -170,7 +176,7 @@ impl HandoffFixture {
             .run_turn("generated handoff", Arc::new(NullSink), None)
             .await?;
         let observed = observe_source_handoff(stream).await?;
-        let (agent, target_id) = observed
+        let (agent, target_id, _) = observed
             .committed
             .as_ref()
             .expect("generated handoff must commit a destination");
@@ -363,7 +369,7 @@ fn message(id: &str, role: MessageRole, text: &str) -> SessionLogEntry {
 #[derive(Default)]
 struct ObservedHandoff {
     requested: Option<(String, Option<String>)>,
-    committed: Option<(String, String)>,
+    committed: Option<(String, String, Option<u64>)>,
     order: Vec<&'static str>,
 }
 
@@ -381,10 +387,13 @@ async fn observe_source_handoff(mut stream: SessionEventStream) -> Result<Observ
                 observed.requested = Some((agent, session_id));
             }
             AgentEvent::Session(SessionEvent::HandoffCommitted {
-                agent, session_id, ..
+                agent,
+                session_id,
+                after_seq,
+                ..
             }) => {
                 observed.order.push("committed");
-                observed.committed = Some((agent, session_id));
+                observed.committed = Some((agent, session_id, after_seq));
             }
             AgentEvent::Turn(TurnEvent::Ended { .. }) => {
                 observed.order.push("ended");
@@ -414,7 +423,7 @@ fn assert_explicit_source(entries: &[(u64, SessionLogEntry)]) {
     );
 }
 
-fn assert_explicit_events(observed: ObservedHandoff) {
+fn assert_explicit_events(observed: ObservedHandoff, durable_handoff_seq: u64) {
     assert_eq!(
         observed.requested,
         Some((
@@ -426,7 +435,8 @@ fn assert_explicit_events(observed: ObservedHandoff) {
         observed.committed,
         Some((
             "delegate-agent@local".to_string(),
-            EXPLICIT_TARGET_ID.to_string()
+            EXPLICIT_TARGET_ID.to_string(),
+            Some(durable_handoff_seq),
         ))
     );
     assert_eq!(observed.order, ["requested", "committed", "ended"]);

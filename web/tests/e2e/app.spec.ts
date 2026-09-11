@@ -59,6 +59,12 @@ test('committed handoff navigates and hydrates the durable target session', asyn
     'Durable handoff target history',
   );
   await expect(page.locator('.aui-composer-send')).toHaveText('Send');
+
+  // Verify reload safety (#1803): re-attaching to the source session replays the handoff
+  // as history (after_seq <= attached_seq), which must NOT trigger re-navigation.
+  await page.goto('/agents/coding%2Fcoder/sessions/session-1?scenario=happy');
+  await expect(page).toHaveURL(/\/agents\/coding%2Fcoder\/sessions\/session-1/);
+  await expect(page.locator('.aui-composer-send')).toHaveText('Send');
 });
 
 test('sub-agent row transitions, opens the child, and browser Back returns to the parent', async ({ page }) => {

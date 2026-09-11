@@ -157,6 +157,8 @@ pub enum SessionEvent {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         handoff_tool_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_seq: Option<u64>,
     },
     Saved {
         path: PathBuf,

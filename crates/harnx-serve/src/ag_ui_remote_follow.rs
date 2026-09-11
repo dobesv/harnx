@@ -26,7 +26,8 @@ use tokio_stream::{Stream, StreamExt as _};
 use crate::ag_ui::UsageContextSnapshot;
 
 use crate::{
-    ag_ui::{frame_event, snapshot_event, AgUiError, AgUiSink},
+    ag_ui::{frame_event, AgUiError, AgUiSink},
+    ag_ui_attach::{session_attach_boundary_event, snapshot_event},
     ag_ui_sync::{frame_run_boundary_event, history_warning_event},
     session_actor::SubscribeResult,
 };
@@ -168,6 +169,9 @@ async fn build_remote_follow_event_stream(
         params.thread_id,
         params.run_id,
     ));
+    let boundary_frame = Bytes::from(super::ag_ui::frame_event(&session_attach_boundary_event(
+        event_stream.last_applied_seq(),
+    ))?);
 
     // Compute through_seq from the single history snapshot (avoiding duplicate load).
     let through_seq = last_user_sequence(event_stream.history());
@@ -184,7 +188,7 @@ async fn build_remote_follow_event_stream(
             .filter_map(|e| super::ag_ui::frame_event(&e).ok().map(Bytes::from))
             .collect();
         return Ok(completed_remote_stream(
-            started_frame,
+            [started_frame, boundary_frame],
             params.snapshot_frame,
             control_frames,
             params.thread_id,
@@ -197,6 +201,7 @@ async fn build_remote_follow_event_stream(
         jetstream,
         session_id: params.session_id.to_string(),
         started_frame,
+        boundary_frame,
         snapshot_frame: params.snapshot_frame,
         thread_id: params.thread_id.to_string(),
         run_id: params.run_id.to_string(),
@@ -218,6 +223,7 @@ struct LiveFollowParams {
     jetstream: JetstreamContext,
     session_id: String,
     started_frame: Bytes,
+    boundary_frame: Bytes,
     snapshot_frame: Option<Bytes>,
     thread_id: String,
     run_id: String,
@@ -248,7 +254,7 @@ fn build_live_follow_stream(params: LiveFollowParams) -> AgUiEventStream {
         through_seq: params.through_seq,
     });
 
-    let initial_frames = vec![params.started_frame]
+    let initial_frames = vec![params.started_frame, params.boundary_frame]
         .into_iter()
         .chain(params.snapshot_frame)
         .chain(control_frames);
@@ -263,14 +269,14 @@ fn build_live_follow_stream(params: LiveFollowParams) -> AgUiEventStream {
 }
 
 pub(crate) fn completed_remote_stream(
-    started_frame: Bytes,
+    initial_frames: [Bytes; 2],
     snapshot_frame: Option<Bytes>,
     control_frames: Vec<Bytes>,
     thread_id: &str,
     run_id: &str,
 ) -> AgUiEventStream {
     let finished_frame = Bytes::from(frame_run_boundary_event("RUN_FINISHED", thread_id, run_id));
-    let frames: Vec<Bytes> = vec![started_frame]
+    let frames: Vec<Bytes> = initial_frames
         .into_iter()
         .chain(snapshot_frame)
         .chain(control_frames)

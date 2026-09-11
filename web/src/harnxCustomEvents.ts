@@ -1,36 +1,21 @@
 import type { UsageData } from './UsageContext';
 import { setDocumentTitle } from './sessionTitle';
 
-/** Global map tracking consumed handoff markers to prevent re-navigation. */
-const consumedHandoffs = new Map<string, Set<string>>();
-
-/** Check if a handoff marker has been consumed for a source session. */
-export function isHandoffConsumed(sourceSessionId: string, handoffToolCallId: string): boolean {
-  const sessionSet = consumedHandoffs.get(sourceSessionId);
-  return sessionSet?.has(handoffToolCallId) ?? false;
-}
-
-/** Mark a handoff marker as consumed for a source session. */
-export function markHandoffConsumed(sourceSessionId: string, handoffToolCallId: string): void {
-  let sessionSet = consumedHandoffs.get(sourceSessionId);
-  if (!sessionSet) {
-    sessionSet = new Set();
-    consumedHandoffs.set(sourceSessionId, sessionSet);
-  }
-  sessionSet.add(handoffToolCallId);
-}
+/**
+ * Internal Harnx control events that drive navigation and sequence gating,
+ * but must NOT be forwarded to the assistant-ui runtime (they are not chat content).
+ */
+export const NAVIGATION_CONTROL_EVENTS = ['session_attach_boundary', 'session_handoff'] as const;
 
 export interface HarnxCustomEventCallbacks {
   onStatus: (text: string | null) => void;
   onRunFailed: (message: string) => void;
   onUsage: (usage: UsageData) => void;
   onToolSummary: (id: string, summary: string) => void;
-  onHandoff?: (agent: string, sessionId: string) => void;
+  onAttachBoundary?: (seq: number) => void;
+  onHandoff?: (agent: string, sessionId: string, afterSeq: number) => void;
   /** Called when a hitl_pending_approval CUSTOM event is received. */
   onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
-  isRunActive: boolean;
-  /** Source session ID for handoff deduplication (set by ChatProvider). */
-  sourceSessionId?: string;
 }
 
 type CustomEventHandler = (callbacks: HarnxCustomEventCallbacks, value: unknown) => void;
@@ -72,12 +57,22 @@ function isUsageData(value: unknown): value is UsageData {
   );
 }
 
-function handoffTarget(value: unknown): { agent: string; sessionId: string; toolCallId?: string } | undefined {
+function validSeq(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function handoffTarget(value: unknown): {
+  agent: string;
+  sessionId: string;
+  toolCallId?: string;
+  afterSeq?: number;
+} | undefined {
   const handoff = eventRecord(value);
   const agent = nonBlankString(handoff.agent);
   const sessionId = nonBlankString(handoff.session_id);
   const toolCallId = nonBlankString(handoff.handoff_tool_call_id);
-  return agent && sessionId ? { agent, sessionId, toolCallId } : undefined;
+  const afterSeq = validSeq(handoff.after_seq) ? handoff.after_seq : undefined;
+  return agent && sessionId ? { agent, sessionId, toolCallId, afterSeq } : undefined;
 }
 
 const handlers: Record<string, CustomEventHandler> = {
@@ -105,24 +100,16 @@ const handlers: Record<string, CustomEventHandler> = {
     console.error('session_history_warning:', message);
     callbacks.onRunFailed(message);
   },
+  session_attach_boundary: (callbacks, value) => {
+    const raw = eventRecord(value).attached_seq;
+    if (validSeq(raw)) {
+      callbacks.onAttachBoundary?.(raw);
+    }
+  },
   session_handoff: (callbacks, value) => {
     const target = handoffTarget(value);
-    if (!target) return;
-
-    const hasMarker = Boolean(target.toolCallId && callbacks.sourceSessionId);
-
-    // On hydrated replay (!isRunActive), require both a non-blank toolCallId and
-    // sourceSessionId. Without them we can't dedupe, so ignore to prevent
-    // spurious re-navigation. Live events (isRunActive) always navigate.
-    if (!callbacks.isRunActive && !hasMarker) return;
-
-    // With a marker, dedupe: skip if already navigated, else record it.
-    if (hasMarker) {
-      if (isHandoffConsumed(callbacks.sourceSessionId!, target.toolCallId!)) return;
-      markHandoffConsumed(callbacks.sourceSessionId!, target.toolCallId!);
-    }
-
-    callbacks.onHandoff?.(target.agent, target.sessionId);
+    if (!target || target.afterSeq === undefined) return;
+    callbacks.onHandoff?.(target.agent, target.sessionId, target.afterSeq);
   },
   hitl_pending_approval: (callbacks, value) => {
     const toolCallId = stringField(value, 'tool_call_id');
