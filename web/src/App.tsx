@@ -364,26 +364,28 @@ const UsageIndicator = ({ usage }: { usage: UsageData }) => {
   );
 };
 
-const StatusBar = () => {
+export const StatusBar = () => {
   const { statusText } = useContext(PendingContext);
   const { usage } = useContext(UsageContext);
   const isRunning = useAuiState(s => s.thread.isRunning);
 
-  if (!isRunning && !usage && !statusText) return null;
-
   return (
-    <div className="aui-status-bar">
-      <StatusIndicator isRunning={isRunning} statusText={statusText} />
-      {usage && <UsageIndicator usage={usage} />}
+    <div role="status" aria-live="polite" aria-atomic="true">
+      {(isRunning || usage || statusText) && (
+        <div className="aui-status-bar">
+          <StatusIndicator isRunning={isRunning} statusText={statusText} />
+          {usage && <UsageIndicator usage={usage} />}
+        </div>
+      )}
     </div>
   );
 };
 
-const SendErrorIndicator = () => {
+export const SendErrorIndicator = () => {
   const { errorText } = useContext(PendingContext);
   if (!errorText) return null;
   return (
-    <div role="alert" className="aui-error" data-testid="send-error">
+    <div role="alert" aria-live="assertive" className="aui-error" data-testid="send-error">
       {errorText}
     </div>
   );
@@ -469,6 +471,7 @@ export const BatchInterruptUI = ({ agentName, sessionId }: { agentName: string; 
 
         <div className="aui-interrupt-actions" style={{ marginTop: '10px', display: 'flex', gap: '10px' }}>
           <button
+            type="button"
             disabled={submitting}
             onClick={() => handleDecision(true)}
             className="aui-interrupt-submit"
@@ -477,6 +480,7 @@ export const BatchInterruptUI = ({ agentName, sessionId }: { agentName: string; 
             Approve
           </button>
           <button
+            type="button"
             disabled={submitting}
             onClick={() => handleDecision(false)}
             className="aui-interrupt-submit"

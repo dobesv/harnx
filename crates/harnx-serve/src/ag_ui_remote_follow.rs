@@ -499,12 +499,5 @@ fn compute_usage_context(
         base_session.clone(),
     )
     .ok()?;
-    let (context_tokens, context_percent) = session.tokens_usage();
-    let max_context_tokens = session.model().max_input_tokens();
-
-    Some(UsageContextSnapshot {
-        context_tokens,
-        max_context_tokens,
-        context_percent: max_context_tokens.map(|_| context_percent),
-    })
+    Some(UsageContextSnapshot::from_session(&session))
 }

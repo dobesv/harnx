@@ -187,24 +187,13 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
         .await;
     }
 
-    let activation_route = activation_route_for_cluster(
-        LOCAL_CLUSTER_KEY,
-        &params.local_worker,
-        params.abort_signal.clone(),
-    )
-    .await?;
-    let initializer = {
-        let config = params.prompt_config.read();
-        harnx_runtime::SessionInitializer::named_from_config(params.agent.clone(), &config)
-    };
-    let session = NatsSession::from_global_config(
-        NatsSessionConfig {
-            cluster: LOCAL_CLUSTER_KEY.to_string(),
-            initializer,
-            session_id: Some(params.session_id.clone()),
-            activation_route,
-        },
+    let session = open_actor_nats_session(
         &params.prompt_config,
+        &params.local_worker,
+        SessionKey {
+            agent: params.agent.clone(),
+            session: params.session_id.clone(),
+        },
         params.abort_signal,
     )
     .await?;
@@ -224,6 +213,31 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
         .run_turn_input(&input, attachments_dir.as_deref(), params.sink, None)
         .await
         .map(|_| harnx_runtime::LoopResult::Completed)
+}
+
+async fn open_actor_nats_session(
+    prompt_config: &GlobalConfig,
+    local_worker: &Arc<Mutex<Option<LocalWorkerSupervisor>>>,
+    key: SessionKey,
+    abort_signal: AbortSignal,
+) -> anyhow::Result<NatsSession> {
+    let activation_route =
+        activation_route_for_cluster(LOCAL_CLUSTER_KEY, local_worker, abort_signal.clone()).await?;
+    let initializer = {
+        let config = prompt_config.read();
+        harnx_runtime::SessionInitializer::named_from_config(key.agent, &config)
+    };
+    NatsSession::from_global_config(
+        NatsSessionConfig {
+            cluster: LOCAL_CLUSTER_KEY.to_string(),
+            initializer,
+            session_id: Some(key.session),
+            activation_route,
+        },
+        prompt_config,
+        abort_signal,
+    )
+    .await
 }
 
 fn test_injection_channel(
@@ -257,24 +271,10 @@ impl SessionActor {
             &key,
             actor_config.call_fn.is_some(),
         );
-        let activation_route = activation_route_for_cluster(
-            LOCAL_CLUSTER_KEY,
-            &actor_config.local_worker,
-            create_abort_signal(),
-        )
-        .await?;
-        let initializer = {
-            let config = prompt_config.read();
-            harnx_runtime::SessionInitializer::named_from_config(key.agent, &config)
-        };
-        let session = NatsSession::from_global_config(
-            NatsSessionConfig {
-                cluster: LOCAL_CLUSTER_KEY.to_string(),
-                initializer,
-                session_id: Some(key.session),
-                activation_route,
-            },
+        let session = open_actor_nats_session(
             &prompt_config,
+            &actor_config.local_worker,
+            key,
             create_abort_signal(),
         )
         .await?;
@@ -362,6 +362,9 @@ impl SessionActor {
                 let _ = reply.send(result);
             }
             SessionCommand::Cancel { reply } => {
+                // Cancel affects queued prompts and the active run. Approval routing
+                // completes independently: its worker may already have committed a
+                // decision, so dropping the routing task cannot revoke that decision.
                 self.pending.clear();
                 if let Some(active_run) = &self.active_run {
                     active_run.abort_signal.set_ctrlc();
@@ -686,13 +689,7 @@ impl SessionActor {
             {
                 Ok((session, entries, base_session)) if session.agent_name.as_deref() == Some(self.key.agent.as_str()) => {
                     // Capture session tokens usage for context fields on hydrated usage events
-                    let (context_tokens, context_percent) = session.tokens_usage();
-                    let max_context_tokens = session.model().max_input_tokens();
-                    let tokens_usage = Some(crate::ag_ui::UsageContextSnapshot {
-                        context_tokens,
-                        max_context_tokens,
-                        context_percent: max_context_tokens.map(|_| context_percent),
-                    });
+                    let tokens_usage = Some(crate::ag_ui::UsageContextSnapshot::from_session(&session));
                     (
                         crate::ag_ui::history_messages_for_snapshot(&session.messages),
                         session.replay_warnings,
@@ -893,13 +890,7 @@ fn usage_context_snapshot(
     let prompt_config = prompt_config_for_agent_session_from_global(base_config, key, false);
     let config = prompt_config.read();
     let session = config.session.as_ref()?;
-    let (context_tokens, percent) = session.tokens_usage();
-    let max_context_tokens = session.model().max_input_tokens();
-    Some(crate::ag_ui::UsageContextSnapshot {
-        context_tokens,
-        max_context_tokens,
-        context_percent: max_context_tokens.map(|_| percent),
-    })
+    Some(crate::ag_ui::UsageContextSnapshot::from_session(session))
 }
 
 fn base_event() -> BaseEvent {
@@ -1008,7 +999,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hitl_approval_routing_does_not_block_cancel_command() {
+    async fn hitl_approval_routing_survives_cancel_command() {
+        harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let registry = SessionRegistry::new_for_tests(
@@ -1042,6 +1034,12 @@ mod tests {
             .expect("Cancel must remain responsive while approval routing is in flight");
 
         drop(worker_guard);
+        let result = tokio::time::timeout(Duration::from_secs(10), approval_reply_rx)
+            .await
+            .expect("approval routing must complete after Cancel")
+            .expect("Cancel must not drop the approval reply")
+            .expect("approval routing succeeds");
+        assert!(!result, "the session has no pending approval to apply");
     }
     fn load_session_messages(agent: &str, session_id: &str) -> Vec<Message> {
         super::load_test_session_messages(agent, session_id)
