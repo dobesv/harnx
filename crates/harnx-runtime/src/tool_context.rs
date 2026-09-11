@@ -145,6 +145,12 @@ fn cache_discovery<K: Clone + Eq + std::hash::Hash, T>(
     let mut cache = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache
+        .get(&key)
+        .is_some_and(|entry| entry.discovered_at > discovered_at)
+    {
+        return;
+    }
     // Execution-scoped keys may never be read again after completion, so writes
     // must prune stale entries too. The capacity also bounds short-lived bursts;
     // refreshing an existing execution never evicts another provider.
@@ -510,6 +516,29 @@ mod tests {
                 .get(&0)
                 .and_then(|entry| entry.provider.as_ref())
                 .expect("refreshed entry retained")
+        ));
+    }
+
+    #[test]
+    fn discovery_cache_rejects_out_of_order_refresh() {
+        let cache = std::sync::Mutex::new(HashMap::new());
+        let discovered_at = Instant::now();
+        let newer_provider = Arc::new("newer");
+        cache_discovery(
+            &cache,
+            "key",
+            Some(Arc::clone(&newer_provider)),
+            discovered_at + Duration::from_secs(1),
+        );
+
+        cache_discovery(&cache, "key", Some(Arc::new("older")), discovered_at);
+
+        let cache = cache.lock().expect("cache lock");
+        let entry = cache.get("key").expect("newer entry retained");
+        assert_eq!(entry.discovered_at, discovered_at + Duration::from_secs(1));
+        assert!(Arc::ptr_eq(
+            &newer_provider,
+            entry.provider.as_ref().expect("newer provider retained")
         ));
     }
 
