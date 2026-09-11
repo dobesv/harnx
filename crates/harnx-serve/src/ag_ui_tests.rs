@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 
 #[path = "ag_ui_handoff_tests.rs"]
 mod handoff_tests;
+#[path = "ag_ui_remote_follow_tests.rs"]
+mod remote_follow_tests;
 
 fn collect_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>) -> Vec<Event> {
     let mut events = Vec::new();
@@ -35,6 +37,11 @@ fn assert_event_type_sequence(events: &[Value], expected: &[&str]) {
         .map(|event| event["type"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert_eq!(event_types, expected);
+}
+
+fn assert_attach_boundary(event: &Value, attached_seq: u64) {
+    assert_eq!(event["name"], "session_attach_boundary");
+    assert_eq!(event["value"]["attached_seq"], attached_seq);
 }
 
 fn ag_ui_test_registry(
@@ -1220,6 +1227,7 @@ async fn ag_ui_run_streams_ordered_events_with_stubbed_call_fn() {
         event_types,
         vec![
             "RUN_STARTED",
+            "CUSTOM",
             "TEXT_MESSAGE_START",
             "TEXT_MESSAGE_CONTENT",
             "TEXT_MESSAGE_END",
@@ -1231,20 +1239,20 @@ async fn ag_ui_run_streams_ordered_events_with_stubbed_call_fn() {
         Some(run_id_uuid.to_string().as_str())
     );
     assert_eq!(
-        parsed_events[4]["runId"].as_str(),
+        parsed_events[5]["runId"].as_str(),
         Some(run_id_uuid.to_string().as_str())
     );
+    assert_attach_boundary(&parsed_events[1], 0);
+    assert_eq!(parsed_events[3]["delta"].as_str(), Some("chunk-text"));
 
-    assert_eq!(parsed_events[2]["delta"].as_str(), Some("chunk-text"));
-
-    let text_message_id = parsed_events[1]["messageId"].as_str().unwrap().to_string();
+    let text_message_id = parsed_events[2]["messageId"].as_str().unwrap().to_string();
     assert_eq!(
-        parsed_events[2]["messageId"].as_str(),
+        parsed_events[3]["messageId"].as_str(),
         Some(text_message_id.as_str())
     );
     // TEXT_MESSAGE_END (next frame) must carry same messageId as streamed content.
     assert_eq!(
-        parsed_events[3]["messageId"].as_str(),
+        parsed_events[4]["messageId"].as_str(),
         Some(text_message_id.as_str())
     );
 
@@ -1428,13 +1436,14 @@ async fn ag_ui_run_emits_run_error_without_run_finished_when_call_fn_fails() {
         event_types,
         vec![
             "RUN_STARTED",
+            "CUSTOM",
             "TEXT_MESSAGE_START",
             "TEXT_MESSAGE_END",
             "RUN_ERROR",
         ]
     );
     assert_eq!(
-        parsed_events[3]["message"].as_str(),
+        parsed_events[4]["message"].as_str(),
         Some("stubbed call failure")
     );
     assert!(parsed_events
@@ -1551,7 +1560,7 @@ async fn ag_ui_run_idle_join_snapshot_and_close() {
     .await;
     assert_event_type_sequence(
         &events,
-        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "RUN_FINISHED"],
+        &["RUN_STARTED", "CUSTOM", "MESSAGES_SNAPSHOT", "RUN_FINISHED"],
     );
 }
 
@@ -1610,10 +1619,11 @@ async fn ag_ui_run_empty_messages_join_only_snapshot_no_new_run() {
     )
     .await
     .expect("join only");
-    let events = read_sse_events_until(response, |events| events.len() >= 3).await;
+    let events = read_sse_events_until(response, |events| events.len() >= 4).await;
     assert_eq!(events[0]["type"], "RUN_STARTED");
-    assert_eq!(events[1]["type"], "MESSAGES_SNAPSHOT");
-    assert_eq!(events[2]["type"], "RUN_FINISHED");
+    assert_eq!(events[1]["name"], "session_attach_boundary");
+    assert_eq!(events[2]["type"], "MESSAGES_SNAPSHOT");
+    assert_eq!(events[3]["type"], "RUN_FINISHED");
 }
 
 #[tokio::test]
@@ -1675,15 +1685,15 @@ async fn ag_ui_run_promptless_join_returns_persisted_history_in_snapshot() {
     )
     .await
     .expect("promptless join");
-    let events = read_sse_events_until(response, |events| events.len() >= 3).await;
+    let events = read_sse_events_until(response, |events| events.len() >= 4).await;
 
-    // Expected sequence: RUN_STARTED → MESSAGES_SNAPSHOT (with prior messages) → RUN_FINISHED
     assert_eq!(events[0]["type"], "RUN_STARTED");
-    assert_eq!(events[1]["type"], "MESSAGES_SNAPSHOT");
-    assert_eq!(events[2]["type"], "RUN_FINISHED");
+    assert_eq!(events[1]["name"], "session_attach_boundary");
+    assert_eq!(events[2]["type"], "MESSAGES_SNAPSHOT");
+    assert_eq!(events[3]["type"], "RUN_FINISHED");
 
     // Verify snapshot contains the seeded history (at minimum user + assistant)
-    let snapshot = &events[1]["messages"];
+    let snapshot = &events[2]["messages"];
     assert!(
         snapshot.is_array(),
         "MESSAGES_SNAPSHOT should have messages array"
@@ -1786,13 +1796,15 @@ async fn ag_ui_run_uses_only_last_message_user_prompt() {
         event_types,
         vec![
             "RUN_STARTED",
+            "CUSTOM",
             "TEXT_MESSAGE_START",
             "TEXT_MESSAGE_CONTENT",
             "TEXT_MESSAGE_END",
             "RUN_FINISHED",
         ]
     );
-    assert_eq!(events[2]["delta"].as_str(), Some("assistant2"));
+    assert_eq!(events[1]["name"], "session_attach_boundary");
+    assert_eq!(events[3]["delta"].as_str(), Some("assistant2"));
 }
 
 #[tokio::test]
@@ -2416,7 +2428,8 @@ async fn ag_ui_run_promptless_join_forwards_live_events_when_session_active() {
         events
     );
     assert_eq!(events[0]["type"], "RUN_STARTED");
-    assert_eq!(events[1]["type"], "MESSAGES_SNAPSHOT");
+    assert_attach_boundary(&events[1], 0);
+    assert_eq!(events[2]["type"], "MESSAGES_SNAPSHOT");
     let live_index = events
         .iter()
         .position(|event| event["type"] == "TEXT_MESSAGE_CONTENT")
@@ -2504,10 +2517,18 @@ async fn promptless_active_reconnect_hydrates_control_before_live_events() {
     let events = decode_sse_bytes_chunks(tokio_stream::StreamExt::collect::<Vec<_>>(stream).await);
     assert_event_type_sequence(
         &events,
-        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "CUSTOM", "RUN_FINISHED"],
+        &[
+            "RUN_STARTED",
+            "CUSTOM",
+            "MESSAGES_SNAPSHOT",
+            "CUSTOM",
+            "RUN_FINISHED",
+        ],
     );
-    assert_eq!(events[2]["name"], "session_handoff");
-    assert_eq!(events[2]["value"]["handoff_tool_call_id"], "handoff-call");
+    assert_attach_boundary(&events[1], 1);
+    assert_eq!(events[3]["name"], "session_handoff");
+    assert_eq!(events[3]["value"]["handoff_tool_call_id"], "handoff-call");
+    assert_eq!(events[3]["value"]["after_seq"], 1);
 }
 
 #[tokio::test]
@@ -3122,7 +3143,7 @@ async fn ag_ui_run_empty_last_user_message_joins_only_and_does_not_start_run() {
     assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_event_type_sequence(
         &read.events,
-        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "RUN_FINISHED"],
+        &["RUN_STARTED", "CUSTOM", "MESSAGES_SNAPSHOT", "RUN_FINISHED"],
     );
     assert!(
         load_session_messages(&config, "plain", "empty-last-user").is_empty(),
@@ -3228,12 +3249,19 @@ async fn promptless_interrupted_reconnect_replays_outcome_and_terminates() {
     let events = decode_sse_bytes_chunks(frames);
     assert_event_type_sequence(
         &events,
-        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "CUSTOM", "RUN_FINISHED"],
+        &[
+            "RUN_STARTED",
+            "CUSTOM",
+            "MESSAGES_SNAPSHOT",
+            "CUSTOM",
+            "RUN_FINISHED",
+        ],
     );
-    assert_eq!(events[2]["name"], "hitl_pending_approval");
-    assert_eq!(events[2]["value"]["tool_call_id"], "call-1");
-    assert_eq!(events[3]["outcome"]["type"], "interrupt");
-    assert!(events[3].get("result").is_none());
+    assert_attach_boundary(&events[1], 1);
+    assert_eq!(events[3]["name"], "hitl_pending_approval");
+    assert_eq!(events[3]["value"]["tool_call_id"], "call-1");
+    assert_eq!(events[4]["outcome"]["type"], "interrupt");
+    assert!(events[4].get("result").is_none());
 }
 
 #[test]
@@ -3259,6 +3287,7 @@ fn control_snapshot_events_emits_handoff_with_marker_identity() {
             assert_eq!(value["session_id"], "target-session-123");
             // Marker identity for dedupe
             assert_eq!(value["handoff_tool_call_id"], "call-abc");
+            assert_eq!(value["after_seq"], 1);
         }
         other => panic!("expected Custom event, got: {other:?}"),
     }
@@ -3282,6 +3311,7 @@ fn control_snapshot_events_omits_missing_handoff_identity() {
         panic!("expected Custom event")
     };
     assert!(value.get("handoff_tool_call_id").is_none());
+    assert_eq!(value["after_seq"], 1);
 }
 
 #[test]
@@ -3761,25 +3791,34 @@ fn session_updated_advisory_formats_as_sse_event() {
 // Integration tests for promptless attach hydration (t1-delivery acceptance #2)
 // ---------------------------------------------------------------------------
 
-/// Test that promptless local attach emits hydrated handoff CUSTOM event.
-/// Seeds a durable log with HandoffCommitted, builds an idle promptless stream,
-/// and asserts session_handoff appears after MESSAGES_SNAPSHOT with correct marker identity.
+/// Promptless idle attach uses the durable tail for its boundary while each
+/// hydrated handoff keeps the sequence of its own durable entry.
 #[tokio::test]
-async fn promptless_idle_attach_emits_hydrated_handoff() {
+async fn promptless_idle_attach_uses_durable_tail_for_boundary() {
     use harnx_core::session::SessionLogEntry;
 
     let run_id = Uuid::new_v4().to_string();
     let thread_id = Uuid::new_v4().to_string();
 
-    // Seed durable log with a HandoffCommitted entry
-    let log_entries = vec![(
-        1u64,
-        SessionLogEntry::HandoffCommitted {
-            target_agent: "target-agent".to_string(),
-            target_session_id: "target-session-123".to_string(),
-            handoff_tool_call_id: Some("call-abc".to_string()),
-        },
-    )];
+    let log_entries = vec![
+        (
+            7u64,
+            SessionLogEntry::HandoffCommitted {
+                target_agent: "target-agent".to_string(),
+                target_session_id: "target-session-123".to_string(),
+                handoff_tool_call_id: Some("call-abc".to_string()),
+            },
+        ),
+        (
+            9u64,
+            SessionLogEntry::TurnEnd {
+                through_seq: 5,
+                fence_token: 42,
+                timestamp: None,
+                usage: None,
+            },
+        ),
+    ];
 
     // Build snapshot frame (idle session needs MESSAGES_SNAPSHOT)
     let snapshot = vec![user_msg("test message")];
@@ -3806,15 +3845,23 @@ async fn promptless_idle_attach_emits_hydrated_handoff() {
     // Assert event sequence: RUN_STARTED, MESSAGES_SNAPSHOT, CUSTOM (handoff), RUN_FINISHED
     assert_event_type_sequence(
         &events,
-        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "CUSTOM", "RUN_FINISHED"],
+        &[
+            "RUN_STARTED",
+            "CUSTOM",
+            "MESSAGES_SNAPSHOT",
+            "CUSTOM",
+            "RUN_FINISHED",
+        ],
     );
 
-    // Assert the CUSTOM event is session_handoff with correct marker identity
-    let handoff_event = &events[2];
+    assert_attach_boundary(&events[1], 9);
+
+    let handoff_event = &events[3];
     assert_eq!(handoff_event["name"], "session_handoff");
     assert_eq!(handoff_event["value"]["agent"], "target-agent");
     assert_eq!(handoff_event["value"]["session_id"], "target-session-123");
     assert_eq!(handoff_event["value"]["handoff_tool_call_id"], "call-abc");
+    assert_eq!(handoff_event["value"]["after_seq"], 7);
 }
 
 /// Test that promptless local attach emits hydrated turn_outcome with usage.
@@ -3865,11 +3912,18 @@ async fn promptless_idle_attach_emits_hydrated_usage() {
     // Assert sequence: RUN_STARTED, MESSAGES_SNAPSHOT, CUSTOM (usage), RUN_FINISHED
     assert_event_type_sequence(
         &events,
-        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "CUSTOM", "RUN_FINISHED"],
+        &[
+            "RUN_STARTED",
+            "CUSTOM",
+            "MESSAGES_SNAPSHOT",
+            "CUSTOM",
+            "RUN_FINISHED",
+        ],
     );
 
     // Assert usage CUSTOM event carries usage fields in web-consumable shape
-    let outcome_event = &events[2];
+    assert_attach_boundary(&events[1], 2);
+    let outcome_event = &events[3];
     assert_eq!(outcome_event["name"], "usage");
     assert_eq!(outcome_event["value"]["input"], 100);
     assert_eq!(outcome_event["value"]["output"], 50);
@@ -3914,9 +3968,16 @@ async fn promptless_idle_attach_emits_fully_structured_sub_agent_start() {
 
     assert_event_type_sequence(
         &events,
-        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "CUSTOM", "RUN_FINISHED"],
+        &[
+            "RUN_STARTED",
+            "CUSTOM",
+            "MESSAGES_SNAPSHOT",
+            "CUSTOM",
+            "RUN_FINISHED",
+        ],
     );
-    let start_event = &events[2];
+    assert_attach_boundary(&events[1], 3);
+    let start_event = &events[3];
     assert_eq!(start_event["name"], "sub_agent_started");
     assert_eq!(start_event["value"]["agent"], "researcher");
     assert_eq!(start_event["value"]["session_id"], "child-session-123");
@@ -3925,66 +3986,5 @@ async fn promptless_idle_attach_emits_fully_structured_sub_agent_start() {
     assert_eq!(
         start_event["value"]["started_at"],
         "2026-09-09T05:15:30+00:00"
-    );
-}
-
-/// Test that idle-remote path emits hydrated control events.
-/// Uses completed_remote_stream (the idle-remote builder) directly with seeded control frames.
-#[tokio::test]
-async fn idle_remote_path_emits_hydrated_control_events() {
-    use harnx_core::session::SessionLogEntry;
-
-    let thread_id = Uuid::new_v4().to_string();
-    let run_id = Uuid::new_v4().to_string();
-
-    // Seed durable log with HandoffCommitted
-    let log_entries = vec![(
-        1u64,
-        SessionLogEntry::HandoffCommitted {
-            target_agent: "remote-agent".to_string(),
-            target_session_id: "remote-session-456".to_string(),
-            handoff_tool_call_id: Some("call-remote".to_string()),
-        },
-    )];
-
-    // Generate control frames using the hydration function
-    let control_events = control_snapshot_events(&log_entries, None);
-    let control_frames: Vec<Bytes> = control_events
-        .into_iter()
-        .filter_map(|e| frame_event(&e).ok().map(Bytes::from))
-        .collect();
-
-    // Build the idle-remote stream using completed_remote_stream
-    let started_frame = Bytes::from(frame_run_boundary_event("RUN_STARTED", &thread_id, &run_id));
-    let snapshot_frame = Some(Bytes::from(
-        frame_event(&snapshot_event(vec![user_msg("remote test")])).expect("snapshot frame"),
-    ));
-
-    let stream = crate::ag_ui_remote_follow::completed_remote_stream(
-        started_frame,
-        snapshot_frame,
-        control_frames,
-        &thread_id,
-        &run_id,
-    );
-
-    // Collect and parse
-    let frames = tokio_stream::StreamExt::collect::<Vec<_>>(stream).await;
-    let events = decode_sse_bytes_chunks(frames);
-
-    // Assert sequence: RUN_STARTED, MESSAGES_SNAPSHOT, CUSTOM (handoff), RUN_FINISHED
-    assert_event_type_sequence(
-        &events,
-        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "CUSTOM", "RUN_FINISHED"],
-    );
-
-    // Assert handoff CUSTOM event carries marker identity
-    let handoff_event = &events[2];
-    assert_eq!(handoff_event["name"], "session_handoff");
-    assert_eq!(handoff_event["value"]["agent"], "remote-agent");
-    assert_eq!(handoff_event["value"]["session_id"], "remote-session-456");
-    assert_eq!(
-        handoff_event["value"]["handoff_tool_call_id"],
-        "call-remote"
     );
 }

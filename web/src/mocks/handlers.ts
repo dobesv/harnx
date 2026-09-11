@@ -149,6 +149,13 @@ function buildSnapshot(session: string) {
   return [...SESSION_ONE_SNAPSHOT, ...additionalSnapshot(session)];
 }
 
+const MOCK_ATTACH_BOUNDARY_SEQ = 100;
+// Live handoff seq (101) > attach boundary (100) ⇒ navigates;
+// persisted/replayed handoff seq (≤100) ⇒ hydrated as history, no re-navigation (models #1803 reload-safety).
+const MOCK_LIVE_HANDOFF_SEQ = 101;
+const MOCK_PERSISTED_HANDOFF_SEQ = 100;
+const pendingLiveHandoffSessions = new Set<string>();
+
 async function emitHandoff(
   controller: ReadableStreamDefaultController<Uint8Array>,
   threadId: string,
@@ -167,7 +174,7 @@ async function emitHandoff(
     threadId,
     runId,
     name: 'session_handoff',
-    value: { agent: 'assistant', session_id: 'handoff-target' },
+    value: { agent: 'assistant', session_id: 'handoff-target', after_seq: MOCK_LIVE_HANDOFF_SEQ },
   }));
   controller.enqueue(encodeSseEvent({ type: 'RUN_FINISHED', threadId, runId }));
   controller.close();
@@ -180,17 +187,31 @@ function emitSnapshot(
   runId: string
 ) {
   controller.enqueue(encodeSseEvent({
+    type: 'CUSTOM',
+    threadId,
+    runId,
+    name: 'session_attach_boundary',
+    value: { attached_seq: MOCK_ATTACH_BOUNDARY_SEQ },
+  }));
+  controller.enqueue(encodeSseEvent({
     type: 'MESSAGES_SNAPSHOT',
     messages: buildSnapshot(session),
   }));
   const states = controlStates.get(session) || [];
+  const isLiveHandoff = pendingLiveHandoffSessions.delete(session);
   for (const state of states) {
+    let value = state.value;
+    if (state.name === 'session_handoff' && isLiveHandoff) {
+      // Live handoff turn emits MOCK_LIVE_HANDOFF_SEQ (101) > attach boundary (100) to navigate.
+      // Re-attaches / reloads replay the persisted MOCK_PERSISTED_HANDOFF_SEQ (100 <= 100) as history.
+      value = { ...(value as any), after_seq: MOCK_LIVE_HANDOFF_SEQ };
+    }
     controller.enqueue(encodeSseEvent({
       type: 'CUSTOM',
       threadId,
       runId,
       name: state.name,
-      value: state.value,
+      value,
     }));
   }
   if (!activeSessions.has(session)) {
@@ -621,8 +642,14 @@ export const happyPathHandlers = [
           
           addControlState(session, {
             name: 'session_handoff',
-            value: { agent: 'assistant', session_id: 'handoff-target', handoff_tool_call_id: 'mock_handoff_id' }
+            value: {
+              agent: 'assistant',
+              session_id: 'handoff-target',
+              handoff_tool_call_id: 'mock_handoff_id',
+              after_seq: MOCK_PERSISTED_HANDOFF_SEQ,
+            }
           });
+          pendingLiveHandoffSessions.add(session);
           notify(session);
         } else if (text === 'delegate to researcher') {
           // Staged sub-agent

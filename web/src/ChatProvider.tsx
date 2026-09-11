@@ -8,7 +8,7 @@ import { PendingContext, type HydratedPendingApproval } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { uploadAttachment } from './api';
 import { RuntimeSessionSubscriber } from './RuntimeSessionSubscriber';
-import { handleHarnxCustomEvent } from './harnxCustomEvents';
+import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS } from './harnxCustomEvents';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { INITIAL_SUB_AGENT_NOTES_STATE, reduceSubAgentNotes } from './subAgentNotes';
 
@@ -103,8 +103,7 @@ export class HarnxHttpAgent extends HttpAgent {
   private readonly onHandoff?: (agent: string, sessionId: string) => void;
   private readonly onSubAgentEvent: (event: unknown) => void;
   private readonly onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
-  private isRunActive = false;
-  private sourceSessionId?: string;
+  private handoffBoundarySeq?: number;
 
   constructor(options: HarnxHttpAgentOptions) {
     super({ url: options.url });
@@ -117,48 +116,45 @@ export class HarnxHttpAgent extends HttpAgent {
     this.onHitlPendingApproval = options.onHitlPendingApproval;
   }
 
-  /** Set the source session ID for handoff deduplication. */
-  setSourceSessionId(sessionId: string): void {
-    this.sourceSessionId = sessionId;
-  }
-
   private handleCustomEvent(name: string, value: unknown) {
     handleHarnxCustomEvent(name, value, {
       onStatus: this.onStatus,
       onRunFailed: this.onRunFailedCb,
       onUsage: this.onUsageCb,
       onToolSummary: this.onToolSummaryCb,
-      onHandoff: this.onHandoff,
+      onAttachBoundary: (seq: number) => {
+        this.handoffBoundarySeq = Math.max(this.handoffBoundarySeq ?? 0, seq);
+      },
+      onHandoff: (agent: string, sessionId: string, afterSeq: number) => {
+        if (this.handoffBoundarySeq !== undefined && afterSeq > this.handoffBoundarySeq) {
+          this.handoffBoundarySeq = afterSeq;
+          this.onHandoff?.(agent, sessionId);
+        }
+      },
       onHitlPendingApproval: this.onHitlPendingApproval,
-      isRunActive: this.isRunActive,
-      sourceSessionId: this.sourceSessionId,
     });
   }
 
   private handleAgentEvent(event: any) {
     this.onSubAgentEvent(event);
-    switch (event?.type) {
-      case 'RUN_STARTED':
-        this.isRunActive = true;
-        break;
-      case 'RUN_FINISHED':
-      case 'RUN_ERROR':
-        this.isRunActive = false;
-        break;
-      case 'CUSTOM':
-        this.handleCustomEvent(event.name, event.value);
-        break;
+    if (event?.type === 'CUSTOM') {
+      this.handleCustomEvent(event.name, event.value);
     }
-  }
-
-  private handleCustomSubscriberEvent(event: any) {
-    this.onSubAgentEvent({ type: 'CUSTOM', name: event?.name, value: event?.value });
-    this.handleCustomEvent(event?.name, event?.value);
   }
 
   private handleRunFailure(message: string) {
     this.onSubAgentEvent({ type: 'RUN_ERROR' });
     this.onRunFailedCb(message || 'Failed to send message');
+  }
+
+  // Navigation control events are handled via onEvent (see handleAgentEvent) and
+  // must not reach the assistant-ui runtime, which would synthesize phantom
+  // transcript rows for them. Every other CUSTOM event forwards downstream.
+  private forwardsCustomEvent(name: unknown): boolean {
+    return (
+      typeof name !== 'string' ||
+      !(NAVIGATION_CONTROL_EVENTS as readonly string[]).includes(name)
+    );
   }
 
   private wrapSubscriber(subscriber?: AgentSubscriber): AgentSubscriber {
@@ -169,7 +165,7 @@ export class HarnxHttpAgent extends HttpAgent {
         return subscriber?.onEvent?.(payload as any);
       },
       onCustomEvent: async (payload) => {
-        this.handleCustomSubscriberEvent(payload.event);
+        if (!this.forwardsCustomEvent((payload?.event as any)?.name)) return;
         return subscriber?.onCustomEvent?.(payload as any);
       },
       onRunFailed: async (payload) => {
@@ -297,11 +293,6 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     onSubAgentEvent: dispatchSubAgentEvent,
     onHitlPendingApproval: (toolCallId, summary) => addHydratedApproval({ toolCallId, summary }),
   }), [agentName, sessionId, onHandoff, addHydratedApproval]);
-
-  // Provide source session ID for handoff deduplication
-  useEffect(() => {
-    agent.setSourceSessionId(sessionId);
-  }, [agent, sessionId]);
 
   const runtime = useAgUiRuntime({
     agent,

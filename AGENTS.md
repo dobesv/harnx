@@ -265,10 +265,22 @@ session continues and the agent can retry. The canonical pattern is
 
 ### Session log entries and transcript protocol
 
-Adding a `SessionLogEntry` variant in `harnx-core/src/session.rs` is a **transcript-protocol
-change**. Canonical NATS replay hard-rejects `Unknown`, so older workers cannot read
-transcripts containing new variants. Deploy readers before writers in multi-instance
-clusters. Precedents: `TurnEnd` (#1490), `Error` (#1545), `SubAgentStarted` (#1604).
+`SessionLogEntry` (`harnx-core/src/session.rs`) and `SessionEvent` (`harnx-core/src/event.rs`)
+are different types with different change-cost:
+
+- **`SessionLogEntry`** — durable transcript entries persisted to NATS. Adding a variant is a
+  **transcript-protocol change**; canonical replay hard-rejects `Unknown`, so older workers
+  cannot read transcripts with new variants. Deploy readers before writers. Precedents:
+  `TurnEnd` (#1490), `Error` (#1545), `SubAgentStarted` (#1604).
+
+- **`SessionEvent`** — advisory events emitted to live subscribers, not persisted. Adding an
+  optional field (with `#[serde(default, skip_serializing_if)]`) is a safe additive change.
+  Used when a live client needs data that isn't in the durable entry (e.g. `after_seq` field
+  in `HandoffCommitted` added in #1803).
+
+When extending handoff or session metadata, check which type carries the data. The durable
+entry is the source of truth; the advisory event is a convenience for clients that haven't
+reloaded the transcript.
 
 Required match-site updates (3 compile-time exhaustive matches):
 - `config/session.rs` — reconstruction into `Session.messages`
@@ -285,6 +297,11 @@ preserved. See `SubAgentStarted` handling in `config/session.rs` for the pattern
 Append to another session's log via `NatsSessionLog::new(jetstream, session_id)` with no
 `fence_token`. Used when a tool/client needs durable state visible to a session it doesn't
 hold the lease for (e.g. sub-agent start entries in parent log).
+
+The worker appends the durable `HandoffCommitted` entry **before** emitting the advisory
+`SessionEvent::HandoffCommitted` (see `agent_loop.rs:979-1001`). This guarantees a live
+handoff's sequence is strictly greater than any attach boundary captured before the commit,
+enabling clients to gate navigation on `after_seq > attached_seq`.
 
 Worker-written control entries (`HandoffCommitted`, `HitlApprovalRequested`,
 `HitlApprovalDecision`) use `FencedSessionLogSink`, which stamps the lease revision as
