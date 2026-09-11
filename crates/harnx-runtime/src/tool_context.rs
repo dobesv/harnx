@@ -84,11 +84,38 @@ impl AgentLoopContext {
 const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 type HookDiscoveryCache = std::sync::Mutex<HashMap<ServerScope, CachedDiscovery<NatsHookProvider>>>;
-type ToolDiscoveryKey = (ServerScope, Option<String>);
+/// `NatsToolProvider` captures the invoking session and execution parent, so
+/// registration snapshots may only be shared within that exact context.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ToolDiscoveryKey {
+    instance_id: ServerScope,
+    active_package: Option<String>,
+    parent_session_id: Option<String>,
+    execution: Option<(String, String)>,
+}
 type ToolDiscoveryCache =
     std::sync::Mutex<HashMap<ToolDiscoveryKey, CachedDiscovery<NatsToolProvider>>>;
 static NATS_HOOK_DISCOVERY_CACHE: OnceLock<HookDiscoveryCache> = OnceLock::new();
 static NATS_TOOL_DISCOVERY_CACHE: OnceLock<ToolDiscoveryCache> = OnceLock::new();
+
+fn tool_discovery_key(
+    config: &Config,
+    instance_id: &ServerScope,
+    active_package: Option<&str>,
+) -> ToolDiscoveryKey {
+    ToolDiscoveryKey {
+        instance_id: instance_id.clone(),
+        active_package: active_package.map(str::to_string),
+        parent_session_id: config
+            .session
+            .as_ref()
+            .map(|session| session.id().to_string()),
+        execution: config
+            .execution_control
+            .as_ref()
+            .map(|(_, reference)| (reference.session_id.clone(), reference.execution_id.clone())),
+    }
+}
 
 struct CachedDiscovery<T> {
     provider: Option<Arc<T>>,
@@ -176,7 +203,7 @@ pub async fn discover_nats_tool_provider_cached(
     active_package: Option<&str>,
 ) -> Option<Arc<NatsToolProvider>> {
     let cache = NATS_TOOL_DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let key = (instance_id.clone(), active_package.map(str::to_string));
+    let key = tool_discovery_key(config, instance_id, active_package);
     discover_cached(cache, &key, || {
         Box::pin(discover_nats_tool_provider_fresh(
             config,
@@ -198,7 +225,7 @@ pub(crate) async fn discover_nats_tool_provider_fresh(
     active_package: Option<&str>,
 ) -> Option<Arc<NatsToolProvider>> {
     let cache = NATS_TOOL_DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let key = (instance_id.clone(), active_package.map(str::to_string));
+    let key = tool_discovery_key(config, instance_id, active_package);
     // Don't hold the process-wide lock while connecting to NATS or scanning KV.
     let provider = match NatsToolProvider::discover(
         config,
