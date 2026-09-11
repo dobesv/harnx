@@ -158,6 +158,13 @@ Same canonical session URL, negotiated into programmatic control.
   { "jsonrpc": "2.0", "id": 3, "method": "session/cancel" }
   ```
   **Result:** `{ "cancelled": true }`
+- **`session/abandon_cancellation`**: Explicitly abandons an unconfirmed
+  cancellation so a new execution can be admitted. The observed execution ID
+  is required to prevent abandoning a newer generation by mistake.
+  ```json
+  { "jsonrpc": "2.0", "id": 4, "method": "session/abandon_cancellation", "params": { "expected_execution_id": "..." } }
+  ```
+  **Result:** `{ "cancelled": true, "disposition": "cancelled", "execution_id": "...", "abandoned": true }`
 
 **Error Codes:**
 - `-32001`: Unknown session (HTTP 404)
@@ -170,7 +177,9 @@ Same canonical session URL, negotiated into programmatic control.
 
 1. **Create**: `POST` the session collection and use the returned `session_id` as the URL, NATS stream, and persistence identity.
 2. **Connect**: Open the session event feed and use promptless AG-UI runs to hydrate or join an active run.
-3. **Drive**: Use JSON-RPC on same canonical session URL to send prompts (`session/prompt`) or cancel runs (`session/cancel`).
+3. **Drive**: Use JSON-RPC on the same canonical session URL to send prompts
+   (`session/prompt`), cancel runs (`session/cancel`), or explicitly recover an
+   unconfirmed cancellation (`session/abandon_cancellation`).
 4. **Stateless UI**: Clients only send new inputs via RPC; they do not need to re-POST full transcript.
 
 ### Disconnect Semantics (D5)

@@ -475,15 +475,31 @@ it to claim or acknowledge an invocation still owned by another process.
 ### Acceptance versus shutdown
 
 `NatsSession::request_cancel` bounds durable acceptance to two seconds without
-waiting for shutdown. `cancel_status` and `wait_for_cancel` report convergence;
+waiting for shutdown or recovery activation. Once its KV CAS succeeds, a slow or
+failed activation wake-up cannot turn the accepted request into a persistence
+failure. `cancel_status` and `wait_for_cancel` report convergence;
 `cancel_pending_turn` remains the blocking compatibility wrapper. An idle cancel
 succeeds without appending a transcript entry.
+
+Status reconciliation propagates an accepted cancellation through registered
+descendants. An ownerless operation still in `Preparing` never started work and
+is closed immediately; this repairs the interruption race where a sub-agent
+session was registered but cancellation arrived before its activation. Other
+descendants retain their normal owner cleanup requirements.
 
 The state machine is preparing → running → completed for normal completion, or
 cancel_requested → quiescing → cancelled for cancellation. Five seconds without
 progress produces **unconfirmed**, which remains nonterminal and blocks prompts.
 It may later converge to cancelled. Retry can move unconfirmed back to requested.
 Closing normal prompt admission does not itself cancel already-registered work.
+
+An operator may explicitly abandon an unconfirmed cancellation to unblock the
+session. Abandonment terminalizes the old operation graph and marks its records
+with `abandoned: true`; it does not assert that vanished owners completed cleanup,
+and their external work may still run. The terminal records reject late owner
+updates, and the next prompt installs a fresh execution generation. This override
+is generation-scoped and is never available before cancellation becomes
+unconfirmed.
 
 The worker signals local abort immediately, writes the existing fenced
 `SessionLogEntry::Cancel`, drains owned work, releases its lease, and confirms cancellation only when
@@ -539,16 +555,35 @@ until replacement; session deletion purges its entire control prefix.
 ### Frontend behavior
 
 The TUI replaces the composer with a cancellation tray for root cancellation.
-Unconfirmed state is static and offers retry. Child Ctrl+C targets the viewed or
-focused invocation only when its monitored execution ID matches. While requesting
-interrupt-and-exit, Esc stays in the TUI and keeps cancellation running, Ctrl+D
-exits immediately, and durable acceptance triggers automatic exit. Persistence
-failure keeps an actionable tray.
+Unconfirmed state is static and offers `Ctrl+C` to retry or `Esc` to open an
+explicitly confirmed `resume anyway` abandonment. The confirmation warns that
+prior work may still be running. After local abandonment, the frontend retires
+its managed worker and tool-server process tree so the next prompt starts on a fresh worker. Child Ctrl+C
+targets the viewed or focused invocation only when its monitored execution ID
+matches. Worker
+preparation is outside the two-second durable-acceptance bound, and local retries
+retain their frontend-targeted activation route. Attaching to a session whose
+operation is already cancelling automatically retries recovery; accepted
+cancellation cannot be undone because descendants may already have stopped.
+Abandonment starts a new execution instead of reviving the old one.
+While requesting
+interrupt-and-exit, Esc in the exit confirmation stays in the TUI and keeps cancellation running, Ctrl+D
+exits immediately, and durable acceptance triggers automatic exit when the worker
+is remote or owned by another frontend. A worker owned by this TUI remains alive
+until the operation graph confirms cancellation, then the TUI exits automatically;
+this prevents frontend teardown from stranding registered child operations in an
+unconfirmed state. Persistence failure keeps an actionable tray.
 
 `session/cancel` accepts optional `expected_execution_id`. Its response retains
 `cancelled` and adds `disposition`, `cancellation_id`, `execution_id`,
-`requested_at`, and `unconfirmed_after_ms`. Dispositions include idle, requested,
-already_requested, quiescing, cancelled, and unconfirmed. Idle is HTTP success.
+`requested_at`, `unconfirmed_after_ms`, and `abandoned`. Dispositions include idle,
+requested, already_requested, quiescing, cancelled, and unconfirmed. Idle is HTTP
+success. `abandoned: true` distinguishes an operator override from confirmed
+owner cleanup.
+`session/abandon_cancellation` requires `expected_execution_id` and exposes the
+same override to browser clients. The Web UI presents separate retry and
+confirmed resume-anyway actions. A one-shot CLI prompt can opt in with
+`--resume-anyway`; ordinary prompt admission remains fail-closed.
 `session/get` reports `cancelling` or `cancel_unconfirmed`, disables `canPrompt`,
 and retains `canCancel` for retry. AG-UI `CUSTOM` events named `cancellation_state`
 carry operational updates without changing the transcript protocol. Clients also

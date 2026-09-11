@@ -43,6 +43,7 @@ export interface CancelResult {
   cancellation_id?: string | null;
   requested_at?: string | null;
   unconfirmed_after_ms?: number;
+  abandoned?: boolean;
 }
 
 export interface PromptResult {

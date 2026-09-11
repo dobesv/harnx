@@ -1,9 +1,9 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { cancel, sessionControl } from '../api';
+import { abandonCancellation, cancel, sessionControl } from '../api';
 import { useCancellation } from '../useCancellation';
 import type { CancelResult, SessionControlState } from '../types';
-vi.mock('../api', () => ({ cancel: vi.fn(), sessionControl: vi.fn() }));
+vi.mock('../api', () => ({ abandonCancellation: vi.fn(), cancel: vi.fn(), sessionControl: vi.fn() }));
 beforeEach(() => vi.resetAllMocks());
 afterEach(() => vi.useRealTimers());
 
@@ -44,6 +44,16 @@ describe('root cancellation state', () => {
     const { result } = renderHook(() => useCancellation('agent', 'session'));
     await waitFor(() => expect(result.current.phase).toBe('unconfirmed'));
     act(() => result.current.observe({ cancelled: true, disposition: 'cancelled', execution_id: 'execution' }));
+    expect(result.current.phase).toBe('idle');
+  });
+
+  it('abandons only the execution observed in the unconfirmed receipt', async () => {
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'cancel_unconfirmed', cancellation: { cancelled: true, disposition: 'unconfirmed', execution_id: 'execution' } } });
+    vi.mocked(abandonCancellation).mockResolvedValue({ cancelled: true, disposition: 'cancelled', execution_id: 'execution', abandoned: true });
+    const { result } = renderHook(() => useCancellation('agent', 'session'));
+    await waitFor(() => expect(result.current.phase).toBe('unconfirmed'));
+    await act(async () => { await result.current.resumeAnyway(); });
+    expect(abandonCancellation).toHaveBeenCalledWith('agent', 'session', 'execution');
     expect(result.current.phase).toBe('idle');
   });
 

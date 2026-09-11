@@ -2,6 +2,23 @@ use super::*;
 use harnx_execution_control::{CancelDisposition, CancelReceipt, CancelRequest, ExecutionStore};
 
 impl SessionActor {
+    pub(super) async fn answer_cancellation_command(&mut self, command: SessionCommand) {
+        match command {
+            SessionCommand::Cancel {
+                reply,
+                expected_execution_id,
+            } => self.answer_cancellation(reply, expected_execution_id).await,
+            SessionCommand::AbandonCancellation {
+                reply,
+                expected_execution_id,
+            } => {
+                self.answer_cancellation_abandonment(reply, expected_execution_id)
+                    .await
+            }
+            _ => unreachable!("non-cancellation command routed to cancellation handler"),
+        }
+    }
+
     pub(super) async fn answer_cancellation(
         &mut self,
         reply: tokio::sync::oneshot::Sender<Result<CancelReceipt, String>>,
@@ -9,6 +26,18 @@ impl SessionActor {
     ) {
         let result = self
             .request_cancellation(expected_execution_id)
+            .await
+            .map_err(|error| format!("{error:#}"));
+        let _ = reply.send(result);
+    }
+
+    pub(super) async fn answer_cancellation_abandonment(
+        &mut self,
+        reply: tokio::sync::oneshot::Sender<Result<CancelReceipt, String>>,
+        expected_execution_id: String,
+    ) {
+        let result = self
+            .abandon_cancellation(expected_execution_id)
             .await
             .map_err(|error| format!("{error:#}"));
         let _ = reply.send(result);
@@ -83,6 +112,47 @@ impl SessionActor {
         }
         self.apply_cancellation(receipt.clone());
         Ok(receipt)
+    }
+
+    async fn abandon_cancellation(
+        &mut self,
+        expected_execution_id: String,
+    ) -> anyhow::Result<CancelReceipt> {
+        let receipt = self
+            .control_session()
+            .await?
+            .abandon_unconfirmed_cancellation(Some(&expected_execution_id))
+            .await?;
+        if receipt.abandoned {
+            self.detach_active_run_for_abandonment().await;
+            self.execution_id = receipt.execution_id.clone();
+            self.execution_state = Some(harnx_execution_control::OperationState::Cancelled);
+            self.apply_cancellation(receipt.clone());
+        }
+        Ok(receipt)
+    }
+
+    async fn detach_active_run_for_abandonment(&mut self) {
+        self.pending.clear();
+        let active_run = self.active_run.take();
+        if let Some(run) = &active_run {
+            run.abort_signal.set_ctrlc();
+        }
+        if let Some(mut task) = self.run_done_task.take() {
+            task.abort();
+            let _ = (&mut task).await;
+        }
+        // Awaiting the sole run task above guarantees that any completion it
+        // sent is already queued. Discard it so it cannot later reset a fresh
+        // replacement run to idle.
+        while self.run_done_rx.try_recv().is_ok() {}
+        if active_run.is_some() {
+            let _ = self.broadcast_tx.send(Event::RunError(RunErrorEvent {
+                base: base_event(),
+                message: "Run abandoned; prior work may still be running".into(),
+                code: None,
+            }));
+        }
     }
 
     fn abort_active_run(&mut self) {

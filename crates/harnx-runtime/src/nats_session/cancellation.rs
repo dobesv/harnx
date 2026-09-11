@@ -57,11 +57,19 @@ impl NatsSession {
         let receipt = tokio::time::timeout(Duration::from_secs(2), async {
             resolve_pending_execution(&self.execution_store, &self.jetstream, &self.session_id)
                 .await?;
-            let receipt = self
-                .execution_store
+            self.execution_store
                 .request_cancel(&self.session_id, request)
-                .await?;
-            if receipt.cancelled {
+                .await
+        })
+        .await
+        .context("timed out persisting cancellation request; retry to reconcile")??;
+        if receipt.cancelled {
+            self.abort_signal.set_ctrlc();
+            // The cancellation CAS above is already authoritative. Activation
+            // only wakes a replacement worker when no active owner is watching
+            // the graph, so a slow or failed publish must not turn an accepted
+            // cancellation into a request failure.
+            let wake = async {
                 let operation = self
                     .execution_store
                     .current(&self.session_id)
@@ -74,14 +82,17 @@ impl NatsSession {
                     .max()
                     .unwrap_or(0);
                 self.publish_activation((&operation.reference.execution_id, through), None, None)
-                    .await?;
+                    .await
+            };
+            match tokio::time::timeout(Duration::from_secs(2), wake).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    log::warn!("failed to publish cancellation recovery activation: {error:#}");
+                }
+                Err(_) => {
+                    log::warn!("timed out publishing cancellation recovery activation");
+                }
             }
-            Ok::<_, anyhow::Error>(receipt)
-        })
-        .await
-        .context("timed out persisting cancellation request; retry to reconcile")??;
-        if receipt.cancelled {
-            self.abort_signal.set_ctrlc();
         }
         // The operation is already durable. Failure to publish a latency hint
         // must never turn accepted cancellation into a request-failed UI.
@@ -114,6 +125,19 @@ impl NatsSession {
         self.reconcile_cancelled_owner(&operation).await?;
         let operation = self.execution_store.status(&reference).await?;
         Ok(CancelReceipt::from_operation(&operation, false))
+    }
+
+    /// Explicitly abandon an unconfirmed cancellation. This permits a new
+    /// execution even though an owner that disappeared without acknowledging
+    /// cleanup may still be running. Late control-plane updates are rejected by
+    /// the now-terminal operation records.
+    pub async fn abandon_unconfirmed_cancellation(
+        &self,
+        expected_execution_id: Option<&str>,
+    ) -> Result<CancelReceipt> {
+        self.execution_store
+            .abandon_unconfirmed(&self.session_id, expected_execution_id)
+            .await
     }
 
     async fn reconcile_cancelled_owner(&self, operation: &Operation) -> Result<()> {

@@ -49,6 +49,25 @@ async function isRpcRequest(request: Request): Promise<boolean> {
   }
 }
 
+function cancellationRpcResponse(body: any): Record<string, unknown> | null {
+  if (body.method === 'session/cancel') {
+    return { jsonrpc: '2.0', result: { cancelled: true }, id: body.id };
+  }
+  if (body.method === 'session/abandon_cancellation') {
+    return {
+      jsonrpc: '2.0',
+      result: {
+        cancelled: true,
+        disposition: 'cancelled',
+        execution_id: body.params?.expected_execution_id,
+        abandoned: true,
+      },
+      id: body.id,
+    };
+  }
+  return null;
+}
+
 function encodeSseEvent(data: unknown): Uint8Array {
   return new TextEncoder().encode(`event: message\ndata: ${JSON.stringify(data)}\n\n`);
 }
@@ -618,9 +637,8 @@ export const happyPathHandlers = [
   http.post('/v1/agents/:agent/sessions/:session', async ({ request, params }) => {
     if (await isRpcRequest(request)) {
       const body = await request.clone().json() as any;
-      if (body.method === 'session/cancel') {
-        return HttpResponse.json({ jsonrpc: '2.0', result: { cancelled: true }, id: body.id });
-      }
+      const cancellationResponse = cancellationRpcResponse(body);
+      if (cancellationResponse) return HttpResponse.json(cancellationResponse);
       if (body.method === 'session/prompt') {
         const text = body.params?.text || '';
         const session = String(params.session);

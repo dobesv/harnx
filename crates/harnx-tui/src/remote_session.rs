@@ -1,7 +1,7 @@
 //! Shared construction and recovery operations for broker-backed sessions.
 
-use crate::types::{ExitCancelFactory, ExitWorkerState, Tui};
-use anyhow::{Context, Result};
+use crate::types::{CancellationAction, ExitCancelFactory, ExitWorkerState, Tui};
+use anyhow::Result;
 use futures_util::FutureExt;
 use harnx_runtime::config::{GlobalConfig, LOCAL_CLUSTER_KEY};
 use harnx_runtime::nats_lease::{lease_holder_in, NatsLeaseConfig};
@@ -74,23 +74,79 @@ pub(super) async fn nats_session_for_target(
     .await
 }
 
+/// Build a read-only cancellation status session without consulting the local
+/// worker supervisor. This session never publishes an activation.
+pub(super) async fn cancellation_status_session_for_target(
+    config: &GlobalConfig,
+    session_id: String,
+    cluster: String,
+) -> Result<NatsSession> {
+    let abort_signal = harnx_runtime::utils::create_abort_signal();
+    let initializer = {
+        let config = config.read();
+        let agent = config
+            .remote_agent
+            .as_ref()
+            .map(|(agent, _)| agent.clone())
+            .or_else(|| config.agent.as_ref().map(|agent| agent.name().to_string()))
+            .unwrap_or_default();
+        harnx_runtime::SessionInitializer::named_from_config(agent, &config)
+    };
+    NatsSession::from_global_config(
+        NatsSessionConfig {
+            cluster,
+            initializer,
+            session_id: Some(session_id),
+            activation_route: harnx_runtime::nats_worker::SessionActivationRoute::ClusterShared,
+        },
+        config,
+        abort_signal,
+    )
+    .await
+}
+
 pub(crate) fn default_exit_cancel_factory() -> ExitCancelFactory {
     Arc::new(
-        |config, local_worker, session_id, cluster, expected_execution_id| {
+        |config, local_worker, session_id, cluster, expected_execution_id, action| {
             Box::pin(async move {
-                tokio::time::timeout(Duration::from_secs(2), async {
-                    let session =
-                        nats_session_for_target(&config, &local_worker, session_id, cluster)
+                match action {
+                    CancellationAction::Request => {
+                        // Worker preparation is intentionally outside the durable
+                        // request's own two-second persistence bound. Local workers
+                        // consume targeted activations, and readiness can legitimately
+                        // take longer than the cancellation CAS itself.
+                        let session =
+                            nats_session_for_target(&config, &local_worker, session_id, cluster)
+                                .await?;
+                        session
+                            .request_cancel(harnx_execution_control::CancelRequest {
+                                expected_execution_id,
+                                retry: true,
+                            })
+                            .await
+                    }
+                    CancellationAction::Abandon => {
+                        // Abandonment is a control-plane override and must not
+                        // start a replacement local worker merely to retire the
+                        // generation whose owners disappeared.
+                        let retire_local_worker = cluster == LOCAL_CLUSTER_KEY;
+                        let session =
+                            cancellation_status_session_for_target(&config, session_id, cluster)
+                                .await?;
+                        let receipt = session
+                            .abandon_unconfirmed_cancellation(expected_execution_id.as_deref())
                             .await?;
-                    session
-                        .request_cancel(harnx_execution_control::CancelRequest {
-                            expected_execution_id,
-                            retry: true,
-                        })
-                        .await
-                })
-                .await
-                .context("timed out preparing cancellation request; retry to reconcile")?
+                        if receipt.abandoned && retire_local_worker {
+                            // Keep this wait in the background cancellation
+                            // future. Polling it from the TUI loop would freeze
+                            // the frame before the Abandoning state is drawn.
+                            // The composer remains locked until the old process
+                            // tree has been retired.
+                            local_worker.lock().await.take();
+                        }
+                        Ok(receipt)
+                    }
+                }
             })
         },
     )
@@ -145,6 +201,9 @@ impl Tui {
 
     pub(crate) async fn poll_pending_exit_cancel(&mut self) {
         self.poll_cancellation_status();
+        if self.finish_exit_after_confirmed_cancellation() {
+            return;
+        }
         let result = self
             .pending_exit_cancel
             .as_mut()
@@ -155,11 +214,26 @@ impl Tui {
         self.pending_exit_cancel = None;
         match result {
             Ok(receipt) => {
-                if self.exit_after_cancel {
+                let locally_owned_worker = matches!(
+                    self.app.modal,
+                    Some(crate::types::ModalState::ConfirmExit {
+                        worker_state: ExitWorkerState::LocalOwnedHere,
+                        ..
+                    })
+                );
+                if self.exit_after_cancel && !locally_owned_worker {
+                    self.exit_after_cancel = false;
                     self.app.modal = None;
                     self.app.should_quit = true;
                 } else {
+                    // A local worker and its managed tool/sub-agent servers are
+                    // children of this frontend. Keep that process tree alive
+                    // until the durable operation graph confirms it stopped;
+                    // exiting on acceptance alone can strand descendants in an
+                    // unconfirmed state that permanently blocks later prompts.
+                    self.app.modal = None;
                     self.monitor_cancellation(receipt);
+                    self.finish_exit_after_confirmed_cancellation();
                 }
             }
             Err(error) => {
@@ -175,6 +249,21 @@ impl Tui {
                 }
             }
         }
+    }
+
+    fn finish_exit_after_confirmed_cancellation(&mut self) -> bool {
+        if !self.exit_after_cancel {
+            return false;
+        }
+        if self.pending_exit_cancel.is_some() {
+            return false;
+        }
+        if self.cancellation.is_some() {
+            return false;
+        }
+        self.exit_after_cancel = false;
+        self.app.should_quit = true;
+        true
     }
 
     #[cfg(test)]

@@ -21,7 +21,7 @@ import { UsageContext, type UsageData } from './UsageContext';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { SubAgentSessionNotes } from './SubAgentSessionNotes';
 import { sendPrompt, submitHitlDecision, uploadAttachment } from './api';
-import { CancellationContext } from './CancellationContext';
+import { CancellationContext, type CancellationControl } from './CancellationContext';
 import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
 import { AttachIcon, SendIcon } from './icons';
@@ -109,12 +109,25 @@ const MyMessage = () => {
   );
 };
 
+const CancellationActions = ({ phase, stop, resumeAnyway }: Pick<CancellationControl, 'phase' | 'stop' | 'resumeAnyway'>) => {
+  if (phase === 'unconfirmed') {
+    const confirmResume = () => {
+      if (window.confirm('Resume anyway? Prior work may still be running.')) void resumeAnyway();
+    };
+    return <span className="aui-cancel-actions">
+      <button type="button" className="aui-cancel-button" onClick={() => void stop()}>Retry cancellation</button>
+      <button type="button" className="aui-cancel-button" onClick={confirmResume}>Resume anyway</button>
+    </span>;
+  }
+  const label = { idle: 'Stop', requesting: 'Requesting cancellation…', stopping: 'Stopping…', abandoning: 'Resuming…', failed: 'Cancellation request failed — Retry' }[phase];
+  return <button type="button" className="aui-cancel-button" disabled={phase === 'requesting' || phase === 'stopping' || phase === 'abandoning'} onClick={() => void stop()}>{label}</button>;
+};
+
 export const CancelButton = () => {
   const isRunning = useAuiState((s) => s.thread.isRunning);
-  const { phase, stop } = useContext(CancellationContext);
-  if (!isRunning && phase === 'idle') return null;
-  const label = { idle: 'Stop', requesting: 'Requesting cancellation…', stopping: 'Stopping…', unconfirmed: 'Cancellation unconfirmed — Retry', failed: 'Cancellation request failed — Retry' }[phase];
-  return <button type="button" className="aui-cancel-button" disabled={phase === 'requesting' || phase === 'stopping'} onClick={() => void stop()}>{label}</button>;
+  const cancellation = useContext(CancellationContext);
+  if (!isRunning && cancellation.phase === 'idle') return null;
+  return <CancellationActions {...cancellation} />;
 };
 
 const MyAttachment = () => (
@@ -337,7 +350,7 @@ export const StatusIndicator = ({ isRunning, statusText }: { isRunning: boolean,
     ) : (
       <span className="aui-idle-dot"></span>
     )}
-    <span className="aui-status-text">{phase !== 'idle' ? (phase === 'unconfirmed' ? 'Cancellation unconfirmed' : 'Cancelling') : statusText || (isRunning ? 'Running...' : 'Idle')}</span>
+    <span className="aui-status-text">{phase !== 'idle' ? (phase === 'unconfirmed' ? 'Cancellation unconfirmed' : phase === 'abandoning' ? 'Resuming…' : 'Cancelling') : statusText || (isRunning ? 'Running...' : 'Idle')}</span>
   </div>
 );
 };
