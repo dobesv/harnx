@@ -130,4 +130,105 @@ describe('ToolCallCard', () => {
     fireEvent.click(container.querySelector('.aui-tool-call-header')!);
     expect(screen.getByText('View Source')).toBeInTheDocument();
   });
+
+  describe('status presentation and initial expansion', () => {
+    it('renders pending spinner ⏳ and is collapsed for requires-action with reason tool-calls', () => {
+      const props = {
+        toolName: 'my_tool',
+        toolCallId: 'call_1',
+        status: { type: 'requires-action', reason: 'tool-calls' }
+      } as any;
+
+      const { container } = renderWithContext(props);
+      const icon = container.querySelector('.aui-tool-call-icon');
+      const header = container.querySelector('.aui-tool-call-header');
+      const card = container.querySelector('.aui-tool-call') as HTMLElement;
+
+      expect(icon?.textContent).toBe('⏳');
+      expect(icon?.textContent).not.toBe('⚠️');
+      expect(header).toHaveAttribute('aria-expanded', 'false');
+      expect(card.style.borderLeft).toBe('4px solid var(--status-running)');
+    });
+
+    it('renders alert icon ⚠️ and is expanded for requires-action with reason interrupt', () => {
+      const props = {
+        toolName: 'my_tool',
+        toolCallId: 'call_1',
+        status: { type: 'requires-action', reason: 'interrupt' }
+      } as any;
+
+      const { container } = renderWithContext(props);
+      const icon = container.querySelector('.aui-tool-call-icon');
+      const header = container.querySelector('.aui-tool-call-header');
+      const card = container.querySelector('.aui-tool-call') as HTMLElement;
+
+      expect(icon?.textContent).toBe('⚠️');
+      expect(header).toHaveAttribute('aria-expanded', 'true');
+      expect(card.style.borderLeft).toBe('4px solid var(--status-action)');
+    });
+
+    it('renders pending spinner ⏳ and is collapsed for running', () => {
+      const props = {
+        toolName: 'my_tool',
+        toolCallId: 'call_1',
+        status: { type: 'running' }
+      } as any;
+
+      const { container } = renderWithContext(props);
+      const icon = container.querySelector('.aui-tool-call-icon');
+      const header = container.querySelector('.aui-tool-call-header');
+      const card = container.querySelector('.aui-tool-call') as HTMLElement;
+
+      expect(icon?.textContent).toBe('⏳');
+      expect(header).toHaveAttribute('aria-expanded', 'false');
+      expect(card.style.borderLeft).toBe('4px solid var(--status-running)');
+    });
+
+    it('renders checkmark ✅ and is collapsed for complete with no error', () => {
+      const props = {
+        toolName: 'my_tool',
+        toolCallId: 'call_1',
+        status: { type: 'complete' }
+      } as any;
+
+      const { container } = renderWithContext(props);
+      const icon = container.querySelector('.aui-tool-call-icon');
+      const header = container.querySelector('.aui-tool-call-header');
+      const card = container.querySelector('.aui-tool-call') as HTMLElement;
+
+      expect(icon?.textContent).toBe('✅');
+      expect(header).toHaveAttribute('aria-expanded', 'false');
+      expect(card.style.borderLeft).toBe('4px solid var(--status-complete)');
+    });
+
+    it('renders cross ❌ when isError is true', () => {
+      const props = {
+        toolName: 'my_tool',
+        toolCallId: 'call_1',
+        status: { type: 'complete' },
+        isError: true
+      } as any;
+
+      const { container } = renderWithContext(props);
+      const icon = container.querySelector('.aui-tool-call-icon');
+
+      expect(icon?.textContent).toBe('❌');
+    });
+
+    it('renders error border for incomplete status with error', () => {
+      const props = {
+        toolName: 'my_tool',
+        toolCallId: 'call_1',
+        status: { type: 'incomplete' },
+        isError: true
+      } as any;
+
+      const { container } = renderWithContext(props);
+      const icon = container.querySelector('.aui-tool-call-icon');
+      const card = container.querySelector('.aui-tool-call') as HTMLElement;
+
+      expect(icon?.textContent).toBe('❌');
+      expect(card.style.borderLeft).toBe('4px solid var(--status-error)');
+    });
+  });
 });

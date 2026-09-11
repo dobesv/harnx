@@ -102,14 +102,17 @@ export const ToolCallCard: React.FC<ToolCallMessagePartProps> = (props) => {
   const { toolSummaries } = useContext(UsageContext);
 
   const statusType = status?.type;
+  const statusReason = status?.reason;
+  const isPending = statusType === 'running' || (statusType === 'requires-action' && statusReason !== 'interrupt');
+  const isActionRequired = statusType === 'requires-action' && statusReason === 'interrupt';
   
   let borderColor = 'var(--border)';
-  if (statusType === 'running') borderColor = 'var(--status-running)';
+  if (isPending) borderColor = 'var(--status-running)';
   else if (statusType === 'complete') borderColor = 'var(--status-complete)';
-  else if (statusType === 'requires-action') borderColor = 'var(--status-action)';
+  else if (isActionRequired) borderColor = 'var(--status-action)';
   else if (statusType === 'incomplete' || isError) borderColor = 'var(--status-error)';
 
-  const [expanded, setExpanded] = useState(statusType === 'requires-action');
+  const [expanded, setExpanded] = useState(isActionRequired);
   const [viewSource, setViewSource] = useState(false);
 
   // Get markdown summary
@@ -162,7 +165,7 @@ export const ToolCallCard: React.FC<ToolCallMessagePartProps> = (props) => {
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', overflow: 'hidden' }}>
           <span className="aui-tool-call-icon">
-            {statusType === 'running' ? '⏳' : statusType === 'requires-action' ? '⚠️' : isError ? '❌' : '✅'}
+            {isPending ? '⏳' : isActionRequired ? '⚠️' : isError ? '❌' : '✅'}
           </span>
           <span className="aui-tool-call-label">
             <strong>{toolName}</strong>
