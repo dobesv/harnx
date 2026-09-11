@@ -121,7 +121,7 @@ impl SessionActor {
         let receipt = self
             .control_session()
             .await?
-            .abandon_unconfirmed_cancellation(Some(&expected_execution_id))
+            .abandon_unconfirmed_cancellation(&expected_execution_id)
             .await?;
         if receipt.abandoned {
             self.detach_active_run_for_abandonment().await;

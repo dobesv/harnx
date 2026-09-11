@@ -169,6 +169,62 @@ async fn attaching_to_cancelling_session_automatically_retries_recovery() {
     ));
 }
 
+#[tokio::test]
+async fn failed_automatic_recovery_can_abandon_the_observed_generation() {
+    let mut tui = Tui::init(&test_config())
+        .await
+        .expect("initialize test TUI");
+    tui.session_activity_target = Some(("session".into(), LOCAL_CLUSTER_KEY.into()));
+    let actions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    tui.set_exit_cancel_factory(Arc::new({
+        let actions = Arc::clone(&actions);
+        move |_, _, _, _, expected, action| {
+            actions.lock().unwrap().push((expected, action));
+            Box::pin(async move {
+                match action {
+                    crate::types::CancellationAction::Request => {
+                        anyhow::bail!("automatic recovery failed")
+                    }
+                    crate::types::CancellationAction::Abandon => std::future::pending().await,
+                }
+            })
+        }
+    }));
+    let mut operation = harnx_execution_control::Operation::preparing(
+        harnx_execution_control::OperationRef::new("session", "observed-execution"),
+        harnx_execution_control::OperationKind::Session,
+        None,
+    );
+    operation.request_cancel("cancel", false).unwrap();
+
+    tui.hydrate_execution_state(LOCAL_CLUSTER_KEY.into(), operation);
+    tui.poll_pending_exit_cancel().await;
+    assert!(matches!(
+        tui.cancellation.as_ref().map(|tray| &tray.phase),
+        Some(crate::cancellation::CancellationPhase::Failed(_))
+    ));
+
+    tui.handle_key(esc()).await.unwrap();
+    assert!(matches!(
+        tui.app.modal,
+        Some(ModalState::ConfirmAbandonCancellation)
+    ));
+    tui.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *actions.lock().unwrap(),
+        vec![
+            (None, crate::types::CancellationAction::Request),
+            (
+                Some("observed-execution".into()),
+                crate::types::CancellationAction::Abandon
+            )
+        ]
+    );
+}
+
 #[test]
 fn exit_worker_classification_detects_remote_session() {
     assert_eq!(

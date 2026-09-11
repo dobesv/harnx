@@ -133,8 +133,11 @@ pub(crate) fn default_exit_cancel_factory() -> ExitCancelFactory {
                         let session =
                             cancellation_status_session_for_target(&config, session_id, cluster)
                                 .await?;
+                        let expected_execution_id = expected_execution_id
+                            .as_deref()
+                            .ok_or_else(|| anyhow::anyhow!("cancellation generation missing"))?;
                         let receipt = session
-                            .abandon_unconfirmed_cancellation(expected_execution_id.as_deref())
+                            .abandon_unconfirmed_cancellation(expected_execution_id)
                             .await?;
                         if receipt.abandoned && retire_local_worker {
                             // Keep this wait in the background cancellation

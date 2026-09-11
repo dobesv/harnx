@@ -709,13 +709,16 @@ async fn resume_session_anyway(session: &harnx_runtime::NatsSession, enabled: bo
     if !enabled {
         return Ok(());
     }
-    let expected_execution_id = session
+    let Some(expected_execution_id) = session
         .execution_store()
         .current(session.session_id())
         .await?
-        .map(|operation| operation.reference.execution_id);
+        .map(|operation| operation.reference.execution_id)
+    else {
+        return Ok(());
+    };
     let receipt = session
-        .abandon_unconfirmed_cancellation(expected_execution_id.as_deref())
+        .abandon_unconfirmed_cancellation(&expected_execution_id)
         .await
         .context("--resume-anyway could not abandon the pending cancellation")?;
     if receipt.abandoned {

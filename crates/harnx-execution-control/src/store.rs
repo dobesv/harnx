@@ -324,12 +324,12 @@ impl ExecutionStore {
     pub async fn abandon_unconfirmed(
         &self,
         session: &str,
-        expected_execution_id: Option<&str>,
+        expected_execution_id: &str,
     ) -> Result<CancelReceipt> {
         let Some(current) = self.current(session).await? else {
             return Ok(CancelReceipt::idle());
         };
-        if expected_execution_id.is_some_and(|id| id != current.reference.execution_id) {
+        if expected_execution_id != current.reference.execution_id {
             return Ok(CancelReceipt::idle());
         }
 

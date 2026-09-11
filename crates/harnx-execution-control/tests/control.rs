@@ -199,7 +199,7 @@ async fn operator_can_abandon_an_unconfirmed_graph_and_start_a_new_generation() 
         })
         .await?;
 
-    let receipt = store.abandon_unconfirmed("abandon", Some("old")).await?;
+    let receipt = store.abandon_unconfirmed("abandon", "old").await?;
     assert_eq!(receipt.disposition, CancelDisposition::Cancelled);
     assert!(receipt.abandoned);
     for reference in [&root.reference, &child.reference] {
@@ -226,12 +226,10 @@ async fn abandonment_is_generation_scoped_and_requires_unconfirmed_state() -> Re
         .session("scoped-abandon", None, Some("current"))
         .await?;
 
-    let stale = store
-        .abandon_unconfirmed("scoped-abandon", Some("stale"))
-        .await?;
+    let stale = store.abandon_unconfirmed("scoped-abandon", "stale").await?;
     assert_eq!(stale.disposition, CancelDisposition::Idle);
     assert!(store
-        .abandon_unconfirmed("scoped-abandon", Some("current"))
+        .abandon_unconfirmed("scoped-abandon", "current")
         .await
         .is_err());
     assert_eq!(

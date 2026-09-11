@@ -678,13 +678,15 @@ impl NatsSession {
         if requested_seq_status(&entries, user_msg_seq)? == RequestedSeqStatus::Covered {
             return Ok(None);
         }
-        let operation = cancellation::resolve_pending_execution(
+        let Some(operation) = cancellation::resolve_pending_execution(
             &self.execution_store,
             &self.jetstream,
             &self.session_id,
         )
         .await?
-        .context("pending execution missing")?;
+        else {
+            return Ok(None);
+        };
         self.publish_activation(
             (&operation.reference.execution_id, user_msg_seq),
             confirmation_subject,

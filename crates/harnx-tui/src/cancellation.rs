@@ -118,8 +118,22 @@ impl Tui {
             // already have stopped. Re-issue it on attachment so an abandoned
             // local execution is targeted at this frontend's replacement
             // worker instead of leaving the user in a passive dead end.
-            self.start_cancellation(operation.reference.session_id.clone(), cluster, None);
+            self.start_observed_cancellation(
+                operation.reference.session_id.clone(),
+                cluster,
+                operation.reference.execution_id.clone(),
+            );
         }
+    }
+
+    fn start_observed_cancellation(
+        &mut self,
+        session_id: String,
+        cluster: String,
+        execution_id: String,
+    ) {
+        self.start_cancellation(session_id, cluster, None);
+        self.cancellation.as_mut().unwrap().execution_id = Some(execution_id);
     }
 
     pub(crate) fn start_cancellation(
@@ -160,7 +174,10 @@ impl Tui {
         let Some(tray) = self.cancellation.as_ref() else {
             return;
         };
-        if !matches!(tray.phase, CancellationPhase::Unconfirmed) {
+        if !matches!(
+            tray.phase,
+            CancellationPhase::Unconfirmed | CancellationPhase::Failed(_)
+        ) {
             return;
         }
         let session_id = tray.session_id.clone();
@@ -278,10 +295,13 @@ impl Tui {
                 }
             }
             (KeyCode::Esc, KeyModifiers::NONE)
-                if self
-                    .cancellation
-                    .as_ref()
-                    .is_some_and(|tray| matches!(tray.phase, CancellationPhase::Unconfirmed)) =>
+                if self.cancellation.as_ref().is_some_and(|tray| {
+                    tray.execution_id.is_some()
+                        && matches!(
+                            tray.phase,
+                            CancellationPhase::Unconfirmed | CancellationPhase::Failed(_)
+                        )
+                }) =>
             {
                 self.app.modal = Some(ModalState::ConfirmAbandonCancellation);
             }
@@ -309,7 +329,14 @@ impl Tui {
                 "Cancellation unconfirmed. Work may still be running.  Ctrl+C: retry  Esc: resume anyway  Ctrl+D: exit".into()
             }
             CancellationPhase::Failed(error) => {
-                format!("Cancellation request failed: {error}  Ctrl+C: retry  Ctrl+D: exit")
+                let resume = tray
+                    .execution_id
+                    .as_ref()
+                    .map(|_| "  Esc: resume anyway")
+                    .unwrap_or_default();
+                format!(
+                    "Cancellation request failed: {error}  Ctrl+C: retry{resume}  Ctrl+D: exit"
+                )
             }
         };
         frame.render_widget(
