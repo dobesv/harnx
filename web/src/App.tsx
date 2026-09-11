@@ -20,7 +20,8 @@ import { PendingContext } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { SubAgentSessionNotes } from './SubAgentSessionNotes';
-import { cancel, sendPrompt, uploadAttachment, submitHitlDecision } from './api';
+import { sendPrompt, submitHitlDecision, uploadAttachment } from './api';
+import { CancellationContext } from './CancellationContext';
 import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
 import { AttachIcon, SendIcon } from './icons';
@@ -106,17 +107,12 @@ const MyMessage = () => {
   );
 };
 
-const CancelButton = ({ agentName, sessionId }: { agentName: string, sessionId: string }) => {
+export const CancelButton = () => {
   const isRunning = useAuiState((s) => s.thread.isRunning);
-  if (!isRunning) return null;
-  return (
-    <button
-      className="aui-cancel-button"
-      onClick={() => cancel(agentName, sessionId).catch(console.error)}
-    >
-      Stop
-    </button>
-  );
+  const { phase, stop } = useContext(CancellationContext);
+  if (!isRunning && phase === 'idle') return null;
+  const label = { idle: 'Stop', requesting: 'Requesting cancellation…', stopping: 'Stopping…', unconfirmed: 'Cancellation unconfirmed — Retry', failed: 'Cancellation request failed — Retry' }[phase];
+  return <button type="button" className="aui-cancel-button" disabled={phase === 'requesting' || phase === 'stopping'} onClick={() => void stop()}>{label}</button>;
 };
 
 const MyAttachment = () => (
@@ -149,6 +145,8 @@ export const MyComposer = ({
   switchSessionHref: string;
 }) => {
   const { setErrorText } = useContext(PendingContext);
+  const { phase } = useContext(CancellationContext);
+  const cancelling = phase !== 'idle';
   const composerRuntime = useAui().composer;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [isSending, setIsSending] = useState(false);
@@ -199,9 +197,10 @@ export const MyComposer = ({
     collapseTextarea();
   }, [composerRuntime, collapseTextarea]);
 
+  const submissionDisabled = isSending || cancelling;
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (isSending) return;
+    if (submissionDisabled) return;
     setErrorText(null);
 
     const state = composerRuntime.getState();
@@ -289,10 +288,10 @@ export const MyComposer = ({
       <ComposerPrimitive.Input
         className="aui-composer-input"
         placeholder={placeholder}
-        render={<textarea disabled={isSending} ref={setTextareaRef} rows={1} onInput={(e) => resizeTextarea(e.currentTarget)} />}
+        render={<textarea disabled={isSending || cancelling} ref={setTextareaRef} rows={1} onInput={(e) => resizeTextarea(e.currentTarget)} />}
       />
       <div className="aui-composer-controls">
-        <ComposerPrimitive.AddAttachment disabled={isSending} className="aui-composer-add-attachment aui-composer-icon-btn" aria-label="Attach file" title="Attach file">
+        <ComposerPrimitive.AddAttachment disabled={isSending || cancelling} className="aui-composer-add-attachment aui-composer-icon-btn" aria-label="Attach file" title="Attach file">
           <AttachIcon />
           <span className="aui-visually-hidden">Attach file</span>
         </ComposerPrimitive.AddAttachment>
@@ -305,11 +304,11 @@ export const MyComposer = ({
           <AgentSessionMenu {...menuProps} />
         </div>
         
-        <button disabled={isSending} type="submit" className="aui-composer-send aui-composer-icon-btn" aria-label={sendLabel} title={sendLabel}>
+        <button disabled={isSending || cancelling} type="submit" className="aui-composer-send aui-composer-icon-btn" aria-label={sendLabel} title={sendLabel}>
           {isSending ? <span className="aui-spinner"><span></span></span> : <SendIcon />}
           <span className="aui-visually-hidden">{sendLabel}</span>
         </button>
-        <CancelButton agentName={agentName} sessionId={sessionId} />
+        <CancelButton />
       </div>
     </ComposerPrimitive.Root>
   );
@@ -327,16 +326,19 @@ const RunStateMonitor = ({ onRunFinish }: { onRunFinish: () => void }) => {
   return null;
 };
 
-const StatusIndicator = ({ isRunning, statusText }: { isRunning: boolean, statusText: string | null }) => (
+export const StatusIndicator = ({ isRunning, statusText }: { isRunning: boolean, statusText: string | null }) => {
+  const { phase } = useContext(CancellationContext);
+  return (
   <div className="aui-status-left">
-    {isRunning ? (
+    {isRunning && phase !== 'unconfirmed' && phase !== 'failed' ? (
       <span className="aui-spinner"><span></span></span>
     ) : (
       <span className="aui-idle-dot"></span>
     )}
-    <span className="aui-status-text">{statusText || (isRunning ? 'Running...' : 'Idle')}</span>
+    <span className="aui-status-text">{phase !== 'idle' ? (phase === 'unconfirmed' ? 'Cancellation unconfirmed' : 'Cancelling') : statusText || (isRunning ? 'Running...' : 'Idle')}</span>
   </div>
 );
+};
 
 const UsageItem = ({ icon, label, value }: { icon: string, label: string, value: string }) => (
   <span className="aui-status-usage-item" title={label} aria-label={`${label}: ${value}`}>

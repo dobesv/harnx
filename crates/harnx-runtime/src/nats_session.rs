@@ -56,6 +56,9 @@ use crate::nats_worker::{
     SessionActivationRoute,
 };
 use crate::utils::AbortSignal;
+pub use harnx_execution_control::{CancelReceipt, CancelRequest, CancellationStatus};
+use harnx_execution_control::{ExecutionStore, OperationRef};
+pub(crate) mod cancellation;
 
 /// Generate a client-side message ID (UUID v4).
 pub(crate) fn new_client_message_id() -> String {
@@ -73,7 +76,7 @@ const ORPHAN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 const ORPHAN_MISSING_CHECKS: u32 = 2;
 const CONTROL_ACK_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 const CONTROL_ACK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
-const CANCEL_RECOVERY_TIMEOUT: std::time::Duration =
+const CONTROL_RECOVERY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(crate::nats_lease::DEFAULT_LEASE_TTL.as_secs() + 10);
 
 /// Lease-backed detector for a session whose worker disappeared without
@@ -297,6 +300,9 @@ pub struct NatsSession {
     abort_signal: AbortSignal,
     metadata_store: SessionMetadataStore,
     attachment_replicas: usize,
+    execution_store: ExecutionStore,
+    execution_parent: Option<OperationRef>,
+    invocation_id: Option<String>,
 }
 
 /// Result of durably queueing one prompt for worker execution.
@@ -331,10 +337,30 @@ impl DurableTextEnqueue {
     }
 }
 
-struct AppendedPrompt {
+#[derive(Clone)]
+pub struct AppendedPrompt {
     user_msg_id: String,
     user_msg_seq: u64,
+    execution_id: String,
+    events: Option<Arc<tokio::sync::Mutex<Option<SessionEventStream>>>>,
 }
+
+impl std::fmt::Debug for AppendedPrompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppendedPrompt")
+            .field("user_msg_id", &self.user_msg_id)
+            .field("execution_id", &self.execution_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for AppendedPrompt {
+    fn eq(&self, other: &Self) -> bool {
+        self.user_msg_id == other.user_msg_id && self.execution_id == other.execution_id
+    }
+}
+
+impl Eq for AppendedPrompt {}
 
 impl NatsSession {
     /// Create a new NATS session.
@@ -355,7 +381,17 @@ impl NatsSession {
         jetstream: jetstream::Context,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
-        let metadata_store = SessionMetadataStore::ensure(&jetstream, 1)
+        Self::new_with_replicas((config, 1), client, jetstream, abort_signal).await
+    }
+
+    async fn new_with_replicas(
+        config: (NatsSessionConfig, usize),
+        client: async_nats::Client,
+        jetstream: jetstream::Context,
+        abort_signal: AbortSignal,
+    ) -> Result<Self> {
+        let (config, replicas) = config;
+        let metadata_store = SessionMetadataStore::ensure(&jetstream, replicas)
             .await
             .context("failed to open canonical session metadata store")?;
         let session_id = match config.session_id.as_ref() {
@@ -379,11 +415,14 @@ impl NatsSession {
         Ok(Self {
             config,
             session_id,
-            jetstream,
+            jetstream: jetstream.clone(),
             client,
             abort_signal,
             metadata_store,
-            attachment_replicas: 1,
+            attachment_replicas: replicas,
+            execution_store: ExecutionStore::ensure(&jetstream, replicas).await?,
+            execution_parent: None,
+            invocation_id: None,
         })
     }
 
@@ -405,8 +444,13 @@ impl NatsSession {
             .context("failed to connect to NATS cluster")?;
         let jetstream = async_nats::jetstream::new(client.clone());
 
-        let mut nats_session = Self::new(config, client, jetstream, abort_signal).await?;
-        nats_session.attachment_replicas = attachment_replicas;
+        let nats_session = Self::new_with_replicas(
+            (config, attachment_replicas),
+            client,
+            jetstream,
+            abort_signal,
+        )
+        .await?;
 
         // Front-end dot commands mutate the active Config session synchronously.
         // Give that in-memory session a metadata-capable sink so `.model`,
@@ -452,6 +496,17 @@ impl NatsSession {
 
     async fn append_user_content(&self, content: MessageContent) -> Result<AppendedPrompt> {
         let user_msg_id = new_client_message_id();
+        let operation = self
+            .execution_store
+            .session(
+                &self.session_id,
+                self.execution_parent.clone(),
+                self.invocation_id.as_deref(),
+            )
+            .await?;
+        self.execution_store
+            .reserve_prompt(&operation.reference, &user_msg_id)
+            .await?;
         let log = NatsSessionLog::new(self.jetstream.clone(), self.session_id.clone());
         let user_entry = SessionLogEntry::Message {
             id: Some(user_msg_id.clone()),
@@ -464,6 +519,9 @@ impl NatsSession {
             .append_event_async(&user_entry)
             .await
             .context("failed to append user message to session log")?;
+        self.execution_store
+            .commit_prompt(&operation.reference, &user_msg_id, user_msg_seq)
+            .await?;
 
         log::info!(
             "nats session: appended user message session_id={} len={}",
@@ -471,20 +529,24 @@ impl NatsSession {
             serde_json::to_string(&user_entry).map_or(0, |entry| entry.len())
         );
         Ok(AppendedPrompt {
+            execution_id: operation.reference.execution_id,
             user_msg_id,
             user_msg_seq,
+            events: None,
         })
     }
 
     async fn publish_activation(
         &self,
-        user_msg_seq: u64,
+        execution: (&str, u64),
         tool_confirmation_subject: Option<&str>,
         token_budget: Option<u64>,
     ) -> Result<()> {
+        let (execution_id, user_msg_seq) = execution;
         match &self.config.activation_route {
             SessionActivationRoute::ClusterShared => {
                 let activation = SessionActivate::new(&self.session_id)
+                    .with_execution_id(execution_id)
                     .with_tool_confirmation_subject(tool_confirmation_subject)
                     .with_token_budget(token_budget);
                 publish_session_activate(&self.jetstream, &self.config.cluster, &activation)
@@ -497,6 +559,7 @@ impl NatsSession {
             } => {
                 let activation =
                     SessionActivate::targeted(&self.session_id, user_msg_seq, worker_id)
+                        .with_execution_id(execution_id)
                         .with_tool_confirmation_subject(tool_confirmation_subject)
                         .with_token_budget(token_budget);
                 publish_targeted_session_activate(
@@ -562,7 +625,11 @@ impl NatsSession {
             .append_user_content(MessageContent::Text(user_message.to_string()))
             .await?;
         let activation_error = self
-            .publish_activation(appended.user_msg_seq, confirmation_subject, None)
+            .publish_activation(
+                (&appended.execution_id, appended.user_msg_seq),
+                confirmation_subject,
+                None,
+            )
             .await
             .err();
         Ok(DurableTextEnqueue {
@@ -611,39 +678,20 @@ impl NatsSession {
         if requested_seq_status(&entries, user_msg_seq)? == RequestedSeqStatus::Covered {
             return Ok(None);
         }
-        self.publish_activation(user_msg_seq, confirmation_subject, None)
-            .await?;
+        let operation = cancellation::resolve_pending_execution(
+            &self.execution_store,
+            &self.jetstream,
+            &self.session_id,
+        )
+        .await?
+        .context("pending execution missing")?;
+        self.publish_activation(
+            (&operation.reference.execution_id, user_msg_seq),
+            confirmation_subject,
+            None,
+        )
+        .await?;
         Ok(Some(user_msg_seq))
-    }
-
-    /// Cancel the latest pending turn and wait until a lease holder confirms
-    /// the durable cancellation.
-    ///
-    /// Re-activation is intentional: after a local worker is replaced, the new
-    /// process first needs to claim the pending session and install its control
-    /// subscription. The bounded retry window includes one default lease TTL,
-    /// allowing a killed holder's lease to expire before its replacement
-    /// writes the fenced `Cancel` entry.
-    pub async fn cancel_pending_turn(&self) -> Result<bool> {
-        let Some(user_msg_seq) = self.activate_pending_turn().await? else {
-            return Ok(false);
-        };
-        let deadline = tokio::time::Instant::now() + CANCEL_RECOVERY_TIMEOUT;
-        loop {
-            if self.request_cancel_acknowledgement().await {
-                return Ok(true);
-            }
-            if self.pending_turn_is_covered(user_msg_seq).await? {
-                return Ok(true);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!(
-                    "timed out waiting for worker to durably cancel session '{}'",
-                    self.session_id
-                );
-            }
-            tokio::time::sleep(CONTROL_ACK_RETRY_DELAY).await;
-        }
     }
 
     /// Route a tool-approval decision to the lease holder and wait until its
@@ -656,18 +704,15 @@ impl NatsSession {
     ) -> Result<bool> {
         let entries = self.load_durable_entries().await?;
         let pending = crate::nats_worker::derive_pending_hitl_approvals(&entries)?;
-        if !pending
-            .iter()
-            .any(|approval| approval.tool_call_id == tool_call_id)
-        {
+        if !pending.iter().any(|item| item.tool_call_id == tool_call_id) {
             return Ok(false);
         }
         let Some(_) = self.activate_pending_turn().await? else {
             let entries = self.load_durable_entries().await?;
-            let still_pending = crate::nats_worker::derive_pending_hitl_approvals(&entries)?
+            if !crate::nats_worker::derive_pending_hitl_approvals(&entries)?
                 .iter()
-                .any(|approval| approval.tool_call_id == tool_call_id);
-            if !still_pending {
+                .any(|item| item.tool_call_id == tool_call_id)
+            {
                 return Ok(false);
             }
             anyhow::bail!(
@@ -680,7 +725,7 @@ impl NatsSession {
             approved,
             note,
         };
-        let deadline = tokio::time::Instant::now() + CANCEL_RECOVERY_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + CONTROL_RECOVERY_TIMEOUT;
         loop {
             if request_control_command(
                 &self.client,
@@ -694,10 +739,10 @@ impl NatsSession {
                 return Ok(true);
             }
             let entries = self.load_durable_entries().await?;
-            let still_pending = crate::nats_worker::derive_pending_hitl_approvals(&entries)?
+            if !crate::nats_worker::derive_pending_hitl_approvals(&entries)?
                 .iter()
-                .any(|approval| approval.tool_call_id == tool_call_id);
-            if !still_pending {
+                .any(|item| item.tool_call_id == tool_call_id)
+            {
                 return Ok(false);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -708,30 +753,6 @@ impl NatsSession {
             }
             tokio::time::sleep(CONTROL_ACK_RETRY_DELAY).await;
         }
-    }
-
-    async fn request_cancel_acknowledgement(&self) -> bool {
-        let result = request_control_command(
-            &self.client,
-            &self.session_id,
-            &ControlCommand::Cancel,
-            CONTROL_ACK_ATTEMPT_TIMEOUT,
-        )
-        .await;
-        if let Err(error) = &result {
-            log::debug!(
-                "session cancel not yet acknowledged: session_id={} error={error:#}",
-                self.session_id,
-            );
-        }
-        result.is_ok()
-    }
-
-    async fn pending_turn_is_covered(&self, user_msg_seq: u64) -> Result<bool> {
-        let Ok(entries) = self.load_durable_entries().await else {
-            return Ok(false);
-        };
-        Ok(requested_seq_status(&entries, user_msg_seq)? == RequestedSeqStatus::Covered)
     }
 
     /// Run a turn: append user message, activate worker, stream events until completion.
@@ -841,6 +862,43 @@ impl NatsSession {
         .await
     }
 
+    /// Admit and durably append a composed prompt before acknowledging it to a
+    /// caller. Publication failure remains recoverable through the returned ID.
+    pub async fn admit_input(
+        &self,
+        input: &crate::config::Input,
+        source_dir: Option<&std::path::Path>,
+    ) -> Result<AppendedPrompt> {
+        let mut content = input.message_content();
+        crate::nats_attachments::externalize_message_attachments(
+            crate::nats_attachments::AttachmentLocation::new(
+                &self.jetstream,
+                self.attachment_replicas,
+                &self.session_id,
+            ),
+            &mut content,
+            source_dir,
+        )
+        .await?;
+        // Subscribe before admission: an already-running owner can consume the
+        // message as soon as it is appended, before the frontend begins follow.
+        let events = SessionEventStream::attach(
+            self.jetstream.clone(),
+            self.client.clone(),
+            &self.session_id,
+        )
+        .await?;
+        let mut appended = self.append_user_content(content).await?;
+        appended.events = Some(Arc::new(tokio::sync::Mutex::new(Some(events))));
+        if let Err(error) = self
+            .publish_activation((&appended.execution_id, appended.user_msg_seq), None, None)
+            .await
+        {
+            log::warn!("admitted prompt requires activation retry: {error:#}");
+        }
+        Ok(appended)
+    }
+
     /// Run a turn from a composed input while routing `PreToolUse` approval
     /// requests from the worker to an interactive frontend.
     pub async fn run_turn_input_with_tool_confirmation(
@@ -903,17 +961,44 @@ impl NatsSession {
         // Step 1: Append user message to durable log BEFORE activating.
         // The worker derives input from the last user message.
         let appended = self.append_user_content(content).await?;
+        self.follow_admitted_prompt(
+            appended,
+            event_sink,
+            pending_cancel,
+            tool_confirmation_subject,
+            options,
+        )
+        .await
+    }
+
+    /// Follow a prompt already admitted and appended by a frontend. Its execution
+    /// identity is retained even if a later turn replaces the session pointer.
+    pub async fn follow_admitted_prompt(
+        &self,
+        appended: AppendedPrompt,
+        event_sink: Arc<dyn AgentEventSink>,
+        pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
+        tool_confirmation_subject: Option<&str>,
+        options: RunTurnOptions,
+    ) -> Result<NatsTurnResult> {
         let user_msg_id = appended.user_msg_id;
         let user_msg_seq = appended.user_msg_seq;
 
         // Step 2: Attach to session event stream (subscribe-first, then history).
-        let event_stream = SessionEventStream::attach(
-            self.jetstream.clone(),
-            self.client.clone(),
-            &self.session_id,
-        )
-        .await
-        .context("failed to attach to session event stream")?;
+        let retained = match appended.events {
+            Some(events) => events.lock().await.take(),
+            None => None,
+        };
+        let event_stream = match retained {
+            Some(events) => events,
+            None => SessionEventStream::attach(
+                self.jetstream.clone(),
+                self.client.clone(),
+                &self.session_id,
+            )
+            .await
+            .context("failed to attach to session event stream")?,
+        };
 
         // Render history to event sink (for resume/attach scenarios)
         let history = event_stream.history();
@@ -936,7 +1021,7 @@ impl NatsSession {
         // construction subscribes and flushes before this method is called, so
         // a fast worker cannot send an approval request before it is ready.
         self.publish_activation(
-            user_msg_seq,
+            (&appended.execution_id, user_msg_seq),
             tool_confirmation_subject,
             options.token_budget,
         )
@@ -978,15 +1063,10 @@ impl NatsSession {
                 _ = wait_abort_signal(&abort_signal_clone) => {
                     was_cancelled = true;
                     log::info!("nats session: abort signal received, publishing cancel");
-                    if let Err(error) = publish_control_command(
-                        &self.client,
-                        &self.session_id,
-                        &ControlCommand::Cancel,
-                    )
-                    .await
-                    {
-                        log::warn!("nats session: failed to publish abort control command: {error:#}");
-                    }
+                    self.request_cancel(CancelRequest {
+                        expected_execution_id: Some(appended.execution_id.clone()),
+                        retry: false,
+                    }).await?;
                     break;
                 }
 
@@ -1000,15 +1080,10 @@ impl NatsSession {
                 } => {
                     was_cancelled = true;
                     log::info!("nats session: pending cancel received, publishing cancel");
-                    if let Err(error) = publish_control_command(
-                        &self.client,
-                        &self.session_id,
-                        &ControlCommand::Cancel,
-                    )
-                    .await
-                    {
-                        log::warn!("nats session: failed to publish pending cancel control command: {error:#}");
-                    }
+                    self.request_cancel(CancelRequest {
+                        expected_execution_id: Some(appended.execution_id.clone()),
+                        retry: false,
+                    }).await?;
                     break;
                 }
 
@@ -1173,6 +1248,18 @@ impl NatsSession {
                     }
                 }
                 Err(error) => final_reload_error = Some(error),
+            }
+        }
+
+        // Admission may start the worker before this follower is polled. Drain
+        // its retained subscription before a durable completion check can hide
+        // response events already queued by that worker.
+        while let Some(Some(envelope)) = futures_util::FutureExt::now_or_never(event_stream.next())
+        {
+            if event_stream.should_render(&envelope) {
+                saw_terminal_model_error |=
+                    matches!(envelope.event, AgentEvent::Model(ModelEvent::Error(_)));
+                pending_advisories.push_back(envelope);
             }
         }
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { listAgents, listSessions, createSession, getAgent, cancel, uploadAttachment, sendPrompt } from '../api';
+import { listAgents, listSessions, createSession, getAgent, cancel, sessionControl, uploadAttachment, sendPrompt } from '../api';
 
 const fetchMock = vi.fn();
 globalThis.fetch = fetchMock as any;
@@ -101,17 +101,14 @@ describe('api.ts', () => {
       }));
     });
 
-    it('treats JSON-RPC -32002 (idle) as success even on HTTP 400', async () => {
-      // The real backend returns HTTP 400 with a JSON-RPC -32002 error body
-      // for an idle-session cancel. The body must be parsed before the status
-      // check, otherwise the idle-cancel path is unreachable.
+    it('treats legacy JSON-RPC -32002 (idle) as success even on HTTP 400', async () => {
       fetchMock.mockResolvedValueOnce({
         ok: false,
         status: 400,
         json: async () => ({ error: { code: -32002 } }),
       });
       const result = await cancel('agent', 'session');
-      expect(result).toEqual({ cancelled: true });
+      expect(result).toEqual({ cancelled: false, disposition: 'idle' });
     });
 
     it('throws on other JSON-RPC errors', async () => {
@@ -129,6 +126,61 @@ describe('api.ts', () => {
         json: async () => { throw new Error('no body'); },
       });
       await expect(cancel('agent', 'session')).rejects.toThrow('RPC call failed with HTTP 500');
+    });
+  });
+
+  describe('sessionControl', () => {
+    it('loads durable cancellation state with a two-second request deadline', async () => {
+      const timeoutSignal = new AbortController().signal;
+      const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeoutSignal);
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          result: {
+            execution_state: 'cancel_requested',
+            state: { status: 'cancelling' },
+            execution_id: 'exec-1',
+            canPrompt: false,
+            canCancel: true,
+          },
+        }),
+      });
+
+      try {
+        await expect(sessionControl('agent/A', 'session B')).resolves.toEqual(
+          expect.objectContaining({ execution_id: 'exec-1', canPrompt: false }),
+        );
+        expect(timeoutSpy).toHaveBeenCalledWith(2000);
+        expect(fetchMock).toHaveBeenCalledWith(
+          '/v1/agents/agent%2FA/sessions/session%20B',
+          expect.objectContaining({
+            method: 'POST',
+            signal: timeoutSignal,
+            body: JSON.stringify({ jsonrpc: '2.0', id: 'control', method: 'session/get' }),
+          }),
+        );
+      } finally {
+        timeoutSpy.mockRestore();
+      }
+    });
+
+    it('surfaces JSON-RPC failures', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ error: { code: -32000, message: 'Control state unavailable' } }),
+      });
+
+      await expect(sessionControl('agent', 'session')).rejects.toThrow(
+        'Control state unavailable',
+      );
+    });
+
+    it('propagates transport timeouts', async () => {
+      fetchMock.mockRejectedValueOnce(new DOMException('The operation timed out', 'TimeoutError'));
+
+      await expect(sessionControl('agent', 'session')).rejects.toMatchObject({
+        name: 'TimeoutError',
+      });
     });
   });
 

@@ -45,6 +45,7 @@ fn spec<T: JsonSchema + 'static>(
     call_template: &str,
 ) -> ToolSpec {
     ToolSpec {
+        cancellation_guarantee: Default::default(),
         name: name.to_string(),
         description: description.to_string(),
         input_schema: input_schema::<T>(),

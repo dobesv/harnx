@@ -5,6 +5,7 @@ mod test_executor;
 #[path = "session_actor_test_log.rs"]
 mod test_log;
 
+mod cancellation;
 mod handoff;
 mod registry;
 
@@ -76,6 +77,7 @@ struct HitlApprovalFinished {
 }
 
 struct ActorTurnParams {
+    admitted: Option<harnx_runtime::nats_session::AppendedPrompt>,
     prompt_config: GlobalConfig,
     call_fn: Option<AgentCallFn>,
     abort_signal: AbortSignal,
@@ -98,6 +100,8 @@ struct SessionActor {
     broadcast_tx: broadcast::Sender<Event>,
     subscribers: usize,
     state: SessionState,
+    execution_id: Option<String>,
+    execution_state: Option<harnx_execution_control::OperationState>,
     pending: VecDeque<PendingPrompt>,
     active_run: Option<ActiveRun>,
     run_done_tx: mpsc::Sender<RunFinished>,
@@ -149,6 +153,8 @@ fn spawn_session_actor(
         broadcast_tx,
         subscribers: 0,
         state: SessionState::Idle,
+        execution_id: None,
+        execution_state: None,
         pending: VecDeque::new(),
         active_run: None,
         run_done_tx,
@@ -187,7 +193,8 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
         .await;
     }
 
-    let session = open_actor_nats_session(
+    let abort_signal = params.abort_signal.clone();
+    let session = match open_actor_nats_session(
         &params.prompt_config,
         &params.local_worker,
         SessionKey {
@@ -196,7 +203,17 @@ async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime
         },
         params.abort_signal,
     )
-    .await?;
+    .await
+    {
+        Err(_) if abort_signal.aborted() => return Ok(harnx_runtime::LoopResult::Completed),
+        result => result?,
+    };
+    if let Some(admitted) = params.admitted {
+        return session
+            .follow_admitted_prompt(admitted, params.sink, None, None, Default::default())
+            .await
+            .map(|_| harnx_runtime::LoopResult::Completed);
+    }
     let input = build_input(&params.prompt_config, &params.text, &params.attachment_refs)?;
     let attachments_dir = if params.attachment_refs.is_empty() {
         None
@@ -296,8 +313,10 @@ impl SessionActor {
         let reap_sleep = sleep_until(far_future);
         tokio::pin!(reap_sleep);
 
+        let mut cancellation_poll = tokio::time::interval(Duration::from_millis(250));
         loop {
             tokio::select! {
+                _ = cancellation_poll.tick() => self.refresh_cancellation().await,
                 maybe_cmd = self.rx.recv() => {
                     let Some(cmd) = maybe_cmd else {
                         if let Some(active_run) = &self.active_run {
@@ -343,6 +362,7 @@ impl SessionActor {
                 self.subscribers += 1;
                 self.cancel_reap(reap_sleep);
                 self.refresh_history_snapshot().await;
+                self.refresh_cancellation().await;
                 let _ = reply.send(SubscribeResult {
                     snapshot: self.history_snapshot.clone(),
                     history_warnings: self.history_warnings.clone(),
@@ -361,16 +381,12 @@ impl SessionActor {
                 let result = self.handle_prompt(text, options, reap_sleep).await;
                 let _ = reply.send(result);
             }
-            SessionCommand::Cancel { reply } => {
-                // Cancel affects queued prompts and the active run. Approval routing
-                // completes independently: its worker may already have committed a
-                // decision, so dropping the routing task cannot revoke that decision.
-                self.pending.clear();
-                if let Some(active_run) = &self.active_run {
-                    active_run.abort_signal.set_ctrlc();
-                }
-                let _ = reply.send(());
-            }
+            SessionCommand::Cancel {
+                reply,
+                expected_execution_id,
+                // Approval routing completes independently: a worker may have
+                // committed its decision before cancellation is accepted.
+            } => self.answer_cancellation(reply, expected_execution_id).await,
             SessionCommand::HitlApprovalDecision {
                 tool_call_id,
                 approved,
@@ -395,6 +411,7 @@ impl SessionActor {
             }
             SessionCommand::Get { reply } => {
                 self.refresh_history_snapshot().await;
+                self.refresh_cancellation().await;
                 let _ = reply.send(self.session_info());
             }
             SessionCommand::Unsubscribe => {
@@ -415,9 +432,29 @@ impl SessionActor {
     async fn handle_prompt(
         &mut self,
         text: String,
-        options: SessionPromptOptions,
+        mut options: SessionPromptOptions,
         reap_sleep: &mut std::pin::Pin<&mut Sleep>,
     ) -> PromptResult {
+        self.refresh_cancellation().await;
+        if matches!(
+            self.state,
+            SessionState::Cancelling(_) | SessionState::CancelUnconfirmed(_)
+        ) {
+            return PromptResult::Rejected {
+                reason: "session cancellation is pending; retry cancellation before prompting"
+                    .into(),
+            };
+        }
+        if self.actor_config.call_fn.is_none() {
+            match self.admit_prompt(&text, &options).await {
+                Ok(admitted) => options.admitted = Some(admitted),
+                Err(error) => {
+                    return PromptResult::Rejected {
+                        reason: format!("{error:#}"),
+                    }
+                }
+            }
+        }
         let Some(active_run) = &self.active_run else {
             let run_id = self.start_run(text, options, reap_sleep).await;
             return PromptResult::Accepted {
@@ -488,10 +525,16 @@ impl SessionActor {
             SessionState::Interrupted { pending } => Some(serde_json::json!({
                 "outcome": pending.metadata.clone()
             })),
-            SessionState::Idle | SessionState::Running { .. } => None,
+            SessionState::Idle
+            | SessionState::Running { .. }
+            | SessionState::Cancelling(_)
+            | SessionState::CancelUnconfirmed(_) => None,
         };
         self.finish_run(done, result);
-        if !matches!(self.state, SessionState::Interrupted { .. }) {
+        if matches!(
+            self.state,
+            SessionState::Idle | SessionState::Running { .. }
+        ) {
             self.state = SessionState::Idle;
         }
     }
@@ -556,6 +599,7 @@ impl SessionActor {
         let sink_for_task = sink.clone();
         let attachment_refs = options.attachment_refs.clone();
         let turn = ActorTurnParams {
+            admitted: options.admitted,
             prompt_config,
             call_fn: self.actor_config.call_fn.clone(),
             abort_signal: abort_signal.clone(),
@@ -598,11 +642,16 @@ impl SessionActor {
 
     fn session_info(&self) -> SessionInfo {
         SessionInfo {
+            execution_id: self.execution_id.clone(),
+            execution_state: self.execution_state,
             state: self.state.clone(),
             history_snapshot: self.history_snapshot.clone(),
             history_warnings: self.history_warnings.clone(),
             capabilities: SessionCapabilities {
-                can_prompt: true,
+                can_prompt: !matches!(
+                    self.state,
+                    SessionState::Cancelling(_) | SessionState::CancelUnconfirmed(_)
+                ),
                 can_cancel: true,
                 supports_snapshot: true,
             },
@@ -610,7 +659,13 @@ impl SessionActor {
     }
 
     fn is_running(&self) -> bool {
-        matches!(self.state, SessionState::Running { .. })
+        matches!(
+            self.state,
+            SessionState::Running { .. }
+                | SessionState::Interrupted { .. }
+                | SessionState::Cancelling(_)
+                | SessionState::CancelUnconfirmed(_)
+        )
     }
 
     /// Drop this actor's registry entry, leaving any replacement under the same key in place.
@@ -984,10 +1039,16 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         handle
             .tx
-            .send(SessionCommand::Cancel { reply: reply_tx })
+            .send(SessionCommand::Cancel {
+                reply: reply_tx,
+                expected_execution_id: None,
+            })
             .await
             .expect("send cancel");
-        reply_rx.await.expect("recv cancel reply");
+        reply_rx
+            .await
+            .expect("recv cancel reply")
+            .expect("cancellation accepted");
     }
 
     fn registry_with_call_fn(call_fn: AgentCallFn) -> SessionRegistry {

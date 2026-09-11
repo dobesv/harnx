@@ -325,6 +325,11 @@ pub struct Config {
     pub last_message: Option<LastMessage>,
 
     pub session: Option<Session>,
+    pub execution_control: Option<(
+        harnx_execution_control::ExecutionStore,
+        harnx_execution_control::OperationRef,
+    )>,
+    pub maintenance_abort: Option<crate::utils::AbortSignal>,
     pub rag: Option<Arc<Rag>>,
     pub agent: Option<Agent>,
     /// Agent and cluster when the active agent ref names one
@@ -397,6 +402,8 @@ impl Clone for Config {
             working_mode: self.working_mode.clone(),
             last_message: self.last_message.clone(),
             session: self.session.clone(),
+            maintenance_abort: self.maintenance_abort.clone(),
+            execution_control: self.execution_control.clone(),
             rag: self.rag.clone(),
             agent: self.agent.clone(),
             remote_agent: self.remote_agent.clone(),
@@ -441,6 +448,8 @@ impl Config {
             working_mode: self.working_mode.clone(),
             last_message: self.last_message.clone(),
             session: None,
+            maintenance_abort: None,
+            execution_control: None,
             rag: self.rag.clone(),
             agent: self.agent.clone(),
             remote_agent: self.remote_agent.clone(),
@@ -478,6 +487,8 @@ impl Default for Config {
             last_message: None,
 
             session: None,
+            maintenance_abort: None,
+            execution_control: None,
             rag: None,
             agent: None,
             remote_agent: None,

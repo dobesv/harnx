@@ -1,4 +1,4 @@
-export type SubAgentNoteStatus = 'running' | 'done' | 'failed';
+export type SubAgentNoteStatus = 'running' | 'done' | 'failed' | 'cancelling' | 'cancelled' | 'unconfirmed';
 
 export interface SubAgentNote {
   id: string;
@@ -121,7 +121,7 @@ function subAgentMarker(value: unknown): SubAgentIdentity | undefined {
 
 function progressStatus(value: unknown): SubAgentNoteStatus | undefined {
   if (typeof value !== 'string') return undefined;
-  if (!['running', 'done', 'failed'].includes(value)) return undefined;
+  if (!['running', 'done', 'failed', 'cancelling', 'cancelled', 'unconfirmed'].includes(value)) return undefined;
   return value as SubAgentNoteStatus;
 }
 
@@ -367,6 +367,15 @@ function noteFromProgress(
   };
 }
 
+function progressCanReplace(
+  current: SubAgentNoteStatus,
+  incoming: SubAgentNoteStatus,
+): boolean {
+  if (current === 'done' || current === 'cancelled') return false;
+  if (current === 'failed') return incoming === 'done';
+  return true;
+}
+
 function applyProgress(
   state: SubAgentNotesState,
   value: unknown,
@@ -375,9 +384,7 @@ function applyProgress(
   if (!progress) return state;
   const index = state.notes.findIndex((note) => note.invocationId === progress.invocationId);
   if (index >= 0) {
-    if (state.notes[index].status !== 'running' && progress.status !== 'done') {
-      return state;
-    }
+    if (!progressCanReplace(state.notes[index].status, progress.status)) return state;
     return {
       ...state,
       notes: state.notes.map((note, noteIndex) => (

@@ -131,6 +131,7 @@ mod tests {
             config: "tools".to_string(),
             server: "fs".to_string(),
             tools: vec![ToolSpec {
+                cancellation_guarantee: Default::default(),
                 name: "read".to_string(),
                 description: String::new(),
                 input_schema: json!({ "type": "object" }),

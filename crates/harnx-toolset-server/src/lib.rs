@@ -1,8 +1,11 @@
 //! Server-side adapters for hosting a [`harnx_toolset::Toolset`].
 
+mod control;
+use control::handle_control;
 mod aggregate;
 pub mod content;
 mod drain;
+mod execution;
 mod lifecycle;
 mod registration_identity;
 pub mod schema;
@@ -44,14 +47,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 pub const TOOL_REGISTRY_BUCKET: &str = "harnx_tool_registry";
-pub const TOOL_PROTOCOL_VERSION: u32 = 1;
+pub const TOOL_PROTOCOL_VERSION: u32 = 2;
 pub const TOOL_SCHEMA_VERSION: u32 = 1;
 
 const IDEMPOTENCY_CACHE_TTL: Duration = Duration::from_secs(60);
 const IDEMPOTENCY_CACHE_MAX_ENTRIES: usize = 1_024;
 const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
-type InFlight = Arc<Mutex<HashMap<String, CancellationToken>>>;
+type InFlight = Arc<Mutex<HashMap<String, execution::ActiveCall>>>;
 type ReplyCache = Arc<Mutex<HashMap<String, ReplyCacheEntry>>>;
 
 enum ReplyCacheEntry {
@@ -82,6 +85,7 @@ struct ToolRequestContext {
     active_requests: InFlightRequests,
     server_scope: ServerScope,
     server_identity: String,
+    execution_store: harnx_execution_control::ExecutionStore,
 }
 
 struct ValidatedToolRequest {
@@ -275,8 +279,7 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
         schema_version: TOOL_SCHEMA_VERSION,
         proto_version: TOOL_PROTOCOL_VERSION,
     };
-    let jetstream = jetstream::new(client.clone());
-    let registry = ensure_registry_bucket(&jetstream, replicas).await?;
+    let (registry, execution_store) = ensure_control_stores(&client, replicas).await?;
     let mut revision = publish_registration(&registry, &instance_id, &registration).await?;
     signal_started(started);
 
@@ -289,6 +292,7 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
         active_requests,
         server_scope: instance_id.clone(),
         server_identity: identity_token.clone(),
+        execution_store,
     };
     let mut refresh = tokio::time::interval(REGISTRATION_REFRESH_INTERVAL);
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -372,7 +376,8 @@ async fn serve_requests(
                 let Some(control) = control else {
                     anyhow::bail!("control subscription closed");
                 };
-                handle_control(control, &request_context.in_flight).await;
+                let context = request_context.clone();
+                tokio::spawn(async move { handle_control(control, &context).await; });
             }
             _ = refresh.interval.tick() => {
                 match publish_registration(refresh.registry, refresh.instance_id, refresh.registration).await {
@@ -414,17 +419,20 @@ async fn process_tool_request(
     } = validated;
     let completion = match reserve_cache_entry(&context.reply_cache, &idempotency_key).await {
         CacheReservation::Complete(mut reply) => {
+            execution::complete_without_invocation(context, &request).await?;
             reply.call_id.clone_from(&request.call_id);
             finalize_execution_context(context, &request, &mut reply);
             return publish_reply(&context.client, reply_subject, &reply).await;
         }
         CacheReservation::Wait(reply) => {
             let mut reply = wait_for_cached_reply(reply).await?;
+            execution::complete_without_invocation(context, &request).await?;
             reply.call_id.clone_from(&request.call_id);
             finalize_execution_context(context, &request, &mut reply);
             return publish_reply(&context.client, reply_subject, &reply).await;
         }
         CacheReservation::Full => {
+            execution::complete_without_invocation(context, &request).await?;
             return publish_recoverable_reply(
                 &context.client,
                 reply_subject,
@@ -464,14 +472,26 @@ async fn invoke_uncached_tool(
     request: &mut ToolRequest,
     parent_cx: OtelContext,
 ) -> Result<Value, ToolInvokeError> {
+    let execution = execution::InvocationExecution::claim(
+        &context.execution_store,
+        request,
+        &context.server_identity,
+    )
+    .await
+    .map_err(|error| ToolInvokeError::Fatal(format!("register tool execution: {error:#}")))?;
     let cancel = CancellationToken::new();
-    context
-        .in_flight
-        .lock()
-        .await
-        .insert(request.call_id.clone(), cancel.clone());
+    let (stopped, stopped_rx) = watch::channel(false);
+    context.in_flight.lock().await.insert(
+        request.call_id.clone(),
+        execution::ActiveCall {
+            reference: execution.reference.clone(),
+            cancel: cancel.clone(),
+            stopped: stopped_rx,
+        },
+    );
     let mut args = std::mem::take(&mut request.args);
     let invocation_context = ToolInvocationContext {
+        operation: Some(execution.reference.clone()),
         call_id: request.call_id.clone(),
         invoking_session_id: request.parent_session_id.clone(),
         capabilities: request.capabilities.clone(),
@@ -484,15 +504,24 @@ async fn invoke_uncached_tool(
     );
     let metric_tool = metric_tool_name(context.toolset.as_ref(), &request.tool);
     let start = Instant::now();
-    let result = context
+    let guarantee = context
+        .toolset
+        .tools()
+        .iter()
+        .find(|spec| spec.name == request.tool)
+        .map(|spec| spec.cancellation_guarantee)
+        .unwrap_or_default();
+    let invocation = context
         .toolset
         .invoke_with_context(ToolInvocation {
             tool: request.tool.clone(),
             args,
             context: invocation_context,
-            cancel,
+            cancel: cancel.clone(),
         })
-        .instrument(tool_exec_span(&request.tool, parent_cx))
+        .instrument(tool_exec_span(&request.tool, parent_cx));
+    let result = execution
+        .invoke(cancel, guarantee, invocation, stopped)
         .await;
     context.in_flight.lock().await.remove(&request.call_id);
     let elapsed = start.elapsed();
@@ -781,26 +810,23 @@ async fn publish_reply(
         .context("publish tool reply")
 }
 
-async fn handle_control(message: async_nats::Message, in_flight: &InFlight) {
-    let Ok(control) = serde_json::from_slice::<ControlMessage>(&message.payload) else {
-        return;
-    };
-    let call_id = header_value(&message, HDR_CALL_ID).unwrap_or(control.call_id);
-    match control.kind {
-        ControlKind::Cancel => {
-            if let Some(cancel) = in_flight.lock().await.get(&call_id) {
-                cancel.cancel();
-            }
-        }
-    }
-}
-
 fn header_value(message: &async_nats::Message, name: &str) -> Option<String> {
     message
         .headers
         .as_ref()?
         .get(name)
         .map(|value| value.as_str().to_owned())
+}
+
+async fn ensure_control_stores(
+    client: &async_nats::Client,
+    replicas: usize,
+) -> Result<(kv::Store, harnx_execution_control::ExecutionStore)> {
+    let js = jetstream::new(client.clone());
+    Ok((
+        ensure_registry_bucket(&js, replicas).await?,
+        harnx_execution_control::ExecutionStore::ensure(&js, replicas).await?,
+    ))
 }
 
 async fn ensure_registry_bucket(
@@ -1008,6 +1034,7 @@ impl McpToolsetAdapter {
             .into_iter()
             .collect();
         let invocation_context = ToolInvocationContext {
+            operation: None,
             call_id: format!("{:?}", context.id),
             invoking_session_id: None,
             capabilities,
@@ -1253,6 +1280,7 @@ mod tests {
 
         fn tools(&self) -> Vec<harnx_toolset::ToolSpec> {
             vec![harnx_toolset::ToolSpec {
+                cancellation_guarantee: Default::default(),
                 name: "known".to_owned(),
                 description: "known test tool".to_owned(),
                 input_schema: serde_json::json!({ "type": "object" }),

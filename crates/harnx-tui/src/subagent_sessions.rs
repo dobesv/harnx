@@ -11,6 +11,46 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_core::event::{AgentEvent, SessionEvent, ToolEvent, TurnEvent};
 
 impl Tui {
+    pub(super) fn cancel_selected_child(&mut self) -> bool {
+        let view = self.app.subagent_view_stack.last().cloned().or_else(|| {
+            self.app
+                .transcript_focus
+                .and_then(|focus| self.app.transcript.get(focus))
+                .and_then(subagent_row_view)
+        });
+        let Some(view) = view else {
+            return false;
+        };
+        if !matches!(
+            view.status,
+            SubAgentStatus::Running | SubAgentStatus::Unconfirmed
+        ) {
+            return !self.app.subagent_view_stack.is_empty();
+        }
+        let Some(progress) = view.progress else {
+            return true;
+        };
+        if !self
+            .app
+            .monitored_sessions
+            .get(&view.key)
+            .is_some_and(|state| {
+                state.execution_id.as_deref() == Some(&progress.snapshot.invocation_id)
+            })
+        {
+            return true;
+        }
+        // The row's attested invocation ID is the expected execution generation;
+        // the coordinator rejects old rows after a child session is reused.
+        self.exit_after_cancel = false;
+        self.start_cancellation(
+            view.key.session_id,
+            view.key.cluster,
+            Some(progress.snapshot.invocation_id),
+        );
+        true
+    }
+
     pub(super) async fn handle_session_event(
         &mut self,
         event: &AgentEvent,

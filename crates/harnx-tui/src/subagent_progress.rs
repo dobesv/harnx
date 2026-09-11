@@ -205,10 +205,14 @@ fn upsert_invocation(
         status, progress, ..
     }) = existing
     {
-        if progress
-            .as_ref()
-            .is_some_and(|current| current.snapshot.status != SubAgentProgressStatus::Running)
-        {
+        if progress.as_ref().is_some_and(|current| {
+            matches!(
+                current.snapshot.status,
+                SubAgentProgressStatus::Done
+                    | SubAgentProgressStatus::Failed
+                    | SubAgentProgressStatus::Cancelled
+            )
+        }) {
             return false;
         }
         *status = update.status;

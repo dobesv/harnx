@@ -477,22 +477,61 @@ impl Toolset for BridgeToolset {
         };
         let params = prepare_call_tool_params(tool, arguments);
 
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                Err(ToolInvokeError::Recoverable("call cancelled".into()))
-            }
-            result = self.peer.call_tool(params) => match result {
-                Ok(result) => serde_json::to_value(result)
-                    .map_err(|err| ToolInvokeError::Fatal(err.to_string())),
-                Err(ServiceError::TransportClosed | ServiceError::TransportSend(_)) => {
-                    Err(ToolInvokeError::Fatal(format!(
+        if cancel.is_cancelled() {
+            return Err(ToolInvokeError::Recoverable("call cancelled".into()));
+        }
+        self.invoke_cancellable(params, cancel)
+            .await
+            .map_err(|err| match err {
+                ServiceError::TransportClosed | ServiceError::TransportSend(_) => {
+                    ToolInvokeError::Fatal(format!(
                         "MCP server '{}' exited during call",
                         self.server_name
-                    )))
+                    ))
                 }
-                Err(err) => Err(ToolInvokeError::Recoverable(err.to_string())),
-            },
+                err => ToolInvokeError::Recoverable(err.to_string()),
+            })
+    }
+}
+
+impl BridgeToolset {
+    async fn invoke_cancellable(
+        &self,
+        params: CallToolRequestParams,
+        cancel: CancellationToken,
+    ) -> Result<Value, ServiceError> {
+        use rmcp::model::{CallToolRequest, ClientRequest, CustomNotification, ServerResult};
+        let request = self
+            .peer
+            .send_cancellable_request(
+                ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+                rmcp::service::PeerRequestOptions::no_options(),
+            )
+            .await?;
+        let request_id = request.id.clone();
+        let response = request.await_response();
+        tokio::pin!(response);
+        let result = tokio::select! {
+            result = &mut response => result?,
+            _ = cancel.cancelled() => {
+                // RMCP's typed CancelledNotification removes the local response
+                // waiter as soon as the notification is sent. That is not a
+                // shutdown acknowledgement. Send the same wire notification
+                // through its raw variant to retain the actual server response.
+                let notification = CustomNotification::new("notifications/cancelled", Some(serde_json::json!({
+                    "requestId": request_id, "reason": "invocation cancelled",
+                })));
+                let _ = self.peer.send_notification(notification.into()).await;
+                // A notification is only a request. Retain the response future:
+                // an unresponsive shared server must remain an explicit blocker.
+                response.await?
+            }
+        };
+        match result {
+            ServerResult::CallToolResult(result) => {
+                serde_json::to_value(result).map_err(|_| ServiceError::UnexpectedResponse)
+            }
+            _ => Err(ServiceError::UnexpectedResponse),
         }
     }
 }
@@ -520,6 +559,7 @@ fn configure_child_process(_command: &mut Command) {}
 fn map_tool(tool: Tool) -> ToolSpec {
     let annotations = tool.annotations.as_ref();
     ToolSpec {
+        cancellation_guarantee: Default::default(),
         name: tool.name.into(),
         description: tool
             .description

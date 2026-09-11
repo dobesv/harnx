@@ -170,6 +170,9 @@ impl LifecycleToolset {
     }
 
     async fn invoke_inner(&self, invocation: ToolInvocation) -> Result<Value, ToolInvokeError> {
+        if invocation.cancel.is_cancelled() {
+            return Err(ToolInvokeError::Fatal("tool call cancelled".into()));
+        }
         let ToolInvocation {
             tool,
             args,
@@ -216,11 +219,9 @@ impl Toolset for LifecycleToolset {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Value, ToolInvokeError> {
-        let cancel = invocation.cancel.clone();
-        tokio::select! {
-            result = self.invoke_inner(invocation) => result,
-            _ = cancel.cancelled() => Err(ToolInvokeError::Fatal("tool call cancelled".to_string())),
-        }
+        // Retain in-flight lifecycle operations and remote clone calls until
+        // their owner returns; dropping this future is not a cleanup guarantee.
+        self.invoke_inner(invocation).await
     }
 }
 
@@ -243,6 +244,7 @@ fn parse_args<T: for<'de> Deserialize<'de>>(tool: &str, args: Value) -> Result<T
 pub(super) fn lifecycle_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
+            cancellation_guarantee: Default::default(),
             name: "connect".to_string(),
             description: "Connect this Harnx session to an existing Kubernetes sandbox or create and start a new sandbox.".to_string(),
             input_schema: json!({
@@ -261,6 +263,7 @@ pub(super) fn lifecycle_specs() -> Vec<ToolSpec> {
             meta: None,
         },
         ToolSpec {
+            cancellation_guarantee: Default::default(),
             name: "status".to_string(),
             description: "Observe sandbox status without waking it or extending its activity.".to_string(),
             input_schema: json!({"type": "object", "properties": {
@@ -273,6 +276,7 @@ pub(super) fn lifecycle_specs() -> Vec<ToolSpec> {
             meta: None,
         },
         ToolSpec {
+            cancellation_guarantee: Default::default(),
             name: "release".to_string(),
             description: "Hibernate the current sandbox while preserving storage, or permanently destroy it.".to_string(),
             input_schema: json!({"type": "object", "properties": {

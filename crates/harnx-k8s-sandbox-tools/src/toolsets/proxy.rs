@@ -81,12 +81,12 @@ impl ProxyToolset {
 
     async fn execute(&self, invocation: ToolInvocation) -> Result<Value, ToolInvokeError> {
         let cancel = invocation.cancel.clone();
-        let resolved = tokio::select! {
-            result = self.resolve(invocation) => result?,
-            _ = cancel.cancelled() => {
-                return Err(ToolInvokeError::Fatal("tool call cancelled".to_string()));
-            }
-        };
+        if cancel.is_cancelled() {
+            return Err(ToolInvokeError::Fatal("tool call cancelled".into()));
+        }
+        // Resolving may activate a sandbox. Keep ownership until that work
+        // settles; the remote caller checks cancellation before sending a call.
+        let resolved = self.resolve(invocation).await?;
         // Once forwarding starts, the MCP caller owns cancellation so it can
         // notify the in-sandbox server before completing the invocation.
         self.forward(resolved).await

@@ -26,6 +26,11 @@ pub enum ControlCommand {
     /// Worker-originated: carries the fence token for tombstone.
     /// The worker appends a Cancel entry BEFORE firing the AbortSignal.
     Cancel,
+    /// Generation-scoped latency hint. Durable KV state is authoritative.
+    CancelExecution {
+        execution_id: String,
+        cancellation_id: String,
+    },
     /// Resolve one durable pending tool approval.
     HitlApprovalDecision {
         tool_call_id: String,
@@ -59,55 +64,83 @@ pub(super) struct SessionControlHandler {
     lease: Arc<NatsSessionLease>,
     backend: NatsSessionLogBackend,
     abort_signal: crate::utils::AbortSignal,
+    execution: super::execution_control::WorkerExecution,
     hitl_decision_tx: tokio::sync::mpsc::UnboundedSender<AppliedHitlDecision>,
 }
 
 impl SessionControlHandler {
     pub(super) fn new(
-        client: &async_nats::Client,
-        jetstream: &async_nats::jetstream::Context,
-        session_id: &str,
-        lease: &Arc<NatsSessionLease>,
-        backend: &NatsSessionLogBackend,
-        abort_signal: &crate::utils::AbortSignal,
+        ctx: &super::daemon_runtime::ControlListenerCtx<'_>,
         hitl_decision_tx: tokio::sync::mpsc::UnboundedSender<AppliedHitlDecision>,
     ) -> Self {
         Self {
-            client: client.clone(),
-            jetstream: jetstream.clone(),
-            session_id: session_id.to_string(),
-            lease: Arc::clone(lease),
-            backend: backend.clone(),
-            abort_signal: abort_signal.clone(),
+            execution: ctx.execution.clone(),
+            client: ctx.client.clone(),
+            jetstream: ctx.jetstream.clone(),
+            session_id: ctx.session_id.to_string(),
+            lease: Arc::clone(ctx.lease),
+            backend: ctx.backend.clone(),
+            abort_signal: ctx.abort_signal.clone(),
             hitl_decision_tx,
         }
     }
 
-    pub(super) async fn listen(self, mut subscriber: async_nats::Subscriber) {
+    pub(super) async fn listen(
+        self,
+        mut subscriber: async_nats::Subscriber,
+        mut watch: async_nats::jetstream::kv::Watch,
+    ) {
         use futures_util::StreamExt;
-        while let Some(message) = subscriber.next().await {
-            let command = match ControlCommand::from_bytes(&message.payload) {
-                Ok(command) => command,
-                Err(error) => {
-                    log::debug!("invalid control command payload, ignoring: {error}");
-                    continue;
+        loop {
+            if !self.abort_signal.aborted()
+                && self
+                    .execution
+                    .store
+                    .check_ancestors(&self.execution.reference)
+                    .await
+                    .is_err()
+            {
+                self.cancel(None).await;
+            }
+            tokio::select! {
+                update = watch.next() => {
+                    if !matches!(update, Some(Ok(_))) {
+                        self.abort_signal.set_ctrlc();
+                        let _ = self.execution.store.cancel_operation(&self.execution.reference, None, false).await;
+                        return;
+                    }
                 }
-            };
-            match command {
-                ControlCommand::Cancel => self.cancel(message.reply).await,
-                ControlCommand::HitlApprovalDecision {
-                    tool_call_id,
-                    approved,
-                    note,
-                } => {
-                    self.apply_hitl_decision(tool_call_id, approved, note, message.reply)
-                        .await;
+                message = subscriber.next() => {
+                    let Some(message) = message else { self.abort_signal.set_ctrlc(); return; };
+                    match ControlCommand::from_bytes(&message.payload) {
+                        Ok(ControlCommand::CancelExecution { execution_id, cancellation_id }) if execution_id == self.execution.reference.execution_id => {
+                            let _ = self.execution.store.cancel_operation(&self.execution.reference, Some(&cancellation_id), false).await;
+                            self.cancel(message.reply).await;
+                        }
+                        Ok(ControlCommand::HitlApprovalDecision { tool_call_id, approved, note }) => {
+                            self.apply_hitl_decision(tool_call_id, approved, note, message.reply).await;
+                        }
+                        Ok(ControlCommand::Cancel) => self.cancel(message.reply).await,
+                        Ok(ControlCommand::CancelExecution { .. }) => {}
+                        Err(error) => log::debug!("invalid control command payload, ignoring: {error}"),
+                    }
                 }
             }
         }
     }
 
     async fn cancel(&self, reply: Option<async_nats::Subject>) {
+        self.abort_signal.set_ctrlc();
+        let _ = self
+            .execution
+            .store
+            .cancel_operation(&self.execution.reference, None, false)
+            .await;
+        let _ = self
+            .execution
+            .store
+            .quiesce(&self.execution.reference, &self.execution.owner)
+            .await;
         let durable = self.append_cancel();
         if durable {
             self.acknowledge(reply).await;
@@ -246,6 +279,10 @@ pub async fn publish_control_command(
     session_id: &str,
     command: &ControlCommand,
 ) -> Result<()> {
+    let command = durable_command(client, session_id, command).await?;
+    let Some(command) = command else {
+        return Ok(());
+    };
     let subject = control_subject(session_id);
     let payload = command.to_bytes()?;
     client
@@ -271,6 +308,10 @@ pub async fn request_control_command(
     command: &ControlCommand,
     timeout: std::time::Duration,
 ) -> Result<()> {
+    let command = durable_command(client, session_id, command).await?;
+    let Some(command) = command else {
+        return Ok(());
+    };
     let subject = control_subject(session_id);
     let payload = command.to_bytes()?;
     tokio::time::timeout(timeout, client.request(subject, payload.into()))
@@ -278,4 +319,38 @@ pub async fn request_control_command(
         .context("timed out waiting for session control acknowledgement")?
         .context("request session control acknowledgement")?;
     Ok(())
+}
+
+async fn durable_command(
+    client: &async_nats::Client,
+    session_id: &str,
+    command: &ControlCommand,
+) -> Result<Option<ControlCommand>> {
+    if !matches!(command, ControlCommand::Cancel) {
+        return Ok(Some(command.clone()));
+    }
+    let js = async_nats::jetstream::new(client.clone());
+    // Legacy callers do not carry cluster configuration. Opening an existing
+    // bucket must preserve its replica count rather than applying a local default.
+    let store = match js.get_key_value(harnx_execution_control::BUCKET).await {
+        Ok(bucket) => harnx_execution_control::ExecutionStore::from_store(bucket),
+        Err(error) if crate::nats_admin::kv_bucket_missing(&error) => {
+            harnx_execution_control::ExecutionStore::ensure(&js, 1).await?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let Some(operation) =
+        crate::nats_session::cancellation::resolve_pending_execution(&store, &js, session_id)
+            .await?
+    else {
+        return Ok(None);
+    };
+    let operation = store
+        .cancel_operation(&operation.reference, None, false)
+        .await?;
+    let cancel = operation.cancellation.context("cancellation missing")?;
+    Ok(Some(ControlCommand::CancelExecution {
+        execution_id: operation.reference.execution_id,
+        cancellation_id: cancel.cancellation_id,
+    }))
 }

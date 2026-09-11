@@ -7,6 +7,9 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[path = "mcp_tests/shared_cancellation.rs"]
+mod shared_cancellation;
+
 #[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct CounterArgs {}
 

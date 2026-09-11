@@ -1,6 +1,7 @@
-use super::test_config;
+use super::{normalize_screen, test_config};
+use crate::exit_confirmation::exit_body_copy;
 use crate::remote_session::classify_exit_worker_state;
-use crate::render::exit_body_copy;
+use crate::test_utils::TuiTestHarness;
 use crate::types::{
     ExitCancelFactory, ExitCancelFuture, ExitPhase, ExitWorkerState, ModalState, Tui,
 };
@@ -28,6 +29,35 @@ async fn prompting_exit_tui() -> Tui {
         phase: ExitPhase::Prompting,
     });
     tui
+}
+
+#[tokio::test]
+async fn exit_confirmation_replaces_input_with_full_width_tray() {
+    let mut harness = TuiTestHarness::with_size(80, 16).await;
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(crate::types::TranscriptItem::SystemText(
+            "Transcript stays above the exit confirmation.".to_string(),
+        ));
+    harness
+        .tui()
+        .app
+        .input
+        .insert_str("draft input must be hidden");
+    harness.tui().app.modal = Some(ModalState::ConfirmExit {
+        worker_state: ExitWorkerState::LocalOwnedHere,
+        phase: ExitPhase::Prompting,
+    });
+
+    harness.render();
+    let rendered = normalize_screen(&harness.screen_contents());
+
+    assert!(rendered.contains("Transcript stays above the exit confirmation."));
+    assert!(rendered.contains("Agent is still working"));
+    assert!(!rendered.contains("draft input must be hidden"));
+    insta::assert_snapshot!("exit_confirmation_bottom_tray", rendered);
 }
 
 fn assert_exit_phase(tui: &Tui, expected: ExitPhase) {
@@ -64,13 +94,13 @@ fn controlled_cancel_factory(
     release: Arc<Notify>,
     error: Option<&'static str>,
 ) -> ExitCancelFactory {
-    Arc::new(move |_, _, _, _| -> ExitCancelFuture {
+    Arc::new(move |_, _, _, _, _| -> ExitCancelFuture {
         let release = Arc::clone(&release);
         Box::pin(async move {
             release.notified().await;
             match error {
                 Some(message) => Err(anyhow::anyhow!(message)),
-                None => Ok(()),
+                None => Ok(harnx_execution_control::CancelReceipt::idle()),
             }
         })
     })
@@ -235,7 +265,7 @@ async fn completed_turn_race_exits_without_starting_cancel() {
 }
 
 #[tokio::test]
-async fn interrupt_exit_waits_for_cancel_before_quitting_and_keeps_worker_owner() {
+async fn escape_during_exit_cancellation_stays_and_preserves_request() {
     let mut tui = prompting_exit_tui().await;
     let release = Arc::new(Notify::new());
     tui.set_exit_cancel_factory(controlled_cancel_factory(Arc::clone(&release), None));
@@ -250,20 +280,19 @@ async fn interrupt_exit_waits_for_cancel_before_quitting_and_keeps_worker_owner(
 
     tui.handle_modal_key(esc())
         .await
-        .expect("ignore input while interrupting");
+        .expect("stay while cancellation continues");
     tui.poll_pending_exit_cancel().await;
-
-    assert_interrupt_in_flight(&tui, &local_worker, local_worker_was_present).await;
-
+    assert!(!tui.app.should_quit);
+    assert!(tui.app.modal.is_none());
+    assert!(tui.pending_exit_cancel.is_some());
     release.notify_one();
     tui.poll_pending_exit_cancel().await;
-
-    assert_exit_finished(&tui);
-    assert!(tui.exit_interrupt_error().is_none());
+    assert!(!tui.app.should_quit);
+    assert!(tui.pending_exit_cancel.is_none());
 }
 
 #[tokio::test]
-async fn interrupt_exit_failure_quits_and_records_warning_detail() {
+async fn interrupt_exit_failure_stays_with_retry_and_error() {
     let mut tui = prompting_exit_tui().await;
     let release = Arc::new(Notify::new());
     tui.set_exit_cancel_factory(controlled_cancel_factory(
@@ -283,6 +312,69 @@ async fn interrupt_exit_failure_quits_and_records_warning_detail() {
     release.notify_one();
     tui.poll_pending_exit_cancel().await;
 
-    assert_exit_finished(&tui);
+    assert!(!tui.app.should_quit);
+    assert_exit_phase(&tui, ExitPhase::RequestFailed);
     assert_eq!(tui.exit_interrupt_error(), Some("boom"));
+}
+
+#[tokio::test]
+async fn force_exit_does_not_wait_for_cancel_persistence() {
+    let mut tui = prompting_exit_tui().await;
+    tui.set_exit_cancel_factory(controlled_cancel_factory(Arc::new(Notify::new()), None));
+    tui.handle_modal_key(ctrl('c')).await.unwrap();
+    tui.poll_pending_exit_cancel().await;
+    assert!(tui.pending_exit_cancel.is_some());
+    tui.handle_modal_key(ctrl('d')).await.unwrap();
+    assert!(tui.app.should_quit);
+}
+
+#[tokio::test]
+async fn interrupt_exit_finishes_on_durable_acceptance_before_shutdown() {
+    let mut tui = prompting_exit_tui().await;
+    tui.set_exit_cancel_factory(Arc::new(|_, _, _, _, _| {
+        Box::pin(async {
+            let mut receipt = harnx_execution_control::CancelReceipt::idle();
+            receipt.cancelled = true;
+            receipt.disposition = harnx_execution_control::CancelDisposition::Requested;
+            Ok(receipt)
+        })
+    }));
+    tui.handle_modal_key(ctrl('c')).await.unwrap();
+    tui.poll_pending_exit_cancel().await;
+    assert_exit_finished(&tui);
+    assert!(
+        tui.app.llm_busy,
+        "durable acceptance must not claim the worker is idle"
+    );
+}
+
+#[tokio::test]
+async fn root_cancellation_blocks_editing_and_has_static_unconfirmed_tray() {
+    let mut harness = TuiTestHarness::with_size(100, 20).await;
+    let tui = harness.tui();
+    tui.set_exit_cancel_factory(controlled_cancel_factory(Arc::new(Notify::new()), None));
+    tui.start_cancellation("root".into(), "local".into(), None);
+    tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(tui.app.input.lines().iter().all(String::is_empty));
+    assert!(tui.app.pending_message.is_none());
+    tui.cancellation.as_mut().unwrap().phase = crate::cancellation::CancellationPhase::Unconfirmed;
+    assert!(tui.cancellation_unconfirmed());
+    harness.render();
+    assert!(harness
+        .screen_contents()
+        .contains("Cancellation unconfirmed"));
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT))
+        .await
+        .unwrap();
+    assert!(matches!(
+        harness.tui().cancellation.as_ref().map(|tray| &tray.phase),
+        Some(crate::cancellation::CancellationPhase::Requesting)
+    ));
 }

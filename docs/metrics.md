@@ -58,6 +58,29 @@ Histogram buckets for duration metrics use default boundaries: `[0.005, 0.01, 0.
 - **Token counting semantics change**: `input_tokens` uses the OpenTelemetry subset convention, where `input_tokens` includes all cache tokens (`input_tokens >= cache_read + cache_write`). For Anthropic and Bedrock providers, `input_tokens` now includes cached tokens (previously Anthropic excluded cache-read tokens; Bedrock excluded cache-read and discarded cache-write). OpenAI and Gemini were already subset models and remain unchanged. Dashboards or queries that sum Anthropic or Bedrock `input_tokens` will reflect higher values than before.
 - **Cardinality protection**: Metrics omit `session_id` and raw dynamic URL paths to prevent cardinality explosion. HTTP route labels use matched path templates (such as `/token/{context}`) or fixed route identifiers (`proxy` for `harnx-proxy-auth`).
 
+## Cancellation progress
+
+`harnx_execution_transitions_total{kind,state}` counts successfully persisted
+operation state changes. `kind` is `session` or `tool` (including controlled hook
+invocations). Useful states include `cancel_requested`, `quiescing`, `unconfirmed`,
+and `cancelled`. CAS conflicts and read-only polling do not increment the counter.
+
+`harnx_cancellation_quiescence_seconds{kind}` records elapsed time from the original
+cancellation request to confirmed cancellation. Retries preserve the original
+request timestamp. The histogram excludes operations still unconfirmed, so pair
+latency dashboards with the unconfirmed transition counter. These are process-local
+observations, not a durable count of currently blocked executions: a process can
+exit after the KV write but before emitting a metric. Collect from workers,
+serve, and tool/hook servers with a metrics recorder enabled. Session and execution
+IDs are deliberately omitted from labels.
+
+Use `harnx_execution_control` KV records to investigate current blockers. A
+session's `children` references identify calls that have not acknowledged cleanup;
+unresolved `admissions` identify a prompt reservation needing log reconciliation.
+Keep unconfirmed sessions blocked while investigating. Removing a lease, writing
+a Cancel marker, or restarting shared MCP infrastructure does not establish that
+an individual operation stopped. See [the cancellation control plane](nats-ha.md#control-plane).
+
 ## Extending Metrics
 
 ### Adding LLM token/cost recording

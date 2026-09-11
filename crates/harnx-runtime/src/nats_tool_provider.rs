@@ -1,6 +1,6 @@
 use crate::config::{Config, LOCAL_CLUSTER_KEY};
 use crate::server_identity::ServerIdentity;
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
@@ -122,6 +122,10 @@ pub struct NatsToolProvider {
     client: async_nats::Client,
     instance_id: ServerScope,
     parent_session_id: Option<String>,
+    execution_control: Option<(
+        harnx_execution_control::ExecutionStore,
+        harnx_execution_control::OperationRef,
+    )>,
     tools: HashMap<String, RegisteredTool>,
     registrations: Vec<Registration>,
     active_package: Option<String>,
@@ -170,6 +174,11 @@ impl NatsToolProvider {
                 (None, Vec::new())
             }
         };
+        for registration in &registrations {
+            anyhow::ensure!(registration.proto_version == harnx_toolset_server::TOOL_PROTOCOL_VERSION,
+                "incompatible tool protocol {} from '{}'; expected v{}; upgrade workers and tool servers together",
+                registration.proto_version, registration.server, harnx_toolset_server::TOOL_PROTOCOL_VERSION);
+        }
         registrations.sort_by_key(|registration| match registration.package.as_deref() {
             Some(package) if Some(package) == active_package => 0,
             None => usize::from(active_package.is_some()),
@@ -185,6 +194,7 @@ impl NatsToolProvider {
             client,
             instance_id,
             parent_session_id,
+            execution_control: config.execution_control.clone(),
             tools,
             registrations,
             active_package: active_package.map(str::to_string),
@@ -269,8 +279,31 @@ impl NatsToolProvider {
         }
     }
 
+    async fn register_operation(&self, call_id: &str) -> anyhow::Result<()> {
+        if let Some((store, parent)) = &self.execution_control {
+            let child = harnx_execution_control::OperationRef::new(&parent.session_id, call_id);
+            store.child(child, parent.clone()).await?;
+        }
+        Ok(())
+    }
+
+    async fn request_operation_cancel(&self, call_id: &str) -> anyhow::Result<String> {
+        if let Some((store, parent)) = &self.execution_control {
+            let reference = harnx_execution_control::OperationRef::new(&parent.session_id, call_id);
+            let operation = store.cancel_operation(&reference, None, false).await?;
+            return Ok(operation
+                .cancellation
+                .context("tool cancellation missing")?
+                .cancellation_id);
+        }
+        Ok(Uuid::new_v4().to_string())
+    }
+
     async fn publish_cancel(&self, call_id: &str) -> anyhow::Result<()> {
+        let cancellation_id = self.request_operation_cancel(call_id).await?;
         let control = ControlMessage {
+            operation_id: call_id.to_string(),
+            cancellation_id,
             call_id: call_id.to_string(),
             kind: ControlKind::Cancel,
         };
@@ -297,6 +330,7 @@ impl NatsToolProvider {
     ) -> Result<PendingToolRequest, ToolError> {
         let call_id = Uuid::new_v4().to_string();
         let request = ToolRequest {
+            operation_id: call_id.clone(),
             call_id: call_id.clone(),
             tool: route.raw_name.clone(),
             args: arguments,
@@ -341,6 +375,9 @@ impl NatsToolProvider {
         };
         let pending = self.prepare_request(arguments, &route, tool_call_id)?;
         let call_id = pending.call_id.clone();
+        self.register_operation(&call_id)
+            .await
+            .map_err(ToolError::Fatal)?;
         let message = self.await_response(pending, abort).await?;
         let reply: ToolReply = serde_json::from_slice(&message.payload).map_err(|error| {
             ToolError::Recoverable(anyhow!("invalid reply from tool server: {error}"))
@@ -421,6 +458,9 @@ impl NatsToolProvider {
                         "tool call aborted; failed to publish cancellation: {error}"
                     )));
                 }
+                if tokio::time::timeout(Duration::from_secs(5), &mut request).await.is_err() {
+                    return Err(ToolError::Fatal(anyhow!("tool cancellation unconfirmed; invocation has not acknowledged shutdown")));
+                }
                 return Err(ToolError::Fatal(anyhow!("tool call aborted")));
             }
             failure = &mut supervised_failure => {
@@ -429,17 +469,28 @@ impl NatsToolProvider {
                     Ok(InFlightFailure::Unavailable(message)) => message,
                     Err(_) => "tool server unavailable".to_string(),
                 };
-                return Err(ToolError::Recoverable(anyhow!(message)));
+                return Err(self.transport_failure(&call_id, message).await);
             }
             message = self.wait_for_registration_loss(&registration_key) => {
                 self.in_flight.complete(&call_id).await;
-                return Err(ToolError::Recoverable(anyhow!(message)));
+                return Err(self.transport_failure(&call_id, message).await);
             }
             response = &mut request => response,
         };
         self.in_flight.complete(&call_id).await;
-        response
-            .map_err(|error| ToolError::Recoverable(anyhow!("tool server unavailable: {error}")))
+        match response {
+            Ok(message) => Ok(message),
+            Err(error) => Err(self
+                .transport_failure(&call_id, format!("tool server unavailable: {error}"))
+                .await),
+        }
+    }
+    async fn transport_failure(&self, call_id: &str, message: String) -> ToolError {
+        if self.execution_control.is_none() {
+            return ToolError::Recoverable(anyhow!(message));
+        }
+        let _ = self.publish_cancel(call_id).await;
+        ToolError::Fatal(anyhow!("{message}; tool shutdown is unconfirmed"))
     }
 }
 
@@ -759,6 +810,7 @@ mod tests {
             client,
             instance_id,
             parent_session_id: None,
+            execution_control: None,
             tools: HashMap::new(),
             registrations: Vec::new(),
             active_package: None,
@@ -819,6 +871,7 @@ mod tests {
             config: String::new(),
             server: "fs".to_string(),
             tools: vec![ToolSpec {
+                cancellation_guarantee: Default::default(),
                 name: "read".to_string(),
                 description: "Read a file".to_string(),
                 input_schema: json!({
@@ -833,7 +886,7 @@ mod tests {
                 meta: None,
             }],
             schema_version: 1,
-            proto_version: 1,
+            proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
         };
 
         let (tools, declarations) = build_registered_tools(None, vec![registration]);
@@ -872,7 +925,7 @@ mod tests {
             server: "time".to_string(),
             tools: specs.clone(),
             schema_version: 1,
-            proto_version: 1,
+            proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
         };
 
         let (_, declarations) = build_registered_tools(None, vec![registration]);
@@ -902,6 +955,7 @@ mod tests {
             config: String::new(),
             server: "template-server".to_string(),
             tools: vec![ToolSpec {
+                cancellation_guarantee: Default::default(),
                 name: "template_tool".to_string(),
                 description: "Tool with display templates".to_string(),
                 input_schema: json!({ "type": "object" }),
@@ -911,7 +965,7 @@ mod tests {
                 meta: Some(meta),
             }],
             schema_version: 1,
-            proto_version: 1,
+            proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
         };
 
         let (_, declarations) = build_registered_tools(None, vec![registration]);

@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Shared toolset contract and wire types for harnx tool servers"
 
 [dependencies]
+harnx-execution-control.workspace = true
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

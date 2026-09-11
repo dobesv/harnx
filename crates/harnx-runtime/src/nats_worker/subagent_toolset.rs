@@ -3,7 +3,6 @@
 mod termination;
 
 use super::subagent_progress::SubagentProgressReporter;
-use super::{publish_control_command, ControlCommand};
 use crate::nats_event_sink::NatsEventSink;
 use crate::nats_session::{NatsSession, NatsSessionConfig, NatsTurnResult};
 use crate::nats_session_log::NatsSessionLog;
@@ -15,8 +14,9 @@ use harnx_core::event::{AgentEvent, AgentSource, SubAgentProgress, TurnEvent};
 use harnx_core::package_namespace::sanitize_for_tool_name;
 use harnx_core::session::SessionLogEntry;
 use harnx_toolset::{
-    ToolInvocation, ToolInvokeError, ToolSpec, Toolset, SUBAGENT_SESSION_CANCEL_TOOL,
-    SUBAGENT_SESSION_LOAD_TOOL, SUBAGENT_SESSION_NEW_TOOL, SUBAGENT_SESSION_PROMPT_TOOL,
+    ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolSpec, Toolset,
+    SUBAGENT_SESSION_CANCEL_TOOL, SUBAGENT_SESSION_LOAD_TOOL, SUBAGENT_SESSION_NEW_TOOL,
+    SUBAGENT_SESSION_PROMPT_TOOL,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -92,6 +92,13 @@ struct SubagentStart<'a> {
     tool_call_id: Option<&'a str>,
 }
 
+struct ProgressReporterStart {
+    child_session_id: String,
+    parent_session_id: Option<String>,
+    invocation_id: String,
+    tool_call_id: Option<String>,
+}
+
 impl SubagentToolset {
     pub(crate) fn new(
         agent: impl Into<String>,
@@ -164,12 +171,10 @@ impl SubagentToolset {
 
     async fn start_progress_reporter(
         &self,
-        child_session_id: &str,
-        params: &termination::PromptParams<'_>,
+        start: ProgressReporterStart,
     ) -> Result<SubagentProgressReporter, ToolInvokeError> {
-        let invocation_id = uuid::Uuid::new_v4().to_string();
-        let parent_sink = match params.parent_session_id {
-            Some(ref parent_session_id) => {
+        let parent_sink = match start.parent_session_id {
+            Some(parent_session_id) => {
                 let sink = NatsEventSink::new(
                     self.client.clone(),
                     self.jetstream.clone(),
@@ -178,11 +183,11 @@ impl SubagentToolset {
                 .await;
                 self.emit_parent_subagent_started(
                     &sink,
-                    parent_session_id,
+                    &parent_session_id,
                     SubagentStart {
-                        child_session_id,
-                        invocation_id: &invocation_id,
-                        tool_call_id: params.tool_call_id.as_deref(),
+                        child_session_id: &start.child_session_id,
+                        invocation_id: &start.invocation_id,
+                        tool_call_id: start.tool_call_id.as_deref(),
                     },
                 )
                 .await?;
@@ -192,8 +197,8 @@ impl SubagentToolset {
         };
         Ok(SubagentProgressReporter::spawn(
             self.agent.clone(),
-            child_session_id.to_string(),
-            invocation_id,
+            start.child_session_id,
+            start.invocation_id,
             parent_sink,
             self.progress_heartbeat,
         ))
@@ -264,6 +269,7 @@ impl SubagentToolset {
         &self,
         args: Value,
         cancel: CancellationToken,
+        context: ToolInvocationContext,
     ) -> Result<Value, ToolInvokeError> {
         let args: NewSessionArgs = parse_args(SUBAGENT_SESSION_NEW_TOOL, args)?;
         let result = self
@@ -275,6 +281,7 @@ impl SubagentToolset {
                 timeout_secs: None,
                 token_budget: None,
                 cancel,
+                context,
             })
             .await?;
         self.turn_result_value(&result)
@@ -284,6 +291,7 @@ impl SubagentToolset {
         &self,
         args: Value,
         cancel: CancellationToken,
+        context: ToolInvocationContext,
     ) -> Result<Value, ToolInvokeError> {
         let args: PromptArgs = parse_args(SUBAGENT_SESSION_PROMPT_TOOL, args)?;
         if args.message.trim().is_empty() {
@@ -300,6 +308,7 @@ impl SubagentToolset {
                 timeout_secs: args.timeout_secs,
                 token_budget: args.token_budget,
                 cancel,
+                context,
             })
             .await?;
         self.turn_result_value(&result)
@@ -329,14 +338,22 @@ impl SubagentToolset {
     async fn session_cancel(&self, args: Value) -> Result<Value, ToolInvokeError> {
         let args: SessionArgs = parse_args(SUBAGENT_SESSION_CANCEL_TOOL, args)?;
         let session_id = required_session_id(args.session_id)?;
-        publish_control_command(&self.client, &session_id, &ControlCommand::Cancel)
+        let session = self.create_session(Some(session_id.clone()), None).await?;
+        let receipt = session
+            .request_cancel(crate::nats_session::CancelRequest {
+                expected_execution_id: args.expected_execution_id,
+                retry: true,
+            })
             .await
             .map_err(|error| {
                 ToolInvokeError::Recoverable(format!(
                     "cancel sub-agent session '{session_id}': {error:#}"
                 ))
             })?;
-        Ok(json!({ "session_id": session_id, "cancelled": true }))
+        let mut value = serde_json::to_value(receipt)
+            .map_err(|error| ToolInvokeError::Fatal(error.to_string()))?;
+        value["session_id"] = json!(session_id);
+        Ok(value)
     }
 }
 
@@ -419,6 +436,8 @@ struct PromptArgs {
 #[derive(Deserialize)]
 struct SessionArgs {
     session_id: String,
+    #[serde(default)]
+    expected_execution_id: Option<String>,
 }
 
 #[async_trait]
@@ -438,9 +457,10 @@ impl Toolset for SubagentToolset {
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
         if tool == SUBAGENT_SESSION_NEW_TOOL {
-            self.session_new(args, cancel).await
+            self.session_new(args, cancel, standalone_context()).await
         } else if tool == SUBAGENT_SESSION_PROMPT_TOOL {
-            self.session_prompt(args, cancel).await
+            self.session_prompt(args, cancel, standalone_context())
+                .await
         } else if tool == SUBAGENT_SESSION_LOAD_TOOL {
             self.session_load(args).await
         } else if tool == SUBAGENT_SESSION_CANCEL_TOOL {
@@ -461,7 +481,7 @@ impl Toolset for SubagentToolset {
             SUBAGENT_SESSION_NEW_TOOL | SUBAGENT_SESSION_PROMPT_TOOL
         ) {
             if let (Some(parent), Some(object)) = (
-                invocation.context.invoking_session_id,
+                invocation.context.invoking_session_id.clone(),
                 invocation.args.as_object_mut(),
             ) {
                 object.insert(
@@ -470,8 +490,20 @@ impl Toolset for SubagentToolset {
                 );
             }
         }
-        self.invoke(&invocation.tool, invocation.args, invocation.cancel)
-            .await
+        match invocation.tool.as_str() {
+            SUBAGENT_SESSION_NEW_TOOL => {
+                self.session_new(invocation.args, invocation.cancel, invocation.context)
+                    .await
+            }
+            SUBAGENT_SESSION_PROMPT_TOOL => {
+                self.session_prompt(invocation.args, invocation.cancel, invocation.context)
+                    .await
+            }
+            _ => {
+                self.invoke(&invocation.tool, invocation.args, invocation.cancel)
+                    .await
+            }
+        }
     }
 }
 
@@ -489,6 +521,7 @@ const SHORT_SESSION_ID: &str = "{{ args.session_id | truncate(8, end='') }}";
 
 fn session_new_spec(agent: &str) -> ToolSpec {
     ToolSpec {
+        cancellation_guarantee: Default::default(),
         name: SUBAGENT_SESSION_NEW_TOOL.to_string(),
         description: format!("Create a new session on the '{agent}' agent"),
         input_schema: json!({ "type": "object", "properties": {} }),
@@ -503,6 +536,7 @@ fn session_new_spec(agent: &str) -> ToolSpec {
 
 fn session_prompt_spec(agent: &str) -> ToolSpec {
     ToolSpec {
+            cancellation_guarantee: Default::default(),
         name: SUBAGENT_SESSION_PROMPT_TOOL.to_string(),
         description: format!(
             "Send a prompt to the '{agent}' agent. To continue a conversation, pass only the exact session_id returned by session_prompt or session_new. To start a new conversation, omit session_id; empty or whitespace-only values also start a new session. Do not invent a session ID."
@@ -580,6 +614,7 @@ impl SessionIdTool {
 fn session_id_tool_spec(agent: &str, tool: SessionIdTool) -> ToolSpec {
     let verb = tool.verb();
     ToolSpec {
+        cancellation_guarantee: Default::default(),
         name: tool.tool_name().to_string(),
         description: tool.describe(agent),
         input_schema: json!({
@@ -598,6 +633,15 @@ fn session_id_tool_spec(agent: &str, tool: SessionIdTool) -> ToolSpec {
         meta: None,
     }
     .with_call_template(&format!("@ {agent} {verb} {SHORT_SESSION_ID}"))
+}
+
+fn standalone_context() -> ToolInvocationContext {
+    ToolInvocationContext {
+        call_id: uuid::Uuid::now_v7().to_string(),
+        operation: None,
+        invoking_session_id: None,
+        capabilities: Default::default(),
+    }
 }
 
 #[cfg(test)]

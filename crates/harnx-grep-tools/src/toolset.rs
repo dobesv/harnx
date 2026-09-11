@@ -60,6 +60,7 @@ impl Toolset for GrepToolset {
 
     fn tools(&self) -> Vec<ToolSpec> {
         vec![ToolSpec {
+            cancellation_guarantee: Default::default(),
             name: "grep_query".to_string(),
             description: GREP_QUERY_DESCRIPTION.to_string(),
             input_schema: Value::Object(grep_query_schema()),

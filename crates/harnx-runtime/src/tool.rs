@@ -175,17 +175,24 @@ async fn persist_failed_tool_results(
 }
 
 fn build_dispatch_hook_fn(
-    session_name: Option<&str>,
+    session: (&GlobalConfig, Option<&str>),
     working_dir: Option<&std::path::Path>,
     nats_hook_provider: Option<Arc<NatsHookProvider>>,
     pending_async_context: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
 ) -> Arc<DispatchHookFn> {
+    let (config, session_name) = session;
+    let execution = config
+        .read()
+        .execution_control
+        .as_ref()
+        .map(|(_, reference)| reference.clone());
     let session_id = session_name.unwrap_or("cmd").to_string();
     let cwd = working_dir
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     Arc::new(move |event: HookEvent| {
         let session_id = session_id.clone();
+        let execution = execution.clone();
         let cwd = cwd.clone();
         let nats_hook_provider = nats_hook_provider.clone();
         let pending_async_context = pending_async_context.clone();
@@ -198,6 +205,7 @@ fn build_dispatch_hook_fn(
                 event,
                 provider: nats_hook_provider.as_deref(),
                 meta: HookDispatchMeta {
+                    execution,
                     session_id,
                     cwd,
                     resume_count: 0,
@@ -295,7 +303,7 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
     let allowed_tool_names: HashSet<String> = decl_map.keys().cloned().collect();
     let providers = build_tool_providers(config, nats_provider);
     let dispatch_hook_fn = build_dispatch_hook_fn(
-        session_name.as_deref(),
+        (config, session_name.as_deref()),
         working_dir,
         nats_hook_provider,
         pending_async_context,

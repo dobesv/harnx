@@ -618,6 +618,7 @@ pub(crate) enum SessionOrigin {
 }
 
 struct SessionStartDispatch<'a> {
+    execution: Option<harnx_execution_control::OperationRef>,
     origin: SessionOrigin,
     provider: Option<&'a NatsHookProvider>,
     session_id: &'a str,
@@ -642,7 +643,14 @@ async fn dispatch_context_session_start(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let model = ctx.config.read().current_model().id().to_string();
+    let execution = ctx
+        .config
+        .read()
+        .execution_control
+        .as_ref()
+        .map(|(_, reference)| reference.clone());
     dispatch_session_start(SessionStartDispatch {
+        execution,
         origin,
         provider: ctx.nats_hook_provider.as_deref(),
         session_id,
@@ -674,6 +682,7 @@ async fn dispatch_session_start(params: SessionStartDispatch<'_>) {
         },
         provider: params.provider,
         meta: HookDispatchMeta {
+            execution: params.execution,
             session_id: params.session_id.to_string(),
             cwd: params.cwd,
             resume_count: 0,
@@ -1595,6 +1604,7 @@ mod tests {
         let (provider, seen) = recording_session_start_provider();
 
         dispatch_session_start(SessionStartDispatch {
+            execution: None,
             origin: SessionOrigin::Created,
             provider: Some(&provider),
             session_id: "fresh-session",
@@ -1620,6 +1630,7 @@ mod tests {
         let (provider, seen) = recording_session_start_provider();
 
         dispatch_session_start(SessionStartDispatch {
+            execution: None,
             origin: SessionOrigin::Resumed,
             provider: Some(&provider),
             session_id: "existing-session",

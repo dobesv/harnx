@@ -892,3 +892,8 @@ body {
   overflow-x: auto;
   max-width: 100%;
 }
+
+.aui-sub-agent-row { display: flex; align-items: center; gap: .5rem; }
+.aui-sub-agent-row .aui-sub-agent-note { flex: 1; min-width: 0; }
+.aui-sub-agent-stop { padding: .4rem .7rem; cursor: pointer; }
+.aui-sub-agent-status-unconfirmed .aui-sub-agent-status-icon { animation: none; }

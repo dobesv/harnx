@@ -93,14 +93,18 @@ impl CliSubagentReporter {
         if report.terminal {
             return None;
         }
-        if progress.status == SubAgentProgressStatus::Running {
-            let bucket = progress.elapsed_ms / SUBAGENT_REPORT_INTERVAL_MS;
-            if bucket == 0 || bucket <= report.last_running_bucket {
-                return None;
+        match progress.status {
+            SubAgentProgressStatus::Running => {
+                let bucket = progress.elapsed_ms / SUBAGENT_REPORT_INTERVAL_MS;
+                if bucket == 0 || bucket <= report.last_running_bucket {
+                    return None;
+                }
+                report.last_running_bucket = bucket;
             }
-            report.last_running_bucket = bucket;
-        } else {
-            report.terminal = true;
+            SubAgentProgressStatus::Cancelling | SubAgentProgressStatus::Unconfirmed => {}
+            SubAgentProgressStatus::Done
+            | SubAgentProgressStatus::Failed
+            | SubAgentProgressStatus::Cancelled => report.terminal = true,
         }
         Some(format_subagent_progress(progress))
     }
@@ -111,6 +115,9 @@ fn format_subagent_progress(progress: &SubAgentProgress) -> String {
         SubAgentProgressStatus::Running => "running",
         SubAgentProgressStatus::Done => "done",
         SubAgentProgressStatus::Failed => "failed",
+        SubAgentProgressStatus::Cancelling => "cancelling",
+        SubAgentProgressStatus::Cancelled => "cancelled",
+        SubAgentProgressStatus::Unconfirmed => "unconfirmed",
     };
     format!(
         "[sub-agent] {status} agent={} session={} elapsed={} in={} out={} cached={} tools={}",
@@ -803,21 +810,47 @@ mod tests {
 
     #[test]
     fn subagent_reporter_always_reports_one_terminal_state() {
-        for status in [SubAgentProgressStatus::Done, SubAgentProgressStatus::Failed] {
+        for status in [
+            SubAgentProgressStatus::Done,
+            SubAgentProgressStatus::Failed,
+            SubAgentProgressStatus::Cancelled,
+        ] {
             let mut reporter = CliSubagentReporter::default();
             reporter.started("researcher", "child", Some("inv-1"));
             let terminal = subagent_progress("inv-1", "child", status, 1_250);
             let line = reporter
                 .progress(&terminal)
                 .expect("terminal progress is reported immediately");
-            assert!(line.contains(if status == SubAgentProgressStatus::Done {
-                " done "
-            } else {
-                " failed "
-            }));
+            let expected = match status {
+                SubAgentProgressStatus::Done => " done ",
+                SubAgentProgressStatus::Failed => " failed ",
+                SubAgentProgressStatus::Cancelled => " cancelled ",
+                _ => unreachable!(),
+            };
+            assert!(line.contains(expected));
             assert!(line.contains("elapsed=1s"));
             assert!(reporter.progress(&terminal).is_none());
         }
+    }
+
+    #[test]
+    fn subagent_reporter_keeps_nonterminal_cancellation_progress_open() {
+        let mut reporter = CliSubagentReporter::default();
+        reporter.started("researcher", "child", Some("inv-1"));
+
+        for status in [
+            SubAgentProgressStatus::Cancelling,
+            SubAgentProgressStatus::Unconfirmed,
+        ] {
+            assert!(reporter
+                .progress(&subagent_progress("inv-1", "child", status, 1_250))
+                .is_some());
+        }
+
+        let cancelled =
+            subagent_progress("inv-1", "child", SubAgentProgressStatus::Cancelled, 1_500);
+        assert!(reporter.progress(&cancelled).is_some());
+        assert!(reporter.progress(&cancelled).is_none());
     }
 
     #[test]

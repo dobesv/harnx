@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rmcp::model::{
-    CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam,
-    ClientRequest, ServerResult,
+    CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, CustomNotification,
+    ServerResult,
 };
 use rmcp::service::{PeerRequestOptions, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::{
@@ -203,6 +203,12 @@ impl McpCaller for StreamableHttpMcpCaller {
         capabilities: BTreeSet<String>,
         cancel: CancellationToken,
     ) -> Result<Value, McpCallError> {
+        if cancel.is_cancelled() {
+            return Err(McpCallError::new(
+                McpCallErrorKind::Cancelled,
+                "tool call cancelled",
+            ));
+        }
         let service = self.session(sandbox_id, endpoint, &cancel).await?;
 
         let mut request = CallToolRequestParams::new(tool.to_string()).with_arguments(args);
@@ -245,11 +251,18 @@ impl McpCaller for StreamableHttpMcpCaller {
                 }
             },
             _ = cancel.cancelled() => {
-                let notification = peer.notify_cancelled(CancelledNotificationParam::new(
-                    Some(request_id),
-                    Some("Harnx tool call cancelled".to_string()),
-                ));
+                // A typed RMCP cancellation discards the local response waiter.
+                // Preserve it while sending the identical notification on wire.
+                let notification = peer.send_notification(CustomNotification::new("notifications/cancelled", Some(serde_json::json!({
+                    "requestId": request_id, "reason": "Harnx tool call cancelled",
+                }))).into());
                 let _ = tokio::time::timeout(CANCEL_NOTIFICATION_TIMEOUT, notification).await;
+                let acknowledgement = call.await;
+                if !matches!(acknowledgement, Ok(_) | Err(rmcp::ServiceError::McpError(_))) {
+                    // A lost connection is not proof that a remote handler
+                    // stopped. Its cooperative operation remains unconfirmed.
+                    return std::future::pending().await;
+                }
                 return Err(McpCallError::new(McpCallErrorKind::Cancelled, "tool call cancelled"));
             }
         };

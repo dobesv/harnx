@@ -346,12 +346,15 @@ impl BashServer {
         let stdout_task = tokio::spawn(read_pipe_to_file(stdout, stdout_file));
         let stderr_task = tokio::spawn(read_pipe_to_file(stderr, stderr_file));
 
-        let (status, timed_out) = wait_for_child(child.as_mut(), timeout_secs)
-            .await
-            .map_err(|err| internal_error(err.to_string()))?;
+        let outcome = wait_for_child(child.as_mut(), timeout_secs).await;
+        if outcome.is_err() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
 
         let stdout_bytes = join_pipe(stdout_task, "stdout").await?;
         let stderr_bytes = join_pipe(stderr_task, "stderr").await?;
+        let (status, timed_out) = outcome.map_err(|err| internal_error(err.to_string()))?;
 
         // Sync log files to disk to ensure they're visible to other processes immediately
         if let Ok(f) = tokio::fs::File::open(stdout_log_path).await {
@@ -374,17 +377,24 @@ async fn wait_for_child(
     child: &mut dyn ChildWrapper,
     timeout_secs: Option<u64>,
 ) -> anyhow::Result<(std::process::ExitStatus, bool)> {
-    let Some(timeout_secs) = timeout_secs else {
-        return Ok((child.wait().await?, false));
-    };
-
-    match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-        Ok(result) => Ok((result?, false)),
-        Err(_) => {
-            child.start_kill()?;
-            Ok((child.wait().await?, true))
+    let cancel = crate::toolset::INVOCATION_CANCEL
+        .try_with(Clone::clone)
+        .unwrap_or_default();
+    let deadline = async {
+        match timeout_secs {
+            Some(seconds) => tokio::time::sleep(Duration::from_secs(seconds)).await,
+            None => std::future::pending::<()>().await,
         }
-    }
+    };
+    let timed_out = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => false,
+        result = child.wait() => return Ok((result?, false)),
+        _ = deadline => true,
+    };
+    // ProcessGroup / JobObject forwards this to the entire owned process tree.
+    child.start_kill()?;
+    Ok((child.wait().await?, timed_out))
 }
 
 /// Renders the invocation as a line that can be pasted into a shell, with

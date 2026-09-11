@@ -1,0 +1,20 @@
+---
+source: crates/harnx-tui/src/tests/exit_interrupt_tests.rs
+expression: rendered
+---
+Welcome to harnx [VERSION]  •  Type .help for commands, Tab to complete.
+Transcript stays above the exit confirmation.
+
+
+
+
+
+
+
+
+┌Agent is still working────────────────────────────────────────────────────────┐
+│Runs on a local worker owned by this client. Exit without interrupting and the│
+│work stops; reopening the session resumes it from where it stopped.           │
+│                                                                              │
+│[Ctrl+D] exit without interrupting   [Ctrl+C] interrupt and exit   [Esc] stay │
+└──────────────────────────────────────────────────────────────────────────────┘

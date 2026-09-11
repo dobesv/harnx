@@ -415,7 +415,7 @@ impl Config {
         tokio::spawn(async move {
             let result = harnx_core::sink::with_agent_event_sink(
                 Arc::new(harnx_core::event::NullSink),
-                Self::generate_title(&config),
+                Self::with_maintenance_abort(&config, Self::generate_title(&config)),
             )
             .await;
             Self::clear_titling(&config, titling_session_id.as_deref());

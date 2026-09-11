@@ -26,12 +26,30 @@ pub const HDR_INSTANCE_ID: &str = "X-Harnx-Instance-Id";
 /// Header carrying the payload media type.
 pub const HDR_CONTENT_TYPE: &str = "Content-Type";
 
+/// Whether dropping a per-call future guarantees that all its work stops.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationGuarantee {
+    HardOnDrop,
+    #[default]
+    Cooperative,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancellationAcknowledgement {
+    pub operation_id: String,
+    pub cancellation_id: String,
+    pub stopped: bool,
+}
+
 /// Schema and execution hints for one tool.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    #[serde(default)]
+    pub cancellation_guarantee: CancellationGuarantee,
     pub idempotent_hint: bool,
     pub read_only_hint: bool,
     /// Request/reply timeout advertised to transport clients, in seconds.
@@ -126,6 +144,7 @@ impl std::error::Error for ToolInvokeError {}
 /// [`Toolset::invoke`] only.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ToolInvocationContext {
+    pub operation: Option<harnx_execution_control::OperationRef>,
     pub call_id: String,
     pub invoking_session_id: Option<String>,
     pub capabilities: BTreeSet<String>,
@@ -164,6 +183,7 @@ pub trait Toolset: Send + Sync {
 /// Request body for one tool invocation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRequest {
+    pub operation_id: String,
     pub call_id: String,
     pub tool: String,
     pub args: Value,
@@ -204,6 +224,8 @@ pub struct ToolReply {
 /// Per-instance control message.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlMessage {
+    pub operation_id: String,
+    pub cancellation_id: String,
     pub call_id: String,
     pub kind: ControlKind,
 }
@@ -285,6 +307,7 @@ mod tests {
 
     fn tool_spec() -> ToolSpec {
         ToolSpec {
+            cancellation_guarantee: Default::default(),
             name: "time_now".to_string(),
             description: "Return the current time".to_string(),
             input_schema: json!({
@@ -366,6 +389,7 @@ mod tests {
     fn wire_types_round_trip_through_serde() {
         assert_round_trip(tool_spec());
         assert_round_trip(ToolRequest {
+            operation_id: "call-1".to_string(),
             call_id: "call-1".to_string(),
             tool: "time_now".to_string(),
             args: json!({ "timezone": "UTC" }),
@@ -384,6 +408,8 @@ mod tests {
             )),
         });
         assert_round_trip(ControlMessage {
+            operation_id: "call-1".to_string(),
+            cancellation_id: "cancel-test".into(),
             call_id: "call-1".to_string(),
             kind: ControlKind::Cancel,
         });
@@ -433,6 +459,8 @@ mod tests {
     #[test]
     fn control_subject_messages_are_tagged_by_kind() {
         let cancel = serde_json::to_value(ControlMessage {
+            operation_id: "call-1".to_string(),
+            cancellation_id: "cancel-test".into(),
             call_id: "call-1".to_string(),
             kind: ControlKind::Cancel,
         })
