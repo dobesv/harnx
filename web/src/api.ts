@@ -1,51 +1,81 @@
-import type { Agent, SessionRef, AgentDetail, JsonRpcResponse, PromptResult } from './types';
+import type { Agent, AgentDetail, JsonRpcResponse, PromptResult, SessionRef } from './types';
+import { fetchJsonWithRetry, observedFetch, PermanentError } from './httpClient';
 
 const API_BASE = '/v1';
 
-export async function listAgents(): Promise<Agent[]> {
-  const res = await fetch(`${API_BASE}/agents?role=assistant`);
-  if (!res.ok) throw new Error(`Failed to list agents: ${res.statusText}`);
-  const json = await res.json() as { data: Agent[] };
-  return json.data;
-}
-
-export async function listSessions(agent: string): Promise<SessionRef[]> {
-  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions`);
-  if (!res.ok) {
-    let detail = res.statusText;
-    try {
-      const body = await res.json() as { error?: { message?: string } | string };
-      detail = typeof body.error === 'string' ? body.error : body.error?.message || detail;
-    } catch {
-      // Keep the HTTP status text when the response is not JSON.
+export async function listAgents(options?: { signal?: AbortSignal }): Promise<Agent[]> {
+  try {
+    const json = await fetchJsonWithRetry<{ data: Agent[] }>(
+      `${API_BASE}/agents?role=assistant`,
+      undefined,
+      options
+    );
+    return json.data;
+  } catch (err) {
+    if (err instanceof PermanentError) {
+      throw new Error(`Failed to list agents: ${err.message}`);
     }
-    throw new Error(`Failed to list sessions for ${agent}: ${detail}`);
+    throw err;
   }
-  const json = await res.json() as SessionRef[];
-  return json;
 }
 
-export async function createSession(agent: string): Promise<SessionRef> {
-  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions`, {
+export async function listSessions(agent: string, options?: { signal?: AbortSignal }): Promise<SessionRef[]> {
+  try {
+    const json = await fetchJsonWithRetry<SessionRef[]>(
+      `${API_BASE}/agents/${encodeURIComponent(agent)}/sessions`,
+      undefined,
+      options
+    );
+    return json;
+  } catch (err) {
+    if (err instanceof PermanentError) {
+      throw new Error(`Failed to list sessions for ${agent}: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+export async function getAgent(agent: string, options?: { signal?: AbortSignal }): Promise<AgentDetail> {
+  try {
+    const json = await fetchJsonWithRetry<AgentDetail>(
+      `${API_BASE}/agents/${encodeURIComponent(agent)}`,
+      undefined,
+      options
+    );
+    return json;
+  } catch (err) {
+    if (err instanceof PermanentError) {
+      throw new Error(`Failed to get agent ${agent}: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+export interface CreateSessionResult {
+  session_id: string;
+  title?: string | null;
+  updated_at?: string | number | null;
+  [key: string]: unknown;
+}
+
+export async function createSession(agent: string): Promise<CreateSessionResult> {
+  const res = await observedFetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions`, {
     method: 'POST',
   });
   if (!res.ok) throw new Error(`Failed to create session for ${agent}: ${res.statusText}`);
-  return await res.json() as SessionRef;
+  return await res.json() as CreateSessionResult;
 }
 
-export async function getAgent(agent: string): Promise<AgentDetail> {
-  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}`);
-  if (!res.ok) throw new Error(`Failed to get agent ${agent}: ${res.statusText}`);
-  const json = await res.json() as AgentDetail;
-  return json;
-}
-
-export async function uploadAttachment(agent: string, session: string, file: File): Promise<string[]> {
-  const formData = new FormData();
-  formData.append('attachment', file);
-  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}/attachments`, {
+export async function uploadAttachment(
+  agent: string,
+  session: string,
+  file: File
+): Promise<string[]> {
+  const form = new FormData();
+  form.append('file', file);
+  const res = await observedFetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}/attachments`, {
     method: 'POST',
-    body: formData
+    body: form,
   });
   if (!res.ok) {
     let msg = res.statusText;
@@ -64,7 +94,7 @@ export async function sendPrompt(
   session: string,
   { text, attachmentRefs }: { text: string; attachmentRefs?: string[] }
 ): Promise<PromptResult> {
-  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
+  const res = await observedFetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -101,7 +131,7 @@ export async function submitHitlDecision(
   session: string,
   { toolCallId, approved, note }: { toolCallId: string; approved: boolean; note?: string }
 ): Promise<{ applied: boolean }> {
-  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
+  const res = await observedFetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({

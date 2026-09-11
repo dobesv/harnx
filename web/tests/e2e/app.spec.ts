@@ -139,9 +139,10 @@ test('composer: no scrollbar until max-height, resets after send', async ({ page
 test('agents-fetch error', async ({ page }) => {
   await page.goto('/?scenario=agentsFail');
 
+  // 404 is a permanent error, so it immediately renders the dead-end error box
   const errorEl = page.getByTestId('agents-error');
   await expect(errorEl).toBeVisible();
-  await expect(errorEl).toHaveText(/Internal Server Error/i);
+  await expect(errorEl).toHaveText(/Not Found/i);
 
   await expect(page).toHaveScreenshot('agents-fetch-error.png');
 });
@@ -180,8 +181,9 @@ test('send-failure error (out-of-band send)', async ({ page }) => {
   await page.locator('.aui-composer-input').fill('Start running');
   await page.locator('.aui-composer-send').click();
 
-  // Wait for the first message to land to transition from fresh to existing session
+  // Wait for the first message and reply to land to transition from fresh to existing session
   await expect(page.locator('.aui-message-content').filter({ hasText: 'Start running' })).toBeVisible();
+  await expect(page.locator('.aui-message-content').filter({ hasText: 'Mock streamed reply to: Start running' })).toBeVisible();
 
   await page.evaluate(() => {
     const msw = (window as any).__msw;

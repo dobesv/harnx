@@ -1,9 +1,13 @@
 import type { JsonRpcResponse, SessionControlState, CancelResult } from './types';
+import { observedFetch } from './httpClient';
+
 const API_BASE = '/v1';
 
 export async function sessionControl(agent: string, session: string): Promise<SessionControlState> {
-  const response = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
-    method: 'POST', signal: AbortSignal.timeout(2000), headers: { 'Content-Type': 'application/json' },
+  const response = await observedFetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(2000),
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 'control', method: 'session/get' }),
   });
   const body = await response.json() as JsonRpcResponse<SessionControlState>;
@@ -12,7 +16,7 @@ export async function sessionControl(agent: string, session: string): Promise<Se
 }
 
 export async function cancel(agent: string, session: string, expectedExecutionId?: string): Promise<CancelResult> {
-  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
+  const res = await observedFetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
     method: 'POST',
     signal: AbortSignal.timeout(2000),
     headers: {

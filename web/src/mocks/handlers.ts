@@ -758,7 +758,7 @@ export const happyPathHandlers = [
 
 export const agentsFailHandlers = [
   http.get('/v1/agents', () => {
-    return new HttpResponse(null, { status: 500, statusText: 'Internal Server Error' });
+    return new HttpResponse(null, { status: 404, statusText: 'Not Found' });
   }),
   ...happyPathHandlers
 ];
@@ -803,11 +803,43 @@ export const sendFailHandlers = [
   ...happyPathHandlers
 ];
 
+export const agentsEmptyHandlers = [
+  http.get('/v1/agents', () => {
+    return HttpResponse.json({ data: [] });
+  }),
+  ...happyPathHandlers
+];
+
+export const agentsNetworkErrorHandlers = [
+  http.get('/v1/agents', () => {
+    return HttpResponse.error();
+  }),
+  ...happyPathHandlers
+];
+
+export const agentsTransient502Handlers = [
+  http.get('/v1/agents', () => {
+    return new HttpResponse(null, { status: 502, statusText: 'Bad Gateway' });
+  }),
+  ...happyPathHandlers
+];
+
+export const sessionsTransient502Handlers = [
+  http.get('/v1/agents/:agent/sessions', () => {
+    return new HttpResponse(null, { status: 502, statusText: 'Bad Gateway' });
+  }),
+  ...happyPathHandlers
+];
+
 export const scenarios = {
   happy: happyPathHandlers,
   agentsFail: agentsFailHandlers,
+  agentsTransient502: agentsTransient502Handlers,
   sessionsFail: sessionsFailHandlers,
+  sessionsTransient502: sessionsTransient502Handlers,
   sendFail: sendFailHandlers,
+  agentsEmpty: agentsEmptyHandlers,
+  agentsNetworkError: agentsNetworkErrorHandlers,
 };
 
 export const handlers = happyPathHandlers;

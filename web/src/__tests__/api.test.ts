@@ -17,7 +17,7 @@ describe('api.ts', () => {
       });
       const agents = await listAgents();
       expect(agents).toEqual([{ name: 'a' }]);
-      expect(fetchMock).toHaveBeenCalledWith('/v1/agents?role=assistant');
+      expect(fetchMock).toHaveBeenCalledWith('/v1/agents?role=assistant', expect.any(Object));
     });
   });
 
@@ -29,20 +29,22 @@ describe('api.ts', () => {
       });
       const sessions = await listSessions('agent/A');
       expect(sessions).toEqual([{ id: '1' }]);
-      expect(fetchMock).toHaveBeenCalledWith('/v1/agents/agent%2FA/sessions');
+      expect(fetchMock).toHaveBeenCalledWith('/v1/agents/agent%2FA/sessions', expect.any(Object));
     });
 
     it('throws if not ok', async () => {
       fetchMock.mockResolvedValueOnce({
         ok: false,
+        status: 404,
         statusText: 'Not Found',
       });
-      await expect(listSessions('agent/A')).rejects.toThrow('Failed to list sessions for agent/A: Not Found');
+      await expect(listSessions('agent/A')).rejects.toThrow('Failed to list sessions for agent/A: HTTP error (404): Not Found');
     });
 
     it('surfaces the server explanation when session discovery is unavailable', async () => {
       fetchMock.mockResolvedValueOnce({
         ok: false,
+        status: 400,
         statusText: 'Bad Request',
         json: async () => ({
           error: { message: 'Session discovery is not available yet; try again shortly' },
@@ -50,7 +52,7 @@ describe('api.ts', () => {
       });
 
       await expect(listSessions('agent/A')).rejects.toThrow(
-        'Failed to list sessions for agent/A: Session discovery is not available yet; try again shortly',
+        'Failed to list sessions for agent/A: HTTP error (400): Session discovery is not available yet; try again shortly',
       );
     });
   });
@@ -83,7 +85,7 @@ describe('api.ts', () => {
       });
       const agent = await getAgent('agent/A');
       expect(agent).toEqual({ name: 'test' });
-      expect(fetchMock).toHaveBeenCalledWith('/v1/agents/agent%2FA');
+      expect(fetchMock).toHaveBeenCalledWith('/v1/agents/agent%2FA', expect.any(Object));
     });
   });
 

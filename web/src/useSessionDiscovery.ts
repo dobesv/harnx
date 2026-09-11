@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import { createSession, listSessions } from './api';
 import type { SessionRef } from './types';
+import { isAbortError } from './httpClient';
 
 interface SessionDiscoveryOptions {
   selectedAgent: string;
@@ -19,8 +20,9 @@ interface SessionCreationOptions {
 const errorMessage = (error: unknown, fallback: string) =>
   error instanceof Error && error.message ? error.message : fallback;
 
-const withoutListedSessions = (ids: string[], sessions: SessionRef[]) =>
-  ids.filter((id) => !sessions.some((session) => session.session_id === id));
+function withoutListedSessions(ids: string[], sessions: SessionRef[]) {
+  return ids.filter((id) => !sessions.some((session) => session.session_id === id));
+}
 
 function useSessionList(
   selectedAgent: string,
@@ -30,28 +32,54 @@ function useSessionList(
   const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [requestLoading, setRequestLoading] = useState(false);
   const [settledAgent, setSettledAgent] = useState('');
+  const [hasLoadedSessions, setHasLoadedSessions] = useState(false);
+
   const sessionsRequestRef = useRef(0);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const previousAgentRef = useRef(selectedAgent);
+
+  // When selectedAgent changes to a different agent, reset immediately
+  if (previousAgentRef.current !== selectedAgent) {
+    previousAgentRef.current = selectedAgent;
+    setSessions([]);
+    setSessionsError(null);
+    setSettledAgent('');
+    setHasLoadedSessions(false);
+  }
 
   const refreshSessions = useCallback(() => {
+    // Abort previous in-flight request before starting a fresh attempt
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+
     const request = ++sessionsRequestRef.current;
     if (!selectedAgent) {
       setSessions([]);
       setSessionsError(null);
       setRequestLoading(false);
       setSettledAgent('');
+      setHasLoadedSessions(false);
       return;
     }
 
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setRequestLoading(true);
     setSessionsError(null);
-    listSessions(selectedAgent)
+
+    listSessions(selectedAgent, { signal: controller.signal })
       .then((data) => {
         if (request !== sessionsRequestRef.current) return;
         setSessions(data);
+        setHasLoadedSessions(true);
         setFreshSessionIds((previous) => withoutListedSessions(previous, data));
       })
       .catch((error: unknown) => {
         if (request !== sessionsRequestRef.current) return;
+        if (isAbortError(error)) return;
         console.error(error);
         setSessionsError(errorMessage(error, 'Failed to fetch sessions'));
       })
@@ -62,13 +90,22 @@ function useSessionList(
       });
   }, [selectedAgent, setFreshSessionIds]);
 
-  useEffect(refreshSessions, [refreshSessions]);
+  useEffect(() => {
+    refreshSessions();
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+    };
+  }, [refreshSessions]);
 
   return {
     sessions,
     sessionsError,
     setSessionsError,
     sessionsLoading: Boolean(selectedAgent) && (requestLoading || settledAgent !== selectedAgent),
+    hasLoadedSessions,
     refreshSessions,
   };
 }
@@ -122,7 +159,6 @@ export function useSessionDiscovery({
     setFreshSessionIds((previous) => previous.filter((id) => id !== sessionId));
   }, [setSelectedSessionId]);
 
-
   const markSessionNotFresh = useCallback((sessionId: string) => {
     setFreshSessionIds((previous) => previous.filter((id) => id !== sessionId));
   }, []);
@@ -131,6 +167,7 @@ export function useSessionDiscovery({
     sessions: sessionList.sessions,
     sessionsError: sessionList.sessionsError,
     sessionsLoading: sessionList.sessionsLoading,
+    hasLoadedSessions: sessionList.hasLoadedSessions,
     isFreshSession: freshSessionIds.includes(selectedSessionId),
     markSessionNotFresh,
     refreshSessions: sessionList.refreshSessions,

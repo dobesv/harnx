@@ -400,4 +400,63 @@ describe('toAgUiMessages', () => {
       });
       expect(onHandoff).toHaveBeenCalledWith('targetAgent3', '9999');
     });
+
+    it('reports transport failures to connection.noteTransientTrouble without replaying', async () => {
+      const { connection } = await import('../connection');
+      const noteSpy = vi.spyOn(connection, 'noteTransientTrouble');
+
+      const onRunFailed = vi.fn();
+      const { HarnxHttpAgent } = await import('../ChatProvider');
+      const agent = new HarnxHttpAgent({
+        url: '/url',
+        onStatus: vi.fn(),
+        onRunFailed,
+        onUsage: vi.fn(),
+        onToolSummary: vi.fn(),
+        onSubAgentEvent: vi.fn(),
+      });
+
+      // 1. Transport error in runAgent catch block
+      vi.spyOn(Object.getPrototypeOf(Object.getPrototypeOf(agent)), 'runAgent').mockRejectedValueOnce(
+        new TypeError('Failed to fetch')
+      );
+
+      await expect(agent.runAgent({})).rejects.toThrow('Failed to fetch');
+      expect(noteSpy).toHaveBeenCalledTimes(1);
+      expect(onRunFailed).toHaveBeenCalledWith('Failed to fetch');
+
+      // 2. Non-transport / model / application error should NOT note trouble
+      noteSpy.mockClear();
+      onRunFailed.mockClear();
+
+      vi.spyOn(Object.getPrototypeOf(Object.getPrototypeOf(agent)), 'runAgent').mockRejectedValueOnce(
+        new Error('Context length exceeded: prompt too long')
+      );
+
+      await expect(agent.runAgent({})).rejects.toThrow('Context length exceeded');
+      expect(noteSpy).not.toHaveBeenCalled();
+      expect(onRunFailed).toHaveBeenCalledWith('Context length exceeded: prompt too long');
+
+      // 3. onRunFailed subscriber callback with transport error
+      noteSpy.mockClear();
+      onRunFailed.mockClear();
+
+      const subscriber: any = {};
+      vi.spyOn(Object.getPrototypeOf(Object.getPrototypeOf(agent)), 'runAgent').mockImplementation((_params: any, sub: any) => {
+        Object.assign(subscriber, sub);
+        return Promise.resolve();
+      });
+
+      await agent.runAgent({});
+      await subscriber.onRunFailed({ error: new Error('net::ERR_CONNECTION_REFUSED') });
+      expect(noteSpy).toHaveBeenCalledTimes(1);
+      expect(onRunFailed).toHaveBeenCalledWith('net::ERR_CONNECTION_REFUSED');
+
+      // 4. onRunFailed subscriber callback with application error
+      noteSpy.mockClear();
+      onRunFailed.mockClear();
+      await subscriber.onRunFailed({ error: new Error('Rate limit exceeded: 429') });
+      expect(noteSpy).not.toHaveBeenCalled();
+      expect(onRunFailed).toHaveBeenCalledWith('Rate limit exceeded: 429');
+    });
   });
