@@ -133,19 +133,17 @@ fn install_web_assets(workspace_root: &Path) -> Result<()> {
     }
 
     let pnpm = pnpm_command();
-    ensure_pnpm_available(&pnpm)?;
+    install_pnpm_with_corepack(&web_dir)?;
+    ensure_pnpm_available(&pnpm, &web_dir)?;
 
     println!("==> Installing web-ui dependencies (pnpm install)");
-    let mut install = pnpm_process(&pnpm);
-    install
-        .arg("install")
-        .arg("--frozen-lockfile")
-        .current_dir(&web_dir);
+    let mut install = pnpm_process(&pnpm, &web_dir);
+    install.arg("install").arg("--frozen-lockfile");
     run_command(&mut install, "pnpm install")?;
 
     println!("==> Building web-ui (pnpm build)");
-    let mut build = pnpm_process(&pnpm);
-    build.arg("build").current_dir(&web_dir);
+    let mut build = pnpm_process(&pnpm, &web_dir);
+    build.arg("build");
     run_command(&mut build, "pnpm build")?;
 
     let dist = web_dir.join("dist");
@@ -169,21 +167,40 @@ fn pnpm_command() -> OsString {
     env::var_os("PNPM").unwrap_or_else(|| OsString::from("pnpm"))
 }
 
-/// Create a pnpm process that will not wait for Corepack download approval.
+/// Create a web-project command that will not wait for Corepack download approval.
 ///
 /// Corepack may need to download the version pinned in `package.json`. Setting
 /// this variable keeps unattended installs non-interactive while still
 /// allowing that download to proceed.
-fn pnpm_process(pnpm: &OsStr) -> Command {
-    let mut command = Command::new(pnpm);
+fn web_project_process(program: &OsStr, web_dir: &Path) -> Command {
+    let mut command = Command::new(program);
     command.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+    command.current_dir(web_dir);
     command
+}
+
+/// Ask Corepack to download and cache the pnpm version pinned by the web
+/// project's `package.json` before invoking the pnpm shim.
+fn install_pnpm_with_corepack(web_dir: &Path) -> Result<()> {
+    println!("==> Preparing web-ui package manager (corepack install)");
+    let mut install = web_project_process(OsStr::new("corepack"), web_dir);
+    install.arg("install");
+    run_command(&mut install, "corepack install").with_context(|| {
+        "failed to prepare the pnpm version pinned by web/package.json; install Corepack or pass \
+         --skip-web to install without the web UI"
+    })
+}
+
+/// Create a pnpm process rooted in the web project so Corepack always resolves
+/// the version pinned by `web/package.json`.
+fn pnpm_process(pnpm: &OsStr, web_dir: &Path) -> Command {
+    web_project_process(pnpm, web_dir)
 }
 
 /// Verify the pnpm executable can be run before we lean on it, so a missing
 /// pnpm yields an actionable message instead of a raw "No such file" IO error.
-fn ensure_pnpm_available(pnpm: &OsString) -> Result<()> {
-    match pnpm_process(pnpm).arg("--version").output() {
+fn ensure_pnpm_available(pnpm: &OsString, web_dir: &Path) -> Result<()> {
+    match pnpm_process(pnpm, web_dir).arg("--version").output() {
         Ok(output) if output.status.success() => Ok(()),
         Ok(output) => Err(command_failure(
             "pnpm --version",
@@ -801,14 +818,24 @@ mod tests {
     }
 
     #[test]
-    fn pnpm_process_disables_corepack_download_prompt() {
-        let command = pnpm_process(OsStr::new("pnpm"));
+    fn pnpm_process_uses_web_project_and_disables_corepack_download_prompt() {
+        let web_dir = Path::new("/workspace/web");
+        let command = pnpm_process(OsStr::new("pnpm"), web_dir);
         let prompt_setting = command
             .get_envs()
             .find(|(key, _)| *key == OsStr::new("COREPACK_ENABLE_DOWNLOAD_PROMPT"))
             .and_then(|(_, value)| value);
 
         assert_eq!(prompt_setting, Some(OsStr::new("0")));
+        assert_eq!(command.get_current_dir(), Some(web_dir));
+    }
+
+    #[test]
+    fn corepack_process_uses_web_project() {
+        let web_dir = Path::new("/workspace/web");
+        let command = web_project_process(OsStr::new("corepack"), web_dir);
+
+        assert_eq!(command.get_current_dir(), Some(web_dir));
     }
 
     #[test]
