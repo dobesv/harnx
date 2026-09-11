@@ -2224,7 +2224,9 @@ impl Tui {
             }
             Some(_) => match (key.code, key.modifiers) {
                 (KeyCode::Char('y'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE) => {
-                    self.confirm_modal_action().await?;
+                    // The command path carries the full TUI command future. Keep that
+                    // state off Tokio's comparatively small Windows worker stack.
+                    Box::pin(self.confirm_modal_action()).await?;
                 }
                 (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, KeyModifiers::NONE) => {
                     self.app.modal = None;
