@@ -138,7 +138,10 @@ async fn in_flight_rpc_returns_after_broker_owner_exit_without_reinvocation() ->
         )
         .await
     });
-    let request = requests.next().await.context("request delivered")?;
+    let request = tokio::time::timeout(Duration::from_secs(5), requests.next())
+        .await
+        .context("request delivery timed out")?
+        .context("request delivered")?;
     let _activity = rpc::RequestActivity::start(&responder, &request);
     let target = rpc::ReplyTarget::from_message(&request)?;
     drop(owner);

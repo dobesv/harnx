@@ -173,9 +173,22 @@ impl Tui {
     pub(super) fn handle_subagent_snapshot(
         &mut self,
         key: MonitoredSessionKey,
-        transcript: Vec<TranscriptItem>,
-        status: SubAgentStatus,
+        snapshot: crate::types::SubAgentSnapshot,
     ) {
+        let crate::types::SubAgentSnapshot {
+            invocation_id,
+            transcript,
+            status,
+        } = snapshot;
+        if self
+            .app
+            .monitored_sessions
+            .get(&key)
+            .and_then(|state| state.invocation_id.as_ref())
+            != invocation_id.as_ref()
+        {
+            return;
+        }
         let nested = transcript
             .iter()
             .filter_map(subagent_row_key)

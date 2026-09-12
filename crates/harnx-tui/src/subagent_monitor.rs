@@ -185,7 +185,9 @@ async fn monitor_subagent_attachment(
         attached_seq: stream.last_applied_seq(),
         attached_during_turn: history_has_pending_turn(stream.history()),
     };
-    let Some(status) = send_subagent_snapshot(config, event_tx, key, stream.history()).await else {
+    let Some(status) =
+        send_subagent_snapshot(config, event_tx, key, invocation_id, stream.history()).await
+    else {
         return AttachmentOutcome::Disconnected;
     };
     if status != SubAgentStatus::Running {
@@ -214,7 +216,14 @@ async fn monitor_subagent_attachment(
                     return AttachmentOutcome::Disconnected;
                 }
                 if terminal {
-                    return match refresh_terminal_subagent_snapshot(config, event_tx, key).await {
+                    return match refresh_terminal_subagent_snapshot(
+                        config,
+                        event_tx,
+                        key,
+                        invocation_id,
+                    )
+                    .await
+                    {
                         Some(SubAgentStatus::Completed | SubAgentStatus::Failed) => {
                             AttachmentOutcome::Terminal
                         }
@@ -228,7 +237,14 @@ async fn monitor_subagent_attachment(
                     return AttachmentOutcome::Disconnected;
                 }
                 if subagent_history_status(stream.history()) != SubAgentStatus::Running {
-                    let _ = send_subagent_snapshot(config, event_tx, key, stream.history()).await;
+                    let _ = send_subagent_snapshot(
+                        config,
+                        event_tx,
+                        key,
+                        invocation_id,
+                        stream.history(),
+                    )
+                    .await;
                     return AttachmentOutcome::Terminal;
                 }
                 if let Some(reason) = lease_watchdog.check(&jetstream, &key.session_id).await {
@@ -242,8 +258,11 @@ async fn monitor_subagent_attachment(
                     transcript.push(TranscriptItem::ErrorText(reason));
                     let _ = event_tx.send(TuiEvent::SubAgentSessionSnapshot {
                         key: key.clone(),
-                        transcript,
-                        status: SubAgentStatus::Failed,
+                        snapshot: crate::types::SubAgentSnapshot {
+                            invocation_id: invocation_id.map(str::to_owned),
+                            transcript,
+                            status: SubAgentStatus::Failed,
+                        },
                     });
                     return AttachmentOutcome::Terminal;
                 }
@@ -256,6 +275,7 @@ async fn refresh_terminal_subagent_snapshot(
     config: &GlobalConfig,
     event_tx: &UnboundedSender<TuiEvent>,
     key: &MonitoredSessionKey,
+    invocation_id: Option<&str>,
 ) -> Option<SubAgentStatus> {
     let client = stream_client(config, &key.cluster).await?;
     let log = harnx_runtime::nats_session_log::NatsSessionLog::new(
@@ -270,7 +290,7 @@ async fn refresh_terminal_subagent_snapshot(
         if subagent_history_status(&history) == SubAgentStatus::Running {
             continue;
         }
-        return send_subagent_snapshot(config, event_tx, key, &history).await;
+        return send_subagent_snapshot(config, event_tx, key, invocation_id, &history).await;
     }
     Some(SubAgentStatus::Running)
 }
@@ -284,14 +304,18 @@ async fn send_subagent_snapshot(
     config: &GlobalConfig,
     event_tx: &UnboundedSender<TuiEvent>,
     key: &MonitoredSessionKey,
+    invocation_id: Option<&str>,
     history: &[(u64, SessionLogEntry)],
 ) -> Option<SubAgentStatus> {
     let status = subagent_history_status(history);
     event_tx
         .send(TuiEvent::SubAgentSessionSnapshot {
             key: key.clone(),
-            transcript: load_subagent_transcript(config, key).await,
-            status: status.clone(),
+            snapshot: crate::types::SubAgentSnapshot {
+                invocation_id: invocation_id.map(str::to_owned),
+                transcript: load_subagent_transcript(config, key).await,
+                status: status.clone(),
+            },
         })
         .is_ok()
         .then_some(status)

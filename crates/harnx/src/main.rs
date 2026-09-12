@@ -97,7 +97,7 @@ pub fn remote_list_outcome(result: Result<Vec<SessionMeta>, anyhow::Error>) -> L
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<std::process::ExitCode> {
     load_env_file()?;
     let cli = Cli::parse();
     setup_logger(LogSink::File)?;
@@ -108,12 +108,17 @@ async fn main() -> Result<()> {
     telemetry.shutdown().await;
     if let Some(error) = result? {
         if invocation_limit_reached(&error) {
-            std::process::exit(oneshot_nats::INVOCATION_LIMIT_EXIT_CODE);
+            return Ok(std::process::ExitCode::from(
+                oneshot_nats::INVOCATION_LIMIT_EXIT_CODE as u8,
+            ));
         }
         render_error(error);
-        std::process::exit(1);
+        return Ok(std::process::ExitCode::FAILURE);
     }
-    Ok(())
+    // Returning drops the Tokio runtime and its broker supervision tasks.
+    // process::exit bypasses that cleanup, leaving a broker bound on platforms
+    // without Linux's parent-death signal and preventing immediate restart.
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 async fn run_main(cli: Cli) -> Result<Option<anyhow::Error>> {

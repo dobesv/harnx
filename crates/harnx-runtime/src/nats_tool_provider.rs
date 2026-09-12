@@ -300,26 +300,30 @@ impl NatsToolProvider {
     }
 
     async fn publish_cancel(&self, call_id: &str) -> anyhow::Result<()> {
-        let cancellation_id = self.request_operation_cancel(call_id).await?;
-        let control = ControlMessage {
-            operation_id: call_id.to_string(),
-            cancellation_id,
-            call_id: call_id.to_string(),
-            kind: ControlKind::Cancel,
-        };
-        let mut headers = async_nats::HeaderMap::new();
-        headers.insert(HDR_CALL_ID, call_id);
-        headers.insert(HDR_INSTANCE_ID, self.instance_id.as_str());
-        headers.insert(HDR_CONTENT_TYPE, JSON_CONTENT_TYPE);
-        self.client
-            .publish_with_headers(
-                self.instance_id.control_subject(),
-                headers,
-                serde_json::to_vec(&control)?.into(),
-            )
-            .await?;
-        self.client.flush().await?;
-        Ok(())
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let cancellation_id = self.request_operation_cancel(call_id).await?;
+            let control = ControlMessage {
+                operation_id: call_id.to_string(),
+                cancellation_id,
+                call_id: call_id.to_string(),
+                kind: ControlKind::Cancel,
+            };
+            let mut headers = async_nats::HeaderMap::new();
+            headers.insert(HDR_CALL_ID, call_id);
+            headers.insert(HDR_INSTANCE_ID, self.instance_id.as_str());
+            headers.insert(HDR_CONTENT_TYPE, JSON_CONTENT_TYPE);
+            self.client
+                .publish_with_headers(
+                    self.instance_id.control_subject(),
+                    headers,
+                    serde_json::to_vec(&control)?.into(),
+                )
+                .await?;
+            self.client.flush().await?;
+            Ok(())
+        })
+        .await
+        .context("tool cancellation publication timed out; shutdown is unconfirmed")?
     }
 
     fn prepare_request(
@@ -496,7 +500,7 @@ impl NatsToolProvider {
         }
         // A failed backend must not turn error reporting into another
         // unbounded wait for cancellation delivery.
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.publish_cancel(call_id)).await;
+        let _ = self.publish_cancel(call_id).await;
         ToolError::Fatal(anyhow!("{message}; tool shutdown is unconfirmed"))
     }
 }

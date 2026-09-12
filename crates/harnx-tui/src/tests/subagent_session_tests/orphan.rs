@@ -1,6 +1,48 @@
 use super::*;
 
 #[tokio::test]
+async fn stale_snapshot_cannot_replace_a_resumed_invocation() {
+    let mut harness = TuiTestHarness::new().await;
+    let key = monitored_key("athena", "snapshot-race");
+    emit_subagent_invocation_started(harness.tui(), &key, Some("old")).await;
+    harness.tui().fail_monitored_invocation(&key, "old");
+    emit_subagent_invocation_started(harness.tui(), &key, Some("resumed")).await;
+    for invocation_id in [Some("old".to_string()), None] {
+        harness
+            .tui()
+            .handle_tui_event(TuiEvent::SubAgentSessionSnapshot {
+                key: key.clone(),
+                snapshot: crate::types::SubAgentSnapshot {
+                    invocation_id,
+                    transcript: vec![TranscriptItem::ErrorText("stale failure".into())],
+                    status: SubAgentStatus::Failed,
+                },
+            })
+            .await
+            .unwrap();
+        let state = &harness.tui().app.monitored_sessions[&key];
+        assert_eq!(state.status, SubAgentStatus::Running);
+        assert!(state.transcript.is_empty());
+    }
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::SubAgentSessionSnapshot {
+            key: key.clone(),
+            snapshot: crate::types::SubAgentSnapshot {
+                invocation_id: Some("resumed".into()),
+                transcript: vec![assistant_text("current result")],
+                status: SubAgentStatus::Completed,
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.tui().app.monitored_sessions[&key].status,
+        SubAgentStatus::Completed
+    );
+}
+
+#[tokio::test]
 async fn orphaned_invocation_stops_spinning_without_failing_its_resumed_invocation() {
     let mut harness = TuiTestHarness::new().await;
     harness.tui().clear_transcript();

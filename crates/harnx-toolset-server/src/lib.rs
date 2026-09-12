@@ -126,6 +126,7 @@ struct ServeSettings {
 struct RegistrationRefresh<'a> {
     registry: &'a kv::Store,
     instance_id: &'a ServerScope,
+    identity_token: &'a str,
     registration: &'a Registration,
     /// The revision of our own last-published registration, so shutdown can
     /// delete it conditionally instead of unconditionally (see the delete
@@ -304,6 +305,7 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
         RegistrationRefresh {
             registry: &registry,
             instance_id: &instance_id,
+            identity_token: &identity_token,
             registration: &registration,
             revision: &mut revision,
         },
@@ -361,7 +363,7 @@ async fn serve_requests(
 ) -> Result<()> {
     let mut renewals = Box::pin(harnx_nats_common::registry::refreshes(
         refresh.registry.clone(),
-        registration_key(refresh.instance_id, &refresh.registration.server),
+        registration_key(refresh.instance_id, refresh.identity_token),
         serde_json::to_vec(refresh.registration)?.into(),
         REGISTRATION_REFRESH_INTERVAL,
     ));

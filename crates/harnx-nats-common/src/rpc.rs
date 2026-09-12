@@ -3,6 +3,11 @@
 //! Opt-in headers keep ordinary NATS request clients compatible. A caller
 //! retains one inbox through reconnect; a server retains its finished result
 //! until receipt is acknowledged or the recovery deadline expires.
+//!
+//! Core publish errors are terminal: invalid subject/payload or a closed
+//! command channel. Transient disconnects keep that channel alive; enqueueing
+//! succeeds or waits while async-nats reconnects. Retry missing receipts, not
+//! terminal publish errors on a client that can no longer reconnect.
 
 use crate::recovery::RECOVERY_TIMEOUT;
 use anyhow::{Context, Result};

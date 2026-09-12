@@ -617,6 +617,12 @@ pub(crate) enum ToolConfirmationEvent {
     Dismiss { confirmation_id: u64 },
 }
 
+pub(super) struct SubAgentSnapshot {
+    pub invocation_id: Option<String>,
+    pub transcript: Vec<TranscriptItem>,
+    pub status: SubAgentStatus,
+}
+
 pub(crate) enum TuiEvent {
     ExecutionState {
         cluster: String,
@@ -644,8 +650,7 @@ pub(crate) enum TuiEvent {
     /// Durable child history loaded subscribe-first before live forwarding.
     SubAgentSessionSnapshot {
         key: MonitoredSessionKey,
-        transcript: Vec<TranscriptItem>,
-        status: SubAgentStatus,
+        snapshot: SubAgentSnapshot,
     },
     /// Live advisory belonging exclusively to a monitored child session.
     SubAgentSessionEvent {

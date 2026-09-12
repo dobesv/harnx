@@ -2,6 +2,15 @@ use super::*;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn nats_tool_provider_reports_backend_outage_during_unbounded_call() -> Result<()> {
+    assert_outage_result(false).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nats_tool_provider_bounds_explicit_abort_during_backend_outage() -> Result<()> {
+    assert_outage_result(true).await
+}
+
+async fn assert_outage_result(explicit_abort: bool) -> Result<()> {
     let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
         auth_token: Some(TOKEN.to_string()),
     })
@@ -37,16 +46,21 @@ async fn nats_tool_provider_reports_backend_outage_during_unbounded_call() -> Re
         _ = &mut call => anyhow::bail!("call returned before the outage"),
     }
     drop(server);
-    let result = tokio::time::timeout(Duration::from_secs(40), call).await;
+    let timeout = if explicit_abort {
+        abort.set_ctrlc();
+        Duration::from_secs(7)
+    } else {
+        Duration::from_secs(40)
+    };
+    let result = tokio::time::timeout(timeout, call).await;
     server_task.abort();
     let result =
         result.context("unbounded tool request ignored persistent registry read failures")?;
-    let Err(ToolError::Recoverable(error)) = result else {
-        anyhow::bail!("expected explicit unavailable result")
+    let error = match (explicit_abort, result) {
+        (true, Err(ToolError::Fatal(error))) => error,
+        (false, Err(ToolError::Recoverable(error))) => error,
+        _ => anyhow::bail!("expected explicit unavailable result"),
     };
-    assert!(
-        error.to_string().contains("completion unconfirmed"),
-        "{error:#}"
-    );
+    assert!(format!("{error:#}").contains("unconfirmed"), "{error:#}");
     Ok(())
 }
