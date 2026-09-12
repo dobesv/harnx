@@ -152,4 +152,4 @@ export async function submitHitlDecision(
   return json?.result || { applied: false };
 }
 
-export { cancel, sessionControl } from './cancellationApi';
+export { abandonCancellation, cancel, sessionControl } from './cancellationApi';

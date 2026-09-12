@@ -61,6 +61,9 @@ pub struct Cli {
     /// Maximum budgeted tokens for one-shot invocation (0 or unset means unlimited)
     #[clap(long, value_name = "TOKENS", global = true)]
     pub token_budget: Option<u64>,
+    /// Abandon an unconfirmed cancellation before running a one-shot prompt
+    #[clap(long, global = true)]
+    pub resume_anyway: bool,
     /// Display the message without sending it
     #[clap(long, global = true, hide = true)]
     pub dry_run: bool,
@@ -260,6 +263,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_resume_anyway_for_one_shot_prompt() {
+        let cli = Cli::try_parse_from([
+            "harnx",
+            "--agent",
+            "foo",
+            "--session",
+            "stuck",
+            "prompt",
+            "--resume-anyway",
+            "continue",
+        ])
+        .unwrap();
+        assert!(cli.resume_anyway);
+        assert_eq!(cli.text().unwrap().as_deref(), Some("continue"));
+    }
+
+    #[test]
     fn parses_prompt_invocation_limits_before_or_after_subcommand() {
         let before = Cli::try_parse_from([
             "harnx",
@@ -302,6 +322,7 @@ mod tests {
         assert!(help.contains("0 or unset means no limit"));
         assert!(help.contains("--token-budget <TOKENS>"));
         assert!(help.contains("0 or unset means unlimited"));
+        assert!(help.contains("--resume-anyway"));
     }
 
     #[test]

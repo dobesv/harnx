@@ -39,6 +39,11 @@ pub(crate) enum ExitPhase {
 
 pub(crate) type ExitCancelFuture =
     Pin<Box<dyn Future<Output = anyhow::Result<harnx_execution_control::CancelReceipt>> + Send>>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CancellationAction {
+    Request,
+    Abandon,
+}
 pub(crate) type ExitCancelFactory = Arc<
     dyn Fn(
             GlobalConfig,
@@ -46,6 +51,7 @@ pub(crate) type ExitCancelFactory = Arc<
             String,
             String,
             Option<String>,
+            CancellationAction,
         ) -> ExitCancelFuture
         + Send
         + Sync,
@@ -426,6 +432,9 @@ pub(super) enum ModalState {
         worker_state: ExitWorkerState,
         phase: ExitPhase,
     },
+    /// Confirmation for making an unconfirmed cancellation terminal even
+    /// though work outside the control plane may still be running.
+    ConfirmAbandonCancellation,
     /// Agent selection
     AgentPicker {
         agents: Vec<String>,
@@ -454,6 +463,20 @@ pub(super) enum ModalState {
 }
 
 impl ModalState {
+    pub(super) fn simple_confirmation_prompt(&self) -> Option<String> {
+        match self {
+            Self::ConfirmDelete { from, to } if from == to => {
+                Some(format!("Delete entry {from}? [y/N]"))
+            }
+            Self::ConfirmDelete { from, to } => Some(format!("Delete entries {from}–{to}? [y/N]")),
+            Self::ConfirmRewind { seq, .. } => Some(format!("Rewind to entry {seq}? [y/N]")),
+            Self::ConfirmAbandonCancellation => {
+                Some("Resume anyway? Prior work may still be running. [y/N]".into())
+            }
+            _ => None,
+        }
+    }
+
     /// Return the subset of agents matching the current query (case-insensitive
     /// substring). Returns all agents when the query is empty.
     pub(super) fn filtered_agents(agents: &[String], query: &str) -> Vec<String> {

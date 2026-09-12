@@ -117,3 +117,52 @@ async fn durable_cancellation_reaches_three_worker_levels_without_forwarding_han
 async fn direct_child_cancellation_stops_only_its_worker_subtree() -> Result<()> {
     exercise_hierarchy(false).await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_ownerless_child_prompt_is_not_replayed_when_reopened() -> Result<()> {
+    let server = require_nats_server()
+        .await?
+        .context("nats-server required")?;
+    let root = session(server.url(), "ownerless-cancel-root").await?;
+    let store = root.execution_store();
+    let root_operation = store.session(root.session_id(), None, None).await?;
+    let child = enqueue_child(&root, server.url(), "ownerless-cancel-child").await?;
+    let child_execution_id = store
+        .current(child.session_id())
+        .await?
+        .unwrap()
+        .reference
+        .execution_id;
+
+    store
+        .request_cancel(root.session_id(), CancelRequest::default())
+        .await?;
+    store.status(&root_operation.reference).await?;
+    let cancelled_child = store.current(child.session_id()).await?.unwrap();
+    assert_eq!(cancelled_child.state, OperationState::Cancelled);
+    assert!(cancelled_child.cancel_recorded);
+
+    let reopened = session(server.url(), child.session_id()).await?;
+    assert_eq!(reopened.activate_pending_turn().await?, None);
+    assert_eq!(
+        store
+            .current(child.session_id())
+            .await?
+            .unwrap()
+            .reference
+            .execution_id,
+        child_execution_id
+    );
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let daemon = spawn_worker_daemon_with_call_fn(
+        local_nats_runtime_config(server.url()),
+        "ownerless-cancel-worker",
+        fold_capture_call_fn(calls.clone(), Arc::new(AsyncMutex::new(Vec::new()))),
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    daemon.abort();
+    let _ = daemon.await;
+    Ok(())
+}

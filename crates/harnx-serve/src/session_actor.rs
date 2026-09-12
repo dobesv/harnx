@@ -381,12 +381,10 @@ impl SessionActor {
                 let result = self.handle_prompt(text, options, reap_sleep).await;
                 let _ = reply.send(result);
             }
-            SessionCommand::Cancel {
-                reply,
-                expected_execution_id,
-                // Approval routing completes independently: a worker may have
-                // committed its decision before cancellation is accepted.
-            } => self.answer_cancellation(reply, expected_execution_id).await,
+            command @ (SessionCommand::Cancel { .. }
+            | SessionCommand::AbandonCancellation { .. }) => {
+                self.answer_cancellation_command(command).await
+            }
             SessionCommand::HitlApprovalDecision {
                 tool_call_id,
                 approved,

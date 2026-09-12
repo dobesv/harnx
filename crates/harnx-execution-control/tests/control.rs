@@ -96,6 +96,21 @@ fn terminal_states_never_reopen_and_cancel_does_not_complete_running_work() {
     assert!(!Unconfirmed.accepts_work());
 }
 
+#[test]
+fn legacy_operation_without_abandoned_flag_remains_compatible() -> Result<()> {
+    let operation = Operation::preparing(
+        OperationRef::new("legacy", "execution"),
+        OperationKind::Session,
+        None,
+    );
+    let mut value = serde_json::to_value(operation)?;
+    value.as_object_mut().unwrap().remove("abandoned");
+
+    let operation: Operation = serde_json::from_value(value)?;
+    assert!(!operation.abandoned);
+    Ok(())
+}
+
 #[tokio::test]
 async fn duplicate_cancel_retry_and_stale_generation_are_idempotent() -> Result<()> {
     let (_server, store) = store().await?;
@@ -151,6 +166,76 @@ async fn duplicate_cancel_retry_and_stale_generation_are_idempotent() -> Result<
         .unwrap()
         .state
         .accepts_work());
+    Ok(())
+}
+
+#[tokio::test]
+async fn operator_can_abandon_an_unconfirmed_graph_and_start_a_new_generation() -> Result<()> {
+    let (_server, store) = store().await?;
+    let root = store.session("abandon", None, Some("old")).await?;
+    let root_owner = owner(1);
+    store.claim(&root.reference, root_owner.clone()).await?;
+    let tool = store
+        .child(OperationRef::new("abandon", "tool"), root.reference.clone())
+        .await?;
+    let tool_owner = Owner::invocation("tool-server");
+    store.claim(&tool.reference, tool_owner.clone()).await?;
+    let child = store
+        .session(
+            "child",
+            Some(tool.reference.clone()),
+            Some("child-execution"),
+        )
+        .await?;
+    let child_owner = owner(2);
+    store.claim(&child.reference, child_owner.clone()).await?;
+
+    store
+        .request_cancel("abandon", CancelRequest::default())
+        .await?;
+    store
+        .mutate(&root.reference, |operation| {
+            operation.transition(OperationState::Unconfirmed)
+        })
+        .await?;
+
+    let receipt = store.abandon_unconfirmed("abandon", "old").await?;
+    assert_eq!(receipt.disposition, CancelDisposition::Cancelled);
+    assert!(receipt.abandoned);
+    for reference in [&root.reference, &child.reference] {
+        let operation = store.get(reference).await?.unwrap();
+        assert_eq!(operation.state, OperationState::Cancelled);
+        assert!(operation.abandoned);
+        assert!(operation.owner_stopped);
+    }
+    assert!(store
+        .record_coverage(&tool.reference, &tool_owner, 1, true)
+        .await
+        .is_err());
+    assert!(store.get(&tool.reference).await?.is_none());
+
+    let replacement = store.session("abandon", None, Some("new")).await?;
+    assert_eq!(replacement.reference.execution_id, "new");
+    Ok(())
+}
+
+#[tokio::test]
+async fn abandonment_is_generation_scoped_and_requires_unconfirmed_state() -> Result<()> {
+    let (_server, store) = store().await?;
+    let root = store
+        .session("scoped-abandon", None, Some("current"))
+        .await?;
+
+    let stale = store.abandon_unconfirmed("scoped-abandon", "stale").await?;
+    assert_eq!(stale.disposition, CancelDisposition::Idle);
+    assert!(store
+        .abandon_unconfirmed("scoped-abandon", "current")
+        .await
+        .is_err());
+    assert_eq!(
+        store.get(&root.reference).await?.unwrap().state,
+        OperationState::Preparing
+    );
     Ok(())
 }
 
@@ -385,6 +470,49 @@ async fn cancellation_waits_for_three_levels_and_concurrent_observers_converge()
     assert!(store.get(&tool.reference).await?.is_none());
     assert_eq!(
         store.current("child").await?.unwrap().state,
+        OperationState::Cancelled
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_recovers_cancellation_stranded_during_child_startup() -> Result<()> {
+    let (_server, store) = store().await?;
+    let root = store.session("stranded-root", None, None).await?;
+    store.claim(&root.reference, owner(1)).await?;
+    let tool = store
+        .child(
+            OperationRef::new("stranded-root", "subagent-call"),
+            root.reference.clone(),
+        )
+        .await?;
+    store.claim(&tool.reference, owner(1)).await?;
+    let child = store
+        .session(
+            "stranded-child",
+            Some(tool.reference.clone()),
+            Some("subagent-call"),
+        )
+        .await?;
+    store
+        .reserve_prompt(&child.reference, "reserved-before-interrupt")
+        .await?;
+    store.owner_stopped(&tool.reference, &owner(1)).await?;
+
+    store.cancel_operation(&root.reference, None, false).await?;
+    store.quiesce(&root.reference, &owner(1)).await?;
+    store
+        .record_coverage(&root.reference, &owner(1), 0, true)
+        .await?;
+    store.owner_stopped(&root.reference, &owner(1)).await?;
+
+    assert_eq!(
+        store.status(&root.reference).await?.state,
+        OperationState::Cancelled
+    );
+    assert!(store.get(&tool.reference).await?.is_none());
+    assert_eq!(
+        store.current("stranded-child").await?.unwrap().state,
         OperationState::Cancelled
     );
     Ok(())

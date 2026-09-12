@@ -2551,6 +2551,9 @@ impl Tui {
                     self.app.transcript_focus = None;
                     self.app.transcript_selection_anchor = None;
                 }
+                crate::types::ModalState::ConfirmAbandonCancellation => {
+                    self.start_cancellation_abandonment();
+                }
                 _ => {}
             }
         }

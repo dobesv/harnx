@@ -34,6 +34,7 @@ pub(crate) struct InvocationOptions {
     final_only: bool,
     timeout_secs: Option<u64>,
     token_budget: Option<u64>,
+    resume_anyway: bool,
 }
 
 impl InvocationOptions {
@@ -48,7 +49,13 @@ impl InvocationOptions {
             final_only,
             timeout_secs: timeout_secs.filter(|seconds| *seconds > 0),
             token_budget: token_budget.filter(|budget| *budget > 0),
+            resume_anyway: false,
         }
+    }
+
+    pub(crate) fn with_resume_anyway(mut self, resume_anyway: bool) -> Self {
+        self.resume_anyway = resume_anyway;
+        self
     }
 
     pub(crate) fn abort_signal(&self) -> &AbortSignal {
@@ -57,6 +64,10 @@ impl InvocationOptions {
 
     pub(crate) fn final_only(&self) -> bool {
         self.final_only
+    }
+
+    pub(crate) fn resume_anyway(&self) -> bool {
+        self.resume_anyway
     }
 }
 

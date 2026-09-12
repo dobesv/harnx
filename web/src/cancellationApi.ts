@@ -51,3 +51,21 @@ export async function cancel(agent: string, session: string, expectedExecutionId
 
   return json?.result as CancelResult;
 }
+
+export async function abandonCancellation(agent: string, session: string, expectedExecutionId: string): Promise<CancelResult> {
+  const res = await observedFetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(2000),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'session/abandon_cancellation',
+      params: { expected_execution_id: expectedExecutionId }
+    })
+  });
+  const json = await res.json() as JsonRpcResponse<CancelResult>;
+  if (json.error) throw new Error(`RPC Error: ${json.error.message || json.error.code}`);
+  if (!res.ok || !json.result) throw new Error(`RPC call failed with HTTP ${res.status}`);
+  return json.result;
+}

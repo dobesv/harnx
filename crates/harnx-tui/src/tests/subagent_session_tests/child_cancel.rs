@@ -28,7 +28,7 @@ async fn child_tui() -> (Tui, MonitoredSessionKey, Targets) {
     let targets: Targets = Default::default();
     tui.set_exit_cancel_factory(Arc::new({
         let targets = targets.clone();
-        move |_, _, session, _, expected| {
+        move |_, _, session, _, expected, _| {
             targets.lock().unwrap().push((session, expected));
             Box::pin(async { Ok(harnx_execution_control::CancelReceipt::idle()) })
         }

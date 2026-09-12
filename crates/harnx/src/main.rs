@@ -492,7 +492,8 @@ async fn run_one_shot(
         cli.final_only,
         cli.timeout_secs,
         cli.token_budget,
-    );
+    )
+    .with_resume_anyway(cli.resume_anyway);
     let result = start_directive(config, input, options).await;
     exit_session(config, !cli.final_only)?;
     match result {
@@ -678,6 +679,7 @@ async fn start_directive(
     )
     .await
     .context("failed to create NATS session")?;
+    resume_session_anyway(&session, options.resume_anyway()).await?;
     if let Some(heading) =
         one_shot_session_heading(options.final_only(), &agent, session.session_id())
     {
@@ -701,6 +703,32 @@ async fn start_directive(
             options: &options,
         },
     )
+}
+
+async fn resume_session_anyway(session: &harnx_runtime::NatsSession, enabled: bool) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    let Some(expected_execution_id) = session
+        .execution_store()
+        .current(session.session_id())
+        .await?
+        .map(|operation| operation.reference.execution_id)
+    else {
+        return Ok(());
+    };
+    let receipt = session
+        .abandon_unconfirmed_cancellation(&expected_execution_id)
+        .await
+        .context("--resume-anyway could not abandon the pending cancellation")?;
+    if receipt.abandoned {
+        eprintln!(
+            "Warning: resumed session '{}' by abandoning execution '{}'; prior work may still be running.",
+            session.session_id(),
+            receipt.execution_id.as_deref().unwrap_or("unknown"),
+        );
+    }
+    Ok(())
 }
 
 async fn start_interactive(config: &GlobalConfig) -> Result<()> {

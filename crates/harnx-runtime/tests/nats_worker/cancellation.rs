@@ -8,6 +8,19 @@ mod hierarchy;
 mod recovery;
 
 async fn session(url: &str, id: &str) -> Result<NatsSession> {
+    session_with_route(
+        url,
+        id,
+        harnx_runtime::SessionActivationRoute::ClusterShared,
+    )
+    .await
+}
+
+async fn session_with_route(
+    url: &str,
+    id: &str,
+    activation_route: harnx_runtime::SessionActivationRoute,
+) -> Result<NatsSession> {
     let client = async_nats::connect(url).await?;
     NatsSession::new(
         NatsSessionConfig {
@@ -18,13 +31,38 @@ async fn session(url: &str, id: &str) -> Result<NatsSession> {
                 SessionOverrides::default(),
             ),
             session_id: Some(id.into()),
-            activation_route: harnx_runtime::SessionActivationRoute::ClusterShared,
+            activation_route,
         },
         client.clone(),
         async_nats::jetstream::new(client),
         create_abort_signal(),
     )
     .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accepted_cancellation_survives_recovery_activation_failure() -> Result<()> {
+    let Some(server) = require_nats_server().await? else {
+        return Ok(());
+    };
+    let session = session_with_route(
+        server.url(),
+        "cancel-invalid-recovery-route",
+        harnx_runtime::SessionActivationRoute::WorkerTargeted {
+            session_scope: "invalid".into(),
+            worker_id: "worker".into(),
+        },
+    )
+    .await?;
+    session
+        .execution_store()
+        .session(session.session_id(), None, None)
+        .await?;
+
+    let receipt = session.request_cancel(CancelRequest::default()).await?;
+
+    assert_eq!(receipt.disposition, CancelDisposition::Requested);
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -318,6 +318,36 @@ impl ExecutionStore {
         Ok(CancelReceipt::from_operation(&operation, already))
     }
 
+    /// Make an unconfirmed cancellation terminal so a session can admit a new
+    /// execution. This is an explicit operator override: owners that vanished
+    /// without acknowledging cleanup may still be running.
+    pub async fn abandon_unconfirmed(
+        &self,
+        session: &str,
+        expected_execution_id: &str,
+    ) -> Result<CancelReceipt> {
+        let Some(current) = self.current(session).await? else {
+            return Ok(CancelReceipt::idle());
+        };
+        if expected_execution_id != current.reference.execution_id {
+            return Ok(CancelReceipt::idle());
+        }
+
+        let current = self.status(&current.reference).await?;
+        if current.state.is_terminal() {
+            return Ok(CancelReceipt::from_operation(&current, false));
+        }
+        ensure!(
+            current.state == OperationState::Unconfirmed,
+            "cancellation is {:?}; only unconfirmed cancellation can be abandoned",
+            current.state
+        );
+
+        let postorder = verified_postorder(self, &current.reference).await?;
+        let result = abandon_postorder(self, &current.reference, postorder).await?;
+        Ok(CancelReceipt::from_operation(&result, false))
+    }
+
     pub async fn cancel_operation(
         &self,
         reference: &OperationRef,
@@ -409,23 +439,14 @@ impl ExecutionStore {
     }
 
     pub async fn status(&self, reference: &OperationRef) -> Result<Operation> {
-        let mut stack = vec![(reference.clone(), None, false)];
+        let mut stack = vec![(reference.clone(), None, false, false)];
         let mut seen = BTreeSet::new();
         let mut root = None;
-        while let Some((current, parent, visited)) = stack.pop() {
-            let Some(operation) = self.get(&current).await? else {
-                // Another observer may already have removed a terminal child.
-                // Only an edge that still exists represents a missing blocker.
-                if let Some(parent) = &parent {
-                    if self
-                        .get(parent)
-                        .await?
-                        .is_some_and(|op| !op.children.contains(&current))
-                    {
-                        continue;
-                    }
-                }
-                bail!("execution descendant missing; cancellation unconfirmed");
+        while let Some((current, parent, ancestor_cancelling, visited)) = stack.pop() {
+            let Some(operation) =
+                status_operation(self, &current, parent.as_ref(), ancestor_cancelling).await?
+            else {
+                continue;
             };
             if visited {
                 let operation = self.reconcile_one(&current).await?;
@@ -438,9 +459,10 @@ impl ExecutionStore {
                 seen.insert(current.clone()),
                 "execution graph cycle; cancellation unconfirmed"
             );
-            stack.push((current.clone(), parent, true));
+            let descendants_cancelling = ancestor_cancelling || operation.state.cancelling();
+            stack.push((current.clone(), parent, ancestor_cancelling, true));
             for child in operation.children {
-                stack.push((child, Some(current.clone()), false));
+                stack.push((child, Some(current.clone()), descendants_cancelling, false));
             }
         }
         root.context("execution missing")
@@ -559,6 +581,117 @@ impl ExecutionStore {
         }
         Ok(())
     }
+}
+
+/// Snapshot a verified post-order traversal. Descendants must become terminal
+/// before their parents so a new root cannot be installed halfway through.
+async fn verified_postorder(
+    store: &ExecutionStore,
+    root: &OperationRef,
+) -> Result<Vec<OperationRef>> {
+    let mut stack = vec![(root.clone(), None, false)];
+    let mut seen = BTreeSet::new();
+    let mut postorder = Vec::new();
+    while let Some((reference, parent, visited)) = stack.pop() {
+        let operation = store
+            .get(&reference)
+            .await?
+            .context("execution descendant missing; cancellation unconfirmed")?;
+        ensure!(
+            operation.parent.as_ref() == parent.as_ref(),
+            "execution parent mismatch; cancellation unconfirmed"
+        );
+        if visited {
+            postorder.push(reference);
+            continue;
+        }
+        ensure!(
+            seen.insert(reference.clone()),
+            "execution graph cycle; cancellation unconfirmed"
+        );
+        stack.push((reference.clone(), parent, true));
+        for child in operation.children {
+            stack.push((child, Some(reference.clone()), false));
+        }
+    }
+    Ok(postorder)
+}
+
+async fn abandon_postorder(
+    store: &ExecutionStore,
+    root: &OperationRef,
+    postorder: Vec<OperationRef>,
+) -> Result<Operation> {
+    let descendants = postorder.clone();
+    for reference in postorder {
+        store
+            .mutate(&reference, Operation::abandon_unconfirmed)
+            .await?;
+    }
+    let result = store
+        .get(root)
+        .await?
+        .context("execution root missing during abandonment")?;
+    for reference in descendants
+        .into_iter()
+        .filter(|reference| reference != root)
+    {
+        store.purge_observed_terminal(&reference).await?;
+    }
+    Ok(result)
+}
+
+async fn status_operation(
+    store: &ExecutionStore,
+    reference: &OperationRef,
+    parent: Option<&OperationRef>,
+    ancestor_cancelling: bool,
+) -> Result<Option<Operation>> {
+    let Some(mut operation) = store.get(reference).await? else {
+        // Another observer may already have removed a terminal child. Only an
+        // edge that still exists represents a missing blocker.
+        if let Some(parent) = parent {
+            if store
+                .get(parent)
+                .await?
+                .is_some_and(|op| !op.children.contains(reference))
+            {
+                return Ok(None);
+            }
+        }
+        bail!("execution descendant missing; cancellation unconfirmed");
+    };
+    if ancestor_cancelling && !operation.state.is_terminal() {
+        operation = cancel_from_ancestor(store, reference).await?;
+    }
+    Ok(Some(operation))
+}
+
+/// Persist inherited cancellation even when the descendant owner vanished
+/// before observing its ancestor. An ownerless preparing operation never
+/// started work, so it can be closed immediately without cleanup.
+async fn cancel_from_ancestor(
+    store: &ExecutionStore,
+    reference: &OperationRef,
+) -> Result<Operation> {
+    let cancellation_id = uuid::Uuid::now_v7().to_string();
+    store
+        .mutate(reference, |operation| {
+            if operation.state.is_terminal() {
+                return Ok(());
+            }
+            let never_started =
+                operation.state == OperationState::Preparing && operation.owner.is_none();
+            operation.request_cancel(&cancellation_id, false)?;
+            if never_started {
+                operation.transition(OperationState::Quiescing)?;
+                operation.owner_stopped = true;
+                operation.cancel_recorded = true;
+                operation.transition(OperationState::Cancelled)?;
+            }
+            Ok(())
+        })
+        .await
 }
 
 fn current_key(session: &str) -> String {

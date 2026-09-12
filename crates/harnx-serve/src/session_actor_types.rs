@@ -55,6 +55,10 @@ pub enum SessionCommand {
         expected_execution_id: Option<String>,
         reply: oneshot::Sender<Result<harnx_execution_control::CancelReceipt, String>>,
     },
+    AbandonCancellation {
+        expected_execution_id: String,
+        reply: oneshot::Sender<Result<harnx_execution_control::CancelReceipt, String>>,
+    },
     HitlApprovalDecision {
         tool_call_id: String,
         approved: bool,
