@@ -41,7 +41,7 @@ impl Tui {
             RowUpdate {
                 key: key.clone(),
                 status: SubAgentStatus::Running,
-                invocation_id,
+                invocation_id: invocation_id.clone(),
                 progress,
             },
         ) {
@@ -54,6 +54,12 @@ impl Tui {
             .or_insert_with(|| MonitoredSessionState::new(SubAgentStatus::Running));
         state.status = SubAgentStatus::Running;
         state.streaming_open = false;
+        if state.invocation_id != invocation_id {
+            state.invocation_id = invocation_id;
+            if let Some(handle) = self.subagent_monitor_handles.remove(&key) {
+                handle.abort();
+            }
+        }
         self.ensure_subagent_monitor(key);
         self.pin_transcript_to_bottom();
     }

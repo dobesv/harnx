@@ -6,7 +6,7 @@
 use crate::config::{
     HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV, HARNX_WORKER_BIN_ENV, LOCAL_CLUSTER_KEY,
 };
-use crate::nats_local_server::{ensure_shared_server, SharedNatsServer};
+use crate::nats_local_server::{LocalBroker, LocalBrokerStatus};
 use crate::nats_worker::{
     targeted_worker_ready_subject, validate_worker_id, LocalWorkerTarget, SessionActivationRoute,
 };
@@ -109,7 +109,7 @@ pub fn resolve_worker_binary() -> Result<PathBuf> {
 
 /// Keeps the shared broker alive and owns one frontend-affine worker process.
 pub struct LocalWorkerSupervisor {
-    server: SharedNatsServer,
+    server: LocalBroker,
     worker_binary: PathBuf,
     route: LocalWorkerRoute,
     child: Option<Child>,
@@ -159,7 +159,7 @@ impl LocalWorkerSupervisor {
         binary: impl AsRef<Path>,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
-        let server = ensure_shared_server().await?;
+        let server = LocalBroker::start().await?;
         let worker_binary = binary
             .as_ref()
             .canonicalize()
@@ -181,18 +181,6 @@ impl LocalWorkerSupervisor {
     /// event-loop stall.
     /// Running workers are never restarted for binary or configuration changes.
     pub async fn ensure(&mut self, abort_signal: AbortSignal) -> Result<LocalWorkerRoute> {
-        if self
-            .server
-            .refresh_if_stale()
-            .await
-            .context("refresh shared local NATS server")?
-        {
-            // A worker is affine to the broker identity passed in its
-            // environment. It cannot serve turns on the replacement broker,
-            // even if its process has not noticed the old broker's exit yet.
-            self.stop_worker();
-        }
-
         // Subscribe before checking or spawning. Core NATS does not replay old
         // readiness markers, so a marker received below proves the existing
         // worker's event loop is currently making progress. The same
@@ -348,11 +336,15 @@ impl LocalWorkerSupervisor {
     }
 
     async fn subscribe_to_readiness(&self) -> Result<async_nats::Subscriber> {
-        let client = async_nats::ConnectOptions::new()
-            .token(self.server.token.clone())
-            .connect(&self.server.url)
-            .await
-            .context("connect local worker readiness client")?;
+        let server = self.server.status();
+        let client = harnx_nats_common::connect::NatsEndpoint {
+            url: server.url,
+            token: Some(server.token),
+            ..Default::default()
+        }
+        .connect()
+        .await
+        .context("connect local worker readiness client")?;
         let subject = targeted_worker_ready_subject(LocalWorkerTarget::new(
             self.route.session_scope(),
             self.route.worker_id(),
@@ -391,8 +383,8 @@ impl LocalWorkerSupervisor {
         let mut command = build_local_worker_command(
             &self.worker_binary,
             self.route.worker_id(),
-            &self.server.url,
-            &self.server.token,
+            &self.server.status().url,
+            &self.server.status().token,
         );
         let child = command
             .spawn()
@@ -410,8 +402,8 @@ impl LocalWorkerSupervisor {
         &self.route
     }
 
-    pub fn server(&self) -> &SharedNatsServer {
-        &self.server
+    pub fn server(&self) -> LocalBrokerStatus {
+        self.server.status()
     }
 
     fn stop_worker(&mut self) {

@@ -37,10 +37,8 @@ pub(super) async fn handle(
         }
     };
     store.owner_stopped(&reference, &owner).await?;
-    if let Some(reply) = message.reply {
-        client
-            .publish(reply, serde_json::to_vec(&outcome)?.into())
-            .await?;
+    if let Ok(reply) = harnx_nats_common::rpc::ReplyTarget::from_message(&message) {
+        reply.send(&client, serde_json::to_vec(&outcome)?).await?;
     }
     Ok(())
 }

@@ -425,7 +425,7 @@ async fn old_instances_shutdown_does_not_delete_a_replacements_registration() ->
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn graceful_shutdown_removes_the_registration() -> Result<()> {
+async fn graceful_shutdown_removes_the_renewed_registration() -> Result<()> {
     harnx_core::require_nextest();
     let Some(mut harness) = TestHarness::start().await? else {
         return Ok(());
@@ -439,7 +439,29 @@ async fn graceful_shutdown_removes_the_registration() -> Result<()> {
     let jetstream = async_nats::jetstream::new(harness.client.clone());
     let registry = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await?;
     let key = registration_key(&harness.instance_id, "____test");
-    assert!(registry.get(&key).await?.is_some());
+    let original = registry
+        .entry(&key)
+        .await?
+        .context("initial registration")?
+        .revision;
+    tokio::time::timeout(Duration::from_secs(35), async {
+        loop {
+            if registry
+                .entry(&key)
+                .await?
+                .is_some_and(|entry| entry.revision > original)
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("renewal did not update the original registration key")??;
+    assert!(registry
+        .get(registration_key(&harness.instance_id, "test"))
+        .await?
+        .is_none());
 
     harness.shutdown().await;
     assert!(

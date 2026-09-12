@@ -194,8 +194,15 @@ impl Toolset for TestToolset {
         match tool {
             "echo" => {
                 self.echo_invocations.fetch_add(1, Ordering::SeqCst);
+                if args.get("gate_result").and_then(Value::as_bool) == Some(true) {
+                    self.slow_started.notify_one();
+                    self.allow_cleanup.notified().await;
+                }
                 if let Some(delay_ms) = args.get("delay_ms").and_then(Value::as_u64) {
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                if let Some(error) = args.get("error").and_then(Value::as_str) {
+                    return Err(ToolInvokeError::Recoverable(error.to_string()));
                 }
                 Ok(args)
             }

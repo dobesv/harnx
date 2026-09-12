@@ -10,6 +10,9 @@ use tempfile::TempDir;
 
 const TOKEN: &str = "nats-common-test-token";
 
+#[path = "registry_ttl/recovery.rs"]
+mod recovery;
+
 struct NatsServerHandle {
     url: String,
     _store_dir: TempDir,

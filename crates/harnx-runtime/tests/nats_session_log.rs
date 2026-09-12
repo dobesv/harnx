@@ -12,6 +12,74 @@ use harnx_core::{
 use harnx_runtime::{config::Config, nats_session_log::NatsSessionLog};
 use serde_json::json;
 
+/// Only an explicit missing-message response is a retention gap. A broker
+/// failure must not produce a successful, truncated transcript.
+#[tokio::test]
+async fn nats_session_log_rejects_transport_errors_instead_of_skipping_entries() -> Result<()> {
+    use futures_util::StreamExt;
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let js = async_nats::jetstream::new(client.clone());
+    let log = NatsSessionLog::new(js.clone(), "read-failure");
+    log.append_event_async(&SessionLogEntry::Cancel { fence_token: 1 })
+        .await?;
+    let info = client
+        .request("$JS.API.STREAM.INFO.SESSION_READ-FAILURE", "{}".into())
+        .await?
+        .payload;
+    let mut requests = client.subscribe("FAULT.>".to_string()).await?;
+    client.flush().await?;
+    let responder = tokio::spawn(async move {
+        while let Some(request) = requests.next().await {
+            let payload = if request.subject.as_str().contains(".MSG.GET.") {
+                serde_json::to_vec(&json!({"error": {"code": 503, "err_code": 10008, "description": "injected storage failure"}})).unwrap().into()
+            } else {
+                info.clone()
+            };
+            client
+                .publish(request.reply.unwrap(), payload)
+                .await
+                .unwrap();
+        }
+    });
+    let faulty = NatsSessionLog::new(
+        async_nats::jetstream::with_prefix(async_nats::connect(server.url()).await?, "FAULT"),
+        "read-failure",
+    );
+    let result = faulty.load_events_async().await;
+    responder.abort();
+    let error = result.expect_err("a failed read must not silently omit the entry");
+    let message = format!("{error:#}");
+    assert!(message.contains("stream sequence 1"), "{message}");
+    assert!(message.contains("injected storage failure"), "{message}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn nats_session_log_still_skips_confirmed_retention_gaps() -> Result<()> {
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+    let log = NatsSessionLog::new(js.clone(), "read-gap");
+    for fence_token in 1..=3 {
+        log.append_event_async(&SessionLogEntry::Cancel { fence_token })
+            .await?;
+    }
+    js.get_stream("SESSION_READ-GAP")
+        .await?
+        .delete_message(2)
+        .await?;
+    let entries = log.load_events_async().await?;
+    assert_eq!(
+        entries.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn nats_session_log_round_trips_and_reconstructs() -> Result<()> {
     require_nextest();

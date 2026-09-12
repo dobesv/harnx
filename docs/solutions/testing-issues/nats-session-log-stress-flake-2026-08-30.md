@@ -4,7 +4,7 @@ date: 2026-08-30
 last_verified: 2026-08-30
 component: "harnx-runtime/src/nats_worker"
 problem_type: test_failure
-status: current
+status: superseded
 anchors:
   - crates/harnx-runtime/src/nats_session_log.rs:243-255
   - crates/harnx-runtime/src/nats_worker/tests.rs
@@ -18,6 +18,12 @@ plan_ref: "harnx-healthz-addr"
 ---
 
 # NATS session-log remote-session-migration tests flake under stress
+
+Resolved by distinguishing explicit `NoMessageFound` responses from transport
+and storage failures in `NatsSessionLog::read_range`. See the maintained
+[completion-stall guidance](../../nats-ha.md#diagnosing-sub-agent-completion-stalls)
+and the `nats_session_log_rejects_transport_errors_instead_of_skipping_entries`
+regression test. The analysis below describes the former behavior.
 
 ## When this is relevant
 
@@ -59,12 +65,3 @@ is unrelated to healthz wiring.
   for this feature; could be a separate hardening effort.
 - **Increasing test timeouts:** Bounds the flake but doesn't fix the underlying
   discard-on-error behavior.
-
-## Recommended actions if flake blocks merge
-
-1. Run the failing test in isolation (`cargo nextest run -p harnx-runtime -- <test_name>`)
-   to confirm pass.
-2. Re-run the stress suite; flakes are non-deterministic and may move between
-   siblings in the same family.
-3. If flake persists after merge, file separate issue for the discard-on-error
-   read path hardening.

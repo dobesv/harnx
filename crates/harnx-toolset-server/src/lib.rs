@@ -89,7 +89,7 @@ struct ToolRequestContext {
 }
 
 struct ValidatedToolRequest {
-    reply_subject: async_nats::Subject,
+    reply_subject: harnx_nats_common::rpc::ReplyTarget,
     request: ToolRequest,
     idempotency_key: String,
     parent_cx: OtelContext,
@@ -126,8 +126,8 @@ struct ServeSettings {
 struct RegistrationRefresh<'a> {
     registry: &'a kv::Store,
     instance_id: &'a ServerScope,
+    identity_token: &'a str,
     registration: &'a Registration,
-    interval: &'a mut tokio::time::Interval,
     /// The revision of our own last-published registration, so shutdown can
     /// delete it conditionally instead of unconditionally (see the delete
     /// call in `serve_with_shutdown`). Updated after every successful
@@ -294,9 +294,6 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
         server_identity: identity_token.clone(),
         execution_store,
     };
-    let mut refresh = tokio::time::interval(REGISTRATION_REFRESH_INTERVAL);
-    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    refresh.tick().await;
 
     let outcome = serve_requests(
         &request_context,
@@ -308,8 +305,8 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
         RegistrationRefresh {
             registry: &registry,
             instance_id: &instance_id,
+            identity_token: &identity_token,
             registration: &registration,
-            interval: &mut refresh,
             revision: &mut revision,
         },
     )
@@ -364,6 +361,12 @@ async fn serve_requests(
     subscriptions: ToolSubscriptions<'_>,
     refresh: RegistrationRefresh<'_>,
 ) -> Result<()> {
+    let mut renewals = Box::pin(harnx_nats_common::registry::refreshes(
+        refresh.registry.clone(),
+        registration_key(refresh.instance_id, refresh.identity_token),
+        serde_json::to_vec(refresh.registration)?.into(),
+        REGISTRATION_REFRESH_INTERVAL,
+    ));
     loop {
         tokio::select! {
             request = subscriptions.tool_requests.next() => {
@@ -379,8 +382,8 @@ async fn serve_requests(
                 let context = request_context.clone();
                 tokio::spawn(async move { handle_control(control, &context).await; });
             }
-            _ = refresh.interval.tick() => {
-                match publish_registration(refresh.registry, refresh.instance_id, refresh.registration).await {
+            Some(renewal) = renewals.next() => {
+                match renewal {
                     Ok(new_revision) => *refresh.revision = new_revision,
                     Err(error) => {
                         log::warn!("refresh tool registration failed; retrying next interval: {error:#}");
@@ -408,6 +411,7 @@ async fn process_tool_request(
     context: &ToolRequestContext,
     message: async_nats::Message,
 ) -> Result<()> {
+    let _activity = harnx_nats_common::rpc::RequestActivity::start(&context.client, &message);
     let Some(validated) = validate_tool_request(context, message).await? else {
         return Ok(());
     };
@@ -655,10 +659,7 @@ async fn validate_tool_request(
         .as_ref()
         .map(harnx_telemetry::propagate::extract_context_from_nats)
         .unwrap_or_default();
-    let reply_subject = message
-        .reply
-        .clone()
-        .context("tool request has no reply subject")?;
+    let reply_subject = harnx_nats_common::rpc::ReplyTarget::from_message(&message)?;
     let header_call_id = header_value(&message, HDR_CALL_ID);
     let request: ToolRequest = match serde_json::from_slice(&message.payload) {
         Ok(request) => request,
@@ -775,7 +776,7 @@ async fn complete_cache_entry(
 
 async fn publish_recoverable_reply(
     client: &async_nats::Client,
-    subject: async_nats::Subject,
+    subject: harnx_nats_common::rpc::ReplyTarget,
     call_id: String,
     message: String,
 ) -> Result<()> {
@@ -800,12 +801,12 @@ fn map_invoke_error(error: ToolInvokeError) -> ToolErrorPayload {
 
 async fn publish_reply(
     client: &async_nats::Client,
-    subject: async_nats::Subject,
+    subject: harnx_nats_common::rpc::ReplyTarget,
     reply: &ToolReply,
 ) -> Result<()> {
     let payload = serde_json::to_vec(reply).context("encode tool reply")?;
-    client
-        .publish(subject, payload.into())
+    subject
+        .send(client, payload)
         .await
         .context("publish tool reply")
 }

@@ -8,6 +8,30 @@ use std::time::Duration;
 /// tolerated before a server is treated as gone.
 pub const REGISTRATION_TTL: Duration = Duration::from_secs(90);
 
+/// Retain each renewal future independently of request/control polling. A
+/// broker timeout must not monopolize a server's request or shutdown loop.
+pub fn refreshes(
+    store: kv::Store,
+    key: String,
+    payload: bytes::Bytes,
+    period: Duration,
+) -> impl futures_util::Stream<Item = Result<u64>> {
+    futures_util::stream::unfold(
+        (store, key, payload),
+        move |(store, key, payload)| async move {
+            tokio::time::sleep(period).await;
+            // Repeating the same registration value is idempotent.
+            let result = crate::recovery::retry_until(
+                tokio::time::Instant::now() + crate::recovery::RECOVERY_TIMEOUT,
+                || store.put(&key, payload.clone()),
+                |_| true,
+            )
+            .await;
+            Some((result, (store, key, payload)))
+        },
+    )
+}
+
 /// Open a KV bucket, creating it with `ttl` or bringing an existing bucket up to
 /// that TTL.
 pub async fn ensure_bucket_with_ttl(

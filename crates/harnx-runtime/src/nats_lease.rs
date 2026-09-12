@@ -2,7 +2,7 @@ use crate::config::DEFAULT_BUCKET_REPLICAS;
 use crate::nats_metrics;
 use crate::nats_session_metadata::SessionMetadataStore;
 use anyhow::{anyhow, bail, Context, Result};
-use async_nats::header::{NATS_EXPECTED_LAST_SUBJECT_SEQUENCE, NATS_MESSAGE_TTL};
+use async_nats::header::{NATS_EXPECTED_LAST_SUBJECT_SEQUENCE, NATS_MESSAGE_ID, NATS_MESSAGE_TTL};
 use async_nats::jetstream::{self, context::PublishErrorKind, kv, stream};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -95,6 +95,7 @@ struct LeaseState {
     fence_token: AtomicU64,
     renew_lock: Mutex<()>,
     status_tx: watch::Sender<bool>,
+    confirmed_until: parking_lot::Mutex<time::Instant>,
 }
 
 impl NatsSessionLease {
@@ -113,6 +114,7 @@ impl NatsSessionLease {
         let record = LeaseRecord::new(worker_id.clone(), generation);
         let payload = serde_json::to_vec(&record).context("Failed to serialize lease record")?;
 
+        let acquired_at = time::Instant::now();
         let revision = match bucket
             .create_with_ttl(&key, payload.into(), config.ttl)
             .await
@@ -135,6 +137,7 @@ impl NatsSessionLease {
             fence_token: AtomicU64::new(revision),
             renew_lock: Mutex::new(()),
             status_tx,
+            confirmed_until: parking_lot::Mutex::new(acquired_at + config.ttl),
         });
         info!(
             "nats lease acquired: session_id={session_id} worker_id={} generation={} revision={revision}",
@@ -539,6 +542,8 @@ async fn renew_once(
     state: &LeaseState,
 ) -> Result<u64> {
     let expected_revision = state.fence_token.load(Ordering::SeqCst);
+    let sent_at = time::Instant::now();
+    let deadline = *state.confirmed_until.lock();
     let record = LeaseRecord::new(state.worker_id.clone(), state.generation);
     let payload =
         serde_json::to_vec(&record).context("Failed to serialize renewed lease record")?;
@@ -549,17 +554,36 @@ async fn renew_once(
         expected_revision.to_string(),
     );
     headers.insert(NATS_MESSAGE_TTL, state.ttl.as_secs().to_string());
-    let ack = jetstream
-        .publish_with_headers(subject, headers, payload.into())
-        .await
-        .with_context(|| format!("Failed to publish renewal for lease key '{key}'"))?
-        .await;
+    headers.insert(
+        NATS_MESSAGE_ID,
+        format!(
+            "lease:{key}:{}:{}:{expected_revision}",
+            state.worker_id, state.generation
+        ),
+    );
+    let payload = bytes::Bytes::from(payload);
+    let ack = harnx_nats_common::recovery::retry_until(
+        deadline,
+        || async {
+            jetstream
+                .publish_with_headers(subject.clone(), headers.clone(), payload.clone())
+                .await?
+                .await
+        },
+        harnx_nats_common::recovery::transient_publish,
+    )
+    .await;
     match ack {
         Ok(ack) => {
             state.fence_token.store(ack.sequence, Ordering::SeqCst);
+            *state.confirmed_until.lock() = sent_at + state.ttl;
             Ok(ack.sequence)
         }
-        Err(error) if error.kind() == PublishErrorKind::WrongLastSequence => {
+        Err(error)
+            if error
+                .downcast_ref::<jetstream::context::PublishError>()
+                .is_some_and(|error| error.kind() == PublishErrorKind::WrongLastSequence) =>
+        {
             bail!("Lost lease CAS for key '{key}'")
         }
         Err(error) => {

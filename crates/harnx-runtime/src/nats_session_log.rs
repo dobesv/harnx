@@ -83,28 +83,28 @@ impl NatsSessionLog {
         entry: &SessionLogEntry,
         publish_message: PublishMessage,
     ) -> Result<u64> {
-        self.ensure_stream().await?;
+        harnx_nats_common::recovery::read(|| self.ensure_stream()).await?;
         let payload = serialize_entry(entry)?;
-        let ack = self
-            .jetstream
-            .send_publish(
-                self.subject.clone(),
-                publish_message.payload(Bytes::from(payload)),
+        // The same message ID and CAS expectation survive a lost publish ack.
+        // A conflict is authoritative and is never retried as a new append.
+        let message = publish_message.payload(Bytes::from(payload));
+        let ack = harnx_nats_common::recovery::retry_until(
+            tokio::time::Instant::now() + harnx_nats_common::recovery::RECOVERY_TIMEOUT,
+            || async {
+                self.jetstream
+                    .send_publish(self.subject.clone(), message.clone())
+                    .await?
+                    .await
+            },
+            harnx_nats_common::recovery::transient_publish,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "JetStream did not ack session log entry for session '{}'",
+                self.session_id
             )
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to publish session log entry for session '{}'",
-                    self.session_id
-                )
-            })?
-            .await
-            .with_context(|| {
-                format!(
-                    "JetStream did not ack session log entry for session '{}'",
-                    self.session_id
-                )
-            })?;
+        })?;
         Ok(ack.sequence)
     }
 
@@ -258,7 +258,15 @@ impl NatsSessionLog {
                 Ok(Ok(raw)) => raw,
                 // Sequence may have been removed (retention/limits) leaving a gap;
                 // skip missing sequences rather than failing the whole read.
-                Ok(Err(_)) => continue,
+                Ok(Err(error)) if error.kind() == LastRawMessageErrorKind::NoMessageFound => {
+                    continue
+                }
+                Ok(Err(error)) => {
+                    return Err(error).with_context(|| format!(
+                        "Failed to read JetStream session log for session '{}' at stream sequence {}",
+                        self.session_id, seq
+                    ));
+                }
                 Err(_) => {
                     return Err(anyhow::anyhow!(
                         "Timed out after {:?} reading JetStream session log for session '{}' at stream sequence {}",

@@ -122,10 +122,6 @@ pub async fn serve_with_shutdown(
     let registry = ensure_hook_registry_bucket(&jetstream, replicas).await?;
     let mut revision = publish_hook_registration(&registry, &instance_id, &registration).await?;
 
-    let mut refresh = tokio::time::interval(REGISTRATION_REFRESH_INTERVAL);
-    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    refresh.tick().await;
-
     let outcome = serve_requests(
         &client,
         &hook,
@@ -137,7 +133,6 @@ pub async fn serve_with_shutdown(
             registry: &registry,
             instance_id: &instance_id,
             registration: &registration,
-            interval: &mut refresh,
             revision: &mut revision,
         },
     )
@@ -182,7 +177,6 @@ struct RegistrationRefresh<'a> {
     registry: &'a kv::Store,
     instance_id: &'a ServerScope,
     registration: &'a HookRegistration,
-    interval: &'a mut tokio::time::Interval,
     /// The revision of our own last-published registration, so shutdown can
     /// delete it conditionally instead of unconditionally (see the delete
     /// call in `serve_with_shutdown`). Updated after every successful
@@ -204,6 +198,12 @@ async fn serve_requests(
     subscriptions: HookSubscriptions<'_>,
     refresh: RegistrationRefresh<'_>,
 ) -> Result<()> {
+    let mut renewals = Box::pin(harnx_nats_common::registry::refreshes(
+        refresh.registry.clone(),
+        hook_registration_key(refresh.instance_id, &refresh.registration.server),
+        serde_json::to_vec(refresh.registration)?.into(),
+        REGISTRATION_REFRESH_INTERVAL,
+    ));
     loop {
         tokio::select! {
             request = subscriptions.requests.next() => {
@@ -219,8 +219,8 @@ async fn serve_requests(
                     }
                 });
             }
-            _ = refresh.interval.tick() => {
-                match publish_hook_registration(refresh.registry, refresh.instance_id, refresh.registration).await {
+            Some(renewal) = renewals.next() => {
+                match renewal {
                     Ok(new_revision) => *refresh.revision = new_revision,
                     Err(error) => {
                         log::warn!("refresh hook registration failed; retrying next interval: {error:#}");
@@ -247,6 +247,7 @@ async fn handle_hook_request(
     specs: &[HookSpec],
     message: async_nats::Message,
 ) -> Result<()> {
+    let _activity = harnx_nats_common::rpc::RequestActivity::start(&client, &message);
     if message
         .headers
         .as_ref()
@@ -254,7 +255,7 @@ async fn handle_hook_request(
     {
         return execution::handle(client, hook, message).await;
     }
-    let Some(reply_subject) = message.reply else {
+    let Ok(reply_subject) = harnx_nats_common::rpc::ReplyTarget::from_message(&message) else {
         log::warn!("hook request missing reply subject");
         return Ok(());
     };
@@ -285,8 +286,8 @@ async fn handle_hook_request(
         }
     };
     let payload = serde_json::to_vec(&outcome).context("encode hook outcome")?;
-    client
-        .publish(reply_subject, payload.into())
+    reply_subject
+        .send(&client, payload)
         .await
         .context("publish hook outcome")?;
     client.flush().await.context("flush hook outcome")

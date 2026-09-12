@@ -4109,6 +4109,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-nats",
+ "bytes",
+ "futures-util",
  "harnx-core",
  "log",
  "rcgen",

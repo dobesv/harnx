@@ -88,7 +88,7 @@ impl SessionControlHandler {
     pub(super) async fn listen(
         self,
         mut subscriber: async_nats::Subscriber,
-        mut watch: async_nats::jetstream::kv::Watch,
+        mut watch: harnx_nats_common::recovery::KvUpdates,
     ) {
         use futures_util::StreamExt;
         loop {

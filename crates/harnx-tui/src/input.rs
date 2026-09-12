@@ -753,15 +753,14 @@ impl Tui {
                 self.handle_shared_session_agent_event(session_id, cluster, event)
                     .await;
             }
-            TuiEvent::SubAgentSessionSnapshot {
-                key,
-                transcript,
-                status,
-            } => {
-                self.handle_subagent_snapshot(key, transcript, status);
+            TuiEvent::SubAgentSessionSnapshot { key, snapshot } => {
+                self.handle_subagent_snapshot(key, snapshot);
             }
             TuiEvent::SubAgentSessionEvent { key, event } => {
                 self.handle_subagent_session_event(key, event);
+            }
+            TuiEvent::SubAgentInvocationFailed { key, invocation_id } => {
+                self.fail_monitored_invocation(&key, &invocation_id);
             }
             TuiEvent::ToolRoundComplete => {
                 // Intermediate tool round — prompt loop continues, don't clear llm_busy.

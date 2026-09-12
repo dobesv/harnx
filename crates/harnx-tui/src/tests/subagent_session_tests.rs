@@ -14,6 +14,9 @@ use std::time::Duration;
 #[path = "subagent_session_tests/child_cancel.rs"]
 mod child_cancel;
 
+#[path = "subagent_session_tests/orphan.rs"]
+mod orphan;
+
 fn monitored_key(agent: &str, session_id: &str) -> MonitoredSessionKey {
     MonitoredSessionKey {
         cluster: harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
@@ -245,8 +248,11 @@ async fn terminal_progress_is_not_reopened_by_child_monitor_or_late_progress() {
         .tui()
         .handle_tui_event(TuiEvent::SubAgentSessionSnapshot {
             key: key.clone(),
-            transcript: vec![],
-            status: SubAgentStatus::Running,
+            snapshot: crate::types::SubAgentSnapshot {
+                invocation_id: Some("inv-terminal".into()),
+                transcript: vec![],
+                status: SubAgentStatus::Running,
+            },
         })
         .await
         .unwrap();
@@ -405,16 +411,19 @@ async fn nested_session_harness() -> (TuiTestHarness, MonitoredSessionKey, Monit
         .tui()
         .handle_tui_event(TuiEvent::SubAgentSessionSnapshot {
             key: parent.clone(),
-            transcript: vec![
-                assistant_text("parent transcript"),
-                TranscriptItem::SubAgentSession {
-                    key: nested.clone(),
-                    status: SubAgentStatus::Running,
-                    invocation_id: None,
-                    progress: None,
-                },
-            ],
-            status: SubAgentStatus::Running,
+            snapshot: crate::types::SubAgentSnapshot {
+                invocation_id: Some("inv-parent".into()),
+                transcript: vec![
+                    assistant_text("parent transcript"),
+                    TranscriptItem::SubAgentSession {
+                        key: nested.clone(),
+                        status: SubAgentStatus::Running,
+                        invocation_id: None,
+                        progress: None,
+                    },
+                ],
+                status: SubAgentStatus::Running,
+            },
         })
         .await
         .unwrap();
@@ -422,8 +431,11 @@ async fn nested_session_harness() -> (TuiTestHarness, MonitoredSessionKey, Monit
         .tui()
         .handle_tui_event(TuiEvent::SubAgentSessionSnapshot {
             key: nested.clone(),
-            transcript: vec![assistant_text("nested transcript")],
-            status: SubAgentStatus::Completed,
+            snapshot: crate::types::SubAgentSnapshot {
+                invocation_id: None,
+                transcript: vec![assistant_text("nested transcript")],
+                status: SubAgentStatus::Completed,
+            },
         })
         .await
         .unwrap();
@@ -555,8 +567,11 @@ async fn fullscreen_subagent_navigation_is_bounded_and_keeps_focus_visible() {
         .tui()
         .handle_tui_event(TuiEvent::SubAgentSessionSnapshot {
             key: child.clone(),
-            transcript,
-            status: SubAgentStatus::Completed,
+            snapshot: crate::types::SubAgentSnapshot {
+                invocation_id: Some("inv-1".into()),
+                transcript,
+                status: SubAgentStatus::Completed,
+            },
         })
         .await
         .unwrap();
@@ -1026,8 +1041,11 @@ async fn test_subagent_session_jump_keys() {
         .tui()
         .handle_tui_event(TuiEvent::SubAgentSessionSnapshot {
             key: child.clone(),
-            transcript,
-            status: SubAgentStatus::Completed,
+            snapshot: crate::types::SubAgentSnapshot {
+                invocation_id: Some("inv-1".into()),
+                transcript,
+                status: SubAgentStatus::Completed,
+            },
         })
         .await
         .unwrap();
@@ -1088,11 +1106,7 @@ async fn test_subagent_session_jump_keys() {
     assert!(!follow, "jump-to-top should disable follow");
 
     // Test jump-to-bottom with 'G' char key
-    harness
-        .tui()
-        .handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE))
-        .await
-        .unwrap();
+    press_key(&mut harness, KeyCode::Char('G')).await;
     harness.render();
     let (pos, follow, max_pos) = scroll_state(&mut harness);
     assert_eq!(pos, max_pos, "'G' should jump to bottom in subagent view");
@@ -1104,21 +1118,13 @@ async fn test_subagent_session_jump_keys() {
     let (before_home, _, _) = scroll_state(&mut harness);
     assert!(before_home > 0, "should be scrolled before Home test");
 
-    harness
-        .tui()
-        .handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))
-        .await
-        .unwrap();
+    press_key(&mut harness, KeyCode::Home).await;
     let (pos, follow, _) = scroll_state(&mut harness);
     assert_eq!(pos, 0, "Home should jump to top in subagent view");
     assert!(!follow, "Home should disable follow");
 
     // Test End keycode (jump-to-bottom)
-    harness
-        .tui()
-        .handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
-        .await
-        .unwrap();
+    press_key(&mut harness, KeyCode::End).await;
     harness.render();
     let (pos, follow, max_pos) = scroll_state(&mut harness);
     assert_eq!(pos, max_pos, "End should jump to bottom in subagent view");

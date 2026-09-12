@@ -4,6 +4,9 @@
 #[allow(dead_code)]
 mod common;
 
+#[path = "local_worker_supervisor/failover.rs"]
+mod failover;
+
 use harnx_core::{event::NullSink, require_nextest};
 use harnx_runtime::config::LOCAL_CLUSTER_KEY;
 use harnx_runtime::local_orchestrator::LocalWorkerSupervisor;
@@ -73,7 +76,12 @@ fn isolated_environment(root: &Path) -> Vec<EnvGuard> {
     ]
 }
 
-async fn start_mock_openai() -> (String, tokio::task::JoinHandle<()>) {
+type ModelGate = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+async fn start_mock_openai(gate: Option<ModelGate>) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock OpenAI server");
@@ -102,6 +110,10 @@ async fn start_mock_openai() -> (String, tokio::task::JoinHandle<()>) {
                     break;
                 }
             }
+        }
+        if let Some((entered, release)) = gate {
+            entered.send(()).expect("signal model request");
+            release.await.expect("release model response");
         }
         let body = r#"{"id":"chatcmpl-local","object":"chat.completion","created":1,"model":"test","choices":[{"index":0,"message":{"role":"assistant","content":"worker completed"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
         let response = format!(
@@ -304,6 +316,38 @@ async fn crash_and_respawn(frontend: &mut LocalWorkerSupervisor, old_pid: u32) -
     }
 }
 
+async fn await_background_broker_recovery(
+    supervisor: &LocalWorkerSupervisor,
+    previous_nonce: &str,
+) {
+    // No new prompt/ensure call triggers recovery. The surviving frontend's
+    // broker guard must recover while existing callers are still waiting.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while supervisor.server().nonce == previous_nonce {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut readiness = async_nats::ConnectOptions::new()
+            .token(supervisor.server().token)
+            .connect(&supervisor.server().url)
+            .await
+            .expect("connect recovered broker")
+            .subscribe(targeted_worker_ready_subject(
+                LocalWorkerTarget::new(
+                    supervisor.route().session_scope(),
+                    supervisor.route().worker_id(),
+                )
+                .expect("valid worker target"),
+            ))
+            .await
+            .expect("subscribe after failover");
+        futures_util::StreamExt::next(&mut readiness)
+            .await
+            .expect("worker reconnected");
+    })
+    .await
+    .expect("background broker failover");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn running_worker_without_readiness_heartbeats_is_replaced() {
     require_nextest();
@@ -369,13 +413,16 @@ async fn joined_supervisor_recovers_after_broker_owner_exits() {
         "joined worker exited before broker recovery"
     );
 
+    await_background_broker_recovery(&joiner, &old_broker_nonce).await;
     let recovered_route = joiner
         .ensure(create_abort_signal())
         .await
         .expect("recover joined worker after broker owner exits");
     let replacement_worker_pid = joiner.worker_pid().expect("replacement worker PID");
-    assert_ne!(replacement_worker_pid, joined_worker_pid);
-    wait_for_process_exit(joined_worker_pid).await;
+    assert_eq!(
+        replacement_worker_pid, joined_worker_pid,
+        "broker failover must preserve running workers"
+    );
     assert_eq!(recovered_route, joined_route);
     assert_eq!(joiner.route(), &joined_route);
     assert_ne!(joiner.server().nonce, old_broker_nonce);
@@ -406,7 +453,7 @@ async fn local_supervisors_own_distinct_workers_routes_and_process_trees() {
     let binary = root.path().join("harnx-worker");
     std::fs::copy(installed_binary, &binary).expect("copy worker binary fixture");
     let _environment = isolated_environment(root.path());
-    let (api_base, mock_task) = start_mock_openai().await;
+    let (api_base, mock_task) = start_mock_openai(None).await;
     write_trivial_agent_config(root.path(), &api_base);
 
     let mut frontend_a =

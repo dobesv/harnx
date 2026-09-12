@@ -265,6 +265,14 @@ session continues and the agent can retry. The canonical pattern is
 
 ### Session log entries and transcript protocol
 
+Local broker failover keeps the authenticated endpoint stable and runs election
+through `nats_local_server::LocalBroker` even while a frontend is idle. Create
+production connections with `harnx_nats_common::connect::NatsEndpoint`; use the
+operation-specific recovery helpers documented in `docs/nats-ha.md` under
+“Recovery contract and shared implementation”. Retrying a handler whose side
+effects are unknown is unsafe. Failover tests must retain existing clients and
+in-flight work while removing the owner, rather than testing only fresh clients.
+
 `SessionLogEntry` (`harnx-core/src/session.rs`) and `SessionEvent` (`harnx-core/src/event.rs`)
 are different types with different change-cost:
 

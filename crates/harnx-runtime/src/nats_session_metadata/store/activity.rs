@@ -98,8 +98,7 @@ impl SessionMetadataStore {
                 .await
                 .map_err(anyhow::Error::from);
         }
-        self.store
-            .update(key, payload.into(), revision)
+        harnx_nats_common::cas::update(&self.store, key.to_string(), payload.into(), revision)
             .await
             .map_err(anyhow::Error::from)
     }

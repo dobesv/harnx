@@ -10,8 +10,8 @@ pub struct ExecutionStore {
 }
 
 impl ExecutionStore {
-    pub async fn watch(&self) -> Result<kv::Watch> {
-        Ok(self.kv.watch_all().await?)
+    pub async fn watch(&self) -> Result<harnx_nats_common::recovery::KvUpdates> {
+        harnx_nats_common::recovery::kv_updates(self.kv.clone()).await
     }
     pub async fn ensure(js: &jetstream::Context, replicas: usize) -> Result<Self> {
         let kv = match js
@@ -43,7 +43,7 @@ impl ExecutionStore {
     }
 
     async fn entry(&self, key: &str) -> Result<Option<(Operation, u64)>> {
-        let Some(entry) = self.kv.entry(key).await? else {
+        let Some(entry) = harnx_nats_common::recovery::read(|| self.kv.entry(key)).await? else {
             return Ok(None);
         };
         if entry.operation != kv::Operation::Put {
@@ -56,7 +56,9 @@ impl ExecutionStore {
     }
 
     pub async fn current(&self, session: &str) -> Result<Option<Operation>> {
-        let Some(value) = self.kv.get(current_key(session)).await? else {
+        let Some(value) =
+            harnx_nats_common::recovery::read(|| self.kv.get(current_key(session))).await?
+        else {
             return Ok(None);
         };
         let reference: OperationRef = serde_json::from_slice(&value)?;
@@ -215,14 +217,13 @@ impl ExecutionStore {
             if serde_json::to_vec(&operation)? == before {
                 return Ok(operation);
             }
-            match self
-                .kv
-                .update(
-                    reference.key(),
-                    serde_json::to_vec(&operation)?.into(),
-                    revision,
-                )
-                .await
+            match harnx_nats_common::cas::update(
+                &self.kv,
+                reference.key(),
+                serde_json::to_vec(&operation)?.into(),
+                revision,
+            )
+            .await
             {
                 Ok(_) => {
                     crate::telemetry::transition(previous_state, &operation);
@@ -376,7 +377,7 @@ impl ExecutionStore {
     /// observe ancestors themselves, so a dead intermediate owner cannot lose
     /// the cancellation cascade. A broker/graph failure is fail-closed.
     pub async fn watch_cancellation(&self, reference: &OperationRef) -> Result<()> {
-        let mut watch = self.kv.watch_all().await?;
+        let mut watch = self.watch().await?;
         self.check_ancestors(reference).await?;
         while let Some(entry) = watch.next().await {
             entry?;
