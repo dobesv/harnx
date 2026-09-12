@@ -1,5 +1,5 @@
 use super::repo_clone::{clone_repo, CloneRequest, RepoSpec};
-use super::{fatal, mcp_endpoint, recoverable, Gateway, SANDBOX_CONTEXT_KEY};
+use super::{fatal, lifecycle_error, mcp_endpoint, recoverable, Gateway, SANDBOX_CONTEXT_KEY};
 use async_trait::async_trait;
 use harnx_runtime::nats_session_metadata::ToolContextEntry;
 use harnx_toolset::{ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolSpec, Toolset};
@@ -51,13 +51,13 @@ impl LifecycleToolset {
                 "sandbox_connect requires an invoking Harnx session".to_string(),
             )
         })?;
-        let sandbox_id = self.resolve_connection(&args, context).await?;
+        let sandbox_id = self.resolve_connection(&args, context, &cancel).await?;
         let pod_ip = self
             .gateway
             .manager
-            .ensure_active(&sandbox_id)
+            .ensure_active(&sandbox_id, &cancel)
             .await
-            .map_err(recoverable)?;
+            .map_err(lifecycle_error)?;
         let endpoint = mcp_endpoint(&pod_ip);
         self.bind_ready_sandbox(session_id, &sandbox_id).await?;
 
@@ -83,15 +83,16 @@ impl LifecycleToolset {
         &self,
         args: &ConnectArgs,
         context: &ToolInvocationContext,
+        cancel: &CancellationToken,
     ) -> Result<String, ToolInvokeError> {
         if let Some(id) = args.sandbox_id.as_ref().filter(|id| !id.trim().is_empty()) {
             return Ok(id.clone());
         }
         self.gateway
             .manager
-            .create(&context.call_id, args.description.as_deref())
+            .create(&context.call_id, args.description.as_deref(), cancel)
             .await
-            .map_err(recoverable)
+            .map_err(lifecycle_error)
     }
 
     async fn bind_ready_sandbox(
@@ -113,15 +114,16 @@ impl LifecycleToolset {
         &self,
         args: Value,
         context: &ToolInvocationContext,
+        cancel: &CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
         let args: StatusArgs = parse_args("sandbox_status", args)?;
         let id = self.gateway.sandbox_id(args.sandbox_id, context).await?;
         let status = self
             .gateway
             .manager
-            .status(&id, args.timeout_secs.map(Duration::from_secs))
+            .status(&id, args.timeout_secs.map(Duration::from_secs), cancel)
             .await
-            .map_err(recoverable)?;
+            .map_err(lifecycle_error)?;
         serde_json::to_value(status).map_err(fatal)
     }
 
@@ -129,6 +131,7 @@ impl LifecycleToolset {
         &self,
         args: Value,
         context: &ToolInvocationContext,
+        cancel: &CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
         let args: ReleaseArgs = parse_args("sandbox_release", args)?;
         let ambient = self
@@ -140,9 +143,9 @@ impl LifecycleToolset {
         let status = self
             .gateway
             .manager
-            .release(&id, args.destroy)
+            .release(&id, args.destroy, cancel)
             .await
-            .map_err(recoverable)?;
+            .map_err(lifecycle_error)?;
         if args.destroy && ambient.as_deref() == Some(id.as_str()) {
             self.clear_binding(context, &id).await?;
         }
@@ -181,8 +184,8 @@ impl LifecycleToolset {
         } = invocation;
         match tool.as_str() {
             "connect" => self.connect(args, &context, cancel).await,
-            "status" => self.status(args, &context).await,
-            "release" => self.release(args, &context).await,
+            "status" => self.status(args, &context, &cancel).await,
+            "release" => self.release(args, &context, &cancel).await,
             _ => Err(ToolInvokeError::Recoverable(format!(
                 "unknown sandbox tool: {tool}"
             ))),
