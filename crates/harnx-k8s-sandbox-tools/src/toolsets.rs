@@ -1,5 +1,6 @@
 use crate::lifecycle::SandboxManager;
 use crate::mcp::{McpCallError, McpCallErrorKind, McpCaller};
+use crate::policy::{EndReason, TerminalError};
 use harnx_runtime::nats_session_metadata::{SessionMetadataStore, ToolContextEntry};
 use harnx_toolset::{ToolInvocationContext, ToolInvokeError, Toolset};
 use serde::{Deserialize, Serialize};
@@ -152,31 +153,9 @@ impl Gateway {
         capabilities: BTreeSet<String>,
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
-        let mut last_error = None;
-        for attempt in 1..=3 {
-            let outcome = self
-                .call_with_activity_heartbeat(
-                    sandbox_id,
-                    endpoint,
-                    tool,
-                    args.clone(),
-                    capabilities.clone(),
-                    cancel.clone(),
-                )
-                .await;
-            match outcome {
-                Ok(result) => return Ok(result),
-                Err(error) if error.kind == McpCallErrorKind::Cancelled => {
-                    return Err(ToolInvokeError::Fatal("tool call cancelled".to_string()));
-                }
-                Err(error) if error.kind == McpCallErrorKind::Connect && attempt < 3 => {
-                    last_error = Some(error);
-                    retry_delay(&cancel).await?;
-                }
-                Err(error) => return Err(remote_error(error)),
-            }
-        }
-        Err(remote_error(last_error.expect("retry records its error")))
+        self.call_with_activity_heartbeat(sandbox_id, endpoint, tool, args, capabilities, cancel)
+            .await
+            .map_err(remote_error)
     }
 
     async fn call_with_activity_heartbeat(
@@ -188,32 +167,42 @@ impl Gateway {
         capabilities: BTreeSet<String>,
         cancel: CancellationToken,
     ) -> Result<Value, McpCallError> {
-        let call = self
-            .caller
-            .call(sandbox_id, endpoint, tool, args, capabilities, cancel);
+        let call = self.caller.call(
+            sandbox_id,
+            endpoint,
+            tool,
+            args,
+            capabilities,
+            cancel.clone(),
+        );
         tokio::pin!(call);
-        let first_heartbeat = tokio::time::Instant::now() + Duration::from_secs(60);
-        let mut heartbeat = tokio::time::interval_at(first_heartbeat, Duration::from_secs(60));
-        loop {
-            tokio::select! {
-                result = &mut call => return result,
-                _ = heartbeat.tick() => {
-                    if let Err(error) = self.manager.record_activity(sandbox_id).await {
-                        log::warn!("failed to refresh activity for sandbox '{sandbox_id}': {error:#}");
+        let heartbeat_cancel = cancel.child_token();
+        let heartbeat = async {
+            let first = tokio::time::Instant::now() + Duration::from_secs(60);
+            let mut ticker = tokio::time::interval_at(first, Duration::from_secs(60));
+            loop {
+                ticker.tick().await;
+                if let Err(error) = self
+                    .manager
+                    .record_activity(sandbox_id, &heartbeat_cancel)
+                    .await
+                {
+                    if heartbeat_cancel.is_cancelled() {
+                        // MCP caller owns stop acknowledgement. Finishing this
+                        // auxiliary would drop its waiter before that settles.
+                        std::future::pending::<()>().await;
                     }
+                    log::warn!("failed to refresh activity for sandbox '{sandbox_id}': {error:#}");
                 }
             }
+        };
+        tokio::pin!(heartbeat);
+        tokio::select! {
+            result = &mut call => result,
+            () = &mut heartbeat => unreachable!("activity heartbeat never completes"),
         }
     }
 }
-
-async fn retry_delay(cancel: &CancellationToken) -> Result<(), ToolInvokeError> {
-    tokio::select! {
-        _ = cancel.cancelled() => Err(ToolInvokeError::Fatal("tool call cancelled".to_string())),
-        () = tokio::time::sleep(Duration::from_secs(2)) => Ok(()),
-    }
-}
-
 fn mcp_endpoint(ip: &str) -> String {
     if ip.contains(':') {
         format!("http://[{ip}]:{MCP_PORT}/mcp")
@@ -236,9 +225,28 @@ fn recoverable(error: impl std::fmt::Display) -> ToolInvokeError {
 fn fatal(error: impl std::fmt::Display) -> ToolInvokeError {
     ToolInvokeError::Fatal(error.to_string())
 }
+fn lifecycle_error(error: anyhow::Error) -> ToolInvokeError {
+    let cancelled = error.chain().any(|source| {
+        source
+            .downcast_ref::<TerminalError>()
+            .is_some_and(|error| error.end_reason == EndReason::Cancelled)
+    });
+    if cancelled {
+        ToolInvokeError::Fatal(error.to_string())
+    } else {
+        ToolInvokeError::Recoverable(error.to_string())
+    }
+}
 
 fn remote_error(error: McpCallError) -> ToolInvokeError {
-    ToolInvokeError::Recoverable(error.to_string())
+    match error.kind {
+        McpCallErrorKind::Cancelled
+        | McpCallErrorKind::Serialization
+        | McpCallErrorKind::TransportClosed => ToolInvokeError::Fatal(error.to_string()),
+        McpCallErrorKind::Connect | McpCallErrorKind::Call | McpCallErrorKind::DeadlineExceeded => {
+            ToolInvokeError::Recoverable(error.to_string())
+        }
+    }
 }
 
 #[cfg(test)]

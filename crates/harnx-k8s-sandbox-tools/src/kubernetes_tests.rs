@@ -5,6 +5,7 @@ use kube::client::Body;
 use parking_lot::Mutex;
 use std::convert::Infallible;
 use std::sync::Arc;
+use tokio::sync::Notify;
 use tower::service_fn;
 
 #[derive(Clone, Debug)]
@@ -375,4 +376,167 @@ async fn get_maps_a_missing_claim_to_none() {
     });
 
     assert!(api.get("missing").await.unwrap().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_kubernetes_request_hits_per_request_timeout() {
+    let started = Arc::new(Notify::new());
+    let waiting = started.notified();
+    let service = service_fn({
+        let started = started.clone();
+        move |_request: Request<Body>| {
+            let started = started.clone();
+            async move {
+                started.notify_one();
+                std::future::pending::<Result<Response<Body>, Infallible>>().await
+            }
+        }
+    });
+    let api = KubernetesSandboxApi::with_timeouts(
+        Client::new(service, "test-ns"),
+        "test-ns",
+        Duration::from_secs(5),
+        Duration::from_secs(20),
+    );
+    let call = tokio::spawn(async move { api.get("hung").await });
+    waiting.await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+
+    let error = call.await.unwrap().unwrap_err();
+    assert_eq!(kubernetes_failure(&error).0, FailureKind::Timeout);
+}
+
+#[tokio::test(start_paused = true)]
+async fn composite_deadline_bounds_multiple_kubernetes_requests() {
+    let second_started = Arc::new(Notify::new());
+    let waiting = second_started.notified();
+    let service = service_fn({
+        let second_started = second_started.clone();
+        move |request: Request<Body>| {
+            let second_started = second_started.clone();
+            async move {
+                let path = request.uri().path().to_string();
+                let value = if path.ends_with("/sandboxclaims/aggregate") {
+                    claim("aggregate", Some("sandbox-aggregate"), None)
+                } else {
+                    second_started.notify_one();
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    sandbox("sandbox-aggregate", 1)
+                };
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&value).unwrap()))
+                        .unwrap(),
+                )
+            }
+        }
+    });
+    let api = KubernetesSandboxApi::with_timeouts(
+        Client::new(service, "test-ns"),
+        "test-ns",
+        Duration::from_secs(20),
+        Duration::from_secs(5),
+    );
+    let call = tokio::spawn(async move { api.get("aggregate").await });
+    waiting.await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+
+    let error = call.await.unwrap().unwrap_err();
+    assert_eq!(kubernetes_failure(&error).0, FailureKind::Timeout);
+}
+
+#[test]
+fn kubernetes_status_classification_distinguishes_permanent_and_transient() {
+    let status_error = |code| {
+        kube::Error::Api(
+            kube::error::Status::failure("scripted", "scripted")
+                .with_code(code)
+                .boxed(),
+        )
+    };
+
+    for code in [400, 401, 403, 404, 422] {
+        assert_eq!(
+            classify_kube_error(&status_error(code)),
+            FailureKind::Permanent
+        );
+    }
+    for code in [408, 409, 429, 500, 503] {
+        assert_eq!(
+            classify_kube_error(&status_error(code)),
+            FailureKind::RemoteTransient
+        );
+    }
+}
+
+#[test]
+fn service_error_classification_inspects_typed_source_chain() {
+    let service_error = |kind| kube::Error::Service(Box::new(std::io::Error::from(kind)));
+
+    assert_eq!(
+        classify_kube_error(&service_error(std::io::ErrorKind::ConnectionReset)),
+        FailureKind::Transport
+    );
+    assert_eq!(
+        classify_kube_error(&service_error(std::io::ErrorKind::TimedOut)),
+        FailureKind::Timeout
+    );
+    assert_eq!(
+        classify_kube_error(&service_error(std::io::ErrorKind::PermissionDenied)),
+        FailureKind::Permanent
+    );
+}
+
+async fn empty_http_response(
+    _request: Request<hyper::body::Incoming>,
+) -> Result<Response<http_body_util::Empty<hyper::body::Bytes>>, Infallible> {
+    Ok(Response::new(http_body_util::Empty::new()))
+}
+
+#[tokio::test(start_paused = true)]
+async fn hyper_header_timeout_is_classified_as_timeout() {
+    let (_client, server) = tokio::io::duplex(64);
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(5));
+    let connection = builder.serve_connection(
+        hyper_util::rt::TokioIo::new(server),
+        hyper::service::service_fn(empty_http_response),
+    );
+    tokio::pin!(connection);
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let error = connection.await.unwrap_err();
+
+    assert!(error.is_timeout());
+    assert_eq!(classify_hyper_error(&error), FailureKind::Timeout);
+}
+
+#[tokio::test]
+async fn incomplete_hyper_message_is_classified_as_broken_transport() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let (mut client, server) = tokio::io::duplex(64);
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(None);
+    let connection = builder.serve_connection(
+        hyper_util::rt::TokioIo::new(server),
+        hyper::service::service_fn(empty_http_response),
+    );
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: sandbox")
+        .await
+        .unwrap();
+    drop(client);
+
+    let error = connection.await.unwrap_err();
+
+    assert!(error.is_incomplete_message());
+    assert!(is_broken_transport(&error));
+    assert_eq!(classify_hyper_error(&error), FailureKind::Transport);
 }

@@ -1,4 +1,4 @@
-use super::{mcp_endpoint, recoverable, Gateway};
+use super::{lifecycle_error, mcp_endpoint, Gateway};
 use async_trait::async_trait;
 use harnx_toolset::{ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolSpec, Toolset};
 use serde_json::{json, Map, Value};
@@ -53,9 +53,9 @@ impl ProxyToolset {
         let pod_ip = self
             .gateway
             .manager
-            .ensure_active(&sandbox_id)
+            .ensure_active(&sandbox_id, &cancel)
             .await
-            .map_err(recoverable)?;
+            .map_err(lifecycle_error)?;
         Ok(ResolvedInvocation {
             sandbox_id,
             endpoint: mcp_endpoint(&pod_ip),

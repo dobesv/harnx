@@ -23,11 +23,13 @@ harnx-runtime = { path = "../harnx-runtime" }
 harnx-telemetry = { workspace = true, features = ["mcp", "nats"] }
 harnx-toolset = { path = "../harnx-toolset" }
 harnx-toolset-server = { path = "../harnx-toolset-server" }
+hyper = { workspace = true }
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
 log = { workspace = true }
 metrics = { workspace = true }
 reqwest = { workspace = true }
+rand = "0.10.2"
 rmcp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -38,8 +40,11 @@ tokio-util = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+metrics-util = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 http = { workspace = true }
 http-body-util = { workspace = true }
+hyper-util = { workspace = true, features = ["tokio"] }
 parking_lot = { workspace = true }
 schemars = { workspace = true }
 tempfile = { workspace = true }

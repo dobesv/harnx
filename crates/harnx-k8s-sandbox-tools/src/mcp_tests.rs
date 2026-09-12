@@ -1,5 +1,6 @@
 use super::*;
 use anyhow::Result;
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{ContentBlock, ErrorData, ServerCapabilities, ServerInfo};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -67,6 +68,18 @@ impl CounterServer {
         tokio::time::sleep(Duration::from_secs(30)).await;
         Ok(CallToolResult::success(vec![ContentBlock::text("done")]))
     }
+
+    #[tool(description = "Complete after pre-dispatch deadline")]
+    async fn slow_success(
+        &self,
+        Parameters(CounterArgs {}): Parameters<CounterArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let count = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            count.to_string(),
+        )]))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -89,6 +102,10 @@ struct TestMcp {
 
 impl TestMcp {
     async fn start() -> Result<Self> {
+        Self::start_with_config(McpCallerConfig::default()).await
+    }
+
+    async fn start_with_config(config: McpCallerConfig) -> Result<Self> {
         let shutdown = CancellationToken::new();
         let service: StreamableHttpService<CounterServer, LocalSessionManager> =
             StreamableHttpService::new(
@@ -109,7 +126,7 @@ impl TestMcp {
                 .unwrap();
         });
         Ok(Self {
-            caller: StreamableHttpMcpCaller::new()?,
+            caller: StreamableHttpMcpCaller::with_config(config)?,
             endpoint,
             shutdown,
             server,
@@ -149,6 +166,9 @@ impl TestMcp {
 #[tokio::test]
 async fn caller_reuses_one_stateful_mcp_session_per_sandbox() -> Result<()> {
     harnx_core::require_nextest();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::set_global_recorder(recorder).expect("test process has no metrics recorder");
     let mcp = TestMcp::start().await?;
 
     assert_eq!(response_text(&mcp.increment("sandbox-a").await?), "1");
@@ -163,6 +183,20 @@ async fn caller_reuses_one_stateful_mcp_session_per_sandbox() -> Result<()> {
         recoverable["content"][0]["text"],
         "recoverable tool failure"
     );
+    let sandbox_error_metrics = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(key, _, _, value)| {
+            key.key().name() == "harnx_sandbox_gateway_operation_total"
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "outcome" && label.value() == "sandbox_error")
+                && *value == DebugValue::Counter(1)
+        })
+        .count();
+    assert_eq!(sandbox_error_metrics, 1);
 
     let error = mcp
         .call("sandbox-a", "protocol_error", CancellationToken::new())
@@ -195,26 +229,85 @@ async fn empty_session_slot_remains_reserved() {
     assert!(retain_session_slot(&slot));
 }
 
-#[tokio::test]
-async fn caller_classifies_connection_establishment_failures() -> Result<()> {
+async fn unavailable_call(
+    config: McpCallerConfig,
+    sandbox_id: &str,
+    tool: &str,
+) -> Result<McpCallError> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}/mcp", listener.local_addr()?);
     drop(listener);
-    let caller = StreamableHttpMcpCaller::new()?;
-
-    let error = caller
+    let caller = StreamableHttpMcpCaller::with_config(config)?;
+    Ok(caller
         .call(
-            "sandbox-unavailable",
+            sandbox_id,
             &endpoint,
-            "increment",
+            tool,
             Map::new(),
             BTreeSet::new(),
             CancellationToken::new(),
         )
         .await
-        .unwrap_err();
+        .unwrap_err())
+}
+
+#[tokio::test]
+async fn caller_classifies_connection_establishment_failures() -> Result<()> {
+    let error = unavailable_call(
+        McpCallerConfig {
+            max_attempts: 1,
+            ..McpCallerConfig::default()
+        },
+        "sandbox-unavailable",
+        "increment",
+    )
+    .await?;
 
     assert_eq!(error.kind, McpCallErrorKind::Connect);
+    assert!(error.message.contains("connect to sandbox MCP"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn already_cancelled_call_skips_connection_attempt() -> Result<()> {
+    let caller = StreamableHttpMcpCaller::new()?;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let error = caller
+        .call(
+            "cancelled",
+            "http://127.0.0.1:1/mcp",
+            "bash_exec",
+            Map::new(),
+            BTreeSet::new(),
+            cancel,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, McpCallErrorKind::Cancelled);
+    assert_eq!(error.attempts, 0);
+    assert!(caller.sessions.lock().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn connection_retry_exhaustion_reports_exact_attempt_count() -> Result<()> {
+    let error = unavailable_call(
+        McpCallerConfig {
+            backoff_base: Duration::ZERO,
+            backoff_cap: Duration::ZERO,
+            max_attempts: 2,
+            ..McpCallerConfig::default()
+        },
+        "retry-count",
+        "bash_exec",
+    )
+    .await?;
+
+    assert_eq!(error.kind, McpCallErrorKind::Connect);
+    assert_eq!(error.attempts, 2);
     assert!(error.message.contains("connect to sandbox MCP"));
     Ok(())
 }
