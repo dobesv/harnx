@@ -3,6 +3,7 @@ import type { ToolCallMessagePartProps } from '@assistant-ui/react';
 import { JsonView, darkStyles, defaultStyles } from 'react-json-view-lite';
 import 'react-json-view-lite/dist/index.css';
 import { UsageContext } from './UsageContext';
+import { getToolCallPresentation } from './toolCallPresentation';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -101,15 +102,8 @@ export const ToolCallCard: React.FC<ToolCallMessagePartProps> = (props) => {
   const { toolName, args, argsText, result, isError, status, toolCallId } = props as any;
   const { toolSummaries } = useContext(UsageContext);
 
-  const statusType = status?.type;
-  
-  let borderColor = 'var(--border)';
-  if (statusType === 'running') borderColor = 'var(--status-running)';
-  else if (statusType === 'complete') borderColor = 'var(--status-complete)';
-  else if (statusType === 'requires-action') borderColor = 'var(--status-action)';
-  else if (statusType === 'incomplete' || isError) borderColor = 'var(--status-error)';
-
-  const [expanded, setExpanded] = useState(statusType === 'requires-action');
+  const { icon, borderColor, defaultExpanded } = getToolCallPresentation(status, isError);
+  const [expanded, setExpanded] = useState(defaultExpanded);
   const [viewSource, setViewSource] = useState(false);
 
   // Get markdown summary
@@ -161,9 +155,7 @@ export const ToolCallCard: React.FC<ToolCallMessagePartProps> = (props) => {
         style={{ cursor: 'pointer', display: 'flex', justifyContent: 'space-between' }}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', overflow: 'hidden' }}>
-          <span className="aui-tool-call-icon">
-            {statusType === 'running' ? '⏳' : statusType === 'requires-action' ? '⚠️' : isError ? '❌' : '✅'}
-          </span>
+          <span className="aui-tool-call-icon">{icon}</span>
           <span className="aui-tool-call-label">
             <strong>{toolName}</strong>
           </span>
