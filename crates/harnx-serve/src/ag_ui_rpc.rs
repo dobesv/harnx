@@ -12,6 +12,8 @@ use hyper::{body::Incoming, Request};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+mod cancellation;
+
 pub const JSON_RPC_UNKNOWN_SESSION_CODE: i64 = -32001;
 pub const JSON_RPC_IDLE_CANCEL_CODE: i64 = -32002;
 
@@ -132,7 +134,9 @@ pub async fn handle_ag_ui_rpc_bytes(
         "session/hitl_decision" => {
             handle_hitl_decision(rpc.id, rpc.params, config, registry, key).await
         }
-        "session/cancel" => handle_cancel((rpc.id, rpc.params), config, registry, key).await,
+        "session/cancel" | "session/abandon_cancellation" => {
+            cancellation::handle((&rpc.method, rpc.id, rpc.params), (config, registry, key)).await
+        }
         _ => json_rpc_response(
             StatusCode::OK,
             json_rpc_error(rpc.id, -32601, "method not found", None),
@@ -422,48 +426,6 @@ pub(crate) async fn route_hitl_decision(
         .map_err(|_| "session actor unavailable".to_string())?
 }
 
-async fn handle_cancel(
-    request: (Value, Option<Value>),
-    config: &harnx_runtime::config::Config,
-    registry: &SessionRegistry,
-    key: SessionKey,
-) -> anyhow::Result<AppResponse> {
-    let (id, params) = request;
-    if !registry.has_session(&key) && !session_exists(config, &key).await {
-        return json_rpc_response(
-            StatusCode::NOT_FOUND,
-            json_rpc_error(
-                id,
-                JSON_RPC_UNKNOWN_SESSION_CODE,
-                "session not found",
-                Some(json!({ "agent": key.agent, "session": key.session })),
-            ),
-        );
-    }
-
-    let handle = registry.get_or_spawn(key);
-    let request: harnx_execution_control::CancelRequest =
-        match serde_json::from_value(params.unwrap_or_else(|| json!({}))) {
-            Ok(request) => request,
-            Err(error) => {
-                return json_rpc_response(
-                    StatusCode::BAD_REQUEST,
-                    json_rpc_error(id, -32602, &error.to_string(), None),
-                )
-            }
-        };
-    match cancel(&handle, request.expected_execution_id).await {
-        Ok(receipt) => json_rpc_response(
-            StatusCode::OK,
-            json!({ "jsonrpc": "2.0", "id": id, "result": receipt }),
-        ),
-        Err(message) => json_rpc_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            json_rpc_error(id, -32003, &message, None),
-        ),
-    }
-}
-
 async fn session_exists(config: &harnx_runtime::config::Config, key: &SessionKey) -> bool {
     match load_nats_session(config, &key.session).await {
         Ok((session, _entries)) => {
@@ -522,24 +484,6 @@ async fn prompt(
     reply_rx
         .await
         .map_err(|_| "session actor dropped prompt reply".to_string())
-}
-
-async fn cancel(
-    handle: &SessionHandle,
-    expected_execution_id: Option<String>,
-) -> Result<harnx_execution_control::CancelReceipt, String> {
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    handle
-        .tx
-        .send(SessionCommand::Cancel {
-            reply: reply_tx,
-            expected_execution_id,
-        })
-        .await
-        .map_err(|_| "session actor unavailable".to_string())?;
-    reply_rx
-        .await
-        .map_err(|_| "session actor dropped cancel reply".to_string())?
 }
 
 async fn get_info(handle: &SessionHandle) -> Result<SessionInfo, String> {
@@ -609,6 +553,7 @@ mod tests {
         assert!(applied);
         receiver.await.expect("command receiver");
     }
+
     use super::*;
     use crate::{
         session_actor::{SessionKey, SessionRegistry},
@@ -783,6 +728,41 @@ mod tests {
         assert_eq!(body["error"]["code"], JSON_RPC_UNKNOWN_SESSION_CODE);
         assert_eq!(body["error"]["message"], "session not found");
         assert!(!registry.has_session(&key));
+    }
+
+    #[tokio::test]
+    async fn rpc_session_abandon_cancellation_requires_observed_execution_id() {
+        let _guard = TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = sandbox.config();
+        let registry = SessionRegistry::new(config.clone());
+        registry.get_or_spawn(SessionKey {
+            agent: "plain".into(),
+            session: "stuck".into(),
+        });
+
+        let response = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "plain",
+            "stuck",
+            Bytes::from(
+                json!({"jsonrpc":"2.0","id":13,"method":"session/abandon_cancellation","params":{}})
+                    .to_string(),
+            ),
+            &config,
+            &registry,
+            PersistenceKind::Nats,
+        )
+        .await
+        .expect("rpc response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["code"], -32602);
+        assert_eq!(
+            body["error"]["message"],
+            "expected_execution_id is required"
+        );
     }
 
     #[tokio::test]

@@ -1,7 +1,56 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { cancel, sessionControl } from './api';
+import { abandonCancellation, cancel, sessionControl } from './api';
 import type { CancelResult } from './types';
 import type { CancellationControl } from './CancellationContext';
+
+type MutableRef<T> = { current: T };
+
+/* oxlint-disable react/immutability -- these arguments are React refs shared by the parent hook to serialize async cancellation requests */
+function useCancellationActions({
+  agent,
+  session,
+  target,
+  setPhase,
+  observe,
+  acceptedExecution,
+  pendingSince,
+  currentTarget,
+  requestPending,
+  requestVersion,
+}: {
+  agent: string;
+  session: string;
+  target: string;
+  setPhase: (phase: CancellationControl['phase']) => void;
+  observe: (receipt: CancelResult) => void;
+  acceptedExecution: MutableRef<string | undefined>;
+  pendingSince: MutableRef<number | null>;
+  currentTarget: MutableRef<string>;
+  requestPending: MutableRef<boolean>;
+  requestVersion: MutableRef<number>;
+}) {
+  const stop = useCallback(async () => {
+    setPhase('requesting');
+    pendingSince.current = Date.now();
+    requestPending.current = true;
+    const version = ++requestVersion.current;
+    try { observe(await cancel(agent, session, acceptedExecution.current)); }
+    catch { if (currentTarget.current === target) setPhase('failed'); }
+    finally { if (requestVersion.current === version) requestPending.current = false; }
+  }, [acceptedExecution, agent, currentTarget, observe, pendingSince, requestPending, requestVersion, session, setPhase, target]);
+  const resumeAnyway = useCallback(async () => {
+    const expectedExecutionId = acceptedExecution.current;
+    if (!expectedExecutionId) return;
+    setPhase('abandoning');
+    requestPending.current = true;
+    const version = ++requestVersion.current;
+    try { observe(await abandonCancellation(agent, session, expectedExecutionId)); }
+    catch { if (currentTarget.current === target) setPhase('unconfirmed'); }
+    finally { if (requestVersion.current === version) requestPending.current = false; }
+  }, [acceptedExecution, agent, currentTarget, observe, requestPending, requestVersion, session, setPhase, target]);
+  return { stop, resumeAnyway };
+}
+/* oxlint-enable react/immutability */
 
 export function useCancellation(agent: string, session: string): CancellationControl {
   const target = `${agent}\0${session}`;
@@ -32,15 +81,10 @@ export function useCancellation(agent: string, session: string): CancellationCon
         setPhase('stopping');
     }
   }, [target, setPhase]);
-  const stop = useCallback(async () => {
-    setPhase('requesting');
-    pendingSince.current = Date.now();
-    requestPending.current = true;
-    const version = ++requestVersion.current;
-    try { observe(await cancel(agent, session)); }
-    catch { if (currentTarget.current === target) setPhase('failed'); }
-    finally { if (requestVersion.current === version) requestPending.current = false; }
-  }, [agent, session, observe, target, setPhase]);
+  const { stop, resumeAnyway } = useCancellationActions({
+    agent, session, target, setPhase, observe, acceptedExecution, pendingSince,
+    currentTarget, requestPending, requestVersion,
+  });
 
   useEffect(() => {
     let disposed = false;
@@ -67,5 +111,5 @@ export function useCancellation(agent: string, session: string): CancellationCon
     void hydrate();
     return () => { disposed = true; clearTimeout(timer); };
   }, [agent, session, observe, setPhase]);
-  return { phase, stop, observe };
+  return { phase, stop, resumeAnyway, observe };
 }

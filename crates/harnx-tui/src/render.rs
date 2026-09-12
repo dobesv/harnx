@@ -883,19 +883,11 @@ impl Tui {
         screen_size: ratatui::layout::Rect,
         modal: &ModalState,
     ) {
+        if let Some(prompt) = modal.simple_confirmation_prompt() {
+            self.render_simple_modal(frame, screen_size, &prompt);
+            return;
+        }
         match modal {
-            ModalState::ConfirmDelete { from, to } => {
-                let prompt_text = if from == to {
-                    format!("Delete entry {}? [y/N]", from)
-                } else {
-                    format!("Delete entries {}–{}? [y/N]", from, to)
-                };
-                self.render_simple_modal(frame, screen_size, &prompt_text);
-            }
-            ModalState::ConfirmRewind { seq, .. } => {
-                let prompt_text = format!("Rewind to entry {}? [y/N]", seq);
-                self.render_simple_modal(frame, screen_size, &prompt_text);
-            }
             ModalState::ConfirmToolUse { .. } => {
                 self.render_tool_confirm_overlay(frame, screen_size, modal);
             }
@@ -949,6 +941,9 @@ impl Tui {
                     },
                 );
             }
+            ModalState::ConfirmDelete { .. }
+            | ModalState::ConfirmRewind { .. }
+            | ModalState::ConfirmAbandonCancellation => unreachable!(),
         }
     }
     fn render_simple_modal(

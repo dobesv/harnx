@@ -130,6 +130,10 @@ pub struct Operation {
     pub sealed: bool,
     pub covered_through: u64,
     pub cancel_recorded: bool,
+    /// An operator explicitly made an unconfirmed cancellation terminal.
+    /// The abandoned owner may still be running outside the control plane.
+    #[serde(default)]
+    pub abandoned: bool,
 }
 
 impl Operation {
@@ -154,6 +158,7 @@ impl Operation {
             sealed: false,
             covered_through: 0,
             cancel_recorded: false,
+            abandoned: false,
         }
     }
 
@@ -259,7 +264,29 @@ impl Operation {
         Ok(())
     }
 
+    pub(crate) fn abandon_unconfirmed(&mut self) -> Result<()> {
+        if self.state.is_terminal() {
+            return Ok(());
+        }
+        ensure!(
+            self.state.cancelling(),
+            "only a cancelling execution can be abandoned"
+        );
+        if self.state == OperationState::CancelRequested {
+            self.transition(OperationState::Quiescing)?;
+        }
+        self.transition(OperationState::Cancelled)?;
+        self.owner_stopped = true;
+        self.sealed = true;
+        self.cancel_recorded = true;
+        self.abandoned = true;
+        self.children.clear();
+        self.blocker = Some("cancellation abandoned by operator; prior work may still run".into());
+        Ok(())
+    }
+
     pub fn check_owner(&self, owner: &Owner) -> Result<()> {
+        ensure!(!self.abandoned, "execution was abandoned by operator");
         ensure!(
             self.owner.as_ref() == Some(owner),
             "execution owner fence changed"
@@ -295,6 +322,8 @@ pub struct CancelReceipt {
     pub execution_id: Option<String>,
     pub requested_at: Option<DateTime<Utc>>,
     pub unconfirmed_after_ms: u64,
+    #[serde(default)]
+    pub abandoned: bool,
 }
 
 impl CancelReceipt {
@@ -306,6 +335,7 @@ impl CancelReceipt {
             execution_id: None,
             requested_at: None,
             unconfirmed_after_ms: UNCONFIRMED_AFTER_MS,
+            abandoned: false,
         }
     }
 
@@ -329,6 +359,7 @@ impl CancelReceipt {
             execution_id: Some(operation.reference.execution_id.clone()),
             requested_at: operation.cancellation.as_ref().map(|c| c.requested_at),
             unconfirmed_after_ms: UNCONFIRMED_AFTER_MS,
+            abandoned: operation.abandoned,
         }
     }
 }

@@ -239,6 +239,11 @@ body {
   border-radius: 4px;
 }
 
+.aui-cancel-actions {
+  display: inline-flex;
+  gap: 0.4rem;
+}
+
 .aui-cancel-button:hover {
   background: var(--danger-hover);
 }
@@ -948,4 +953,3 @@ body {
   border-radius: 8px;
   border: 1px dashed var(--border);
 }
-

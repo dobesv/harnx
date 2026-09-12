@@ -1,5 +1,5 @@
 //! Cancellation is operational state, independent of transcript completion.
-use crate::types::{ModalState, Tui};
+use crate::types::{CancellationAction, ModalState, Tui};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_execution_control::{CancelDisposition, CancelReceipt};
 use ratatui::{
@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 pub(crate) enum CancellationPhase {
     Requesting,
+    Abandoning,
     Stopping,
     Unconfirmed,
     Failed(String),
@@ -22,6 +23,7 @@ pub(crate) struct CancellationTray {
     session_id: String,
     cluster: String,
     expected: Option<String>,
+    execution_id: Option<String>,
     updates: Option<mpsc::UnboundedReceiver<CancelReceipt>>,
 }
 
@@ -112,15 +114,26 @@ impl Tui {
             && operation.state.cancelling()
             && self.cancellation.is_none()
         {
-            self.cancellation = Some(CancellationTray {
-                phase: CancellationPhase::Stopping,
-                session_id: operation.reference.session_id.clone(),
+            // Cancellation cannot safely be undone after any descendant may
+            // already have stopped. Re-issue it on attachment so an abandoned
+            // local execution is targeted at this frontend's replacement
+            // worker instead of leaving the user in a passive dead end.
+            self.start_observed_cancellation(
+                operation.reference.session_id.clone(),
                 cluster,
-                expected: None,
-                updates: None,
-            });
-            self.monitor_cancellation(CancelReceipt::from_operation(&operation, false));
+                operation.reference.execution_id.clone(),
+            );
         }
+    }
+
+    fn start_observed_cancellation(
+        &mut self,
+        session_id: String,
+        cluster: String,
+        execution_id: String,
+    ) {
+        self.start_cancellation(session_id, cluster, None);
+        self.cancellation.as_mut().unwrap().execution_id = Some(execution_id);
     }
 
     pub(crate) fn start_cancellation(
@@ -135,12 +148,14 @@ impl Tui {
             session_id.clone(),
             cluster.clone(),
             expected.clone(),
+            CancellationAction::Request,
         ));
         self.exit_interrupt_error = None;
         self.cancellation = Some(CancellationTray {
             phase: CancellationPhase::Requesting,
             session_id,
             cluster,
+            execution_id: expected.clone(),
             expected,
             updates: None,
         });
@@ -155,6 +170,35 @@ impl Tui {
         }
     }
 
+    pub(crate) fn start_cancellation_abandonment(&mut self) {
+        let Some(tray) = self.cancellation.as_ref() else {
+            return;
+        };
+        if !matches!(
+            tray.phase,
+            CancellationPhase::Unconfirmed | CancellationPhase::Failed(_)
+        ) {
+            return;
+        }
+        let session_id = tray.session_id.clone();
+        let cluster = tray.cluster.clone();
+        let Some(expected) = tray.execution_id.clone() else {
+            return;
+        };
+        self.pending_exit_cancel = Some((self.exit_cancel_factory)(
+            self.config.clone(),
+            self.local_worker.clone(),
+            session_id,
+            cluster,
+            Some(expected),
+            CancellationAction::Abandon,
+        ));
+        self.exit_interrupt_error = None;
+        if let Some(tray) = self.cancellation.as_mut() {
+            tray.phase = CancellationPhase::Abandoning;
+        }
+    }
+
     pub(crate) fn monitor_cancellation(&mut self, receipt: CancelReceipt) {
         if matches!(
             receipt.disposition,
@@ -166,17 +210,17 @@ impl Tui {
         let Some(tray) = self.cancellation.as_mut() else {
             return;
         };
+        tray.execution_id = receipt.execution_id.clone();
         tray.phase = CancellationPhase::Stopping;
         let (tx, rx) = mpsc::unbounded_channel();
         tray.updates = Some(rx);
         let target = (tray.session_id.clone(), tray.cluster.clone());
         let config = self.config.clone();
-        let worker = self.local_worker.clone();
         tokio::spawn(async move {
             let session = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                crate::remote_session::nats_session_for_target(
-                    &config, &worker, target.0, target.1,
+                crate::remote_session::cancellation_status_session_for_target(
+                    &config, target.0, target.1,
                 ),
             )
             .await;
@@ -232,15 +276,12 @@ impl Tui {
     }
 
     pub(crate) fn handle_cancellation_key(&mut self, key: KeyEvent) -> bool {
-        if !self.has_root_cancellation()
-            || matches!(self.app.modal, Some(ModalState::ConfirmExit { .. }))
-        {
+        if !self.has_root_cancellation() || self.app.modal.is_some() {
             return false;
         }
         match (key.code, key.modifiers) {
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => self.app.should_quit = true,
-            (KeyCode::Char('r' | 'R'), KeyModifiers::NONE | KeyModifiers::SHIFT)
-            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 let tray = self.cancellation.as_ref().unwrap();
                 if matches!(
                     tray.phase,
@@ -252,6 +293,17 @@ impl Tui {
                         tray.expected.clone(),
                     );
                 }
+            }
+            (KeyCode::Esc, KeyModifiers::NONE)
+                if self.cancellation.as_ref().is_some_and(|tray| {
+                    tray.execution_id.is_some()
+                        && matches!(
+                            tray.phase,
+                            CancellationPhase::Unconfirmed | CancellationPhase::Failed(_)
+                        )
+                }) =>
+            {
+                self.app.modal = Some(ModalState::ConfirmAbandonCancellation);
             }
             _ => {}
         }
@@ -266,16 +318,25 @@ impl Tui {
             CancellationPhase::Requesting => {
                 "Requesting cancellation…  Ctrl+D: exit immediately".into()
             }
+            CancellationPhase::Abandoning => {
+                "Resuming with a new execution…  Prior work may still be running".into()
+            }
             CancellationPhase::Stopping => {
                 "Stopping…  Waiting for execution and child operations to stop.  Ctrl+D: exit"
                     .into()
             }
             CancellationPhase::Unconfirmed => {
-                "Cancellation unconfirmed. Work may still be running.  R: retry  Ctrl+D: exit"
-                    .into()
+                "Cancellation unconfirmed. Work may still be running.  Ctrl+C: retry  Esc: resume anyway  Ctrl+D: exit".into()
             }
             CancellationPhase::Failed(error) => {
-                format!("Cancellation request failed: {error}  R: retry  Ctrl+D: exit")
+                let resume = tray
+                    .execution_id
+                    .as_ref()
+                    .map(|_| "  Esc: resume anyway")
+                    .unwrap_or_default();
+                format!(
+                    "Cancellation request failed: {error}  Ctrl+C: retry{resume}  Ctrl+D: exit"
+                )
             }
         };
         frame.render_widget(

@@ -27,6 +27,7 @@ Options:
       --final-only                     Print only the final response
       --timeout-secs <SECONDS>         Set maximum invocation duration in seconds (0 or unset = no limit)
       --token-budget <TOKENS>          Set maximum budgeted tokens for invocation (0 or unset = unlimited)
+      --resume-anyway                  Abandon an unconfirmed cancellation before a one-shot prompt
       --dry-run                        Display the message without sending it
       --info                           Display information
       --sync-models                    Sync models updates
@@ -66,6 +67,7 @@ harnx --macro macro2 -- arg1 arg2              # Execute macro 'macro2' with arg
 
 output=$(harnx prompt --final-only -- "$input") # Return only the final response
 harnx prompt --timeout-secs 30 --token-budget 100000 -- "Summarize system logs"
+harnx -a agent1 -s session1 prompt --resume-anyway continue
 cat prompt.txt | harnx prompt                    # Read the prompt from stdin
 
 harnx prompt -f a.png -f b.png diff images     # Use files
@@ -87,6 +89,14 @@ independently.
 `--final-only` suppresses the root heading, delegation status, and all other
 startup/progress output. On success, stdout contains only the final response,
 which makes the mode safe for command substitution and pipelines.
+
+If an earlier cancellation is unconfirmed because its execution owners
+disappeared, normal one-shot prompt admission fails closed. Pass
+`--resume-anyway` to abandon that exact current execution generation before
+submitting the prompt. Harnx prints a warning because external work from the
+abandoned generation may still be running. The option does not interrupt or
+replace a healthy running execution and fails if cancellation has not reached
+the unconfirmed state.
 
 ## Bounding a One-Shot Run
 

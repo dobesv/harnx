@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { listAgents, listSessions, createSession, getAgent, cancel, sessionControl, uploadAttachment, sendPrompt } from '../api';
+import { abandonCancellation, listAgents, listSessions, createSession, getAgent, cancel, sessionControl, uploadAttachment, sendPrompt } from '../api';
 
 const fetchMock = vi.fn();
 globalThis.fetch = fetchMock as any;
@@ -128,6 +128,30 @@ describe('api.ts', () => {
         json: async () => { throw new Error('no body'); },
       });
       await expect(cancel('agent', 'session')).rejects.toThrow('RPC call failed with HTTP 500');
+    });
+  });
+
+  describe('abandonCancellation', () => {
+    it('sends the observed execution id and returns the abandonment receipt', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ result: { cancelled: true, disposition: 'cancelled', execution_id: 'exec-1', abandoned: true } }),
+      });
+      await expect(abandonCancellation('agent/A', 'session B', 'exec-1')).resolves.toEqual(
+        expect.objectContaining({ execution_id: 'exec-1', abandoned: true }),
+      );
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/v1/agents/agent%2FA/sessions/session%20B',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'session/abandon_cancellation',
+            params: { expected_execution_id: 'exec-1' },
+          }),
+        }),
+      );
     });
   });
 

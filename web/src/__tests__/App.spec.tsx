@@ -56,7 +56,8 @@ vi.mock('@assistant-ui/react', async (importOriginal) => {
 const cancellationControl = (
   phase: CancellationControl['phase'],
   stop = vi.fn(async () => {}),
-): CancellationControl => ({ phase, stop, observe: vi.fn() });
+  resumeAnyway = vi.fn(async () => {}),
+): CancellationControl => ({ phase, stop, resumeAnyway, observe: vi.fn() });
 
 describe('cancellation UI', () => {
   beforeEach(() => {
@@ -103,18 +104,26 @@ describe('cancellation UI', () => {
     expect(screen.getByRole('button', { name: 'Stopping…' })).toBeDisabled();
   });
 
-  it('offers retry after cancellation becomes unconfirmed or the request fails', () => {
+  it('offers retry and confirmed resume after cancellation becomes unconfirmed', () => {
     const stop = vi.fn(async () => {});
-    const { rerender } = render(
-      <CancellationContext.Provider value={cancellationControl('unconfirmed', stop)}>
+    const resumeAnyway = vi.fn(async () => {});
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(
+      <CancellationContext.Provider value={cancellationControl('unconfirmed', stop, resumeAnyway)}>
         <CancelButton />
       </CancellationContext.Provider>,
     );
-    const unconfirmed = screen.getByRole('button', { name: 'Cancellation unconfirmed — Retry' });
-    expect(unconfirmed).toBeEnabled();
-    fireEvent.click(unconfirmed);
+    fireEvent.click(screen.getByRole('button', { name: 'Retry cancellation' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Resume anyway' }));
+    expect(stop).toHaveBeenCalledOnce();
+    expect(confirm).toHaveBeenCalledWith('Resume anyway? Prior work may still be running.');
+    expect(resumeAnyway).toHaveBeenCalledOnce();
+    confirm.mockRestore();
+  });
 
-    rerender(
+  it('offers retry after the cancellation request fails', () => {
+    const stop = vi.fn(async () => {});
+    render(
       <CancellationContext.Provider value={cancellationControl('failed', stop)}>
         <CancelButton />
       </CancellationContext.Provider>,
@@ -122,7 +131,7 @@ describe('cancellation UI', () => {
     const failed = screen.getByRole('button', { name: 'Cancellation request failed — Retry' });
     expect(failed).toBeEnabled();
     fireEvent.click(failed);
-    expect(stop).toHaveBeenCalledTimes(2);
+    expect(stop).toHaveBeenCalledOnce();
   });
 
   it('uses a static warning instead of a spinner when cancellation is unconfirmed', () => {
