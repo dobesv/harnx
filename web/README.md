@@ -123,3 +123,19 @@ In development mode (`import.meta.env.DEV`), `window.__harnxConnection = { initi
 ### Connection Coordinator
 
 `web/src/connection.ts` is a React-free module-level singleton implementing the retry round scheduler with frozen snapshots. React integration uses `useSyncExternalStore` in `web/src/useConnectionStatus.ts`. Do not import React in `connection.ts` — it must remain UI-agnostic for potential non-React consumers.
+
+### assistant-ui Tool-Call Status Semantics
+
+`@assistant-ui/core` derives tool-call status via `getAutoStatus` (`runtime/utils/auto-status.ts`). A tool call with `result === undefined` receives:
+
+- `{ type: "running" }` only when on the **last, actively running** message
+- `{ type: "requires-action", reason: "tool-calls" }` (plain pending) once no longer last — e.g., a session reconstructed in a second tab (promptless join appends a trailing message)
+- `{ type: "requires-action", reason: "interrupt" }` for genuine HITL approval/interrupt
+
+`type: "requires-action"` is overloaded: it means both "pending execution" and "needs human action." Any UI rendering tool-call status MUST inspect `status.reason`:
+- `reason === "interrupt"` → genuine alert (amber icon, expanded)
+- `reason !== "interrupt"` (including `"tool-calls"`) → pending (spinner, collapsed)
+
+`toMessagePartStatus` passes `message.status` through to the part, so `reason` is available.
+
+In this app, HITL approvals render via a separate path (`web/src/App.tsx` `useAgUiInterrupts()` → `BatchInterruptUI`) — not via `ToolCallCard`. See `ToolCallCard.tsx:104-107` for the `isPending`/`isActionRequired` derivation. Issue #1827.
