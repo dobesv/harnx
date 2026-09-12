@@ -17,6 +17,7 @@ mod servers_split;
 pub mod session;
 mod session_dump;
 pub(crate) mod session_externalize;
+mod session_format;
 pub mod session_meta;
 mod session_ops_compaction;
 mod session_ops_core;
@@ -62,6 +63,10 @@ pub const DEFAULT_BUCKET_REPLICAS: usize = 1;
 /// front-end, and for tests that build both into a scratch directory.
 pub const HARNX_WORKER_BIN_ENV: &str = "HARNX_WORKER_BIN";
 pub use self::session_dump::{render_session_dump, render_session_dump_for_agent};
+pub use self::session_format::{
+    dump_entries_jsonl, dump_entries_yaml, jsonl_line, load_session_for_render,
+    render_metadata_json, render_metadata_yaml, yaml_doc, SessionFormat,
+};
 
 pub use self::agent::TEMP_AGENT_NAME;
 pub use self::agent::{
