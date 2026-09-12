@@ -19,6 +19,9 @@ use tempfile::NamedTempFile;
 use tokio::time::sleep;
 use uuid::Uuid;
 
+mod supervision;
+pub use supervision::{LocalBroker, LocalBrokerStatus};
+
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -122,7 +125,6 @@ impl std::fmt::Debug for SharedNatsServer {
 struct ServerOwner {
     child: Child,
     lock_file: File,
-    nonce: String,
     config_path: PathBuf,
 }
 
@@ -131,13 +133,18 @@ impl Drop for ServerOwner {
         // Keep lock held until child has exited and stale discovery metadata has
         // been removed. A waiter can only become owner after cleanup completes.
         stop_server(&mut self.child);
-        remove_metadata_if_nonce_matches(&self.nonce);
+        // Keep the authenticated endpoint across owner changes. Existing NATS
+        // clients reconnect to this address; the lifetime lock, not metadata
+        // existence, proves that an owner is present.
         remove_file_if_present(&self.config_path, "shared local NATS config");
         let _ = self.lock_file.unlock();
     }
 }
 
 fn stop_server(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
     #[cfg(unix)]
     {
         let result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
@@ -245,16 +252,33 @@ fn open_lock_file() -> Result<File> {
         .with_context(|| format!("failed to open shared local NATS lock {}", path.display()))
 }
 
+fn persistent_endpoint() -> Result<(Option<u16>, String)> {
+    let previous = match read_metadata() {
+        Ok(metadata) => Some(metadata),
+        Err(error) if !nats_runtime_ports_file().exists() => {
+            log::debug!("initializing shared local NATS endpoint: {error:#}");
+            None
+        }
+        Err(error) => return Err(error).context("read persistent local NATS endpoint"),
+    };
+    let token = previous.as_ref().map_or_else(
+        || Uuid::new_v4().simple().to_string(),
+        |metadata| metadata.token.clone(),
+    );
+    let port = previous.map(|metadata| metadata.port);
+    Ok((port, token))
+}
+
 async fn start_owned_server(lock_file: File) -> Result<SharedNatsServer> {
     let binary = nats_server_binary()?;
     verify_nats_server_version(&binary)?;
     let nonce = Uuid::new_v4().to_string();
-    let token = Uuid::new_v4().simple().to_string();
+    let (port, token) = persistent_endpoint()?;
     let config_path = nats_runtime_dir().join("nats.conf");
     let mut last_error = None;
 
     for _ in 0..SPAWN_ATTEMPTS {
-        match spawn_once(&binary, &config_path, &token).await {
+        match spawn_once(&binary, &config_path, &token, port).await {
             Ok((child, port)) => {
                 let metadata = ServerMetadata {
                     port,
@@ -275,7 +299,6 @@ async fn start_owned_server(lock_file: File) -> Result<SharedNatsServer> {
                     owner: Some(ServerOwner {
                         child,
                         lock_file,
-                        nonce,
                         config_path,
                     }),
                 });
@@ -290,8 +313,13 @@ async fn start_owned_server(lock_file: File) -> Result<SharedNatsServer> {
     ))
 }
 
-async fn spawn_once(binary: &Path, config_path: &Path, token: &str) -> Result<(Child, u16)> {
-    write_server_config_atomically(config_path, token)?;
+async fn spawn_once(
+    binary: &Path,
+    config_path: &Path,
+    token: &str,
+    port: Option<u16>,
+) -> Result<(Child, u16)> {
+    write_server_config_atomically(config_path, token, port)?;
 
     let mut command = Command::new(binary);
     command
@@ -303,13 +331,17 @@ async fn spawn_once(binary: &Path, config_path: &Path, token: &str) -> Result<(C
         .stdout(harnx_core::logging::child_output_sink())
         .stderr(harnx_core::logging::child_output_sink());
     configure_parent_death(&mut command);
-    let mut child = command
+    let child = command
         .spawn()
         .with_context(|| format!("failed to spawn {}", binary.display()))?;
+    // Discovery can be cancelled when its frontend exits. Retain RAII cleanup
+    // through startup, including while waiting for the ports report/readiness.
+    let mut startup = ServerStartup(Some(child));
+    let child = startup.0.as_mut().expect("startup owns child");
 
     let child_pid = child.id();
     let ports_path = port_report_path(binary, child_pid);
-    let port = match read_bound_port(&mut child, &ports_path).await {
+    let port = match read_bound_port(child, &ports_path).await {
         Ok(port) => port,
         Err(error) => {
             let _ = child.kill();
@@ -318,7 +350,7 @@ async fn spawn_once(binary: &Path, config_path: &Path, token: &str) -> Result<(C
         }
     };
     let url = format!("nats://127.0.0.1:{port}");
-    if let Err(error) = wait_for_nats_ready(&url, token, &mut child).await {
+    if let Err(error) = wait_for_nats_ready(&url, token, child).await {
         let _ = child.kill();
         let _ = child.wait();
         remove_ports_file(ports_path);
@@ -328,7 +360,17 @@ async fn spawn_once(binary: &Path, config_path: &Path, token: &str) -> Result<(C
     // usually killed, so drop it now that the port is known and republished in
     // harnx's ports.json.
     remove_ports_file(ports_path);
-    Ok((child, port))
+    Ok((startup.0.take().expect("startup owns child"), port))
+}
+
+struct ServerStartup(Option<Child>);
+
+impl Drop for ServerStartup {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            stop_server(child);
+        }
+    }
 }
 
 /// Wait for nats-server to report the port it bound.
@@ -570,15 +612,22 @@ fn parse_major_minor(version: &str) -> Option<(u64, u64)> {
 /// bound. Allocating the port here and closing the listener before nats-server
 /// opened it left a window where another process could claim it, which showed up
 /// as a spawn attempt dying immediately.
-fn write_server_config_atomically(destination: &Path, token: &str) -> Result<()> {
+fn write_server_config_atomically(
+    destination: &Path,
+    token: &str,
+    port: Option<u16>,
+) -> Result<()> {
     let runtime_dir = nats_runtime_dir();
     let store_dir = serde_json::to_string(&nats_runtime_store_dir())
         .context("failed to encode shared local NATS store path")?;
     let ports_dir = serde_json::to_string(&runtime_dir)
         .context("failed to encode shared local NATS ports directory")?;
     let token = serde_json::to_string(token).context("failed to encode shared local NATS token")?;
+    // Only first startup asks the broker to allocate a port. Failover must bind
+    // the original endpoint, never silently strand clients on another port.
+    let port = port.map_or(-1, i32::from);
     let config = format!(
-        "host: \"127.0.0.1\"\nport: -1\nports_file_dir: {ports_dir}\njetstream {{ store_dir: {store_dir} }}\nauthorization {{ token: {token} }}\n"
+        "host: \"127.0.0.1\"\nport: {port}\nports_file_dir: {ports_dir}\njetstream {{ store_dir: {store_dir} }}\nauthorization {{ token: {token} }}\n"
     );
     let mut temporary = NamedTempFile::new_in(&runtime_dir).with_context(|| {
         format!(
@@ -657,15 +706,6 @@ fn read_metadata() -> Result<ServerMetadata> {
             path.display()
         )
     })
-}
-
-fn remove_metadata_if_nonce_matches(nonce: &str) {
-    if read_metadata().is_ok_and(|metadata| metadata.nonce == nonce) {
-        remove_file_if_present(
-            &nats_runtime_ports_file(),
-            "stale shared local NATS ports.json",
-        );
-    }
 }
 
 fn remove_file_if_present(path: &Path, description: &str) {

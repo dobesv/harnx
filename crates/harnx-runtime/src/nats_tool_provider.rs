@@ -417,19 +417,24 @@ impl NatsToolProvider {
         };
         let mut checks = tokio::time::interval(REGISTRATION_LIVENESS_CHECK_INTERVAL);
         checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut failures = 0;
         loop {
             checks.tick().await;
-            match registry.get(key).await {
-                Ok(Some(_)) => {}
-                Ok(None) => {
+            match tokio::time::timeout(Duration::from_secs(10), registry.get(key)).await {
+                Ok(Ok(Some(_))) => failures = 0,
+                Ok(Ok(None)) => {
                     return format!(
                         "tool server unavailable: registration '{key}' is no longer active"
                     );
                 }
-                Err(error) => {
-                    // A registry read failure says nothing about server health.
-                    // The NATS request and later KV checks remain authoritative.
-                    log::debug!("tool registration liveness check failed for '{key}': {error:#}");
+                error => {
+                    failures += 1;
+                    log::warn!("tool registration liveness check failed for '{key}' ({failures}/3): {error:?}");
+                    if failures == 3 {
+                        // This establishes loss of observability, not that the
+                        // tool stopped. transport_failure preserves that distinction.
+                        return format!("tool completion unconfirmed: NATS registration '{key}' could not be read after 3 attempts");
+                    }
                 }
             }
         }
@@ -448,7 +453,7 @@ impl NatsToolProvider {
             request,
         } = pending;
         let mut supervised_failure = self.in_flight.register(call_id.clone(), server).await;
-        let request = self.client.send_request(subject, request);
+        let request = harnx_nats_common::rpc::request(&self.client, subject, request);
         tokio::pin!(request);
         let response = tokio::select! {
             _ = wait_abort_signal(abort) => {
@@ -489,7 +494,9 @@ impl NatsToolProvider {
         if self.execution_control.is_none() {
             return ToolError::Recoverable(anyhow!(message));
         }
-        let _ = self.publish_cancel(call_id).await;
+        // A failed backend must not turn error reporting into another
+        // unbounded wait for cancellation delivery.
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.publish_cancel(call_id)).await;
         ToolError::Fatal(anyhow!("{message}; tool shutdown is unconfirmed"))
     }
 }

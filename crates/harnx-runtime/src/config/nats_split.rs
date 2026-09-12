@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, path::Path, sync::OnceLock};
 
 static LOCAL_NATS_SERVER: OnceLock<
-    tokio::sync::Mutex<Option<crate::nats_local_server::SharedNatsServer>>,
+    tokio::sync::Mutex<Option<crate::nats_local_server::LocalBroker>>,
 > = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,20 +93,17 @@ pub async fn resolve_local_nats_server_config() -> Result<NatsServerConfig> {
             let manager = LOCAL_NATS_SERVER.get_or_init(|| tokio::sync::Mutex::new(None));
             let mut managed_server = manager.lock().await;
             let needs_refresh = match managed_server.as_mut() {
-                Some(server) => !server.is_current().await,
+                Some(server) => !server.is_running(),
                 None => true,
             };
             if needs_refresh {
-                // A joiner does not control the broker lifetime. Refresh a
-                // cached discovery result after its owner exits, but retain a
-                // live joiner so frequent config lookups do not each perform a
-                // separate NATS connection and flush.
                 managed_server.take();
-                *managed_server = Some(crate::nats_local_server::ensure_shared_server().await?);
+                *managed_server = Some(crate::nats_local_server::LocalBroker::start().await?);
             }
             let server = managed_server
                 .as_ref()
-                .expect("local NATS server initialized above");
+                .expect("local NATS server initialized above")
+                .status();
             let (url, token) = (server.url.clone(), server.token.clone());
             (url, token, None, None, None, None, None)
         }
@@ -199,19 +196,8 @@ impl Config {
     }
 
     pub async fn connect_nats_server(server: &NatsServerConfig) -> Result<async_nats::Client> {
-        if !server.has_auth_or_tls_config() {
-            return async_nats::connect(&server.url)
-                .await
-                .with_context(|| format!("Failed to connect to NATS cluster at '{}'", server.url));
-        }
-
-        let options = NatsEndpoint::from(server)
-            .connect_options()
-            .with_context(|| {
-                format!("Invalid auth/TLS config for NATS cluster '{}'", server.name)
-            })?;
-        options
-            .connect(&server.url)
+        NatsEndpoint::from(server)
+            .connect()
             .await
             .with_context(|| format!("Failed to connect to NATS cluster at '{}'", server.url))
     }
@@ -233,16 +219,6 @@ impl Config {
         expand_env_option(&mut server.tls_cert);
         expand_env_option(&mut server.tls_key);
         expand_env_option(&mut server.tls_ca);
-    }
-}
-
-impl NatsServerConfig {
-    fn has_auth_or_tls_config(&self) -> bool {
-        self.token.is_some()
-            || self.tls.unwrap_or(false)
-            || self.tls_cert.is_some()
-            || self.tls_key.is_some()
-            || self.tls_ca.is_some()
     }
 }
 
@@ -286,9 +262,8 @@ mod tests {
             server.name.as_str(),
             server.url.as_str(),
             server.token.as_deref(),
-            server.has_auth_or_tls_config(),
         );
-        assert_eq!(actual, (LOCAL_CLUSTER_KEY, url, Some(token), true));
+        assert_eq!(actual, (LOCAL_CLUSTER_KEY, url, Some(token)));
     }
 
     /// Assert an error message mentions each expected substring. Keeps the

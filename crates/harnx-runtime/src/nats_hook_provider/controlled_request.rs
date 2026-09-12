@@ -31,7 +31,11 @@ pub(super) async fn request(
         .payload(payload.into())
         .headers(headers)
         .timeout(None);
-    let response = tokio::time::timeout(timeout, client.send_request(subject, request)).await;
+    let response = tokio::time::timeout(
+        timeout,
+        harnx_nats_common::rpc::request(client, subject, request),
+    )
+    .await;
     match response {
         Ok(Ok(message)) => {
             serde_json::from_slice(&message.payload).context("deserialize hook reply")

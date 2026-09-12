@@ -8,6 +8,8 @@ use std::{future::Future, time::Duration};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Clone)]
 pub(super) struct ActiveCall {
     pub reference: OperationRef,
@@ -19,7 +21,7 @@ pub(super) struct InvocationExecution {
     store: ExecutionStore,
     pub reference: OperationRef,
     owner: Owner,
-    watch: async_nats::jetstream::kv::Watch,
+    watch: harnx_nats_common::recovery::KvUpdates,
 }
 
 impl InvocationExecution {
@@ -81,9 +83,20 @@ impl InvocationExecution {
         stopped: watch::Sender<bool>,
     ) -> Result<Value, ToolInvokeError> {
         let result = self.run(&cancel, guarantee, future).await;
+        // A child can lose its lease without recording owner_stopped. Waiting
+        // forever here used to hide even an already-produced error/answer from
+        // the caller. Bound confirmation, while retaining the durable blocker
+        // and withholding the stopped acknowledgement when cleanup is unknown.
         let completion = self.finish().await;
         completion.map_err(|error| {
-            ToolInvokeError::Fatal(format!("tool shutdown unconfirmed: {error:#}"))
+            let detail = match &result {
+                Err(original) => format!("; invocation error: {original}"),
+                Ok(_) => {
+                    "; invocation returned a result but descendant shutdown could not be confirmed"
+                        .to_string()
+                }
+            };
+            ToolInvokeError::Fatal(format!("tool shutdown unconfirmed: {error:#}{detail}"))
         })?;
         stopped.send_replace(true);
         result
@@ -141,6 +154,12 @@ impl InvocationExecution {
         if operation.state.is_terminal() {
             return Ok(());
         }
+        tokio::time::timeout(COMPLETION_TIMEOUT, self.wait_for_children())
+            .await
+            .context("timed out waiting for registered children to stop")?
+    }
+
+    async fn wait_for_children(&mut self) -> Result<()> {
         // A completed invocation may still be waiting for its child's lease
         // release. Normal cleanup must not turn that success into cancellation.
         loop {

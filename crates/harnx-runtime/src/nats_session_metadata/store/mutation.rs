@@ -211,8 +211,7 @@ impl SessionMetadataStore {
                 metadata.session_id
             )
         })?;
-        self.store
-            .update(&key, payload.into(), revision)
+        harnx_nats_common::cas::update(&self.store, key.clone(), payload.into(), revision)
             .await
             .map_err(anyhow::Error::from)
             .with_context(|| {

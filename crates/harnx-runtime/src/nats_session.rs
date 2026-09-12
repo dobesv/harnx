@@ -35,6 +35,7 @@
 
 use anyhow::{Context, Result};
 use async_nats::jetstream;
+use futures_util::StreamExt;
 use harnx_core::abort::wait_abort_signal;
 use harnx_core::event::{
     AgentEvent, AgentEventSink, ModelEvent, SessionEvent, TurnEvent, UserEvent,
@@ -59,6 +60,7 @@ use crate::utils::AbortSignal;
 pub use harnx_execution_control::{CancelReceipt, CancelRequest, CancellationStatus};
 use harnx_execution_control::{ExecutionStore, OperationRef};
 pub(crate) mod cancellation;
+mod completion;
 
 /// Generate a client-side message ID (UUID v4).
 pub(crate) fn new_client_message_id() -> String {
@@ -1040,20 +1042,16 @@ impl NatsSession {
         let mut cached_effective: Option<Vec<(u64, SessionLogEntry)>> = None;
         let mut pending_advisories = VecDeque::new();
         let mut emitted_logical_seqs = HashSet::new();
-        // Throttle the durable-log completion check: advisory events arrive at
-        // streaming-token frequency, and reloading the full log on each would be
-        // O(N^2) in session size. Check at most once per interval instead — the
-        // turn-complete signal (a final AssistantMessage) is not latency
-        // sensitive, and the post-loop reload guarantees we never miss it.
-        const COMPLETION_CHECK_INTERVAL: std::time::Duration =
-            std::time::Duration::from_millis(500);
-        let mut last_completion_check = std::time::Instant::now() - COMPLETION_CHECK_INTERVAL;
-        let mut completion_interval = tokio::time::interval(COMPLETION_CHECK_INTERVAL);
-        completion_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut completion_updates = Box::pin(completion::updates(
+            self.jetstream.clone(),
+            self.session_id.clone(),
+            event_stream.history().to_vec(),
+        ));
+        let mut completion_error = None;
+        let mut emitted_subagent_completions = HashSet::new();
         // Wrap channel in Option for select! handling.
         let mut pending_cancel_rx = pending_cancel;
         let mut was_cancelled = false;
-        let mut orphan_watchdog = SessionLeaseWatchdog::new();
         let mut saw_terminal_model_error = false;
         let mut saw_turn_ended = false;
 
@@ -1092,8 +1090,9 @@ impl NatsSession {
                 // Poll durable completion independently so a client that misses
                 // the live Turn::Ended advisory still observes the authoritative
                 // TurnEnd marker promptly.
-                _ = completion_interval.tick() => {
-                    if let Ok(entries) = self.load_durable_entries().await {
+                Some(update) = completion_updates.next() => {
+                    match update {
+                        Ok(completion::DurableUpdate { entries, orphaned }) => {
                         // Refresh cached effective log for live LogSeqAssigned.
                         let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries).ok();
                         let completion_visible = Self::is_turn_completion_visible(
@@ -1117,16 +1116,19 @@ impl NatsSession {
                                 AdvisoryFlush::Live,
                             );
                         }
+                        completion::reconcile_subagent_progress(
+                            cached_effective.as_deref().unwrap_or(&entries),
+                            user_msg_seq,
+                            &event_sink,
+                            &mut emitted_subagent_completions,
+                        );
                         if completion_visible {
                             (final_response, turn_error) =
                                 Self::extract_turn_outcome(&entries, user_msg_seq);
                             turn_complete = true;
                             break;
                         }
-                        if let Some(reason) = orphan_watchdog
-                            .check(&self.jetstream, &self.session_id)
-                            .await
-                        {
+                        if let Some(reason) = orphaned {
                             // Workers predating durable TurnEnd release their
                             // lease after persisting the assistant row. Treat
                             // that confirmed release as their durable-compatible
@@ -1138,6 +1140,11 @@ impl NatsSession {
                                 turn_error = Some(reason);
                             }
                             turn_complete = true;
+                            break;
+                        }
+                        }
+                        Err(error) => {
+                            completion_error = Some(error);
                             break;
                         }
                     }
@@ -1171,44 +1178,6 @@ impl NatsSession {
                                     AdvisoryFlush::Live,
                                 );
                             }
-                            // Poll durable log for turn completion, but at most
-                            // once per COMPLETION_CHECK_INTERVAL so bursty
-                            // streaming advisories do not trigger full log reload
-                            // each time (avoids O(N^2) growth).
-                            if last_completion_check.elapsed() >= COMPLETION_CHECK_INTERVAL {
-                                last_completion_check = std::time::Instant::now();
-                                if let Ok(entries) = self.load_durable_entries().await {
-                                    let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries).ok();
-                                    let completion_visible = Self::is_turn_completion_visible(
-                                        &entries,
-                                        effective.as_deref(),
-                                        user_msg_seq,
-                                        saw_turn_ended,
-                                    );
-                                    if let Some(effective) = effective {
-                                        cached_effective = Some(effective);
-                                        emit_all_logical_seqs_for_window(
-                                cached_effective.as_deref(),
-                                &event_sink,
-                                &mut emitted_logical_seqs,
-                            );
-                                        flush_pending_advisories(
-                                            &mut pending_advisories,
-                                            cached_effective.as_deref(),
-                                            &event_sink,
-                                            &mut emitted_logical_seqs,
-                                            AdvisoryFlush::Live,
-                                        );
-                                    }
-                                    if completion_visible {
-                                        // Extract final response before we finish
-                                        (final_response, turn_error) =
-                                            Self::extract_turn_outcome(&entries, user_msg_seq);
-                                        turn_complete = true;
-                                        break;
-                                    }
-                                }
-                            }
                         }
                         None => {
                             // Subscription closed, check final state
@@ -1226,9 +1195,9 @@ impl NatsSession {
         // skip the final flush below and lose advisories that had already been
         // received, which is the whole point of that flush. They get emitted
         // undecorated (no reload means no window), then the error is returned.
-        let mut final_reload_error = None;
-        if !turn_complete {
-            match self.load_durable_entries().await {
+        let mut final_reload_error = completion_error;
+        if !turn_complete && final_reload_error.is_none() {
+            match completion::bounded_refresh(self.load_durable_entries()).await {
                 Ok(entries) => {
                     (final_response, turn_error) =
                         Self::extract_turn_outcome(&entries, user_msg_seq);
@@ -1407,7 +1376,11 @@ impl NatsSession {
             });
         status == Some(RequestedSeqStatus::Covered)
             || awaiting_hitl
-            || (saw_turn_ended && Self::has_durable_assistant_response(entries, user_msg_seq))
+            || (saw_turn_ended
+                && !entries
+                    .iter()
+                    .any(|(_, entry)| matches!(entry, SessionLogEntry::TurnEnd { .. }))
+                && Self::has_durable_assistant_response(entries, user_msg_seq))
     }
 
     /// Final assistant text and worker-reported failure for the current turn.

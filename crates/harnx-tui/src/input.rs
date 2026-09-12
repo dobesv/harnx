@@ -763,6 +763,9 @@ impl Tui {
             TuiEvent::SubAgentSessionEvent { key, event } => {
                 self.handle_subagent_session_event(key, event);
             }
+            TuiEvent::SubAgentInvocationFailed { key, invocation_id } => {
+                self.fail_monitored_invocation(&key, &invocation_id);
+            }
             TuiEvent::ToolRoundComplete => {
                 // Intermediate tool round — prompt loop continues, don't clear llm_busy.
                 // Flush any pending thought so follow-up thought after tool results

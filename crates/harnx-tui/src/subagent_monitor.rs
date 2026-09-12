@@ -84,8 +84,13 @@ impl Tui {
         if let Some(handle) = self.subagent_monitor_handles.remove(&key) {
             handle.abort();
         }
-        let handle =
-            spawn_subagent_monitor(self.config.clone(), self.event_tx.clone(), key.clone());
+        let invocation_id = self.app.monitored_sessions[&key].invocation_id.clone();
+        let handle = spawn_subagent_monitor(
+            self.config.clone(),
+            self.event_tx.clone(),
+            key.clone(),
+            invocation_id,
+        );
         self.subagent_monitor_handles.insert(key, handle);
     }
 
@@ -110,12 +115,13 @@ fn spawn_subagent_monitor(
     config: GlobalConfig,
     event_tx: UnboundedSender<TuiEvent>,
     key: MonitoredSessionKey,
+    invocation_id: Option<String>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let target = (key.session_id.clone(), key.cluster.clone());
         tokio::join!(
             crate::cancellation::monitor_execution(&config, &event_tx, &target),
-            monitor_subagent_session(config.clone(), event_tx.clone(), key)
+            monitor_subagent_session(config.clone(), event_tx.clone(), key, invocation_id)
         );
     })
 }
@@ -124,11 +130,19 @@ async fn monitor_subagent_session(
     config: GlobalConfig,
     event_tx: UnboundedSender<TuiEvent>,
     key: MonitoredSessionKey,
+    invocation_id: Option<String>,
 ) {
     let target = (key.session_id.clone(), key.cluster.clone());
     let mut reconnect_delay = RECONNECT_DELAY;
     loop {
-        let outcome = monitor_subagent_attachment(&config, &event_tx, &key, &target).await;
+        let outcome = monitor_subagent_attachment(
+            &config,
+            &event_tx,
+            &key,
+            &target,
+            invocation_id.as_deref(),
+        )
+        .await;
         if outcome == AttachmentOutcome::Terminal {
             return;
         }
@@ -153,6 +167,7 @@ async fn monitor_subagent_attachment(
     event_tx: &UnboundedSender<TuiEvent>,
     key: &MonitoredSessionKey,
     target: &(String, String),
+    invocation_id: Option<&str>,
 ) -> AttachmentOutcome {
     let mut stream = match attach_session_event_stream(config, target).await {
         Ok(stream) => stream,
@@ -217,6 +232,12 @@ async fn monitor_subagent_attachment(
                     return AttachmentOutcome::Terminal;
                 }
                 if let Some(reason) = lease_watchdog.check(&jetstream, &key.session_id).await {
+                    if let Some(invocation_id) = invocation_id {
+                        let _ = event_tx.send(TuiEvent::SubAgentInvocationFailed {
+                            key: key.clone(),
+                            invocation_id: invocation_id.to_string(),
+                        });
+                    }
                     let mut transcript = load_subagent_transcript(config, key).await;
                     transcript.push(TranscriptItem::ErrorText(reason));
                     let _ = event_tx.send(TuiEvent::SubAgentSessionSnapshot {

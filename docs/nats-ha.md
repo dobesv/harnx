@@ -526,6 +526,15 @@ upgrade. Registrations using v1 are rejected. `ToolRequest.operation_id` and
 control acknowledgements identify the invocation; a cancellation acknowledgement
 is sent only after invocation cleanup and registered-child completion.
 
+Returning a tool result and confirming descendant shutdown are separate steps.
+After the handler returns, the server allows five seconds for execution-control
+cleanup. If a vanished child cannot confirm shutdown, the caller receives a
+`tool shutdown unconfirmed` error, including the handler's original error when
+present. The unresolved execution remains durable and no stopped acknowledgement
+is sent. Do not remove this deadline: a child lease watchdog can return an error
+while its execution record still has a live descendant, otherwise hiding that
+error from the parent indefinitely (`InvocationExecution::invoke`).
+
 `CancellationGuarantee::Cooperative` is the default. A handler that ignores its
 token remains owned and can become unconfirmed. `HardOnDrop` is reserved for
 implementations whose future owns and stops all per-call work on drop. Foreground
@@ -636,6 +645,64 @@ appear as current orphan warnings.
 
 ## Failover & Safety
 
+### Recovery contract and shared implementation
+
+Local broker ownership is temporary; its authenticated endpoint and JetStream
+store are persistent. The first owner lets NATS allocate a port. Subsequent
+owners bind that same port with the same token, publishing a new owner nonce.
+`ports.json` survives shutdown; the exclusive lifetime lock establishes whether
+an owner exists. A port conflict fails explicitly rather than moving the broker
+and stranding existing clients. Keep this file private (0600); it contains the
+local authentication token.
+
+`nats_local_server::LocalBroker` continuously checks ownership, including while
+a frontend is idle or awaiting a sub-agent. Both frontend worker supervision and
+configuration-backed local connections retain this guard. When an owner exits,
+survivors elect one replacement. Existing workers keep their PIDs, environments,
+tool servers, and activation routes. Exiting a frontend still shuts down that
+frontend's own worker tree; this recovery contract covers surviving frontends.
+
+All production runtime, tool-server, and hook-server connections use
+`harnx_nats_common::connect::NatsEndpoint`. It keeps reconnecting to the stable
+endpoint with bounded reconnect delay. Reusing the same `async_nats::Client`
+preserves Core subscription identity. Socket reconnection alone cannot recover
+messages lost while disconnected: Core NATS is at-most-once, whereas durable
+state must be read back after reconnect. See the
+[NATS reconnect guidance](https://docs.nats.io/learn/resilient-clients/reconnection).
+
+Use these operation-specific patterns when adding a NATS caller:
+
+| Operation | Recovery rule and implementation |
+| --- | --- |
+| Read durable state | `recovery::read` retries transport reads within a fixed deadline. Decode/validate outside the retry. Never translate an unreadable record into absence. |
+| KV cancellation watch | `recovery::kv_updates` restores interrupted watches and supplies periodic wakeups. `ExecutionStore` rereads the current ancestor chain; an advisory is never evidence that work is permitted or cancelled. |
+| Append a transcript entry | Retain the same message ID, payload, and CAS expectation through `recovery::retry_until`. Retry timeout/broken-pipe errors; a CAS conflict is authoritative. |
+| Mutate execution or session metadata | `cas::update` reads back an ambiguous acknowledgement. Matching persisted bytes confirm the write; an unchanged revision permits retrying the exact CAS. A different value/revision remains unconfirmed. |
+| Renew a session lease | Retry the same deduplicated CAS only until the previously confirmed lease deadline. A conflict or expired deadline fences the worker; reconnect never restores lost ownership. |
+| Invoke a tool or hook | `rpc::request`, `RequestActivity`, and `ReplyTarget` confirm activity and acknowledge replies. Resend a completed result until receipt, never rerun the handler. A NATS 503 is not a reply receipt. |
+| Renew discovery registration | `registry::refreshes` retains a separate pending renewal future so broker latency cannot block serving requests, controls, or shutdown. |
+| Observe turn completion | Incremental transcript polling operates independently of live advisories. Durable coverage determines which prompt completed; a prior turn's advisory cannot complete an injected prompt. |
+| Consume worker activations | Reopen the durable pull stream after errors/closure; acknowledge according to the activation's durable admission and lease state. |
+
+General recovery operations have a 15-second budget. RPC handler heartbeats renew
+the activity deadline, so a healthy long-running handler has no imposed total
+duration beyond its configured timeout. Results retain a bounded receipt window.
+Loss of activity or exhausted recovery reports **completion unconfirmed**; it
+does not prove that a side effect was rolled back or that a descendant stopped.
+Cancellation continues to use the durable execution graph and ownership checks.
+
+Deploy the frontend, worker, and tool/hook binaries together for this contract.
+Older clients still receive ordinary replies, but an older server cannot provide
+the activity receipts expected by a new long-running RPC caller. Restart all
+local frontends for the persistent endpoint policy: an old broker owner still
+deletes its discovery metadata at shutdown. No transcript variant is added.
+
+Regression coverage lives in `nats_local_server/failover.rs`,
+`local_worker_supervisor.rs`, the execution-control/tool completion tests, and
+`harnx-nats-common/tests/registry_ttl/recovery.rs`. Failover tests must retain
+existing clients and in-flight work while removing the broker owner; reconnecting
+a newly constructed client alone does not establish recovery.
+
 ### Leases & Fencing
 Harnx uses a renewable CAS (Compare-And-Swap) lease in NATS KV:
 - **TTL**: ~30 seconds.
@@ -643,6 +710,26 @@ Harnx uses a renewable CAS (Compare-And-Swap) lease in NATS KV:
 - **Fence Token**: The KV revision of the lease. Every write to the durable log is gated by this token.
 
 If a worker loses its lease (e.g., network partition), it immediately aborts. This prevents "split-brain" scenarios where two workers think they are active.
+
+### Diagnosing sub-agent completion stalls
+
+An assistant message in the child transcript does not prove the parent received
+the result. Check the child's `TurnEnd` or lease release, then the parent's
+`ToolResults` for that invocation. A terminal result in the parent distinguishes
+a missed display update from a blocked invocation. Live progress is advisory;
+the session follower repairs missed terminal progress from durable tool results.
+
+Completion polling retains raw history and reads only entries beyond its last
+successful cursor. It remains independently pollable while delivering advisories
+and cancellation. Each refresh is bounded to 30 seconds; three consecutive failed
+reads report that completion is unconfirmed. Similarly, an unbounded tool request
+ends after three failed registration checks instead of silently waiting through
+a persistent backend outage. These failures do not attest that the child stopped.
+
+`NatsSessionLog::read_range` skips only explicit `NoMessageFound` retention gaps.
+Transport and storage errors must fail the read: treating them as missing entries
+can hide completion or fabricate an incomplete transcript. Do not advance a
+replay cursor after a partially successful read.
 
 ### Resume & Idempotency
 When a worker resumes an interrupted session:

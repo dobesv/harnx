@@ -14,6 +14,9 @@ use std::time::Duration;
 #[path = "subagent_session_tests/child_cancel.rs"]
 mod child_cancel;
 
+#[path = "subagent_session_tests/orphan.rs"]
+mod orphan;
+
 fn monitored_key(agent: &str, session_id: &str) -> MonitoredSessionKey {
     MonitoredSessionKey {
         cluster: harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),

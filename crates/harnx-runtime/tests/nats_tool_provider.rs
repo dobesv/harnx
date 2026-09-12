@@ -518,6 +518,9 @@ async fn assert_server_unavailable(
     Ok(())
 }
 
+#[path = "nats_tool_provider/outage.rs"]
+mod outage;
+
 #[tokio::test(flavor = "multi_thread")]
 async fn nats_tool_provider_end_to_end_declarations_cancel_and_precedence() -> Result<()> {
     let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {

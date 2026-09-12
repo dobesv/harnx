@@ -349,6 +349,7 @@ impl SubAgentInvocationProgress {
 }
 
 pub(super) struct MonitoredSessionState {
+    pub invocation_id: Option<String>,
     pub execution_id: Option<String>,
     pub transcript: Vec<TranscriptItem>,
     pub status: SubAgentStatus,
@@ -365,6 +366,7 @@ impl MonitoredSessionState {
         Self {
             transcript: Vec::new(),
             execution_id: None,
+            invocation_id: None,
             status,
             transcript_focus: None,
             scroll,
@@ -649,6 +651,11 @@ pub(crate) enum TuiEvent {
     SubAgentSessionEvent {
         key: MonitoredSessionKey,
         event: harnx_core::event::AgentEvent,
+    },
+    /// A lease watchdog confirmed the loss of this specific invocation.
+    SubAgentInvocationFailed {
+        key: MonitoredSessionKey,
+        invocation_id: String,
     },
     /// Intermediate tool round completed; retained for queued-message tests.
     #[allow(dead_code)]

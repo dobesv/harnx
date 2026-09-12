@@ -5,7 +5,7 @@
 //! handful of settings into an [`async_nats::ConnectOptions`]. This module is
 //! the one implementation, so a TLS fix lands once instead of twice.
 
-use std::{io::BufReader, path::PathBuf};
+use std::{io::BufReader, path::PathBuf, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use async_nats::ConnectOptions;
@@ -142,6 +142,26 @@ impl NatsEndpoint {
     /// `Option<String>` fields, so cloning it to satisfy `spawn_blocking`'s
     /// `'static` bound doesn't cost anything worth avoiding.
     pub async fn connect(&self) -> Result<async_nats::Client> {
+        crate::recovery::retry_until(
+            tokio::time::Instant::now() + crate::recovery::RECOVERY_TIMEOUT,
+            || self.connect_once(),
+            |error| {
+                error
+                    .downcast_ref::<async_nats::ConnectError>()
+                    .is_some_and(|error| {
+                        matches!(
+                            error.kind(),
+                            async_nats::ConnectErrorKind::Io
+                                | async_nats::ConnectErrorKind::Dns
+                                | async_nats::ConnectErrorKind::TimedOut
+                        )
+                    })
+            },
+        )
+        .await
+    }
+
+    async fn connect_once(&self) -> Result<async_nats::Client> {
         let endpoint = self.clone();
         let options = tokio::task::spawn_blocking(move || endpoint.connect_options())
             .await
@@ -155,7 +175,16 @@ impl NatsEndpoint {
     /// Build the `ConnectOptions` for this endpoint: token auth, and TLS or
     /// mTLS if configured.
     pub fn connect_options(&self) -> Result<ConnectOptions> {
-        let mut options = ConnectOptions::new();
+        // Every production role uses this policy. Preserve the Client across
+        // outages so async-nats restores its Core subscriptions. Application
+        // operations still need their own deadlines and replay semantics.
+        let mut options = ConnectOptions::new()
+            .max_reconnects(None)
+            .ping_interval(Duration::from_secs(5))
+            .connection_timeout(Duration::from_secs(2))
+            .reconnect_delay_callback(|attempt| {
+                Duration::from_millis((100_u64 << attempt.min(4)).min(1_000))
+            });
         options = self.apply_auth_options(options);
         options = self.apply_tls_options(options)?;
 

@@ -4,6 +4,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+#[path = "nats_local_server/failover.rs"]
+mod failover;
+
 struct DataDirGuard {
     previous: Option<OsString>,
 }
