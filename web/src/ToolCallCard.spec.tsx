@@ -130,4 +130,78 @@ describe('ToolCallCard', () => {
     fireEvent.click(container.querySelector('.aui-tool-call-header')!);
     expect(screen.getByText('View Source')).toBeInTheDocument();
   });
+
+  describe('status presentation and initial expansion', () => {
+    const cases = [
+      {
+        scenario: 'requires-action with reason tool-calls',
+        status: { type: 'requires-action', reason: 'tool-calls' },
+        isError: undefined,
+        expectedIcon: '⏳',
+        expectedExpanded: 'false',
+        expectedBorder: '4px solid var(--status-running)',
+      },
+      {
+        scenario: 'requires-action with reason interrupt',
+        status: { type: 'requires-action', reason: 'interrupt' },
+        isError: undefined,
+        expectedIcon: '⚠️',
+        expectedExpanded: 'true',
+        expectedBorder: '4px solid var(--status-action)',
+      },
+      {
+        scenario: 'running',
+        status: { type: 'running' },
+        isError: undefined,
+        expectedIcon: '⏳',
+        expectedExpanded: 'false',
+        expectedBorder: '4px solid var(--status-running)',
+      },
+      {
+        scenario: 'complete with no error',
+        status: { type: 'complete' },
+        isError: undefined,
+        expectedIcon: '✅',
+        expectedExpanded: 'false',
+        expectedBorder: '4px solid var(--status-complete)',
+      },
+      {
+        scenario: 'complete with isError true',
+        status: { type: 'complete' },
+        isError: true,
+        expectedIcon: '❌',
+        expectedExpanded: 'false',
+        expectedBorder: '4px solid var(--status-complete)',
+      },
+      {
+        scenario: 'incomplete status with error',
+        status: { type: 'incomplete' },
+        isError: true,
+        expectedIcon: '❌',
+        expectedExpanded: 'false',
+        expectedBorder: '4px solid var(--status-error)',
+      },
+    ];
+
+    it.each(cases)(
+      'renders correct icon, expansion, and border for $scenario',
+      ({ status, isError, expectedIcon, expectedExpanded, expectedBorder }) => {
+        const props = {
+          toolName: 'my_tool',
+          toolCallId: 'call_1',
+          status,
+          isError,
+        } as any;
+
+        const { container } = renderWithContext(props);
+        const icon = container.querySelector('.aui-tool-call-icon');
+        const header = container.querySelector('.aui-tool-call-header');
+        const card = container.querySelector('.aui-tool-call') as HTMLElement;
+
+        expect(icon?.textContent).toBe(expectedIcon);
+        expect(header).toHaveAttribute('aria-expanded', expectedExpanded);
+        expect(card.style.borderLeft).toBe(expectedBorder);
+      },
+    );
+  });
 });
