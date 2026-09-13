@@ -229,62 +229,145 @@ async fn run_dump_command(dump_args: &crate::cli::DumpArgs) -> Result<()> {
             follow,
         } => {
             if *follow {
-                bail!("--follow is not yet implemented");
+                return run_dump_session_follow(session_id, agent_name, *format).await;
             }
-            use harnx_runtime::config::SessionFormat;
-            let config = Config::init(WorkingMode::Cmd, true).await?;
-
-            // Validate session exists for this agent
-            let jetstream = config
-                .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
-                .await?;
-            let store =
-                harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
-                    .await?;
-            store
-                .get_for_agent(session_id, agent_name)
-                .await?
-                .with_context(|| {
-                    format!(
-                        "Session '{}' for agent '{}' not found",
-                        session_id, agent_name
-                    )
-                })?;
-
-            // Load raw entries and reconstruct
-            let log = harnx_runtime::nats_session_log::NatsSessionLog::new(
-                jetstream,
-                session_id.to_string(),
-            );
-            let raw = log.load_events_async().await?;
-            let entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)?;
-
-            match format {
-                SessionFormat::Text => {
-                    // Build CliAgentEventSink and replay entries
-                    use crate::cli_event_sink::CliAgentEventSink;
-                    use harnx_core::abort::create_abort_signal;
-                    use harnx_render::RenderOptions;
-                    let render_options = RenderOptions::default();
-                    let abort_signal = create_abort_signal();
-                    let sink =
-                        Arc::new(CliAgentEventSink::new(false, render_options, abort_signal));
-                    harnx_runtime::replay_entries_to_sink(&entries, sink);
-                }
-                SessionFormat::Yaml => {
-                    let out =
-                        harnx_runtime::config::dump_entries_yaml(entries.iter().map(|(_, e)| e))?;
-                    print!("{out}");
-                }
-                SessionFormat::Json => {
-                    let out =
-                        harnx_runtime::config::dump_entries_jsonl(entries.iter().map(|(_, e)| e))?;
-                    print!("{out}");
-                }
-            }
-            Ok(())
+            run_dump_session_once(session_id, agent_name, format).await
         }
     }
+}
+
+async fn run_dump_session_once(
+    session_id: &str,
+    agent_name: &str,
+    format: &harnx_runtime::config::SessionFormat,
+) -> Result<()> {
+    use harnx_runtime::config::SessionFormat;
+    let config = Config::init(WorkingMode::Cmd, true).await?;
+
+    // Validate session exists for this agent
+    let jetstream = config
+        .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+        .await?;
+    let store =
+        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await?;
+    store
+        .get_for_agent(session_id, agent_name)
+        .await?
+        .with_context(|| format!("Session '{session_id}' for agent '{agent_name}' not found"))?;
+
+    // Load raw entries and reconstruct
+    let log =
+        harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, session_id.to_string());
+    let raw = log.load_events_async().await?;
+    let entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)?;
+
+    match format {
+        SessionFormat::Text => {
+            // Build CliAgentEventSink and replay entries
+            use crate::cli_event_sink::CliAgentEventSink;
+            use harnx_core::abort::create_abort_signal;
+            use harnx_render::RenderOptions;
+            let render_options = RenderOptions::default();
+            let abort_signal = create_abort_signal();
+            let sink = Arc::new(CliAgentEventSink::new(false, render_options, abort_signal));
+            harnx_runtime::replay_entries_to_sink(&entries, sink);
+        }
+        SessionFormat::Yaml => {
+            let out = harnx_runtime::config::dump_entries_yaml(entries.iter().map(|(_, e)| e))?;
+            print!("{out}");
+        }
+        SessionFormat::Json => {
+            let out = harnx_runtime::config::dump_entries_jsonl(entries.iter().map(|(_, e)| e))?;
+            print!("{out}");
+        }
+    }
+    Ok(())
+}
+
+async fn run_dump_session_follow(
+    session_id: &str,
+    agent_name: &str,
+    format: harnx_runtime::config::SessionFormat,
+) -> Result<()> {
+    use std::io::Write;
+
+    let config = Config::init(WorkingMode::Cmd, true).await?;
+    let cluster = harnx_runtime::config::LOCAL_CLUSTER_KEY;
+
+    // Validate session exists for this agent and get jetstream context
+    let jetstream = config.nats_jetstream(cluster).await?;
+    let store =
+        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await?;
+    store
+        .get_for_agent(session_id, agent_name)
+        .await?
+        .with_context(|| format!("Session '{session_id}' for agent '{agent_name}' not found"))?;
+
+    // Attach to session event stream (uses same jetstream context)
+    let client = config.nats_client(cluster).await?;
+    let mut stream =
+        harnx_runtime::nats_event_sink::SessionEventStream::attach(jetstream, client, session_id)
+            .await?;
+
+    // Replay initial history
+    replay_dump_entries(stream.history(), &format).await?;
+    std::io::stdout().flush()?;
+
+    // Follow loop: durable-only, with periodic poll timeout for lossy advisories
+    loop {
+        tokio::select! {
+            // Advisory wake-up (lossy)
+            _ = stream.next() => {}
+            // Periodic poll timeout — REQUIRED for entries with no advisory (e.g. TurnEnd)
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(1000)) => {}
+            // Clean exit on Ctrl-C
+            _ = tokio::signal::ctrl_c() => {
+                return Ok(());
+            }
+        }
+
+        // On wake, check for new durable entries
+        let old_len = stream.history().len();
+        if stream.refresh_history().await? {
+            let new_entries = &stream.history()[old_len..];
+            if !new_entries.is_empty() {
+                replay_dump_entries(new_entries, &format).await?;
+                std::io::stdout().flush()?;
+            }
+        }
+    }
+}
+
+async fn replay_dump_entries(
+    entries: &[(u64, harnx_core::session::SessionLogEntry)],
+    format: &harnx_runtime::config::SessionFormat,
+) -> Result<()> {
+    use harnx_runtime::config::SessionFormat;
+
+    match format {
+        SessionFormat::Text => {
+            use crate::cli_event_sink::CliAgentEventSink;
+            use harnx_core::abort::create_abort_signal;
+            use harnx_render::RenderOptions;
+            let render_options = RenderOptions::default();
+            let abort_signal = create_abort_signal();
+            let sink = Arc::new(CliAgentEventSink::new(false, render_options, abort_signal));
+            harnx_runtime::replay_entries_to_sink(entries, sink);
+        }
+        SessionFormat::Yaml => {
+            for (_, entry) in entries {
+                let doc = harnx_runtime::config::yaml_doc(entry)?;
+                print!("{doc}");
+            }
+        }
+        SessionFormat::Json => {
+            for (_, entry) in entries {
+                let line = harnx_runtime::config::jsonl_line(entry)?;
+                print!("{line}");
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn run_delete_command(delete_args: &crate::cli::DeleteArgs) -> Result<()> {
