@@ -257,28 +257,66 @@ async fn dump_session_jsonl_is_n_lines_parsable_independently() -> Result<()> {
 }
 
 /// Test `load_session_for_render` reconstructs session with model and token counts.
-/// Seeds a named-agent session with entries, sets model override, and verifies
-/// the reconstructed session has expected model ID and token counts.
+/// Seeds a named-agent session with entries and verifies the reconstructed session.
+/// Does NOT test model resolution (that's covered elsewhere); skips model override.
 #[tokio::test]
 async fn load_session_for_render_reconstructs_session_with_model_and_tokens() -> Result<()> {
+    use harnx_runtime::config::load_session_for_render;
+
     require_nextest();
 
     let Some(server) = spawn_nats_server().await? else {
         return Ok(());
     };
 
-    let config = local_nats_config(server.url());
+    // Configure with MockClient
+    use harnx_runtime::client::Client;
+    let mut config = local_nats_config(server.url());
+    let model = harnx_runtime::test_utils::MockClient::builder()
+        .build()
+        .model()
+        .clone();
+    config.clients = vec![harnx_runtime::client::ClientConfig::Unknown];
+    config.model = model.clone();
+
+    // Create an agent file for test-agent with the model set
+    let temp_dir = tempfile::tempdir()?;
+    let agents_dir = temp_dir.path().join("agents");
+    std::fs::create_dir_all(&agents_dir)?;
+    let agent_file = agents_dir.join("test-agent.md");
+    std::fs::write(
+        &agent_file,
+        format!(
+            r#"---
+model: {}
+---
+You are a test agent."#,
+            model.id()
+        ),
+    )?;
+
+    let prev_config_dir = std::env::var("HARNX_CONFIG_DIR").ok();
+    unsafe {
+        std::env::set_var("HARNX_CONFIG_DIR", temp_dir.path());
+    }
+    let _guard = scopeguard::guard(prev_config_dir, |prev| match prev {
+        Some(v) => unsafe {
+            std::env::set_var("HARNX_CONFIG_DIR", v);
+        },
+        None => unsafe {
+            std::env::remove_var("HARNX_CONFIG_DIR");
+        },
+    });
+
     let jetstream = config.nats_jetstream("local").await?;
     let session_id = new_session_id();
 
-    // Seed session metadata with model override
+    // Seed session metadata for a named agent
     let metadata_store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let mut metadata = SessionMetadata::new(
+    let metadata = SessionMetadata::new(
         &session_id,
         SessionInitializer::named("test-agent", Default::default()),
     );
-    metadata.overrides.model = Some("test-model-id".into());
-    metadata.title.value = Some("Test Session Title".into());
     metadata_store.create(&metadata).await?;
 
     // Seed entries with user and assistant messages
@@ -307,22 +345,53 @@ async fn load_session_for_render_reconstructs_session_with_model_and_tokens() ->
     })
     .await?;
 
-    // Load session using a minimal config (no real agent config needed for this test)
-    // This tests the entry loading and reconstruction path
-    let raw = log.load_events_async().await?;
-    let entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)?;
+    // Call load_session_for_render directly
+    let session =
+        load_session_for_render(&config, Some("local"), &session_id, "test-agent").await?;
 
-    // Verify entries reconstructed correctly
-    // Note: TurnEnd may be filtered out by reconstruction logic
+    // Verify session has correct model
+    assert_eq!(session.model_id, model.id());
+
+    // Verify messages were reconstructed
+    assert_eq!(session.messages.len(), 2, "should have 2 messages");
+
+    // Verify we can render the session
+    let rendered = harnx_runtime::config::session::render(&session)?;
     assert!(
-        entries.len() >= 2,
-        "should have at least 2 entries (messages)"
+        rendered.contains(&model.id()) || rendered.contains("model"),
+        "rendered session should contain model info: {rendered}"
     );
 
-    // Verify we can render metadata
-    let yaml = render_metadata_yaml(&metadata)?;
-    assert!(yaml.contains("model: test-model-id"), "yaml: {yaml}");
-    // Note: title may be rendered differently depending on metadata format
+    Ok(())
+}
+
+/// Test `load_session_for_render` returns error for nonexistent agent.
+#[tokio::test]
+async fn load_session_for_render_errors_for_nonexistent_agent() -> Result<()> {
+    use harnx_runtime::config::load_session_for_render;
+
+    require_nextest();
+
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+
+    let config = local_nats_config(server.url());
+    let jetstream = config.nats_jetstream("local").await?;
+    let session_id = new_session_id();
+
+    // Seed session metadata for "test-agent"
+    let metadata_store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let metadata = SessionMetadata::new(
+        &session_id,
+        SessionInitializer::named("test-agent", Default::default()),
+    );
+    metadata_store.create(&metadata).await?;
+
+    // Try to load with wrong agent name - should error
+    let result =
+        load_session_for_render(&config, Some("local"), &session_id, "nonexistent-agent").await;
+    assert!(result.is_err(), "should error for nonexistent agent");
 
     Ok(())
 }

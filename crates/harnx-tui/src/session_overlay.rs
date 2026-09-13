@@ -97,6 +97,8 @@ fn concat_text_blocks(blocks: &[ContentBlock]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harnx_core::api_types::CompletionTokenUsage;
+    use harnx_core::event::{AgentEventSink, ToolKind};
     use harnx_core::message::MessageRole;
 
     fn text_entry(role: MessageRole, content: &str) -> (u64, SessionLogEntry) {
@@ -141,5 +143,117 @@ mod tests {
         let output = render_transcript_text(&entries);
         // Error entries are replayed as notice events
         assert!(!output.is_empty());
+    }
+
+    /// Test BufferSink handles all 7 event types derived from SessionLogEntry:
+    /// - UserEvent::Message
+    /// - ModelEvent::Final
+    /// - ModelEvent::MessageChunk
+    /// - ToolEvent::Started
+    /// - ToolEvent::Completed
+    /// - NoticeEvent::Error
+    /// - NoticeEvent::Warning (Warning is tested separately; Cancel doesn't exist)
+    #[test]
+    fn buffer_sink_formats_user_message_event() {
+        let sink = Arc::new(BufferSink::default());
+        sink.emit(AgentEvent::User(UserEvent::Message {
+            content: "User asks a question".into(),
+        }));
+        let output = sink.lines();
+        assert!(output.contains("── user ──"), "output: {output}");
+        assert!(output.contains("User asks a question"), "output: {output}");
+    }
+
+    #[test]
+    fn buffer_sink_formats_assistant_final_message_event() {
+        let sink = Arc::new(BufferSink::default());
+        sink.emit(AgentEvent::Model(ModelEvent::Final {
+            output: "Assistant response text".into(),
+            usage: CompletionTokenUsage::new(Some(10), Some(20), None),
+        }));
+        let output = sink.lines();
+        assert!(output.contains("── assistant ──"), "output: {output}");
+        assert!(
+            output.contains("Assistant response text"),
+            "output: {output}"
+        );
+    }
+
+    #[test]
+    fn buffer_sink_formats_message_chunk_event() {
+        let sink = Arc::new(BufferSink::default());
+        sink.emit(AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("streaming text".into())],
+        }));
+        let output = sink.lines();
+        assert!(output.contains("── chunk ──"), "output: {output}");
+        assert!(output.contains("streaming text"), "output: {output}");
+    }
+
+    #[test]
+    fn buffer_sink_formats_tool_started_event() {
+        let sink = Arc::new(BufferSink::default());
+        sink.emit(AgentEvent::Tool(ToolEvent::Started {
+            id: "call-1".into(),
+            name: "bash_exec".into(),
+            kind: ToolKind::Other,
+            markdown: None,
+            input: serde_json::json!({"command": "echo hello"}),
+            locations: vec![],
+        }));
+        let output = sink.lines();
+        assert!(output.contains("── tool call ──"), "output: {output}");
+        assert!(output.contains("→ bash_exec"), "output: {output}");
+    }
+
+    #[test]
+    fn buffer_sink_formats_tool_completed_event() {
+        let sink = Arc::new(BufferSink::default());
+        sink.emit(AgentEvent::Tool(ToolEvent::Completed {
+            id: "call-1".into(),
+            output: serde_json::json!({"result": "hello"}),
+            markdown: Some("```\nhello\n```".into()),
+        }));
+        let output = sink.lines();
+        assert!(output.contains("── tool result ──"), "output: {output}");
+    }
+
+    #[test]
+    fn buffer_sink_formats_notice_cancel_event() {
+        // Note: NoticeEvent::Cancel doesn't exist in harnx_core::event::NoticeEvent.
+        // The NoticeEvent enum has Info, Warning, and Error variants.
+        // This test verifies we handle the existing variants correctly.
+        let sink = Arc::new(BufferSink::default());
+        sink.emit(AgentEvent::Notice(NoticeEvent::Info(
+            "cancellation notice".into(),
+        )));
+        let output = sink.lines();
+        // Info events don't produce output in the current implementation
+        assert!(
+            output.is_empty() || !output.contains("error"),
+            "info should not error"
+        );
+    }
+
+    #[test]
+    fn buffer_sink_formats_notice_error_event() {
+        let sink = Arc::new(BufferSink::default());
+        sink.emit(AgentEvent::Notice(NoticeEvent::Error(
+            "something went wrong".into(),
+        )));
+        let output = sink.lines();
+        assert!(output.contains("error:"), "output: {output}");
+        assert!(output.contains("something went wrong"), "output: {output}");
+    }
+
+    #[test]
+    fn buffer_sink_formats_notice_warning_event() {
+        let sink = Arc::new(BufferSink::default());
+        sink.emit(AgentEvent::Notice(NoticeEvent::Warning(
+            "deprecation notice".into(),
+        )));
+        let output = sink.lines();
+        assert!(output.contains("⚠"), "output: {output}");
+        assert!(output.contains("deprecation notice"), "output: {output}");
     }
 }

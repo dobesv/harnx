@@ -2151,7 +2151,15 @@ impl Tui {
         let cfg = self.config.read();
         match positional.len() {
             0 => {
-                let agent_name = cfg.agent.as_ref().map(|x| x.name().to_string());
+                let agent_name = cfg
+                    .agent
+                    .as_ref()
+                    .map(|x| x.name().to_string())
+                    .or_else(|| {
+                        cfg.session
+                            .as_ref()
+                            .and_then(|s| s.agent_name().map(str::to_string))
+                    });
                 let session_id = cfg
                     .session
                     .as_ref()
