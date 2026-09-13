@@ -17,7 +17,10 @@ pub use harnx_core::safety as mcp_safety;
 pub use harnx_runtime::{client, commands, config, tool};
 pub use harnx_tui as tui;
 
-use crate::cli::{Cli, Commands, DeleteSessionArgs, InfoSubcommands, SessionSubcommands};
+use crate::cli::{
+    Cli, Commands, DeleteSessionArgs, DeleteSubcommands, DumpSubcommands, InfoSubcommands,
+    ListSubcommands,
+};
 use crate::client::{list_models, ModelType};
 use crate::config::{
     list_agents, list_assistant_agents, load_env_file, macro_execute, render_agent_dump, Config,
@@ -41,22 +44,22 @@ fn invocation_limit_reached(error: &anyhow::Error) -> bool {
     error.is::<oneshot_nats::InvocationLimitReached>()
 }
 
-/// Routing decision for `--list-sessions` handler.
+/// Routing decision for `list sessions` handler.
 /// Extracted as a pure function for testability.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ListSessionsTarget {
+enum ListSessionsTarget {
     /// List sessions from the shared local NATS cluster.
     Local,
     /// List sessions from a remote NATS cluster.
     Remote { cluster: String },
 }
 
-/// Pure routing decision for `--list-sessions`.
+/// Pure routing decision for `list sessions`.
 /// Given the remote agent context, returns whether to list local or remote sessions.
 ///
 /// This function encapsulates the branch selection logic so it can be unit-tested
 /// without requiring a live NATS cluster or mocking async I/O.
-pub fn resolve_list_sessions_target(remote_agent: Option<&(String, String)>) -> ListSessionsTarget {
+fn resolve_list_sessions_target(remote_agent: Option<&(String, String)>) -> ListSessionsTarget {
     match remote_agent {
         Some((_, cluster)) => ListSessionsTarget::Remote {
             cluster: cluster.clone(),
@@ -67,7 +70,7 @@ pub fn resolve_list_sessions_target(remote_agent: Option<&(String, String)>) -> 
 
 /// Format session metadata as one ID per line.
 /// This helper is extracted for testability without touching stdout.
-pub fn format_sessions_for_output(sessions: &[SessionMeta]) -> String {
+fn format_sessions_for_output(sessions: &[SessionMeta]) -> String {
     let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
     ids.join("\n")
 }
@@ -76,7 +79,7 @@ pub fn format_sessions_for_output(sessions: &[SessionMeta]) -> String {
 /// This pure helper enables unit-testing the error-propagation path without
 /// mocking the async NATS client or relying on assertion side-effects.
 #[derive(Debug, PartialEq, Eq)]
-pub enum ListSessionsOutcome {
+enum ListSessionsOutcome {
     /// Sessions fetched successfully; output to be printed to stdout.
     Print(String),
     /// Remote fetch failed; error message for stderr and non-zero exit.
@@ -89,7 +92,7 @@ pub enum ListSessionsOutcome {
 ///
 /// This helper exists to make error-propagation genuinely testable.
 /// The handler calls this and then performs the actual println/eprintln/return-Err.
-pub fn remote_list_outcome(result: Result<Vec<SessionMeta>, anyhow::Error>) -> ListSessionsOutcome {
+fn remote_list_outcome(result: Result<Vec<SessionMeta>, anyhow::Error>) -> ListSessionsOutcome {
     match result {
         Ok(sessions) => ListSessionsOutcome::Print(format_sessions_for_output(&sessions)),
         Err(e) => ListSessionsOutcome::Error(format!("{e:#}")),
@@ -123,7 +126,12 @@ async fn main() -> Result<std::process::ExitCode> {
 
 async fn run_main(cli: Cli) -> Result<Option<anyhow::Error>> {
     match &cli.command {
-        Some(command @ (Commands::Info(_) | Commands::Session(_))) => {
+        Some(
+            command @ (Commands::Info(_)
+            | Commands::Dump(_)
+            | Commands::Delete(_)
+            | Commands::List(_)),
+        ) => {
             run_command(command).await?;
             return Ok(None);
         }
@@ -143,35 +151,179 @@ async fn run_main(cli: Cli) -> Result<Option<anyhow::Error>> {
 async fn run_command(command: &Commands) -> Result<()> {
     match command {
         Commands::Prompt(_) => bail!("prompt commands use the one-shot execution path"),
-        Commands::Info(info_args) => match &info_args.command {
-            InfoSubcommands::Agent { name } => {
-                let config = Config::init(WorkingMode::Cmd, true).await?;
-                let out = render_agent_dump(&config, name)?;
-                println!("{out}");
-                Ok(())
-            }
-            InfoSubcommands::Session {
-                agent_name,
-                session_id,
-            } => {
-                let config = Config::init(WorkingMode::Cmd, true).await?;
-                let out = harnx_runtime::config::render_session_dump_for_agent(
-                    &config,
-                    harnx_runtime::config::LOCAL_CLUSTER_KEY,
-                    session_id,
-                    Some(agent_name),
-                )
-                .await?;
-                println!("{out}");
-                Ok(())
-            }
-        },
-        Commands::Session(session_args) => match &session_args.command {
-            SessionSubcommands::Delete(delete_args) => {
-                run_session_delete_command(delete_args).await
-            }
-        },
+        Commands::Info(info_args) => run_info_command(info_args).await,
+        Commands::Dump(dump_args) => run_dump_command(dump_args).await,
+        Commands::Delete(delete_args) => run_delete_command(delete_args).await,
+        Commands::List(list_args) => run_list_command(list_args).await,
     }
+}
+
+async fn run_info_command(info_args: &crate::cli::InfoArgs) -> Result<()> {
+    match &info_args.command {
+        InfoSubcommands::Agent { name } => {
+            let config = Config::init(WorkingMode::Cmd, true).await?;
+            let out = render_agent_dump(&config, name)?;
+            println!("{out}");
+            Ok(())
+        }
+        InfoSubcommands::Session {
+            agent_name,
+            session_id,
+            format,
+        } => run_info_session(agent_name, session_id, format).await,
+    }
+}
+
+async fn run_info_session(
+    agent_name: &str,
+    session_id: &str,
+    format: &harnx_runtime::config::SessionFormat,
+) -> Result<()> {
+    use harnx_runtime::config::SessionFormat;
+    let config = Config::init(WorkingMode::Cmd, true).await?;
+    match format {
+        SessionFormat::Text => {
+            let session = harnx_runtime::config::load_session_for_render(
+                &config, None, session_id, agent_name,
+            )
+            .await?;
+            let out = harnx_runtime::config::session::render(&session)?;
+            println!("{out}");
+        }
+        SessionFormat::Yaml | SessionFormat::Json => {
+            let metadata = fetch_session_metadata(&config, session_id, agent_name).await?;
+            let out = match format {
+                SessionFormat::Yaml => harnx_runtime::config::render_metadata_yaml(&metadata)?,
+                SessionFormat::Json => harnx_runtime::config::render_metadata_json(&metadata)?,
+                SessionFormat::Text => unreachable!(),
+            };
+            println!("{out}");
+        }
+    }
+    Ok(())
+}
+
+async fn fetch_session_metadata(
+    config: &Config,
+    session_id: &str,
+    agent_name: &str,
+) -> Result<harnx_runtime::nats_session_metadata::SessionMetadata> {
+    let jetstream = config
+        .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+        .await?;
+    let store =
+        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let record = store
+        .get_for_agent(session_id, agent_name)
+        .await?
+        .with_context(|| format!("Session '{session_id}' for agent '{agent_name}' not found"))?;
+    Ok(record.metadata)
+}
+
+async fn run_dump_command(dump_args: &crate::cli::DumpArgs) -> Result<()> {
+    match &dump_args.command {
+        DumpSubcommands::Session {
+            agent_name,
+            session_id,
+            format,
+            follow,
+        } => {
+            if *follow {
+                bail!("--follow is not yet implemented");
+            }
+            use harnx_runtime::config::SessionFormat;
+            let config = Config::init(WorkingMode::Cmd, true).await?;
+
+            // Validate session exists for this agent
+            let jetstream = config
+                .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+                .await?;
+            let store =
+                harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+                    .await?;
+            store
+                .get_for_agent(session_id, agent_name)
+                .await?
+                .with_context(|| {
+                    format!(
+                        "Session '{}' for agent '{}' not found",
+                        session_id, agent_name
+                    )
+                })?;
+
+            // Load raw entries and reconstruct
+            let log = harnx_runtime::nats_session_log::NatsSessionLog::new(
+                jetstream,
+                session_id.to_string(),
+            );
+            let raw = log.load_events_async().await?;
+            let entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)?;
+
+            match format {
+                SessionFormat::Text => {
+                    // Build CliAgentEventSink and replay entries
+                    use crate::cli_event_sink::CliAgentEventSink;
+                    use harnx_core::abort::create_abort_signal;
+                    use harnx_render::RenderOptions;
+                    let render_options = RenderOptions::default();
+                    let abort_signal = create_abort_signal();
+                    let sink =
+                        Arc::new(CliAgentEventSink::new(false, render_options, abort_signal));
+                    harnx_runtime::replay_entries_to_sink(&entries, sink);
+                }
+                SessionFormat::Yaml => {
+                    let out =
+                        harnx_runtime::config::dump_entries_yaml(entries.iter().map(|(_, e)| e))?;
+                    print!("{out}");
+                }
+                SessionFormat::Json => {
+                    let out =
+                        harnx_runtime::config::dump_entries_jsonl(entries.iter().map(|(_, e)| e))?;
+                    print!("{out}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn run_delete_command(delete_args: &crate::cli::DeleteArgs) -> Result<()> {
+    match &delete_args.command {
+        DeleteSubcommands::Session(args) => run_session_delete_command(args).await,
+    }
+}
+
+async fn run_list_command(list_args: &crate::cli::ListArgs) -> Result<()> {
+    match &list_args.command {
+        ListSubcommands::Sessions => run_list_sessions().await,
+    }
+}
+
+async fn run_list_sessions() -> Result<()> {
+    let config = Config::init(WorkingMode::Cmd, true).await?;
+
+    let target = resolve_list_sessions_target(config.remote_agent.as_ref());
+    match target {
+        ListSessionsTarget::Remote { cluster } => {
+            let result = config.list_remote_sessions_with_meta(&cluster).await;
+            match remote_list_outcome(result) {
+                ListSessionsOutcome::Print(output) => {
+                    println!("{output}");
+                }
+                ListSessionsOutcome::Error(msg) => {
+                    eprintln!("error: could not list sessions for cluster '{cluster}': {msg}");
+                    return Err(anyhow::anyhow!("{msg}"));
+                }
+            }
+        }
+        ListSessionsTarget::Local => {
+            let sessions = config
+                .list_remote_sessions_with_meta(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+                .await?;
+            println!("{}", format_sessions_for_output(&sessions));
+        }
+    }
+    Ok(())
 }
 
 async fn run_session_delete_command(delete_args: &DeleteSessionArgs) -> Result<()> {
@@ -210,22 +362,10 @@ fn legacy_info_flag(cli: &Cli) -> bool {
         || cli.list_assistant_agents
         || cli.list_rags
         || cli.list_macros
-        || cli.list_sessions
-}
-
-async fn resolve_session_arg(
-    config: &GlobalConfig,
-    session: Option<&Option<String>>,
-) -> Result<Option<String>> {
-    match session {
-        None => Ok(None),
-        Some(Some(session_id)) => Ok(Some(session_id.clone())),
-        Some(None) => Config::reserve_new_session_id(config).await.map(Some),
-    }
 }
 
 fn command_only_needs_supplied_session(cli: &Cli) -> bool {
-    cli.list_sessions || cli.info
+    cli.info
 }
 
 async fn apply_session_arg(config: &GlobalConfig, cli: &Cli) -> Result<()> {
@@ -235,9 +375,10 @@ async fn apply_session_arg(config: &GlobalConfig, cli: &Cli) -> Result<()> {
     if session.is_none() && command_only_needs_supplied_session(cli) {
         return Ok(());
     }
-    let session = resolve_session_arg(config, Some(session))
-        .await?
-        .expect("a supplied session argument always resolves");
+    let session = match session {
+        Some(s) => s.clone(),
+        None => Config::reserve_new_session_id(config).await?,
+    };
     config.write().use_session(Some(&session))
 }
 
@@ -381,35 +522,6 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         if let Some(rag) = &cli.rag {
             Config::use_rag(&config, Some(rag), abort_signal.clone()).await?;
         }
-    }
-    if cli.list_sessions {
-        // Use the pure routing decision function for branch selection.
-        // This logic is now unit-testable via resolve_list_sessions_target.
-        let target = resolve_list_sessions_target(config.read().remote_agent.as_ref());
-        match target {
-            ListSessionsTarget::Remote { cluster } => {
-                // Clone config to avoid holding lock across await
-                let cfg = config.read().clone();
-                let result = cfg.list_remote_sessions_with_meta(&cluster).await;
-                match remote_list_outcome(result) {
-                    ListSessionsOutcome::Print(output) => {
-                        println!("{output}");
-                    }
-                    ListSessionsOutcome::Error(msg) => {
-                        eprintln!("error: could not list sessions for cluster '{cluster}': {msg}");
-                        return Err(anyhow::anyhow!("{msg}"));
-                    }
-                }
-            }
-            ListSessionsTarget::Local => {
-                let cfg = config.read().clone();
-                let sessions = cfg
-                    .list_remote_sessions_with_meta(harnx_runtime::config::LOCAL_CLUSTER_KEY)
-                    .await?;
-                println!("{}", format_sessions_for_output(&sessions));
-            }
-        }
-        return Ok(());
     }
     if let Some(model_id) = &cli.model {
         config.write().set_model(model_id)?;

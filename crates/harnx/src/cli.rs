@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use harnx_runtime::config::SessionFormat;
 use is_terminal::IsTerminal;
 use std::io::{stdin, Read};
 
@@ -76,9 +77,6 @@ pub struct Cli {
     /// List all available chat models
     #[clap(long, global = true, hide = true)]
     pub list_models: bool,
-    /// List all sessions
-    #[clap(long, global = true, hide = true)]
-    pub list_sessions: bool,
     /// List all agents
     #[clap(long, global = true, hide = true)]
     pub list_agents: bool,
@@ -111,8 +109,12 @@ pub enum Commands {
     Prompt(PromptArgs),
     /// Inspect harnx state
     Info(InfoArgs),
-    /// Session management commands
-    Session(SessionArgs),
+    /// Dump session transcript (full history)
+    Dump(DumpArgs),
+    /// Delete resources
+    Delete(DeleteArgs),
+    /// List resources
+    List(ListArgs),
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -123,15 +125,15 @@ pub struct PromptArgs {
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
-pub struct SessionArgs {
+pub struct DeleteArgs {
     #[command(subcommand)]
-    pub command: SessionSubcommands,
+    pub command: DeleteSubcommands,
 }
 
 #[derive(Subcommand, Debug, PartialEq, Eq)]
-pub enum SessionSubcommands {
-    /// Delete remote NATS session log stream + lease key for a cluster
-    Delete(DeleteSessionArgs),
+pub enum DeleteSubcommands {
+    /// Delete a remote NATS session log stream + lease key
+    Session(DeleteSessionArgs),
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -140,6 +142,39 @@ pub struct DeleteSessionArgs {
     /// Cluster key from nats_servers/<name>.yaml
     #[arg(long)]
     pub cluster: String,
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct ListArgs {
+    #[command(subcommand)]
+    pub command: ListSubcommands,
+}
+
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+pub enum ListSubcommands {
+    /// List sessions (local or remote based on --agent context)
+    Sessions,
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct DumpArgs {
+    #[command(subcommand)]
+    pub command: DumpSubcommands,
+}
+
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+pub enum DumpSubcommands {
+    /// Dump session transcript entries
+    Session {
+        agent_name: String,
+        session_id: String,
+        /// Output format: text (human-readable), yaml (--- documents), json (JSONL)
+        #[arg(long, default_value = "text")]
+        format: SessionFormat,
+        /// Follow live updates (stream mode)
+        #[arg(long)]
+        follow: bool,
+    },
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -152,10 +187,13 @@ pub struct InfoArgs {
 pub enum InfoSubcommands {
     /// Print fully-rendered agent markdown
     Agent { name: String },
-    /// Print saved session state
+    /// Print saved session metadata (no transcript)
     Session {
         agent_name: String,
         session_id: String,
+        /// Output format: text (human-readable), yaml, json
+        #[arg(long, default_value = "text")]
+        format: SessionFormat,
     },
 }
 
@@ -172,72 +210,167 @@ impl Cli {
             _ => &self.text,
         };
         if text_args.is_empty() {
-            if stdin_text.is_empty() {
+            let trimmed = stdin_text.trim();
+            if trimmed.is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(stdin_text))
-            }
-        } else if self.macro_name.is_some() {
-            let text = text_args
-                .iter()
-                .map(|v| shell_words::quote(v))
-                .collect::<Vec<_>>()
-                .join(" ");
-            if stdin_text.is_empty() {
-                Ok(Some(text))
-            } else {
-                Ok(Some(format!("{text} -- {stdin_text}")))
+                Ok(Some(trimmed.to_string()))
             }
         } else {
-            let text = text_args.join(" ");
-            if stdin_text.is_empty() {
-                Ok(Some(text))
-            } else {
-                Ok(Some(format!("{text}\n{stdin_text}")))
-            }
+            Ok(Some(text_args.join(" ")))
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, InfoSubcommands, SessionSubcommands};
-    use clap::{CommandFactory, Parser};
+    use super::*;
 
-    #[test]
-    fn parses_info_agent_subcommand() {
-        let cli = Cli::try_parse_from(["harnx", "info", "agent", "foo"]).unwrap();
-        assert_eq!(
-            cli.command,
-            Some(Commands::Info(super::InfoArgs {
-                command: InfoSubcommands::Agent {
-                    name: "foo".to_string(),
-                },
-            }))
-        );
+    fn assert_info_agent(cli: Cli, expected: &str) {
+        match cli.command {
+            Some(Commands::Info(args)) => match args.command {
+                InfoSubcommands::Agent { name } => {
+                    assert_eq!(name, expected);
+                }
+                _ => panic!("unexpected info subcommand"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    fn assert_info_session(
+        cli: Cli,
+        expected_agent: &str,
+        expected_session: &str,
+        expected_format: SessionFormat,
+    ) {
+        match cli.command {
+            Some(Commands::Info(args)) => match args.command {
+                InfoSubcommands::Session {
+                    agent_name,
+                    session_id,
+                    format,
+                } => {
+                    assert_eq!(agent_name, expected_agent);
+                    assert_eq!(session_id, expected_session);
+                    assert_eq!(format, expected_format);
+                }
+                _ => panic!("unexpected info subcommand"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]
-    fn parses_legacy_flat_flag() {
-        let cli = Cli::try_parse_from(["harnx", "--list-agents"]).unwrap();
-        assert!(cli.command.is_none());
-        assert!(cli.list_agents);
+    fn parses_info_agent() {
+        let cli = Cli::try_parse_from(["harnx", "info", "agent", "example-agent"]).unwrap();
+        assert_info_agent(cli, "example-agent");
     }
 
     #[test]
-    fn parses_session_delete_subcommand() {
+    fn parses_info_session_default_format() {
         let cli =
-            Cli::try_parse_from(["harnx", "session", "delete", "sess-1", "--cluster", "local"])
+            Cli::try_parse_from(["harnx", "info", "session", "my-agent", "sess-123"]).unwrap();
+        assert_info_session(cli, "my-agent", "sess-123", SessionFormat::Text);
+    }
+
+    #[test]
+    fn parses_info_session_yaml_format() {
+        let cli = Cli::try_parse_from([
+            "harnx", "info", "session", "my-agent", "sess-123", "--format", "yaml",
+        ])
+        .unwrap();
+        assert_info_session(cli, "my-agent", "sess-123", SessionFormat::Yaml);
+    }
+
+    #[test]
+    fn parses_dump_session_with_format_and_follow() {
+        let cli = Cli::try_parse_from([
+            "harnx", "dump", "session", "a", "id", "--format", "json", "--follow",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Dump(args)) => match args.command {
+                DumpSubcommands::Session {
+                    agent_name,
+                    session_id,
+                    format,
+                    follow,
+                } => {
+                    assert_eq!(agent_name, "a");
+                    assert_eq!(session_id, "id");
+                    assert_eq!(format, SessionFormat::Json);
+                    assert!(follow);
+                }
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_delete_session() {
+        let cli =
+            Cli::try_parse_from(["harnx", "delete", "session", "sess-1", "--cluster", "local"])
                 .unwrap();
         match cli.command {
-            Some(Commands::Session(args)) => match args.command {
-                SessionSubcommands::Delete(delete) => {
+            Some(Commands::Delete(args)) => match args.command {
+                DeleteSubcommands::Session(delete) => {
                     assert_eq!(delete.session_id, "sess-1");
                     assert_eq!(delete.cluster, "local");
                 }
             },
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_list_sessions() {
+        let cli = Cli::try_parse_from(["harnx", "list", "sessions"]).unwrap();
+        match cli.command {
+            Some(Commands::List(args)) => match args.command {
+                ListSubcommands::Sessions => {}
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_old_session_delete_syntax() {
+        // Old syntax: harnx session delete <id> --cluster <cluster>
+        let result =
+            Cli::try_parse_from(["harnx", "session", "delete", "sess-1", "--cluster", "local"]);
+        assert!(
+            result.is_err(),
+            "Old session delete syntax should be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_old_list_sessions_flag() {
+        // Old syntax: harnx --list-sessions
+        let result = Cli::try_parse_from(["harnx", "--list-sessions"]);
+        assert!(
+            result.is_err(),
+            "Old --list-sessions flag should be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_format_with_short_f() {
+        // `-f` should parse as --file, not --format
+        let result = Cli::try_parse_from(["harnx", "dump", "session", "a", "id", "-f", "json"]);
+        // Should either error or parse `json` as a file, not as format
+        if let Ok(cli) = result {
+            if let Some(Commands::Dump(args)) = cli.command {
+                let DumpSubcommands::Session { format, .. } = args.command;
+                // If it parses, -f was interpreted as --file, not --format
+                // format should still be Text (default)
+                assert_eq!(format, SessionFormat::Text);
+                // And file should contain "json"
+                assert!(cli.file.contains(&"json".to_string()));
+            }
+        }
+        // Either it errors, or -f is treated as file (not format)
     }
 
     #[test]
@@ -310,6 +443,7 @@ mod tests {
 
     #[test]
     fn prompt_help_exposes_invocation_limits() {
+        use clap::CommandFactory;
         let mut command = Cli::command();
         command.build();
         let help = command
