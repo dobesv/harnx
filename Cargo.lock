@@ -4541,6 +4541,7 @@ dependencies = [
  "metrics-util",
  "opentelemetry",
  "rmcp",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

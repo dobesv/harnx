@@ -178,11 +178,38 @@ pub trait Toolset: Send + Sync {
         self.invoke(&invocation.tool, invocation.args, invocation.cancel)
             .await
     }
+
+    /// Permit a replacement server to own this invocation and call `replay`.
+    /// Stateful tools override both methods to recover their original durable
+    /// job; the default policy uses the tool server's repetition hints.
+    fn can_replay(&self, tool: &str) -> bool {
+        self.tools()
+            .iter()
+            .any(|spec| spec.name == tool && (spec.idempotent_hint || spec.read_only_hint))
+    }
+
+    /// Recover the original invocation after its caller/worker restarted.
+    /// The invocation identity is unchanged. Implementations may reconnect to a
+    /// durable job; they must not start another non-idempotent operation.
+    /// The default retries only tools whose advertised hints permit repetition.
+    async fn replay(&self, invocation: ToolInvocation) -> Result<Value, ToolInvokeError> {
+        if self.can_replay(&invocation.tool) {
+            self.invoke_with_context(invocation).await
+        } else {
+            Err(ToolInvokeError::Recoverable(
+                "tool response lost (session was interrupted before results were persisted); this tool cannot replay the interrupted operation".into(),
+            ))
+        }
+    }
 }
 
 /// Request body for one tool invocation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRequest {
+    /// A replay is attested by the current parent execution owner. It preserves
+    /// call_id/operation_id and never silently falls through to normal invoke.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<harnx_execution_control::Owner>,
     pub operation_id: String,
     pub call_id: String,
     pub tool: String,
@@ -389,6 +416,7 @@ mod tests {
     fn wire_types_round_trip_through_serde() {
         assert_round_trip(tool_spec());
         assert_round_trip(ToolRequest {
+            replay: None,
             operation_id: "call-1".to_string(),
             call_id: "call-1".to_string(),
             tool: "time_now".to_string(),
