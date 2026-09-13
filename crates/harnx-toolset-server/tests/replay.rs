@@ -164,31 +164,31 @@ async fn tool_server_rejects_non_retryable_replay_without_invoking() -> Result<(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_parent_cannot_replay_work() -> Result<()> {
-    let mut toolset = common::TestToolset::default();
-    toolset.idempotent = true;
-    let mut harness = TestHarness::with_toolset(toolset)
-        .await?
-        .context("nats-server required")?;
-    let (_, mut request) = interrupted_call(&harness, "echo").await?;
-    request.replay = Some(Owner {
-        instance_id: "old-worker".into(),
-        fence: 1,
-    });
-    assert!(replay(&harness, &request).await?.result.is_err());
-    assert_eq!(harness.toolset.echo_invocations.load(Ordering::SeqCst), 0);
-    harness.shutdown().await;
-    Ok(())
+    assert_replay_rejected(|request| {
+        request.replay = Some(Owner {
+            instance_id: "old-worker".into(),
+            fence: 1,
+        });
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replay_cannot_change_original_arguments() -> Result<()> {
+    assert_replay_rejected(|request| {
+        request.args = json!({"value": "different operation"});
+    })
+    .await
+}
+
+async fn assert_replay_rejected(change: impl FnOnce(&mut ToolRequest)) -> Result<()> {
     let mut toolset = common::TestToolset::default();
     toolset.idempotent = true;
     let mut harness = TestHarness::with_toolset(toolset)
         .await?
         .context("nats-server required")?;
     let (_, mut request) = interrupted_call(&harness, "echo").await?;
-    request.args = json!({"value": "different operation"});
+    change(&mut request);
     assert!(replay(&harness, &request).await?.result.is_err());
     assert_eq!(harness.toolset.echo_invocations.load(Ordering::SeqCst), 0);
     harness.shutdown().await;

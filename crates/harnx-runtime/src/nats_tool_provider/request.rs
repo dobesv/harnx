@@ -1,6 +1,12 @@
 //! Encoding, journaling and decoding one NATS tool invocation.
 use super::*;
 
+pub(super) struct ToolCallInput<'a> {
+    pub name: &'a str,
+    pub arguments: Value,
+    pub id: Option<&'a str>,
+}
+
 impl NatsToolProvider {
     pub(super) fn prepare_request(
         &self,
@@ -54,19 +60,18 @@ impl NatsToolProvider {
 
     pub(super) async fn call_registered_tool(
         &self,
-        tool_name: &str,
-        arguments: Value,
-        tool_call_id: Option<&str>,
+        call: ToolCallInput<'_>,
         abort: &AbortSignal,
     ) -> Result<ToolProviderOutput, ToolError> {
-        let Some(route) = self.resolve_route(tool_name) else {
+        let Some(route) = self.resolve_route(call.name) else {
             return Err(ToolError::Recoverable(anyhow!(
-                "NATS tool is not registered: {tool_name}"
+                "NATS tool is not registered: {}",
+                call.name
             )));
         };
-        let pending = self.prepare_request(arguments, &route, tool_call_id)?;
+        let pending = self.prepare_request(call.arguments, &route, call.id)?;
         let call_id = pending.call_id.clone();
-        self.record_invocation(&pending.durable, tool_name, &route.server)
+        self.record_invocation(&pending.durable, call.name, &route.server)
             .await
             .map_err(ToolError::Fatal)?;
         self.register_operation(&call_id)

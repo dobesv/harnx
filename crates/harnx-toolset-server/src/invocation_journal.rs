@@ -178,30 +178,41 @@ impl InvocationJournal {
         field: impl Fn(&mut RecordedInvocation) -> &mut Option<T>,
     ) -> Result<T> {
         loop {
-            let entry = self
-                .0
-                .entry(&key)
-                .await?
-                .context("durable tool invocation missing")?;
-            ensure!(
-                entry.operation == kv::Operation::Put,
-                "tool invocation was deleted"
-            );
-            let mut record: RecordedInvocation = serde_json::from_slice(&entry.value)?;
-            let slot = field(&mut record);
-            if let Some(existing) = slot {
-                return Ok(existing.clone());
+            if let Some(saved) = self.try_first_value(&key, &value, &field).await? {
+                return Ok(saved);
             }
-            *slot = Some(value.clone());
-            match self
-                .0
-                .update(&key, serde_json::to_vec(&record)?.into(), entry.revision)
-                .await
-            {
-                Ok(_) => return Ok(value),
-                Err(error) if error.kind() == kv::UpdateErrorKind::WrongLastRevision => {}
-                Err(error) => return Err(error).context("persist tool invocation state"),
-            }
+        }
+    }
+
+    async fn try_first_value<T: Clone>(
+        &self,
+        key: &str,
+        value: &T,
+        field: &impl Fn(&mut RecordedInvocation) -> &mut Option<T>,
+    ) -> Result<Option<T>> {
+        let entry = self
+            .0
+            .entry(key)
+            .await?
+            .context("durable tool invocation missing")?;
+        ensure!(
+            entry.operation == kv::Operation::Put,
+            "tool invocation was deleted"
+        );
+        let mut record: RecordedInvocation = serde_json::from_slice(&entry.value)?;
+        let slot = field(&mut record);
+        if let Some(existing) = slot {
+            return Ok(Some(existing.clone()));
+        }
+        *slot = Some(value.clone());
+        match self
+            .0
+            .update(key, serde_json::to_vec(&record)?.into(), entry.revision)
+            .await
+        {
+            Ok(_) => Ok(Some(value.clone())),
+            Err(error) if error.kind() == kv::UpdateErrorKind::WrongLastRevision => Ok(None),
+            Err(error) => Err(error).context("persist tool invocation state"),
         }
     }
 

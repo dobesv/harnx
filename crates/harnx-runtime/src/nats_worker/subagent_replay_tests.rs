@@ -59,30 +59,7 @@ async fn detached_delegation(
             .await?;
     }
     let log = NatsSessionLog::new(js.clone(), PARENT);
-    let tool_round = log
-        .append_event_async(&SessionLogEntry::ToolCalls {
-            text: "delegating".into(),
-            thought: None,
-            calls: vec![ToolCall::new(
-                "metis_session_prompt".into(),
-                json!({"session_id": CHILD, "message": "finish child work"}),
-                Some(CALL.into()),
-                None,
-            )],
-            timestamp: None,
-            fence_token: None,
-        })
-        .await?;
-    if dispatched {
-        log.append_event_async(&SessionLogEntry::SubAgentStarted {
-            agent: "metis".into(),
-            session_id: CHILD.into(),
-            invocation_id: Some(CALL.into()),
-            tool_call_id: Some(CALL.into()),
-            started_at: Some(chrono::Utc::now()),
-        })
-        .await?;
-    }
+    let tool_round = append_detached_tool_round(&log, dispatched).await?;
     let request = harnx_toolset::ToolRequest {
         replay: None,
         operation_id: CALL.into(),
@@ -114,6 +91,34 @@ async fn detached_delegation(
         claim_departed_owner(js, store, &operation.reference).await?;
     }
     Ok(parent)
+}
+
+async fn append_detached_tool_round(log: &NatsSessionLog, dispatched: bool) -> Result<u64> {
+    let tool_round = log
+        .append_event_async(&SessionLogEntry::ToolCalls {
+            text: "delegating".into(),
+            thought: None,
+            calls: vec![ToolCall::new(
+                "metis_session_prompt".into(),
+                json!({"session_id": CHILD, "message": "finish child work"}),
+                Some(CALL.into()),
+                None,
+            )],
+            timestamp: None,
+            fence_token: None,
+        })
+        .await?;
+    if dispatched {
+        log.append_event_async(&SessionLogEntry::SubAgentStarted {
+            agent: "metis".into(),
+            session_id: CHILD.into(),
+            invocation_id: Some(CALL.into()),
+            tool_call_id: Some(CALL.into()),
+            started_at: Some(chrono::Utc::now()),
+        })
+        .await?;
+    }
+    Ok(tool_round)
 }
 
 fn resumed_model(child_calls: Arc<AtomicUsize>) -> crate::AgentCallFn {

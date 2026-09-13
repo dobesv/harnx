@@ -49,9 +49,8 @@ impl NatsToolProvider {
             session_id: session,
             tool_round: round,
             call,
-            worker_id,
-            fence_token,
             authorization,
+            ..
         } = replay;
         let Some(call_id) = call.id.as_deref() else {
             return Ok(None);
@@ -63,24 +62,7 @@ impl NatsToolProvider {
             return Ok(None);
         };
         anyhow::ensure!(record.tool_name == call.name, "replayed tool name changed");
-        let (store, parent) = self
-            .execution_control
-            .as_ref()
-            .context("replay requires an execution owner")?;
-        anyhow::ensure!(parent.session_id == session, "replay session mismatch");
-        let owner = store
-            .get(parent)
-            .await?
-            .context("replay parent missing")?
-            .owner
-            .context("replay parent has no owner")?;
-        // A stale worker must not borrow its replacement's owner from KV.
-        // Lease renewals can raise the caller's fence beyond its graph claim.
-        anyhow::ensure!(
-            worker_id == Some(owner.instance_id.as_str())
-                && fence_token.is_some_and(|fence| owner.fence <= fence),
-            "replay requester no longer owns the parent execution"
-        );
+        let (store, owner) = self.replay_owner(replay).await?;
         if let Some(reply) = record.reply {
             let reference =
                 harnx_execution_control::OperationRef::new(session, &record.request.call_id);
@@ -124,6 +106,37 @@ impl NatsToolProvider {
                 ToolError::Fatal(error) | ToolError::Recoverable(error) => error,
             })?;
         recovered_output(self.decode_reply(message, id, route))
+    }
+
+    async fn replay_owner(
+        &self,
+        replay: harnx_core::tool::ToolReplay<'_>,
+    ) -> anyhow::Result<(
+        &harnx_execution_control::ExecutionStore,
+        harnx_execution_control::Owner,
+    )> {
+        let (store, parent) = self
+            .execution_control
+            .as_ref()
+            .context("replay requires an execution owner")?;
+        anyhow::ensure!(
+            parent.session_id == replay.session_id,
+            "replay session mismatch"
+        );
+        let owner = store
+            .get(parent)
+            .await?
+            .context("replay parent missing")?
+            .owner
+            .context("replay parent has no owner")?;
+        // A stale worker must not borrow its replacement's owner from KV.
+        // Lease renewals can raise the caller's fence beyond its graph claim.
+        anyhow::ensure!(
+            replay.worker_id == Some(owner.instance_id.as_str())
+                && replay.fence_token.is_some_and(|fence| owner.fence <= fence),
+            "replay requester no longer owns the parent execution"
+        );
+        Ok((store, owner))
     }
 }
 

@@ -253,7 +253,8 @@ async fn multi_round_resume_with_queued_user_repairs_once_and_becomes_idle() -> 
         fixture.session.activate_pending_turn().await?,
         Some(fixture.queued_user_seq)
     );
-    wait_for_worker_daemon_idle(metrics_before.lease_acquisitions).await?;
+    let js = local_test_nats(server.url()).await?;
+    wait_for_worker_daemon_idle(&js, SESSION_ID, metrics_before.lease_acquisitions).await?;
     assert_resume_outcome(&fixture, &capture, metrics_before).await?;
 
     daemon.abort();

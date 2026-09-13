@@ -577,7 +577,7 @@ impl ToolProvider for NatsToolProvider {
         arguments: Value,
         abort: &AbortSignal,
     ) -> Result<ToolProviderOutput, ToolError> {
-        self.call_registered_tool(tool_name, arguments, None, abort)
+        self.call_tool_with_id(tool_name, arguments, None, abort)
             .await
     }
 
@@ -588,8 +588,15 @@ impl ToolProvider for NatsToolProvider {
         tool_call_id: Option<&str>,
         abort: &AbortSignal,
     ) -> Result<ToolProviderOutput, ToolError> {
-        self.call_registered_tool(tool_name, arguments, tool_call_id, abort)
-            .await
+        self.call_registered_tool(
+            request::ToolCallInput {
+                name: tool_name,
+                arguments,
+                id: tool_call_id,
+            },
+            abort,
+        )
+        .await
     }
 }
 
