@@ -11,6 +11,7 @@ const FIXED_SUBCOMMANDS: &[(&str, &[&str])] = &[
         &["agent", "session", "rag", "macro", "agent-data", "message"],
     ),
     (".drop", &["tool"]),
+    (".dump", &["session"]),
     (
         ".edit",
         &["config", "agent", "session", "message", "rag-docs"],
