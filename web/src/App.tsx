@@ -24,7 +24,8 @@ import { sendPrompt, submitHitlDecision, uploadAttachment } from './api';
 import { CancellationContext, type CancellationControl } from './CancellationContext';
 import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
-import { AttachIcon, SendIcon } from './icons';
+import { AttachIcon, SendIcon, StopIcon } from './icons';
+import { MarkdownLink } from './markdownLink';
 import { AgentDropdown, SessionDropdown, AgentSessionMenu } from './composer/AgentSessionMenu';
 import { ConnectionBanner } from './ConnectionBanner';
 import { useConnectionStatus, useRetryCountdownSeconds } from './useConnectionStatus';
@@ -45,13 +46,14 @@ function formatTokenCount(value: number | undefined) {
   return value.toLocaleString();
 }
 
-const MessageContent = () => (
+export const MessageContent = () => (
   <MessagePrimitive.Content components={{
     Text: () => (
       <MarkdownTextPrimitive
         remarkPlugins={[remarkGfm]}
         components={{
           SyntaxHighlighter,
+          a: MarkdownLink,
           table: ({ node: _node, ...props }: any) => (
             <div className="overflow-x-auto">
               <table {...props} />
@@ -110,18 +112,64 @@ const MyMessage = () => {
   );
 };
 
+const CANCELLATION_PHASE_LABELS: Record<string, string> = {
+  idle: 'Stop',
+  requesting: 'Requesting cancellation…',
+  stopping: 'Stopping…',
+  abandoning: 'Resuming…',
+  failed: 'Cancellation request failed — Retry',
+};
+
 const CancellationActions = ({ phase, stop, resumeAnyway }: Pick<CancellationControl, 'phase' | 'stop' | 'resumeAnyway'>) => {
   if (phase === 'unconfirmed') {
     const confirmResume = () => {
       if (window.confirm('Resume anyway? Prior work may still be running.')) void resumeAnyway();
     };
-    return <span className="aui-cancel-actions">
-      <button type="button" className="aui-cancel-button" onClick={() => void stop()}>Retry cancellation</button>
-      <button type="button" className="aui-cancel-button" onClick={confirmResume}>Resume anyway</button>
-    </span>;
+    return (
+      <span className="aui-cancel-actions">
+        <button type="button" className="aui-cancel-button aui-cancel-btn-text" onClick={() => void stop()}>
+          Retry cancellation
+        </button>
+        <button type="button" className="aui-cancel-button aui-cancel-btn-text aui-cancel-btn-secondary" onClick={confirmResume}>
+          Resume anyway
+        </button>
+      </span>
+    );
   }
-  const label = { idle: 'Stop', requesting: 'Requesting cancellation…', stopping: 'Stopping…', abandoning: 'Resuming…', failed: 'Cancellation request failed — Retry' }[phase];
-  return <button type="button" className="aui-cancel-button" disabled={phase === 'requesting' || phase === 'stopping' || phase === 'abandoning'} onClick={() => void stop()}>{label}</button>;
+  const label = CANCELLATION_PHASE_LABELS[phase];
+  const isDisabled = phase === 'requesting' || phase === 'stopping' || phase === 'abandoning';
+
+  if (phase === 'idle' || isDisabled) {
+    return (
+      <button
+        type="button"
+        className="aui-cancel-button aui-composer-icon-btn"
+        disabled={isDisabled}
+        onClick={() => void stop()}
+        aria-label={label}
+        title={label}
+      >
+        {isDisabled ? (
+          <span className="aui-spinner"><span></span></span>
+        ) : (
+          <StopIcon />
+        )}
+        <span className="aui-visually-hidden">{label}</span>
+      </button>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      className="aui-cancel-button aui-cancel-btn-text"
+      onClick={() => void stop()}
+      aria-label={label}
+      title={label}
+    >
+      {label}
+    </button>
+  );
 };
 
 export const CancelButton = () => {
@@ -131,13 +179,15 @@ export const CancelButton = () => {
   return <CancellationActions {...cancellation} />;
 };
 
-const MyAttachment = () => (
+export const MyAttachment = () => (
   <AttachmentPrimitive.Root className="aui-attachment">
     <AttachmentPrimitive.unstable_Thumb className="aui-attachment-thumb" />
     <div className="aui-attachment-info">
       <span className="aui-attachment-name"><AttachmentPrimitive.Name /></span>
-      <AttachmentPrimitive.Remove className="aui-attachment-remove">✖</AttachmentPrimitive.Remove>
     </div>
+    <AttachmentPrimitive.Remove className="aui-attachment-remove" aria-label="Remove attachment" title="Remove attachment">
+      ✖
+    </AttachmentPrimitive.Remove>
   </AttachmentPrimitive.Root>
 );
 
