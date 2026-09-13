@@ -136,6 +136,17 @@ fn spawn_session_actor(
     reap_ttl: Duration,
     actor_config: SessionActorConfig,
 ) -> SessionHandle {
+    let (actor, handle) = make_session_actor(key, registry, reap_ttl, actor_config);
+    tokio::spawn(actor.start());
+    handle
+}
+
+fn make_session_actor(
+    key: SessionKey,
+    registry: SessionMap,
+    reap_ttl: Duration,
+    actor_config: SessionActorConfig,
+) -> (SessionActor, SessionHandle) {
     let (tx, rx) = mpsc::channel(COMMAND_BUFFER);
     let (broadcast_tx, _) = broadcast::channel(BROADCAST_BUFFER);
     let (run_done_tx, run_done_rx) = mpsc::channel(COMMAND_BUFFER);
@@ -171,8 +182,7 @@ fn spawn_session_actor(
         session_base: None,
         actor_config,
     };
-    tokio::spawn(actor.run());
-    handle
+    (actor, handle)
 }
 
 async fn run_actor_turn(params: ActorTurnParams) -> anyhow::Result<harnx_runtime::LoopResult> {
@@ -308,15 +318,23 @@ impl SessionActor {
         )
     }
 
-    async fn run(mut self) {
+    async fn start(self) {
+        let poll = cancellation::poller(self.actor_config.clone(), self.key.session.clone());
+        self.run(poll).await;
+    }
+
+    async fn run(mut self, mut cancellation_poll: cancellation::CancellationPoller) {
         let far_future = Instant::now() + Duration::from_secs(FAR_FUTURE_SECS);
         let reap_sleep = sleep_until(far_future);
         tokio::pin!(reap_sleep);
 
-        let mut cancellation_poll = tokio::time::interval(Duration::from_millis(250));
         loop {
             tokio::select! {
-                _ = cancellation_poll.tick() => self.refresh_cancellation().await,
+                result = cancellation_poll.next(), if self.actor_config.call_fn.is_none() => {
+                    if let Some(result) = result {
+                        self.apply_cancellation_refresh(result);
+                    }
+                },
                 maybe_cmd = self.rx.recv() => {
                     let Some(cmd) = maybe_cmd else {
                         if let Some(active_run) = &self.active_run {
@@ -326,6 +344,7 @@ impl SessionActor {
                         break;
                     };
                     self.handle_command(cmd, &mut reap_sleep).await;
+                    cancellation_poll.invalidate();
                 }
                 maybe_done = self.run_done_rx.recv() => {
                     let Some(done) = maybe_done else {
@@ -333,10 +352,12 @@ impl SessionActor {
                         break;
                     };
                     self.handle_run_done(done, &mut reap_sleep).await;
+                    cancellation_poll.invalidate();
                 }
                 Some(done) = self.hitl_approval_done_rx.recv() => {
                     self.refresh_history_snapshot().await;
                     let _ = done.reply.send(done.result);
+                    cancellation_poll.invalidate();
                 }
                 _ = &mut reap_sleep, if self.reap_deadline.is_some() => {
                     if self.reap_now() {
@@ -1068,8 +1089,14 @@ mod tests {
             None,
         );
         let local_worker = registry.local_worker_for_tests();
-        let worker_guard = local_worker.lock().await;
         let handle = registry.get_or_spawn(key("plain", "approval-mailbox"));
+        // Establish the broker-backed actor before measuring lock independence;
+        // cold broker startup is not part of the cancellation latency contract.
+        wait_for_state(&handle, "ready for approval routing", |state| {
+            matches!(state, SessionState::Idle)
+        })
+        .await;
+        let worker_guard = local_worker.lock().await;
         let (approval_reply_tx, mut approval_reply_rx) = oneshot::channel();
         handle
             .tx

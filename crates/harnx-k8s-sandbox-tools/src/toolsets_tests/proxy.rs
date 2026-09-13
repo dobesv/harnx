@@ -125,12 +125,15 @@ async fn proxy_forwards_cancellation_after_the_mcp_call_starts() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn heartbeat_cancellation_does_not_drop_mcp_stop_waiter() -> Result<()> {
     harnx_core::require_nextest();
     let Some(fixture) = ToolsetFixture::start("session-heartbeat", None).await? else {
         return Ok(());
     };
+    // The broker uses real time. Pause only after its I/O has completed so
+    // auto-advance cannot expire setup requests before NATS answers them.
+    tokio::time::pause();
     fixture.api.hold_activity.store(true, Ordering::SeqCst);
     fixture
         .caller

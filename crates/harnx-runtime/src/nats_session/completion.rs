@@ -104,6 +104,20 @@ pub(super) fn reconcile_subagent_progress(
     sink: &Arc<dyn AgentEventSink>,
     emitted: &mut HashSet<String>,
 ) {
+    for progress in completed_subagent_progress(entries, after_seq) {
+        if emitted.insert(progress.invocation_id.clone()) {
+            sink.emit(AgentEvent::Turn(TurnEvent::SubAgentProgress(progress)));
+        }
+    }
+}
+
+/// Recover invocation summaries from durable tool results when live progress
+/// was lost. Callers track their applied cursor or invocation IDs to deduplicate.
+pub fn completed_subagent_progress(
+    entries: &[(u64, SessionLogEntry)],
+    after_seq: u64,
+) -> Vec<SubAgentProgress> {
+    let mut completed = Vec::new();
     for (_, entry) in entries.iter().filter(|(seq, _)| *seq > after_seq) {
         let SessionLogEntry::ToolResults { results, .. } = entry else {
             continue;
@@ -115,11 +129,10 @@ pub(super) fn reconcile_subagent_progress(
             let Ok(progress) = serde_json::from_value::<SubAgentProgress>(value.clone()) else {
                 continue;
             };
-            if progress.status != SubAgentProgressStatus::Running
-                && emitted.insert(progress.invocation_id.clone())
-            {
-                sink.emit(AgentEvent::Turn(TurnEvent::SubAgentProgress(progress)));
+            if progress.status != SubAgentProgressStatus::Running {
+                completed.push(progress);
             }
         }
     }
+    completed
 }

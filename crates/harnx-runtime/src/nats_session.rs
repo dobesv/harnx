@@ -61,6 +61,7 @@ pub use harnx_execution_control::{CancelReceipt, CancelRequest, CancellationStat
 use harnx_execution_control::{ExecutionStore, OperationRef};
 pub(crate) mod cancellation;
 mod completion;
+pub use completion::completed_subagent_progress;
 
 /// Generate a client-side message ID (UUID v4).
 pub(crate) fn new_client_message_id() -> String {

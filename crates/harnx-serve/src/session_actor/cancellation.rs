@@ -1,5 +1,32 @@
 use super::*;
-use harnx_execution_control::{CancelDisposition, CancelReceipt, CancelRequest, ExecutionStore};
+use harnx_execution_control::{
+    CancelDisposition, CancelReceipt, CancelRequest, ExecutionStore, Operation,
+};
+
+mod poll;
+pub(super) use poll::{poller, CancellationPoller};
+
+type RefreshResult = anyhow::Result<Option<Operation>>;
+
+async fn read_cancellation(config: &Config, session_id: &str) -> RefreshResult {
+    let js = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
+    let bucket = match js.get_key_value(harnx_execution_control::BUCKET).await {
+        Ok(bucket) => bucket,
+        Err(error) if harnx_runtime::nats_admin::kv_bucket_missing(&error) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let store = ExecutionStore::from_store(bucket);
+    let Some(current) = store.current(session_id).await? else {
+        return Ok(None);
+    };
+    store.status(&current.reference).await.map(Some)
+}
+
+async fn bounded_refresh(read: impl std::future::Future<Output = RefreshResult>) -> RefreshResult {
+    tokio::time::timeout(Duration::from_secs(2), read)
+        .await
+        .context("cancellation hydration timed out")?
+}
 
 impl SessionActor {
     pub(super) async fn answer_cancellation_command(&mut self, command: SessionCommand) {
@@ -166,9 +193,24 @@ impl SessionActor {
         if self.actor_config.call_fn.is_some() {
             return;
         }
-        match tokio::time::timeout(Duration::from_secs(2), self.read_cancellation()).await {
-            Ok(Ok(Some(receipt))) => self.apply_cancellation(receipt),
-            Ok(Ok(None)) => {}
+        let result = bounded_refresh(read_cancellation(
+            &self.actor_config.base_config,
+            &self.key.session,
+        ))
+        .await;
+        self.apply_cancellation_refresh(result);
+    }
+
+    pub(super) fn apply_cancellation_refresh(&mut self, result: RefreshResult) {
+        match result {
+            Ok(Some(current)) => {
+                self.execution_id = Some(current.reference.execution_id.clone());
+                self.execution_state = Some(current.state);
+                if current.cancellation.is_some() {
+                    self.apply_cancellation(CancelReceipt::from_operation(&current, false));
+                }
+            }
+            Ok(None) => {}
             error => {
                 log::debug!("cancellation hydration unavailable: {error:?}");
                 if let SessionState::Cancelling(receipt)
@@ -180,30 +222,6 @@ impl SessionActor {
                 }
             }
         }
-    }
-
-    async fn read_cancellation(&mut self) -> anyhow::Result<Option<CancelReceipt>> {
-        let js = self
-            .actor_config
-            .base_config
-            .nats_jetstream(LOCAL_CLUSTER_KEY)
-            .await?;
-        let bucket = match js.get_key_value(harnx_execution_control::BUCKET).await {
-            Ok(bucket) => bucket,
-            Err(error) if harnx_runtime::nats_admin::kv_bucket_missing(&error) => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let store = ExecutionStore::from_store(bucket);
-        let Some(current) = store.current(&self.key.session).await? else {
-            return Ok(None);
-        };
-        let current = store.status(&current.reference).await?;
-        self.execution_id = Some(current.reference.execution_id.clone());
-        self.execution_state = Some(current.state);
-        if current.cancellation.is_none() {
-            return Ok(None);
-        }
-        Ok(Some(CancelReceipt::from_operation(&current, false)))
     }
 
     fn apply_cancellation(&mut self, receipt: CancelReceipt) {

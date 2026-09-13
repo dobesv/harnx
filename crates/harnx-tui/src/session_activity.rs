@@ -31,16 +31,12 @@ struct SessionEventForwarder<'a> {
 }
 
 impl SessionEventForwarder<'_> {
-    fn should_forward(
-        &self,
-        stream: &SessionEventStream,
-        envelope: &harnx_runtime::nats_event_sink::AdvisoryEnvelope,
-    ) -> bool {
-        stream.should_render(envelope) && self.follows_attach(envelope.after_seq)
-    }
-
     fn follows_attach(&self, after_seq: u64) -> bool {
-        self.attached_during_turn || after_seq > self.attached_seq
+        // Recovery reads advance the durable cursor without rendering the
+        // transcript. Only the attachment boundary can filter live events;
+        // using the read cursor would discard queued output and handoffs.
+        after_seq > self.attached_seq
+            || (self.attached_during_turn && after_seq == self.attached_seq)
     }
 
     fn send_activity(&self, active: bool) -> bool {
@@ -53,11 +49,31 @@ impl SessionEventForwarder<'_> {
 
     fn send_agent_event(&self, event: AgentEvent) -> bool {
         let activity = event_activity(&event);
+        self.send_session_event(event) && activity.is_none_or(|active| self.send_activity(active))
+    }
+
+    fn send_session_event(&self, event: AgentEvent) -> bool {
         self.send(TuiEvent::SessionAgent {
             session_id: self.target.0.clone(),
             cluster: self.target.1.clone(),
             event,
-        }) && activity.is_none_or(|active| self.send_activity(active))
+        })
+    }
+
+    fn recover_subagent_progress(
+        &self,
+        history: &[(u64, SessionLogEntry)],
+        after_seq: u64,
+    ) -> bool {
+        let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(history)
+            .unwrap_or_else(|_| history.to_vec());
+        // Compaction trims model context, but archived rows and open child
+        // views remain visible and still need their terminal progress.
+        harnx_runtime::nats_session::completed_subagent_progress(&effective, after_seq)
+            .into_iter()
+            .all(|progress| {
+                self.send_session_event(AgentEvent::Turn(TurnEvent::SubAgentProgress(progress)))
+            })
     }
 
     fn send(&self, event: TuiEvent) -> bool {
@@ -290,7 +306,11 @@ async fn monitor_session_connection(
         attached_seq,
         attached_during_turn,
     };
-    if !forwarder.send_activity(attached_during_turn) {
+    // A reconnect can seed its cursor beyond the missed child result while
+    // the parent is still busy, so reconcile the attachment history as well.
+    if !forwarder.recover_subagent_progress(stream.history(), 0)
+        || !forwarder.send_activity(attached_during_turn)
+    {
         return false;
     }
     forward_session_activity(&mut stream, &forwarder).await
@@ -311,15 +331,21 @@ async fn forward_session_activity(
     forwarder: &SessionEventForwarder<'_>,
 ) -> bool {
     let mut active = forwarder.attached_during_turn;
+    let mut refresh = tokio::time::interval(DURABLE_REFRESH_INTERVAL);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        match next_session_activity_input(stream, active).await {
+        match next_session_activity_input(stream.next(), active, &mut refresh).await {
             SessionActivityInput::Advisory(envelope) => {
-                if !forward_advisory(stream, forwarder, envelope, &mut active) {
+                if !forward_advisory(forwarder, envelope, &mut active) {
                     return false;
                 }
             }
             SessionActivityInput::RefreshDurableHistory => {
-                match refresh_durable_activity(stream, forwarder, &mut active).await {
+                let outcome = refresh_durable_activity(stream, forwarder, &mut active).await;
+                // Leave time for advisories even when a durable read takes
+                // longer than the refresh interval.
+                refresh.reset();
+                match outcome {
                     DurableRefreshOutcome::Continue => {}
                     DurableRefreshOutcome::Reconnect => return true,
                     DurableRefreshOutcome::Stop => return false,
@@ -331,29 +357,30 @@ async fn forward_session_activity(
 }
 
 async fn next_session_activity_input(
-    stream: &mut SessionEventStream,
+    advisory: impl std::future::Future<
+        Output = Option<harnx_runtime::nats_event_sink::AdvisoryEnvelope>,
+    >,
     active: bool,
+    refresh: &mut tokio::time::Interval,
 ) -> SessionActivityInput {
-    if !active {
-        return stream.next().await.map_or(
+    // A fresh timeout per advisory starves durable recovery while the parent
+    // keeps streaming. The interval survives each advisory and wins when due.
+    tokio::select! {
+        biased;
+        _ = refresh.tick(), if active => SessionActivityInput::RefreshDurableHistory,
+        envelope = advisory => envelope.map_or(
             SessionActivityInput::SubscriptionClosed,
             SessionActivityInput::Advisory,
-        );
-    }
-    match tokio::time::timeout(DURABLE_REFRESH_INTERVAL, stream.next()).await {
-        Ok(Some(envelope)) => SessionActivityInput::Advisory(envelope),
-        Ok(None) => SessionActivityInput::SubscriptionClosed,
-        Err(_) => SessionActivityInput::RefreshDurableHistory,
+        ),
     }
 }
 
 fn forward_advisory(
-    stream: &SessionEventStream,
     forwarder: &SessionEventForwarder<'_>,
     envelope: harnx_runtime::nats_event_sink::AdvisoryEnvelope,
     active: &mut bool,
 ) -> bool {
-    if !forwarder.should_forward(stream, &envelope) {
+    if !forwarder.follows_attach(envelope.after_seq) {
         return true;
     }
     let activity = event_activity(&envelope.event);
@@ -368,6 +395,7 @@ async fn refresh_durable_activity(
     forwarder: &SessionEventForwarder<'_>,
     active: &mut bool,
 ) -> DurableRefreshOutcome {
+    let after_seq = stream.last_applied_seq();
     if let Err(error) = stream.refresh_history().await {
         log::debug!(
             "failed to refresh durable session activity: session_id={} cluster={} error={error:#}",
@@ -375,6 +403,11 @@ async fn refresh_durable_activity(
             forwarder.target.1,
         );
         return DurableRefreshOutcome::Reconnect;
+    }
+    // Completion of a child does not end the parent's turn. Repair its row
+    // before checking whether root activity changed, without replaying output.
+    if !forwarder.recover_subagent_progress(stream.history(), after_seq) {
+        return DurableRefreshOutcome::Stop;
     }
     let durable_activity = history_has_pending_turn(stream.history());
     if durable_activity == *active {
@@ -437,10 +470,30 @@ pub(super) fn history_has_pending_turn(history: &[(u64, SessionLogEntry)]) -> bo
 }
 
 #[cfg(test)]
+#[path = "session_activity/recovery_tests.rs"]
+mod recovery_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use harnx_core::event::ModelEvent;
     use harnx_core::message::{MessageContent, MessageRole};
+
+    #[tokio::test]
+    async fn durable_refresh_is_not_starved_by_ready_advisories() {
+        let mut refresh = tokio::time::interval(Duration::from_millis(1));
+        refresh.tick().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let advisory =
+            std::future::ready(Some(harnx_runtime::nats_event_sink::AdvisoryEnvelope::new(
+                1,
+                AgentEvent::Turn(TurnEvent::Started),
+            )));
+        assert!(matches!(
+            next_session_activity_input(advisory, true, &mut refresh).await,
+            SessionActivityInput::RefreshDurableHistory
+        ));
+    }
 
     fn message(role: MessageRole, text: &str) -> SessionLogEntry {
         SessionLogEntry::Message {
@@ -560,6 +613,7 @@ mod tests {
             attached_seq: 7,
             attached_during_turn: false,
         };
+        assert!(!completed.follows_attach(6));
         assert!(!completed.follows_attach(7));
         assert!(completed.follows_attach(8));
 
@@ -567,6 +621,7 @@ mod tests {
             attached_during_turn: true,
             ..completed
         };
+        assert!(!active.follows_attach(6));
         assert!(active.follows_attach(7));
     }
 }
