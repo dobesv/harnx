@@ -339,4 +339,30 @@ describe('child cancellation', () => {
     expect(await screen.findByText('Unconfirmed')).toBeVisible();
     expect(screen.getByRole('button', { name: 'Retry stopping researcher' })).toBeEnabled();
   });
+
+  it('does not surface "signal is aborted without reason" on screen (#1838)', async () => {
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' }, execution_id: 'invocation', execution_state: 'running' });
+    vi.mocked(cancel).mockRejectedValue(new DOMException('signal is aborted without reason', 'AbortError'));
+    render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop researcher sub-agent session child-session-running' }));
+    expect(await screen.findByText('Unconfirmed')).toBeVisible();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('does not surface TimeoutError on screen (#1838, #1861)', async () => {
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' }, execution_id: 'invocation', execution_state: 'running' });
+    vi.mocked(cancel).mockRejectedValue(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+    render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop researcher sub-agent session child-session-running' }));
+    expect(await screen.findByText('Unconfirmed')).toBeVisible();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('surfaces legitimate non-abort errors on screen', async () => {
+    vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' }, execution_id: 'invocation', execution_state: 'running' });
+    vi.mocked(cancel).mockRejectedValue(new Error('Server communication failed'));
+    render(<SubAgentSessionNotes notes={[{ ...note('running'), invocationId: 'invocation' }]} onOpen={() => {}} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop researcher sub-agent session child-session-running' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Error: Server communication failed');
+  });
 });

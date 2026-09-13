@@ -243,10 +243,10 @@ describe('BatchInterruptUI', () => {
     expect(screen.queryByTestId('hydrated-pending-approval')).not.toBeInTheDocument();
   });
 
-  it('surfaces an error on rejection', async () => {
+  const renderBatchInterruptWithDecisionError = (error: unknown) => {
     const setErrorText = vi.fn();
     vi.mocked(agUi.useAgUiInterrupts).mockReturnValue([{ id: 'int-2', toolCallId: 'tool-2', reason: '' } as any]);
-    vi.mocked(submitHitlDecision).mockRejectedValue(new Error('Network error'));
+    vi.mocked(submitHitlDecision).mockRejectedValue(error);
 
     render(
       <PendingContext.Provider value={{ ...defaultPendingContext, setErrorText }}>
@@ -255,10 +255,25 @@ describe('BatchInterruptUI', () => {
     );
 
     fireEvent.click(screen.getByText('Approve'));
+    return setErrorText;
+  };
 
+  it('surfaces an error on rejection', async () => {
+    const setErrorText = renderBatchInterruptWithDecisionError(new Error('Network error'));
     await waitFor(() => {
       expect(setErrorText).toHaveBeenCalledWith('Network error');
     });
+  });
+
+  it('does not surface an error when submitHitlDecision is aborted (#1838)', async () => {
+    const setErrorText = renderBatchInterruptWithDecisionError(
+      new DOMException('signal is aborted without reason', 'AbortError')
+    );
+
+    await waitFor(() => {
+      expect(submitHitlDecision).toHaveBeenCalled();
+    });
+    expect(setErrorText).not.toHaveBeenCalledWith(expect.any(String));
   });
 
   it('renders hydrated pending approval from hitl_pending_approval CUSTOM event', () => {
@@ -546,10 +561,10 @@ describe('MyComposer', () => {
     expect(document.querySelector('.aui-spinner')).not.toBeInTheDocument();
   });
 
-  it('restores input text and attachments on sendPrompt error', async () => {
+  const submitWithSendPromptError = async (error: unknown) => {
     vi.mocked(uploadAttachment).mockResolvedValueOnce(['cid:file.png']);
-    vi.mocked(sendPrompt).mockRejectedValueOnce(new Error('RPC boom'));
-    
+    vi.mocked(sendPrompt).mockRejectedValueOnce(error);
+
     const file = new File([''], 'file.png');
     composerRuntime.getState = () => ({ text: 'my draft', attachments: [{ status: { type: 'running' }, file }] });
 
@@ -558,13 +573,30 @@ describe('MyComposer', () => {
     fireEvent.submit(form!);
 
     await waitFor(() => {
-      expect(setErrorText).toHaveBeenCalledWith('RPC boom');
+      expect(composerRuntime.setText).toHaveBeenCalledWith('my draft');
     });
 
-    expect(composerRuntime.setText).toHaveBeenCalledWith('my draft');
     expect(composerRuntime.addAttachment).toHaveBeenCalledWith(file);
-    // Re-enables input
     expect(screen.getByRole('textbox')).not.toBeDisabled();
+  };
+
+  it('restores input text and attachments on sendPrompt error', async () => {
+    await submitWithSendPromptError(new Error('RPC boom'));
+    expect(setErrorText).toHaveBeenCalledWith('RPC boom');
+  });
+
+  it('restores input text and attachments on sendPrompt timeout without surfacing error (#1861)', async () => {
+    await submitWithSendPromptError(
+      new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+    );
+    expect(setErrorText).not.toHaveBeenCalledWith(expect.any(String));
+  });
+
+  it('restores input text and attachments on bare abort ("signal is aborted without reason") without surfacing error (#1838)', async () => {
+    await submitWithSendPromptError(
+      new DOMException('signal is aborted without reason', 'AbortError')
+    );
+    expect(setErrorText).not.toHaveBeenCalledWith(expect.any(String));
   });
 
   it('uploads attachments on existing-session submit', async () => {

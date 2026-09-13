@@ -4,6 +4,7 @@
 
 pub mod ag_ui;
 mod ag_ui_attach;
+mod ag_ui_lifecycle;
 mod ag_ui_remote_follow;
 pub mod ag_ui_rpc;
 mod ag_ui_sync;

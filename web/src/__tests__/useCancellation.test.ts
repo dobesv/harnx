@@ -13,6 +13,25 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+async function testStopError(error: unknown) {
+  vi.mocked(sessionControl).mockResolvedValue({ state: { status: 'running' }, execution_state: 'running', canPrompt: true });
+  vi.mocked(cancel).mockRejectedValue(error);
+  const { result } = renderHook(() => useCancellation('agent', 'session'));
+  await act(async () => { await result.current.stop(); });
+  return result.current.phase;
+}
+
+async function testResumeAnywayError(error: unknown) {
+  vi.mocked(sessionControl).mockResolvedValue({
+    state: { status: 'cancel_unconfirmed', cancellation: { cancelled: true, disposition: 'unconfirmed', execution_id: 'execution' } },
+  });
+  vi.mocked(abandonCancellation).mockRejectedValue(error);
+  const { result } = renderHook(() => useCancellation('agent', 'session'));
+  await waitFor(() => expect(result.current.phase).toBe('unconfirmed'));
+  await act(async () => { await result.current.resumeAnyway(); });
+  return result.current.phase;
+}
+
 describe('root cancellation state', () => {
   it('lets the server distinguish a progressing cascade from unconfirmed work', async () => {
     vi.useFakeTimers();
@@ -74,5 +93,40 @@ describe('root cancellation state', () => {
     rerender({ session: 'new' });
     await act(async () => { acceptance.resolve({ cancelled: true, disposition: 'requested' }); });
     expect(result.current.phase).toBe('idle');
+  });
+
+  it('aborts the in-flight sessionControl call on unmount', () => {
+    let capturedSignal: AbortSignal | undefined;
+    vi.mocked(sessionControl).mockImplementation((_agent, _session, options) => {
+      capturedSignal = options?.signal;
+      return new Promise(() => {});
+    });
+
+    const { unmount } = renderHook(() => useCancellation('agent', 'session'));
+    expect(capturedSignal).toBeDefined();
+    expect(capturedSignal?.aborted).toBe(false);
+
+    unmount();
+    expect(capturedSignal?.aborted).toBe(true);
+  });
+
+  it('swallows abort/timeout errors in stop() without moving phase to failed (#1838, #1861)', async () => {
+    const phase = await testStopError(new DOMException('signal is aborted without reason', 'AbortError'));
+    expect(phase).toBe('requesting');
+  });
+
+  it('swallows TimeoutError in stop() without moving phase to failed (#1861)', async () => {
+    const phase = await testStopError(new DOMException('Request timeout', 'TimeoutError'));
+    expect(phase).toBe('requesting');
+  });
+
+  it('swallows abort/timeout errors in resumeAnyway() without moving phase to unconfirmed (#1838, #1861)', async () => {
+    const phase = await testResumeAnywayError(new DOMException('signal is aborted without reason', 'AbortError'));
+    expect(phase).toBe('abandoning');
+  });
+
+  it('moves phase to unconfirmed when resumeAnyway() encounters a genuine error', async () => {
+    const phase = await testResumeAnywayError(new Error('Network failure'));
+    expect(phase).toBe('unconfirmed');
   });
 });

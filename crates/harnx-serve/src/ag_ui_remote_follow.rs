@@ -18,7 +18,7 @@ use harnx_runtime::{
     nats_lease::session_has_active_lease,
 };
 use tokio::sync::{
-    mpsc::{error::TrySendError, UnboundedReceiver, UnboundedSender},
+    mpsc::{UnboundedReceiver, UnboundedSender},
     Notify,
 };
 use tokio_stream::{Stream, StreamExt as _};
@@ -28,6 +28,7 @@ use crate::ag_ui::UsageContextSnapshot;
 use crate::{
     ag_ui::{frame_event, AgUiError, AgUiSink},
     ag_ui_attach::{session_attach_boundary_event, snapshot_event},
+    ag_ui_lifecycle::{frame_guarded_live_event, LiveStreamGuard},
     ag_ui_sync::{frame_run_boundary_event, history_warning_event},
     session_actor::SubscribeResult,
 };
@@ -46,7 +47,8 @@ const LEASE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const LEASE_ABSENT_THRESHOLD: usize = 5;
 
 /// Buffer size for frame-forwarding channel.
-/// Advisory frames are loss-tolerant; a slow client dropping frames is acceptable.
+/// Sends apply backpressure because mapped advisories contain ordered AG-UI lifecycle
+/// frames; dropping any frame can invalidate every later frame in the run.
 /// Matches the bounded nature of the local broadcast path (which uses 64).
 const FRAME_CHANNEL_SIZE: usize = 256;
 
@@ -349,43 +351,55 @@ async fn remote_follow_task(mut params: FollowTaskParams) -> Result<()> {
     let mut lease_poll_interval = tokio::time::interval(LEASE_POLL_INTERVAL);
     lease_poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    loop {
+    let result = loop {
         tokio::select! {
             envelope = params.event_stream.next() => {
-                if !forwarder.forward(&params.event_stream, envelope, &params.session_id) {
-                    // Client dropped; return Ok - guard will notify.
-                    return Ok(());
+                if !forwarder
+                    .forward(&params.event_stream, envelope, &params.session_id)
+                    .await
+                {
+                    break Ok(());
                 }
             }
             _ = lease_poll_interval.tick() => {
-                if poller.turn_finished(&mut params.event_stream).await? {
-                    // Turn ended; return Ok - guard will notify.
-                    return Ok(());
+                match poller.turn_finished(&mut params.event_stream).await {
+                    Ok(true) => break Ok(()),
+                    Ok(false) => {}
+                    Err(err) => break Err(err),
                 }
             }
-            _ = tx_for_close.closed() => return Ok(()),
+            _ = tx_for_close.closed() => break Ok(()),
         }
+    };
+
+    // NotifyOnDrop exposes the synthetic RUN_FINISHED only after every lifecycle
+    // close has entered the ordered frame channel.
+    if !forwarder.finalize().await {
+        return Ok(());
     }
+    result
 }
 
-struct AdvisoryForwarder {
+pub(crate) struct AdvisoryForwarder {
     sink: AgUiSink,
     event_rx: UnboundedReceiver<Event>,
     tx: tokio::sync::mpsc::Sender<Bytes>,
+    guard: LiveStreamGuard,
 }
 
 impl AdvisoryForwarder {
-    fn new(tx: tokio::sync::mpsc::Sender<Bytes>) -> Self {
+    pub(crate) fn new(tx: tokio::sync::mpsc::Sender<Bytes>) -> Self {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let message_id = ag_ui_core::types::ids::MessageId::random();
         Self {
             sink: AgUiSink::new_for_remote_follow(event_tx, message_id),
             event_rx,
             tx,
+            guard: LiveStreamGuard::default(),
         }
     }
 
-    fn forward(
+    async fn forward(
         &mut self,
         event_stream: &SessionEventStream,
         envelope: Option<AdvisoryEnvelope>,
@@ -399,20 +413,32 @@ impl AdvisoryForwarder {
             return true;
         }
         self.sink.emit(envelope.event);
+        self.drain_events().await
+    }
+
+    async fn drain_events(&mut self) -> bool {
         while let Ok(event) = self.event_rx.try_recv() {
-            if let Ok(frame) = frame_event(&event) {
-                match self.tx.try_send(Bytes::from(frame)) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
-                        log::debug!(
-                            "Dropping remote advisory frame for slow client on session {session_id}"
-                        );
-                    }
-                    Err(TrySendError::Closed(_)) => return false,
+            if let Some(frame) = frame_guarded_live_event(event, &mut self.guard) {
+                if self.tx.send(frame).await.is_err() {
+                    return false;
                 }
             }
         }
         true
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn forward_agent_event(
+        &mut self,
+        event: harnx_core::event::AgentEvent,
+    ) -> bool {
+        self.sink.emit(event);
+        self.drain_events().await
+    }
+
+    pub(crate) async fn finalize(&mut self) -> bool {
+        let closes = self.guard.finalize_open_lifecycles();
+        closes.is_empty() || self.tx.send(closes).await.is_ok()
     }
 }
 
@@ -483,8 +509,8 @@ fn turn_ended(history: &[(u64, SessionLogEntry)], through_seq: u64) -> bool {
 impl AgUiSink {
     /// Creates a sink for the remote-follow path.
     ///
-    /// Uses an unbounded event channel (advisory frames are loss-tolerant;
-    /// the frame channel is bounded separately).
+    /// Uses an unbounded internal event channel; the bounded wire-frame channel
+    /// applies async backpressure without discarding lifecycle events.
     pub(crate) fn new_for_remote_follow(
         tx: UnboundedSender<Event>,
         message_id: ag_ui_core::types::ids::MessageId,

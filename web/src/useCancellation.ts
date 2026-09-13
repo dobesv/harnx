@@ -1,9 +1,40 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { abandonCancellation, cancel, sessionControl } from './api';
+import { isAbortError } from './httpClient';
 import type { CancelResult } from './types';
 import type { CancellationControl } from './CancellationContext';
 
 type MutableRef<T> = { current: T };
+
+async function executeCancellationAction({
+  action,
+  target,
+  fallbackPhase,
+  setPhase,
+  observe,
+  currentTarget,
+  requestPending,
+  requestVersion,
+}: {
+  action: () => Promise<CancelResult>;
+  target: string;
+  fallbackPhase: CancellationControl['phase'];
+  setPhase: (phase: CancellationControl['phase']) => void;
+  observe: (receipt: CancelResult) => void;
+  currentTarget: MutableRef<string>;
+  requestPending: MutableRef<boolean>;
+  requestVersion: MutableRef<number>;
+}): Promise<void> {
+  const version = ++requestVersion.current;
+  try {
+    observe(await action());
+  } catch (err) {
+    if (isAbortError(err)) return;
+    if (currentTarget.current === target) setPhase(fallbackPhase);
+  } finally {
+    if (requestVersion.current === version) requestPending.current = false;
+  }
+}
 
 /* oxlint-disable react/immutability -- these arguments are React refs shared by the parent hook to serialize async cancellation requests */
 function useCancellationActions({
@@ -33,20 +64,32 @@ function useCancellationActions({
     setPhase('requesting');
     pendingSince.current = Date.now();
     requestPending.current = true;
-    const version = ++requestVersion.current;
-    try { observe(await cancel(agent, session, acceptedExecution.current)); }
-    catch { if (currentTarget.current === target) setPhase('failed'); }
-    finally { if (requestVersion.current === version) requestPending.current = false; }
+    await executeCancellationAction({
+      action: () => cancel(agent, session, acceptedExecution.current),
+      target,
+      fallbackPhase: 'failed',
+      setPhase,
+      observe,
+      currentTarget,
+      requestPending,
+      requestVersion,
+    });
   }, [acceptedExecution, agent, currentTarget, observe, pendingSince, requestPending, requestVersion, session, setPhase, target]);
   const resumeAnyway = useCallback(async () => {
     const expectedExecutionId = acceptedExecution.current;
     if (!expectedExecutionId) return;
     setPhase('abandoning');
     requestPending.current = true;
-    const version = ++requestVersion.current;
-    try { observe(await abandonCancellation(agent, session, expectedExecutionId)); }
-    catch { if (currentTarget.current === target) setPhase('unconfirmed'); }
-    finally { if (requestVersion.current === version) requestPending.current = false; }
+    await executeCancellationAction({
+      action: () => abandonCancellation(agent, session, expectedExecutionId),
+      target,
+      fallbackPhase: 'unconfirmed',
+      setPhase,
+      observe,
+      currentTarget,
+      requestPending,
+      requestVersion,
+    });
   }, [acceptedExecution, agent, currentTarget, observe, requestPending, requestVersion, session, setPhase, target]);
   return { stop, resumeAnyway };
 }
@@ -89,6 +132,7 @@ export function useCancellation(agent: string, session: string): CancellationCon
   useEffect(() => {
     let disposed = false;
     let timer: ReturnType<typeof setTimeout>;
+    const controller = new AbortController();
     pendingSince.current = null;
     requestPending.current = false;
     acceptedExecution.current = undefined;
@@ -96,7 +140,7 @@ export function useCancellation(agent: string, session: string): CancellationCon
     const hydrate = async () => {
       const version = requestVersion.current;
       try {
-        const status = await sessionControl(agent, session);
+        const status = await sessionControl(agent, session, { signal: controller.signal });
         if (disposed) return;
         if (!requestPending.current && version === requestVersion.current) {
           if (status.state.cancellation) observe(status.state.cancellation);
@@ -109,7 +153,11 @@ export function useCancellation(agent: string, session: string): CancellationCon
       if (!disposed) timer = setTimeout(hydrate, 500);
     };
     void hydrate();
-    return () => { disposed = true; clearTimeout(timer); };
+    return () => {
+      disposed = true;
+      clearTimeout(timer);
+      controller.abort();
+    };
   }, [agent, session, observe, setPhase]);
   return { phase, stop, resumeAnyway, observe };
 }

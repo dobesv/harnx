@@ -459,4 +459,50 @@ describe('toAgUiMessages', () => {
       expect(noteSpy).not.toHaveBeenCalled();
       expect(onRunFailed).toHaveBeenCalledWith('Rate limit exceeded: 429');
     });
+
+    it('suppresses onRunFailed and RUN_ERROR for AbortError, TimeoutError, and "signal is aborted without reason" (#1838, #1861)', async () => {
+      const onRunFailed = vi.fn();
+      const onSubAgentEvent = vi.fn();
+      const { HarnxHttpAgent } = await import('../ChatProvider');
+      const agent = new HarnxHttpAgent({
+        url: '/url',
+        onStatus: vi.fn(),
+        onRunFailed,
+        onUsage: vi.fn(),
+        onToolSummary: vi.fn(),
+        onSubAgentEvent,
+      });
+
+      // 1. AbortError DOMException
+      (agent as any).handleRunFailure('Aborted', new DOMException('The operation was aborted', 'AbortError'));
+      expect(onSubAgentEvent).not.toHaveBeenCalled();
+      expect(onRunFailed).not.toHaveBeenCalled();
+
+      // 2. TimeoutError DOMException
+      (agent as any).handleRunFailure('Timeout', new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+      expect(onSubAgentEvent).not.toHaveBeenCalled();
+      expect(onRunFailed).not.toHaveBeenCalled();
+
+      // 3. "signal is aborted without reason" message
+      (agent as any).handleRunFailure('signal is aborted without reason');
+      expect(onSubAgentEvent).not.toHaveBeenCalled();
+      expect(onRunFailed).not.toHaveBeenCalled();
+
+      // 4. "signal is aborted without reason" Error instance
+      (agent as any).handleRunFailure('Failed', new Error('signal is aborted without reason'));
+      expect(onSubAgentEvent).not.toHaveBeenCalled();
+      expect(onRunFailed).not.toHaveBeenCalled();
+
+      // 5. Genuine transport error still emits RUN_ERROR and calls onRunFailed
+      (agent as any).handleRunFailure('Failed to fetch', new TypeError('Failed to fetch'));
+      expect(onSubAgentEvent).toHaveBeenCalledWith({ type: 'RUN_ERROR' });
+      expect(onRunFailed).toHaveBeenCalledWith('Failed to fetch');
+
+      // 6. Genuine application error still emits RUN_ERROR and calls onRunFailed
+      onSubAgentEvent.mockClear();
+      onRunFailed.mockClear();
+      (agent as any).handleRunFailure('Model error: context length exceeded', new Error('Model error'));
+      expect(onSubAgentEvent).toHaveBeenCalledWith({ type: 'RUN_ERROR' });
+      expect(onRunFailed).toHaveBeenCalledWith('Model error: context length exceeded');
+    });
   });
