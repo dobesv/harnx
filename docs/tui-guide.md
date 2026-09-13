@@ -25,6 +25,17 @@ There is no readline-based REPL.
   completed duration. Focus a row with normal transcript `↑` / `↓` navigation
   and press `Enter` to open the child's complete transcript fullscreen.
 
+### Selecting and copying text
+
+Hold **Shift** while dragging with the mouse to select text, then use your
+terminal's copy shortcut or context menu. This works in Kitty and the JetBrains
+IDE terminal; other terminals may use a different modifier to override mouse
+capture.
+
+Harnx enables mouse capture for wheel scrolling, so ordinary clicks and drags
+are sent to Harnx instead of selecting text in the terminal. Holding Shift lets
+the terminal handle selection. To copy the entire last response, use `.copy`.
+
 ### Transcript and sub-agent navigation
 
 When the input is blank, `↑` enters transcript navigation. Navigable rows
