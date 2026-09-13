@@ -73,6 +73,37 @@ pub async fn reserve_short_session_id(
     }
 }
 
+/// Replay an allocation from the same starting timestamp. The winning metadata
+/// record stores its allocation identity in the same CAS that reserves the ID,
+/// so a crash before the invocation checkpoint cannot orphan a new session.
+pub async fn reserve_invocation_session_id(
+    store: &crate::nats_session_metadata::SessionMetadataStore,
+    initializer: &crate::nats_session_metadata::SessionInitializer,
+    invocation: &str,
+    started_at_ms: u64,
+) -> anyhow::Result<String> {
+    let mut seconds = started_at_ms / 1000;
+    loop {
+        let candidate = encode_timestamp_session_id(seconds);
+        if let Some(existing) = store.get(&candidate).await? {
+            if existing.metadata.creation_invocation.as_deref() == Some(invocation) {
+                existing.metadata.validate_initializer(initializer)?;
+                return Ok(candidate);
+            }
+            seconds += 1;
+            continue;
+        }
+        let mut metadata =
+            crate::nats_session_metadata::SessionMetadata::new(&candidate, initializer.clone());
+        metadata.creation_invocation = Some(invocation.into());
+        if store.create(&metadata).await?.is_some() {
+            return Ok(candidate);
+        }
+        // Retry this candidate after a competing reservation, including a
+        // concurrent observer recovering the very same invocation.
+    }
+}
+
 /// Generate a unique session ID starting from current time, retrying +1 second until exists(candidate) is false.
 pub fn generate_session_id(exists: impl Fn(&str) -> bool) -> String {
     let mut seconds = SystemTime::now()

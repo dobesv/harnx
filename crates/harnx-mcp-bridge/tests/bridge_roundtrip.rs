@@ -192,6 +192,7 @@ async fn wait_for_registration(
 
 fn tool_request(call_id: &str, tool: &str) -> ToolRequest {
     ToolRequest {
+        replay: None,
         operation_id: call_id.to_owned(),
         call_id: call_id.to_owned(),
         tool: tool.to_owned(),

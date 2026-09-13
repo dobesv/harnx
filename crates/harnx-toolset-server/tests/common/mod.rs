@@ -140,6 +140,7 @@ fn nats_server_binary() -> Option<PathBuf> {
 #[derive(Clone)]
 pub(crate) struct TestToolset {
     server_name: &'static str,
+    pub(crate) idempotent: bool,
     pub(crate) echo_invocations: Arc<AtomicUsize>,
     pub(crate) slow_started: Arc<Notify>,
     pub(crate) slow_cancelled: Arc<Notify>,
@@ -157,6 +158,7 @@ impl TestToolset {
     pub(crate) fn named(server_name: &'static str) -> Self {
         Self {
             server_name,
+            idempotent: false,
             echo_invocations: Arc::default(),
             slow_started: Arc::default(),
             slow_cancelled: Arc::default(),
@@ -178,7 +180,7 @@ impl Toolset for TestToolset {
             name: "echo".to_string(),
             description: "echo input".to_string(),
             input_schema: json!({ "type": "object" }),
-            idempotent_hint: false,
+            idempotent_hint: self.idempotent,
             read_only_hint: false,
             timeout_secs: None,
             meta: None,
@@ -276,11 +278,14 @@ pub(crate) struct TestHarness {
 
 impl TestHarness {
     pub(crate) async fn start() -> Result<Option<Self>> {
+        Self::with_toolset(TestToolset::default()).await
+    }
+
+    pub(crate) async fn with_toolset(toolset: TestToolset) -> Result<Option<Self>> {
         let Some(server) = spawn_nats_server().await? else {
             return Ok(None);
         };
         let instance_id = ServerScope::new();
-        let toolset = TestToolset::default();
         let shutdown = CancellationToken::new();
         let readiness = harnx_healthz::Readiness::default();
         let server_client = async_nats::ConnectOptions::new()

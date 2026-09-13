@@ -240,8 +240,12 @@ async fn first_package_agent_turn_waits_for_delegation_registrations() {
     let _ = nats.wait();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn parent_can_delegate_again_after_nested_subagent_completes() {
+#[test]
+fn parent_can_delegate_again_after_nested_subagent_completes() {
+    run_with_bounded_worker_stack(repeated_nested_delegation());
+}
+
+async fn repeated_nested_delegation() {
     harnx_core::require_nextest();
     let _env_guard = env_lock().await;
     let Some((url, mut nats, _store_dir)) = spawn_test_nats().await else {
