@@ -2,7 +2,28 @@ mod common;
 
 use anyhow::Result;
 use harnx_core::session::SessionLogEntry;
-use harnx_runtime::nats_session_log::NatsSessionLog;
+use harnx_runtime::nats_session_log::{stream_name_for_session, NatsSessionLog};
+
+#[test]
+fn session_stream_names_stay_distinct_on_case_insensitive_filesystems() {
+    let first = stream_name_for_session("aqCV1g");
+    let second = stream_name_for_session("aqcV1g");
+    assert_ne!(first.to_ascii_lowercase(), second.to_ascii_lowercase());
+}
+
+#[test]
+fn session_stream_names_are_bounded_and_do_not_sanitize_distinct_ids_together() {
+    assert_ne!(
+        stream_name_for_session("with.dot"),
+        stream_name_for_session("with_dot")
+    );
+    let name = stream_name_for_session(&"a".repeat(200));
+    let encoded = name.strip_prefix("SESSION_").unwrap();
+    assert_eq!(encoded.len(), 64);
+    assert!(encoded
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+}
 
 #[tokio::test]
 async fn case_distinct_sessions_have_independent_transcripts() -> Result<()> {
@@ -32,7 +53,7 @@ async fn case_distinct_sessions_have_independent_transcripts() -> Result<()> {
         SessionLogEntry::Cancel { fence_token: 22 }
     ));
     assert_eq!(
-        js.get_stream("SESSION_aqCV1g")
+        js.get_stream(stream_name_for_session("aqCV1g"))
             .await?
             .cached_info()
             .state

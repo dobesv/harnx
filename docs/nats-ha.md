@@ -48,13 +48,14 @@ Harnx automatically manages the following JetStream resources:
   server discovery and its fail-closed fallback routes. Only the copies
   opened by the standalone `harnx-hookset-server` binary carry a TTL; the
   worker daemon's own copy of the same buckets does not set one.
-- **Streams**: `SESSION_<id>` (Subject: `sessions.{id}.log`) stores only the
+- **Streams**: `SESSION_<sha256(id)>` (Subject: `sessions.{id}.log`) stores only the
   durable append-only conversation history. Agent identity, settings, rendered
-  prompts, and titles do not belong in this stream. Preserve the case of `<id>`:
-  short base64url session IDs are case-sensitive. Uppercasing aliases distinct
-  sessions, causing reads to return another transcript and appends to fail with
-  `no stream found for given subject`. Stream names previously uppercased by
-  Harnx are not migrated; start fresh sessions after upgrading.
+  prompts, and titles do not belong in this stream. Hash the exact, case-sensitive
+  session ID to lowercase hexadecimal with `stream_name_for_session`. JetStream
+  uses stream names as directory names, so simply preserving case still aliases
+  distinct IDs on case-insensitive filesystems. The fixed-length digest also
+  avoids filename length limits. Subjects and user-visible IDs remain unchanged.
+  Earlier stream names are not migrated; start fresh sessions after upgrading.
 - **Object Store**: `harnx_attachments` stores binary attachment payloads under
   session-scoped object names. Conversation entries contain only `cid:`
   references; workers hydrate the matching blobs into their local
