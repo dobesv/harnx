@@ -344,6 +344,53 @@ broker-authoritative—a stale worker can race after TTL expiry. See
 NATS. Adding a field or variant is a local TUI change, not a transcript-protocol change. Contrast
 with `SessionLogEntry` variants (previous section), which are protocol-versioned.
 
+## CLI Flag Constraints
+
+The root `Cli.file: Vec<String>` has `#[clap(short, long, global = true, hide = true)]` at
+`crates/harnx/src/cli.rs:42`. This reserves `-f` globally for `--file`. New format flags (e.g.
+`--format`) MUST NOT define a short form — use long-only. See `sessionFormat` in
+`harnx-runtime/src/config/session_format.rs` and the `--format` flag in `harnx/src/cli.rs`
+for the precedent (PR #1448).
+
+## Durable vs Advisory Event Contract
+
+`SessionLogEntry` (`harnx-core/src/session.rs`) is durable and persisted to NATS JetStream.
+`AgentEvent` (`harnx-core/src/event.rs`) is advisory and emitted to the lossy fan-out subject
+`sessions.{id}.events`. The durable entry is authoritative; advisories are best-effort previews.
+
+### Follow mode MUST emit durable entries only
+
+`SessionEventStream::attach()` (`nats_event_sink.rs:386`) subscribes to advisories first, then
+loads durable history. Live clients call `refresh_history()` on wake to poll for newly committed
+entries — this is REQUIRED because some durable entries (e.g. `TurnEnd`) have NO advisory event.
+
+When implementing `--follow` or live-tail rendering (CLI or TUI):
+
+1. Replay `stream.history()` for initial output.
+2. In the follow loop, `tokio::select!{ next() | timeout | ctrl_c() }`.
+3. On wake, record `old_len = stream.history().len()`.
+4. Call `stream.refresh_history().await` and emit `history()[old_len..]` as `SessionLogEntry`.
+5. NEVER serialize `AdvisoryEnvelope.event` directly — it's a preview, not durable state.
+
+`--follow` is read-only observation; it does not interrupt or cancel the running session.
+
+### Entry rendering for text output
+
+`replay_entries_to_sink()` (`nats_session.rs:1473`) renders `SessionLogEntry` tuples through a
+frontend's `AgentEventSink`. Callers must first apply log mutations (edits/rewinds) if they need
+an effective snapshot — the helper renders entries in the supplied order without resolution.
+Control entries (`TurnEnd`, `HandoffCommitted`, `HitlApproval*`, `SubAgentStarted`) are silent
+in text rendering because their state hydrates separately from human transcript output.
+
+### Metadata rendering requires session reconstruction
+
+Text-format session metadata (`.info session` or `harnx info session`) uses `session::render()`
+(`config/session.rs:500`) which requires a reconstructed `Session` with model resolution and
+token counts. The helper `load_session_for_render()` (`session_format.rs:88`) loads KV metadata,
+resolves the model via `overrides.model` or the named agent's config, reconstructs transcript-
+derived fields (`turns`, `tokens`), and calls `update_tokens()`. Do NOT pass the raw
+`SessionMetadata` KV record to `session::render()` — it lacks resolved model and transcript state.
+
 ## Usage Accounting Semantics
 
 `ModelEvent::Final.usage` (`harnx-core/src/event.rs:66-71`) is a **display-only per-turn total** that

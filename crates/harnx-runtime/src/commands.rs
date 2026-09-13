@@ -30,7 +30,7 @@ pub enum CommandOutcome {
     OpenSessionPicker,
 }
 
-pub static COMMANDS: LazyLock<[Command; 48]> = LazyLock::new(|| {
+pub static COMMANDS: LazyLock<[Command; 49]> = LazyLock::new(|| {
     [
         Command::new(".help", "Show this help guide"),
         Command::new(".info", "Show system info"),
@@ -61,7 +61,16 @@ pub static COMMANDS: LazyLock<[Command; 48]> = LazyLock::new(|| {
             ".compact session",
             "Compact session messages using configured compaction agent",
         ),
-        Command::new(".info session", "Show session info"),
+        Command::with_usage(
+            ".info session",
+            "[<agent> <id>] [--format text|yaml|json]",
+            "Show session info (metadata)",
+        ),
+        Command::with_usage(
+            ".dump session",
+            "[<agent> <id>] [--format text|yaml|json]",
+            "Show session transcript dump",
+        ),
         Command::new(
             ".info model",
             "Show active model details (id, client, pricing, vision/tool-use, catalog source)",
