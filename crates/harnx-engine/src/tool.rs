@@ -148,6 +148,17 @@ pub async fn eval_tool_calls(
     calls: Vec<ToolCall>,
     abort_signal: &AbortSignal,
 ) -> Result<Vec<ToolResult>> {
+    eval_tool_calls_with_authorization(ctx, calls, abort_signal, None).await
+}
+
+/// Legacy recovery still runs pre-use hooks and approval. Recheck the worker
+/// lease after those waits, immediately before each provider dispatch.
+pub async fn eval_tool_calls_with_authorization(
+    ctx: &ToolEvalContext,
+    calls: Vec<ToolCall>,
+    abort_signal: &AbortSignal,
+    authorization: Option<&dyn harnx_core::tool::ReplayAuthorization>,
+) -> Result<Vec<ToolResult>> {
     let mut output = vec![];
     if calls.is_empty() {
         return Ok(output);
@@ -252,11 +263,9 @@ pub async fn eval_tool_calls(
         return Err(ToolApprovalRequiredError::new(all_calls, deferred).into());
     }
 
-    let dispatch_futures = approved.iter().map(|approved_call| {
-        let call = approved_call.call.clone();
-        let json_data = approved_call.json_data.clone();
-        async move { dispatch_tool_call(call, json_data, ctx, abort_signal).await }
-    });
+    let dispatch_futures = approved
+        .iter()
+        .map(|call| dispatch_authorized_call(call, ctx, abort_signal, authorization));
     let dispatch_results = join_all(dispatch_futures).await;
     let (completed, dispatched_all_null, fatal_err) =
         collect_dispatch_results(ctx, approved, dispatch_results).await;
@@ -269,6 +278,18 @@ pub async fn eval_tool_calls(
         output = vec![];
     }
     Ok(output)
+}
+
+async fn dispatch_authorized_call(
+    call: &ApprovedToolCall,
+    ctx: &ToolEvalContext,
+    abort_signal: &AbortSignal,
+    authorization: Option<&dyn harnx_core::tool::ReplayAuthorization>,
+) -> Result<ToolProviderOutput, ToolError> {
+    if let Some(authorization) = authorization {
+        authorization.revalidate().await.map_err(ToolError::Fatal)?;
+    }
+    dispatch_tool_call(call.call.clone(), call.json_data.clone(), ctx, abort_signal).await
 }
 
 async fn collect_dispatch_results(
@@ -344,6 +365,42 @@ async fn complete_successful_tool_call(
         completed_tool_result(approved.call.clone(), value, images, execution_context),
         was_null,
     )
+}
+
+/// Recover a tool response without repeating approval or post-use hooks whose
+/// side effects may already have happened before the worker disappeared.
+pub async fn replay_tool_call(
+    ctx: &ToolEvalContext,
+    replay: harnx_core::tool::ToolReplay<'_>,
+    abort: &AbortSignal,
+) -> anyhow::Result<Option<ToolResult>> {
+    let call = replay.call;
+    for provider in &ctx.providers {
+        let output = match provider.replay_tool_call(replay, abort).await {
+            Ok(Some(output)) => output,
+            Ok(None) => continue,
+            Err(ToolError::Fatal(error)) => return Err(error),
+            Err(ToolError::Recoverable(error)) => {
+                ToolProviderOutput::new(json!({"is_error": true, "error": error.to_string()}))
+            }
+        };
+        let (mut value, observation) = output.into_parts();
+        let images = crate::media::extract_image_parts(&value);
+        if !images.is_empty() {
+            crate::media::redact_image_data(&mut value);
+        }
+        (ctx.emit_tool_result_fn)(call, &value);
+        if value.is_null() {
+            value = json!("DONE");
+        }
+        return Ok(Some(completed_tool_result(
+            call.clone(),
+            value,
+            images,
+            observation,
+        )));
+    }
+    Ok(None)
 }
 
 fn parse_call_arguments(call: &ToolCall) -> Result<Value, ToolError> {
@@ -597,6 +654,37 @@ mod tests {
             self.tool_name == tool_name
         }
 
+        fn replay_tool_call<'a, 'b, 'c, 'async_trait>(
+            &'a self,
+            _replay: harnx_core::tool::ToolReplay<'b>,
+            _abort: &'c AbortSignal,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Option<ToolProviderOutput>, ToolError>>
+                    + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'a: 'async_trait,
+            'b: 'async_trait,
+            'c: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                if self.tool_name == "replay_only" {
+                    self.result
+                        .lock()
+                        .await
+                        .take()
+                        .unwrap()
+                        .map(|value| Some(value.into()))
+                } else {
+                    Ok(None)
+                }
+            })
+        }
+
         fn call_tool<'life0, 'life1, 'life2, 'async_trait>(
             &'life0 self,
             tool_name: &'life1 str,
@@ -802,6 +890,82 @@ mod tests {
                 Box::pin(async move { outcome })
             }),
         }
+    }
+
+    struct TestReplayLease(Arc<std::sync::atomic::AtomicBool>);
+
+    impl harnx_core::tool::ReplayAuthorization for TestReplayLease {
+        fn revalidate<'a, 'b>(&'a self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'b>>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            Box::pin(async move {
+                anyhow::ensure!(
+                    self.0.load(std::sync::atomic::Ordering::SeqCst),
+                    "lease replaced during approval"
+                );
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_revalidates_after_approval_before_dispatch() {
+        let held = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let lease = TestReplayLease(held.clone());
+        let mut ctx = test_context(vec![Arc::new(MockToolProvider::panic("tool_a"))], |_| {
+            HookOutcome {
+                control: HookResultControl::Ask { reason: None },
+                result: HookResult::default(),
+            }
+        });
+        ctx.confirm_tool_use_fn = Arc::new(move |_, _, _| {
+            held.store(false, std::sync::atomic::Ordering::SeqCst);
+            ToolUseConfirmation::Approve
+        });
+        let error = eval_tool_calls_with_authorization(
+            &ctx,
+            vec![test_call("tool_a")],
+            &create_abort_signal(),
+            Some(&lease),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("lease replaced during approval"));
+    }
+
+    #[tokio::test]
+    async fn replay_queries_retired_tools_and_normalizes_null() {
+        let ctx = test_context_with_emitters(
+            vec![Arc::new(MockToolProvider::ok(
+                "replay_only",
+                Duration::ZERO,
+                Value::Null,
+            ))],
+            |_| panic!("recovery must not repeat hooks"),
+            |_, _| {},
+            |_, value| assert!(value.is_null(), "display preserves the provider reply"),
+            |_, _| {},
+        );
+        let call = ToolCall::new("retired_tool".into(), json!({}), Some("call".into()), None);
+        assert!(!ctx.providers[0].has_tool(&call.name));
+        let recovered = replay_tool_call(
+            &ctx,
+            harnx_core::tool::ToolReplay {
+                session_id: "session",
+                tool_round: 1,
+                call: &call,
+                worker_id: None,
+                fence_token: None,
+                authorization: None,
+            },
+            &create_abort_signal(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered.output, json!("DONE"));
     }
 
     fn two_tool_context(

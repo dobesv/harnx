@@ -214,6 +214,10 @@ impl NatsSessionLease {
     }
 
     pub async fn release(&self) -> Result<()> {
+        // A renewal may already have committed in NATS while its acknowledgement
+        // is still in flight. Let it save the new revision before aborting it;
+        // deleting with the old revision otherwise strands the lease until TTL.
+        let _renew_guard = self.state.renew_lock.lock().await;
         let handle = self.stop_renew_task().await;
         let held = self.state.mark_lost();
 
@@ -264,19 +268,28 @@ impl Drop for NatsSessionLease {
         let bucket = self.bucket.clone();
         let _jetstream = self.jetstream.clone();
         let key = self.key.clone();
-        let revision = self.fence_token();
-        let held = self.state.mark_lost();
         let state = Arc::clone(&self.state);
+        let task = self.renew_task.get_mut().take();
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            if let Some(task) = self.renew_task.get_mut().take() {
-                task.abort();
-            }
-            if held {
-                handle.spawn(async move {
+            handle.spawn(async move {
+                // As with explicit release, let a committed renewal publish its
+                // revision locally before stopping it and deleting the lease.
+                let _renew_guard = state.renew_lock.lock().await;
+                let held = state.mark_lost();
+                if let Some(task) = task {
+                    task.abort();
+                    let _ = task.await;
+                }
+                if held {
+                    let revision = state.fence_token.load(Ordering::SeqCst);
                     let _ = bucket.delete_expect_revision(&key, Some(revision)).await;
-                    drop(state);
-                });
+                }
+            });
+        } else {
+            state.mark_lost();
+            if let Some(task) = task {
+                task.abort();
             }
         }
     }
@@ -600,6 +613,67 @@ fn is_create_conflict(error: &kv::CreateError) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn release_waits_for_committed_renewal_revision() -> Result<()> {
+        check_release_after_renewal(false).await
+    }
+
+    #[tokio::test]
+    async fn drop_waits_for_committed_renewal_revision() -> Result<()> {
+        check_release_after_renewal(true).await
+    }
+
+    async fn check_release_after_renewal(drop_lease: bool) -> Result<()> {
+        let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+            .await
+            .context("nats-server required")?;
+        let js = jetstream::new(async_nats::connect(&url).await?);
+        let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
+            jetstream: js.clone(),
+            session_id: "release-race",
+            worker_id: "old-worker".into(),
+            generation: 1,
+            config: Default::default(),
+            session_metadata: None,
+        })
+        .await?
+        .context("lease")?;
+        let state = Arc::clone(&lease.state);
+        let renew_guard = state.renew_lock.lock().await;
+        lease.stop_renewal_for_test().await;
+        // Pause a renewal after its broker commit, before the local revision
+        // update. Release must wait rather than delete using the old revision.
+        let value = lease.bucket.get(&lease.key).await?.context("lease entry")?;
+        let revision = lease
+            .bucket
+            .update(&lease.key, value, lease.fence_token())
+            .await?;
+        if drop_lease {
+            drop(lease);
+            tokio::task::yield_now().await;
+            assert!(state.held.load(Ordering::SeqCst));
+            state.fence_token.store(revision, Ordering::SeqCst);
+            drop(renew_guard);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while session_has_active_lease(&js, "release-race").await.unwrap() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+        } else {
+            let release = lease.release();
+            tokio::pin!(release);
+            assert!(futures_util::poll!(&mut release).is_pending());
+            state.fence_token.store(revision, Ordering::SeqCst);
+            drop(renew_guard);
+            release.await?;
+        }
+        assert!(!session_has_active_lease(&js, "release-race").await?);
+        let _ = nats.kill();
+        let _ = nats.wait();
+        Ok(())
+    }
 
     #[tokio::test]
     async fn best_effort_activity_refresh_timeout_is_bounded() {

@@ -28,6 +28,7 @@ async fn assert_registration(harness: &TestHarness) -> Result<()> {
 async fn assert_idempotent_replay(harness: &TestHarness) -> Result<()> {
     let invocations_before = harness.toolset.echo_invocations.load(Ordering::SeqCst);
     let request = ToolRequest {
+        replay: None,
         operation_id: "call-echo".to_string(),
         call_id: "call-echo".to_string(),
         tool: "echo".to_string(),
@@ -60,6 +61,7 @@ async fn assert_idempotent_replay(harness: &TestHarness) -> Result<()> {
 
 async fn assert_invocation_context(harness: &TestHarness) -> Result<()> {
     let request = ToolRequest {
+        replay: None,
         operation_id: "call-invocation-context".to_string(),
         call_id: "call-invocation-context".to_string(),
         tool: "echo".to_string(),
@@ -101,6 +103,7 @@ async fn assert_execution_context_capability_is_per_request(harness: &TestHarnes
         }
     });
     let opted_in = ToolRequest {
+        replay: None,
         operation_id: "call-context-enabled".to_string(),
         call_id: "call-context-enabled".to_string(),
         tool: "echo".to_string(),
@@ -124,6 +127,7 @@ async fn assert_execution_context_capability_is_per_request(harness: &TestHarnes
     assert_eq!(provenance["call_id"], opted_in.call_id);
 
     let opted_out = ToolRequest {
+        replay: None,
         operation_id: "call-context-disabled".to_string(),
         call_id: "call-context-disabled".to_string(),
         tool: "echo".to_string(),
@@ -153,6 +157,7 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
     let invocations_before = harness.toolset.echo_invocations.load(Ordering::SeqCst);
     let args = json!({ "value": 43, "delay_ms": 100 });
     let first = ToolRequest {
+        replay: None,
         operation_id: "call-concurrent-a".to_string(),
         call_id: "call-concurrent-a".to_string(),
         tool: "echo".to_string(),
@@ -162,6 +167,7 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
         capabilities: Default::default(),
     };
     let second = ToolRequest {
+        replay: None,
         operation_id: "call-concurrent-b".to_string(),
         call_id: "call-concurrent-b".to_string(),
         tool: "echo".to_string(),
@@ -232,6 +238,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
     )
     .await?;
     let mismatched = ToolRequest {
+        replay: None,
         operation_id: "payload-call".to_string(),
         call_id: "payload-call".to_string(),
         tool: "echo".to_string(),
@@ -248,6 +255,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
     )
     .await?;
     let missing_key = ToolRequest {
+        replay: None,
         operation_id: "call-missing-key".to_string(),
         call_id: "call-missing-key".to_string(),
         tool: "echo".to_string(),
@@ -269,6 +277,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
 
 async fn assert_cancellation(harness: &TestHarness) -> Result<()> {
     let request = ToolRequest {
+        replay: None,
         operation_id: "call-slow".to_string(),
         call_id: "call-slow".to_string(),
         tool: "slow".to_string(),
@@ -495,6 +504,7 @@ async fn shutdown_drains_in_flight_requests_before_deregistering() -> Result<()>
     assert_registration(&harness).await?;
 
     let request = ToolRequest {
+        replay: None,
         operation_id: "call-drain".to_string(),
         call_id: "call-drain".to_string(),
         tool: "echo".to_string(),

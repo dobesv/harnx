@@ -131,6 +131,24 @@ impl SubagentToolset {
         session_id: Option<String>,
         parent_session_id: Option<&str>,
     ) -> Result<NatsSession, ToolInvokeError> {
+        let config = self.session_config(session_id, parent_session_id).await?;
+        NatsSession::new(
+            config,
+            self.client.clone(),
+            self.jetstream.clone(),
+            harnx_core::abort::create_abort_signal(),
+        )
+        .await
+        .map_err(|error| {
+            ToolInvokeError::Recoverable(format!("create sub-agent session: {error:#}"))
+        })
+    }
+
+    async fn session_config(
+        &self,
+        session_id: Option<String>,
+        parent_session_id: Option<&str>,
+    ) -> Result<crate::NatsSessionConfig, ToolInvokeError> {
         let mut config = self.route.session_config(&self.agent, session_id.clone());
         if session_id.is_none() {
             if let Some(parent_session_id) = parent_session_id {
@@ -150,16 +168,7 @@ impl SubagentToolset {
                 }
             }
         }
-        NatsSession::new(
-            config,
-            self.client.clone(),
-            self.jetstream.clone(),
-            harnx_core::abort::create_abort_signal(),
-        )
-        .await
-        .map_err(|error| {
-            ToolInvokeError::Recoverable(format!("create sub-agent session: {error:#}"))
-        })
+        Ok(config)
     }
 
     async fn run_prompt(
@@ -215,6 +224,25 @@ impl SubagentToolset {
             invocation_id,
             tool_call_id,
         } = start;
+        let entry = SessionLogEntry::SubAgentStarted {
+            agent: self.agent.clone(),
+            session_id: child_session_id.to_string(),
+            invocation_id: Some(invocation_id.to_string()),
+            tool_call_id: tool_call_id.map(str::to_string),
+            started_at: Some(chrono::Utc::now()),
+        };
+        let (_, inserted) = crate::nats_session::append_invocation_entry(
+            &NatsSessionLog::new(self.jetstream.clone(), parent_session_id),
+            &entry,
+            invocation_id,
+        )
+        .await
+        .map_err(|error| {
+            ToolInvokeError::Recoverable(format!("persist sub-agent start: {error:#}"))
+        })?;
+        if !inserted {
+            return Ok(());
+        }
         let source = AgentSource {
             agent: self.agent.clone(),
             session_id: Some(child_session_id.to_string()),
@@ -235,22 +263,6 @@ impl SubagentToolset {
             ))
         })?;
 
-        let entry = SessionLogEntry::SubAgentStarted {
-            agent: self.agent.clone(),
-            session_id: child_session_id.to_string(),
-            invocation_id: Some(invocation_id.to_string()),
-            tool_call_id: tool_call_id.map(str::to_string),
-            started_at: Some(chrono::Utc::now()),
-        };
-        if let Err(error) =
-            NatsSessionLog::new(self.jetstream.clone(), parent_session_id.to_string())
-                .append_event_async(&entry)
-                .await
-        {
-            log::warn!(
-                "failed to append durable sub-agent start entry to parent session '{parent_session_id}': {error:#}"
-            );
-        }
         Ok(())
     }
 
@@ -442,6 +454,30 @@ struct SessionArgs {
 
 #[async_trait]
 impl Toolset for SubagentToolset {
+    fn can_replay(&self, tool: &str) -> bool {
+        matches!(
+            tool,
+            SUBAGENT_SESSION_NEW_TOOL
+                | SUBAGENT_SESSION_PROMPT_TOOL
+                | SUBAGENT_SESSION_LOAD_TOOL
+                | SUBAGENT_SESSION_CANCEL_TOOL
+        )
+    }
+
+    async fn replay(&self, invocation: ToolInvocation) -> Result<Value, ToolInvokeError> {
+        if invocation.tool == SUBAGENT_SESSION_CANCEL_TOOL
+            && invocation.args["expected_execution_id"].is_null()
+        {
+            return Err(ToolInvokeError::Recoverable(
+                "interrupted cancellation cannot be replayed without its original execution ID"
+                    .into(),
+            ));
+        }
+        // run_prompt binds a durable child handle and deduplicates its admitted
+        // prompt by invocation identity, so this reattaches instead of redelegating.
+        self.invoke_with_context(invocation).await
+    }
+
     fn name(&self) -> &str {
         &self.server_name
     }

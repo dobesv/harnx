@@ -149,6 +149,22 @@ impl std::fmt::Display for ToolProviderOutput {
     }
 }
 
+#[async_trait::async_trait]
+pub trait ReplayAuthorization: Send + Sync {
+    /// Revalidate the caller's live ownership immediately before replay dispatch.
+    async fn revalidate(&self) -> anyhow::Result<()>;
+}
+
+#[derive(Clone, Copy)]
+pub struct ToolReplay<'a> {
+    pub session_id: &'a str,
+    pub tool_round: u64,
+    pub call: &'a ToolCall,
+    pub worker_id: Option<&'a str>,
+    pub fence_token: Option<u64>,
+    pub authorization: Option<&'a dyn ReplayAuthorization>,
+}
+
 pub enum ToolError {
     Recoverable(anyhow::Error),
     Fatal(anyhow::Error),
@@ -160,6 +176,16 @@ pub enum ToolError {
 /// asks "do you handle this tool?" and "call it".
 #[async_trait]
 pub trait ToolProvider: Send + Sync {
+    /// Reissue a durable invocation during worker recovery. None means this
+    /// provider has no replay record; it must never imply a fresh invocation.
+    async fn replay_tool_call(
+        &self,
+        _replay: ToolReplay<'_>,
+        _abort: &AbortSignal,
+    ) -> Result<Option<ToolProviderOutput>, ToolError> {
+        Ok(None)
+    }
+
     /// Short provider identifier used for logging/diagnostics.
     fn name(&self) -> &str;
 

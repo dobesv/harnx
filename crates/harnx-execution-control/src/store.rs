@@ -259,6 +259,69 @@ impl ExecutionStore {
         .await
     }
 
+    /// Replay is a tool-server decision, authorized by the current session
+    /// owner. Keep the same operation and children so cancellation still reaches
+    /// work started by the original invocation; never reopen terminal work.
+    pub async fn claim_replay(
+        &self,
+        reference: &OperationRef,
+        parent_owner: &Owner,
+        owner: Owner,
+    ) -> Result<Operation> {
+        let previous = self
+            .get(reference)
+            .await?
+            .context("replayed execution missing")?;
+        let parent = previous
+            .parent
+            .as_ref()
+            .context("replay requires a session owner")?;
+        self.get(parent)
+            .await?
+            .context("replay parent missing")?
+            .check_owner(parent_owner)?;
+        // Registration itself has two writes. Repair a missing parent edge
+        // before permitting work, even when the child record already exists.
+        self.register(reference, parent).await?;
+        let result = self
+            .mutate(reference, |operation| {
+                ensure!(
+                    operation.kind == OperationKind::Tool && operation.state.accepts_work(),
+                    "tool execution cannot be replayed"
+                );
+                ensure!(
+                    operation.parent == previous.parent && operation.owner == previous.owner,
+                    "tool owner changed during replay"
+                );
+                operation.owner = Some(owner.clone());
+                operation.owner_stopped = false;
+                operation.sealed = false;
+                if operation.state == OperationState::Preparing {
+                    operation.transition(OperationState::Running)?;
+                }
+                Ok(())
+            })
+            .await?;
+        let validation = async {
+            self.get(parent)
+                .await?
+                .context("replay parent missing")?
+                .check_owner(parent_owner)?;
+            self.check_ancestors(reference).await
+        }
+        .await;
+        if let Err(error) = validation {
+            // No handler has started under this owner. Restore the prior owner
+            // only if another replay has not already claimed the operation.
+            self.mutate(reference, |operation| {
+                restore_replay_claim(operation, &previous, &owner)
+            })
+            .await?;
+            return Err(error);
+        }
+        Ok(result)
+    }
+
     pub async fn reserve_prompt(&self, reference: &OperationRef, message_id: &str) -> Result<()> {
         self.mutate(reference, |operation| {
             ensure!(
@@ -450,7 +513,12 @@ impl ExecutionStore {
                 continue;
             };
             if visited {
-                let operation = self.reconcile_one(&current).await?;
+                let result = self.reconcile_one(&current).await.map(Some);
+                let Some(operation) =
+                    reconcile_observed(self, &current, parent.as_ref(), result).await?
+                else {
+                    continue;
+                };
                 if current == *reference {
                     root = Some(operation);
                 }
@@ -648,25 +716,54 @@ async fn status_operation(
     parent: Option<&OperationRef>,
     ancestor_cancelling: bool,
 ) -> Result<Option<Operation>> {
-    let Some(mut operation) = store.get(reference).await? else {
-        // Another observer may already have removed a terminal child. Only an
-        // edge that still exists represents a missing blocker.
-        if let Some(parent) = parent {
-            if store
-                .get(parent)
-                .await?
-                .is_some_and(|op| !op.children.contains(reference))
-            {
-                return Ok(None);
-            }
-        }
-        bail!("execution descendant missing; cancellation unconfirmed");
+    let result = read_status_operation(store, reference, ancestor_cancelling).await;
+    reconcile_observed(store, reference, parent, result).await
+}
+
+async fn reconcile_observed(
+    store: &ExecutionStore,
+    reference: &OperationRef,
+    parent: Option<&OperationRef>,
+    result: Result<Option<Operation>>,
+) -> Result<Option<Operation>> {
+    if result.is_ok() {
+        return result;
+    }
+    let Some(parent) = parent else {
+        return result;
     };
+    // Reconciliation includes multiple reads and CAS writes. A different
+    // observer can retire this child at any await, including after preflight.
+    // Only ignore absence when its parent no longer retains the blocker.
+    if store.get(reference).await?.is_none()
+        && store
+            .get(parent)
+            .await?
+            .is_some_and(|op| !op.children.contains(reference))
+    {
+        return Ok(None);
+    }
+    result
+}
+
+async fn read_status_operation(
+    store: &ExecutionStore,
+    reference: &OperationRef,
+    ancestor_cancelling: bool,
+) -> Result<Option<Operation>> {
+    let mut operation = store
+        .get(reference)
+        .await?
+        .context("execution descendant missing; cancellation unconfirmed")?;
     if ancestor_cancelling && !operation.state.is_terminal() {
         operation = cancel_from_ancestor(store, reference).await?;
     }
     Ok(Some(operation))
 }
+
+#[cfg(test)]
+#[path = "store_tests.rs"]
+mod tests;
 
 /// Persist inherited cancellation even when the descendant owner vanished
 /// before observing its ancestor. An ownerless preparing operation never
@@ -697,4 +794,27 @@ async fn cancel_from_ancestor(
 
 fn current_key(session: &str) -> String {
     format!("sessions/{session}/current")
+}
+
+fn restore_replay_claim(
+    operation: &mut Operation,
+    previous: &Operation,
+    owner: &Owner,
+) -> Result<()> {
+    if operation.owner.as_ref() != Some(owner) || operation.state.is_terminal() {
+        return Ok(());
+    }
+    operation.owner = previous.owner.clone();
+    operation.owner_stopped = previous.owner_stopped;
+    if operation.state.accepts_work() {
+        // This was an uncommitted claim; no handler ran under the new owner.
+        operation.state = previous.state;
+        operation.sealed = previous.sealed;
+    } else if previous.owner.is_none() {
+        // Cancellation raced validation. Preserve it, but there is no old
+        // handler to await for a claim that never started any work.
+        operation.owner_stopped = true;
+        operation.cancel_recorded = true;
+    }
+    Ok(())
 }

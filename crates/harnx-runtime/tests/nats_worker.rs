@@ -7,6 +7,9 @@ mod cancellation;
 mod common;
 #[path = "nats_worker/multi_round_resume.rs"]
 mod multi_round_resume;
+#[path = "nats_worker/session_completion.rs"]
+mod session_completion;
+use session_completion::{activate_session, local_test_nats, wait_for_worker_daemon_idle};
 #[path = "nats_worker/session_metadata.rs"]
 mod session_metadata;
 
@@ -159,18 +162,6 @@ fn count_tool_results_with_id(entries: &[(u64, SessionLogEntry)], call_id: &str)
             _ => false,
         })
         .count()
-}
-
-async fn wait_for_worker_daemon_idle(metrics_before_lease_acquisitions: u64) -> Result<()> {
-    wait_until(CI_SAFE_TIMEOUT, || {
-        harnx_runtime::nats_metrics::snapshot().lease_acquisitions
-            > metrics_before_lease_acquisitions
-    })
-    .await?;
-    wait_until(CI_SAFE_TIMEOUT, || {
-        harnx_runtime::nats_metrics::snapshot().active_sessions_per_worker == 0
-    })
-    .await
 }
 
 fn assert_no_resume_or_interrupt_metric_delta(
@@ -418,24 +409,6 @@ async fn wait_for_worker_session_cleanup(
         harnx_runtime::nats_metrics::snapshot().active_sessions_per_worker == 0
     })
     .await
-}
-
-async fn local_test_nats(server_url: &str) -> Result<async_nats::jetstream::Context> {
-    Ok(async_nats::jetstream::new(
-        async_nats::connect(server_url).await?,
-    ))
-}
-
-async fn activate_session(
-    jetstream: &async_nats::jetstream::Context,
-    session_id: &str,
-) -> Result<()> {
-    let store = SessionMetadataStore::ensure(jetstream, 1).await?;
-    if store.get(session_id).await?.is_none() {
-        seed_session_metadata(jetstream, session_id).await?;
-    }
-    publish_session_activate(jetstream, "local", &SessionActivate::new(session_id)).await?;
-    Ok(())
 }
 
 /// Stub LLM that emits a tool call for the first `TOOL_ROUNDS` calls and a
@@ -1713,12 +1686,9 @@ async fn retracted_orphan_tool_call_is_not_repaired_by_worker() -> Result<()> {
 
     activate_session(&js, session_id).await?;
 
-    // Deterministic barrier: wait until the worker has actually CLAIMED the session
-    // (lease_acquisitions increments) — which proves it reached load_or_repair_session
-    // and ran the orphan scan — and then FINISHED (active_sessions back to 0). Without
-    // this, the assertions could run before the worker did anything (a 0==0 check is
-    // satisfied immediately), letting the test pass vacuously even with the bug present.
-    wait_for_worker_daemon_idle(metrics_before.lease_acquisitions).await?;
+    // Wait for acquisition followed by lease release and task completion, so
+    // zero-valued assertions cannot pass before the orphan scan has run.
+    wait_for_worker_daemon_idle(&js, session_id, metrics_before.lease_acquisitions).await?;
 
     let entries = log.load_events_async().await?;
     assert_eq!(

@@ -47,7 +47,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 pub const TOOL_REGISTRY_BUCKET: &str = "harnx_tool_registry";
-pub const TOOL_PROTOCOL_VERSION: u32 = 2;
+pub const TOOL_PROTOCOL_VERSION: u32 = 3;
+
+pub mod invocation_journal;
+mod recovery;
 pub const TOOL_SCHEMA_VERSION: u32 = 1;
 
 const IDEMPOTENCY_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -86,6 +89,7 @@ struct ToolRequestContext {
     server_scope: ServerScope,
     server_identity: String,
     execution_store: harnx_execution_control::ExecutionStore,
+    journal: invocation_journal::InvocationJournal,
 }
 
 struct ValidatedToolRequest {
@@ -280,6 +284,8 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
         proto_version: TOOL_PROTOCOL_VERSION,
     };
     let (registry, execution_store) = ensure_control_stores(&client, replicas).await?;
+    let journal =
+        invocation_journal::InvocationJournal::ensure(&jetstream::new(client.clone())).await?;
     let mut revision = publish_registration(&registry, &instance_id, &registration).await?;
     signal_started(started);
 
@@ -293,6 +299,7 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
         server_scope: instance_id.clone(),
         server_identity: identity_token.clone(),
         execution_store,
+        journal,
     };
 
     let outcome = serve_requests(
@@ -361,6 +368,10 @@ async fn serve_requests(
     subscriptions: ToolSubscriptions<'_>,
     refresh: RegistrationRefresh<'_>,
 ) -> Result<()> {
+    let mut journal_reconciliation = Box::pin(invocation_journal::replica_reconciliations(
+        jetstream::new(request_context.client.clone()),
+        REGISTRATION_REFRESH_INTERVAL,
+    ));
     let mut renewals = Box::pin(harnx_nats_common::registry::refreshes(
         refresh.registry.clone(),
         registration_key(refresh.instance_id, refresh.identity_token),
@@ -369,6 +380,11 @@ async fn serve_requests(
     ));
     loop {
         tokio::select! {
+            Some(result) = journal_reconciliation.next() => {
+                if let Err(error) = result {
+                    log::warn!("reconcile invocation journal replicas failed; retrying next interval: {error:#}");
+                }
+            }
             request = subscriptions.tool_requests.next() => {
                 let Some(request) = request else {
                     anyhow::bail!("tool request subscription closed");
@@ -476,6 +492,11 @@ async fn invoke_uncached_tool(
     request: &mut ToolRequest,
     parent_cx: OtelContext,
 ) -> Result<Value, ToolInvokeError> {
+    let recovery = recovery::InvocationRecovery::load(context, request).await?;
+    if let Some(reply) = recovery.completed_reply(context).await? {
+        return reply_result(reply);
+    }
+    recovery.check_policy(context).await?;
     let execution = execution::InvocationExecution::claim(
         &context.execution_store,
         request,
@@ -515,14 +536,14 @@ async fn invoke_uncached_tool(
         .find(|spec| spec.name == request.tool)
         .map(|spec| spec.cancellation_guarantee)
         .unwrap_or_default();
-    let invocation = context
-        .toolset
-        .invoke_with_context(ToolInvocation {
-            tool: request.tool.clone(),
-            args,
-            context: invocation_context,
-            cancel: cancel.clone(),
-        })
+    let invocation = ToolInvocation {
+        tool: request.tool.clone(),
+        args,
+        context: invocation_context,
+        cancel: cancel.clone(),
+    };
+    let invocation = recovery
+        .invoke(context.toolset.as_ref(), invocation)
         .instrument(tool_exec_span(&request.tool, parent_cx));
     let result = execution
         .invoke(cancel, guarantee, invocation, stopped)
@@ -532,6 +553,13 @@ async fn invoke_uncached_tool(
     let is_ok = result.is_ok();
     harnx_metrics::record_tool_call(metric_tool, is_ok, elapsed);
     result
+}
+
+fn reply_result(reply: ToolReply) -> Result<Value, ToolInvokeError> {
+    reply.result.map_err(|error| match error {
+        ToolErrorPayload::Recoverable(message) => ToolInvokeError::Recoverable(message),
+        ToolErrorPayload::Fatal(message) => ToolInvokeError::Fatal(message),
+    })
 }
 
 struct RequestAttestation {
@@ -696,6 +724,16 @@ async fn validate_tool_request(
         .await?;
         return Ok(None);
     };
+    if let Err(error) = recovery::validate_replay(context, &request).await {
+        return publish_recoverable_reply(
+            &context.client,
+            reply_subject,
+            request.call_id,
+            format!("reject tool replay: {error:#}"),
+        )
+        .await
+        .map(|_| None);
+    }
     Ok(Some(ValidatedToolRequest {
         reply_subject,
         request,

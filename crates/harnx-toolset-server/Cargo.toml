@@ -21,6 +21,7 @@ harnx-toolset = { path = "../harnx-toolset" }
 log = { workspace = true }
 opentelemetry = { workspace = true }
 rmcp = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

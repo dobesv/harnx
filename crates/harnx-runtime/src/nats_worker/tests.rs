@@ -1233,8 +1233,26 @@ async fn subagent_silent_turn_waits_for_lease_backed_completion() {
     let _ = nats.wait();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn nested_subagent_prompt_returns_final_message_over_nats() {
+// Nested delegation exercises the production worker activation path. A fixed
+// budget below Tokio's default catches oversized async frames on Linux too,
+// rather than relying on platform-specific code generation to expose them.
+fn run_with_bounded_worker_stack(future: impl std::future::Future<Output = ()>) {
+    harnx_core::require_nextest();
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(1536 * 1024)
+        .enable_all()
+        .build()
+        .expect("build bounded-stack runtime")
+        .block_on(future);
+}
+
+#[test]
+fn nested_subagent_prompt_returns_final_message_over_nats() {
+    run_with_bounded_worker_stack(nested_subagent_prompt());
+}
+
+async fn nested_subagent_prompt() {
     const CHILD_PROMPT: &str = "complete the delegated child work";
     const CHILD_FINAL: &str = "child final message over nats";
     const PARENT_FINAL: &str = "parent received child result";

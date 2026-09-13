@@ -49,6 +49,8 @@ mod session_start_hook_tests;
 #[cfg(test)]
 mod subagent_progress_tests;
 #[cfg(test)]
+mod subagent_replay_tests;
+#[cfg(test)]
 mod subagent_tool_context_tests;
 #[cfg(test)]
 pub(crate) mod tests;

@@ -196,7 +196,11 @@ async fn assert_resume_outcome(
     metrics_before: harnx_runtime::nats_metrics::NatsMetricsSnapshot,
 ) -> Result<()> {
     let entries = fixture.log.load_events_async().await?;
-    assert_eq!(capture.model_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        capture.model_calls.load(Ordering::SeqCst),
+        1,
+        "resume transcript: {entries:#?}"
+    );
     let captured = capture.inputs.lock().await;
     assert_eq!(captured.len(), 1);
     assert_eq!(captured[0].0, "original request");
@@ -239,6 +243,11 @@ async fn multi_round_resume_with_queued_user_repairs_once_and_becomes_idle() -> 
     let Some(server) = require_nats_server().await? else {
         return Ok(());
     };
+    // Tool discovery uses the dynamic local endpoint, independently of the
+    // daemon's named cluster. Nextest isolates this environment per test.
+    // Never let replay read journal state from the developer's shared broker.
+    std::env::set_var("HARNX_NATS_URL", server.url());
+    std::env::set_var("HARNX_NATS_TOKEN", "");
     let (capture, call_fn) = capturing_call_fn();
     let daemon = spawn_worker_daemon_with_call_fn(
         local_nats_runtime_config(server.url()),
@@ -253,7 +262,8 @@ async fn multi_round_resume_with_queued_user_repairs_once_and_becomes_idle() -> 
         fixture.session.activate_pending_turn().await?,
         Some(fixture.queued_user_seq)
     );
-    wait_for_worker_daemon_idle(metrics_before.lease_acquisitions).await?;
+    let js = local_test_nats(server.url()).await?;
+    wait_for_worker_daemon_idle(&js, SESSION_ID, metrics_before.lease_acquisitions).await?;
     assert_resume_outcome(&fixture, &capture, metrics_before).await?;
 
     daemon.abort();
