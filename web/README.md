@@ -148,4 +148,4 @@ In development mode (`import.meta.env.DEV`), `window.__harnxConnection = { initi
 
 `toMessagePartStatus` passes `message.status` through to the part, so `reason` is available.
 
-In this app, HITL approvals render via a separate path (`web/src/App.tsx` `useAgUiInterrupts()` → `BatchInterruptUI`) — not via `ToolCallCard`. See `ToolCallCard.tsx:104-107` for the `isPending`/`isActionRequired` derivation. Issue #1827.
+In this app, HITL approvals render via a separate path (`web/src/App.tsx` `useAgUiInterrupts()` → `BatchInterruptUI`) — not via `ToolCallCard`. See `toolCallPresentation.ts` (`getToolCallPresentation`) for the `isPending`/`isActionRequired` derivation. Issue #1827.
