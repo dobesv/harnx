@@ -9,11 +9,13 @@ import '@testing-library/jest-dom';
 import {
   BatchInterruptUI,
   CancelButton,
+  MyAttachment,
   MyComposer,
   SendErrorIndicator,
   StatusBar,
   StatusIndicator,
 } from '../App';
+import { MarkdownLink } from '../markdownLink';
 import { sendPrompt, uploadAttachment, submitHitlDecision } from '../api';
 import { PendingContext } from '../PendingContext';
 import { UsageContext } from '../UsageContext';
@@ -50,6 +52,16 @@ vi.mock('@assistant-ui/react', async (importOriginal) => {
     ...actual, 
     useAuiState: vi.fn(), 
     useAui: vi.fn(),
+    AttachmentPrimitive: {
+      Root: ({ className, children }: any) => <div className={className}>{children}</div>,
+      unstable_Thumb: ({ className }: any) => <div className={className} />,
+      Name: () => <span>diagram.png</span>,
+      Remove: ({ className, children, ...props }: any) => (
+        <button type="button" className={className} {...props}>
+          {children}
+        </button>
+      ),
+    },
   };
 });
 
@@ -84,7 +96,10 @@ describe('cancellation UI', () => {
         <CancelButton />
       </CancellationContext.Provider>,
     );
-    fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
+    const stopBtn = screen.getByRole('button', { name: 'Stop' });
+    expect(stopBtn).toHaveClass('aui-composer-icon-btn');
+    expect(stopBtn).toHaveClass('aui-cancel-button');
+    fireEvent.click(stopBtn);
     expect(stop).toHaveBeenCalledOnce();
   });
 
@@ -94,14 +109,27 @@ describe('cancellation UI', () => {
         <CancelButton />
       </CancellationContext.Provider>,
     );
-    expect(screen.getByRole('button', { name: 'Requesting cancellation…' })).toBeDisabled();
+    const requestingBtn = screen.getByRole('button', { name: 'Requesting cancellation…' });
+    expect(requestingBtn).toBeDisabled();
+    expect(requestingBtn).toHaveClass('aui-composer-icon-btn');
 
     rerender(
       <CancellationContext.Provider value={cancellationControl('stopping')}>
         <CancelButton />
       </CancellationContext.Provider>,
     );
-    expect(screen.getByRole('button', { name: 'Stopping…' })).toBeDisabled();
+    const stoppingBtn = screen.getByRole('button', { name: 'Stopping…' });
+    expect(stoppingBtn).toBeDisabled();
+    expect(stoppingBtn).toHaveClass('aui-composer-icon-btn');
+
+    rerender(
+      <CancellationContext.Provider value={cancellationControl('abandoning')}>
+        <CancelButton />
+      </CancellationContext.Provider>,
+    );
+    const resumingBtn = screen.getByRole('button', { name: 'Resuming…' });
+    expect(resumingBtn).toBeDisabled();
+    expect(resumingBtn).toHaveClass('aui-composer-icon-btn');
   });
 
   it('offers retry and confirmed resume after cancellation becomes unconfirmed', () => {
@@ -621,5 +649,39 @@ describe('MyComposer', () => {
       text: 'hello', 
       attachmentRefs: ['cid:file1'] 
     });
+  });
+
+  it('renders attachment chip with horizontal layout, thumbnail, filename, and remove button', () => {
+    const { container } = render(<MyAttachment />);
+    const chip = container.querySelector('.aui-attachment');
+    expect(chip).toBeInTheDocument();
+    expect(container.querySelector('.aui-attachment-thumb')).toBeInTheDocument();
+    expect(container.querySelector('.aui-attachment-info')).toBeInTheDocument();
+    expect(container.querySelector('.aui-attachment-name')).toBeInTheDocument();
+    expect(screen.getByText('diagram.png')).toBeInTheDocument();
+    const removeBtn = container.querySelector('.aui-attachment-remove');
+    expect(removeBtn).toBeInTheDocument();
+    expect(removeBtn).toHaveAttribute('aria-label', 'Remove attachment');
+  });
+});
+
+describe('MarkdownLink', () => {
+  it('renders markdown links with target="_blank" and rel="noopener noreferrer"', () => {
+    render(<MarkdownLink href="https://example.com">Documentation</MarkdownLink>);
+    const link = screen.getByRole('link', { name: 'Documentation' });
+    expect(link).toHaveAttribute('href', 'https://example.com');
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+  });
+
+  it('stops click propagation so parent accordions are not triggered', () => {
+    const parentClick = vi.fn();
+    render(
+      <div onClick={parentClick}>
+        <MarkdownLink href="https://example.com">External Resource</MarkdownLink>
+      </div>
+    );
+    fireEvent.click(screen.getByRole('link', { name: 'External Resource' }));
+    expect(parentClick).not.toHaveBeenCalled();
   });
 });

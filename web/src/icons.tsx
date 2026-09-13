@@ -32,6 +32,14 @@ export function SendIcon({ className, ...props }: IconProps) {
   );
 }
 
+export function StopIcon({ className, ...props }: IconProps) {
+  return (
+    <svg className={className} {...defaultProps} {...props}>
+      <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
 export function ChevronDownIcon({ className, ...props }: IconProps) {
   return (
     <svg className={className} {...defaultProps} {...props}>
