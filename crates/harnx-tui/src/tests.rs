@@ -979,6 +979,24 @@ async fn info_session_without_session_renders_in_tui_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn dump_session_without_session_renders_in_tui_snapshot() {
+    let config = test_config();
+    let mut harness = TuiTestHarness::with_size(60, 14).await;
+    harness.tui().config = config.clone();
+
+    harness.tui().run_command(".dump session").await.unwrap();
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(!rendered.is_empty());
+    assert!(harness.tui().app.detail_view_open);
+    insta::assert_snapshot!("dump_session_without_session_in_tui", rendered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn info_agent_overlay_renders_in_tui_snapshot() {
     let mut harness = TuiTestHarness::with_size(72, 20).await;
     {

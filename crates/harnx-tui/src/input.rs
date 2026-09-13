@@ -2,16 +2,61 @@ use crate::lifecycle::session_history_transcript_items;
 use crate::render_helpers::render_status_line;
 use crate::strip_ansi;
 use crate::types::{ExitPhase, ModalState, TranscriptItem, Tui, TuiEvent};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use crossterm::ExecutableCommand;
 use harnx_core::event::{AgentEvent, AgentSource};
 use harnx_render::pretty_error_string;
-use harnx_runtime::config::list_assistant_agents;
+use harnx_runtime::config::{
+    dump_entries_jsonl, dump_entries_yaml, list_assistant_agents, load_session_for_render,
+    render_metadata_json, render_metadata_yaml, SessionFormat,
+};
+use harnx_runtime::nats_session_log::NatsSessionLog;
+use harnx_runtime::nats_session_metadata::SessionMetadataStore;
 use harnx_runtime::utils::pretty_yaml_block;
 use ratatui_textarea::{Input as TextInput, Key};
 use std::path::Path;
 
+/// Parse tokens after `.info session` or `.dump session` into positional args and format.
+fn parse_session_tokens(tokens: &[String]) -> Result<(Vec<String>, SessionFormat)> {
+    let mut positional = Vec::new();
+    let mut format = SessionFormat::Text;
+    let mut format_next = false;
+    // Skip command tokens [".info", "session"] or [".dump", "session"]
+    for token in tokens.iter().skip(2) {
+        if format_next {
+            format = token.parse()?;
+            format_next = false;
+        } else if token == "--format" {
+            format_next = true;
+        } else if let Some(val) = token.strip_prefix("--format=") {
+            format = val.parse()?;
+        } else {
+            positional.push(token.clone());
+        }
+    }
+    if format_next {
+        anyhow::bail!("Missing value for --format");
+    }
+    Ok((positional, format))
+}
+
+/// Types of overlay content for info/dump commands.
+enum InfoOverlayType {
+    AgentInfo,
+    SessionInfo,
+    SessionDump,
+}
+
+impl InfoOverlayType {
+    fn title(&self) -> &'static str {
+        match self {
+            InfoOverlayType::AgentInfo => "Agent Info",
+            InfoOverlayType::SessionInfo => "Session Info",
+            InfoOverlayType::SessionDump => "Session Transcript",
+        }
+    }
+}
 /// Byte budget for an attachment preview. Applied via `truncate_output`'s
 /// `max_output_bytes` (and split across per-line head/tail byte limits), so it
 /// is measured in bytes rather than characters — multibyte text may crop a
@@ -1951,12 +1996,8 @@ impl Tui {
     }
 
     async fn try_handle_info_overlay(&mut self, line_cmd: &str) -> bool {
-        let is_info_agent =
-            line_cmd.starts_with(".info agent") || line_cmd.starts_with("/info agent");
-        let is_info_session =
-            line_cmd.starts_with(".info session") || line_cmd.starts_with("/info session");
-
-        if !is_info_agent && !is_info_session {
+        let info_type = self.detect_info_overlay_type(line_cmd);
+        if info_type.is_none() {
             return false;
         }
 
@@ -1967,35 +2008,163 @@ impl Tui {
             return true;
         };
 
-        let result = if is_info_agent {
-            self.resolve_info_agent_target(&tokens)
-                .and_then(|agent_name| {
-                    let cfg = self.config.read();
-                    harnx_runtime::config::render_agent_dump(&cfg, &agent_name)
-                })
-        } else {
-            async {
-                let (_agent_name, session_id) = self.resolve_info_session_target(&tokens)?;
-                let cfg = self.config.read().clone();
-                let cluster = cfg
-                    .remote_agent
-                    .as_ref()
-                    .map(|(_, cluster)| cluster.as_str())
-                    .unwrap_or(harnx_runtime::config::LOCAL_CLUSTER_KEY)
-                    .to_string();
-                harnx_runtime::config::render_session_dump(&cfg, &cluster, &session_id).await
-            }
-            .await
-        };
-
+        let info_type = info_type.unwrap();
+        let result = self.render_info_overlay(&tokens, &info_type).await;
         let display_text = result.unwrap_or_else(|err| format!("Error: {}", err));
-        let title = if is_info_agent {
-            "Agent Info"
-        } else {
-            "Session Info"
-        };
+        let title = info_type.title();
         self.open_info_overlay(display_text, title);
         true
+    }
+
+    fn detect_info_overlay_type(&self, line_cmd: &str) -> Option<InfoOverlayType> {
+        if line_cmd.starts_with(".info agent") || line_cmd.starts_with("/info agent") {
+            Some(InfoOverlayType::AgentInfo)
+        } else if line_cmd.starts_with(".info session") || line_cmd.starts_with("/info session") {
+            Some(InfoOverlayType::SessionInfo)
+        } else if line_cmd.starts_with(".dump session") || line_cmd.starts_with("/dump session") {
+            Some(InfoOverlayType::SessionDump)
+        } else {
+            None
+        }
+    }
+
+    async fn render_info_overlay(
+        &self,
+        tokens: &[String],
+        info_type: &InfoOverlayType,
+    ) -> Result<String> {
+        match info_type {
+            InfoOverlayType::AgentInfo => {
+                self.resolve_info_agent_target(tokens)
+                    .and_then(|agent_name| {
+                        let cfg = self.config.read();
+                        harnx_runtime::config::render_agent_dump(&cfg, &agent_name)
+                    })
+            }
+            InfoOverlayType::SessionInfo => self.render_info_session_overlay(tokens).await,
+            InfoOverlayType::SessionDump => self.render_dump_session_overlay(tokens).await,
+        }
+    }
+
+    async fn render_info_session_overlay(&self, tokens: &[String]) -> Result<String> {
+        let (agent_name, session_id, format) =
+            self.resolve_session_target_and_format(tokens, ".info session")?;
+        let cfg = self.config.read().clone();
+        let cluster = cfg
+            .remote_agent
+            .as_ref()
+            .map(|(_, cluster)| cluster.as_str())
+            .unwrap_or(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+            .to_string();
+
+        match format {
+            SessionFormat::Text => {
+                let resolved_agent = agent_name.ok_or_else(|| {
+                    anyhow::anyhow!("No active agent or agent name provided for text metadata view")
+                })?;
+                let session =
+                    load_session_for_render(&cfg, Some(&cluster), &session_id, &resolved_agent)
+                        .await?;
+                harnx_runtime::config::session::render(&session)
+            }
+            SessionFormat::Yaml | SessionFormat::Json => {
+                let jetstream = cfg.nats_jetstream(&cluster).await?;
+                let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+                let record = if let Some(agent) = agent_name.as_deref() {
+                    store.get_for_agent(&session_id, agent).await?
+                } else {
+                    store.get(&session_id).await?
+                };
+                let record = record
+                    .ok_or_else(|| anyhow::anyhow!("NATS session '{session_id}' was not found"))?;
+                match format {
+                    SessionFormat::Yaml => render_metadata_yaml(&record.metadata),
+                    SessionFormat::Json => render_metadata_json(&record.metadata),
+                    SessionFormat::Text => unreachable!(),
+                }
+            }
+        }
+    }
+
+    async fn render_dump_session_overlay(&self, tokens: &[String]) -> Result<String> {
+        let (agent_name, session_id, format) =
+            self.resolve_session_target_and_format(tokens, ".dump session")?;
+        let cfg = self.config.read().clone();
+        let cluster = cfg
+            .remote_agent
+            .as_ref()
+            .map(|(_, cluster)| cluster.as_str())
+            .unwrap_or(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+            .to_string();
+
+        let jetstream = cfg.nats_jetstream(&cluster).await?;
+        let metadata_store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+        let metadata = metadata_store
+            .get(&session_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("NATS session '{session_id}' was not found"))?
+            .metadata;
+
+        if let Some(expected_agent) = agent_name.as_deref() {
+            let actual_agent = metadata.agent.name();
+            if actual_agent != Some(expected_agent) {
+                anyhow::bail!(
+                    "NATS session '{session_id}' belongs to agent '{}', not '{expected_agent}'",
+                    actual_agent.unwrap_or("<unknown>")
+                );
+            }
+        }
+
+        let log = NatsSessionLog::new(jetstream, session_id.to_string());
+        let raw = log
+            .load_events_async()
+            .await
+            .with_context(|| format!("Failed to load NATS session '{session_id}'"))?;
+        let entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)?;
+
+        match format {
+            SessionFormat::Text => {
+                let lines = crate::session_overlay::render_transcript_text(&entries);
+                Ok(lines)
+            }
+            SessionFormat::Yaml => dump_entries_yaml(entries.iter().map(|(_, e)| e)),
+            SessionFormat::Json => dump_entries_jsonl(entries.iter().map(|(_, e)| e)),
+        }
+    }
+
+    fn resolve_session_target_and_format(
+        &self,
+        tokens: &[String],
+        cmd_prefix: &str,
+    ) -> Result<(Option<String>, String, SessionFormat)> {
+        let (positional, format) = parse_session_tokens(tokens)?;
+        let (agent_name, session_id) = self.resolve_agent_and_session(&positional)?;
+        if session_id.is_empty() {
+            anyhow::bail!(
+                "No active session or insufficient arguments. Usage: {cmd_prefix} [<agent> <id>] [--format text|yaml|json]"
+            );
+        }
+        Ok((agent_name, session_id, format))
+    }
+
+    fn resolve_agent_and_session(&self, positional: &[String]) -> Result<(Option<String>, String)> {
+        let cfg = self.config.read();
+        match positional.len() {
+            0 => {
+                let agent_name = cfg.agent.as_ref().map(|x| x.name().to_string());
+                let session_id = cfg
+                    .session
+                    .as_ref()
+                    .map(|x| x.id().to_string())
+                    .unwrap_or_default();
+                Ok((agent_name, session_id))
+            }
+            1 => {
+                let agent_name = cfg.agent.as_ref().map(|x| x.name().to_string());
+                Ok((agent_name, positional[0].clone()))
+            }
+            _ => Ok((Some(positional[0].clone()), positional[1].clone())),
+        }
     }
 
     fn resolve_info_agent_target(&self, tokens: &[String]) -> anyhow::Result<String> {
@@ -2014,35 +2183,6 @@ impl Tui {
             ))
         } else {
             Ok(agent_name)
-        }
-    }
-
-    fn resolve_info_session_target(
-        &self,
-        tokens: &[String],
-    ) -> anyhow::Result<(Option<String>, String)> {
-        let (agent_name, session_id) = if tokens.len() > 3 {
-            (Some(tokens[2].clone()), tokens[3].clone())
-        } else if tokens.len() == 3 {
-            let cfg = self.config.read();
-            let a = cfg.agent.as_ref().map(|x| x.name().to_string());
-            (a, tokens[2].clone())
-        } else {
-            let cfg = self.config.read();
-            let a = cfg.agent.as_ref().map(|x| x.name().to_string());
-            let s = cfg.session.as_ref().map(|x| x.id().to_string());
-            match (a, s) {
-                (a_opt, Some(session)) => (a_opt, session),
-                _ => (None, String::new()),
-            }
-        };
-
-        if session_id.is_empty() {
-            Err(anyhow::anyhow!(
-                "No active session or insufficient arguments. Usage: .info session [<agent> <id>]"
-            ))
-        } else {
-            Ok((agent_name, session_id))
         }
     }
 
