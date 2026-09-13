@@ -322,12 +322,22 @@ Note that the Read/Write caches above are **not** executable. In particular, `np
 `~/.cache/node/corepack` is the one cache listed under Exec rather than Read/Write, because Corepack spawns the pinned package manager straight out of it — and since pnpm 12 that is a native binary rather than a script run through `node`. Because a more specific grant replaces the one it sits inside, the exec entry also **revokes** the write that `~/.cache` would otherwise give this subtree: sandboxed code can run the cached package manager but cannot swap in a replacement for the host to run later. The trade-off is that Corepack cannot download a *new* package manager version from inside the sandbox. When you bump the `packageManager` field, prime the cache once on the host:
 
 ```sh
-corepack install   # run outside the sandbox after changing packageManager
+cd web            # or the directory containing your project's package.json
+corepack install  # run both Corepack commands outside the sandbox
+corepack pnpm --version
 ```
+
+Corepack only unpacks the pinned package; it does not install its optional
+dependencies or run lifecycle scripts. With pnpm 12, the first invocation downloads
+the native executable separately. `corepack pnpm --version` completes that download
+before the sandboxed `pnpm` shim runs. `corepack install` alone can therefore still
+leave pnpm failing with `EROFS` when it tries to write `pnpm-native.*.tgz` into the
+read-only cache. Both `corepack` and the Node interpreter it uses must have write
+access to the cache during this preparation.
 
 Grant `--allow-rwx ~/.cache/node/corepack` if you would rather let the sandbox download package manager releases itself.
 
-Defaults are skipped when the path does not exist yet, so on a machine that has never run Corepack the *first* sandboxed invocation still fails: the download lands (via the `~/.cache` write grant) but the freshly unpacked binary has no exec grant. The directory exists from then on, so the next run succeeds. `corepack install` on the host avoids the stumble entirely.
+Defaults are skipped when the path does not exist yet, so on a machine that has never run Corepack the *first* sandboxed invocation still fails: the download lands (via the `~/.cache` write grant) but the freshly unpacked binary has no exec grant. Preparing the package and native executable with both commands above on the host avoids this first-run failure.
 
 Any other `$HOME` subdirectory (e.g. `~/.gemini`, `~/.config`, `~/.ssh`) is **blocked** unless you add it with `--allow-read`, `--allow-write`, or `--allow-rwx`. This is intentional — it prevents the sandboxed process from reading credentials or config files it doesn't need.
 
