@@ -40,8 +40,14 @@ Harnx automatically manages the following JetStream resources:
 - **KV Bucket**: `harnx_sessions` — canonical session state. Each session uses
   `sessions/{id}/meta` for immutable identity plus CAS-updated title, variables,
   overrides, and extensions, and `sessions/{id}/activity` for frequently
-  renewed lifecycle timestamps. No expiry. The `sessions/{id}/read/{viewer}`
-  prefix is reserved for future unread cursors.
+  renewed lifecycle timestamps. No expiry. The `sessions/{id}/read/{viewer}` key
+  stores session-level unread state (see [Session Unread State](#session-unread-state)):
+  - `viewer="default"` — the only viewer in current use; session-level (global) unread.
+  - Value shape: `{ "last_attention_seq": u64, "last_read_seq": u64, "manual_unread": bool }`
+  - `is_unread = (last_attention_seq > last_read_seq) || manual_unread`
+  - Monotonic: `last_read_seq` never moves backward; manual unread is a separate flag.
+  - Workers bump `last_attention_seq` on `TurnEnd` (final message) and `HitlApprovalRequested`.
+  - Invalidation subject: `harnx.session.{id}.read.invalidated` (separate from metadata invalidation).
 - **KV Bucket**: `harnx_tool_registry` — tool server discovery, with a
   per-registration TTL.
 - **KV Buckets**: `harnx_hook_registry` and `harnx_hook_expectations` — hook
@@ -644,6 +650,82 @@ a trailing call into an interrupted result. Replay also ignores redundant
 appear as current orphan warnings.
 
 ## Failover & Safety
+
+## Session Unread State
+
+Harnx tracks session-level unread state to surface sessions that require user attention. The unread indicator appears when:
+
+- A model final message (`TurnEnd` with non-zero `through_seq`) was appended by a worker.
+- A tool confirmation (`HitlApprovalRequested`) is pending.
+- A user explicitly marked the session unread.
+
+The unread state follows a monotonic cursor model stored in NATS KV under `harnx_sessions`:
+
+- **Key**: `sessions/{id}/read/default` (`viewer="default"` — session-level, not per-user).
+- **Value**: `{ "last_attention_seq": u64, "last_read_seq": u64, "manual_unread": bool }`.
+- **Predicate**: `is_unread = (last_attention_seq > last_read_seq) || manual_unread`.
+- **Monotonicity**: `last_read_seq` never moves backward; manual unread is a separate bit.
+
+### Worker Attention Bump
+
+Workers automatically bump `last_attention_seq` when appending attention-producing entries:
+
+- `TurnEnd { through_seq, .. }` where `through_seq > 0` — indicates a final message turn.
+- `HitlApprovalRequested { .. }` — indicates a pending tool confirmation.
+
+The bump uses the assigned stream sequence of the appended entry, enabling repair from the log if the bump is lost (e.g., CAS failure, crash before KV write). On worker resume and on server-side session load, `reconcile_attention_from_log` derives the maximum attention sequence from the transcript and repairs the KV entry.
+
+### Mark-Read / Mark-Unread
+
+Users clear unread via presence actions (typing, ESC, CTRL-C, CTRL-D, submit) or explicitly via:
+
+- **TUI**: Press `'u'` or `'U'` in the session picker to toggle unread.
+- **Web**: Click "Mark unread" / "Mark read" button on session cards, or use the JSON-RPC methods:
+
+```
+POST /v1/agents/{agent}/sessions/{session}/rpc
+{ "jsonrpc": "2.0", "method": "session/mark_read", "id": 1 }
+{ "jsonrpc": "2.0", "method": "session/mark_unread", "id": 1 }
+```
+
+- `mark_read`: Advances `last_read_seq` to `last_attention_seq` and clears `manual_unread`.
+- `mark_unread`: Sets `manual_unread = true` without touching the cursor.
+
+Both are idempotent; both publish to the read-invalidation subject.
+
+### Read Invalidation Subject
+
+Mutations to read-state publish a notification to:
+
+```
+harnx.session.{session_id}.read.invalidated
+```
+
+This subject is separate from `harnx.session.{session_id}.metadata.invalidated` (which carries the `/meta` revision). Clients subscribe to the read-invalidation subject for live updates:
+
+- **SSE**: The `/v1/agents/{agent}/sessions/{session}/events` endpoint emits `event: read-updated` for read-state changes, bypassing the `after_seq` gate. The active session's `RuntimeSessionSubscriber` calls its `onReadUpdated` callback on receipt.
+- **TUI**: Subscribes to `harnx.session.{id}.read.invalidated` for the active session in `session_activity.rs` and refreshes the current session's unread indicator and picker sessions on receipt.
+
+### Client Cache Reconciliation
+
+Read-state updates are advisory; clients must handle missed invalidations:
+
+- **Subscribe-before-snapshot**:
+  - **TUI**: `picker_sessions` in `lifecycle.rs` subscribes to the wildcard subject `harnx.session.*.read.invalidated` before taking the session list snapshot, then drains invalidations that arrived during load and refreshes their read-state.
+  - **Web**: The web client does not use subscribe-before-snapshot; it relies on list-level refetching.
+- **Dirty-set tracking**:
+  - **TUI**: Sessions invalidated during the snapshot load are tracked in a dirty-set, then refreshed after the snapshot completes.
+  - **Web**: Not used. Web converges via list-level refetch rather than a per-session dirty set.
+- **Live invalidation refetch**:
+  - **Web**: Active session SSE stream receives `read-updated` events, invoking `onReadUpdated` / `refreshSessions` to refetch the session list.
+- **Periodic reconcile**:
+  - **TUI**: When the session picker modal is open, the main loop emits a `RefreshSessionList` event every 30 seconds. The event handler in `input.rs` refetches the session list.
+  - **Web**: Bounded 30-second periodic reconcile: `useSessionDiscovery` runs an interval triggering `refreshSessions`, and `RuntimeSessionSubscriber` calls `onReadUpdated` every 30 seconds.
+- **Reconnect re-snapshot**:
+  - **TUI**: On NATS reconnect, the session activity monitor re-subscribes to read-invalidation and re-fetches the current session's read state. The picker refetches on the next periodic reconcile or when the user next opens it.
+  - **Web**: SSE `onopen` handler calls `onReadUpdated` on reconnect, triggering a session list refetch.
+- **Subscribe-before-snapshot (active session)**: In the TUI, `monitor_session_connection` subscribes to read-invalidation before attaching the session event stream. When a `ReadInvalidation` arrives, it forwards `SessionReadInvalidation` to the UI for the current session.
+
 
 ### Recovery contract and shared implementation
 

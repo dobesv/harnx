@@ -20,6 +20,8 @@ interface SessionCreationOptions {
 const errorMessage = (error: unknown, fallback: string) =>
   error instanceof Error && error.message ? error.message : fallback;
 
+const SESSION_LIST_RECONCILE_INTERVAL_MS = 30000; // 30 seconds
+
 function withoutListedSessions(ids: string[], sessions: SessionRef[]) {
   return ids.filter((id) => !sessions.some((session) => session.session_id === id));
 }
@@ -69,7 +71,6 @@ function useSessionList(
 
     setRequestLoading(true);
     setSessionsError(null);
-
     listSessions(selectedAgent, { signal: controller.signal })
       .then((data) => {
         if (request !== sessionsRequestRef.current) return;
@@ -90,6 +91,17 @@ function useSessionList(
       });
   }, [selectedAgent, setFreshSessionIds]);
 
+  // Periodic reconcile: refetch on interval
+  useEffect(() => {
+    if (!selectedAgent) return;
+
+    const interval = setInterval(() => {
+      refreshSessions();
+    }, SESSION_LIST_RECONCILE_INTERVAL_MS);
+
+    return () => clearInterval(interval);
+  }, [selectedAgent, refreshSessions]);
+
   useEffect(() => {
     refreshSessions();
     return () => {
@@ -102,6 +114,7 @@ function useSessionList(
 
   return {
     sessions,
+    setSessions,
     sessionsError,
     setSessionsError,
     sessionsLoading: Boolean(selectedAgent) && (requestLoading || settledAgent !== selectedAgent),
@@ -163,6 +176,12 @@ export function useSessionDiscovery({
     setFreshSessionIds((previous) => previous.filter((id) => id !== sessionId));
   }, []);
 
+  const setSessionUnread = useCallback((sessionId: string, unread: boolean) => {
+    sessionList.setSessions((prev) =>
+      prev.map((s) => (s.session_id === sessionId ? { ...s, unread } : s)),
+    );
+  }, [sessionList.setSessions]);
+
   return {
     sessions: sessionList.sessions,
     sessionsError: sessionList.sessionsError,
@@ -171,6 +190,7 @@ export function useSessionDiscovery({
     isFreshSession: freshSessionIds.includes(selectedSessionId),
     markSessionNotFresh,
     refreshSessions: sessionList.refreshSessions,
+    setSessionUnread,
     selectSession,
     newChat,
   };

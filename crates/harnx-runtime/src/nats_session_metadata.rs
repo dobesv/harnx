@@ -5,11 +5,15 @@
 //! frequently refreshed lifecycle timestamps live under
 //! `sessions/{id}/activity` so lease renewal does not contend with metadata
 //! mutations.
+//!
+//! Read-state for session unread tracking lives under `sessions/{id}/read/default`
+//! with a dedicated invalidation subject `harnx.session.{id}.read.invalidated`.
 
 mod activity;
 mod execution_context;
 mod initializer;
 mod model;
+mod read_state;
 mod store;
 mod tool_context;
 mod view;
@@ -26,9 +30,10 @@ pub use initializer::SessionInitializer;
 pub use model::{
     SessionAgentSource, SessionMetadata, SessionOverrideUpdate, SessionOverrides, SessionTitle,
 };
+pub use read_state::SessionReadState;
 pub use store::{
-    activity_key, invalidation_subject, metadata_key, read_cursor_key, session_prefix,
-    SessionExtensionUpdate, SessionMetadataStore,
+    activity_key, invalidation_subject, metadata_key, read_cursor_key, read_invalidation_subject,
+    session_prefix, SessionExtensionUpdate, SessionMetadataStore,
 };
 pub use tool_context::{
     tool_context, ToolContext, ToolContextEntry, TOOL_CONTEXT_NAMESPACE, TOOL_CONTEXT_VERSION,

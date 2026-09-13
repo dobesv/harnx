@@ -4380,6 +4380,7 @@ version = "0.33.4"
 dependencies = [
  "ag-ui-core",
  "anyhow",
+ "async-nats",
  "bytes",
  "chrono",
  "clap",

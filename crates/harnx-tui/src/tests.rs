@@ -9224,3 +9224,235 @@ fn tool_confirmation_json_fence_exceeds_content_backticks() {
     assert!(markdown.starts_with("`````json\n"));
     assert!(markdown.ends_with("\n`````"));
 }
+
+// ---------------------------------------------------------------------------
+// 'u' key in pickers: filter vs toggle unread
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn agent_picker_u_key_filters_query() {
+    // In AgentPicker, pressing 'u' should add to the query filter, not be swallowed
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = TestEnvironment::set(tmp.path());
+    create_agent_stubs(&tmp.path().join("agents"), &["apollo", "argus", "hermes"]);
+
+    let config = picker_test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+
+    tui.app.modal = Some(crate::types::ModalState::AgentPicker {
+        agents: vec!["apollo".into(), "argus".into(), "hermes".into()],
+        selected: 0,
+        query: String::new(),
+    });
+
+    // Press 'u' — should filter by appending to query
+    tui.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    match &tui.app.modal {
+        Some(crate::types::ModalState::AgentPicker { query, .. }) => {
+            assert_eq!(query, "u", "'u' in AgentPicker should append to query");
+        }
+        other => panic!("expected AgentPicker, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn session_picker_u_key_does_not_filter_query() {
+    // In SessionPicker, pressing 'u' should toggle unread, not filter
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = TestEnvironment::set(tmp.path());
+
+    let config = picker_test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+
+    // Set up a SessionPicker with a mock session (no unread toggle logic needed for this test)
+    tui.app.modal = Some(crate::types::ModalState::SessionPicker {
+        sessions: vec![harnx_runtime::config::SessionMeta {
+            id: "test-session".to_string(),
+            session_id: Some("test-session".to_string()),
+            agent_name: Some("test-agent".to_string()),
+            title: Some("Test".to_string()),
+            modified: None,
+            contexts: vec![],
+            unread: false,
+        }],
+        selected: 1, // Select the session (index 0 is "New session")
+        origin_agent: None,
+        origin_session: None,
+        error: None,
+    });
+
+    // Press 'u' — should NOT add to any query (SessionPicker has no query)
+    // It should attempt to toggle unread (which will fail since no NATS, but that's OK)
+    tui.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    // The modal should still be SessionPicker (not dismissed, not changed)
+    assert!(
+        matches!(
+            tui.app.modal,
+            Some(crate::types::ModalState::SessionPicker { .. })
+        ),
+        "'u' in SessionPicker should keep SessionPicker active"
+    );
+}
+
+// --- SessionPicker u/U toggle preserves origin and tracks selection -----------------
+
+/// Test that toggling unread in SessionPicker preserves origin context and
+/// tracks the toggled session's new position after re-sort.
+///
+/// When the picker is opened mid-session (non-null origin), pressing 'u' to
+/// toggle unread must:
+/// 1. Preserve `origin_agent` and `origin_session` (not drop them to None).
+/// 2. Recompute `selected` to track the toggled session's new index in the
+///    re-sorted (unread-first) list, not reuse the stale numeric offset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_picker_toggle_unread_preserves_origin_and_tracks_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = TestEnvironment::set(tmp.path());
+
+    let config = picker_test_config();
+    {
+        let mut guard = config.write();
+        let model = MockClient::builder().build().model().clone();
+        let mut agent =
+            harnx_runtime::config::Agent::new(harnx_runtime::config::AgentConfig::from_prompt(""));
+        agent.set_name("hermes");
+        agent.set_model(model);
+        guard.agent = Some(agent);
+        // Use remote_agent so picker_sessions queries NATS
+        guard.remote_agent = Some((
+            "hermes".to_string(),
+            harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
+        ));
+    }
+
+    let nats_config = config.read().clone();
+    let Ok(jetstream) = nats_config
+        .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+        .await
+    else {
+        eprintln!("skipping: local nats-server is unavailable");
+        return;
+    };
+    let metadata_store =
+        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+            .await
+            .expect("create metadata store");
+
+    // Create two sessions for the same agent:
+    // - session-a: initially read (unread=false)
+    // - session-b: initially unread (unread=true)
+    // After sort (unread-first): [session-b, session-a]
+    // After toggling session-a to unread: [session-a, session-b] (session-a moves to front)
+    for (session_id, agent, unread) in [
+        ("session-a", "hermes", false),
+        ("session-b", "hermes", true),
+    ] {
+        metadata_store
+            .create(&harnx_runtime::nats_session_metadata::SessionMetadata::new(
+                session_id,
+                harnx_runtime::SessionInitializer::named(agent, Default::default()),
+            ))
+            .await
+            .expect("create session metadata fixture");
+
+        if unread {
+            metadata_store
+                .mark_unread(session_id)
+                .await
+                .expect("mark session unread");
+        }
+    }
+
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (sessions, error) = Tui::picker_sessions(&config).await;
+    assert!(error.is_none(), "picker enumeration failed: {error:?}");
+    assert_eq!(sessions.len(), 2, "expected two sessions for agent");
+
+    // Initial sort (unread-first): session-b (unread=true) comes before session-a (read)
+    assert_eq!(
+        sessions[0].id, "session-b",
+        "session-b should be first (unread)"
+    );
+    assert_eq!(
+        sessions[1].id, "session-a",
+        "session-a should be second (read)"
+    );
+
+    // Set up SessionPicker with origin context (simulating mid-session navigation)
+    // Select session-a at index 2 (0="New session", 1=session-b, 2=session-a)
+    let origin_agent = Some("previous-agent".to_string());
+    let origin_session = Some("previous-session".to_string());
+    tui.app.modal = Some(crate::types::ModalState::SessionPicker {
+        sessions: sessions.clone(),
+        selected: 2, // session-a (the read one)
+        origin_agent: origin_agent.clone(),
+        origin_session: origin_session.clone(),
+        error: None,
+    });
+
+    // Press 'u' to toggle session-a to unread
+    tui.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    // Verify the modal is still SessionPicker
+    let Some(crate::types::ModalState::SessionPicker {
+        sessions: new_sessions,
+        selected: new_selected,
+        origin_agent: actual_origin_agent,
+        origin_session: actual_origin_session,
+        error: _,
+    }) = &tui.app.modal
+    else {
+        panic!(
+            "expected SessionPicker after toggle, got {:?}",
+            tui.app.modal
+        );
+    };
+
+    // 1. Origin context must be preserved
+    assert_eq!(
+        *actual_origin_agent, origin_agent,
+        "origin_agent must be preserved after toggle"
+    );
+    assert_eq!(
+        *actual_origin_session, origin_session,
+        "origin_session must be preserved after toggle"
+    );
+
+    // 2. Selected must track the toggled session's new position
+    // After toggle, session-a is unread and should be first in the list
+    assert_eq!(
+        new_sessions.len(),
+        2,
+        "should still have two sessions after toggle"
+    );
+
+    // Find session-a in the new list and verify it's marked unread
+    let session_a = new_sessions
+        .iter()
+        .find(|s| s.id == "session-a")
+        .expect("session-a should exist after toggle");
+    assert!(session_a.unread, "session-a should now be unread");
+
+    // Verify selected points to session-a (the toggled session)
+    // The index is sessions index + 1 (since index 0 is "New session")
+    let expected_selected = new_sessions
+        .iter()
+        .position(|s| s.id == "session-a")
+        .map(|i| i + 1)
+        .expect("session-a should be in the list");
+    assert_eq!(
+        *new_selected, expected_selected,
+        "selected must track session-a's new position, not reuse stale index"
+    );
+}

@@ -138,8 +138,20 @@ impl Server {
 
     async fn session_events(&self, target: AgentSessionRef<'_>) -> Result<AppResponse> {
         let event_stream = attach_agent_session(&self.config, target).await?;
-        let stream = stream::select(session_updates(event_stream), keep_alive())
-            .map(|bytes| Ok::<_, Infallible>(Frame::data(bytes)));
+        // Subscribe to read-invalidation for this session
+        let client = self.config.nats_client(LOCAL_CLUSTER_KEY).await?;
+        let read_invalidation_sub = client
+            .subscribe(
+                harnx_runtime::nats_session_metadata::read_invalidation_subject(target.session),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to subscribe to read-invalidation: {e}"))?;
+
+        let stream = stream::select(
+            session_updates_with_read(event_stream, read_invalidation_sub),
+            keep_alive(),
+        )
+        .map(|bytes| Ok::<_, Infallible>(Frame::data(bytes)));
 
         Ok(Response::builder()
             .status(StatusCode::OK)
@@ -268,6 +280,39 @@ pub(crate) async fn canonical_agent_session_exists(
         .is_some())
 }
 
+pub fn session_updates_with_read(
+    event_stream: harnx_runtime::nats_event_sink::SessionEventStream,
+    read_invalidation_sub: async_nats::Subscriber,
+) -> impl Stream<Item = Bytes> {
+    stream::unfold(
+        (event_stream, read_invalidation_sub, None),
+        |(mut stream, mut read_sub, mut last_notified_seq)| async move {
+            loop {
+                tokio::select! {
+                    // Handle session events with the existing seq gate
+                    Some(envelope) = stream.next() => {
+                        if stream.should_render(&envelope) && last_notified_seq != Some(envelope.after_seq)
+                        {
+                            last_notified_seq = Some(envelope.after_seq);
+                            let data = json!({ "after_seq": envelope.after_seq });
+                            let event = Bytes::from(format!("event: session-updated\ndata: {data}\n\n"));
+                            return Some((event, (stream, read_sub, last_notified_seq)));
+                        }
+                    }
+                    // Handle read-invalidation - BYPASSES the seq gate!
+                    Some(_) = read_sub.next() => {
+                        // Emit read-updated event directly without seq gate
+                        let event = Bytes::from("event: read-updated\ndata: {}\n\n");
+                        return Some((event, (stream, read_sub, last_notified_seq)));
+                    }
+                    else => return None,
+                }
+            }
+        },
+    )
+}
+
+#[allow(dead_code)]
 pub(crate) fn session_updates(
     event_stream: harnx_runtime::nats_event_sink::SessionEventStream,
 ) -> impl Stream<Item = Bytes> {

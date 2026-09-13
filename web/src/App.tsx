@@ -20,7 +20,7 @@ import { PendingContext, type HydratedPendingApproval } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { SubAgentSessionNotes } from './SubAgentSessionNotes';
-import { sendPrompt, submitHitlDecision, uploadAttachment } from './api';
+import { sendPrompt, submitHitlDecision, uploadAttachment, markRead, markUnread } from './api';
 import { CancellationContext, type CancellationControl } from './CancellationContext';
 import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
@@ -200,6 +200,8 @@ function restoreComposerAfterSendFailure({
 export const MyComposer = ({
   agentName,
   sessionId,
+  isUnread,
+  onMarkRead,
   isFreshSession,
   markSessionNotFresh,
   onSwitchAgent,
@@ -209,6 +211,8 @@ export const MyComposer = ({
 }: {
   agentName: string;
   sessionId: string;
+  isUnread?: boolean;
+  onMarkRead?: () => void;
   isFreshSession: boolean;
   markSessionNotFresh: (sessionId: string) => void;
   onSwitchAgent: () => void;
@@ -224,6 +228,41 @@ export const MyComposer = ({
   const [isSending, setIsSending] = useState(false);
   const userMessageCount = useAuiState(s => s.thread.messages.filter(m => m.role === 'user').length);
   const prevUserMessageCount = useRef(userMessageCount);
+
+  const markedReadRef = useRef(false);
+  const isMarkingReadRef = useRef(false);
+
+  // Reset markedReadRef if sessionId changes or isUnread transitions from false to true
+  const prevUnreadRef = useRef(isUnread);
+  const prevSessionIdRef = useRef(sessionId);
+  useEffect(() => {
+    if (prevSessionIdRef.current !== sessionId) {
+      prevSessionIdRef.current = sessionId;
+      markedReadRef.current = false;
+    }
+    if (!prevUnreadRef.current && isUnread) {
+      markedReadRef.current = false;
+    }
+    prevUnreadRef.current = isUnread;
+  }, [sessionId, isUnread]);
+
+  const triggerMarkRead = useCallback(() => {
+    if (!isUnread || markedReadRef.current || isMarkingReadRef.current) return;
+    markedReadRef.current = true;
+    isMarkingReadRef.current = true;
+    markRead(agentName, sessionId)
+      .then(() => {
+        onMarkRead?.();
+      })
+      .catch((err) => {
+        console.error('Failed to mark session as read', err);
+        // On failure, allow retry
+        markedReadRef.current = false;
+      })
+      .finally(() => {
+        isMarkingReadRef.current = false;
+      });
+  }, [isUnread, agentName, sessionId, onMarkRead]);
 
   useEffect(() => {
     if (isSending && userMessageCount > prevUserMessageCount.current) {
@@ -273,6 +312,7 @@ export const MyComposer = ({
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (submissionDisabled) return;
+    triggerMarkRead();
     setErrorText(null);
 
     const state = composerRuntime.getState();
@@ -334,7 +374,7 @@ export const MyComposer = ({
 
   
   const placeholder = 'Type a message...';
-  const menuProps = { agentName, sessionId, switchAgentHref, switchSessionHref, onSwitchAgent, onSwitchSession };
+  const menuProps = { agentName, sessionId, unread: isUnread, switchAgentHref, switchSessionHref, onSwitchAgent, onSwitchSession };
   const sendLabel = 'Send';
 
   return (
@@ -345,7 +385,17 @@ export const MyComposer = ({
       <ComposerPrimitive.Input
         className="aui-composer-input"
         placeholder={placeholder}
-        render={<textarea disabled={isSending || cancelling} ref={setTextareaRef} rows={1} onInput={(e) => resizeTextarea(e.currentTarget)} />}
+        render={
+          <textarea
+            disabled={isSending || cancelling}
+            ref={setTextareaRef}
+            rows={1}
+            onInput={(e) => {
+              triggerMarkRead();
+              resizeTextarea(e.currentTarget);
+            }}
+          />
+        }
       />
       <div className="aui-composer-controls">
         <ComposerPrimitive.AddAttachment disabled={isSending || cancelling} className="aui-composer-add-attachment aui-composer-icon-btn" aria-label="Attach file" title="Attach file">
@@ -602,7 +652,31 @@ export const BatchInterruptUI = ({ agentName, sessionId }: { agentName: string; 
   );
 };
 
-const MyThread = ({ agentName, sessionId, isFreshSession, markSessionNotFresh, onRunFinish, onSwitchAgent, onSwitchSession, switchAgentHref, switchSessionHref }: { agentName: string, sessionId: string, isFreshSession: boolean, markSessionNotFresh: (sessionId: string) => void, onRunFinish: () => void, onSwitchAgent: () => void, onSwitchSession: () => void, switchAgentHref: string, switchSessionHref: string }) => {
+const MyThread = ({
+  agentName,
+  sessionId,
+  isUnread,
+  onMarkRead,
+  isFreshSession,
+  markSessionNotFresh,
+  onRunFinish,
+  onSwitchAgent,
+  onSwitchSession,
+  switchAgentHref,
+  switchSessionHref,
+}: {
+  agentName: string;
+  sessionId: string;
+  isUnread?: boolean;
+  onMarkRead?: () => void;
+  isFreshSession: boolean;
+  markSessionNotFresh: (sessionId: string) => void;
+  onRunFinish: () => void;
+  onSwitchAgent: () => void;
+  onSwitchSession: () => void;
+  switchAgentHref: string;
+  switchSessionHref: string;
+}) => {
   const isEmpty = useAuiState(s => s.thread.messages.length === 0);
 
   return (
@@ -623,6 +697,8 @@ const MyThread = ({ agentName, sessionId, isFreshSession, markSessionNotFresh, o
           <MyComposer
             agentName={agentName}
             sessionId={sessionId}
+            isUnread={isUnread}
+            onMarkRead={onMarkRead}
             isFreshSession={isFreshSession}
             markSessionNotFresh={markSessionNotFresh}
             onSwitchAgent={onSwitchAgent}
@@ -692,7 +768,7 @@ export const AgentPicker = ({
   </div>
 );
 
-const SessionPicker = ({
+export const SessionPicker = ({
   agentName,
   sessions,
   sessionsError,
@@ -701,7 +777,8 @@ const SessionPicker = ({
   onRetry,
   onSelect,
   onNewChat,
-  onBack
+  onBack,
+  onToggleUnread,
 }: {
   agentName: string;
   sessions: SessionRef[];
@@ -712,43 +789,95 @@ const SessionPicker = ({
   onSelect: (id: string) => void;
   onNewChat: () => void;
   onBack: () => void;
-}) => (
-  <div className="picker-container">
-    <button className="back-button" onClick={onBack}>&larr; Back to agents</button>
-    <h2>Sessions for {agentName}</h2>
-    <div className="actions-bar">
-      <button className="new-chat-button" onClick={onNewChat}>New Chat</button>
+  onToggleUnread?: (sessionId: string, currentUnread: boolean) => void;
+}) => {
+  const sortedSessions = useMemo(() => {
+    return [...sessions].sort((a, b) => {
+      const aUnread = a.unread ? 1 : 0;
+      const bUnread = b.unread ? 1 : 0;
+      if (aUnread !== bUnread) {
+        return bUnread - aUnread;
+      }
+      const aTime = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+      const bTime = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+      return bTime - aTime;
+    });
+  }, [sessions]);
+
+  return (
+    <div className="picker-container">
+      <button className="back-button" onClick={onBack}>&larr; Back to agents</button>
+      <h2>Sessions for {agentName}</h2>
+      <div className="actions-bar">
+        <button className="new-chat-button" onClick={onNewChat}>New Chat</button>
+      </div>
+      {sessionsLoading && !hasLoadedSessions ? (
+        <p className="sessions-loading" role="status">Loading sessions…</p>
+      ) : sessionsError ? (
+        <div role="alert" className="aui-error" data-testid="sessions-error">
+          <span>{sessionsError}</span>
+          <button type="button" onClick={onRetry}>Retry</button>
+        </div>
+      ) : (
+        <div className="grid-list sessions-grid">
+          {sortedSessions.length === 0 ? (
+            <p className="no-sessions-msg">No existing sessions found.</p>
+          ) : (
+            sortedSessions.map(s => {
+              const isUnread = Boolean(s.unread);
+              return (
+                <div
+                  key={s.session_id}
+                  className="grid-item session-card"
+                  onClick={() => onSelect(s.session_id)}
+                >
+                  <div
+                    className="session-item session-item-main"
+                    role="button"
+                    tabIndex={0}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSelect(s.session_id);
+                    }}
+                    onKeyDown={(e) => activateOnKey(e, () => onSelect(s.session_id))}
+                  >
+                    <div className="session-item-header">
+                      <h3>{s.session_id}</h3>
+                      {isUnread && (
+                        <span className="session-unread-badge" data-testid="session-unread-badge">
+                          Unread
+                        </span>
+                      )}
+                    </div>
+                    {s.updated_at && <p>Updated: {new Date(s.updated_at).toLocaleString()}</p>}
+                  </div>
+                  {onToggleUnread && (
+                    <div className="session-item-actions">
+                      <button
+                        type="button"
+                        className="session-mark-btn"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onToggleUnread(s.session_id, isUnread);
+                        }}
+                        onKeyDown={(e) => {
+                          e.stopPropagation();
+                        }}
+                        aria-label={isUnread ? `Mark session ${s.session_id} as read` : `Mark session ${s.session_id} as unread`}
+                      >
+                        {isUnread ? 'Mark read' : 'Mark unread'}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
+      )}
     </div>
-    {sessionsLoading && !hasLoadedSessions ? (
-      <p className="sessions-loading" role="status">Loading sessions…</p>
-    ) : sessionsError ? (
-      <div role="alert" className="aui-error" data-testid="sessions-error">
-        <span>{sessionsError}</span>
-        <button type="button" onClick={onRetry}>Retry</button>
-      </div>
-    ) : (
-      <div className="grid-list sessions-grid">
-        {sessions.length === 0 ? (
-          <p className="no-sessions-msg">No existing sessions found.</p>
-        ) : (
-          sessions.map(s => (
-            <div
-              key={s.session_id}
-              className="grid-item session-item"
-              role="button"
-              tabIndex={0}
-              onClick={() => onSelect(s.session_id)}
-              onKeyDown={(e) => activateOnKey(e, () => onSelect(s.session_id))}
-            >
-              <h3>{s.session_id}</h3>
-              {s.updated_at && <p>Updated: {new Date(s.updated_at).toLocaleString()}</p>}
-            </div>
-          ))
-        )}
-      </div>
-    )}
-  </div>
-);
+  );
+};
 
 export default function App() {
   const {
@@ -762,6 +891,7 @@ export default function App() {
     selectedAgent,
     selectedSessionId,
     refreshSessions,
+    setSessionUnread,
     selectAgent,
     selectSession,
     newChat,
@@ -775,6 +905,34 @@ export default function App() {
   const handleHandoff = useCallback((agent: string, sessionId: string) => {
     navigateSession(agent, sessionId);
   }, [navigateSession]);
+
+  const handleToggleUnread = useCallback((sessionId: string, currentUnread: boolean) => {
+    const nextUnread = !currentUnread;
+    // Optimistically update local session unread state
+    setSessionUnread(sessionId, nextUnread);
+    const rpc = nextUnread ? markUnread(selectedAgent, sessionId) : markRead(selectedAgent, sessionId);
+    rpc
+      .then(() => {
+        refreshSessions();
+      })
+      .catch((err) => {
+        console.error('Failed to toggle unread state', err);
+        // Rollback on error
+        setSessionUnread(sessionId, currentUnread);
+      });
+  }, [selectedAgent, setSessionUnread, refreshSessions]);
+
+  const currentSession = selectedSessionId
+    ? sessions.find((s) => s.session_id === selectedSessionId)
+    : undefined;
+  const isCurrentSessionUnread = Boolean(currentSession?.unread);
+
+  const handleCurrentMarkRead = useCallback(() => {
+    if (selectedSessionId) {
+      setSessionUnread(selectedSessionId, false);
+      refreshSessions();
+    }
+  }, [selectedSessionId, setSessionUnread, refreshSessions]);
 
   // Suppress banner on initial AgentPicker without loaded data (blocking state handles it)
   const suppressBanner = !selectedAgent && !hasLoadedAgents;
@@ -800,6 +958,7 @@ export default function App() {
           onSelect={selectSession}
           onNewChat={newChat}
           onBack={clearAgent}
+          onToggleUnread={handleToggleUnread}
         />
       ) : (
         <div className="chat-layout">
@@ -811,10 +970,13 @@ export default function App() {
               isFreshSession={isFreshSession}
               onHandoff={handleHandoff}
               onOpenSubAgent={navigateSession}
+              onReadUpdated={refreshSessions}
             >
               <MyThread
                 agentName={selectedAgent}
                 sessionId={selectedSessionId}
+                isUnread={isCurrentSessionUnread}
+                onMarkRead={handleCurrentMarkRead}
                 isFreshSession={isFreshSession}
                 markSessionNotFresh={markSessionNotFresh}
                 onRunFinish={refreshSessions}

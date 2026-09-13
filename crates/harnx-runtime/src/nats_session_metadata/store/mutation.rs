@@ -248,9 +248,23 @@ fn immutable_identity(
     )
 }
 
+/// Returns true if the error is a revision mismatch error from KV update.
 pub(super) fn is_wrong_last_revision(error: &anyhow::Error) -> bool {
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<kv::UpdateError>())
         .is_some_and(|error| error.kind() == kv::UpdateErrorKind::WrongLastRevision)
+}
+
+/// Returns true if the error is a CAS conflict from concurrent write.
+///
+/// Covers both:
+/// - `UpdateError::WrongLastRevision` (revision mismatch on update)
+/// - `CreateError::AlreadyExists` (losing race to create new entry)
+pub(in crate::nats_session_metadata) fn is_cas_conflict(error: &anyhow::Error) -> bool {
+    is_wrong_last_revision(error)
+        || error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<kv::CreateError>())
+            .is_some_and(|error| error.kind() == kv::CreateErrorKind::AlreadyExists)
 }

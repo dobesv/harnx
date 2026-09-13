@@ -17,3 +17,7 @@ pub fn read_cursor_key(session_id: &str, viewer: &str) -> String {
 pub fn invalidation_subject(session_id: &str) -> String {
     format!("harnx.session.{session_id}.metadata.invalidated")
 }
+
+pub fn read_invalidation_subject(session_id: &str) -> String {
+    format!("harnx.session.{session_id}.read.invalidated")
+}

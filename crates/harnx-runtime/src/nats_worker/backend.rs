@@ -302,6 +302,13 @@ impl NatsSessionLogBackend {
             .context("canonical session metadata store is not attached")
     }
 
+    /// Returns the metadata store if attached, for optional access without error propagation.
+    pub fn metadata_store_opt(
+        &self,
+    ) -> Option<&crate::nats_session_metadata::SessionMetadataStore> {
+        self.metadata_store.as_ref()
+    }
+
     fn patch_metadata_blocking<F>(&self, fence_token: Option<u64>, patch: F) -> Result<()>
     where
         F: FnMut(&mut crate::nats_session_metadata::SessionMetadata) -> Result<()>,
@@ -381,6 +388,33 @@ impl NatsSessionLogBackend {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Reconcile attention sequence from the log.
+    ///
+    /// CAS-bumps `last_attention_seq = max(current, derive_attention_seq(entries))`.
+    /// Idempotent; only writes/publishes on change. Used to repair lost bumps.
+    pub async fn reconcile_attention_from_log(
+        &self,
+        entries: &[(u64, harnx_core::session::SessionLogEntry)],
+    ) -> Result<()> {
+        let Some(store) = self.metadata_store.as_ref().cloned() else {
+            // No metadata store attached - nothing to reconcile
+            return Ok(());
+        };
+        let attention_seq = super::agent_loop::derive_attention_seq(entries);
+        if attention_seq == 0 {
+            // No attention-producing entries
+            return Ok(());
+        }
+        if let Err(error) = store.bump_attention(&self.session_id, attention_seq).await {
+            log::warn!(
+                "failed to reconcile attention seq from log: session_id={} seq={} error={error:#}",
+                self.session_id,
+                attention_seq
+            );
+        }
+        Ok(())
     }
 
     /// Append an entry.

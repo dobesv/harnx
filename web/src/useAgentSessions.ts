@@ -143,6 +143,7 @@ export function useAgentSessions() {
     selectedSessionId,
     isFreshSession: discovery.isFreshSession,
     refreshSessions: discovery.refreshSessions,
+    setSessionUnread: discovery.setSessionUnread,
     markSessionNotFresh: discovery.markSessionNotFresh,
     selectAgent,
     selectSession,

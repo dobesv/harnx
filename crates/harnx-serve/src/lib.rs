@@ -12,7 +12,7 @@ mod ag_ui_usage;
 mod interrupt_resume;
 pub mod session_actor;
 mod session_actor_types;
-mod session_routes;
+pub mod session_routes;
 // Not `#[cfg(test)]`: the `tests/` integration crates link the library built
 // WITHOUT the `test` cfg, so gating this out would break their
 // `harnx_serve::test_support` imports. Kept public for cross-crate test reuse.
@@ -1380,6 +1380,7 @@ async fn agent_sessions_json(config: &Config, agent: &str) -> Result<Vec<Value>>
                     Value::String(format_system_time(modified)),
                 );
             }
+            value.insert(String::from("unread"), Value::Bool(session.unread));
             Value::Object(value)
         })
         .collect())
@@ -1432,6 +1433,17 @@ pub(crate) async fn load_nats_session_with_base(
         .load_events_async()
         .await
         .map_err(|err| anyhow!("Failed to load session history for '{session}': {err}"))?;
+    // Reconcile attention state from log on server read path (repair lost bumps)
+    let attention_seq = harnx_runtime::nats_worker::derive_attention_seq(&entries);
+    if attention_seq > 0 {
+        if let Err(error) = metadata_store.bump_attention(session, attention_seq).await {
+            log::warn!(
+                "failed to reconcile attention on server read: session_id={} seq={} error={error:#}",
+                session,
+                attention_seq
+            );
+        }
+    }
     // If there was no holder before the read, sample once more to cover a
     // worker acquiring the lease and appending ToolCalls during the read.
     let preserve_pending = if lease_was_active {
@@ -1459,6 +1471,19 @@ pub(crate) async fn load_nats_session_with_base(
     }
     .map_err(|err| anyhow!("Failed to reconstruct session history for '{session}': {err}"))?;
     Ok((loaded, entries, base_session))
+}
+
+/// Test helper exposing load_nats_session_with_base for integration tests.
+#[doc(hidden)]
+pub async fn load_nats_session_with_base_for_test(
+    config: &Config,
+    session: &str,
+) -> Result<(
+    harnx_core::session::Session,
+    Vec<(u64, harnx_core::session::SessionLogEntry)>,
+    harnx_core::session::Session,
+)> {
+    load_nats_session_with_base(config, session).await
 }
 
 #[doc(hidden)]
@@ -2063,6 +2088,7 @@ mod tests {
                 title: None,
                 modified: None,
                 contexts: vec![],
+                unread: false,
             },
             SessionMeta {
                 id: "local-2".into(),
@@ -2071,6 +2097,7 @@ mod tests {
                 title: None,
                 modified: None,
                 contexts: vec![],
+                unread: false,
             },
             SessionMeta {
                 id: "local-3".into(),
@@ -2079,6 +2106,7 @@ mod tests {
                 title: None,
                 modified: None,
                 contexts: vec![],
+                unread: false,
             },
         ];
 
@@ -2106,6 +2134,7 @@ mod tests {
             title: None,
             modified,
             contexts: vec![],
+            unread: false,
         };
 
         let base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);

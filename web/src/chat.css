@@ -63,6 +63,84 @@ body {
   color: var(--text-h);
 }
 
+.session-item-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.session-item-header h3 {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-unread-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.15rem 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+  color: var(--accent-contrast);
+  flex-shrink: 0;
+}
+
+.session-item-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  margin-top: 0.75rem;
+}
+
+.session-item-main {
+  cursor: pointer;
+}
+
+.session-item-main:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.session-mark-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 0.25rem 0.5rem;
+  font-size: 0.75rem;
+  min-height: 24px;
+  min-width: 24px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.session-mark-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--surface-hover);
+}
+
+.session-mark-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.session-unread-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+}
+
 .grid-item p {
   margin: 0;
   font-size: 0.9rem;
@@ -674,6 +752,7 @@ body {
 }
 
 .aui-composer-menu-trigger-icon {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;

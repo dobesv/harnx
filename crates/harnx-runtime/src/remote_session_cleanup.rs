@@ -300,6 +300,7 @@ mod tests {
                 first_activation_at: None,
                 last_activity_at: Utc.timestamp_opt(last_activity as i64, 0).unwrap(),
             }),
+            unread: false,
         }
     }
 

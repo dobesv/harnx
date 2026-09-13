@@ -152,4 +152,52 @@ export async function submitHitlDecision(
   return json?.result || { applied: false };
 }
 
+export async function markRead(
+  agent: string,
+  session: string,
+): Promise<{ status: string }> {
+  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'session/mark_read',
+    })
+  });
+  let json: JsonRpcResponse<{ status: string }> | undefined;
+  try {
+    json = await res.json() as JsonRpcResponse<{ status: string }>;
+  } catch {
+    json = undefined;
+  }
+  if (json?.error) throw new Error(`RPC Error: ${json.error.message || json.error.code}`);
+  if (!res.ok) throw new Error(`RPC call failed with HTTP ${res.status}`);
+  return json?.result || { status: 'ok' };
+}
+
+export async function markUnread(
+  agent: string,
+  session: string,
+): Promise<{ status: string }> {
+  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'session/mark_unread',
+    })
+  });
+  let json: JsonRpcResponse<{ status: string }> | undefined;
+  try {
+    json = await res.json() as JsonRpcResponse<{ status: string }>;
+  } catch {
+    json = undefined;
+  }
+  if (json?.error) throw new Error(`RPC Error: ${json.error.message || json.error.code}`);
+  if (!res.ok) throw new Error(`RPC call failed with HTTP ${res.status}`);
+  return json?.result || { status: 'ok' };
+}
+
 export { abandonCancellation, cancel, sessionControl, CANCELLATION_TIMEOUT_MS } from './cancellationApi';

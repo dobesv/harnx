@@ -778,6 +778,11 @@ impl Tui {
         let config_read = self.config.read();
         let mut spans = vec![];
 
+        // Show unread indicator before spinner if current session is unread
+        if self.app.current_session_unread {
+            spans.push(Span::styled("● ", Style::default().fg(Color::Yellow)));
+        }
+
         let spinner = if self.app.llm_busy && !self.cancellation_unconfirmed() {
             SPINNER_FRAMES[self.app.spinner_index]
         } else {
@@ -921,7 +926,7 @@ impl Tui {
                 ..
             } => {
                 let title = "Select Session";
-                let footer = "↑↓ navigate  Enter select  Esc cancel";
+                let footer = "↑↓ navigate  Enter select  u/unread  Esc cancel";
                 let mut items: Vec<String> = vec!["✦ New session".to_string()];
                 items.extend(sessions.iter().map(|session| session.picker_label()));
                 // Prepend error message if present (visible in picker)

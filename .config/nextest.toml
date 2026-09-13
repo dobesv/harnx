@@ -18,7 +18,12 @@ heavy-e2e = { max-threads = 1 }
 # Broker-backed tests each launch a NATS process and several async runtimes.
 # Bound their aggregate process/thread load so one test's broker is not starved
 # or killed when the workspace suite fans out on high-core-count runners.
-broker-e2e = { max-threads = 8 }
+# NOTE: Also serialized because NATS tests across packages share a singleton
+# broker via ensure_shared_server(); binary exit drops the broker, so concurrency
+# causes flakes when harnx-serve NATS tests run parallel to harnx-runtime NATS tests.
+broker-e2e = { max-threads = 1 }
+# (Removed harnx-serve-nats group; consolidated into broker-e2e since both packages
+# share the same singleton broker and need serialization across the full suite.)
 
 [profile.default]
 retries = 0

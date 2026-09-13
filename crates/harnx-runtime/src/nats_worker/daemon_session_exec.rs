@@ -79,7 +79,8 @@ impl WorkerRuntime {
         // Share the `after_seq` high-water mark for event-sink fan-out advisories;
         // worker tail reads themselves use leader-authoritative `load_events_latest_async`.
         let backend = NatsSessionLogBackend::new(self.jetstream.clone(), &activation.session_id)
-            .with_after_seq_observer(Arc::clone(&after_seq_observer));
+            .with_after_seq_observer(Arc::clone(&after_seq_observer))
+            .with_metadata_store(Some(self.session_metadata.clone()));
 
         // Abort turns promptly if lease is lost.
         let watch_task =
@@ -100,9 +101,15 @@ impl WorkerRuntime {
                     break Ok(());
                 }
 
-                let pending_hitl = super::agent_loop::derive_pending_hitl_approvals(
-                    &backend.load_events_latest_async().await?,
-                )?;
+                let entries = backend.load_events_latest_async().await?;
+                // Reconcile attention state from log on worker resume (repair lost bumps)
+                if let Err(error) = backend.reconcile_attention_from_log(&entries).await {
+                    log::warn!(
+                        "failed to reconcile attention on worker resume: session_id={} error={error:#}",
+                        activation.session_id
+                    );
+                }
+                let pending_hitl = super::agent_loop::derive_pending_hitl_approvals(&entries)?;
                 if !pending_hitl.is_empty() {
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(5),
@@ -236,7 +243,7 @@ impl WorkerRuntime {
                         .as_ref()
                         .map(|session| session.completion_usage().clone())
                         .unwrap_or_default();
-                    Self::record_session_turn_end(
+                    Self::record_session_turn_end_impl(
                         &backend,
                         &lease,
                         Some(&*event_sink_for_loop),
@@ -411,7 +418,22 @@ impl WorkerRuntime {
     /// Persist the successful full-loop boundary before checking for another
     /// queued turn. Unlike the live Turn::Ended advisory, this cannot be lost
     /// when the client is briefly disconnected or under load.
-    async fn record_session_turn_end(
+    #[cfg(test)]
+    pub(crate) async fn record_session_turn_end(
+        backend: &NatsSessionLogBackend,
+        lease: &NatsSessionLease,
+        event_sink: Option<&crate::nats_event_sink::NatsEventSink>,
+        through_seq: u64,
+        usage: CompletionTokenUsage,
+    ) -> Result<()> {
+        Self::record_session_turn_end_impl(backend, lease, event_sink, through_seq, usage).await
+    }
+
+    /// Persist the successful full-loop boundary before checking for another
+    /// queued turn. Unlike the live Turn::Ended advisory, this cannot be lost
+    /// when the client is briefly disconnected or under load.
+    #[allow(dead_code)]
+    async fn record_session_turn_end_impl(
         backend: &NatsSessionLogBackend,
         lease: &NatsSessionLease,
         event_sink: Option<&crate::nats_event_sink::NatsEventSink>,
@@ -424,7 +446,7 @@ impl WorkerRuntime {
         if !should_append_control_log_entry(lease) {
             return Ok(());
         }
-        backend
+        let assigned_seq = backend
             .append_event(&harnx_core::session::SessionLogEntry::TurnEnd {
                 through_seq,
                 fence_token: lease.fence_token(),
@@ -432,6 +454,19 @@ impl WorkerRuntime {
                 usage: Some(usage),
             })
             .await?;
+        // Bump attention seq on durable TurnEnd append
+        if let Some(store) = backend.metadata_store_opt() {
+            if let Err(error) = store
+                .bump_attention(backend.session_id(), assigned_seq)
+                .await
+            {
+                log::warn!(
+                    "failed to bump attention after TurnEnd: session_id={} seq={} error={error:#}",
+                    backend.session_id(),
+                    assigned_seq
+                );
+            }
+        }
         // Wake attached clients after durable control append
         if let Some(sink) = event_sink {
             sink.publish_session_updated();
@@ -517,4 +552,165 @@ fn build_durable_tool_round_callback(
             .await
         })
     })
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::*;
+    use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
+    use crate::nats_session_metadata::{SessionInitializer, SessionMetadata, SessionMetadataStore};
+    use harnx_core::require_nextest;
+    use std::sync::Arc;
+
+    /// Test that `record_session_turn_end` appends TurnEnd and bumps attention.
+    /// Verifies the direct bump path (not via `reconcile_attention_from_log`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn record_session_turn_end_bumps_attention_directly() {
+        require_nextest();
+        let Some((url, mut child, _store_dir)) = crate::nats_worker::tests::spawn_test_nats().await
+        else {
+            return;
+        };
+
+        let client = async_nats::connect(&url).await.unwrap();
+        let jetstream = async_nats::jetstream::new(client);
+        let store = SessionMetadataStore::ensure(&jetstream, 1).await.unwrap();
+        let session_id = crate::nats_worker::new_remote_session_id();
+
+        // Create session metadata
+        store
+            .create(&SessionMetadata::new(
+                &session_id,
+                SessionInitializer::named("metis", Default::default()),
+            ))
+            .await
+            .unwrap();
+
+        // Create backend with metadata store attached
+        let backend = NatsSessionLogBackend::new(jetstream.clone(), &session_id)
+            .with_metadata_store(Some(store.clone()));
+
+        // Acquire a lease for the session
+        let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
+            jetstream: jetstream.clone(),
+            session_id: &session_id,
+            worker_id: "test-worker".to_string(),
+            generation: 1,
+            config: NatsLeaseConfig {
+                ttl: std::time::Duration::from_secs(5),
+                renew_interval: std::time::Duration::from_millis(500),
+                replicas: 1,
+                ..Default::default()
+            },
+            session_metadata: Some(store.clone()),
+        })
+        .await
+        .unwrap()
+        .expect("lease should be acquired");
+        let lease = Arc::new(lease);
+
+        // Append a user message first so we have valid through_seq
+        backend
+            .append_event(&harnx_core::session::SessionLogEntry::Message {
+                id: None,
+                role: harnx_core::message::MessageRole::User,
+                content: harnx_core::message::MessageContent::Text("test".to_string()),
+                timestamp: None,
+                fence_token: None,
+            })
+            .await
+            .unwrap();
+
+        // Call record_session_turn_end (test helper exposing the impl)
+        WorkerRuntime::record_session_turn_end(
+            &backend,
+            &lease,
+            None,
+            1, // through_seq
+            CompletionTokenUsage::default(),
+        )
+        .await
+        .unwrap();
+
+        // Verify session is now unread with correct attention seq
+        let state = store.get_read_state(&session_id).await.unwrap();
+        assert!(
+            state.is_unread(),
+            "session should be unread after record_session_turn_end"
+        );
+        assert_eq!(
+            state.last_attention_seq, 2,
+            "last_attention_seq should be set to TurnEnd seq"
+        );
+
+        lease.release().await.unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Test that record_session_turn_end skips when through_seq is zero.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn record_session_turn_end_rejects_zero_through_seq() {
+        require_nextest();
+        let Some((url, mut child, _store_dir)) = crate::nats_worker::tests::spawn_test_nats().await
+        else {
+            return;
+        };
+
+        let client = async_nats::connect(&url).await.unwrap();
+        let jetstream = async_nats::jetstream::new(client);
+        let store = SessionMetadataStore::ensure(&jetstream, 1).await.unwrap();
+        let session_id = crate::nats_worker::new_remote_session_id();
+
+        store
+            .create(&SessionMetadata::new(
+                &session_id,
+                SessionInitializer::named("metis", Default::default()),
+            ))
+            .await
+            .unwrap();
+
+        let backend = NatsSessionLogBackend::new(jetstream.clone(), &session_id)
+            .with_metadata_store(Some(store.clone()));
+
+        let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
+            jetstream: jetstream.clone(),
+            session_id: &session_id,
+            worker_id: "test-worker".to_string(),
+            generation: 1,
+            config: NatsLeaseConfig {
+                ttl: std::time::Duration::from_secs(5),
+                renew_interval: std::time::Duration::from_millis(500),
+                replicas: 1,
+                ..Default::default()
+            },
+            session_metadata: Some(store.clone()),
+        })
+        .await
+        .unwrap()
+        .expect("lease should be acquired");
+        let lease = Arc::new(lease);
+
+        // through_seq = 0 should bail
+        let result = WorkerRuntime::record_session_turn_end(
+            &backend,
+            &lease,
+            None,
+            0,
+            CompletionTokenUsage::default(),
+        )
+        .await;
+        assert!(result.is_err(), "zero through_seq should fail");
+
+        // Session should NOT be unread (no bump happened)
+        let state = store.get_read_state(&session_id).await.unwrap();
+        assert!(
+            !state.is_unread(),
+            "session should NOT be unread after failed TurnEnd"
+        );
+
+        lease.release().await.unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }

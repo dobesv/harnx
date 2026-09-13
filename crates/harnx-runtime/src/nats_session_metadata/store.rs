@@ -9,11 +9,16 @@ mod extensions;
 mod keys;
 mod lookup;
 mod mutation;
+mod read_state;
 
 pub(super) use extension_validation::validate_extensions;
 pub use extensions::SessionExtensionUpdate;
-pub use keys::{activity_key, invalidation_subject, metadata_key, read_cursor_key, session_prefix};
+pub use keys::{
+    activity_key, invalidation_subject, metadata_key, read_cursor_key, read_invalidation_subject,
+    session_prefix,
+};
 pub(super) use lookup::metadata_belongs_to_agent;
+pub(in crate::nats_session_metadata) use mutation::is_cas_conflict;
 pub(in crate::nats_session_metadata) use mutation::PatchGuard;
 
 #[derive(Clone, Debug)]
@@ -137,7 +142,12 @@ impl SessionMetadataStore {
             };
             match self.get(session_id).await {
                 Ok(Some(record)) => {
-                    let activity = match self.get_activity(session_id).await {
+                    // Fetch activity and read_state concurrently
+                    let (activity_result, read_state_result) = tokio::join!(
+                        self.get_activity(session_id),
+                        self.get_read_state(session_id)
+                    );
+                    let activity = match activity_result {
                         Ok(activity) => activity,
                         Err(error) => {
                             log::warn!(
@@ -148,10 +158,22 @@ impl SessionMetadataStore {
                             None
                         }
                     };
+                    let read_state = match read_state_result {
+                        Ok(state) => state,
+                        Err(error) => {
+                            log::warn!(
+                                "could not read session read-state; defaulting to read: bucket={} session_id={} error={error:#}",
+                                SESSION_METADATA_BUCKET,
+                                session_id
+                            );
+                            Default::default()
+                        }
+                    };
                     sessions.push(ListedSession {
                         activity,
                         metadata: record.metadata,
                         metadata_revision: record.revision,
+                        unread: read_state.is_unread(),
                     });
                 }
                 Ok(None) => {}

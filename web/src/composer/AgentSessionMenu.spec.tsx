@@ -129,4 +129,23 @@ describe('AgentSessionMenu', () => {
     
     expect(defaultProps.onSwitchAgent).not.toHaveBeenCalled();
   });
+
+  it('renders unread indicator dot in SessionDropdown and AgentSessionMenu when unread is true', () => {
+    const { unmount } = render(<SessionDropdown {...defaultProps} unread={true} />);
+    const dot = screen.getByTestId('current-session-unread-dot');
+    expect(dot).toBeInTheDocument();
+    expect(dot).toHaveAttribute('aria-hidden', 'true');
+    expect(screen.getByRole('button', { name: 'Session: test-session-id (unread)' })).toBeInTheDocument();
+    unmount();
+
+    render(<SessionDropdown {...defaultProps} unread={false} />);
+    expect(screen.queryByTestId('current-session-unread-dot')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Session: test-session-id' })).toBeInTheDocument();
+
+    render(<AgentSessionMenu {...defaultProps} unread={true} />);
+    const mobileDot = screen.getByTestId('current-session-unread-dot-mobile');
+    expect(mobileDot).toBeInTheDocument();
+    expect(mobileDot).toHaveAttribute('aria-hidden', 'true');
+    expect(screen.getByRole('button', { name: 'Agent and session options (unread)' })).toBeInTheDocument();
+  });
 });

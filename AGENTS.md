@@ -369,4 +369,15 @@ and jump-key handlers in `detail_view.rs`/`input.rs`/`subagent_sessions.rs` for 
 
 ## Issue/task tracker
 
+### Session Unread State
+
+Session-level unread state tracks sessions requiring user attention. Key endpoints:
+
+- **TUI**: In the session picker, press `'u'` or `'U'` to toggle unread on the selected session.
+- **Web**: SSE `/v1/agents/{agent}/sessions/{session}/events` emits `event: read-updated` when read-state changes, triggering session list refresh.
+- **JSON-RPC**: `session/mark_read` and `session/mark_unread` methods control state.
+
+Implementation details in [`docs/nats-ha.md#session-unread-state`](docs/nats-ha.md#session-unread-state).
+
+
 GitHub Issues is the issue/task tracker for this project.

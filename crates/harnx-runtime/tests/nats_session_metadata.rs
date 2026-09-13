@@ -2,6 +2,7 @@ mod common;
 
 use anyhow::Result;
 use common::spawn_nats_server;
+use futures_util::StreamExt;
 use harnx_core::execution_context::{
     ExecutionContextObservation, GitRemoteObservation, GitRepositoryObservation,
     ToolObservationProvenance, EXECUTION_CONTEXT_MAX_RETAINED, EXECUTION_CONTEXT_NAMESPACE,
@@ -9,9 +10,9 @@ use harnx_core::execution_context::{
 };
 use harnx_core::require_nextest;
 use harnx_runtime::nats_session_metadata::{
-    read_cursor_key, SessionExtensionUpdate, SessionInitializer, SessionMetadata,
-    SessionMetadataPatch, SessionMetadataStore, SessionOverrideUpdate, ToolContextEntry,
-    TOOL_CONTEXT_NAMESPACE,
+    read_cursor_key, read_invalidation_subject, SessionExtensionUpdate, SessionInitializer,
+    SessionMetadata, SessionMetadataPatch, SessionMetadataStore, SessionOverrideUpdate,
+    SessionReadState, ToolContextEntry, TOOL_CONTEXT_NAMESPACE,
 };
 use serde_json::json;
 
@@ -544,5 +545,164 @@ async fn private_tool_context_updates_are_reserved_and_merge_concurrently() -> R
     let context = store.get_tool_context(&session_id).await?.unwrap();
     assert!(!context.values.contains_key("sandbox"));
     assert!(context.values.contains_key("workspace"));
+    Ok(())
+}
+
+// ============================================================================
+// Read-state integration tests
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_read_state_returns_default_for_missing_key() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client);
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let session_id = format!("read-state-missing-{}", uuid::Uuid::new_v4());
+
+    // No read-state key exists yet
+    let state = store.get_read_state(&session_id).await?;
+    assert_eq!(state, SessionReadState::default());
+    assert!(!state.is_unread());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bump_attention_advances_cursor_and_publishes_invalidation() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let session_id = format!("read-state-bump-{}", uuid::Uuid::new_v4());
+
+    // Subscribe to read invalidation subject before mutation
+    let subject = read_invalidation_subject(&session_id);
+    let mut subscriber = client.subscribe(subject.clone()).await?;
+
+    // First bump creates key
+    store.bump_attention(&session_id, 10).await?;
+    let state = store.get_read_state(&session_id).await?;
+    assert_eq!(state.last_attention_seq, 10);
+    assert!(state.is_unread());
+
+    // Check invalidation was published
+    let msg = tokio::time::timeout(std::time::Duration::from_millis(500), subscriber.next())
+        .await?
+        .expect("invalidation message");
+    let payload: serde_json::Value = serde_json::from_slice(&msg.payload)?;
+    assert_eq!(payload["session_id"], session_id);
+    assert!(payload["revision"].as_u64().unwrap() > 0);
+
+    // Stale bump is idempotent no-op
+    store.bump_attention(&session_id, 5).await?;
+    let state2 = store.get_read_state(&session_id).await?;
+    assert_eq!(state2.last_attention_seq, 10);
+
+    // No invalidation for stale bump
+    let result =
+        tokio::time::timeout(std::time::Duration::from_millis(100), subscriber.next()).await;
+    assert!(result.is_err(), "no invalidation for stale bump");
+
+    // Higher bump advances
+    store.bump_attention(&session_id, 20).await?;
+    let state3 = store.get_read_state(&session_id).await?;
+    assert_eq!(state3.last_attention_seq, 20);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mark_read_advances_cursor_clears_flag() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client);
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let session_id = format!("read-state-mark-read-{}", uuid::Uuid::new_v4());
+
+    // Set up attention and manual unread
+    store.bump_attention(&session_id, 15).await?;
+    store.mark_unread(&session_id).await?;
+    let before = store.get_read_state(&session_id).await?;
+    assert!(before.is_unread());
+    assert!(before.manual_unread);
+
+    // Mark read clears flag + advances cursor
+    store.mark_read(&session_id).await?;
+    let after = store.get_read_state(&session_id).await?;
+    assert_eq!(after.last_read_seq, 15);
+    assert!(!after.manual_unread);
+    assert!(!after.is_unread());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mark_unread_sets_flag_without_touching_cursor() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client);
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let session_id = format!("read-state-mark-unread-{}", uuid::Uuid::new_v4());
+
+    // Start with attention = read
+    store.bump_attention(&session_id, 10).await?;
+    store.mark_read(&session_id).await?;
+    let before = store.get_read_state(&session_id).await?;
+    assert_eq!(before.last_read_seq, 10);
+    assert!(!before.is_unread());
+
+    // Mark unread sets flag only
+    store.mark_unread(&session_id).await?;
+    let after = store.get_read_state(&session_id).await?;
+    assert_eq!(after.last_read_seq, 10); // unchanged
+    assert!(after.manual_unread);
+    assert!(after.is_unread());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_state_survives_marker_cycles() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client);
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let session_id = format!("read-state-cycle-{}", uuid::Uuid::new_v4());
+
+    // Initial attention bump
+    store.bump_attention(&session_id, 100).await?;
+    assert!(store.get_read_state(&session_id).await?.is_unread());
+
+    // Mark read
+    store.mark_read(&session_id).await?;
+    assert!(!store.get_read_state(&session_id).await?.is_unread());
+
+    // Mark unread
+    store.mark_unread(&session_id).await?;
+    assert!(store.get_read_state(&session_id).await?.is_unread());
+
+    // Mark read again (should not move cursor backward)
+    store.mark_read(&session_id).await?;
+    let state = store.get_read_state(&session_id).await?;
+    assert!(!state.is_unread());
+    assert_eq!(state.last_read_seq, 100); // cursor preserved
+
+    // Stale attention bump is idempotent
+    store.bump_attention(&session_id, 50).await?;
+    let state2 = store.get_read_state(&session_id).await?;
+    assert_eq!(state2.last_attention_seq, 100);
+    assert!(!state2.is_unread());
     Ok(())
 }

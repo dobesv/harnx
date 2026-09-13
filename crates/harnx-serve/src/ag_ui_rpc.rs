@@ -137,6 +137,8 @@ pub async fn handle_ag_ui_rpc_bytes(
         "session/cancel" | "session/abandon_cancellation" => {
             cancellation::handle((&rpc.method, rpc.id, rpc.params), (config, registry, key)).await
         }
+        "session/mark_read" => handle_mark_read(rpc.id, config, key).await,
+        "session/mark_unread" => handle_mark_unread(rpc.id, config, key).await,
         _ => json_rpc_response(
             StatusCode::OK,
             json_rpc_error(rpc.id, -32601, "method not found", None),
@@ -443,6 +445,80 @@ async fn session_exists(config: &harnx_runtime::config::Config, key: &SessionKey
     )
     .await
     .unwrap_or(false)
+}
+
+async fn handle_mark_read(
+    id: Value,
+    config: &harnx_runtime::config::Config,
+    key: SessionKey,
+) -> anyhow::Result<AppResponse> {
+    if !session_exists(config, &key).await {
+        return json_rpc_response(
+            StatusCode::NOT_FOUND,
+            json_rpc_error(
+                id,
+                JSON_RPC_UNKNOWN_SESSION_CODE,
+                "session not found",
+                Some(json!({ "agent": key.agent, "session": key.session })),
+            ),
+        );
+    }
+
+    let jetstream = config
+        .nats_jetstream(crate::LOCAL_CLUSTER_KEY)
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to connect to NATS: {err}"))?;
+    let metadata_store =
+        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to get metadata store: {err}"))?;
+
+    metadata_store
+        .mark_read(&key.session)
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to mark session as read: {err}"))?;
+
+    json_rpc_response(
+        StatusCode::OK,
+        json!({ "jsonrpc": "2.0", "id": id, "result": { "status": "ok" } }),
+    )
+}
+
+async fn handle_mark_unread(
+    id: Value,
+    config: &harnx_runtime::config::Config,
+    key: SessionKey,
+) -> anyhow::Result<AppResponse> {
+    if !session_exists(config, &key).await {
+        return json_rpc_response(
+            StatusCode::NOT_FOUND,
+            json_rpc_error(
+                id,
+                JSON_RPC_UNKNOWN_SESSION_CODE,
+                "session not found",
+                Some(json!({ "agent": key.agent, "session": key.session })),
+            ),
+        );
+    }
+
+    let jetstream = config
+        .nats_jetstream(crate::LOCAL_CLUSTER_KEY)
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to connect to NATS: {err}"))?;
+    let metadata_store =
+        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to get metadata store: {err}"))?;
+
+    metadata_store
+        .mark_unread(&key.session)
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to mark session as unread: {err}"))?;
+
+    json_rpc_response(
+        StatusCode::OK,
+        json!({ "jsonrpc": "2.0", "id": id, "result": { "status": "ok" } }),
+    )
 }
 
 fn session_state_json(state: &SessionState) -> Value {

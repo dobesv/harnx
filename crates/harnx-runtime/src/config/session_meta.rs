@@ -10,6 +10,8 @@ pub struct SessionMeta {
     pub title: Option<String>,
     pub modified: Option<SystemTime>,
     pub contexts: Vec<ExecutionContextObservation>,
+    /// Whether the session has unread attention.
+    pub unread: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +80,9 @@ pub fn sort_sessions_for_picker(mut sessions: Vec<SessionMeta>) -> Vec<SessionMe
 
 /// Context-aware interactive picker ordering. Contexts are also reordered so
 /// the first one is the safe context rendered for that row.
+///
+/// Unread sessions always sort above read sessions, regardless of context tier.
+/// Within unread and read groups, the original tier/recency ordering applies.
 pub fn sort_sessions_for_picker_with_context(
     mut sessions: Vec<SessionMeta>,
     query: &PickerQueryContext,
@@ -90,8 +95,13 @@ pub fn sort_sessions_for_picker_with_context(
         });
     }
     sessions.sort_by(|left, right| {
-        session_match_tier(left, query)
-            .cmp(&session_match_tier(right, query))
+        // Unread sessions sort first (false < true, so unread=true comes before unread=false)
+        right
+            .unread
+            .cmp(&left.unread)
+            // Then by context tier
+            .then_with(|| session_match_tier(left, query).cmp(&session_match_tier(right, query)))
+            // Then by recency
             .then_with(|| session_recency_key(left).cmp(&session_recency_key(right)))
     });
     sessions
@@ -148,6 +158,10 @@ impl SessionMeta {
             .iter()
             .find(|context| context.primary_repository().is_some() || context.branch().is_some())
         else {
+            // Prepend unread marker before returning early
+            if self.unread {
+                return format!("● {}", label);
+            }
             return label;
         };
         let safe_context = match (context.primary_repository(), context.branch()) {
@@ -168,6 +182,10 @@ impl SessionMeta {
             .len();
         if repository_count > 1 {
             label.push_str(&format!("  +{} repos", repository_count - 1));
+        }
+        // Prepend unread marker at the very beginning
+        if self.unread {
+            label = format!("● {}", label);
         }
         label
     }
@@ -191,6 +209,7 @@ mod tests {
             title: None,
             modified: None,
             contexts: Vec::new(),
+            unread: false,
         }
     }
 
@@ -374,5 +393,102 @@ mod tests {
         assert!(label.contains("github.com/acme/one @ main"));
         assert!(label.contains("+1 repos"));
         assert!(!label.contains("/secret"));
+    }
+
+    #[test]
+    fn unread_session_sorts_above_read_session_with_better_context() {
+        // Setup: query context looking for github.com/acme/repo @ main
+        let query = PickerQueryContext {
+            observation: context(Some("github.com/acme/repo"), Some("main"), "/query", 0),
+            mode: PickerMatchMode::Remote,
+        };
+
+        // Unread session with NO matching context (tier 3)
+        let mut unread_no_context = session_meta("unread-no-context");
+        unread_no_context.unread = true;
+
+        // Read session with EXACT matching context (tier 0)
+        let mut read_exact_context = session_meta("read-exact-context");
+        read_exact_context.unread = false;
+        read_exact_context.contexts.push(context(
+            Some("github.com/acme/repo"),
+            Some("main"),
+            "/matching",
+            0,
+        ));
+
+        // Sort with unread-first: unread_no_context should come first
+        let sorted = sort_sessions_for_picker_with_context(
+            vec![read_exact_context, unread_no_context.clone()],
+            &query,
+        );
+        assert_eq!(
+            sorted[0].id, "unread-no-context",
+            "unread session should sort above read session with better context"
+        );
+        assert_eq!(sorted[1].id, "read-exact-context");
+    }
+
+    #[test]
+    fn unread_sessions_sort_by_tier_then_recency_within_unread_group() {
+        let query = PickerQueryContext {
+            observation: context(Some("github.com/acme/repo"), Some("main"), "/query", 0),
+            mode: PickerMatchMode::Remote,
+        };
+
+        // Older unread with matching context (tier 0)
+        let mut unread_matching = session_meta("unread-matching");
+        unread_matching.unread = true;
+        unread_matching.modified = Some(UNIX_EPOCH + Duration::from_secs(1));
+        unread_matching.contexts.push(context(
+            Some("github.com/acme/repo"),
+            Some("main"),
+            "/match",
+            0,
+        ));
+
+        // Newer unread with no context (tier 3)
+        let mut unread_no_context = session_meta("unread-no-context");
+        unread_no_context.unread = true;
+        unread_no_context.modified = Some(UNIX_EPOCH + Duration::from_secs(2));
+
+        // Unread with tier 0 should still come before unread with tier 3
+        let sorted = sort_sessions_for_picker_with_context(
+            vec![unread_no_context, unread_matching.clone()],
+            &query,
+        );
+        assert_eq!(
+            sorted[0].id, "unread-matching",
+            "unread with matching context should come before unread without context"
+        );
+    }
+
+    #[test]
+    fn picker_label_includes_unread_marker_when_unread() {
+        let mut session = session_meta("test-session");
+        session.title = Some("My Session".to_string());
+        session.unread = true;
+
+        let label = session.picker_label();
+        assert!(
+            label.starts_with("● "),
+            "unread session label should start with marker, got: {label}"
+        );
+        assert!(label.contains("test-session"));
+        assert!(label.contains("My Session"));
+    }
+
+    #[test]
+    fn picker_label_no_marker_when_read() {
+        let mut session = session_meta("test-session");
+        session.title = Some("My Session".to_string());
+        session.unread = false;
+
+        let label = session.picker_label();
+        assert!(
+            !label.starts_with("● "),
+            "read session label should not have marker, got: {label}"
+        );
+        assert!(label.starts_with("test-session"));
     }
 }

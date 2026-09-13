@@ -230,6 +230,10 @@ pub(super) struct App {
     /// Identity of `pending_confirm_reply`. Remote handlers use it to dismiss
     /// only their own modal when its confirmation wait is cancelled.
     pub(super) pending_confirm_id: Option<u64>,
+    /// Cached unread state of the current session. Updated on session change
+    /// and when read-invalidation events arrive. Used to show indicator in
+    /// input title and to gate mark-read calls (only emit when unread).
+    pub(super) current_session_unread: bool,
     pub(super) detail_view_scroll: ratatui_widget_scrolling::ScrollState,
     pub(super) detail_view_open: bool,
     pub(super) detail_view_text: Option<String>,
@@ -670,4 +674,10 @@ pub(crate) enum TuiEvent {
     #[allow(dead_code)]
     PendingMessageConsumed(PendingMessage),
     ToolConfirmation(ToolConfirmationEvent),
+    /// Another frontend marked the session as read; TUI should update its cached unread state.
+    SessionReadInvalidation {
+        session_id: String,
+    },
+    /// Periodic reconcile event to refresh session list (emitted by main loop when picker is open).
+    RefreshSessionList,
 }

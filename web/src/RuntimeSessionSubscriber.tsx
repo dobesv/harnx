@@ -4,9 +4,11 @@ import { useAui } from '@assistant-ui/react';
 export const RuntimeSessionSubscriber = ({
   enabled,
   eventsUrl,
+  onReadUpdated,
 }: {
   enabled: boolean;
   eventsUrl: string;
+  onReadUpdated?: () => void;
 }) => {
   const aui = useAui();
   const auiRef = useRef(aui);
@@ -14,10 +16,18 @@ export const RuntimeSessionSubscriber = ({
   const pendingRef = useRef(false);
   const refreshingRef = useRef(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onReadUpdatedRef = useRef(onReadUpdated);
+  onReadUpdatedRef.current = onReadUpdated;
 
   useEffect(() => {
     if (!enabled) return;
     let disposed = false;
+
+    // SSE reconnect must refetch session list (via onReadUpdated callback)
+    // This handles the reconnect re-snapshot requirement for client cache reconciliation
+    const handleSseOpen = () => {
+      onReadUpdatedRef.current?.();
+    };
 
     const scheduleRefresh = () => {
       pendingRef.current = true;
@@ -53,7 +63,16 @@ export const RuntimeSessionSubscriber = ({
 
     if (typeof EventSource !== 'undefined') {
       const events = new EventSource(eventsUrl);
+      
+      // Reconnect re-snapshot: call onReadUpdated on SSE open
       events.addEventListener('session-updated', scheduleRefresh);
+      events.addEventListener('read-updated', () => {
+        onReadUpdatedRef.current?.();
+      });
+      
+      // Handle SSE open (reconnect) - trigger list refresh
+      events.onopen = handleSseOpen;
+      
       return () => {
         disposed = true;
         events.close();

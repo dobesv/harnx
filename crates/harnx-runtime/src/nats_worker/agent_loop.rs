@@ -110,6 +110,27 @@ pub(crate) fn derive_pending_hitl_approvals(
         .collect())
 }
 
+/// Derive the attention sequence from log entries.
+///
+/// Returns the max stream seq among attention-producing entries:
+/// - `TurnEnd` with `through_seq > 0` (final message turn boundary)
+/// - `HitlApprovalRequested` (HITL approval request)
+///
+/// Used by `reconcile_attention_from_log` to repair lost bumps.
+pub fn derive_attention_seq(entries: &[(u64, SessionLogEntry)]) -> u64 {
+    entries
+        .iter()
+        .filter_map(|(seq, entry)| match entry {
+            // TurnEnd with through_seq > 0 marks a complete turn
+            SessionLogEntry::TurnEnd { through_seq, .. } if *through_seq > 0 => Some(*seq),
+            // HitlApprovalRequested always bumps attention
+            SessionLogEntry::HitlApprovalRequested { .. } => Some(*seq),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 fn tool_round_entries(
     entries: &[(u64, SessionLogEntry)],
     tool_calls_seq: u64,
@@ -206,19 +227,59 @@ fn derive_hitl_tool_round_continuation(
         decisions,
     }))
 }
+/// Build the HITL approval request callback that appends entry and bumps attention.
+#[cfg(test)]
+pub(crate) fn build_hitl_approval_request_callback_for_test(
+    jetstream: &jetstream::Context,
+    session_id: &str,
+    lease: &Arc<NatsSessionLease>,
+    event_sink: Option<&Arc<NatsEventSink>>,
+    after_seq_observer: Option<&Arc<AtomicU64>>,
+    metadata_store: Option<&SessionMetadataStore>,
+) -> crate::agent_loop::OnHitlApprovalRequiredFn {
+    build_hitl_approval_request_callback_impl(
+        jetstream,
+        session_id,
+        lease,
+        event_sink,
+        after_seq_observer,
+        metadata_store,
+    )
+}
+
 fn build_hitl_approval_request_callback(
     jetstream: &jetstream::Context,
     session_id: &str,
     lease: &Arc<NatsSessionLease>,
     event_sink: Option<&Arc<NatsEventSink>>,
     after_seq_observer: Option<&Arc<AtomicU64>>,
+    metadata_store: Option<&SessionMetadataStore>,
+) -> crate::agent_loop::OnHitlApprovalRequiredFn {
+    build_hitl_approval_request_callback_impl(
+        jetstream,
+        session_id,
+        lease,
+        event_sink,
+        after_seq_observer,
+        metadata_store,
+    )
+}
+
+fn build_hitl_approval_request_callback_impl(
+    jetstream: &jetstream::Context,
+    session_id: &str,
+    lease: &Arc<NatsSessionLease>,
+    event_sink: Option<&Arc<NatsEventSink>>,
+    after_seq_observer: Option<&Arc<AtomicU64>>,
+    metadata_store: Option<&SessionMetadataStore>,
 ) -> crate::agent_loop::OnHitlApprovalRequiredFn {
     let backend = NatsSessionLogBackend::new(jetstream.clone(), session_id)
         .with_after_seq_observer(
             after_seq_observer
                 .cloned()
                 .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
-        );
+        )
+        .with_metadata_store(metadata_store.cloned());
     let sink = FencedSessionLogSink::new(backend.clone(), Arc::clone(lease));
     let lease = Arc::clone(lease);
     let event_sink = event_sink.cloned();
@@ -258,10 +319,22 @@ fn build_hitl_approval_request_callback(
                 return Ok(oldest.tool_call_id.clone());
             }
             let expected_last_sequence = entries.last().map_or(0, |(seq, _)| *seq);
-            if sink
-                .append_hitl_event_cas_blocking(&entry, expected_last_sequence)?
-                .is_some()
+            if let Some(assigned_seq) =
+                sink.append_hitl_event_cas_blocking(&entry, expected_last_sequence)?
             {
+                // Bump attention seq on durable HitlApprovalRequested append
+                if let Some(store) = backend.metadata_store_opt() {
+                    if let Err(error) = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(store.bump_attention(backend.session_id(), assigned_seq))
+                    }) {
+                        log::warn!(
+                            "failed to bump attention after HITL approval request: session_id={} seq={} error={error:#}",
+                            backend.session_id(),
+                            assigned_seq
+                        );
+                    }
+                }
                 if let Some(event_sink) = &event_sink {
                     event_sink.publish_session_updated();
                 }
@@ -455,6 +528,7 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
             lease,
             event_sink.as_ref(),
             after_seq_observer.as_ref(),
+            session_metadata,
         )
     });
     let ctx = build_agent_loop_context(AgentContextParams {
@@ -1987,5 +2061,102 @@ mod tests {
             Some(4),
             "latest_seq must track max consumed user-message seq"
         );
+    }
+}
+
+/// Tests for `build_hitl_approval_request_callback` attention bump.
+#[cfg(test)]
+mod hitl_attention_tests {
+    use super::*;
+    use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
+    use crate::nats_session_metadata::{SessionInitializer, SessionMetadata, SessionMetadataStore};
+    use crate::tool::DeferredToolCall;
+    use harnx_core::require_nextest;
+    use harnx_core::tool::ToolCall;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    /// Test that `build_hitl_approval_request_callback_for_test` appends
+    /// `HitlApprovalRequested` and bumps attention directly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hitl_approval_callback_bumps_attention_directly() {
+        require_nextest();
+        let Some((url, mut child, _store_dir)) = crate::nats_worker::tests::spawn_test_nats().await
+        else {
+            return;
+        };
+
+        let client = async_nats::connect(&url).await.unwrap();
+        let jetstream = async_nats::jetstream::new(client);
+        let store = SessionMetadataStore::ensure(&jetstream, 1).await.unwrap();
+        let session_id = crate::nats_worker::new_remote_session_id();
+
+        // Create session metadata
+        store
+            .create(&SessionMetadata::new(
+                &session_id,
+                SessionInitializer::named("metis", Default::default()),
+            ))
+            .await
+            .unwrap();
+
+        // Acquire a lease for the session
+        let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
+            jetstream: jetstream.clone(),
+            session_id: &session_id,
+            worker_id: "test-worker".to_string(),
+            generation: 1,
+            config: NatsLeaseConfig {
+                ttl: std::time::Duration::from_secs(5),
+                renew_interval: std::time::Duration::from_millis(500),
+                replicas: 1,
+                ..Default::default()
+            },
+            session_metadata: Some(store.clone()),
+        })
+        .await
+        .unwrap()
+        .expect("lease should be acquired");
+        let lease = Arc::new(lease);
+        let after_seq_observer = Arc::new(AtomicU64::new(0));
+
+        // Build the callback with metadata store attached
+        let callback = build_hitl_approval_request_callback_for_test(
+            &jetstream,
+            &session_id,
+            &lease,
+            None,
+            Some(&after_seq_observer),
+            Some(&store),
+        );
+
+        // Invoke the callback with a deferred tool call
+        let deferred = DeferredToolCall {
+            call: ToolCall::new(
+                "test_tool".to_string(),
+                serde_json::json!({"arg": "value"}),
+                Some("call-123".to_string()),
+                None,
+            ),
+            arguments: serde_json::json!({"arg": "value"}),
+            reason: Some("Test approval".to_string()),
+        };
+        let result = callback(&deferred).unwrap();
+        assert_eq!(result, "call-123");
+
+        // Verify session is now unread with correct attention seq
+        let state = store.get_read_state(&session_id).await.unwrap();
+        assert!(
+            state.is_unread(),
+            "session should be unread after HITL approval request callback"
+        );
+        assert!(
+            state.last_attention_seq >= 1,
+            "last_attention_seq should be at least 1"
+        );
+
+        lease.release().await.unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

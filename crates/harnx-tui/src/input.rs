@@ -8,6 +8,7 @@ use crossterm::ExecutableCommand;
 use harnx_core::event::{AgentEvent, AgentSource};
 use harnx_render::pretty_error_string;
 use harnx_runtime::config::list_assistant_agents;
+use harnx_runtime::nats_session_metadata::SessionMetadataStore;
 use harnx_runtime::utils::pretty_yaml_block;
 use ratatui_textarea::{Input as TextInput, Key};
 use std::path::Path;
@@ -216,6 +217,8 @@ impl Tui {
         if !self.app.llm_busy {
             self.abort_signal.set_ctrld();
         }
+        // Mark current session as read before exiting (if unread)
+        self.mark_current_session_read_if_unread().await;
         self.request_exit().await;
     }
 
@@ -250,6 +253,8 @@ impl Tui {
             self.app.llm_busy = false;
             self.active_remote_session = None;
         }
+        // Mark current session as read before clearing state (if unread)
+        self.mark_current_session_read_if_unread().await;
     }
 
     async fn handle_browsing_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -360,8 +365,13 @@ impl Tui {
                     self.app.transcript_selection_anchor = None;
                     self.app.transcript_browsing = false;
                     self.app.scroll_state.follow = true;
+                    // Mark read on exit from transcript focus (if unread)
+                    self.mark_current_session_read_if_unread().await;
                 } else if !self.app.completions.is_empty() {
                     self.app.completions.clear();
+                } else {
+                    // ESC with no special state: mark read (if unread)
+                    self.mark_current_session_read_if_unread().await;
                 }
             }
             // D4: Keyboard actions on selected transcript item(s)
@@ -393,6 +403,8 @@ impl Tui {
                 self.app.completions.clear();
                 let text = self.app.input.lines().join("\n");
                 if !text.trim().is_empty() || !self.app.attachments.is_empty() {
+                    // Mark read before prompt submission (if unread)
+                    self.mark_current_session_read_if_unread().await;
                     // Reset abort signal before each new submission (fix #3)
                     self.abort_signal.reset();
                     // Add to history (fix #4)
@@ -485,6 +497,10 @@ impl Tui {
                 // else is irrelevant when focus is on a history item.)
                 if self.app.transcript_focus.is_some() {
                     return Ok(());
+                }
+                // First character typed: mark read if unread
+                if self.app.current_session_unread {
+                    self.mark_current_session_read_if_unread().await;
                 }
                 // Exit history preview on any editing key — keep current content as new draft
                 if self.app.history_preview {
@@ -792,6 +808,34 @@ impl Tui {
             }
             TuiEvent::ToolConfirmation(event) => {
                 self.handle_tool_confirmation_event(event);
+            }
+            TuiEvent::SessionReadInvalidation { session_id } => {
+                self.handle_session_read_invalidation(&session_id).await;
+            }
+            TuiEvent::RefreshSessionList => {
+                // Periodic reconcile: refresh the session picker list if open
+                // Box::pin to avoid stack overflow in the event loop handler
+                Box::pin(async {
+                    let modal = self.app.modal.take();
+                    if let Some(crate::types::ModalState::SessionPicker {
+                        sessions: _,
+                        selected,
+                        origin_agent,
+                        origin_session,
+                        error: _,
+                    }) = modal
+                    {
+                        let (sessions, fetch_error) = Self::picker_sessions(&self.config).await;
+                        self.app.modal = Some(crate::types::ModalState::SessionPicker {
+                            sessions,
+                            selected,
+                            origin_agent,
+                            origin_session,
+                            error: fetch_error,
+                        });
+                    }
+                })
+                .await;
             }
         }
         Ok(())
@@ -2242,8 +2286,8 @@ impl Tui {
             self.request_exit().await;
             return Ok(());
         }
-        match key.code {
-            KeyCode::Up => {
+        match (key.code, key.modifiers) {
+            (KeyCode::Up, _) => {
                 if let Some(crate::types::ModalState::AgentPicker { selected, .. })
                 | Some(crate::types::ModalState::SessionPicker { selected, .. }) =
                     self.app.modal.as_mut()
@@ -2251,7 +2295,7 @@ impl Tui {
                     *selected = selected.saturating_sub(1);
                 }
             }
-            KeyCode::Down => {
+            (KeyCode::Down, _) => {
                 if let Some(crate::types::ModalState::AgentPicker {
                     selected,
                     agents,
@@ -2276,7 +2320,93 @@ impl Tui {
                     }
                 }
             }
-            KeyCode::Enter => {
+            // 'u' key in SessionPicker: toggle unread on selected session
+            // Guard: only handle when SessionPicker is active (not AgentPicker)
+            // Using match-arm guard so 'u'/'U' in AgentPicker falls through to the char filter arm.
+            (KeyCode::Char('u' | 'U'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                if matches!(
+                    self.app.modal,
+                    Some(crate::types::ModalState::SessionPicker { .. })
+                ) =>
+            {
+                if let Some(crate::types::ModalState::SessionPicker {
+                    sessions, selected, ..
+                }) = &self.app.modal
+                {
+                    // selected=0 is "New session", skip it
+                    if *selected > 0 && *selected <= sessions.len() {
+                        let session = &sessions[*selected - 1];
+                        let session_id = session.id.clone();
+                        let cluster = self
+                            .config
+                            .read()
+                            .remote_agent
+                            .as_ref()
+                            .map(|(_, c)| c.clone())
+                            .unwrap_or_else(|| {
+                                harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string()
+                            });
+                        // Toggle unread state
+                        let new_unread = !session.unread;
+                        let config = self.config.read().clone();
+                        let jetstream = match config.nats_jetstream(&cluster).await {
+                            Ok(js) => js,
+                            Err(e) => {
+                                log::warn!("Failed to get jetstream for picker mark-unread: {e:#}");
+                                return Ok(());
+                            }
+                        };
+                        let store = match SessionMetadataStore::ensure(&jetstream, 1).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                log::warn!(
+                                    "Failed to ensure metadata store for picker mark-unread: {e:#}"
+                                );
+                                return Ok(());
+                            }
+                        };
+                        if new_unread {
+                            if let Err(e) = store.mark_unread(&session_id).await {
+                                log::warn!("Failed to mark session as unread in picker: {e:#}");
+                            }
+                        } else {
+                            if let Err(e) = store.mark_read(&session_id).await {
+                                log::warn!("Failed to mark session as read in picker: {e:#}");
+                            }
+                        }
+                        // Refresh picker sessions
+                        // Box::pin to avoid stack overflow in the picker handler
+                        let (sessions, fetch_error) =
+                            Box::pin(async { Self::picker_sessions(&self.config).await }).await;
+                        // Preserve origin context from the current modal
+                        let origin = match &self.app.modal {
+                            Some(crate::types::ModalState::SessionPicker {
+                                origin_agent,
+                                origin_session,
+                                ..
+                            }) => (origin_agent.clone(), origin_session.clone()),
+                            _ => (None, None),
+                        };
+                        // Find the toggled session's new index after re-sort (unread-first)
+                        let new_selected = sessions
+                            .iter()
+                            .position(|s| s.id == session_id)
+                            .map(|i| i + 1) // +1 for "New session" at index 0
+                            .unwrap_or_else(|| {
+                                // Clamp: keep selection in valid range
+                                (*selected).min(sessions.len())
+                            });
+                        self.app.modal = Some(crate::types::ModalState::SessionPicker {
+                            sessions,
+                            selected: new_selected,
+                            origin_agent: origin.0,
+                            origin_session: origin.1,
+                            error: fetch_error,
+                        });
+                    }
+                }
+            }
+            (KeyCode::Enter, _) => {
                 let modal = self.app.modal.take();
                 match modal {
                     Some(crate::types::ModalState::AgentPicker {
@@ -2320,7 +2450,9 @@ impl Tui {
                                 return Err(e);
                             }
 
-                            let (sessions, fetch_error) = Self::picker_sessions(&self.config).await;
+                            // Box::pin to avoid stack overflow in the picker handler
+                            let (sessions, fetch_error) =
+                                Box::pin(async { Self::picker_sessions(&self.config).await }).await;
                             // Always show SessionPicker so the user can pick "New session"
                             // (index 0) or an existing session. Carry the pre-activation
                             // origin state so reconcile_transcript_after_command sees the
@@ -2362,6 +2494,7 @@ impl Tui {
                         } else {
                             // Existing session at sessions[selected - 1].
                             let session_name = sessions[selected - 1].id.clone();
+                            let session_unread = sessions[selected - 1].unread;
 
                             if let Err(e) = self.config.write().use_session(Some(&session_name)) {
                                 self.app.modal = Some(crate::types::ModalState::SessionPicker {
@@ -2373,6 +2506,9 @@ impl Tui {
                                 });
                                 return Err(e);
                             }
+
+                            // Update cached unread state for the newly selected session
+                            self.app.current_session_unread = session_unread;
 
                             let llm_busy = self.app.llm_busy;
                             let pending = self.app.pending_message.is_some();
@@ -2397,7 +2533,7 @@ impl Tui {
                     }
                 }
             }
-            KeyCode::Esc => {
+            (KeyCode::Esc, _) => {
                 // ESC behaviour depends on which picker is open and how it was reached.
                 //
                 // SessionPicker:
@@ -2479,9 +2615,7 @@ impl Tui {
             }
 
             // Typing characters filters the AgentPicker list.
-            KeyCode::Char(c)
-                if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT =>
-            {
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 if let Some(crate::types::ModalState::AgentPicker {
                     query, selected, ..
                 }) = self.app.modal.as_mut()
@@ -2490,7 +2624,7 @@ impl Tui {
                     *selected = 0; // reset to top of filtered list
                 }
             }
-            KeyCode::Backspace => {
+            (KeyCode::Backspace, _) => {
                 if let Some(crate::types::ModalState::AgentPicker {
                     query, selected, ..
                 }) = self.app.modal.as_mut()
@@ -2587,6 +2721,47 @@ impl Tui {
             (Some(from), Some(to)) => Some((from.min(to), from.max(to))),
             _ => None,
         }
+    }
+
+    /// Mark the current session as read if it's currently marked unread.
+    /// Called on user presence actions: ESC, CTRL-C, CTRL-D, Enter (submit), first text input.
+    ///
+    /// Boxed to keep `handle_key`'s future frame compact and avoid stack overflow in tests
+    /// (the async body contains await chains that inflate the stack size).
+    fn mark_current_session_read_if_unread(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if !self.app.current_session_unread {
+                return;
+            }
+            // Use session_activity_destination to resolve the current session even when idle
+            // (when user presence typing, ESC, CTRL-C, etc. occur, active_remote_session may be None).
+            let Some((session_id, cluster)) = self.session_activity_destination() else {
+                return;
+            };
+            let config = self.config.read().clone();
+            let jetstream = match config.nats_jetstream(&cluster).await {
+                Ok(js) => js,
+                Err(e) => {
+                    log::warn!("Failed to get jetstream for mark-read: {e:#}");
+                    return;
+                }
+            };
+            let store = match SessionMetadataStore::ensure(&jetstream, 1).await {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("Failed to ensure metadata store for mark-read: {e:#}");
+                    return;
+                }
+            };
+            if let Err(e) = store.mark_read(&session_id).await {
+                log::warn!("Failed to mark session as read: {e:#}");
+                return;
+            }
+            self.app.current_session_unread = false;
+            self.refresh_input_chrome();
+        })
     }
 
     /// Get text content from transcript item for copy/insert operations.

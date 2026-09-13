@@ -169,8 +169,8 @@ async fn monitor_subagent_attachment(
     target: &(String, String),
     invocation_id: Option<&str>,
 ) -> AttachmentOutcome {
-    let mut stream = match attach_session_event_stream(config, target).await {
-        Ok(stream) => stream,
+    let (mut stream, _client) = match attach_session_event_stream(config, target).await {
+        Ok(result) => result,
         Err(error) => {
             log::debug!(
                 "failed to attach sub-agent monitor: agent={} session_id={} cluster={} error={error:#}",

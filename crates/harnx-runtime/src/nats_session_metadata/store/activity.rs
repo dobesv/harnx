@@ -1,4 +1,4 @@
-use super::{mutation::is_wrong_last_revision, *};
+use super::{store::is_cas_conflict, *};
 use anyhow::{Context, Result};
 use async_nats::jetstream::kv;
 use chrono::Utc;
@@ -123,12 +123,4 @@ fn next_activity(previous: Option<SessionActivity>, activation: bool) -> Session
         first_activation_at: previous.and_then(|activity| activity.first_activation_at),
         last_activity_at: Utc::now(),
     }
-}
-
-fn is_cas_conflict(error: &anyhow::Error) -> bool {
-    is_wrong_last_revision(error)
-        || error
-            .chain()
-            .find_map(|cause| cause.downcast_ref::<kv::CreateError>())
-            .is_some_and(|error| error.kind() == kv::CreateErrorKind::AlreadyExists)
 }

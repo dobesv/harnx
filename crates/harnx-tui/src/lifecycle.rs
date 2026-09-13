@@ -50,6 +50,8 @@ const WATCHDOG_RSS_FLOOR: u64 = 512 * 1024 * 1024;
 /// Draining at least this many events from `event_rx` in a single tick is
 /// treated as a producer flooding the channel and is logged.
 const WATCHDOG_EVENT_DRAIN: usize = 2_000;
+/// Periodic reconcile interval for session picker list (30 seconds)
+const SESSION_LIST_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Best-effort resident-set size of this process in bytes (Linux only).
 /// Returns `None` on other platforms or if `/proc` is unreadable. Used purely
@@ -139,6 +141,7 @@ fn build_initial_app(
         modal: None,
         pending_confirm_reply: None,
         pending_confirm_id: None,
+        current_session_unread: false,
         detail_view_scroll: {
             let mut s = ratatui_widget_scrolling::ScrollState::new();
             s.follow = false;
@@ -220,6 +223,9 @@ impl Tui {
 
         let mut app = build_initial_app(config, initial_transcript)?;
 
+        // Initialize current_session_unread from the session's read state
+        app.current_session_unread = Self::fetch_initial_session_unread(config).await;
+
         if !cfg!(test) {
             app.modal = Self::resolve_initial_modal(config).await;
         }
@@ -282,21 +288,190 @@ impl Tui {
         None
     }
 
+    /// Fetch the initial unread state for the session configured at startup.
+    /// Returns false if no session is configured or if the read state cannot be fetched.
+    async fn fetch_initial_session_unread(config: &GlobalConfig) -> bool {
+        let (session_id, cluster) = {
+            let cfg = config.read();
+            let Some(session) = cfg.session.as_ref() else {
+                return false;
+            };
+            let session_id = session.id().to_string();
+            let cluster = cfg
+                .remote_agent
+                .as_ref()
+                .map(|(_, c)| c.clone())
+                .unwrap_or_else(|| harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string());
+            (session_id, cluster)
+        };
+
+        let cfg = config.read().clone();
+        let Ok(jetstream) = cfg.nats_jetstream(&cluster).await else {
+            return false;
+        };
+        let Ok(store) =
+            harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await
+        else {
+            return false;
+        };
+        store
+            .get_read_state(&session_id)
+            .await
+            .is_ok_and(|s| s.is_unread())
+    }
+
+    /// Fetch session list for the picker (subscribe-before-snapshot).
+    ///
+    /// Subscribes to read-invalidation before taking the snapshot, tracks dirty
+    /// session IDs whose invalidations arrive during load, then refreshes their
+    /// read-state after the snapshot to ensure a race during load doesn't leave
+    /// stale unread values.
     pub(crate) async fn picker_sessions(
         config: &GlobalConfig,
     ) -> (Vec<harnx_runtime::config::SessionMeta>, Option<String>) {
-        let cfg = config.read().clone();
-        let cluster = cfg
-            .remote_agent
-            .as_ref()
-            .map(|(_, cluster)| cluster.as_str())
-            .unwrap_or(harnx_runtime::config::LOCAL_CLUSTER_KEY);
-        let agent_name = cfg
-            .remote_agent
-            .as_ref()
-            .map(|(agent, _)| agent.as_str())
-            .or_else(|| cfg.agent.as_ref().map(|agent| agent.name()));
+        // Box::pin to avoid stack overflow — this async contains a large future frame
+        // (NATS subscription + timeout + invalidation drain + dirty-set refresh)
+        Box::pin(async {
+            use futures_util::{FutureExt, StreamExt};
 
+            let cfg = config.read().clone();
+            let cluster = cfg
+                .remote_agent
+                .as_ref()
+                .map(|(_, cluster)| cluster.clone())
+                .unwrap_or_else(|| harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string());
+            let agent_name = cfg
+                .remote_agent
+                .as_ref()
+                .map(|(agent, _)| agent.as_str())
+                .or_else(|| cfg.agent.as_ref().map(|agent| agent.name()));
+
+            // Get NATS client for subscribe-before-snapshot
+            // If client fails (unknown cluster, offline, etc.), gracefully fall back to direct fetch
+            let client = match cfg.nats_client(&cluster).await {
+                Ok(c) => c,
+                Err(_) => {
+                    // Graceful degradation: direct fetch without race protection
+                    return Self::picker_sessions_direct(&cfg, &cluster, agent_name).await;
+                }
+            };
+
+            // Subscribe to wildcard read-invalidation before snapshot
+            // Subject: harnx.session.*.read.invalidated
+            let wildcard_subject = "harnx.session.*.read.invalidated".to_string();
+            let mut read_invalidations = match client.subscribe(wildcard_subject.clone()).await {
+                Ok(sub) => sub,
+                Err(_) => {
+                    // Graceful degradation: direct fetch without race protection
+                    return Self::picker_sessions_direct(&cfg, &cluster, agent_name).await;
+                }
+            };
+
+            // Give subscription time to propagate (NATS best-effort)
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            // Track dirty session IDs during snapshot load
+            let mut dirty_session_ids: HashSet<String> = HashSet::new();
+
+            // Start the snapshot load
+            let list_result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                cfg.list_remote_sessions_with_meta(&cluster),
+            )
+            .await;
+
+            // Drain any invalidations that arrived during load
+            loop {
+                match read_invalidations.next().now_or_never() {
+                    Some(Some(msg)) => {
+                        // Extract session ID from subject: harnx.session.{id}.read.invalidated
+                        if let Some(session_id) = msg
+                            .subject
+                            .as_str()
+                            .strip_prefix("harnx.session.")
+                            .and_then(|s| s.strip_suffix(".read.invalidated"))
+                        {
+                            dirty_session_ids.insert(session_id.to_string());
+                        }
+                    }
+                    Some(None) => break, // Stream closed
+                    None => break,       // No more messages available
+                }
+            }
+
+            // Unsubscribe to clean up
+            let _ = read_invalidations.unsubscribe().await;
+
+            match list_result {
+                Ok(Ok(sessions)) => {
+                    // Filter by agent
+                    let mut sessions: Vec<_> = sessions
+                        .into_iter()
+                        .filter(|session| session.agent_name.as_deref() == agent_name)
+                        .collect();
+
+                    // Refresh read-state for dirty sessions
+                    if !dirty_session_ids.is_empty() {
+                        if let Ok(jetstream) = cfg.nats_jetstream(&cluster).await {
+                            if let Ok(store) =
+                                harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(
+                                    &jetstream, 1,
+                                )
+                                .await
+                            {
+                                for session in &mut sessions {
+                                    if dirty_session_ids.contains(&session.id) {
+                                        if let Ok(read_state) =
+                                            store.get_read_state(&session.id).await
+                                        {
+                                            session.unread = read_state.is_unread();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mode = if cfg.remote_agent.is_some() {
+                        PickerMatchMode::Remote
+                    } else {
+                        PickerMatchMode::Local
+                    };
+                    let query = PickerQueryContext::observe_current(mode).await;
+                    (
+                        sort_sessions_for_picker_with_context(sessions, &query),
+                        None,
+                    )
+                }
+                Ok(Err(error)) => {
+                    log::warn!(
+                        "Failed to list NATS sessions for cluster '{}': {:#}",
+                        cluster,
+                        error
+                    );
+                    (
+                        vec![],
+                        Some(format!("NATS sessions unavailable: {error:#}")),
+                    )
+                }
+                Err(_) => {
+                    log::warn!("Timeout listing NATS sessions for picker");
+                    (
+                        vec![],
+                        Some("NATS sessions unavailable: timeout".to_string()),
+                    )
+                }
+            }
+        })
+        .await
+    }
+
+    /// Direct session list fetch without subscribe-before-snapshot (fallback).
+    async fn picker_sessions_direct(
+        cfg: &harnx_runtime::config::Config,
+        cluster: &str,
+        agent_name: Option<&str>,
+    ) -> (Vec<harnx_runtime::config::SessionMeta>, Option<String>) {
         match cfg.list_remote_sessions_with_meta(cluster).await {
             Ok(sessions) => {
                 let sessions = sessions
@@ -360,6 +535,8 @@ impl Tui {
             restore_picker(self);
             return Err(error);
         }
+        // New sessions start as read (unread=false)
+        self.app.current_session_unread = false;
         let llm_busy = self.app.llm_busy;
         let pending = self.app.pending_message.is_some();
         Self::refresh_input_chrome_from_state(&self.config, &mut self.app, llm_busy, pending);
@@ -468,6 +645,8 @@ impl Tui {
         // from the OOM alone.
         let mut last_watchdog = Instant::now();
         let mut rss_warn_threshold: u64 = WATCHDOG_RSS_FLOOR;
+        // Periodic reconcile timer for session picker list
+        let mut last_session_list_reconcile = Instant::now();
         loop {
             // After an external editor exits, the terminal buffer is stale.
             // Clear it to force ratatui to repaint every cell from scratch.
@@ -559,6 +738,14 @@ impl Tui {
                 // Check for async hook results that need a follow-up prompt (fix #2)
                 if !self.app.llm_busy {
                     self.try_resume_async_hooks().await?;
+                }
+            }
+
+            // Periodic reconcile: emit RefreshSessionList when session picker is open
+            if last_session_list_reconcile.elapsed() >= SESSION_LIST_RECONCILE_INTERVAL {
+                last_session_list_reconcile = Instant::now();
+                if matches!(&self.app.modal, Some(ModalState::SessionPicker { .. })) {
+                    let _ = self.event_tx.send(TuiEvent::RefreshSessionList);
                 }
             }
         }

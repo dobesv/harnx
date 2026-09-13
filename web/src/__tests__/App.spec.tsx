@@ -11,10 +11,11 @@ import {
   CancelButton,
   MyComposer,
   SendErrorIndicator,
+  SessionPicker,
   StatusBar,
   StatusIndicator,
 } from '../App';
-import { sendPrompt, uploadAttachment, submitHitlDecision } from '../api';
+import { sendPrompt, uploadAttachment, submitHitlDecision, markRead } from '../api';
 import { PendingContext } from '../PendingContext';
 import { UsageContext } from '../UsageContext';
 import * as agUi from '@assistant-ui/react-ag-ui';
@@ -41,7 +42,14 @@ vi.mock('@assistant-ui/react-ag-ui', async (importOriginal) => {
 
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>();
-  return { ...actual, sendPrompt: vi.fn(), uploadAttachment: vi.fn(), submitHitlDecision: vi.fn() };
+  return {
+    ...actual,
+    sendPrompt: vi.fn(),
+    uploadAttachment: vi.fn(),
+    submitHitlDecision: vi.fn(),
+    markRead: vi.fn().mockResolvedValue({ status: 'ok' }),
+    markUnread: vi.fn().mockResolvedValue({ status: 'ok' }),
+  };
 });
 vi.mock('../useCancellation', () => ({ useCancellation: vi.fn() }));
 vi.mock('@assistant-ui/react', async (importOriginal) => {
@@ -621,5 +629,174 @@ describe('MyComposer', () => {
       text: 'hello', 
       attachmentRefs: ['cid:file1'] 
     });
+  });
+
+  it('does not mark unread session as read on focus alone, but marks on input or submit once per unread state', async () => {
+    const onMarkRead = vi.fn();
+    const { rerender } = render(
+      <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
+        <PendingContext.Provider value={{ ...defaultPendingContext, setErrorText }}>
+          <MyComposer 
+            agentName="foo" 
+            sessionId="bar" 
+            isUnread={true}
+            onMarkRead={onMarkRead}
+            isFreshSession={false} 
+            markSessionNotFresh={markSessionNotFresh}
+            switchAgentHref="" 
+            switchSessionHref="" 
+            onSwitchAgent={() => {}} 
+            onSwitchSession={() => {}} 
+          />
+        </PendingContext.Provider>
+      </ChatProvider>
+    );
+
+    const textarea = screen.getByRole('textbox');
+    
+    // Focus alone must NOT mark read (viewport/focus auto-read is deferred)
+    fireEvent.focus(textarea);
+    expect(markRead).not.toHaveBeenCalled();
+    expect(onMarkRead).not.toHaveBeenCalled();
+
+    // First keystroke marks read
+    fireEvent.input(textarea, { target: { value: 'a' } });
+
+    await waitFor(() => {
+      expect(markRead).toHaveBeenCalledWith('foo', 'bar');
+      expect(onMarkRead).toHaveBeenCalledTimes(1);
+    });
+
+    // Subsequent keystrokes should not call markRead again
+    fireEvent.input(textarea, { target: { value: 'ab' } });
+    expect(markRead).toHaveBeenCalledTimes(1);
+
+    // If rerendered after becoming read (isUnread: false), focusing or typing does not call markRead
+    rerender(
+      <ChatProvider agentName="foo" sessionId="bar" isFreshSession={false} onOpenSubAgent={vi.fn()}>
+        <PendingContext.Provider value={{ ...defaultPendingContext, setErrorText }}>
+          <MyComposer 
+            agentName="foo" 
+            sessionId="bar" 
+            isUnread={false}
+            onMarkRead={onMarkRead}
+            isFreshSession={false} 
+            markSessionNotFresh={markSessionNotFresh}
+            switchAgentHref="" 
+            switchSessionHref="" 
+            onSwitchAgent={() => {}} 
+            onSwitchSession={() => {}} 
+          />
+        </PendingContext.Provider>
+      </ChatProvider>
+    );
+
+    fireEvent.focus(textarea);
+    fireEvent.input(textarea, { target: { value: 'abc' } });
+    expect(markRead).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks unread session as read on submit without prior input', async () => {
+    const onMarkRead = vi.fn();
+    render(
+      <ChatProvider agentName="foo" sessionId="bar-submit" isFreshSession={false} onOpenSubAgent={vi.fn()}>
+        <PendingContext.Provider value={{ ...defaultPendingContext, setErrorText }}>
+          <MyComposer 
+            agentName="foo" 
+            sessionId="bar-submit" 
+            isUnread={true}
+            onMarkRead={onMarkRead}
+            isFreshSession={false} 
+            markSessionNotFresh={markSessionNotFresh}
+            switchAgentHref="" 
+            switchSessionHref="" 
+            onSwitchAgent={() => {}} 
+            onSwitchSession={() => {}} 
+          />
+        </PendingContext.Provider>
+      </ChatProvider>
+    );
+
+    const sendBtn = screen.getByRole('button', { name: 'Send' });
+    fireEvent.click(sendBtn);
+
+    await waitFor(() => {
+      expect(markRead).toHaveBeenCalledWith('foo', 'bar-submit');
+      expect(onMarkRead).toHaveBeenCalledTimes(1);
+    });
+  });
+});
+
+describe('SessionPicker', () => {
+  const sessions = [
+    { session_id: 'session-old-read', updated_at: '2026-01-01T00:00:00Z', unread: false },
+    { session_id: 'session-new-read', updated_at: '2026-01-03T00:00:00Z', unread: false },
+    { session_id: 'session-old-unread', updated_at: '2026-01-02T00:00:00Z', unread: true },
+    { session_id: 'session-new-unread', updated_at: '2026-01-04T00:00:00Z', unread: true },
+  ];
+
+  it('renders unread badges and sorts unread sessions first (then recency)', () => {
+    render(
+      <SessionPicker
+        agentName="test-agent"
+        sessions={sessions}
+        sessionsError={null}
+        sessionsLoading={false}
+        hasLoadedSessions={true}
+        onRetry={vi.fn()}
+        onSelect={vi.fn()}
+        onNewChat={vi.fn()}
+        onBack={vi.fn()}
+      />
+    );
+
+    const items = screen.getAllByRole('button').filter(b => b.classList.contains('session-item'));
+    expect(items).toHaveLength(4);
+    // Order: session-new-unread, session-old-unread, session-new-read, session-old-read
+    expect(items[0]).toHaveTextContent('session-new-unread');
+    expect(items[1]).toHaveTextContent('session-old-unread');
+    expect(items[2]).toHaveTextContent('session-new-read');
+    expect(items[3]).toHaveTextContent('session-old-read');
+
+    const badges = screen.getAllByTestId('session-unread-badge');
+    expect(badges).toHaveLength(2);
+    expect(badges[0]).toHaveTextContent('Unread');
+    expect(badges[1]).toHaveTextContent('Unread');
+  });
+
+  it('toggles read/unread without triggering card selection', () => {
+    const onSelect = vi.fn();
+    const onToggleUnread = vi.fn();
+
+    render(
+      <SessionPicker
+        agentName="test-agent"
+        sessions={sessions}
+        sessionsError={null}
+        sessionsLoading={false}
+        hasLoadedSessions={true}
+        onRetry={vi.fn()}
+        onSelect={onSelect}
+        onNewChat={vi.fn()}
+        onBack={vi.fn()}
+        onToggleUnread={onToggleUnread}
+      />
+    );
+
+    // Find the toggle button on the first session (which is unread)
+    const markReadBtn = screen.getByRole('button', { name: 'Mark session session-new-unread as read' });
+    expect(markReadBtn).toHaveTextContent('Mark read');
+
+    fireEvent.click(markReadBtn);
+    expect(onToggleUnread).toHaveBeenCalledWith('session-new-unread', true);
+    expect(onSelect).not.toHaveBeenCalled();
+
+    // Find the toggle button on the third session (which is read)
+    const markUnreadBtn = screen.getByRole('button', { name: 'Mark session session-new-read as unread' });
+    expect(markUnreadBtn).toHaveTextContent('Mark unread');
+
+    fireEvent.click(markUnreadBtn);
+    expect(onToggleUnread).toHaveBeenCalledWith('session-new-read', false);
+    expect(onSelect).not.toHaveBeenCalled();
   });
 });

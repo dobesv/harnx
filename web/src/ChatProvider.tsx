@@ -22,6 +22,7 @@ export interface ChatProviderProps {
   isFreshSession: boolean;
   onHandoff?: (agent: string, sessionId: string) => void;
   onOpenSubAgent: (agent: string, sessionId: string) => void;
+  onReadUpdated?: () => void;
   children: React.ReactNode;
 }
 
@@ -227,6 +228,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
   isFreshSession,
   onHandoff,
   onOpenSubAgent,
+  onReadUpdated,
   children,
 }) => {
   const cancellation = useCancellation(agentName, sessionId);
@@ -363,6 +365,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
             <RuntimeSessionSubscriber
               enabled={!isFreshSession}
               eventsUrl={`/v1/agents/${encodeURIComponent(agentName)}/sessions/${encodeURIComponent(sessionId)}/events`}
+              onReadUpdated={onReadUpdated}
             />
             {children}
           </AssistantRuntimeProvider>

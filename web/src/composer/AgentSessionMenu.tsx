@@ -5,6 +5,7 @@ import { LinkButton } from '../LinkButton';
 export interface AgentSessionMenuProps {
   agentName: string;
   sessionId: string;
+  unread?: boolean;
   switchAgentHref: string;
   switchSessionHref: string;
   onSwitchAgent: () => void;
@@ -35,10 +36,18 @@ export function AgentDropdown(props: AgentSessionMenuProps) {
 }
 
 export function SessionDropdown(props: AgentSessionMenuProps) {
+  const sessionLabel = `Session: ${props.sessionId}${props.unread ? ' (unread)' : ''}`;
   return (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
-        <button type="button" className="aui-composer-menu-trigger" aria-label={`Session: ${props.sessionId}`}>
+        <button type="button" className="aui-composer-menu-trigger" aria-label={sessionLabel}>
+          {props.unread && (
+            <span
+              className="session-unread-dot"
+              aria-hidden="true"
+              data-testid="current-session-unread-dot"
+            />
+          )}
           <span>{props.sessionId}</span>
           <ChevronDownIcon />
         </button>
@@ -58,10 +67,19 @@ export function SessionDropdown(props: AgentSessionMenuProps) {
 }
 
 export function AgentSessionMenu(props: AgentSessionMenuProps) {
+  const optionsLabel = `Agent and session options${props.unread ? ' (unread)' : ''}`;
   return (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
-        <button type="button" className="aui-composer-menu-trigger aui-composer-menu-trigger-icon" aria-label="Agent and session options">
+        <button type="button" className="aui-composer-menu-trigger aui-composer-menu-trigger-icon" aria-label={optionsLabel}>
+          {props.unread && (
+            <span
+              className="session-unread-dot"
+              aria-hidden="true"
+              data-testid="current-session-unread-dot-mobile"
+              style={{ position: 'absolute', top: '6px', right: '6px' }}
+            />
+          )}
           <MenuIcon />
         </button>
       </DropdownMenu.Trigger>

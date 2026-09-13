@@ -43,7 +43,13 @@ async fn nats_durable_refresh_preserves_queued_handoff() {
     refresh.tick().await;
     tokio::time::sleep(Duration::from_millis(5)).await;
     assert!(matches!(
-        next_session_activity_input(stream.next(), active, &mut refresh).await,
+        next_session_activity_input(
+            stream.next(),
+            active,
+            &mut refresh,
+            std::future::pending::<Option<async_nats::Message>>()
+        )
+        .await,
         SessionActivityInput::RefreshDurableHistory
     ));
     assert!(matches!(
