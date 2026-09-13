@@ -27,15 +27,7 @@ async fn cancellation_ack_waits_for_cleanup_and_stubborn_calls_remain_unconfirme
     store
         .child(reference.clone(), root.reference.clone())
         .await?;
-    let request = ToolRequest {
-        operation_id: "ack-tool".into(),
-        call_id: "ack-tool".into(),
-        tool: "slow".into(),
-        args: json!({"gate_cleanup": true}),
-        parent_session_id: Some("ack-parent".into()),
-        tool_call_id: None,
-        capabilities: Default::default(),
-    };
+    let request = cancellation_request();
     let invoke = harness.client.send_request(
         harness.instance_id.tool_subject("____test", "slow"),
         async_nats::Request::new()
@@ -107,4 +99,17 @@ async fn cancellation_ack_waits_for_cleanup_and_stubborn_calls_remain_unconfirme
         .result
         .is_err());
     Ok(())
+}
+
+fn cancellation_request() -> ToolRequest {
+    ToolRequest {
+        replay: None,
+        operation_id: "ack-tool".into(),
+        call_id: "ack-tool".into(),
+        tool: "slow".into(),
+        args: json!({"gate_cleanup": true}),
+        parent_session_id: Some("ack-parent".into()),
+        tool_call_id: None,
+        capabilities: Default::default(),
+    }
 }

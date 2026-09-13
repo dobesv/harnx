@@ -108,6 +108,9 @@ pub struct SessionMetadata {
     pub schema_version: u32,
     pub session_id: String,
     pub created_at: DateTime<Utc>,
+    /// Immutable allocation identity for replayable sub-agent session creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_invocation: Option<String>,
     pub agent: SessionAgentSource,
     #[serde(default)]
     pub variables: AgentVariables,
@@ -137,6 +140,7 @@ impl SessionMetadata {
             schema_version: SESSION_METADATA_SCHEMA_VERSION,
             session_id: session_id.into(),
             created_at: Utc::now(),
+            creation_invocation: None,
             agent: initializer.agent,
             variables: initializer.variables,
             overrides: initializer.overrides,

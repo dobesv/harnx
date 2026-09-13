@@ -158,6 +158,7 @@ async fn invoke(
     let request_id = uuid::Uuid::new_v4();
     let call_id = format!("fs-{tool}-{request_id}");
     let request = ToolRequest {
+        replay: None,
         operation_id: call_id.clone(),
         call_id: call_id.clone(),
         tool: tool.to_string(),

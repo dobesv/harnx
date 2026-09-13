@@ -1,5 +1,8 @@
 //! Agent loop entrypoint for NATS-backed sessions.
 
+mod tool_recovery;
+use tool_recovery::repair_single_orphan;
+
 use super::backend::{FencedSessionLogSink, NatsSessionLogBackend};
 use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use crate::agent_loop::OnToolRoundFn;
@@ -374,6 +377,7 @@ struct RepairOrphanToolCallsArgs<'a> {
     worker_id: Option<String>,
     session_id: &'a str,
     abort_signal: &'a AbortSignal,
+    lease: Option<&'a NatsSessionLease>,
 }
 
 /// Run the agent loop with a remote NATS session.
@@ -1241,6 +1245,7 @@ async fn repair_orphan_tool_calls_if_any(params: RepairOrphanCallsParams<'_>) ->
             instance_id,
             fence_token: lease.map(|l| l.fence_token()),
             worker_id: lease.map(|l| l.worker_id().to_string()),
+            lease,
             session_id,
             abort_signal,
         },
@@ -1369,7 +1374,7 @@ async fn repair_orphan_tool_calls_with_hints(
         build_orphan_tool_eval_context(&args.config, args.instance_id, &tool_repair).await;
 
     for orphan in orphan_calls {
-        let results = repair_single_orphan(orphan, &args, &tool_repair, &eval_ctx).await;
+        let results = repair_single_orphan(orphan, &args, &tool_repair, &eval_ctx).await?;
         let entry = apply_optional_fence_token(
             SessionLogEntry::ToolResults {
                 results,
@@ -1433,23 +1438,8 @@ async fn build_orphan_tool_eval_context(
     .await
 }
 
-async fn repair_single_orphan(
-    orphan: &PendingToolCalls,
-    args: &RepairOrphanToolCallsArgs<'_>,
-    repair: &ToolRepairContext,
-    eval_ctx: &crate::tool::ToolEvalContext,
-) -> Vec<harnx_core::session::ToolOutput> {
-    let (mut results, rerun_calls) = partition_orphan_calls(orphan, args, repair);
-    if !rerun_calls.is_empty() {
-        let rerun_results =
-            rerun_or_synthesize_tool_results(rerun_calls, eval_ctx, args.abort_signal).await;
-        results.extend(rerun_results);
-    }
-    results
-}
-
 fn partition_orphan_calls(
-    orphan: &PendingToolCalls,
+    calls: &[harnx_core::tool::ToolCall],
     args: &RepairOrphanToolCallsArgs<'_>,
     repair: &ToolRepairContext,
 ) -> (
@@ -1459,7 +1449,7 @@ fn partition_orphan_calls(
     let mut results = Vec::new();
     let mut rerun_calls = Vec::new();
 
-    for call in &orphan.calls {
+    for call in calls {
         if tool_can_rerun(&repair.decl_map, &call.name) {
             log_resume_decision("rerun", args, call);
             rerun_calls.push(call.clone());

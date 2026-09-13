@@ -32,12 +32,7 @@ pub(super) async fn run_prompt(
     toolset: &SubagentToolset,
     params: PromptParams<'_>,
 ) -> Result<CompletedSubagentTurn, ToolInvokeError> {
-    let session = toolset
-        .create_session(
-            params.session_id.clone(),
-            params.parent_session_id.as_deref(),
-        )
-        .await?;
+    let (session, deadline) = checkpointed_session(toolset, &params).await?;
     let session = match params.context.operation {
         Some(parent) => session.with_execution_parent(parent, params.context.call_id.clone()),
         None => session,
@@ -58,7 +53,8 @@ pub(super) async fn run_prompt(
         &buffering_sink,
         AwaitTurnParams {
             message: params.message,
-            timeout_secs: params.timeout_secs,
+            timeout: deadline
+                .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now())),
             token_budget: params.token_budget,
             cancel: params.cancel,
         },
@@ -88,9 +84,119 @@ pub(super) async fn run_prompt(
     }
 }
 
+async fn checkpointed_session(
+    toolset: &SubagentToolset,
+    params: &PromptParams<'_>,
+) -> Result<(NatsSession, Option<tokio::time::Instant>), ToolInvokeError> {
+    if params.context.operation.is_none() {
+        let deadline = remaining_timeout(params.timeout_secs, None)
+            .map(|remaining| tokio::time::Instant::now() + remaining);
+        let session = toolset
+            .create_session(
+                params.session_id.clone(),
+                params.parent_session_id.as_deref(),
+            )
+            .await?;
+        return Ok((session, deadline));
+    }
+    let journal =
+        harnx_toolset_server::invocation_journal::InvocationJournal::ensure(&toolset.jetstream)
+            .await
+            .map_err(|error| {
+                ToolInvokeError::Fatal(format!("open sub-agent checkpoint: {error:#}"))
+            })?;
+    let parent = params.parent_session_id.as_deref();
+    let record = match parent {
+        Some(parent) => journal
+            .recorded(parent, &params.context.call_id)
+            .await
+            .map_err(|error| {
+                ToolInvokeError::Fatal(format!("read sub-agent checkpoint: {error:#}"))
+            })?,
+        None => None,
+    };
+    let timeout = remaining_timeout(
+        params.timeout_secs,
+        record.as_ref().map(|record| record.started_at_ms),
+    )
+    .map(|remaining| tokio::time::Instant::now() + remaining);
+    let Some(record) = record else {
+        let session = toolset
+            .create_session(params.session_id.clone(), parent)
+            .await?;
+        return Ok((session, timeout));
+    };
+    Ok((
+        checkpointed_handle(toolset, params, &journal, record).await?,
+        timeout,
+    ))
+}
+
+async fn checkpointed_handle(
+    toolset: &SubagentToolset,
+    params: &PromptParams<'_>,
+    journal: &harnx_toolset_server::invocation_journal::InvocationJournal,
+    record: harnx_toolset_server::invocation_journal::RecordedInvocation,
+) -> Result<NatsSession, ToolInvokeError> {
+    let parent = params.parent_session_id.as_deref();
+    let checkpoint = record.checkpoint;
+    let mut session_id = checkpoint
+        .as_ref()
+        .and_then(|value| value["session_id"].as_str())
+        .map(str::to_string)
+        .or_else(|| params.session_id.clone());
+    if session_id.is_none() {
+        let config = toolset.session_config(None, parent).await?;
+        let allocation = format!("{}/{}", parent.unwrap_or(""), params.context.call_id);
+        session_id = Some(
+            crate::utils::session_name::reserve_invocation_session_id(
+                &toolset.session_metadata,
+                &config.initializer,
+                &allocation,
+                record.started_at_ms,
+            )
+            .await
+            .map_err(|error| {
+                ToolInvokeError::Fatal(format!("reserve sub-agent session: {error:#}"))
+            })?,
+        );
+    }
+    let session = toolset.create_session(session_id, parent).await?;
+    if let Some(parent) = parent {
+        let checkpoint = journal
+            .checkpoint(
+                parent,
+                &params.context.call_id,
+                serde_json::json!({"session_id": session.session_id()}),
+            )
+            .await
+            .map_err(|error| {
+                ToolInvokeError::Fatal(format!("persist sub-agent checkpoint: {error:#}"))
+            })?;
+        let id = checkpoint["session_id"]
+            .as_str()
+            .ok_or_else(|| ToolInvokeError::Fatal("invalid sub-agent checkpoint".into()))?;
+        if id != session.session_id() {
+            return toolset.create_session(Some(id.into()), Some(parent)).await;
+        }
+    }
+    Ok(session)
+}
+
+fn remaining_timeout(seconds: Option<u64>, started_at_ms: Option<u64>) -> Option<Duration> {
+    seconds.filter(|seconds| *seconds > 0).map(|seconds| {
+        let elapsed = started_at_ms.map_or(Duration::ZERO, |started| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH + Duration::from_millis(started))
+                .unwrap_or_default()
+        });
+        Duration::from_secs(seconds).saturating_sub(elapsed)
+    })
+}
+
 struct AwaitTurnParams<'a> {
     message: &'a str,
-    timeout_secs: Option<u64>,
+    timeout: Option<Duration>,
     token_budget: Option<u64>,
     cancel: CancellationToken,
 }
@@ -111,7 +217,7 @@ async fn await_prompt_turn(
         },
     );
     tokio::pin!(run_turn);
-    let deadline = invocation_deadline(params.timeout_secs);
+    let deadline = invocation_deadline(params.timeout);
     tokio::pin!(deadline);
 
     let turn = tokio::select! {
@@ -139,9 +245,9 @@ async fn await_prompt_turn(
     turn
 }
 
-async fn invocation_deadline(timeout_secs: Option<u64>) {
-    match timeout_secs.filter(|seconds| *seconds > 0) {
-        Some(seconds) => tokio::time::sleep(Duration::from_secs(seconds)).await,
+async fn invocation_deadline(timeout: Option<Duration>) {
+    match timeout {
+        Some(duration) => tokio::time::sleep(duration).await,
         None => std::future::pending::<()>().await,
     }
 }

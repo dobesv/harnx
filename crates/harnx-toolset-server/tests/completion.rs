@@ -16,6 +16,7 @@ async fn orphaned_child_reply(original_error: Option<&str>) -> Result<()> {
         ExecutionStore::ensure(&async_nats::jetstream::new(harness.client.clone()), 1).await?;
     let call_id = "orphaned-child-call";
     let request = ToolRequest {
+        replay: None,
         call_id: call_id.into(),
         operation_id: call_id.into(),
         tool: "echo".into(),

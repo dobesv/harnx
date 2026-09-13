@@ -498,7 +498,15 @@ impl NatsSession {
     }
 
     async fn append_user_content(&self, content: MessageContent) -> Result<AppendedPrompt> {
-        let user_msg_id = new_client_message_id();
+        if let Some(invocation) = &self.invocation_id {
+            if let Some(prompt) = self.existing_invocation_prompt(invocation).await? {
+                return Ok(prompt);
+            }
+        }
+        let user_msg_id = self
+            .invocation_id
+            .clone()
+            .unwrap_or_else(new_client_message_id);
         let operation = self
             .execution_store
             .session(
@@ -518,8 +526,8 @@ impl NatsSession {
             timestamp: None,
             fence_token: None,
         };
-        let user_msg_seq = log
-            .append_event_async(&user_entry)
+        let user_msg_seq = self
+            .append_prompt_entry(&log, &user_entry, &user_msg_id)
             .await
             .context("failed to append user message to session log")?;
         self.execution_store
@@ -537,6 +545,40 @@ impl NatsSession {
             user_msg_seq,
             events: None,
         })
+    }
+
+    async fn existing_invocation_prompt(&self, invocation: &str) -> Result<Option<AppendedPrompt>> {
+        let Some(operation) = self.execution_store.current(&self.session_id).await? else {
+            return Ok(None);
+        };
+        if operation.reference.execution_id != invocation {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            operation.parent == self.execution_parent,
+            "child session belongs to a different invocation"
+        );
+        if let Some(Some(seq)) = operation.admissions.get(invocation) {
+            return Ok(Some(AppendedPrompt {
+                user_msg_id: invocation.into(),
+                user_msg_seq: *seq,
+                execution_id: operation.reference.execution_id,
+                events: None,
+            }));
+        }
+        Ok(None)
+    }
+
+    async fn append_prompt_entry(
+        &self,
+        log: &NatsSessionLog,
+        entry: &SessionLogEntry,
+        message_id: &str,
+    ) -> Result<u64> {
+        if self.invocation_id.is_none() {
+            return log.append_event_async(entry).await;
+        }
+        append_invocation_prompt(log, entry, message_id).await
     }
 
     async fn publish_activation(
@@ -1742,6 +1784,74 @@ pub async fn send_control_command(
     command: ControlCommand,
 ) -> Result<()> {
     publish_control_command(client, session_id, &command).await
+}
+
+fn invocation_prompt_sequence(entries: &[(u64, SessionLogEntry)], message_id: &str) -> Option<u64> {
+    entries.iter().find_map(|(seq, entry)| match entry {
+        SessionLogEntry::Message { id: Some(id), .. }
+        | SessionLogEntry::SubAgentStarted {
+            invocation_id: Some(id),
+            ..
+        } if id == message_id => Some(*seq),
+        _ => None,
+    })
+}
+
+async fn append_invocation_prompt(
+    log: &NatsSessionLog,
+    entry: &SessionLogEntry,
+    message_id: &str,
+) -> Result<u64> {
+    Ok(append_invocation_entry(log, entry, message_id).await?.0)
+}
+
+pub(crate) async fn append_invocation_entry(
+    log: &NatsSessionLog,
+    entry: &SessionLogEntry,
+    message_id: &str,
+) -> Result<(u64, bool)> {
+    // The reservation and transcript append are separate writes. A replay
+    // after a lost acknowledgement must find the original message, including
+    // after the broker's time-limited publish deduplication window expires.
+    for _ in 0..32 {
+        if let Some(seq) = try_append_invocation_prompt(log, entry, message_id).await? {
+            return Ok(seq);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    anyhow::bail!(
+        "session transcript remained busy while admitting the invocation; retry admission"
+    )
+}
+
+async fn try_append_invocation_prompt(
+    log: &NatsSessionLog,
+    entry: &SessionLogEntry,
+    message_id: &str,
+) -> Result<Option<(u64, bool)>> {
+    let entries = log.load_events_latest_async().await?;
+    if let Some(seq) = invocation_prompt_sequence(&entries, message_id) {
+        return Ok(Some((seq, false)));
+    }
+    let tail = entries.last().map_or(0, |(seq, _)| *seq);
+    match log
+        .append_event_with_expected_last_sequence_and_message_id_async(entry, tail, message_id)
+        .await
+    {
+        Ok(seq) => Ok(Some((seq, true))),
+        Err(error) if is_prompt_append_conflict(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_prompt_append_conflict(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<async_nats::jetstream::context::PublishError>()
+            .is_some_and(|error| {
+                error.kind() == async_nats::jetstream::context::PublishErrorKind::WrongLastSequence
+            })
+    })
 }
 
 #[cfg(test)]
