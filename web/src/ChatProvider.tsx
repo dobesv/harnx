@@ -13,7 +13,7 @@ import { RuntimeSessionSubscriber } from './RuntimeSessionSubscriber';
 import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS } from './harnxCustomEvents';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { INITIAL_SUB_AGENT_NOTES_STATE, reduceSubAgentNotes } from './subAgentNotes';
-import { observedFetch } from './httpClient';
+import { isAbortError, observedFetch } from './httpClient';
 import { connection } from './connection';
 
 export interface ChatProviderProps {
@@ -98,6 +98,23 @@ export interface HarnxHttpAgentOptions {
   onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
 }
 
+const TRANSPORT_ERROR_PATTERN =
+  /Failed to fetch|NetworkError|net::ERR_|connection refused|connection reset|socket|HTTP 5\d\d/i;
+
+function isBenignRunAbort(error: unknown, message: string): boolean {
+  return isAbortError(error) || isAbortError(message);
+}
+
+// Classifies a run failure as a transport (network) problem. Only drives the
+// connection.noteTransientTrouble() telemetry signal — not user-facing error
+// display or RUN_ERROR emission — so matching the pattern against both the
+// Error and the bare message string is intentional and harmless.
+function isTransportFailure(error: unknown, message: string): boolean {
+  if (error instanceof TypeError) return true;
+  if (error instanceof Error && TRANSPORT_ERROR_PATTERN.test(error.message)) return true;
+  return TRANSPORT_ERROR_PATTERN.test(message);
+}
+
 // eslint-disable-next-line react-refresh/only-export-components
 export class HarnxHttpAgent extends HttpAgent {
   private readonly onStatus: (text: string | null) => void;
@@ -147,27 +164,13 @@ export class HarnxHttpAgent extends HttpAgent {
   }
 
   private handleRunFailure(message: string, error?: unknown) {
+    if (isBenignRunAbort(error, message)) {
+      return;
+    }
     this.onSubAgentEvent({ type: 'RUN_ERROR' });
     this.onRunFailedCb(message || 'Failed to send message');
 
-    const isTransportError =
-      error instanceof TypeError ||
-      (error instanceof Error &&
-        (/Failed to fetch/i.test(error.message) ||
-          /NetworkError/i.test(error.message) ||
-          /net::ERR_/i.test(error.message) ||
-          /connection refused/i.test(error.message) ||
-          /connection reset/i.test(error.message) ||
-          /socket/i.test(error.message) ||
-          /HTTP 5\d\d/i.test(error.message))) ||
-      /Failed to fetch/i.test(message) ||
-      /NetworkError/i.test(message) ||
-      /net::ERR_/i.test(message) ||
-      /connection refused/i.test(message) ||
-      /connection reset/i.test(message) ||
-      /HTTP 5\d\d/i.test(message);
-
-    if (isTransportError) {
+    if (isTransportFailure(error, message)) {
       connection.noteTransientTrouble();
     }
   }

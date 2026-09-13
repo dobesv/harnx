@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 
 #[path = "ag_ui_handoff_tests.rs"]
 mod handoff_tests;
+#[path = "ag_ui_lifecycle_tests.rs"]
+mod lifecycle_tests;
 #[path = "ag_ui_remote_follow_tests.rs"]
 mod remote_follow_tests;
 

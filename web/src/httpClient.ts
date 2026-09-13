@@ -20,11 +20,70 @@ export class PermanentError extends Error {
 
 const GET_TIMEOUT_MS = 15000;
 
+const ABORT_ERROR_NAMES = new Set(['AbortError', 'TimeoutError']);
+const BENIGN_ABORT_PATTERNS = [
+  'signal is aborted without reason',
+  'AbortError',
+  'TimeoutError',
+  'Fetch is aborted',
+  'component unmounted',
+  'The operation was aborted',
+  'The user aborted a request',
+];
+
+function isAbortName(name?: string): boolean {
+  return Boolean(name && ABORT_ERROR_NAMES.has(name));
+}
+
+function matchesBenignPattern(message: string): boolean {
+  return BENIGN_ABORT_PATTERNS.some((pattern) => message.includes(pattern));
+}
+
+function extractErrorNameAndMessage(err: unknown): { name?: string; message?: string } {
+  if (typeof err === 'string') {
+    return { message: err };
+  }
+  if (err instanceof Error) {
+    return { name: err.name, message: err.message };
+  }
+  if (err && typeof err === 'object') {
+    const obj = err as Record<string, unknown>;
+    const name = typeof obj.name === 'string' ? obj.name : undefined;
+    const message = typeof obj.message === 'string' ? obj.message : undefined;
+    return { name, message };
+  }
+  return {};
+}
+
+function isRecognizedNetworkError(err: unknown): boolean {
+  if (!err) return true;
+  if (err instanceof TransientError) return true;
+  if (err instanceof PermanentError) return true;
+  return false;
+}
+
 export function isAbortError(err: unknown): boolean {
-  return (
-    (err instanceof Error && err.name === 'AbortError') ||
-    (typeof err === 'object' && err !== null && (err as { name?: string }).name === 'AbortError')
-  );
+  if (isRecognizedNetworkError(err)) {
+    return false;
+  }
+  const { name, message } = extractErrorNameAndMessage(err);
+  if (isAbortName(name)) {
+    return true;
+  }
+  if (!message) {
+    return false;
+  }
+  return matchesBenignPattern(message);
+}
+
+function toFetchFailureError(isTimeout: boolean, operationSignal: AbortSignal, err: unknown): Error {
+  if (isTimeout) {
+    return new TransientError('Request timed out', { cause: err });
+  }
+  if (operationSignal.aborted) {
+    return (operationSignal.reason ?? new DOMException('The operation was aborted.', 'AbortError')) as Error;
+  }
+  return new TransientError('Network connection failed', { cause: err });
 }
 
 async function fetchWithTimeout(
@@ -56,18 +115,78 @@ async function fetchWithTimeout(
   try {
     return await fetch(input, { ...init, signal: controller.signal });
   } catch (err) {
-    if (isTimeout) {
-      throw new TransientError('Request timed out', { cause: err });
-    }
-    if (operationSignal.aborted) {
-      throw operationSignal.reason ?? new DOMException('The operation was aborted.', 'AbortError');
-    }
-    // Fetch rejection (TypeError / connection refused / DNS failure / etc.)
-    throw new TransientError('Network connection failed', { cause: err });
+    throw toFetchFailureError(isTimeout, operationSignal, err);
   } finally {
     if (timeoutId !== null) clearTimeout(timeoutId);
     operationSignal.removeEventListener('abort', abortHandler);
   }
+}
+
+function extractBodyErrorString(body: any): string | undefined {
+  if (typeof body?.error === 'string') return body.error;
+  if (typeof body?.error?.message === 'string') return body.error.message;
+  return undefined;
+}
+
+async function extractHttpErrorDetail(res: Response): Promise<string> {
+  try {
+    const body = (await res.json()) as any;
+    const detail = extractBodyErrorString(body);
+    if (detail) return detail;
+  } catch {
+    // Keep status text if body not JSON
+  }
+  return res.statusText;
+}
+
+async function validateHttpStatus(res: Response): Promise<void> {
+  if (res.status >= 500) {
+    throw new TransientError(`Server error (${res.status}): ${res.statusText}`);
+  }
+  if (!res.ok) {
+    const detail = await extractHttpErrorDetail(res);
+    throw new PermanentError(`HTTP error (${res.status}): ${detail}`);
+  }
+}
+
+function rethrowRecognizedHttpError(err: unknown): void {
+  if (err instanceof TransientError) throw err;
+  if (err instanceof PermanentError) throw err;
+}
+
+function defaultJsonParse<T>(res: Response): Promise<T> {
+  return res.json() as Promise<T>;
+}
+
+async function parseResponseBody<T>(
+  res: Response,
+  parse?: (res: Response) => Promise<T>
+): Promise<T> {
+  try {
+    if (parse) {
+      return await parse(res);
+    }
+    return await defaultJsonParse<T>(res);
+  } catch (parseErr) {
+    rethrowRecognizedHttpError(parseErr);
+    throw new PermanentError('Malformed JSON in response', { cause: parseErr });
+  }
+}
+
+async function handleRetryOrRethrow(
+  err: unknown,
+  operationSignal: AbortSignal
+): Promise<() => void> {
+  if (operationSignal.aborted || isAbortError(err)) {
+    throw err;
+  }
+  if (err instanceof PermanentError) {
+    throw err;
+  }
+  if (err instanceof TransientError) {
+    return await connection.waitForRetry(operationSignal);
+  }
+  throw err;
 }
 
 export type FetchJsonOptions<T> = {
@@ -75,90 +194,84 @@ export type FetchJsonOptions<T> = {
   parse?: (res: Response) => Promise<T>;
 };
 
+function createCallerAbortError(callerSignal?: AbortSignal): DOMException {
+  return callerSignal?.reason ?? new DOMException('The operation was aborted.', 'AbortError');
+}
+
+function checkOperationAborted(operationSignal: AbortSignal): void {
+  if (operationSignal.aborted) {
+    throw operationSignal.reason ?? new DOMException('Aborted', 'AbortError');
+  }
+}
+
+async function executeAttempt<T>(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+  options: FetchJsonOptions<T> | undefined,
+  operationSignal: AbortSignal
+): Promise<T> {
+  checkOperationAborted(operationSignal);
+  const res = await fetchWithTimeout(input, init, GET_TIMEOUT_MS, operationSignal);
+  await validateHttpStatus(res);
+  const data = await parseResponseBody<T>(res, options?.parse);
+  connection.noteSuccess();
+  return data;
+}
+
+function createOperationSignal(callerSignal?: AbortSignal): {
+  operationSignal: AbortSignal;
+  cleanup: () => void;
+} {
+  if (callerSignal?.aborted) {
+    throw createCallerAbortError(callerSignal);
+  }
+  const operationController = new AbortController();
+  const onCallerAbort = () => operationController.abort(callerSignal?.reason);
+  callerSignal?.addEventListener('abort', onCallerAbort);
+  return {
+    operationSignal: operationController.signal,
+    cleanup: () => callerSignal?.removeEventListener('abort', onCallerAbort),
+  };
+}
+
 export async function fetchJsonWithRetry<T>(
   input: RequestInfo | URL,
   init?: RequestInit,
   options?: FetchJsonOptions<T>
 ): Promise<T> {
-  const callerSignal = options?.signal;
-
-  if (callerSignal?.aborted) {
-    throw callerSignal.reason ?? new DOMException('The operation was aborted.', 'AbortError');
-  }
-
-  // Operation-specific AbortController linked to caller's signal
-  const operationController = new AbortController();
-  const onCallerAbort = () => operationController.abort();
-  callerSignal?.addEventListener('abort', onCallerAbort);
-  const operationSignal = operationController.signal;
-
+  const { operationSignal, cleanup } = createOperationSignal(options?.signal);
   let unregister: (() => void) | undefined;
 
   try {
     // eslint-disable-next-line no-constant-condition
     while (true) {
-      if (operationSignal.aborted) {
-        throw operationSignal.reason ?? new DOMException('Aborted', 'AbortError');
-      }
-
       try {
-        const res = await fetchWithTimeout(input, init, GET_TIMEOUT_MS, operationSignal);
-
-        // Status classification BEFORE body parse
-        if (res.status >= 500) {
-          throw new TransientError(`Server error (${res.status}): ${res.statusText}`);
-        }
-        if (!res.ok) {
-          // Permanent error (4xx): try to get detail from body
-          let detail = res.statusText;
-          try {
-            const body = await res.json() as any;
-            detail = typeof body.error === 'string' ? body.error : body.error?.message || detail;
-          } catch {
-            // Keep status text if body not JSON
-          }
-          throw new PermanentError(`HTTP error (${res.status}): ${detail}`);
-        }
-
-        // 2xx response: parse JSON or custom parse
-        let data: T;
-        try {
-          data = options?.parse ? await options.parse(res) : await res.json() as T;
-        } catch (parseErr) {
-          if (parseErr instanceof TransientError || parseErr instanceof PermanentError) {
-            throw parseErr;
-          }
-          throw new PermanentError('Malformed JSON in response', { cause: parseErr });
-        }
-
-        connection.noteSuccess();
-        return data;
+        return await executeAttempt<T>(input, init, options, operationSignal);
       } catch (err) {
-        // Caller abort: rethrow immediately
-        if (operationSignal.aborted || isAbortError(err)) {
-          throw err;
-        }
-
-        // Permanent error: reject immediately (no retry)
-        if (err instanceof PermanentError) {
-          throw err;
-        }
-
-        // Transient error: await backoff and continue loop
-        if (err instanceof TransientError) {
-          unregister = await connection.waitForRetry(operationSignal);
-          // Loop continues to next attempt
-          continue;
-        }
-
-        // Any unexpected error is rethrown
-        throw err;
+        unregister = await handleRetryOrRethrow(err, operationSignal);
       }
     }
   } finally {
     unregister?.();
-    callerSignal?.removeEventListener('abort', onCallerAbort);
+    cleanup();
   }
+}
+
+function notifyResponseStatus(res: Response): void {
+  if (res.status >= 500) {
+    connection.noteTransientTrouble();
+    return;
+  }
+  if (res.ok) {
+    connection.noteSuccess();
+  }
+}
+
+function handleObservedFetchError(err: unknown): never {
+  if (!isAbortError(err)) {
+    connection.noteTransientTrouble();
+  }
+  throw err;
 }
 
 export async function observedFetch(
@@ -167,22 +280,9 @@ export async function observedFetch(
 ): Promise<Response> {
   try {
     const res = await fetch(input, init);
-
-    // Transport succeeded; classify based on status
-    if (res.status >= 500) {
-      connection.noteTransientTrouble();
-    } else if (res.ok) {
-      connection.noteSuccess();
-    }
-    // Return response unchanged for caller to handle
+    notifyResponseStatus(res);
     return res;
   } catch (err) {
-    // Caller abort: rethrow as-is
-    if (isAbortError(err)) {
-      throw err;
-    }
-    // Network error: note trouble and rethrow original error unchanged
-    connection.noteTransientTrouble();
-    throw err;
+    handleObservedFetchError(err);
   }
 }

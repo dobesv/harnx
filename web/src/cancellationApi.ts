@@ -2,11 +2,21 @@ import type { JsonRpcResponse, SessionControlState, CancelResult } from './types
 import { observedFetch } from './httpClient';
 
 const API_BASE = '/v1';
+export const CANCELLATION_TIMEOUT_MS = 15000;
 
-export async function sessionControl(agent: string, session: string): Promise<SessionControlState> {
+function createTimeoutSignal(timeoutMs: number, callerSignal?: AbortSignal): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  return callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
+}
+
+export async function sessionControl(
+  agent: string,
+  session: string,
+  options?: { signal?: AbortSignal }
+): Promise<SessionControlState> {
   const response = await observedFetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
     method: 'POST',
-    signal: AbortSignal.timeout(2000),
+    signal: createTimeoutSignal(CANCELLATION_TIMEOUT_MS, options?.signal),
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 'control', method: 'session/get' }),
   });
@@ -15,10 +25,42 @@ export async function sessionControl(agent: string, session: string): Promise<Se
   return body.result;
 }
 
-export async function cancel(agent: string, session: string, expectedExecutionId?: string): Promise<CancelResult> {
+async function safeParseJson<T>(res: Response): Promise<JsonRpcResponse<T> | undefined> {
+  try {
+    return (await res.json()) as JsonRpcResponse<T>;
+  } catch {
+    return undefined;
+  }
+}
+
+function handleRpcError(error: { code: number | string; message?: string }): CancelResult {
+  if (error.code === -32002) {
+    return { cancelled: false, disposition: 'idle' };
+  }
+  const message = error.message || error.code;
+  throw new Error(`RPC Error: ${message}`);
+}
+
+async function parseCancelResult(res: Response): Promise<CancelResult> {
+  const json = await safeParseJson<CancelResult>(res);
+  if (json && json.error) {
+    return handleRpcError(json.error);
+  }
+  if (!res.ok) {
+    throw new Error(`RPC call failed with HTTP ${res.status}`);
+  }
+  return json?.result as CancelResult;
+}
+
+export async function cancel(
+  agent: string,
+  session: string,
+  expectedExecutionId?: string,
+  options?: { signal?: AbortSignal }
+): Promise<CancelResult> {
   const res = await observedFetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
     method: 'POST',
-    signal: AbortSignal.timeout(2000),
+    signal: createTimeoutSignal(CANCELLATION_TIMEOUT_MS, options?.signal),
     headers: {
       'Content-Type': 'application/json',
     },
@@ -30,32 +72,18 @@ export async function cancel(agent: string, session: string, expectedExecutionId
     })
   });
 
-  // Parse the JSON-RPC body before checking res.ok so older servers can report
-  // an idle-session cancellation as a successful no-op via error code -32002.
-  let json: JsonRpcResponse<CancelResult> | undefined;
-  try {
-    json = await res.json() as JsonRpcResponse<CancelResult>;
-  } catch {
-    json = undefined;
-  }
-
-  if (json?.error) {
-    if (json.error.code === -32002) {
-      // Cancelling an already-idle session is a benign no-op.
-      return { cancelled: false, disposition: 'idle' };
-    }
-    throw new Error(`RPC Error: ${json.error.message || json.error.code}`);
-  }
-
-  if (!res.ok) throw new Error(`RPC call failed with HTTP ${res.status}`);
-
-  return json?.result as CancelResult;
+  return parseCancelResult(res);
 }
 
-export async function abandonCancellation(agent: string, session: string, expectedExecutionId: string): Promise<CancelResult> {
+export async function abandonCancellation(
+  agent: string,
+  session: string,
+  expectedExecutionId: string,
+  options?: { signal?: AbortSignal }
+): Promise<CancelResult> {
   const res = await observedFetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
     method: 'POST',
-    signal: AbortSignal.timeout(2000),
+    signal: createTimeoutSignal(CANCELLATION_TIMEOUT_MS, options?.signal),
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       jsonrpc: '2.0',

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { fetchJsonWithRetry, observedFetch } from '../httpClient';
+import { fetchJsonWithRetry, isAbortError, observedFetch, PermanentError, TransientError } from '../httpClient';
 import * as connectionModule from '../connection';
 
 const fetchMock = vi.fn();
@@ -279,6 +279,60 @@ describe('httpClient.ts', () => {
       });
       // AbortError should NOT trigger noteTransientTrouble
       expect(connection.noteTransientTrouble.mock.calls.length).toBe(0);
+    });
+
+    it('rethrows TimeoutError without noting transient trouble (#1861)', async () => {
+      const connection = (connectionModule as any).connection;
+      const timeoutError = new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+      fetchMock.mockRejectedValueOnce(timeoutError);
+
+      await expect(observedFetch('/test')).rejects.toMatchObject({
+        name: 'TimeoutError',
+      });
+      // TimeoutError should NOT trigger noteTransientTrouble
+      expect(connection.noteTransientTrouble.mock.calls.length).toBe(0);
+    });
+
+    it('rethrows "signal is aborted without reason" without noting transient trouble (#1838)', async () => {
+      const connection = (connectionModule as any).connection;
+      const abortError = new DOMException('signal is aborted without reason', 'AbortError');
+      fetchMock.mockRejectedValueOnce(abortError);
+
+      await expect(observedFetch('/test')).rejects.toThrow('signal is aborted without reason');
+      expect(connection.noteTransientTrouble.mock.calls.length).toBe(0);
+    });
+  });
+
+  describe('isAbortError', () => {
+    it('recognizes standard AbortError DOMException', () => {
+      expect(isAbortError(new DOMException('The operation was aborted.', 'AbortError'))).toBe(true);
+    });
+
+    it('recognizes TimeoutError DOMException from AbortSignal.timeout (#1861)', () => {
+      expect(isAbortError(new DOMException('The operation was aborted due to timeout', 'TimeoutError'))).toBe(true);
+    });
+
+    it('recognizes "signal is aborted without reason" (#1838)', () => {
+      expect(isAbortError(new DOMException('signal is aborted without reason', 'AbortError'))).toBe(true);
+      expect(isAbortError(new Error('signal is aborted without reason'))).toBe(true);
+      expect(isAbortError('AbortError: signal is aborted without reason')).toBe(true);
+      expect(isAbortError({ message: 'signal is aborted without reason' })).toBe(true);
+    });
+
+    it('recognizes other benign abort messages', () => {
+      expect(isAbortError(new Error('Fetch is aborted'))).toBe(true);
+      expect(isAbortError(new Error('component unmounted'))).toBe(true);
+      expect(isAbortError({ name: 'TimeoutError' })).toBe(true);
+      expect(isAbortError({ name: 'AbortError' })).toBe(true);
+    });
+
+    it('does not classify network or retry errors as abort errors', () => {
+      expect(isAbortError(new TypeError('Failed to fetch'))).toBe(false);
+      expect(isAbortError(new Error('Network connection failed'))).toBe(false);
+      expect(isAbortError(new TransientError('Request timed out'))).toBe(false);
+      expect(isAbortError(new PermanentError('HTTP error (404): Not Found'))).toBe(false);
+      expect(isAbortError(null)).toBe(false);
+      expect(isAbortError(undefined)).toBe(false);
     });
   });
 });

@@ -16,7 +16,7 @@ const SyntaxHighlighter = makeLightAsyncSyntaxHighlighter({ useInlineStyles: fal
 import { ToolCallCard } from './ToolCallCard';
 import { useAgUiInterrupts } from '@assistant-ui/react-ag-ui';
 import { ChatProvider, attachmentToMessageParts } from './ChatProvider';
-import { PendingContext } from './PendingContext';
+import { PendingContext, type HydratedPendingApproval } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { SubAgentSessionNotes } from './SubAgentSessionNotes';
@@ -28,6 +28,7 @@ import { AttachIcon, SendIcon } from './icons';
 import { AgentDropdown, SessionDropdown, AgentSessionMenu } from './composer/AgentSessionMenu';
 import { ConnectionBanner } from './ConnectionBanner';
 import { useConnectionStatus, useRetryCountdownSeconds } from './useConnectionStatus';
+import { isAbortError } from './httpClient';
 import './chat.css';
 
 // Activate a click-like handler from keyboard (Enter / Space) so div-based
@@ -140,6 +141,62 @@ const MyAttachment = () => (
   </AttachmentPrimitive.Root>
 );
 
+async function resolveOutofBandAttachmentRefs(
+  attachments: readonly Attachment[],
+  agentName: string,
+  sessionId: string
+): Promise<string[]> {
+  const attachmentRefs: string[] = [];
+  for (const att of attachments) {
+    const parts = attachmentToMessageParts(att);
+    let hasCid = false;
+    for (const p of parts) {
+      if (p.type === 'image' && typeof p.image === 'string') {
+        attachmentRefs.push(p.image);
+        hasCid = true;
+      } else if (p.type === 'file' && typeof p.data === 'string') {
+        attachmentRefs.push(p.data);
+        hasCid = true;
+      }
+    }
+
+    if (!hasCid && att.file) {
+      const refs = await uploadAttachment(agentName, sessionId, att.file as File);
+      attachmentRefs.push(...refs);
+    }
+  }
+  return attachmentRefs;
+}
+
+function restoreComposerAfterSendFailure({
+  err,
+  setErrorText,
+  composerRuntime,
+  savedText,
+  savedAttachments,
+  setIsSending,
+  focusAndResize,
+}: {
+  err: unknown;
+  setErrorText: (text: string | null) => void;
+  composerRuntime: any;
+  savedText: string;
+  savedAttachments: readonly Attachment[];
+  setIsSending: (sending: boolean) => void;
+  focusAndResize: () => void;
+}): void {
+  if (!isAbortError(err)) {
+    console.error('Failed to send prompt or upload attachments out of band', err);
+    setErrorText(err instanceof Error ? err.message : String(err));
+  }
+  composerRuntime.setText(savedText);
+  savedAttachments.forEach((att: Attachment) => {
+    if (att.file) void composerRuntime.addAttachment(att.file);
+  });
+  setIsSending(false);
+  focusAndResize();
+}
+
 export const MyComposer = ({
   agentName,
   sessionId,
@@ -250,41 +307,26 @@ export const MyComposer = ({
       // avoids composerRuntime.send(), we must upload fresh attachments ourselves.
       // Attachments retained from a previous send already have CIDs in .content.
       const doSend = async () => {
-        const attachmentRefs: string[] = [];
-        for (const att of savedAttachments) {
-          const parts = attachmentToMessageParts(att);
-          let hasCid = false;
-          for (const p of parts) {
-            if (p.type === 'image' && typeof p.image === 'string') {
-              attachmentRefs.push(p.image);
-              hasCid = true;
-            } else if (p.type === 'file' && typeof p.data === 'string') {
-              attachmentRefs.push(p.data);
-              hasCid = true;
-            }
-          }
-
-          if (!hasCid && att.file) {
-            const refs = await uploadAttachment(agentName, sessionId, att.file as File);
-            attachmentRefs.push(...refs);
-          }
-        }
-
+        const attachmentRefs = savedAttachments.length === 0
+          ? []
+          : await resolveOutofBandAttachmentRefs(savedAttachments, agentName, sessionId);
         await sendPrompt(agentName, sessionId, { text, attachmentRefs });
       };
 
       doSend().catch(err => {
-        console.error('Failed to send prompt or upload attachments out of band', err);
-        setErrorText(err instanceof Error ? err.message : String(err));
-        // Restore input
-        composerRuntime.setText(savedText);
-        savedAttachments.forEach((att: Attachment) => {
-          if (att.file) void composerRuntime.addAttachment(att.file);
-        });
-        setIsSending(false);
-        requestAnimationFrame(() => {
-          textareaRef.current?.focus();
-          resizeTextarea(textareaRef.current);
+        restoreComposerAfterSendFailure({
+          err,
+          setErrorText,
+          composerRuntime,
+          savedText,
+          savedAttachments,
+          setIsSending,
+          focusAndResize: () => {
+            requestAnimationFrame(() => {
+              textareaRef.current?.focus();
+              resizeTextarea(textareaRef.current);
+            });
+          },
         });
       });
     }
@@ -408,6 +450,66 @@ export const SendErrorIndicator = () => {
   );
 };
 
+function canAddInterrupt(
+  toolCallId: string | undefined,
+  seen: Set<string>,
+  resolved: Set<string>
+): toolCallId is string {
+  if (!toolCallId) return false;
+  if (seen.has(toolCallId)) return false;
+  if (resolved.has(toolCallId)) return false;
+  return true;
+}
+
+function getInterruptSummary(i: { toolCallId: string; message?: string; reason?: string }): string {
+  return i.message || i.reason || i.toolCallId;
+}
+
+function appendHydratedApprovals(
+  items: Array<{ toolCallId: string; summary: string }>,
+  seen: Set<string>,
+  hydratedApprovals: HydratedPendingApproval[],
+  resolvedToolCallIds: Set<string>
+): void {
+  for (const a of hydratedApprovals) {
+    if (resolvedToolCallIds.has(a.toolCallId)) continue;
+    items.push(a);
+    seen.add(a.toolCallId);
+  }
+}
+
+function appendLiveInterrupts(
+  items: Array<{ toolCallId: string; summary: string }>,
+  seen: Set<string>,
+  interrupts: ReadonlyArray<{ toolCallId?: string; message?: string; reason?: string }>,
+  resolvedToolCallIds: Set<string>
+): void {
+  for (const i of interrupts) {
+    if (!canAddInterrupt(i.toolCallId, seen, resolvedToolCallIds)) continue;
+    items.push({ toolCallId: i.toolCallId, summary: getInterruptSummary(i as any) });
+    seen.add(i.toolCallId);
+  }
+}
+
+function collectPendingInterruptItems(
+  hydratedApprovals: HydratedPendingApproval[],
+  interrupts: ReadonlyArray<{ toolCallId?: string; message?: string; reason?: string }>,
+  resolvedToolCallIds: Set<string>
+): Array<{ toolCallId: string; summary: string }> {
+  const items: Array<{ toolCallId: string; summary: string }> = [];
+  const seen = new Set<string>();
+  appendHydratedApprovals(items, seen, hydratedApprovals, resolvedToolCallIds);
+  appendLiveInterrupts(items, seen, interrupts, resolvedToolCallIds);
+  return items;
+}
+
+function handleHitlDecisionError(err: unknown, setErrorText: (text: string | null) => void): void {
+  if (!isAbortError(err)) {
+    console.error('Failed to submit decision', err);
+    setErrorText(err instanceof Error ? err.message : String(err));
+  }
+}
+
 export const BatchInterruptUI = ({ agentName, sessionId }: { agentName: string; sessionId: string }) => {
   const interrupts = useAgUiInterrupts();
   const { setStatusText, setErrorText, hydratedApprovals, removeHydratedApproval } = useContext(PendingContext);
@@ -415,26 +517,10 @@ export const BatchInterruptUI = ({ agentName, sessionId }: { agentName: string; 
   const [note, setNote] = useState('');
   const [resolvedToolCallIds, setResolvedToolCallIds] = useState<Set<string>>(() => new Set());
 
-  const pendingItems = useMemo(() => {
-    const items: Array<{ toolCallId: string; summary: string }> = [];
-    const seen = new Set<string>();
-
-    for (const a of hydratedApprovals) {
-      if (!resolvedToolCallIds.has(a.toolCallId)) {
-        items.push(a);
-        seen.add(a.toolCallId);
-      }
-    }
-
-    for (const i of interrupts) {
-      if (i.toolCallId && !seen.has(i.toolCallId) && !resolvedToolCallIds.has(i.toolCallId)) {
-        items.push({ toolCallId: i.toolCallId, summary: i.message || i.reason || i.toolCallId });
-        seen.add(i.toolCallId);
-      }
-    }
-
-    return items;
-  }, [hydratedApprovals, interrupts, resolvedToolCallIds]);
+  const pendingItems = useMemo(
+    () => collectPendingInterruptItems(hydratedApprovals, interrupts, resolvedToolCallIds),
+    [hydratedApprovals, interrupts, resolvedToolCallIds]
+  );
 
   if (pendingItems.length === 0) return null;
 
@@ -456,8 +542,7 @@ export const BatchInterruptUI = ({ agentName, sessionId }: { agentName: string; 
       setResolvedToolCallIds((prev) => new Set(prev).add(currentItem.toolCallId));
       setNote('');
     } catch (err) {
-      console.error('Failed to submit decision', err);
-      setErrorText(err instanceof Error ? err.message : String(err));
+      handleHitlDecisionError(err, setErrorText);
     } finally {
       setSubmitting(false);
     }

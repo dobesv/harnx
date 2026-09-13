@@ -196,6 +196,34 @@ This implementation deliberately diverges from generic AG-UI/assistant-ui standa
   authoritative snapshot is hydration, not a new prompt. There is no general
   request-version or sequence reconciliation protocol.
 
+### Client Lifecycle Verifier Constraints
+
+The `@ag-ui/client` verify layer enforces strict lifecycle pairing: every
+`TEXT_MESSAGE_END`/`TOOL_CALL_END`/`STEP_FINISHED` requires a matching `START`
+on that subscriber's SSE stream, and `RUN_FINISHED`/`RUN_ERROR` must not fire
+while any text/tool/step/thinking segment is open. A `MESSAGES_SNAPSHOT` hydrates
+message content but does **not** update the verifier's active-lifecycle sets.
+
+This has significant implications for attach-mid-run paths (local join and
+remote-follow):
+
+- **Per-subscriber guard required:** Each new SSE subscriber needs its own
+  `LiveStreamGuard` (`ag_ui_lifecycle.rs`) to synthesize missing opens before
+  unmatched ends and to finalize open lifecycles before terminal frames.
+- **Latch before terminal:** `RUN_FINISHED`/`RUN_ERROR` must be preceded by
+  synthesized closes for any lifecycle segments still open in that subscriber's
+  guard (text message, step, tool call started on this stream, thinking).
+- **Messages snapshot resets guard:** When a live `MESSAGES_SNAPSHOT` replaces
+  a lagged broadcast stream, the guard must finalize any open lifecycles first
+  so subsequent END events don't appear orphaned.
+- **No frame drops:** Lifecycle frames are ordered; dropping an END without its
+  START invalidates every later frame. Remote-follow uses awaited backpressured
+  sends instead of `try_send`-and-drop.
+
+See `ag_ui_lifecycle.rs` for the guard implementation and
+`ag_ui_remote_follow.rs` for remote-follow integration. Tests in
+`ag_ui_lifecycle_tests.rs` verify strict verifier invariants.
+
 ### Phase B Scope
 
 Cross-process live synchronization and durable session persistence use NATS.

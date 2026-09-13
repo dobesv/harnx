@@ -53,3 +53,163 @@ async fn completed_remote_path_orders_boundary_before_hydrated_handoff() {
     assert_eq!(handoff["value"]["handoff_tool_call_id"], "call-remote");
     assert_eq!(handoff["value"]["after_seq"], 1);
 }
+
+fn assert_strict_lifecycle_valid(events: &[serde_json::Value]) {
+    use std::collections::HashSet;
+
+    let mut text = HashSet::new();
+    let mut tools = HashSet::new();
+    let mut steps = HashSet::new();
+    let mut thinking = false;
+    let mut thinking_text = false;
+
+    for event in events {
+        match event["type"].as_str().expect("event type") {
+            "TEXT_MESSAGE_START" => {
+                text.insert(event["messageId"].as_str().expect("message id").to_string());
+            }
+            "TEXT_MESSAGE_END" => assert!(
+                text.remove(event["messageId"].as_str().expect("message id")),
+                "orphan text end: {event:?}"
+            ),
+            "TOOL_CALL_START" => {
+                tools.insert(
+                    event["toolCallId"]
+                        .as_str()
+                        .expect("tool call id")
+                        .to_string(),
+                );
+            }
+            "TOOL_CALL_END" => assert!(
+                tools.remove(event["toolCallId"].as_str().expect("tool call id")),
+                "orphan tool end: {event:?}"
+            ),
+            "STEP_STARTED" => {
+                steps.insert(event["stepName"].as_str().expect("step name").to_string());
+            }
+            "STEP_FINISHED" => assert!(
+                steps.remove(event["stepName"].as_str().expect("step name")),
+                "orphan step finish: {event:?}"
+            ),
+            "THINKING_START" => thinking = true,
+            "THINKING_TEXT_MESSAGE_START" => {
+                assert!(thinking, "thinking text opened outside thinking segment");
+                thinking_text = true;
+            }
+            "THINKING_TEXT_MESSAGE_END" => {
+                assert!(thinking_text, "orphan thinking text end");
+                thinking_text = false;
+            }
+            "THINKING_END" => {
+                assert!(thinking, "orphan thinking end");
+                assert!(!thinking_text, "thinking ended before thinking text");
+                thinking = false;
+            }
+            "RUN_FINISHED" | "RUN_ERROR" => {
+                assert!(text.is_empty(), "active text at terminal: {text:?}");
+                assert!(tools.is_empty(), "active tools at terminal: {tools:?}");
+                assert!(steps.is_empty(), "active steps at terminal: {steps:?}");
+                assert!(!thinking_text, "active thinking text at terminal");
+                assert!(!thinking, "active thinking at terminal");
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn remote_attach_suppresses_completed_tool_tail_without_forwarded_start() {
+    use harnx_core::event::{AgentEvent, ToolEvent};
+
+    let thread_id = Uuid::new_v4().to_string();
+    let run_id = Uuid::new_v4().to_string();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let mut forwarder = crate::ag_ui_remote_follow::AdvisoryForwarder::new(tx);
+
+    assert!(
+        forwarder
+            .forward_agent_event(AgentEvent::Tool(ToolEvent::Completed {
+                id: "chatcmpl-tool-late".to_string(),
+                output: serde_json::json!("done"),
+                markdown: None,
+            }))
+            .await
+    );
+    assert!(forwarder.finalize().await);
+    drop(forwarder);
+
+    let mut chunks = vec![Bytes::from(frame_run_boundary_event(
+        "RUN_STARTED",
+        &thread_id,
+        &run_id,
+    ))];
+    chunks.extend(
+        tokio_stream::StreamExt::collect::<Vec<_>>(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await,
+    );
+    chunks.push(Bytes::from(frame_run_boundary_event(
+        "RUN_FINISHED",
+        &thread_id,
+        &run_id,
+    )));
+    let events = decode_sse_bytes_chunks(chunks);
+
+    assert!(
+        !events.iter().any(|event| matches!(
+            event["type"].as_str(),
+            Some("TOOL_CALL_END" | "TOOL_CALL_RESULT")
+        )),
+        "snapshot-unknown tool tail must be suppressed: {events:?}"
+    );
+    assert_strict_lifecycle_valid(&events);
+}
+
+#[tokio::test]
+async fn remote_poll_terminal_closes_text_when_final_advisory_is_missing() {
+    use harnx_core::event::{AgentEvent, ContentBlock, ModelEvent};
+
+    let thread_id = Uuid::new_v4().to_string();
+    let run_id = Uuid::new_v4().to_string();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let mut forwarder = crate::ag_ui_remote_follow::AdvisoryForwarder::new(tx);
+
+    assert!(
+        forwarder
+            .forward_agent_event(AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text("partial".to_string())],
+            }))
+            .await
+    );
+    assert!(forwarder.finalize().await);
+    drop(forwarder);
+
+    let mut chunks = vec![Bytes::from(frame_run_boundary_event(
+        "RUN_STARTED",
+        &thread_id,
+        &run_id,
+    ))];
+    chunks.extend(
+        tokio_stream::StreamExt::collect::<Vec<_>>(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await,
+    );
+    chunks.push(Bytes::from(frame_run_boundary_event(
+        "RUN_FINISHED",
+        &thread_id,
+        &run_id,
+    )));
+    let events = decode_sse_bytes_chunks(chunks);
+    let text_end = events
+        .iter()
+        .position(|event| event["type"] == "TEXT_MESSAGE_END")
+        .expect("terminal finalization must close text");
+    let run_finished = events
+        .iter()
+        .position(|event| event["type"] == "RUN_FINISHED")
+        .expect("run finished");
+
+    assert!(
+        text_end < run_finished,
+        "text must close before run terminal"
+    );
+    assert_strict_lifecycle_valid(&events);
+}

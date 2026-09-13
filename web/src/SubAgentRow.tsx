@@ -1,4 +1,5 @@
 import { cancel, sessionControl } from './api';
+import { isAbortError } from './httpClient';
 import { useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { SubAgentNote } from './subAgentNotes';
@@ -39,6 +40,40 @@ function formatTokens(value: number) {
   return value.toLocaleString();
 }
 
+function deriveSubAgentStatus(
+  executionState: string | undefined,
+  cancellationDisposition: string | undefined
+): { status?: SubAgentNote['status']; recordContact?: boolean } {
+  if (executionState === 'completed') return { status: 'done' };
+  if (executionState === 'cancelled' || cancellationDisposition === 'cancelled') {
+    return { status: 'cancelled' };
+  }
+  if (cancellationDisposition === 'unconfirmed') return { status: 'unconfirmed' };
+  if (cancellationDisposition && cancellationDisposition !== 'idle') {
+    return { status: 'cancelling', recordContact: true };
+  }
+  return {};
+}
+
+function handleSubAgentRefreshFailure({
+  err,
+  lastContact,
+  clearActiveExecution,
+  markUnconfirmed,
+}: {
+  err: unknown;
+  lastContact: number | null;
+  clearActiveExecution: () => void;
+  markUnconfirmed: () => void;
+}): void {
+  if (!isAbortError(err)) {
+    clearActiveExecution();
+  }
+  if (lastContact !== null && Date.now() - lastContact >= 5000) {
+    markUnconfirmed();
+  }
+}
+
 export function SubAgentRow({ note, nowMs, onOpen }: { note: SubAgentNote; nowMs: number; onOpen: SubAgentSessionNotesProps['onOpen'] }) {
   const [localStatus, setLocalStatus] = useState<SubAgentNote['status']>();
   const [activeExecution, setActiveExecution] = useState<string>();
@@ -51,33 +86,40 @@ export function SubAgentRow({ note, nowMs, onOpen }: { note: SubAgentNote; nowMs
     if (!note.invocationId || ['done', 'failed', 'cancelled'].includes(note.status)) return;
     let disposed = false;
     let timer: ReturnType<typeof setTimeout>;
+    const controller = new AbortController();
     const refresh = async () => {
       try {
-        const state = await sessionControl(note.agent, note.sessionId);
+        const state = await sessionControl(note.agent, note.sessionId, { signal: controller.signal });
         if (disposed) return;
-        setActiveExecution(['preparing', 'running'].includes(state.execution_state ?? '') ? state.execution_id : undefined);
+        const isRunning = ['preparing', 'running'].includes(state.execution_state ?? '');
+        setActiveExecution(isRunning ? state.execution_id : undefined);
+
         if (state.execution_id === note.invocationId) {
-          const disposition = state.state.cancellation?.disposition;
-          if (state.execution_state === 'completed') setLocalStatus('done');
-          if (state.execution_state === 'cancelled') setLocalStatus('cancelled');
-          if (disposition === 'cancelled') setLocalStatus('cancelled');
-          else if (disposition === 'unconfirmed') setLocalStatus('unconfirmed');
-          else if (disposition && disposition !== 'idle') {
-            lastStatusAt.current = Date.now();
-            setLocalStatus('cancelling');
-          }
+          const derived = deriveSubAgentStatus(
+            state.execution_state,
+            state.state.cancellation?.disposition
+          );
+          if (derived.recordContact) lastStatusAt.current = Date.now();
+          if (derived.status) setLocalStatus(derived.status);
         }
-      } catch {
+      } catch (err) {
         if (!disposed) {
-          setActiveExecution(undefined);
-          const lastContact = lastStatusAt.current ?? requestedAt.current;
-          if (lastContact !== null && Date.now() - lastContact >= 5000) setLocalStatus('unconfirmed');
+          handleSubAgentRefreshFailure({
+            err,
+            lastContact: lastStatusAt.current ?? requestedAt.current,
+            clearActiveExecution: () => setActiveExecution(undefined),
+            markUnconfirmed: () => setLocalStatus('unconfirmed'),
+          });
         }
       }
       if (!disposed) timer = setTimeout(refresh, 500);
     };
     void refresh();
-    return () => { disposed = true; clearTimeout(timer); };
+    return () => {
+      disposed = true;
+      clearTimeout(timer);
+      controller.abort();
+    };
   }, [note.agent, note.sessionId, note.invocationId, note.status]);
   const stop = async () => {
     if (!note.invocationId) return;
@@ -91,7 +133,12 @@ export function SubAgentRow({ note, nowMs, onOpen }: { note: SubAgentNote; nowMs
       if (receipt.disposition === 'idle') { setActiveExecution(undefined); setLocalStatus(undefined); }
       else if (receipt.disposition === 'cancelled') setLocalStatus('cancelled');
       else if (receipt.disposition === 'unconfirmed') setLocalStatus('unconfirmed');
-    } catch (error) { setLocalStatus('unconfirmed'); setError(String(error)); }
+    } catch (error) {
+      setLocalStatus('unconfirmed');
+      if (!isAbortError(error)) {
+        setError(String(error));
+      }
+    }
   };
         const statusLabel = STATUS_LABEL[localStatus ?? note.status];
         const open = () => onOpen(note.agent, note.sessionId);

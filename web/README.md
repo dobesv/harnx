@@ -114,7 +114,17 @@ A 502 Bad Gateway with an HTML error page must retry, not fail permanently as "m
 `cancel()` in `cancellationApi.ts` preserves its original contract:
 - Parses JSON body before checking `res.ok`, so a JSON-RPC error (e.g., `-32002` idle session) can be inspected.
 - Treats `-32002` as benign success (session already idle).
-- Uses a 2-second `AbortSignal.timeout`.
+- Uses a 15-second `AbortSignal.timeout` (`CANCELLATION_TIMEOUT_MS`), aligned with `GET_TIMEOUT_MS` to avoid spurious degradation on slow-but-valid responses.
+
+### Abort vs Timeout Classification
+
+`AbortSignal.timeout()` rejects with a `TimeoutError` DOMException (name `'TimeoutError'`), **not** `AbortError`. The `isAbortError()` predicate in `httpClient.ts` matches both:
+
+- `name === 'AbortError'` — caller-aborted requests, component unmount
+- `name === 'TimeoutError'` — `AbortSignal.timeout()` expiry
+- String messages like `'signal is aborted without reason'` — benign SDK aborts
+
+Timeouts must **not** trigger `noteTransientTrouble()`, or slow-but-valid polls flip the connection banner (historical root cause of #1861). When extending abort predicates, ensure restore/cleanup paths remain unconditional — only gate user-facing error surfacing on the benign check.
 
 ### DEV Test Seam
 

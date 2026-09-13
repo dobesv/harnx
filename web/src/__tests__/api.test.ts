@@ -156,7 +156,7 @@ describe('api.ts', () => {
   });
 
   describe('sessionControl', () => {
-    it('loads durable cancellation state with a two-second request deadline', async () => {
+    it('loads durable cancellation state with a 15-second request deadline', async () => {
       const timeoutSignal = new AbortController().signal;
       const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeoutSignal);
       fetchMock.mockResolvedValueOnce({
@@ -176,7 +176,7 @@ describe('api.ts', () => {
         await expect(sessionControl('agent/A', 'session B')).resolves.toEqual(
           expect.objectContaining({ execution_id: 'exec-1', canPrompt: false }),
         );
-        expect(timeoutSpy).toHaveBeenCalledWith(2000);
+        expect(timeoutSpy).toHaveBeenCalledWith(15000);
         expect(fetchMock).toHaveBeenCalledWith(
           '/v1/agents/agent%2FA/sessions/session%20B',
           expect.objectContaining({
