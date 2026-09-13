@@ -762,7 +762,7 @@ lease, every KV key under `sessions/{id}`, and every attachment object owned by
 the session. The periodic remote-session cleanup uses the same deletion path.
 
 ```bash
-harnx session delete <session_id> --cluster local
+harnx delete session <session_id> --cluster local
 ```
 
 ## Observability
