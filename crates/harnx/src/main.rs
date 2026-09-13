@@ -132,7 +132,7 @@ async fn run_main(cli: Cli) -> Result<Option<anyhow::Error>> {
             | Commands::Delete(_)
             | Commands::List(_)),
         ) => {
-            run_command(command).await?;
+            run_command(command, &cli).await?;
             return Ok(None);
         }
         Some(Commands::Prompt(_)) | None => {}
@@ -148,17 +148,17 @@ async fn run_main(cli: Cli) -> Result<Option<anyhow::Error>> {
     Ok(run(config, cli, text).await.err())
 }
 
-async fn run_command(command: &Commands) -> Result<()> {
+async fn run_command(command: &Commands, cli: &Cli) -> Result<()> {
     match command {
         Commands::Prompt(_) => bail!("prompt commands use the one-shot execution path"),
-        Commands::Info(info_args) => run_info_command(info_args).await,
+        Commands::Info(info_args) => run_info_command(info_args, cli).await,
         Commands::Dump(dump_args) => run_dump_command(dump_args).await,
         Commands::Delete(delete_args) => run_delete_command(delete_args).await,
-        Commands::List(list_args) => run_list_command(list_args).await,
+        Commands::List(list_args) => run_list_command(list_args, cli).await,
     }
 }
 
-async fn run_info_command(info_args: &crate::cli::InfoArgs) -> Result<()> {
+async fn run_info_command(info_args: &crate::cli::InfoArgs, _cli: &Cli) -> Result<()> {
     match &info_args.command {
         InfoSubcommands::Agent { name } => {
             let config = Config::init(WorkingMode::Cmd, true).await?;
@@ -241,7 +241,6 @@ async fn run_dump_session_once(
     agent_name: &str,
     format: &harnx_runtime::config::SessionFormat,
 ) -> Result<()> {
-    use harnx_runtime::config::SessionFormat;
     let config = Config::init(WorkingMode::Cmd, true).await?;
 
     // Validate session exists for this agent
@@ -261,26 +260,7 @@ async fn run_dump_session_once(
     let raw = log.load_events_async().await?;
     let entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)?;
 
-    match format {
-        SessionFormat::Text => {
-            // Build CliAgentEventSink and replay entries
-            use crate::cli_event_sink::CliAgentEventSink;
-            use harnx_core::abort::create_abort_signal;
-            use harnx_render::RenderOptions;
-            let render_options = RenderOptions::default();
-            let abort_signal = create_abort_signal();
-            let sink = Arc::new(CliAgentEventSink::new(false, render_options, abort_signal));
-            harnx_runtime::replay_entries_to_sink(&entries, sink);
-        }
-        SessionFormat::Yaml => {
-            let out = harnx_runtime::config::dump_entries_yaml(entries.iter().map(|(_, e)| e))?;
-            print!("{out}");
-        }
-        SessionFormat::Json => {
-            let out = harnx_runtime::config::dump_entries_jsonl(entries.iter().map(|(_, e)| e))?;
-            print!("{out}");
-        }
-    }
+    replay_dump_entries(&entries, format).await?;
     Ok(())
 }
 
@@ -317,7 +297,11 @@ async fn run_dump_session_follow(
     loop {
         tokio::select! {
             // Advisory wake-up (lossy)
-            _ = stream.next() => {}
+            maybe_event = stream.next() => {
+                if maybe_event.is_none() {
+                    return Ok(()); // subscription closed
+                }
+            }
             // Periodic poll timeout — REQUIRED for entries with no advisory (e.g. TurnEnd)
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(1000)) => {}
             // Clean exit on Ctrl-C
@@ -376,14 +360,22 @@ async fn run_delete_command(delete_args: &crate::cli::DeleteArgs) -> Result<()> 
     }
 }
 
-async fn run_list_command(list_args: &crate::cli::ListArgs) -> Result<()> {
+async fn run_list_command(list_args: &crate::cli::ListArgs, cli: &Cli) -> Result<()> {
     match &list_args.command {
-        ListSubcommands::Sessions => run_list_sessions().await,
+        ListSubcommands::Sessions => run_list_sessions(cli).await,
     }
 }
 
-async fn run_list_sessions() -> Result<()> {
-    let config = Config::init(WorkingMode::Cmd, true).await?;
+async fn run_list_sessions(cli: &Cli) -> Result<()> {
+    let mut config = Config::init(WorkingMode::Cmd, true).await?;
+
+    // Activate remote agent if specified via --agent
+    if let Some(agent_str) = &cli.agent {
+        use harnx_core::agent_ref::AgentRef;
+        if let AgentRef::Remote { agent, cluster } = AgentRef::parse(agent_str.as_str()) {
+            config.set_remote_agent(agent.into_owned(), cluster.into_owned());
+        }
+    }
 
     let target = resolve_list_sessions_target(config.remote_agent.as_ref());
     match target {

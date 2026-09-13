@@ -93,3 +93,53 @@ fn concat_text_blocks(blocks: &[ContentBlock]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harnx_core::message::MessageRole;
+
+    fn text_entry(role: MessageRole, content: &str) -> (u64, SessionLogEntry) {
+        (
+            1,
+            SessionLogEntry::Message {
+                id: None,
+                role,
+                content: harnx_core::message::MessageContent::Text(content.into()),
+                timestamp: None,
+                fence_token: Some(0),
+            },
+        )
+    }
+
+    #[test]
+    fn render_transcript_text_formats_user_message() {
+        let entries = vec![text_entry(MessageRole::User, "Hello")];
+        let output = render_transcript_text(&entries);
+        assert!(output.contains("── user ──"));
+        assert!(output.contains("Hello"));
+    }
+
+    #[test]
+    fn render_transcript_text_formats_assistant_message() {
+        let entries = vec![text_entry(MessageRole::Assistant, "Hi there")];
+        let output = render_transcript_text(&entries);
+        assert!(output.contains("── assistant ──"));
+        assert!(output.contains("Hi there"));
+    }
+
+    #[test]
+    fn render_transcript_text_formats_notice_warning() {
+        let entries = vec![(
+            1,
+            SessionLogEntry::Error {
+                message: "test warning".into(),
+                fence_token: 0,
+                timestamp: None,
+            },
+        )];
+        let output = render_transcript_text(&entries);
+        // Error entries are replayed as notice events
+        assert!(!output.is_empty());
+    }
+}

@@ -61,7 +61,11 @@ pub static COMMANDS: LazyLock<[Command; 49]> = LazyLock::new(|| {
             ".compact session",
             "Compact session messages using configured compaction agent",
         ),
-        Command::new(".info session", "Show session info"),
+        Command::with_usage(
+            ".info session",
+            "[<agent> <id>] [--format text|yaml|json]",
+            "Show session info (metadata)",
+        ),
         Command::with_usage(
             ".dump session",
             "[<agent> <id>] [--format text|yaml|json]",

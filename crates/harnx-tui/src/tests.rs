@@ -9242,3 +9242,49 @@ fn tool_confirmation_json_fence_exceeds_content_backticks() {
     assert!(markdown.starts_with("`````json\n"));
     assert!(markdown.ends_with("\n`````"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dump_session_without_active_session_shows_usage_error() {
+    let config = test_config();
+    let mut harness = TuiTestHarness::with_size(60, 14).await;
+    harness.tui().config = config.clone();
+
+    harness.render();
+    harness.tui().run_command(".dump session").await.unwrap();
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(!rendered.is_empty());
+    assert!(harness.tui().app.detail_view_open);
+    // Verify error message is shown
+    assert!(
+        rendered.contains("Error:") || rendered.contains("Usage:"),
+        "should show error or usage"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn info_session_without_active_session_shows_usage_error() {
+    let config = test_config();
+    let mut harness = TuiTestHarness::with_size(60, 14).await;
+    harness.tui().config = config.clone();
+
+    harness.render();
+    harness.tui().run_command(".info session").await.unwrap();
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(!rendered.is_empty());
+    assert!(harness.tui().app.detail_view_open);
+    // Verify error message is shown
+    assert!(
+        rendered.contains("Error:") || rendered.contains("Usage:"),
+        "should show error or usage"
+    );
+}
