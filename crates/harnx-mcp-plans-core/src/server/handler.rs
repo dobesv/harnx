@@ -41,6 +41,20 @@ fn tool_call_succeeded(result: &Result<CallToolResult, ErrorData>) -> bool {
         .as_ref()
         .is_ok_and(|result| result.is_error != Some(true))
 }
+
+/// Converts a domain/inner error into an isError result.
+///
+/// This wrapper maps `Err(ErrorData)` to `Ok(CallToolResult::error(...))`,
+/// ensuring recoverable failures are returned as `is_error: Some(true)`
+/// instead of JSON-RPC error frames. Used at the `dispatch_call_tool`
+/// boundary for known-tool arms.
+fn domain_result(result: Result<CallToolResult, ErrorData>) -> Result<CallToolResult, ErrorData> {
+    match result {
+        Ok(ok) => Ok(ok),
+        Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e.message)])),
+    }
+}
+
 impl<S: PlanStore + 'static> ServerHandler for PlansServer<S> {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -139,64 +153,154 @@ impl<S: PlanStore + 'static> PlansServer<S> {
     ) -> Result<CallToolResult, ErrorData> {
         match request.name.as_ref() {
             "list_plans" => {
-                let params = parse_arguments::<ListPlansParams>(request.arguments)?;
-                self.handle_list_plans(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<ListPlansParams>(request.arguments)?;
+                        self.handle_list_plans(params).await
+                    }
+                    .await,
+                )
             }
             "add_plan" => {
-                let params = parse_arguments::<AddPlanParams>(request.arguments)?;
-                self.handle_add_plan(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<AddPlanParams>(request.arguments)?;
+                        self.handle_add_plan(params).await
+                    }
+                    .await,
+                )
             }
             "get_plan" => {
-                let params = parse_arguments::<GetPlanParams>(request.arguments)?;
-                self.handle_get_plan(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<GetPlanParams>(request.arguments)?;
+                        self.handle_get_plan(params).await
+                    }
+                    .await,
+                )
             }
             "update_plan" => {
-                let params = parse_arguments::<UpdatePlanParams>(request.arguments)?;
-                self.handle_update_plan(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<UpdatePlanParams>(request.arguments)?;
+                        self.handle_update_plan(params).await
+                    }
+                    .await,
+                )
             }
             "delete_plan" => {
-                let params = parse_arguments::<DeletePlanParams>(request.arguments)?;
-                self.handle_delete_plan(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<DeletePlanParams>(request.arguments)?;
+                        self.handle_delete_plan(params).await
+                    }
+                    .await,
+                )
             }
             "list_tasks" => {
-                let params = parse_arguments::<ListTasksParams>(request.arguments)?;
-                self.handle_list_tasks(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<ListTasksParams>(request.arguments)?;
+                        self.handle_list_tasks(params).await
+                    }
+                    .await,
+                )
             }
             "add_task" => {
-                let params = parse_arguments::<AddTaskParams>(request.arguments)?;
-                self.handle_add_task(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<AddTaskParams>(request.arguments)?;
+                        self.handle_add_task(params).await
+                    }
+                    .await,
+                )
             }
             "get_task" => {
-                let params = parse_arguments::<GetTaskParams>(request.arguments)?;
-                self.handle_get_task(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<GetTaskParams>(request.arguments)?;
+                        self.handle_get_task(params).await
+                    }
+                    .await,
+                )
             }
             "update_task" => {
-                let params = parse_arguments::<UpdateTaskParams>(request.arguments)?;
-                self.handle_update_task(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<UpdateTaskParams>(request.arguments)?;
+                        self.handle_update_task(params).await
+                    }
+                    .await,
+                )
             }
             "delete_task" => {
-                let params = parse_arguments::<DeleteTaskParams>(request.arguments)?;
-                self.handle_delete_task(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<DeleteTaskParams>(request.arguments)?;
+                        self.handle_delete_task(params).await
+                    }
+                    .await,
+                )
             }
             "list_notes" => {
-                let params = parse_arguments::<ListNotesParams>(request.arguments)?;
-                self.handle_list_notes(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<ListNotesParams>(request.arguments)?;
+                        self.handle_list_notes(params).await
+                    }
+                    .await,
+                )
             }
             "add_note" => {
-                let params = parse_arguments::<AddNoteParams>(request.arguments)?;
-                self.handle_add_note(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<AddNoteParams>(request.arguments)?;
+                        self.handle_add_note(params).await
+                    }
+                    .await,
+                )
             }
             "get_note" => {
-                let params = parse_arguments::<GetNoteParams>(request.arguments)?;
-                self.handle_get_note(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<GetNoteParams>(request.arguments)?;
+                        self.handle_get_note(params).await
+                    }
+                    .await,
+                )
             }
             "update_note" => {
-                let params = parse_arguments::<UpdateNoteParams>(request.arguments)?;
-                self.handle_update_note(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<UpdateNoteParams>(request.arguments)?;
+                        self.handle_update_note(params).await
+                    }
+                    .await,
+                )
             }
             "delete_note" => {
-                let params = parse_arguments::<DeleteNoteParams>(request.arguments)?;
-                self.handle_delete_note(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<DeleteNoteParams>(request.arguments)?;
+                        self.handle_delete_note(params).await
+                    }
+                    .await,
+                )
             }
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),
@@ -496,5 +600,748 @@ mod tests {
                 repo: "plans.rs".to_string(),
             })
         );
+    }
+
+    // Wire-level tests proving isError handling at the rmcp client boundary.
+    mod wire_tests {
+        use super::*;
+        use crate::store::StoreError;
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+
+        /// A minimal mock store that can simulate failures for wire-level testing.
+        struct MockStore {
+            plans: Mutex<BTreeMap<String, Plan>>,
+        }
+
+        impl MockStore {
+            fn new() -> Self {
+                Self {
+                    plans: Mutex::new(BTreeMap::new()),
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl PlanStore for MockStore {
+            async fn list_plans(
+                &self,
+                _target: &Target,
+                _page: Option<PageToken>,
+            ) -> Result<Page<Plan>, StoreError> {
+                Ok(Page {
+                    items: vec![],
+                    next: None,
+                })
+            }
+
+            async fn get_plan(&self, _target: &Target, plan: &PlanId) -> Result<Plan, StoreError> {
+                let plans = self.plans.lock().unwrap();
+                plans
+                    .get(plan.as_str())
+                    .cloned()
+                    .ok_or(StoreError::NotFound)
+            }
+
+            async fn add_plan(
+                &self,
+                _target: &Target,
+                new_plan: NewPlan,
+            ) -> Result<Plan, StoreError> {
+                let name = new_plan.id.clone();
+                let plan = Plan {
+                    id: name.clone(),
+                    title: new_plan.title,
+                    summary: new_plan.summary,
+                    author: new_plan.author,
+                    assignee: new_plan.assignee,
+                    executor: new_plan.executor,
+                    git_branch: new_plan.git_branch,
+                    github_owner_repo: new_plan.github_owner_repo,
+                    created_at: jiff::Timestamp::now(),
+                    updated_at: None,
+                };
+                self.plans.lock().unwrap().insert(name, plan.clone());
+                Ok(plan)
+            }
+
+            async fn update_plan_meta(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _update: PlanMetaUpdate,
+            ) -> Result<Plan, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn delete_plan(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+            ) -> Result<(), StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn read_plan_body(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+            ) -> Result<String, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn write_plan_body(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _body: &str,
+            ) -> Result<(), StoreError> {
+                Ok(())
+            }
+
+            async fn list_tasks(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _filter: TaskFilter,
+                _page: Option<PageToken>,
+            ) -> Result<Page<Task>, StoreError> {
+                Ok(Page {
+                    items: vec![],
+                    next: None,
+                })
+            }
+
+            async fn get_task(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _task: &crate::model::TaskId,
+            ) -> Result<Task, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn add_task(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _new_task: NewTask,
+            ) -> Result<Task, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn update_task_meta(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _task: &crate::model::TaskId,
+                _update: TaskMetaUpdate,
+            ) -> Result<Task, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn delete_task(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _task: &crate::model::TaskId,
+            ) -> Result<(), StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn read_task_body(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _task: &crate::model::TaskId,
+            ) -> Result<String, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn write_task_body(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _task: &crate::model::TaskId,
+                _body: &str,
+            ) -> Result<(), StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn list_notes(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _page: Option<PageToken>,
+            ) -> Result<Page<Note>, StoreError> {
+                Ok(Page {
+                    items: vec![],
+                    next: None,
+                })
+            }
+
+            async fn get_note(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _note: &crate::model::NoteId,
+            ) -> Result<Note, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn add_note(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _new_note: NewNote,
+            ) -> Result<Note, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn update_note_meta(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _note: &crate::model::NoteId,
+                _update: crate::model::NoteMetaUpdate,
+            ) -> Result<Note, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn delete_note(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _note: &crate::model::NoteId,
+            ) -> Result<(), StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn read_note_body(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _note: &crate::model::NoteId,
+            ) -> Result<String, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn write_note_body(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _note: &crate::model::NoteId,
+                _body: &str,
+            ) -> Result<(), StoreError> {
+                Err(StoreError::NotFound)
+            }
+        }
+
+        type MockServerService = RunningService<RoleServer, PlansServer<MockStore>>;
+        type TestClientService = RunningService<RoleClient, TestClientHandler>;
+
+        async fn setup_client_server() -> (TestClientService, MockServerService) {
+            let (client_transport, server_transport) = duplex(65_536);
+            let store = Arc::new(MockStore::new());
+            let server = PlansServer::new(store);
+
+            let server_fut = serve_server(server, server_transport);
+            let client_fut = serve_client(TestClientHandler, client_transport);
+
+            let (server_res, client_res): (
+                Result<MockServerService, _>,
+                Result<TestClientService, _>,
+            ) = tokio::join!(server_fut, client_fut);
+
+            let server = server_res.unwrap();
+            let client = client_res.unwrap();
+            (client, server)
+        }
+
+        /// Asserts that a known-tool domain failure returns `Ok` with `is_error: Some(true)`
+        /// and that the content contains the expected message fragment.
+        fn assert_is_error_result(
+            result: &Result<CallToolResult, rmcp::service::ServiceError>,
+            contains: &str,
+        ) {
+            match result {
+                Ok(result) => {
+                    assert!(
+                        result.is_error == Some(true),
+                        "expected is_error: Some(true), got {:?}",
+                        result.is_error
+                    );
+                    let text = result
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>();
+                    assert!(
+                        text.contains(contains),
+                        "expected content to contain {:?}, got {:?}",
+                        contains,
+                        text
+                    );
+                }
+                Err(e) => panic!("expected Ok result, got Err: {:?}", e),
+            }
+        }
+
+        #[tokio::test]
+        async fn get_missing_plan_returns_is_error() {
+            let (client, _server) = setup_client_server().await;
+            let peer = client.peer();
+
+            // Try to get a plan that doesn't exist
+            let result = peer
+                .call_tool(
+                    CallToolRequestParams::new("get_plan").with_arguments(
+                        json!({ "name": "nonexistent" })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await;
+
+            assert_is_error_result(&result, "not found");
+
+            // Cleanup
+            client.cancel().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn unknown_tool_returns_protocol_error() {
+            let (client, _server) = setup_client_server().await;
+            let peer = client.peer();
+
+            // Call a tool that doesn't exist
+            let result = peer
+                .call_tool(CallToolRequestParams::new("unknown_tool"))
+                .await;
+
+            // Unknown tool should return Err(ServiceError), not Ok(is_error)
+            match result {
+                Err(e) => {
+                    // ServiceError should indicate invalid params or similar protocol error
+                    assert!(
+                        e.to_string().contains("unknown tool")
+                            || e.to_string().contains("invalid")
+                            || e.to_string().contains("InvalidParams"),
+                        "expected protocol error for unknown tool, got: {:?}",
+                        e
+                    );
+                }
+                Ok(result) => {
+                    panic!("expected Err for unknown tool, got Ok: {:?}", result);
+                }
+            }
+
+            // Cleanup
+            client.cancel().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn get_missing_note_returns_is_error() {
+            let (client, _server) = setup_client_server().await;
+            let peer = client.peer();
+
+            // Try to get a note from a non-existent plan
+            let result = peer
+                .call_tool(
+                    CallToolRequestParams::new("get_note").with_arguments(
+                        json!({ "plan": "test-plan", "note_id": "missing-note" })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await;
+
+            assert_is_error_result(&result, "not found");
+
+            // Cleanup
+            client.cancel().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn get_missing_task_returns_is_error() {
+            let (client, _server) = setup_client_server().await;
+            let peer = client.peer();
+
+            // Try to get a task from a non-existent plan
+            let result = peer
+                .call_tool(
+                    CallToolRequestParams::new("get_task").with_arguments(
+                        json!({ "plan": "test-plan", "id": "missing-task" })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await;
+
+            assert_is_error_result(&result, "not found");
+
+            // Cleanup
+            client.cancel().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn successful_call_returns_ok_without_is_error() {
+            let (client, _server) = setup_client_server().await;
+            let peer = client.peer();
+
+            // Create a plan (should succeed)
+            let result = peer
+                .call_tool(
+                    CallToolRequestParams::new("add_plan").with_arguments(
+                        json!({ "name": "test-plan", "title": "Test Plan" })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await;
+
+            match result {
+                Ok(result) => {
+                    // Successful calls should NOT have is_error set to true
+                    assert!(
+                        result.is_error != Some(true),
+                        "successful call should not have is_error: true"
+                    );
+                }
+                Err(e) => {
+                    panic!("successful call should return Ok, got Err: {:?}", e);
+                }
+            }
+
+            // Cleanup
+            client.cancel().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn invalid_arguments_returns_is_error_not_protocol_error() {
+            let (client, _server) = setup_client_server().await;
+            let peer = client.peer();
+
+            // Call a known tool with missing required argument (add_plan needs 'name')
+            let result = peer
+                .call_tool(
+                    CallToolRequestParams::new("add_plan").with_arguments(
+                        json!({ "title": "Missing name field" })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await;
+
+            // Argument validation errors should return Ok with is_error: true, NOT Err
+            assert_is_error_result(&result, "missing");
+
+            // Cleanup
+            client.cancel().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn empty_arguments_returns_is_error() {
+            let (client, _server) = setup_client_server().await;
+            let peer = client.peer();
+
+            // Call a known tool with empty arguments (add_plan needs 'name')
+            let result = peer.call_tool(CallToolRequestParams::new("add_plan")).await;
+
+            // Argument validation errors should return Ok with is_error: true
+            assert_is_error_result(&result, "missing");
+
+            // Cleanup
+            client.cancel().await.unwrap();
+        }
+
+        /// Mock store that returns RateLimited for get_plan operations.
+        struct RateLimitedMockStore;
+
+        #[async_trait::async_trait]
+        impl PlanStore for RateLimitedMockStore {
+            async fn list_plans(
+                &self,
+                _target: &Target,
+                _page: Option<PageToken>,
+            ) -> Result<Page<Plan>, StoreError> {
+                Ok(Page {
+                    items: vec![],
+                    next: None,
+                })
+            }
+
+            async fn get_plan(&self, _target: &Target, _plan: &PlanId) -> Result<Plan, StoreError> {
+                Err(StoreError::RateLimited {
+                    retry_after_secs: 30,
+                })
+            }
+
+            async fn add_plan(
+                &self,
+                _target: &Target,
+                _new_plan: NewPlan,
+            ) -> Result<Plan, StoreError> {
+                Err(StoreError::RateLimited {
+                    retry_after_secs: 30,
+                })
+            }
+
+            async fn update_plan_meta(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _update: PlanMetaUpdate,
+            ) -> Result<Plan, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn delete_plan(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+            ) -> Result<(), StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn read_plan_body(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+            ) -> Result<String, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn write_plan_body(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _body: &str,
+            ) -> Result<(), StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn list_tasks(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _filter: TaskFilter,
+                _page: Option<PageToken>,
+            ) -> Result<Page<Task>, StoreError> {
+                Ok(Page {
+                    items: vec![],
+                    next: None,
+                })
+            }
+
+            async fn get_task(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _task: &crate::model::TaskId,
+            ) -> Result<Task, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn add_task(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _new_task: NewTask,
+            ) -> Result<Task, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn update_task_meta(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _task: &crate::model::TaskId,
+                _update: TaskMetaUpdate,
+            ) -> Result<Task, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn delete_task(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _task: &crate::model::TaskId,
+            ) -> Result<(), StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn read_task_body(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _task: &crate::model::TaskId,
+            ) -> Result<String, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn write_task_body(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _task: &crate::model::TaskId,
+                _body: &str,
+            ) -> Result<(), StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn list_notes(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _page: Option<PageToken>,
+            ) -> Result<Page<Note>, StoreError> {
+                Ok(Page {
+                    items: vec![],
+                    next: None,
+                })
+            }
+
+            async fn get_note(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _note: &crate::model::NoteId,
+            ) -> Result<Note, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn add_note(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _new_note: NewNote,
+            ) -> Result<Note, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn update_note_meta(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _note: &crate::model::NoteId,
+                _update: crate::model::NoteMetaUpdate,
+            ) -> Result<Note, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn delete_note(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _note: &crate::model::NoteId,
+            ) -> Result<(), StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn read_note_body(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _note: &crate::model::NoteId,
+            ) -> Result<String, StoreError> {
+                Err(StoreError::NotFound)
+            }
+
+            async fn write_note_body(
+                &self,
+                _target: &Target,
+                _plan: &PlanId,
+                _note: &crate::model::NoteId,
+                _body: &str,
+            ) -> Result<(), StoreError> {
+                Err(StoreError::NotFound)
+            }
+        }
+
+        type RateLimitedServerService =
+            RunningService<RoleServer, PlansServer<RateLimitedMockStore>>;
+        type RateLimitedClientService = RunningService<RoleClient, TestClientHandler>;
+
+        async fn setup_rate_limited_client_server(
+        ) -> (RateLimitedClientService, RateLimitedServerService) {
+            let (client_transport, server_transport) = duplex(65_536);
+            let store = Arc::new(RateLimitedMockStore);
+            let server = PlansServer::new(store);
+
+            let server_fut = serve_server(server, server_transport);
+            let client_fut = serve_client(TestClientHandler, client_transport);
+
+            let (server_res, client_res): (
+                Result<RateLimitedServerService, _>,
+                Result<RateLimitedClientService, _>,
+            ) = tokio::join!(server_fut, client_fut);
+
+            let server = server_res.unwrap();
+            let client = client_res.unwrap();
+            (client, server)
+        }
+
+        #[tokio::test]
+        async fn rate_limited_error_returns_is_error_with_retry_guidance() {
+            let (client, _server) = setup_rate_limited_client_server().await;
+            let peer = client.peer();
+
+            // Try to add a plan - the mock store will return RateLimited
+            let result = peer
+                .call_tool(
+                    CallToolRequestParams::new("add_plan").with_arguments(
+                        json!({ "name": "test-plan", "title": "Test Plan" })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await;
+
+            // RateLimited should return Ok with is_error: true, NOT a protocol error
+            assert_is_error_result(&result, "rate limited");
+
+            // Verify the retry guidance is present
+            match result {
+                Ok(result) => {
+                    assert!(
+                        result.is_error == Some(true),
+                        "expected is_error: Some(true), got {:?}",
+                        result.is_error
+                    );
+                    let text = result
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>();
+                    assert!(
+                        text.contains("retry after 30s"),
+                        "expected content to contain retry guidance, got {:?}",
+                        text
+                    );
+                }
+                Err(e) => {
+                    panic!(
+                        "RateLimited should return Ok(CallToolResult), got Err: {:?}",
+                        e
+                    );
+                }
+            }
+
+            // Cleanup
+            client.cancel().await.unwrap();
+        }
     }
 }

@@ -46,6 +46,20 @@ fn tool_call_succeeded(result: &Result<CallToolResult, ErrorData>) -> bool {
         .as_ref()
         .is_ok_and(|result| result.is_error != Some(true))
 }
+
+/// Converts a domain/inner error into an isError result.
+///
+/// This wrapper maps `Err(ErrorData)` to `Ok(CallToolResult::error(...))`,
+/// ensuring recoverable failures are returned as `is_error: Some(true)`
+/// instead of JSON-RPC error frames. Used at the `dispatch_call_tool`
+/// boundary for known-tool arms.
+fn domain_result(result: Result<CallToolResult, ErrorData>) -> Result<CallToolResult, ErrorData> {
+    match result {
+        Ok(ok) => Ok(ok),
+        Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e.message)])),
+    }
+}
+
 #[derive(Clone)]
 pub struct TimeServer {
     local_tz: String,
@@ -464,21 +478,45 @@ impl TimeServer {
     ) -> Result<CallToolResult, ErrorData> {
         match request.name.as_ref() {
             "get_current_time" => {
-                let args = parse_arguments::<GetCurrentTimeParams>(request.arguments)?;
-                self.get_current_time_impl(&args.timezone)
+                let request = request;
+                domain_result(
+                    async {
+                        let args = parse_arguments::<GetCurrentTimeParams>(request.arguments)?;
+                        self.get_current_time_impl(&args.timezone)
+                    }
+                    .await,
+                )
             }
             "convert_time" => {
-                let args = parse_arguments::<ConvertTimeParams>(request.arguments)?;
-                self.convert_time_impl(args)
+                let request = request;
+                domain_result(
+                    async {
+                        let args = parse_arguments::<ConvertTimeParams>(request.arguments)?;
+                        self.convert_time_impl(args)
+                    }
+                    .await,
+                )
             }
             "wait" => {
-                let args = parse_arguments::<WaitParams>(request.arguments)?;
-                self.wait_impl(args.seconds).await
+                let request = request;
+                domain_result(
+                    async {
+                        let args = parse_arguments::<WaitParams>(request.arguments)?;
+                        self.wait_impl(args.seconds).await
+                    }
+                    .await,
+                )
             }
             "wait_until" => {
-                let args = parse_arguments::<WaitUntilParams>(request.arguments)?;
-                self.wait_until_impl(&args.time, args.timezone.as_deref())
-                    .await
+                let request = request;
+                domain_result(
+                    async {
+                        let args = parse_arguments::<WaitUntilParams>(request.arguments)?;
+                        self.wait_until_impl(&args.time, args.timezone.as_deref())
+                            .await
+                    }
+                    .await,
+                )
             }
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),
@@ -915,5 +953,209 @@ mod tests {
             Ok(CallToolResult::error(vec![ContentBlock::text("failed")]));
 
         assert!(!tool_call_succeeded(&result));
+    }
+
+    // Wire-level tests proving isError handling at the dispatch boundary.
+    mod wire_tests {
+        use super::*;
+        use rmcp::handler::client::ClientHandler;
+        use rmcp::model::{ClientCapabilities, InitializeRequestParams};
+        use rmcp::service::{RoleClient, RoleServer, RunningService};
+
+        #[derive(Clone, Default)]
+        struct TestClientHandler;
+
+        impl ClientHandler for TestClientHandler {
+            fn get_info(&self) -> InitializeRequestParams {
+                InitializeRequestParams::new(
+                    ClientCapabilities::builder().build(),
+                    Implementation::new("test", "0.1"),
+                )
+            }
+        }
+
+        type TestServerService = RunningService<RoleServer, TimeServer>;
+        type TestClientService = RunningService<RoleClient, TestClientHandler>;
+
+        async fn setup_client_server() -> (TestClientService, TestServerService) {
+            let (client_transport, server_transport) = tokio::io::duplex(65_536);
+            let server = TimeServer::new();
+
+            let server_fut = rmcp::service::serve_server(server, server_transport);
+            let client_fut = rmcp::service::serve_client(TestClientHandler, client_transport);
+
+            let (server_res, client_res): (
+                Result<TestServerService, _>,
+                Result<TestClientService, _>,
+            ) = tokio::join!(server_fut, client_fut);
+
+            let server = server_res.unwrap();
+            let client = client_res.unwrap();
+            (client, server)
+        }
+
+        /// Asserts that a known-tool domain failure returns `Ok` with `is_error: Some(true)`
+        fn assert_is_error_result(
+            result: &Result<CallToolResult, rmcp::service::ServiceError>,
+            contains: &str,
+        ) {
+            match result {
+                Ok(result) => {
+                    assert!(
+                        result.is_error == Some(true),
+                        "expected is_error: Some(true), got {:?}",
+                        result.is_error
+                    );
+                    let text = result
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>();
+                    assert!(
+                        text.contains(contains),
+                        "expected content to contain {:?}, got {:?}",
+                        contains,
+                        text
+                    );
+                }
+                Err(e) => panic!("expected Ok result, got Err: {:?}", e),
+            }
+        }
+
+        #[tokio::test]
+        async fn invalid_timezone_returns_is_error() {
+            let (client, _server) = setup_client_server().await;
+            let peer = client.peer();
+
+            let result = peer
+                .call_tool(
+                    CallToolRequestParams::new("get_current_time").with_arguments(
+                        json!({ "timezone": "Invalid/Timezone" })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await;
+
+            assert_is_error_result(&result, "Invalid timezone");
+
+            client.cancel().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn conflicting_timestamp_inputs_returns_is_error() {
+            let (client, _server) = setup_client_server().await;
+            let peer = client.peer();
+
+            // Provide both isoTimestamp and unixTimestamp - should fail
+            let result = peer
+                .call_tool(
+                    CallToolRequestParams::new("convert_time").with_arguments(
+                        json!({
+                            "isoTimestamp": "2024-01-01T00:00:00Z",
+                            "unixTimestamp": 1704067200
+                        })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    ),
+                )
+                .await;
+
+            assert_is_error_result(&result, "Provide at most one");
+
+            client.cancel().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn negative_wait_duration_returns_is_error() {
+            let (client, _server) = setup_client_server().await;
+            let peer = client.peer();
+
+            // Wait with negative seconds - should fail
+            let result = peer
+                .call_tool(
+                    CallToolRequestParams::new("wait")
+                        .with_arguments(json!({ "seconds": -5.0 }).as_object().unwrap().clone()),
+                )
+                .await;
+
+            assert_is_error_result(&result, "must be positive");
+
+            client.cancel().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn unknown_tool_returns_protocol_error() {
+            let (client, _server) = setup_client_server().await;
+            let peer = client.peer();
+
+            let result = peer
+                .call_tool(CallToolRequestParams::new("unknown_tool"))
+                .await;
+
+            match result {
+                Err(e) => {
+                    assert!(
+                        e.to_string().contains("unknown tool")
+                            || e.to_string().contains("invalid")
+                            || e.to_string().contains("InvalidParams"),
+                        "expected protocol error for unknown tool, got: {:?}",
+                        e
+                    );
+                }
+                Ok(result) => {
+                    panic!("expected Err for unknown tool, got Ok: {:?}", result);
+                }
+            }
+
+            client.cancel().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn missing_required_argument_returns_is_error() {
+            let (client, _server) = setup_client_server().await;
+            let peer = client.peer();
+
+            // get_current_time requires 'timezone'
+            let result = peer
+                .call_tool(CallToolRequestParams::new("get_current_time"))
+                .await;
+
+            assert_is_error_result(&result, "missing");
+
+            client.cancel().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn successful_call_returns_ok_without_is_error() {
+            let (client, _server) = setup_client_server().await;
+            let peer = client.peer();
+
+            let result = peer
+                .call_tool(
+                    CallToolRequestParams::new("get_current_time")
+                        .with_arguments(json!({ "timezone": "UTC" }).as_object().unwrap().clone()),
+                )
+                .await;
+
+            match result {
+                Ok(result) => {
+                    assert!(
+                        result.is_error != Some(true),
+                        "successful call should not have is_error: true"
+                    );
+                }
+                Err(e) => {
+                    panic!("successful call should return Ok, got Err: {:?}", e);
+                }
+            }
+
+            client.cancel().await.unwrap();
+        }
     }
 }

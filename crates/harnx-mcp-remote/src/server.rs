@@ -13,6 +13,9 @@ use crate::cli::Cli;
 use crate::client_handler::RemoteClientHandler;
 use crate::transport::build_transport;
 
+/// Maps service/transport errors to JSON-RPC error frames.
+/// Per SEP-1303, transport and lifecycle errors legitimately remain as
+/// `Err(ErrorData)` rather than passing through as domain errors.
 fn proxy_error(err: rmcp::service::ServiceError) -> ErrorData {
     // rmcp ServiceError in 2.2.0 does not expose structured remote ErrorData
     // here, so fall back to internal_error while preserving message text.
@@ -49,6 +52,8 @@ impl RemoteProxyServer {
         Ok(())
     }
 
+    /// Gets the initialized peer or returns an error if the peer hasn't been initialized yet.
+    /// This is a lifecycle error - the proxy must complete initialization before handling tool calls.
     fn peer(&self) -> Result<Peer<RoleClient>, ErrorData> {
         self.peer
             .read()
@@ -146,6 +151,11 @@ impl RemoteProxyServer {
     /// elicitation and long-running tasks that this server does not use.
     /// Dispatching separately keeps every arm returning a plain
     /// `CallToolResult`.
+    ///
+    /// Error handling follows SEP-1303 and MCP specification: remote domain errors (including `CallToolResult`
+    /// with `is_error: Some(true)`) pass through as `Ok(CallToolResult)`. Only transport
+    /// and lifecycle failures (peer not initialized, service errors) become `Err(ErrorData)`
+    /// JSON-RPC error frames.
     async fn dispatch_call_tool(
         &self,
         request: CallToolRequestParams,
@@ -154,6 +164,10 @@ impl RemoteProxyServer {
         let peer = self.peer()?;
         let tool_name = request.name.clone();
         let started = Instant::now();
+        // `peer	call_tool` returns `Result<CallToolResult, ServiceError>`. The Ok path
+        // includes remote CallToolResults where `is_error==true`, which correctly
+        // propagates to callers. The Err path (transport/lifecycle failures) is mapped
+        // to ErrorData via proxy_error.
         let result = peer.call_tool(request).await.map_err(proxy_error);
         // mcp-remote is stdio-only; without a cached list, labels follow the upstream tool namespace.
         harnx_metrics::record_tool_call(

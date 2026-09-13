@@ -2212,3 +2212,244 @@ fn validate_plan_name_rejects_invalid() {
         "space normalized to hyphen"
     );
 }
+
+// Wire-level tests proving isError handling at the dispatch boundary.
+mod wire_tests {
+    use super::*;
+    use rmcp::handler::client::ClientHandler;
+    use rmcp::model::{ClientCapabilities, InitializeRequestParams};
+    use rmcp::service::{serve_client, serve_server, RoleClient, RoleServer, RunningService};
+    use tokio::io::duplex;
+
+    #[derive(Clone, Default)]
+    struct TestClientHandler;
+
+    impl ClientHandler for TestClientHandler {
+        fn get_info(&self) -> InitializeRequestParams {
+            InitializeRequestParams::new(
+                ClientCapabilities::builder().build(),
+                Implementation::new("test", "0.1"),
+            )
+        }
+    }
+
+    type TestServerService = RunningService<RoleServer, PlansServer>;
+    type TestClientService = RunningService<RoleClient, TestClientHandler>;
+
+    async fn setup_client_server(dir: PathBuf) -> (TestClientService, TestServerService) {
+        let (client_transport, server_transport) = duplex(65_536);
+        let server = PlansServer::new(dir);
+
+        let server_fut = serve_server(server, server_transport);
+        let client_fut = serve_client(TestClientHandler, client_transport);
+
+        let (server_res, client_res): (Result<TestServerService, _>, Result<TestClientService, _>) =
+            tokio::join!(server_fut, client_fut);
+
+        let server = server_res.unwrap();
+        let client = client_res.unwrap();
+        (client, server)
+    }
+
+    /// Asserts that a known-tool domain failure returns `Ok` with `is_error: Some(true)`
+    /// and that the content contains the expected message fragment.
+    fn assert_is_error_result(
+        result: &Result<CallToolResult, rmcp::service::ServiceError>,
+        contains: &str,
+    ) {
+        match result {
+            Ok(result) => {
+                assert!(
+                    result.is_error == Some(true),
+                    "expected is_error: Some(true), got {:?}",
+                    result.is_error
+                );
+                let text = result
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                assert!(
+                    text.contains(contains),
+                    "expected content to contain {:?}, got {:?}",
+                    contains,
+                    text
+                );
+            }
+            Err(e) => panic!("expected Ok result, got Err: {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_missing_plan_returns_is_error() {
+        let dir = temp_test_dir("wire-get-missing-plan");
+        let (client, _server) = setup_client_server(dir).await;
+        let peer = client.peer();
+
+        // Try to get a plan that doesn't exist
+        let result = peer
+            .call_tool(
+                CallToolRequestParams::new("get_plan").with_arguments(
+                    json!({ "name": "nonexistent" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await;
+
+        assert_is_error_result(&result, "not found");
+
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_missing_task_returns_is_error() {
+        let dir = temp_test_dir("wire-get-missing-task");
+        let (client, _server) = setup_client_server(dir).await;
+        let peer = client.peer();
+
+        // Try to get a task that doesn't exist
+        let result = peer
+            .call_tool(
+                CallToolRequestParams::new("get_task").with_arguments(
+                    json!({ "plan": "test-plan", "id": "missing-task" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await;
+
+        assert_is_error_result(&result, "not found");
+
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_missing_note_returns_is_error() {
+        let dir = temp_test_dir("wire-get-missing-note");
+        let (client, _server) = setup_client_server(dir).await;
+        let peer = client.peer();
+
+        // Try to get a note that doesn't exist
+        let result = peer
+            .call_tool(
+                CallToolRequestParams::new("get_note").with_arguments(
+                    json!({ "plan": "test-plan", "note_id": "missing-note" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await;
+
+        assert_is_error_result(&result, "not found");
+
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_returns_protocol_error() {
+        let dir = temp_test_dir("wire-unknown-tool");
+        let (client, _server) = setup_client_server(dir).await;
+        let peer = client.peer();
+
+        // Call a tool that doesn't exist
+        let result = peer
+            .call_tool(CallToolRequestParams::new("unknown_tool"))
+            .await;
+
+        // Unknown tool should return Err(ServiceError), not Ok(is_error)
+        match result {
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("unknown tool")
+                        || e.to_string().contains("invalid")
+                        || e.to_string().contains("InvalidParams"),
+                    "expected protocol error for unknown tool, got: {:?}",
+                    e
+                );
+            }
+            Ok(result) => {
+                panic!("expected Err for unknown tool, got Ok: {:?}", result);
+            }
+        }
+
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_arguments_returns_is_error_not_protocol_error() {
+        let dir = temp_test_dir("wire-invalid-args");
+        let (client, _server) = setup_client_server(dir).await;
+        let peer = client.peer();
+
+        // Call add_plan without required 'name' field
+        let result = peer
+            .call_tool(
+                CallToolRequestParams::new("add_plan").with_arguments(
+                    json!({ "title": "Missing name field" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await;
+
+        // Argument validation errors should return Ok with is_error: true
+        assert_is_error_result(&result, "missing");
+
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_arguments_returns_is_error() {
+        let dir = temp_test_dir("wire-empty-args");
+        let (client, _server) = setup_client_server(dir).await;
+        let peer = client.peer();
+
+        // Call add_plan with empty arguments
+        let result = peer.call_tool(CallToolRequestParams::new("add_plan")).await;
+
+        assert_is_error_result(&result, "missing");
+
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_call_returns_ok_without_is_error() {
+        let dir = temp_test_dir("wire-success");
+        let (client, _server) = setup_client_server(dir).await;
+        let peer = client.peer();
+
+        // Create a plan (should succeed)
+        let result = peer
+            .call_tool(
+                CallToolRequestParams::new("add_plan").with_arguments(
+                    json!({ "name": "test-plan", "title": "Test Plan" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await;
+
+        match result {
+            Ok(result) => {
+                assert!(
+                    result.is_error != Some(true),
+                    "successful call should not have is_error: true"
+                );
+            }
+            Err(e) => {
+                panic!("successful call should return Ok, got Err: {:?}", e);
+            }
+        }
+
+        client.cancel().await.unwrap();
+    }
+}

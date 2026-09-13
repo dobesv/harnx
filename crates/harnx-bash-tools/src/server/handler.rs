@@ -1,6 +1,15 @@
 // Auto-split from server.rs for cohesion. See server/mod.rs.
 use super::*;
 
+fn domain_result(result: Result<CallToolResult, ErrorData>) -> Result<CallToolResult, ErrorData> {
+    match result {
+        Ok(result) => Ok(result),
+        Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(
+            error.message,
+        )])),
+    }
+}
+
 impl ServerHandler for BashServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -102,12 +111,21 @@ impl BashServer {
     ) -> Result<CallToolResult, ErrorData> {
         let enabled = request_wants_execution_context(&request);
         let tool_name = request.name.to_string();
-        let result = self
-            .invoke_tool_value(
-                request.name.as_ref(),
-                Value::Object(request.arguments.unwrap_or_default()),
-            )
-            .await?;
+        let result = match tool_name.as_str() {
+            tool if BUILTIN_TOOL_NAMES.contains(&tool) || self.has_tool_template(tool) => {
+                domain_result(
+                    self.invoke_tool_value(
+                        tool,
+                        Value::Object(request.arguments.unwrap_or_default()),
+                    )
+                    .await,
+                )
+            }
+            other => Err(ErrorData::invalid_params(
+                format!("unknown tool: {other}"),
+                None,
+            )),
+        }?;
         Ok(finalize_direct_mcp_context(
             result,
             enabled,

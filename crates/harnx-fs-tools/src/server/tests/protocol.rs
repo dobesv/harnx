@@ -231,6 +231,171 @@ async fn test_fs_server_write_and_read() {
 }
 
 #[tokio::test]
+async fn read_missing_file_returns_is_error_not_protocol_error() {
+    let temp_dir = TestDir::new();
+
+    let TestConnection {
+        _server_service,
+        client_service,
+    } = connect_server(
+        make_server(temp_dir.path()),
+        vec![temp_dir.path().to_path_buf()],
+    )
+    .await;
+    let peer = client_service.peer().clone();
+    let _client_task = tokio::spawn(async move {
+        let _ = client_service.waiting().await;
+    });
+
+    let result = peer
+        .call_tool(CallToolRequestParams::new("read").with_arguments(tool_args(
+            serde_json::json!({
+                "path": path_string(&temp_dir.path().join("nonexistent.txt"))
+            }),
+        )))
+        .await;
+
+    // Domain failure should return Ok with is_error: true, not Err
+    match result {
+        Ok(result) => {
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "missing file should return isError"
+            );
+            let text = text_content(&result);
+            assert!(
+                text.contains("not found")
+                    || text.contains("No such file")
+                    || text.contains("cannot find")
+                    || text.contains("cannot access"),
+                "error message should mention file not found: {}",
+                text
+            );
+        }
+        Err(e) => {
+            panic!("expected Ok(is_error) for domain failure, got Err: {:?}", e);
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_regex_returns_is_error_not_protocol_error() {
+    let temp_dir = TestDir::new();
+    write_fixture(&temp_dir, "test.txt", "hello world\n");
+
+    let TestConnection {
+        _server_service,
+        client_service,
+    } = connect_server(
+        make_server(temp_dir.path()),
+        vec![temp_dir.path().to_path_buf()],
+    )
+    .await;
+    let peer = client_service.peer().clone();
+    let _client_task = tokio::spawn(async move {
+        let _ = client_service.waiting().await;
+    });
+
+    let result = peer
+        .call_tool(CallToolRequestParams::new("grep").with_arguments(tool_args(
+            serde_json::json!({
+                "path": path_string(temp_dir.path()),
+                "pattern": "[invalid(regex"
+            }),
+        )))
+        .await;
+
+    match result {
+        Ok(result) => {
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "invalid regex should return isError"
+            );
+        }
+        Err(e) => {
+            panic!("expected Ok(is_error) for invalid regex, got Err: {:?}", e);
+        }
+    }
+}
+
+#[tokio::test]
+async fn missing_required_argument_returns_is_error() {
+    let temp_dir = TestDir::new();
+
+    let TestConnection {
+        _server_service,
+        client_service,
+    } = connect_server(
+        make_server(temp_dir.path()),
+        vec![temp_dir.path().to_path_buf()],
+    )
+    .await;
+    let peer = client_service.peer().clone();
+    let _client_task = tokio::spawn(async move {
+        let _ = client_service.waiting().await;
+    });
+
+    // read requires 'path'
+    let result = peer.call_tool(CallToolRequestParams::new("read")).await;
+
+    match result {
+        Ok(result) => {
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "missing 'path' should return isError"
+            );
+        }
+        Err(e) => {
+            panic!(
+                "expected Ok(is_error) for missing argument, got Err: {:?}",
+                e
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn unknown_tool_returns_protocol_error() {
+    let temp_dir = TestDir::new();
+
+    let TestConnection {
+        _server_service,
+        client_service,
+    } = connect_server(
+        make_server(temp_dir.path()),
+        vec![temp_dir.path().to_path_buf()],
+    )
+    .await;
+    let peer = client_service.peer().clone();
+    let _client_task = tokio::spawn(async move {
+        let _ = client_service.waiting().await;
+    });
+
+    let result = peer
+        .call_tool(CallToolRequestParams::new("unknown_tool"))
+        .await;
+
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("unknown tool")
+                    || msg.contains("invalid")
+                    || msg.contains("InvalidParams"),
+                "expected protocol error for unknown tool, got: {:?}",
+                e
+            );
+        }
+        Ok(result) => {
+            panic!("expected Err for unknown tool, got Ok: {:?}", result);
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_fs_server_edit_file() {
     let temp_dir = TestDir::new();
     let file_path = write_fixture(&temp_dir, "edit.txt", "old value\n");

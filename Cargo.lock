@@ -3807,6 +3807,7 @@ dependencies = [
  "async-trait",
  "fancy-regex 0.19.1",
  "harnx-core",
+ "harnx-metrics",
  "harnx-toolset",
  "harnx-toolset-server",
  "log",
@@ -4470,6 +4471,9 @@ name = "harnx-test-bins"
 version = "0.33.4"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "harnx-mcp-plans-core",
+ "jiff",
  "libc",
  "ratatui",
  "rmcp",

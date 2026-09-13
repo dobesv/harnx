@@ -119,6 +119,87 @@ async fn bash_tools_advertise_call_template_only() {
     }
 }
 
+#[tokio::test]
+async fn wait_unknown_execution_id_returns_is_error() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let server = server_with_sandbox(
+        vec![temp_dir.path().to_path_buf()],
+        disabled_sandbox_config(),
+    );
+    let TestConnection {
+        _server_service,
+        client_service,
+    } = connect_server(server, vec![temp_dir.path().to_path_buf()]).await;
+    let peer = client_service.peer().clone();
+    let _client_task = tokio::spawn(async move {
+        let _ = client_service.waiting().await;
+    });
+
+    let result = peer
+        .call_tool(
+            CallToolRequestParams::new("wait").with_arguments(
+                serde_json::json!({"execution_id": "exec-does-not-exist"})
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("domain failure should be a tool result");
+
+    assert_eq!(result.is_error, Some(true));
+    assert!(text_content(&result).contains("is not a tracked background process"));
+}
+
+#[tokio::test]
+async fn missing_exec_command_returns_is_error() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let server = server_with_sandbox(
+        vec![temp_dir.path().to_path_buf()],
+        disabled_sandbox_config(),
+    );
+    let TestConnection {
+        _server_service,
+        client_service,
+    } = connect_server(server, vec![temp_dir.path().to_path_buf()]).await;
+    let peer = client_service.peer().clone();
+    let _client_task = tokio::spawn(async move {
+        let _ = client_service.waiting().await;
+    });
+
+    let result = peer
+        .call_tool(CallToolRequestParams::new("exec"))
+        .await
+        .expect("argument failure should be a tool result");
+
+    assert_eq!(result.is_error, Some(true));
+    assert!(text_content(&result).contains("missing field `command`"));
+}
+
+#[tokio::test]
+async fn unknown_tool_returns_protocol_error() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let server = server_with_sandbox(
+        vec![temp_dir.path().to_path_buf()],
+        disabled_sandbox_config(),
+    );
+    let TestConnection {
+        _server_service,
+        client_service,
+    } = connect_server(server, vec![temp_dir.path().to_path_buf()]).await;
+    let peer = client_service.peer().clone();
+    let _client_task = tokio::spawn(async move {
+        let _ = client_service.waiting().await;
+    });
+
+    let error: rmcp::service::ServiceError = peer
+        .call_tool(CallToolRequestParams::new("missing"))
+        .await
+        .expect_err("unknown tool should return a protocol error");
+
+    assert!(error.to_string().contains("unknown tool: missing"));
+}
+
 #[cfg(unix)]
 fn collect_arg_pairs(args: &[OsString]) -> Vec<(String, String)> {
     args.chunks(2)
