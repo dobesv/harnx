@@ -50,7 +50,11 @@ Harnx automatically manages the following JetStream resources:
   worker daemon's own copy of the same buckets does not set one.
 - **Streams**: `SESSION_<id>` (Subject: `sessions.{id}.log`) stores only the
   durable append-only conversation history. Agent identity, settings, rendered
-  prompts, and titles do not belong in this stream.
+  prompts, and titles do not belong in this stream. Preserve the case of `<id>`:
+  short base64url session IDs are case-sensitive. Uppercasing aliases distinct
+  sessions, causing reads to return another transcript and appends to fail with
+  `no stream found for given subject`. Stream names previously uppercased by
+  Harnx are not migrated; start fresh sessions after upgrading.
 - **Object Store**: `harnx_attachments` stores binary attachment payloads under
   session-scoped object names. Conversation entries contain only `cid:`
   references; workers hydrate the matching blobs into their local

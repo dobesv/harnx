@@ -39,7 +39,7 @@ async fn nats_completion_reads_only_entries_after_its_successful_cursor() -> Res
         .await?;
     let history = log.load_events_async().await?;
     let mut requests = client
-        .subscribe("$JS.API.STREAM.MSG.GET.SESSION_INCREMENTAL".to_string())
+        .subscribe("$JS.API.STREAM.MSG.GET.SESSION_incremental".to_string())
         .await?;
     client.flush().await?;
     log.append_event_async(&SessionLogEntry::TurnEnd {

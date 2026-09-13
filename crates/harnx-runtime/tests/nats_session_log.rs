@@ -26,7 +26,7 @@ async fn nats_session_log_rejects_transport_errors_instead_of_skipping_entries()
     log.append_event_async(&SessionLogEntry::Cancel { fence_token: 1 })
         .await?;
     let info = client
-        .request("$JS.API.STREAM.INFO.SESSION_READ-FAILURE", "{}".into())
+        .request("$JS.API.STREAM.INFO.SESSION_read-failure", "{}".into())
         .await?
         .payload;
     let mut requests = client.subscribe("FAULT.>".to_string()).await?;
@@ -68,7 +68,7 @@ async fn nats_session_log_still_skips_confirmed_retention_gaps() -> Result<()> {
         log.append_event_async(&SessionLogEntry::Cancel { fence_token })
             .await?;
     }
-    js.get_stream("SESSION_READ-GAP")
+    js.get_stream("SESSION_read-gap")
         .await?
         .delete_message(2)
         .await?;

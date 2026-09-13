@@ -389,7 +389,8 @@ pub fn stream_name_for_session(session_id: &str) -> String {
 
 fn sanitize_stream_name_char(ch: char) -> char {
     if is_valid_stream_name_char(ch) {
-        ch.to_ascii_uppercase()
+        // Short base64url session IDs are case-sensitive, just like subjects.
+        ch
     } else {
         '_'
     }
