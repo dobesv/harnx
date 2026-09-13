@@ -90,7 +90,7 @@ test failures.
 **Run all web/frontend commands from `web/`, never the repo root.** The root has no
 `package.json`, so corepack cannot resolve the pnpm version and attempts to download
 into a read-only cache, failing with `EROFS: read-only file system`. The `web/`
-directory has `web/package.json` with `packageManager: "pnpm@11.25.0"` already provisioned.
+directory has `web/package.json` with the pnpm version pinned in `packageManager`.
 
 ```sh
 cd web
