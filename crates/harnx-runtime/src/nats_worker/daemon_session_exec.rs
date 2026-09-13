@@ -184,7 +184,10 @@ impl WorkerRuntime {
                     attachment_sync,
                 );
 
-                let loop_outcome = run_agent_loop_with_nats_outcome(
+                // Recovery and model/tool dispatch make this future large. Keep
+                // it out of the enclosing activation future: inline construction
+                // and polling can exhaust a Tokio worker's stack in debug builds.
+                let loop_outcome = Box::pin(run_agent_loop_with_nats_outcome(
                     RunAgentLoopArgs {
                         cluster_key: &self.cluster,
                         manage_servers: self.manage_servers,
@@ -205,7 +208,7 @@ impl WorkerRuntime {
                     }
                     .with_lease(Arc::clone(&lease))
                     .with_after_seq_observer(Arc::clone(&after_seq_observer)),
-                )
+                ))
                 .await?;
 
                 // The shared agent loop starts compaction/title generation in
