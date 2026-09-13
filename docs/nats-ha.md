@@ -521,8 +521,8 @@ durable completion must drain already-buffered events before closing that turn.
 
 ### Tool and hook shutdown
 
-The internal tool protocol is v2 and requires an atomic frontend/worker/server
-upgrade. Registrations using v1 are rejected. `ToolRequest.operation_id` and
+The internal tool protocol is v3 and requires an atomic frontend/worker/server
+upgrade. Registrations using earlier versions are rejected. `ToolRequest.operation_id` and
 control acknowledgements identify the invocation; a cancellation acknowledgement
 is sent only after invocation cleanup and registered-child completion.
 
@@ -732,9 +732,37 @@ can hide completion or fabricate an incomplete transcript. Do not advance a
 replay cursor after a partially successful read.
 
 ### Resume & Idempotency
-When a worker resumes an interrupted session:
-- **Idempotent Tools**: Tools marked with `idempotent_hint` or `read_only_hint` in MCP are re-run if their result was lost.
-- **Non-idempotent Tools**: If a result is missing for a non-idempotent tool, Harnx synthesizes an "interrupt-error" result to prevent accidental double-execution of side effects.
+On activation, the worker repairs pending tool calls before asking the model to
+continue. NATS invocations are journaled in `harnx_tool_invocations` before dispatch,
+with the original call identity and durable `ToolCalls` sequence. Recovery reissues
+that request with `ToolRequest.replay`, attested by the current parent owner.
+Dispatch also revalidates the worker's live lease; a graph owner snapshot alone
+cannot prove that the lease remains held. Saved replies can be recovered without
+a current tool registration or live tool server.
+The tool server returns a persisted reply, joins its existing in-memory invocation,
+or applies its `Toolset` replay policy. The default permits advertised read-only or
+idempotent tools; other tools return an interrupted-operation error. A refusal to
+replay does not assert that unknown external work has stopped.
+Opting into replay permits overlapping observers: a tool must tolerate repetition
+or reattach its durable job even if the prior observer is still alive. A graph
+ownership transfer by itself does not provide exactly-once external side effects.
+
+Resumable tools opt into replay and checkpoint a durable job handle before starting
+work. Sub-agent tools retain the child session and use the original invocation ID
+as its prompt admission ID, so replay follows the admitted turn without appending
+another prompt. Prompt recovery uses transcript lookup plus tail CAS, not just the
+broker's time-limited message deduplication. Child ID reservations retain the
+invocation identity in canonical metadata, closing the crash window before the
+checkpoint is written. Durable start entries are also deduplicated by invocation.
+The original timeout includes recovery setup time.
+
+Replies must be persisted before execution ownership is marked stopped: graph
+nodes can be pruned before the parent writes `ToolResults`. Journal records retain
+the original server provenance and remain until session deletion. Cleanup follows
+transcript/lease removal and retains a deletion tombstone to reject late dispatch.
+Recovery does not repeat approval or post-use hooks.
+Legacy calls without a journal record retain the hint-based retry/interruption
+fallback.
 
 User messages submitted while a tool is running are durable immediately, so
 their physical log entries may appear between the corresponding `ToolCalls`

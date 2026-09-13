@@ -346,6 +346,42 @@ async fn complete_successful_tool_call(
     )
 }
 
+/// Recover a tool response without repeating approval or post-use hooks whose
+/// side effects may already have happened before the worker disappeared.
+pub async fn replay_tool_call(
+    ctx: &ToolEvalContext,
+    replay: harnx_core::tool::ToolReplay<'_>,
+    abort: &AbortSignal,
+) -> anyhow::Result<Option<ToolResult>> {
+    let call = replay.call;
+    for provider in &ctx.providers {
+        let output = match provider.replay_tool_call(replay, abort).await {
+            Ok(Some(output)) => output,
+            Ok(None) => continue,
+            Err(ToolError::Fatal(error)) => return Err(error),
+            Err(ToolError::Recoverable(error)) => {
+                ToolProviderOutput::new(json!({"is_error": true, "error": error.to_string()}))
+            }
+        };
+        let (mut value, observation) = output.into_parts();
+        let images = crate::media::extract_image_parts(&value);
+        if !images.is_empty() {
+            crate::media::redact_image_data(&mut value);
+        }
+        (ctx.emit_tool_result_fn)(call, &value);
+        if value.is_null() {
+            value = json!("DONE");
+        }
+        return Ok(Some(completed_tool_result(
+            call.clone(),
+            value,
+            images,
+            observation,
+        )));
+    }
+    Ok(None)
+}
+
 fn parse_call_arguments(call: &ToolCall) -> Result<Value, ToolError> {
     if call.arguments.is_null() {
         return Ok(Value::Null);
@@ -597,6 +633,37 @@ mod tests {
             self.tool_name == tool_name
         }
 
+        fn replay_tool_call<'a, 'b, 'c, 'async_trait>(
+            &'a self,
+            _replay: harnx_core::tool::ToolReplay<'b>,
+            _abort: &'c AbortSignal,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Option<ToolProviderOutput>, ToolError>>
+                    + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'a: 'async_trait,
+            'b: 'async_trait,
+            'c: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                if self.tool_name == "replay_only" {
+                    self.result
+                        .lock()
+                        .await
+                        .take()
+                        .unwrap()
+                        .map(|value| Some(value.into()))
+                } else {
+                    Ok(None)
+                }
+            })
+        }
+
         fn call_tool<'life0, 'life1, 'life2, 'async_trait>(
             &'life0 self,
             tool_name: &'life1 str,
@@ -802,6 +869,39 @@ mod tests {
                 Box::pin(async move { outcome })
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn replay_queries_retired_tools_and_normalizes_null() {
+        let ctx = test_context_with_emitters(
+            vec![Arc::new(MockToolProvider::ok(
+                "replay_only",
+                Duration::ZERO,
+                Value::Null,
+            ))],
+            |_| panic!("recovery must not repeat hooks"),
+            |_, _| {},
+            |_, value| assert!(value.is_null(), "display preserves the provider reply"),
+            |_, _| {},
+        );
+        let call = ToolCall::new("retired_tool".into(), json!({}), Some("call".into()), None);
+        assert!(!ctx.providers[0].has_tool(&call.name));
+        let recovered = replay_tool_call(
+            &ctx,
+            harnx_core::tool::ToolReplay {
+                session_id: "session",
+                tool_round: 1,
+                call: &call,
+                worker_id: None,
+                fence_token: None,
+                authorization: None,
+            },
+            &create_abort_signal(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered.output, json!("DONE"));
     }
 
     fn two_tool_context(

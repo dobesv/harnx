@@ -50,6 +50,18 @@ pub async fn delete_remote_session(
     }
     let stream_deleted = delete_session_stream(&jetstream, session_id).await?;
     let lease_deleted = delete_session_lease(lease_bucket, session_id).await?;
+    match jetstream
+        .get_key_value(harnx_toolset_server::invocation_journal::BUCKET)
+        .await
+    {
+        Ok(store) => {
+            harnx_toolset_server::invocation_journal::InvocationJournal::from_store(store)
+                .purge_session(session_id)
+                .await?
+        }
+        Err(error) if kv_bucket_missing(&error) => {}
+        Err(error) => return Err(error.into()),
+    }
     let metadata_keys_deleted = purge_session_metadata(&jetstream, session_id).await?;
     let attachments_deleted =
         crate::nats_attachments::delete_session_attachments(&jetstream, session_id).await?;

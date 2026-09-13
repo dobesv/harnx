@@ -55,7 +55,16 @@ impl InvocationExecution {
                 .await?;
         }
         let owner = Owner::invocation(server);
-        store.claim(&reference, owner.clone()).await?;
+        match &request.replay {
+            Some(parent_owner) => {
+                store
+                    .claim_replay(&reference, parent_owner, owner.clone())
+                    .await?;
+            }
+            None => {
+                store.claim(&reference, owner.clone()).await?;
+            }
+        }
         let watch = store.watch().await?;
         Ok(Self {
             store: store.clone(),

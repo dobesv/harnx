@@ -20,6 +20,8 @@ use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 
 mod execution_context;
+mod replay;
+mod request;
 
 use execution_context::extract_execution_context;
 
@@ -36,6 +38,7 @@ struct RegisteredTool {
 }
 
 struct PendingToolRequest {
+    durable: ToolRequest,
     call_id: String,
     server: String,
     registration_key: String,
@@ -188,7 +191,13 @@ impl NatsToolProvider {
         let parent_session_id = config
             .session
             .as_ref()
-            .map(|session| session.id().to_string());
+            .map(|session| session.id().to_string())
+            .or_else(|| {
+                config
+                    .execution_control
+                    .as_ref()
+                    .map(|(_, parent)| parent.session_id.clone())
+            });
 
         Ok(Self {
             client,
@@ -326,94 +335,6 @@ impl NatsToolProvider {
         .context("tool cancellation publication timed out; shutdown is unconfirmed")?
     }
 
-    fn prepare_request(
-        &self,
-        arguments: Value,
-        route: &RegisteredTool,
-        tool_call_id: Option<&str>,
-    ) -> Result<PendingToolRequest, ToolError> {
-        let call_id = Uuid::new_v4().to_string();
-        let request = ToolRequest {
-            operation_id: call_id.clone(),
-            call_id: call_id.clone(),
-            tool: route.raw_name.clone(),
-            args: arguments,
-            parent_session_id: self.parent_session_id.clone(),
-            tool_call_id: tool_call_id.map(str::to_string),
-            capabilities: BTreeSet::from([EXECUTION_CONTEXT_NAMESPACE.to_string()]),
-        };
-        let mut headers = async_nats::HeaderMap::new();
-        headers.insert(HDR_IDEMPOTENCY_KEY, Uuid::new_v4().to_string());
-        headers.insert(HDR_INSTANCE_ID, self.instance_id.as_str());
-        headers.insert(HDR_CALL_ID, call_id.as_str());
-        headers.insert(HDR_CONTENT_TYPE, JSON_CONTENT_TYPE);
-        harnx_telemetry::propagate::inject_current_into_nats(&mut headers);
-        let payload = serde_json::to_vec(&request).map_err(|error| {
-            ToolError::Fatal(anyhow!("failed to encode NATS tool request: {error}"))
-        })?;
-        Ok(PendingToolRequest {
-            call_id,
-            server: route.server.clone(),
-            registration_key: registration_key(&self.instance_id, &route.server),
-            subject: self
-                .instance_id
-                .tool_subject(&route.server, &route.raw_name),
-            request: async_nats::Request::new()
-                .headers(headers)
-                .payload(payload.into())
-                .timeout(route.request_timeout),
-        })
-    }
-
-    async fn call_registered_tool(
-        &self,
-        tool_name: &str,
-        arguments: Value,
-        tool_call_id: Option<&str>,
-        abort: &AbortSignal,
-    ) -> Result<ToolProviderOutput, ToolError> {
-        let Some(route) = self.resolve_route(tool_name) else {
-            return Err(ToolError::Recoverable(anyhow!(
-                "NATS tool is not registered: {tool_name}"
-            )));
-        };
-        let pending = self.prepare_request(arguments, &route, tool_call_id)?;
-        let call_id = pending.call_id.clone();
-        self.register_operation(&call_id)
-            .await
-            .map_err(ToolError::Fatal)?;
-        let message = self.await_response(pending, abort).await?;
-        let reply: ToolReply = serde_json::from_slice(&message.payload).map_err(|error| {
-            ToolError::Recoverable(anyhow!("invalid reply from tool server: {error}"))
-        })?;
-        if reply.call_id != call_id {
-            return Err(ToolError::Recoverable(anyhow!(
-                "tool server returned a mismatched call ID"
-            )));
-        }
-        match reply.result {
-            Ok(mut value) => {
-                let execution_context = extract_execution_context(
-                    &mut value,
-                    ToolObservationProvenance::new(
-                        self.instance_id.to_string(),
-                        route.server,
-                        route.raw_name,
-                        call_id,
-                    ),
-                );
-                Ok(ToolProviderOutput {
-                    value,
-                    execution_context,
-                })
-            }
-            Err(ToolErrorPayload::Recoverable(message)) => {
-                Err(ToolError::Recoverable(anyhow!(message)))
-            }
-            Err(ToolErrorPayload::Fatal(message)) => Err(ToolError::Fatal(anyhow!(message))),
-        }
-    }
-
     async fn wait_for_registration_loss(&self, key: &str) -> String {
         let Some(registry) = self.registry.as_ref() else {
             std::future::pending::<()>().await;
@@ -455,6 +376,7 @@ impl NatsToolProvider {
             registration_key,
             subject,
             request,
+            durable: _,
         } = pending;
         let mut supervised_failure = self.in_flight.register(call_id.clone(), server).await;
         let request = harnx_nats_common::rpc::request(&self.client, subject, request);
@@ -631,6 +553,16 @@ fn build_registered_tools(
 
 #[async_trait]
 impl ToolProvider for NatsToolProvider {
+    async fn replay_tool_call(
+        &self,
+        replay: harnx_core::tool::ToolReplay<'_>,
+        abort: &AbortSignal,
+    ) -> Result<Option<ToolProviderOutput>, ToolError> {
+        self.replay_recorded_call(replay, abort)
+            .await
+            .map_err(ToolError::Fatal)
+    }
+
     fn name(&self) -> &str {
         "nats"
     }
@@ -645,7 +577,7 @@ impl ToolProvider for NatsToolProvider {
         arguments: Value,
         abort: &AbortSignal,
     ) -> Result<ToolProviderOutput, ToolError> {
-        self.call_registered_tool(tool_name, arguments, None, abort)
+        self.call_tool_with_id(tool_name, arguments, None, abort)
             .await
     }
 
@@ -656,8 +588,15 @@ impl ToolProvider for NatsToolProvider {
         tool_call_id: Option<&str>,
         abort: &AbortSignal,
     ) -> Result<ToolProviderOutput, ToolError> {
-        self.call_registered_tool(tool_name, arguments, tool_call_id, abort)
-            .await
+        self.call_registered_tool(
+            request::ToolCallInput {
+                name: tool_name,
+                arguments,
+                id: tool_call_id,
+            },
+            abort,
+        )
+        .await
     }
 }
 

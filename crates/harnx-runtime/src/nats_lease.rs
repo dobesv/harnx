@@ -214,6 +214,10 @@ impl NatsSessionLease {
     }
 
     pub async fn release(&self) -> Result<()> {
+        // A renewal may already have committed in NATS while its acknowledgement
+        // is still in flight. Let it save the new revision before aborting it;
+        // deleting with the old revision otherwise strands the lease until TTL.
+        let _renew_guard = self.state.renew_lock.lock().await;
         let handle = self.stop_renew_task().await;
         let held = self.state.mark_lost();
 
@@ -600,6 +604,43 @@ fn is_create_conflict(error: &kv::CreateError) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn release_waits_for_committed_renewal_revision() -> Result<()> {
+        let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+            .await
+            .context("nats-server required")?;
+        let js = jetstream::new(async_nats::connect(&url).await?);
+        let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
+            jetstream: js.clone(),
+            session_id: "release-race",
+            worker_id: "old-worker".into(),
+            generation: 1,
+            config: Default::default(),
+            session_metadata: None,
+        })
+        .await?
+        .context("lease")?;
+        let renew_guard = lease.state.renew_lock.lock().await;
+        lease.stop_renewal_for_test().await;
+        // Pause a renewal after its broker commit, before the local revision
+        // update. Release must wait rather than delete using the old revision.
+        let value = lease.bucket.get(&lease.key).await?.context("lease entry")?;
+        let revision = lease
+            .bucket
+            .update(&lease.key, value, lease.fence_token())
+            .await?;
+        let release = lease.release();
+        tokio::pin!(release);
+        assert!(futures_util::poll!(&mut release).is_pending());
+        lease.state.fence_token.store(revision, Ordering::SeqCst);
+        drop(renew_guard);
+        release.await?;
+        assert!(!session_has_active_lease(&js, "release-race").await?);
+        let _ = nats.kill();
+        let _ = nats.wait();
+        Ok(())
+    }
 
     #[tokio::test]
     async fn best_effort_activity_refresh_timeout_is_bounded() {
