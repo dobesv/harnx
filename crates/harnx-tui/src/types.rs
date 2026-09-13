@@ -5,6 +5,7 @@ use harnx_runtime::local_orchestrator::LocalWorkerSupervisor;
 use harnx_runtime::utils::AbortSignal;
 
 use crate::markdown_render::RenderedEntry;
+use crate::tool_confirmation::ToolConfirmationReply;
 use chrono::{DateTime, Utc};
 use ratatui_textarea::TextArea;
 use std::collections::{HashMap, HashSet};
@@ -223,11 +224,11 @@ pub(super) struct App {
     /// Modal dialog state for destructive action confirmations.
     pub(super) modal: Option<ModalState>,
     /// Reply channel for an in-flight tool-use confirmation. Set alongside a
-    /// `ModalState::ConfirmToolUse`; the blocked tool-eval thread waits on the
+    /// `ModalState::ConfirmToolUse`; the confirmation handler waits on the
     /// receiver, and answering the modal sends the decision here.
-    pub(super) pending_confirm_reply: Option<std::sync::mpsc::Sender<bool>>,
+    pub(super) pending_confirm_reply: Option<ToolConfirmationReply>,
     /// Identity of `pending_confirm_reply`. Remote handlers use it to dismiss
-    /// only their own modal when a turn is cancelled or times out.
+    /// only their own modal when its confirmation wait is cancelled.
     pub(super) pending_confirm_id: Option<u64>,
     pub(super) detail_view_scroll: ratatui_widget_scrolling::ScrollState,
     pub(super) detail_view_open: bool,
@@ -610,7 +611,7 @@ pub(crate) enum ToolConfirmationEvent {
         tool_name: String,
         input_preview: String,
         reason: Option<String>,
-        reply: std::sync::mpsc::Sender<bool>,
+        reply: ToolConfirmationReply,
     },
     /// The remote request stopped waiting. Dismiss the matching modal without
     /// disturbing a newer confirmation or another modal.

@@ -7,6 +7,22 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+/// Match the reply channel to the caller: synchronous tool callbacks must not
+/// depend on a Tokio runtime, while remote handlers need cancellable async waits.
+pub(crate) enum ToolConfirmationReply {
+    Blocking(std::sync::mpsc::Sender<bool>),
+    Async(tokio::sync::oneshot::Sender<bool>),
+}
+
+impl ToolConfirmationReply {
+    pub(crate) fn send(self, approved: bool) -> Result<(), bool> {
+        match self {
+            Self::Blocking(reply) => reply.send(approved).map_err(|error| error.0),
+            Self::Async(reply) => reply.send(approved),
+        }
+    }
+}
+
 fn confirmation_header(tool_name: &str) -> Line<'static> {
     Line::from(Span::styled(
         format!("Allow tool '{tool_name}'?"),
@@ -55,7 +71,7 @@ impl Tui {
         tool_name: String,
         input_preview: String,
         reason: Option<String>,
-        reply: std::sync::mpsc::Sender<bool>,
+        reply: ToolConfirmationReply,
     ) {
         if self.app.modal.is_some() || self.app.pending_confirm_reply.is_some() {
             let _ = reply.send(false);
@@ -84,7 +100,7 @@ impl Tui {
         }
         self.resolve_tool_confirm(false);
         self.app.transcript.push(TranscriptItem::SystemText(
-            "⚠ Tool confirmation expired or was cancelled.".to_string(),
+            "⚠ Tool confirmation was cancelled.".to_string(),
         ));
         self.pin_transcript_to_bottom();
     }
