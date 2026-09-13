@@ -17,6 +17,9 @@ mod child_cancel;
 #[path = "subagent_session_tests/orphan.rs"]
 mod orphan;
 
+#[path = "subagent_session_tests/progress_recovery.rs"]
+mod progress_recovery;
+
 fn monitored_key(agent: &str, session_id: &str) -> MonitoredSessionKey {
     MonitoredSessionKey {
         cluster: harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),

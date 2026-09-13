@@ -25,26 +25,7 @@ impl Tui {
         if key.agent.trim().is_empty() || key.session_id.trim().is_empty() {
             return;
         }
-        let progress = invocation_id.as_ref().map(|invocation_id| {
-            SubAgentInvocationProgress::new(SubAgentProgress {
-                invocation_id: invocation_id.clone(),
-                agent: key.agent.clone(),
-                session_id: key.session_id.clone(),
-                status: SubAgentProgressStatus::Running,
-                elapsed_ms: 0,
-                usage: CompletionTokenUsage::default(),
-                tool_call_count: 0,
-            })
-        });
-        if !self.upsert_subagent_row(
-            parent,
-            RowUpdate {
-                key: key.clone(),
-                status: SubAgentStatus::Running,
-                invocation_id: invocation_id.clone(),
-                progress,
-            },
-        ) {
+        if !self.start_subagent_row(parent, &key, invocation_id.clone()) {
             return;
         }
         let state = self
@@ -62,6 +43,58 @@ impl Tui {
         }
         self.ensure_subagent_monitor(key);
         self.pin_transcript_to_bottom();
+    }
+
+    fn start_subagent_row(
+        &mut self,
+        parent: Option<&MonitoredSessionKey>,
+        key: &MonitoredSessionKey,
+        invocation_id: Option<String>,
+    ) -> bool {
+        // Start is an identity announcement, not a fresh progress snapshot.
+        // Re-delivery must not erase metrics already received for this invocation.
+        if let Some(status) = self.subagent_invocation_status(parent, invocation_id.as_deref()) {
+            return status == SubAgentStatus::Running;
+        }
+        let progress = invocation_id.as_ref().map(|invocation_id| {
+            SubAgentInvocationProgress::new(SubAgentProgress {
+                invocation_id: invocation_id.clone(),
+                agent: key.agent.clone(),
+                session_id: key.session_id.clone(),
+                status: SubAgentProgressStatus::Running,
+                elapsed_ms: 0,
+                usage: CompletionTokenUsage::default(),
+                tool_call_count: 0,
+            })
+        });
+        self.upsert_subagent_row(
+            parent,
+            RowUpdate {
+                key: key.clone(),
+                status: SubAgentStatus::Running,
+                invocation_id: invocation_id.clone(),
+                progress,
+            },
+        )
+    }
+
+    fn subagent_invocation_status(
+        &self,
+        parent: Option<&MonitoredSessionKey>,
+        invocation_id: Option<&str>,
+    ) -> Option<SubAgentStatus> {
+        let id = invocation_id?;
+        let transcript = parent
+            .and_then(|parent| self.app.monitored_sessions.get(parent))
+            .map_or(&self.app.transcript, |state| &state.transcript);
+        transcript.iter().find_map(|item| match item {
+            TranscriptItem::SubAgentSession {
+                invocation_id: Some(existing),
+                status,
+                ..
+            } if existing == id => Some(status.clone()),
+            _ => None,
+        })
     }
 
     pub(super) fn record_subagent_completed(
