@@ -8,36 +8,17 @@ Usage: harnx [OPTIONS] [COMMAND]
 Commands:
   prompt  Run a non-interactive prompt
   info    Inspect harnx state
-  session Manage sessions
+  dump    Dump session transcript (full history)
+  delete  Delete resources
+  list    List resources
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
-  -m, --model <MODEL>                  Select a LLM model
-      --prompt <PROMPT>                Use the system prompt
-  -s, --session [<SESSION>]            Start or join a session
-      --empty-session                  Ensure the session is empty
-      --save-session                   Ensure the new conversation is saved to the session
-  -a, --agent <AGENT>                  Start an agent
-      --agent-variable <NAME> <VALUE>  Set agent variables
-      --rag <RAG>                      Start a RAG
-      --rebuild-rag                    Rebuild the RAG to sync document changes
-      --macro <MACRO>                  Execute a macro
-  -t, --tool <TOOL>                    Use specific tools
-  -f, --file <FILE>                    Include files, directories, or URLs
-  -S, --no-stream                      Turn off stream mode
-      --final-only                     Print only the final response
-      --timeout-secs <SECONDS>         Set maximum invocation duration in seconds (0 or unset = no limit)
-      --token-budget <TOKENS>          Set maximum budgeted tokens for invocation (0 or unset = unlimited)
-      --resume-anyway                  Abandon an unconfirmed cancellation before a one-shot prompt
-      --dry-run                        Display the message without sending it
-      --info                           Display information
-      --sync-models                    Sync models updates
-      --list-models                    List all available chat models
-      --list-sessions                  List all sessions
-      --list-agents                    List all agents
-      --list-rags                      List all RAGs
-      --list-macros                    List all macros
-  -h, --help                           Print help
-  -V, --version                        Print version
+      --timeout-secs <SECONDS>  Maximum one-shot invocation duration in seconds (0 or unset means no limit)
+      --token-budget <TOKENS>   Maximum budgeted tokens for one-shot invocation (0 or unset means unlimited)
+      --resume-anyway           Abandon an unconfirmed cancellation before running a one-shot prompt
+  -h, --help                    Print help
+  -V, --version                 Print version
 ```
 
 ## Examples
@@ -58,7 +39,11 @@ harnx -a agent1                                # Use agent 'agent1'
 harnx --rag rag1                               # Use RAG 'rag1'
 
 harnx info agent agent1                        # View agent info
-harnx info session agent1 session1             # View session info
+harnx info session agent1 session1             # View session metadata
+harnx dump session agent1 session1             # Dump session transcript
+harnx dump session agent1 session1 --follow    # Follow transcript live
+harnx list sessions                            # List sessions
+harnx delete session session1 --cluster local  # Delete session
 harnx --info                                   # View system info
 harnx --rag rag1 --info                        # View RAG info
 
@@ -194,9 +179,9 @@ harnx-serve --dry-run
 harnx-serve --agent-variable env production --agent-variable debug true
 ```
 
-## Inspect Agents and Sessions
+## Inspect Agents
 
-Use the `info` subcommand to inspect the state of agents and sessions.
+Use `harnx info agent` to inspect rendered agent configuration.
 
 ### `harnx info agent <name>`
 
@@ -206,8 +191,38 @@ Prints the fully-rendered agent configuration to stdout. This includes:
 
 If an MCP server fails during tool expansion, a warning is logged to stderr, and the command continues with the remaining tools.
 
-### `harnx info session <agent-name> <session-id>`
+## Inspect and Dump Sessions
 
-Prints the session state (model, tokens, variables, history, and snapshots) to stdout.
-- This command does **not** include the system prompt.
-- It does **not** launch MCP servers.
+### `harnx info session <agent-name> <session-id> [--format text|yaml|json]`
+
+Prints saved session metadata only to stdout.
+
+> **Behavior Change:** `harnx info session` no longer prints the transcript. It outputs session metadata only. To dump the transcript like earlier versions did, use `harnx dump session <agent-name> <session-id> --format yaml`.
+
+Options:
+- `--format text` (default): Prints human-readable session summary metadata (model, title, token usage, turns, settings) matching TUI `.info session`.
+- `--format yaml`: Prints the full `SessionMetadata` record as a single YAML document (includes `variables` and config overrides).
+- `--format json`: Prints the full `SessionMetadata` record as a single JSON object.
+
+This command does not output transcript entries, does not include the system prompt, and does not launch MCP servers.
+
+### `harnx dump session <agent-name> <session-id> [--format text|yaml|json] [--follow]`
+
+Dumps the session transcript (history).
+
+Formats:
+- `--format text` (default): Syntax-highlighted, human-readable output matching one-shot `harnx prompt` rendering. Reconstructs messages and tool calls/results into clean terminal output.
+- `--format yaml`: Prints all durable transcript entries as `---`-separated `SessionLogEntry` YAML documents (includes messages, tool calls, tool results, and control entries).
+- `--format json`: Prints transcript entries as **JSONL** (JSON Lines) with exactly one `SessionLogEntry` JSON object per line. This is NOT a single JSON array `[...]` — each line is an independent JSON object, making it streamable and directly parseable with `jq -c` or line-by-line scripts without loading the entire transcript into memory at once.
+
+Live tail with `--follow`:
+- `--follow`: Runs a `tail -f`-style live follow mode. Replays existing history to stdout, then listens for newly committed durable entries and streams them until interrupted with `Ctrl-C`.
+- Read-only observation: `--follow` observes the session stream and does not interrupt, cancel, or modify the running session or agent.
+
+### `harnx list sessions`
+
+Lists available sessions. For local agents, lists sessions in the local NATS store. When targeting a remote agent via `--agent <remote-agent>`, lists sessions in that remote cluster. (Replaces the deprecated `--list-sessions` flag.)
+
+### `harnx delete session <session-id> --cluster <cluster>`
+
+Deletes a remote NATS session log stream and its lease key from the specified cluster. (Replaces the old `harnx session delete` command.)

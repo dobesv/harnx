@@ -2,9 +2,9 @@
 source: crates/harnx-tui/src/tests.rs
 expression: rendered
 ---
-Session Info────────────────────────────────────────────────
+Session Transcript──────────────────────────────────────────
 Error: No active session or insufficient arguments. Usage:
-.info session [<agent> <id>] [--format text|yaml|json]
+.dump session [<agent> <id>] [--format text|yaml|json]
 
 
 
