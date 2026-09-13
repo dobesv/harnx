@@ -180,7 +180,8 @@ fn web_project_process(program: &OsStr, web_dir: &Path) -> Command {
 }
 
 /// Ask Corepack to download and cache the pnpm version pinned by the web
-/// project's `package.json` before invoking the pnpm shim.
+/// project's `package.json` and bootstrap its native executable before invoking
+/// the pnpm shim, which may run inside a sandbox with a read-only Corepack cache.
 fn install_pnpm_with_corepack(web_dir: &Path) -> Result<()> {
     println!("==> Preparing web-ui package manager (corepack install)");
     let mut install = web_project_process(OsStr::new("corepack"), web_dir);
@@ -188,7 +189,17 @@ fn install_pnpm_with_corepack(web_dir: &Path) -> Result<()> {
     run_command(&mut install, "corepack install").with_context(|| {
         "failed to prepare the pnpm version pinned by web/package.json; install Corepack or pass \
          --skip-web to install without the web UI"
-    })
+    })?;
+
+    // Corepack only unpacks the package; it does not install optional dependencies
+    // or run lifecycle scripts. pnpm 12 downloads its native binary on first use.
+    println!("==> Bootstrapping web-ui pnpm (corepack pnpm --version)");
+    let mut bootstrap = web_project_process(OsStr::new("corepack"), web_dir);
+    bootstrap.args(["pnpm", "--version"]);
+    run_command(&mut bootstrap, "corepack pnpm --version").context(
+        "failed to bootstrap pnpm; run `corepack pnpm --version` from web/ outside the \
+         sandbox with write access to the Corepack cache, or pass --skip-web",
+    )
 }
 
 /// Create a pnpm process rooted in the web project so Corepack always resolves
@@ -836,6 +847,71 @@ mod tests {
         let command = web_project_process(OsStr::new("corepack"), web_dir);
 
         assert_eq!(command.get_current_dir(), Some(web_dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn web_install_bootstraps_native_pnpm_before_using_shim() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root = unique_tmp("pnpm-bootstrap");
+        let web = root.join("web");
+        let bin = root.join("bin");
+        let data = root.join("data");
+        fs::create_dir_all(&web).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(web.join("package.json"), "{}").unwrap();
+        let scripts = [
+            (
+                "corepack",
+                r#"#!/bin/sh
+set -eu
+test -f package.json
+test "$COREPACK_ENABLE_DOWNLOAD_PROMPT" = 0
+case "$*" in
+  install) printf wrapper > wrapper-cached ;;
+  'pnpm --version') test -f wrapper-cached; printf native > native-cached ;;
+  *) exit 1 ;;
+esac
+"#,
+            ),
+            (
+                "pnpm-shim",
+                r#"#!/bin/sh
+set -eu
+test -f package.json
+test "$COREPACK_ENABLE_DOWNLOAD_PROMPT" = 0
+# Model a sandboxed shim that cannot download the missing native executable.
+test -f native-cached
+case "$*" in
+  --version) printf '12.4.1\n' ;;
+  'install --frozen-lockfile') printf dependencies > dependencies-installed ;;
+  build) test -f dependencies-installed; mkdir dist; printf built > dist/index.html ;;
+  *) exit 1 ;;
+esac
+"#,
+            ),
+        ];
+        for (name, script) in scripts {
+            let path = bin.join(name);
+            fs::write(&path, script).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut paths = vec![bin];
+        paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+        let path = env::join_paths(paths).unwrap();
+        let _path = EnvVarGuard::set("PATH", path.to_str().unwrap());
+        let _pnpm = EnvVarGuard::set("PNPM", "pnpm-shim");
+        let _data = EnvVarGuard::set("HARNX_DATA_DIR", data.to_str().unwrap());
+
+        install_web_assets(&root).unwrap();
+
+        assert_eq!(
+            fs::read(data.join("web-assets/index.html")).unwrap(),
+            b"built"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
