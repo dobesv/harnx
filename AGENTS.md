@@ -263,6 +263,27 @@ session continues and the agent can retry. The canonical pattern is
 `crates/harnx-fs-tools/src/toolset.rs:59-66`. When adding a native toolset, do not special-case
 `ErrorCode::INTERNAL_ERROR` to `Fatal`.
 
+### MCP ServerHandler::call_tool error mapping
+
+MCP server implementations (`ServerHandler::call_tool`) must return recoverable failures as
+`Ok(CallToolResult::error(vec![ContentBlock::text(msg)]))` (`is_error: Some(true)`). This applies to:
+
+- argument deserialization errors (`parse_arguments`) and input validation failures
+- domain execution failures (missing resources, file I/O errors, failed text replacements, rate limits)
+
+Reserve `Err(ErrorData)` exclusively for:
+
+- unknown tool names (`ErrorData::invalid_params("unknown tool: ...")`)
+- malformed envelopes rejected before handler execution
+- broken transport, lifecycle, or session state
+
+Do not return `method_not_found` (-32601) for unknown tool names in `tools/call`. That code is
+reserved for unknown JSON-RPC methods. Unknown tool requests must return `invalid_params` (-32602).
+
+Per SEP-1303 and the MCP specification, client agents use `is_error: true` results to see error text
+and self-correct. Returning JSON-RPC error frames for domain or argument errors causes client SDKs to
+abort the session. See `crates/harnx-mcp-plans-core` for the reference implementation.
+
 ### Session log entries and transcript protocol
 
 Local broker failover keeps the authenticated endpoint stable and runs election

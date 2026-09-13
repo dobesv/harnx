@@ -12,6 +12,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 fancy-regex = { workspace = true }
 harnx-core = { path = "../harnx-core" }
+harnx-metrics = { workspace = true }
 harnx-toolset = { path = "../harnx-toolset" }
 harnx-toolset-server = { path = "../harnx-toolset-server" }
 log = { workspace = true }

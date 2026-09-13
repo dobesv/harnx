@@ -312,10 +312,9 @@ fn store_error_to_error_data(err: StoreError) -> ErrorData {
         StoreError::InvalidId(message) | StoreError::InvalidParams(message) => {
             ErrorData::invalid_params(message, None)
         }
-        StoreError::RateLimited { retry_after_secs } => ErrorData::new(
-            rmcp::model::ErrorCode(-32001),
+        StoreError::RateLimited { retry_after_secs } => ErrorData::invalid_params(
             format!("rate limited; retry after {retry_after_secs}s"),
-            Some(json!({ "retry_after_secs": retry_after_secs })),
+            None,
         ),
         StoreError::Backend(err) => ErrorData::internal_error(err.to_string(), None),
     }
@@ -370,3 +369,23 @@ macro_rules! impl_json_schema {
 }
 
 pub(crate) use impl_json_schema;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_error_rate_limited_maps_to_invalid_params() {
+        let error = StoreError::RateLimited {
+            retry_after_secs: 30,
+        };
+        let error_data = store_error_to_error_data(error);
+
+        // The error code should be INVALID_PARAMS (-32602), not a custom code
+        assert_eq!(error_data.code, rmcp::model::ErrorCode(-32602));
+
+        // The message should contain the retry guidance
+        assert!(error_data.message.contains("rate limited"));
+        assert!(error_data.message.contains("30s"));
+    }
+}

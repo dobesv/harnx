@@ -32,6 +32,19 @@ fn tool_call_succeeded(result: &Result<CallToolResult, ErrorData>) -> bool {
         .is_ok_and(|result| result.is_error != Some(true))
 }
 
+/// Converts a domain/inner error into an isError result.
+///
+/// This wrapper maps `Err(ErrorData)` to `Ok(CallToolResult::error(...))`,
+/// ensuring recoverable failures are returned as `is_error: Some(true)`
+/// instead of JSON-RPC error frames. Used at the `dispatch_call_tool`
+/// boundary for known-tool arms.
+fn domain_result(result: Result<CallToolResult, ErrorData>) -> Result<CallToolResult, ErrorData> {
+    match result {
+        Ok(ok) => Ok(ok),
+        Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e.message)])),
+    }
+}
+
 impl ServerHandler for PlansServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -128,64 +141,154 @@ impl PlansServer {
     ) -> Result<CallToolResult, ErrorData> {
         match request.name.as_ref() {
             "list_plans" => {
-                let _params = parse_arguments::<ListPlansParams>(request.arguments)?;
-                self.handle_list_plans().await
+                let request = request;
+                domain_result(
+                    async {
+                        let _params = parse_arguments::<ListPlansParams>(request.arguments)?;
+                        self.handle_list_plans().await
+                    }
+                    .await,
+                )
             }
             "add_plan" => {
-                let params = parse_arguments::<AddPlanParams>(request.arguments)?;
-                self.handle_add_plan(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<AddPlanParams>(request.arguments)?;
+                        self.handle_add_plan(params).await
+                    }
+                    .await,
+                )
             }
             "get_plan" => {
-                let params = parse_arguments::<GetPlanParams>(request.arguments)?;
-                self.handle_get_plan(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<GetPlanParams>(request.arguments)?;
+                        self.handle_get_plan(params).await
+                    }
+                    .await,
+                )
             }
             "update_plan" => {
-                let params = parse_arguments::<UpdatePlanParams>(request.arguments)?;
-                self.handle_update_plan(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<UpdatePlanParams>(request.arguments)?;
+                        self.handle_update_plan(params).await
+                    }
+                    .await,
+                )
             }
             "delete_plan" => {
-                let params = parse_arguments::<DeletePlanParams>(request.arguments)?;
-                self.handle_delete_plan(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<DeletePlanParams>(request.arguments)?;
+                        self.handle_delete_plan(params).await
+                    }
+                    .await,
+                )
             }
             "list_tasks" => {
-                let params = parse_arguments::<ListTasksParams>(request.arguments)?;
-                self.handle_list_tasks(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<ListTasksParams>(request.arguments)?;
+                        self.handle_list_tasks(params).await
+                    }
+                    .await,
+                )
             }
             "add_task" => {
-                let params = parse_arguments::<AddTaskParams>(request.arguments)?;
-                self.handle_add_task(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<AddTaskParams>(request.arguments)?;
+                        self.handle_add_task(params).await
+                    }
+                    .await,
+                )
             }
             "get_task" => {
-                let params = parse_arguments::<GetTaskParams>(request.arguments)?;
-                self.handle_get_task(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<GetTaskParams>(request.arguments)?;
+                        self.handle_get_task(params).await
+                    }
+                    .await,
+                )
             }
             "update_task" => {
-                let params = parse_arguments::<UpdateTaskParams>(request.arguments)?;
-                self.handle_update_task(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<UpdateTaskParams>(request.arguments)?;
+                        self.handle_update_task(params).await
+                    }
+                    .await,
+                )
             }
             "delete_task" => {
-                let params = parse_arguments::<DeleteTaskParams>(request.arguments)?;
-                self.handle_delete_task(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<DeleteTaskParams>(request.arguments)?;
+                        self.handle_delete_task(params).await
+                    }
+                    .await,
+                )
             }
             "list_notes" => {
-                let params = parse_arguments::<ListNotesParams>(request.arguments)?;
-                self.handle_list_notes(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<ListNotesParams>(request.arguments)?;
+                        self.handle_list_notes(params).await
+                    }
+                    .await,
+                )
             }
             "add_note" => {
-                let params = parse_arguments::<AddNoteParams>(request.arguments)?;
-                self.handle_add_note(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<AddNoteParams>(request.arguments)?;
+                        self.handle_add_note(params).await
+                    }
+                    .await,
+                )
             }
             "get_note" => {
-                let params = parse_arguments::<GetNoteParams>(request.arguments)?;
-                self.handle_get_note(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<GetNoteParams>(request.arguments)?;
+                        self.handle_get_note(params).await
+                    }
+                    .await,
+                )
             }
             "update_note" => {
-                let params = parse_arguments::<UpdateNoteParams>(request.arguments)?;
-                self.handle_update_note(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<UpdateNoteParams>(request.arguments)?;
+                        self.handle_update_note(params).await
+                    }
+                    .await,
+                )
             }
             "delete_note" => {
-                let params = parse_arguments::<DeleteNoteParams>(request.arguments)?;
-                self.handle_delete_note(params).await
+                let request = request;
+                domain_result(
+                    async {
+                        let params = parse_arguments::<DeleteNoteParams>(request.arguments)?;
+                        self.handle_delete_note(params).await
+                    }
+                    .await,
+                )
             }
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),
