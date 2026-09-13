@@ -61,6 +61,8 @@ pub use harnx_execution_control::{CancelReceipt, CancelRequest, CancellationStat
 use harnx_execution_control::{ExecutionStore, OperationRef};
 pub(crate) mod cancellation;
 mod completion;
+#[cfg(test)]
+mod replay_tests;
 
 /// Generate a client-side message ID (UUID v4).
 pub(crate) fn new_client_message_id() -> String {
@@ -1457,30 +1459,24 @@ pub struct NatsTurnResult {
     pub user_msg_id: String,
 }
 
-/// Render a session log entry to an event sink.
+/// Replay stored transcript entries synchronously through a frontend's text sink.
 ///
-/// Used for rendering history when attaching to an existing session.
-#[allow(dead_code)]
-fn should_skip_replay_entry(seq: u64, user_msg_seq: u64) -> bool {
-    seq == user_msg_seq
-}
-
-#[allow(dead_code)]
-fn replay_history_to_sink(
-    effective_history: &[(u64, SessionLogEntry)],
-    history_window: &ActiveContextWindow<'_, (u64, SessionLogEntry)>,
-    user_msg_seq: u64,
-    sink: Arc<dyn AgentEventSink>,
-) {
-    for (seq, entry) in effective_history {
-        if should_skip_replay_entry(*seq, user_msg_seq) {
-            continue;
-        }
-        render_log_entry_to_sink(entry, *seq, history_window, sink.clone());
+/// Entries are rendered in the supplied order, including every user message.
+/// To render an effective snapshot, callers must apply log mutations first; this
+/// helper does not resolve edits or rewinds. Control entries remain silent except
+/// for the existing cancellation and error notices.
+///
+/// Physical sequences are preserved for `LogSeqAssigned` events. Logical indices
+/// are relative to the active context window in this slice (after its last
+/// compaction), so passing a follow delta starts a new numbering window. Entries
+/// before that window still render, but without sequence assignments.
+pub fn replay_entries_to_sink(entries: &[(u64, SessionLogEntry)], sink: Arc<dyn AgentEventSink>) {
+    let history_window = active_context_window(entries);
+    for (seq, entry) in entries {
+        render_log_entry_to_sink(entry, *seq, &history_window, sink.clone());
     }
 }
 
-#[allow(dead_code)]
 fn render_log_entry_to_sink(
     entry: &SessionLogEntry,
     physical_seq: u64,
@@ -1508,9 +1504,8 @@ fn render_log_entry_to_sink(
             render_error_entry(message, &sink);
             false
         }
-        // Production replay path is currently unused. Live advisory events are
-        // emitted at creation; later hydration paths replay durable control state.
-        // Rendering these here would duplicate live events on reattach.
+        // Control state is hydrated separately from human transcript output.
+        // Rendering these here would duplicate live advisory events on reattach.
         SessionLogEntry::SubAgentStarted { .. }
         | SessionLogEntry::HandoffCommitted { .. }
         | SessionLogEntry::HitlApprovalRequested { .. }
@@ -2057,7 +2052,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replay_history_skips_last_user_message_only() {
+    fn test_replay_entries_includes_all_user_messages() {
         let count = Arc::new(AtomicUsize::new(0));
         let sink = Arc::new(TestSink {
             count: Arc::clone(&count),
@@ -2070,12 +2065,11 @@ mod tests {
             (3, MessageRole::User, "current user"),
         ]);
 
-        let window = active_context_window(&effective_history);
-        replay_history_to_sink(&effective_history, &window, 3, sink.clone());
+        replay_entries_to_sink(&effective_history, sink.clone());
 
         // Metadata is outside the transcript, so the first user row is logical
         // zero and sequence assignment is immediately authoritative.
-        assert_eq!(count.load(Ordering::SeqCst), 4);
+        assert_eq!(count.load(Ordering::SeqCst), 6);
         let rendered_messages: Vec<String> = sink
             .events
             .lock()
@@ -2089,8 +2083,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(rendered_messages, vec!["first user", "assistant"]);
-        assert!(!rendered_messages.iter().any(|msg| msg == "current user"));
+        assert_eq!(
+            rendered_messages,
+            vec!["first user", "assistant", "current user"]
+        );
         let replayed_seqs: Vec<usize> = sink
             .events
             .lock()
@@ -2101,7 +2097,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(replayed_seqs, vec![0, 1]);
+        assert_eq!(replayed_seqs, vec![0, 1, 2]);
     }
 
     #[test]
@@ -2118,8 +2114,7 @@ mod tests {
             (3, MessageRole::User, "current user"),
         ]);
 
-        let window = active_context_window(&effective_history);
-        replay_history_to_sink(&effective_history, &window, 3, sink.clone());
+        replay_entries_to_sink(&effective_history, sink.clone());
 
         let replayed_seqs: Vec<usize> = sink
             .events
@@ -2131,7 +2126,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(replayed_seqs, vec![0, 1]);
+        assert_eq!(replayed_seqs, vec![0, 1, 2]);
     }
 
     #[test]

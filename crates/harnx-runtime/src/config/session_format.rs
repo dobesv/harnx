@@ -134,7 +134,7 @@ mod tests {
     use serde::Deserialize;
     use serde_json::{json, Value};
 
-    fn entries() -> Vec<SessionLogEntry> {
+    fn message_and_tool_entries() -> Vec<SessionLogEntry> {
         vec![
             SessionLogEntry::Message {
                 id: Some("message-id".into()),
@@ -167,6 +167,12 @@ mod tests {
                 }],
                 timestamp: None,
             },
+        ]
+    }
+
+    fn entries() -> Vec<SessionLogEntry> {
+        let mut entries = message_and_tool_entries();
+        entries.extend([
             SessionLogEntry::DataUrls {
                 urls: [("cid:attachment".into(), "attachment.png".into())].into(),
             },
@@ -216,7 +222,8 @@ mod tests {
             },
             SessionLogEntry::Cancel { fence_token: 7 },
             SessionLogEntry::Unknown,
-        ]
+        ]);
+        entries
     }
 
     #[test]
@@ -250,27 +257,22 @@ mod tests {
     }
 
     #[test]
-    fn yaml_doc_round_trips_all_entry_variants() -> Result<()> {
+    fn entry_emitters_round_trip_all_variants() -> Result<()> {
         for entry in entries() {
+            let expected = serde_json::to_value(&entry)?;
             let document = yaml_doc(&entry)?;
             assert!(document.starts_with("---\n"));
             assert!(document.ends_with('\n'));
             assert_eq!(serde_yaml::Deserializer::from_str(&document).count(), 1);
-            let decoded: SessionLogEntry = serde_yaml::from_str(&document)?;
-            assert_eq!(serde_json::to_value(decoded)?, serde_json::to_value(entry)?);
-        }
-        Ok(())
-    }
+            let yaml_entry: SessionLogEntry = serde_yaml::from_str(&document)?;
+            assert_eq!(serde_json::to_value(yaml_entry)?, expected);
 
-    #[test]
-    fn jsonl_line_round_trips_all_entry_variants() -> Result<()> {
-        for entry in entries() {
             let line = jsonl_line(&entry)?;
             assert!(line.starts_with('{'));
             assert!(line.ends_with("}\n"));
             assert_eq!(line.lines().count(), 1);
-            let decoded: SessionLogEntry = serde_json::from_str(&line)?;
-            assert_eq!(serde_json::to_value(decoded)?, serde_json::to_value(entry)?);
+            let json_entry: SessionLogEntry = serde_json::from_str(&line)?;
+            assert_eq!(serde_json::to_value(json_entry)?, expected);
         }
         Ok(())
     }

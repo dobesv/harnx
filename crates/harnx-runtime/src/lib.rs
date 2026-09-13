@@ -45,8 +45,8 @@ mod worker_identity;
 
 // Re-export session types for frontends
 pub use nats_session::{
-    send_control_command, DurableTextEnqueue, NatsSession, NatsSessionConfig, NatsTurnResult,
-    RunTurnOptions, SessionLeaseWatchdog,
+    replay_entries_to_sink, send_control_command, DurableTextEnqueue, NatsSession,
+    NatsSessionConfig, NatsTurnResult, RunTurnOptions, SessionLeaseWatchdog,
 };
 pub use nats_session_metadata::{SessionInitializer, SessionOverrides};
 pub use nats_worker::{ControlCommand, SessionActivationRoute};
