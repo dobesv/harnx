@@ -6215,19 +6215,19 @@ async fn tool_confirmation_does_not_replace_an_existing_modal() {
     let config = test_config();
     let mut tui = Tui::init(&config).await.unwrap();
     tui.app.modal = Some(crate::types::ModalState::ConfirmDelete { from: 3, to: 3 });
-    let (reply, decision) = std::sync::mpsc::channel();
+    let (reply, decision) = tokio::sync::oneshot::channel();
 
     tui.handle_tui_event(TuiEvent::ToolConfirmation(ToolConfirmationEvent::Show {
         confirmation_id: 41,
         tool_name: "atlas_session_handoff".to_string(),
         input_preview: r#"{"prompt":"execute"}"#.to_string(),
         reason: Some("Hand off this plan?".to_string()),
-        reply,
+        reply: crate::tool_confirmation::ToolConfirmationReply::Async(reply),
     }))
     .await
     .unwrap();
 
-    assert!(!decision.recv().unwrap());
+    assert!(!decision.await.unwrap());
     assert!(matches!(
         tui.app.modal,
         Some(crate::types::ModalState::ConfirmDelete { from: 3, to: 3 })
@@ -6243,14 +6243,14 @@ async fn tool_confirmation_does_not_replace_an_existing_modal() {
 async fn remote_confirmation_cleanup_dismisses_only_its_own_modal() {
     let config = test_config();
     let mut tui = Tui::init(&config).await.unwrap();
-    let (reply, decision) = std::sync::mpsc::channel();
+    let (reply, decision) = tokio::sync::oneshot::channel();
 
     tui.handle_tui_event(TuiEvent::ToolConfirmation(ToolConfirmationEvent::Show {
         confirmation_id: 42,
         tool_name: "atlas_session_handoff".to_string(),
         input_preview: r#"{"prompt":"execute"}"#.to_string(),
         reason: Some("Hand off this plan?".to_string()),
-        reply,
+        reply: crate::tool_confirmation::ToolConfirmationReply::Async(reply),
     }))
     .await
     .unwrap();
@@ -6269,13 +6269,13 @@ async fn remote_confirmation_cleanup_dismisses_only_its_own_modal() {
     }))
     .await
     .unwrap();
-    assert!(!decision.recv().unwrap());
+    assert!(!decision.await.unwrap());
     assert!(tui.app.modal.is_none());
     assert!(tui.app.pending_confirm_reply.is_none());
     assert!(tui.app.pending_confirm_id.is_none());
     assert!(tui.app.transcript.iter().any(|item| matches!(
         item,
-        TranscriptItem::SystemText(text) if text.contains("expired or was cancelled")
+        TranscriptItem::SystemText(text) if text.contains("was cancelled")
     )));
 }
 

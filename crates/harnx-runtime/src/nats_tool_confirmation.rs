@@ -19,9 +19,6 @@ use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
-
-pub const TOOL_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolConfirmationRequest {
@@ -214,19 +211,13 @@ pub(crate) fn nats_confirm_tool_use(
                     return denied(reason);
                 }
             };
-            let nats_request = async_nats::Request::new()
-                .payload(payload.into())
-                .timeout(Some(TOOL_CONFIRMATION_TIMEOUT));
-            let abort_signal = abort_signal.clone();
             let response = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    tokio::select! {
-                        _ = wait_abort_signal(&abort_signal) => None,
-                        response = client.send_request(subject.clone(), nats_request) => {
-                            Some(response)
-                        }
-                    }
-                })
+                tokio::runtime::Handle::current().block_on(request_confirmation(
+                    &client,
+                    &subject,
+                    payload,
+                    &abort_signal,
+                ))
             });
             let response = match response {
                 None => {
@@ -251,8 +242,29 @@ pub(crate) fn nats_confirm_tool_use(
     )
 }
 
+async fn request_confirmation(
+    client: &async_nats::Client,
+    subject: &str,
+    payload: Vec<u8>,
+    abort_signal: &AbortSignal,
+) -> Option<Result<async_nats::Message, async_nats::RequestError>> {
+    // Human input has no deadline. Explicit None also overrides the client's
+    // default RPC timeout; omitting timeout() would inherit that limit.
+    let request = async_nats::Request::new()
+        .payload(payload.into())
+        .timeout(None);
+    tokio::select! {
+        _ = wait_abort_signal(abort_signal) => None,
+        response = client.send_request(subject.to_string(), request) => Some(response),
+    }
+}
+
 fn denied(reason: Option<&str>) -> ToolUseConfirmation {
     ToolUseConfirmation::Deny {
         reason: reason.map(str::to_string),
     }
 }
+
+#[cfg(test)]
+#[path = "nats_tool_confirmation_tests.rs"]
+mod tests;

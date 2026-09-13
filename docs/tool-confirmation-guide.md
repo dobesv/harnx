@@ -86,6 +86,7 @@ Allow this tool call? (y/N)
 ```
 
 *   **Default Behavior**: The default choice is **No** (deny). You must explicitly type `y` to approve.
+*   **Waiting for Approval**: TUI approval prompts have no time limit. Leaving a prompt unanswered does not deny the tool call. Cancelling the turn or closing or detaching the TUI still ends the wait.
 *   **Agent Feedback**: If denied, the agent receives: `{"error": "Denied by user", "blocked_by_hook": true}`. The agent can then choose to try a different approach or ask you for clarification.
 *   **Non-interactive Mode**: If Harnx is running without a TUI/terminal (e.g., in CI or a pipe), tool calls requiring confirmation are **automatically denied**.
 
