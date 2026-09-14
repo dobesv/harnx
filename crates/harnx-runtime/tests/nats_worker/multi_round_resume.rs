@@ -22,7 +22,7 @@ async fn mid_tool_round_user_message_is_injected_once_into_same_turn() -> Result
 
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let session_id = "mid-round-injection";
-    let log = NatsSessionLog::new(js.clone(), session_id);
+    let log = NatsSessionLog::new(js.clone(), storage_key(session_id));
     let queue_session = NatsSession::new(
         NatsSessionConfig {
             cluster: "local".to_string(),
@@ -147,7 +147,7 @@ fn successful_tool_result(name: &str, call_id: &str) -> SessionLogEntry {
 
 async fn seed_resume_fixture(server_url: &str) -> Result<ResumeFixture> {
     let js = local_test_nats(server_url).await?;
-    let log = NatsSessionLog::new(js.clone(), SESSION_ID);
+    let log = NatsSessionLog::new(js.clone(), storage_key(SESSION_ID));
     seed_session_metadata(&js, SESSION_ID).await?;
     log.append_event_async(&append_user_message_entry("user-1", "original request"))
         .await?;

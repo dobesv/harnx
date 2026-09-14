@@ -44,7 +44,7 @@ impl Tui {
         // the coordinator rejects old rows after a child session is reused.
         self.exit_after_cancel = false;
         self.start_cancellation(
-            view.key.session_id,
+            view.key.storage_key(),
             view.key.cluster,
             Some(progress.snapshot.invocation_id),
         );
@@ -241,7 +241,7 @@ impl Tui {
             return;
         }
         let inherited_cluster = self.current_session_cluster();
-        let (target_ref, target_cluster) = handoff_target(&agent, &inherited_cluster);
+        let (target_ref, _) = handoff_target(&agent, &inherited_cluster);
         if let Err(error) = harnx_runtime::config::Config::use_agent(
             &self.config,
             &target_ref,
@@ -258,7 +258,7 @@ impl Tui {
         }
 
         self.current_prompt_abort = None;
-        self.active_remote_session = Some((session_id, target_cluster));
+        self.active_remote_session = self.session_activity_destination();
         self.reset_for_handoff_target().await;
     }
 

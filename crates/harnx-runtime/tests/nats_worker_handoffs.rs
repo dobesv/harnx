@@ -128,7 +128,7 @@ impl HandoffFixture {
         let explicit_target = self.session("delegate-agent", EXPLICIT_TARGET_ID).await?;
         let explicit_log = NatsSessionLog::new(
             self.jetstream.clone(),
-            explicit_target.session_id().to_string(),
+            explicit_target.storage_key().to_string(),
         );
         append_prior_turn(&explicit_log).await?;
         self.session("other-agent", OTHER_TARGET_ID).await?;
@@ -183,15 +183,16 @@ impl HandoffFixture {
         assert_generated_events(&observed, agent, target_id);
         assert_eq!(
             tokio::time::timeout(CI_SAFE_TIMEOUT, activation_observer).await???,
-            target_id.as_str()
+            harnx_core::session_identity::session_key(Some("delegate-agent"), target_id)
         );
-        let target_log = NatsSessionLog::new(self.jetstream.clone(), target_id);
+        let target_log =
+            NatsSessionLog::for_agent(self.jetstream.clone(), "delegate-agent", target_id);
         let entries = wait_for_handoff_target(&target_log, "finish generated work").await?;
         assert_handoff_target_log(&entries, "finish generated work");
         Ok(())
     }
 
-    async fn run_ownership_mismatch_scenario(&self) -> Result<()> {
+    async fn run_agent_scoped_id_reuse_scenario(&self) -> Result<()> {
         let source = self
             .session("source-agent", "nats-handoff-mismatch-root")
             .await?;
@@ -200,12 +201,8 @@ impl HandoffFixture {
             .run_turn("ownership mismatch", Arc::new(NullSink), None)
             .await?;
         assert!(
-            result.error.as_deref().is_some_and(|error| {
-                error.contains("belongs to")
-                    || error.contains("different agent")
-                    || error.contains("identity mismatch")
-            }),
-            "ownership mismatch must fail the source turn: {:?}",
+            result.error.is_none(),
+            "another agent may reuse the same local ID: {:?}",
             result.error
         );
         let observed = observe_source_handoff(stream).await?;
@@ -216,10 +213,18 @@ impl HandoffFixture {
                 Some(OTHER_TARGET_ID.to_string())
             ))
         );
-        assert!(observed.committed.is_none());
-        let entries = NatsSessionLog::new(self.jetstream.clone(), OTHER_TARGET_ID)
-            .load_events_async()
-            .await?;
+        assert_eq!(
+            observed.committed.as_ref().map(|(_, id, _)| id.as_str()),
+            Some(OTHER_TARGET_ID)
+        );
+        let target_log =
+            NatsSessionLog::for_agent(self.jetstream.clone(), "delegate-agent", OTHER_TARGET_ID);
+        let target_entries = wait_for_handoff_target(&target_log, "finish reused-ID work").await?;
+        assert_handoff_target_log(&target_entries, "finish reused-ID work");
+        let entries =
+            NatsSessionLog::for_agent(self.jetstream.clone(), "other-agent", OTHER_TARGET_ID)
+                .load_events_async()
+                .await?;
         assert!(entries.is_empty());
         Ok(())
     }
@@ -228,13 +233,13 @@ impl HandoffFixture {
         SessionEventStream::attach(
             self.jetstream.clone(),
             self.client.clone(),
-            session.session_id(),
+            session.storage_key(),
         )
         .await
     }
 
     fn log(&self, session: &NatsSession) -> NatsSessionLog {
-        NatsSessionLog::new(self.jetstream.clone(), session.session_id())
+        NatsSessionLog::new(self.jetstream.clone(), session.storage_key())
     }
 
     async fn observe_target_activation(
@@ -246,7 +251,7 @@ impl HandoffFixture {
         Ok(spawn_activation_observer(
             subscriber,
             self.jetstream.clone(),
-            source.session_id().to_string(),
+            source.storage_key().to_string(),
         ))
     }
 }
@@ -311,7 +316,7 @@ fn handoff_call_fn() -> harnx_runtime::agent_loop::AgentCallFn {
             if agent == "source-agent" {
                 let (session_id, target_prompt) = match prompt.as_str() {
                     "explicit handoff" => (Some(EXPLICIT_TARGET_ID), "finish explicit work"),
-                    "ownership mismatch" => (Some(OTHER_TARGET_ID), "must not be queued"),
+                    "ownership mismatch" => (Some(OTHER_TARGET_ID), "finish reused-ID work"),
                     _ => (None, "finish generated work"),
                 };
                 Ok((
@@ -548,7 +553,7 @@ fn assert_handoff_target_log(entries: &[(u64, SessionLogEntry)], expected_prompt
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn handoffs_queue_top_level_sessions_preserve_history_and_validate_ownership() -> Result<()> {
+async fn handoffs_queue_top_level_sessions_preserve_history_and_scope_ids_by_agent() -> Result<()> {
     require_nextest();
     let Some(fixture) = HandoffFixture::start().await? else {
         return Ok(());
@@ -556,7 +561,7 @@ async fn handoffs_queue_top_level_sessions_preserve_history_and_validate_ownersh
     let explicit_log = fixture.seed_destinations().await?;
     fixture.run_explicit_scenario(&explicit_log).await?;
     fixture.run_generated_scenario().await?;
-    fixture.run_ownership_mismatch_scenario().await?;
+    fixture.run_agent_scoped_id_reuse_scenario().await?;
     assert!(fixture.config.read().session.is_none());
     assert!(fixture.config.read().agent.is_none());
     Ok(())

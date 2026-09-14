@@ -67,13 +67,15 @@ async fn seed_and_activate(
         initializer,
         message_id,
     } = seed;
+    let storage_key = initializer.session_key(session_id);
     store
         .create(&SessionMetadata::new(session_id, initializer))
         .await?;
-    NatsSessionLog::new(jetstream.clone(), session_id)
+    NatsSessionLog::new(jetstream.clone(), &storage_key)
         .append_event_async(&append_user_message_entry(message_id, message_id))
         .await?;
-    activate_session(jetstream, session_id).await
+    publish_session_activate(jetstream, "local", &SessionActivate::new(storage_key)).await?;
+    Ok(())
 }
 
 fn assert_agent_versions(captured: &[CapturedAgent]) {
@@ -186,7 +188,7 @@ async fn missing_named_agent_fails_durably_without_calling_the_model() -> Result
         },
     )
     .await?;
-    let log = NatsSessionLog::new(jetstream, session_id);
+    let log = NatsSessionLog::for_agent(jetstream, "does-not-exist", session_id);
 
     let entries = tokio::time::timeout(CI_SAFE_TIMEOUT, async {
         loop {
@@ -204,6 +206,54 @@ async fn missing_named_agent_fails_durably_without_calling_the_model() -> Result
     assert!(entries
         .iter()
         .any(|(_, entry)| matches!(entry, SessionLogEntry::Error { .. })));
+    daemon.abort();
+    let _ = daemon.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_local_id_executes_with_each_agents_configuration() -> Result<()> {
+    let Some(server) = require_nats_server().await? else {
+        return Ok(());
+    };
+    let config_root = tempfile::tempdir()?;
+    for agent in ["alpha", "beta"] {
+        write_test_agent(config_root.path(), agent, agent)?;
+    }
+    let _config_guard = EnvVarGuard::set_path("HARNX_CONFIG_DIR", config_root.path());
+    let captured = Arc::new(AsyncMutex::new(Vec::<CapturedAgent>::new()));
+    let daemon = spawn_worker_daemon_with_call_fn(
+        local_nats_runtime_config(server.url()),
+        "worker-agent-isolation",
+        capture_agent_call(Arc::clone(&captured)),
+    )
+    .await;
+    let js = local_test_nats(server.url()).await?;
+    let store = SessionMetadataStore::ensure(&js, 1).await?;
+    for agent in ["alpha", "beta"] {
+        seed_and_activate(
+            &js,
+            &store,
+            SeedActivation {
+                session_id: "review-12345",
+                initializer: SessionInitializer::named(agent, Default::default()),
+                message_id: agent,
+            },
+        )
+        .await?;
+    }
+    wait_until(CI_SAFE_TIMEOUT, || {
+        captured.try_lock().is_ok_and(|values| values.len() == 2)
+    })
+    .await?;
+    let mut instructions: Vec<_> = captured
+        .lock()
+        .await
+        .iter()
+        .map(|(text, _)| text.clone())
+        .collect();
+    instructions.sort();
+    assert_eq!(instructions, ["alpha", "beta"]);
     daemon.abort();
     let _ = daemon.await;
     Ok(())

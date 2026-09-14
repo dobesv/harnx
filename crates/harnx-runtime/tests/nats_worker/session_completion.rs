@@ -12,10 +12,15 @@ pub(super) async fn activate_session(
     session_id: &str,
 ) -> Result<()> {
     let store = SessionMetadataStore::ensure(jetstream, 1).await?;
-    if store.get(session_id).await?.is_none() {
+    if store.get(&storage_key(session_id)).await?.is_none() {
         seed_session_metadata(jetstream, session_id).await?;
     }
-    publish_session_activate(jetstream, "local", &SessionActivate::new(session_id)).await?;
+    publish_session_activate(
+        jetstream,
+        "local",
+        &SessionActivate::new(storage_key(session_id)),
+    )
+    .await?;
     Ok(())
 }
 
@@ -31,9 +36,10 @@ pub(super) async fn wait_for_worker_daemon_idle(
     .await?;
     // Lease acquisition precedes service preparation and active-session
     // accounting. A zero active count alone can still mean "not started yet".
+    let session_key = storage_key(session_id);
     tokio::time::timeout(CI_SAFE_TIMEOUT, async {
         loop {
-            if !harnx_runtime::nats_lease::session_has_active_lease(js, session_id).await?
+            if !harnx_runtime::nats_lease::session_has_active_lease(js, &session_key).await?
                 && harnx_runtime::nats_metrics::snapshot().active_sessions_per_worker == 0
             {
                 return Ok(());
@@ -56,7 +62,7 @@ async fn idle_wait_includes_activation_preparation() -> Result<()> {
     let lease = harnx_runtime::nats_lease::NatsSessionLease::acquire(
         harnx_runtime::nats_lease::NatsLeaseAcquireParams {
             jetstream: js.clone(),
-            session_id: "preparing-session",
+            session_id: &storage_key("preparing-session"),
             worker_id: "preparing-worker".into(),
             generation: 1,
             config: Default::default(),

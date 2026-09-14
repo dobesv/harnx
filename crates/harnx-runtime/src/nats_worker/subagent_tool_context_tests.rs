@@ -73,7 +73,7 @@ async fn create_bound_parent(url: &str) -> ParentBinding {
     metadata
         .replace_tool_context_value(
             ToolContextEntry {
-                session_id: &session_id,
+                session_id: session.storage_key(),
                 key: "sandbox",
             },
             json!({"version": 1, "sandbox_id": "sandbox-inherited"}),
@@ -81,7 +81,7 @@ async fn create_bound_parent(url: &str) -> ParentBinding {
         .await
         .unwrap();
     ParentBinding {
-        session_id,
+        session_id: session.storage_key().to_string(),
         metadata,
         _session: session,
     }
@@ -107,7 +107,10 @@ async fn create_inheriting_child(toolset: &SubagentToolset, parent_session_id: &
 
 async fn assert_inherited_context(metadata: &SessionMetadataStore, session_id: &str) {
     let context = metadata
-        .get_tool_context(session_id)
+        .get_tool_context(&harnx_core::session_identity::session_key(
+            Some("metis"),
+            session_id,
+        ))
         .await
         .unwrap()
         .unwrap();
@@ -120,7 +123,7 @@ async fn assert_inherited_context(metadata: &SessionMetadataStore, session_id: &
 async fn child_log(config: &crate::config::Config, session_id: &str) -> NatsSessionLog {
     NatsSessionLog::new(
         config.nats_jetstream("local").await.unwrap(),
-        session_id.to_string(),
+        harnx_core::session_identity::session_key(Some("metis"), session_id),
     )
 }
 

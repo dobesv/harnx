@@ -7651,8 +7651,11 @@ async fn session_picker_enter_loads_selected_session() {
             .await
             .expect("create picker session metadata fixture");
     }
-    let log =
-        harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, "my-session".to_string());
+    let log = harnx_runtime::nats_session_log::NatsSessionLog::for_agent(
+        jetstream,
+        "hermes",
+        "my-session",
+    );
     for entry in [
         harnx_core::session::SessionLogEntry::Message {
             id: None,
@@ -8898,8 +8901,7 @@ async fn test_info_session_opens_detail_view() {
     let mut harness = TuiTestHarness::with_size(80, 24).await;
     let tui = harness.tui();
 
-    // Let's test `.info session` without args, which should fallback to active session,
-    // or fail and display error in detail view since no active session exists.
+    // Missing explicit identity is reported in the detail view.
     let initial_transcript_len = tui.app.transcript.len();
 
     tui.run_command(".info session").await.unwrap();
@@ -8919,44 +8921,18 @@ async fn test_info_session_single_arg_with_active_agent() {
 
     let tui = harness.tui();
 
-    // With active agent but no active session, `.info session some-id` should work
-    // by pairing the active agent with `some-id`.
     tui.run_command(".info session some-id").await.unwrap();
-
     let text = assert_info_overlay_open(tui, None);
-    assert!(
-        !text.contains("insufficient arguments"),
-        "Should not complain about insufficient arguments when single arg provided with active agent. Text: {}",
-        text
-    );
-    assert!(
-        !text.contains("No active session or insufficient arguments"),
-        "Should not give the default usage error"
-    );
+    assert!(text.contains("An explicit agent and session ID are required"));
 }
+
 #[tokio::test]
 async fn test_info_session_single_arg_no_active_agent() {
     let mut harness = TuiTestHarness::with_size(80, 24).await;
     let tui = harness.tui();
-
-    // No active agent, no active session. .info session some-id should be treated as top-level session.
     tui.run_command(".info session some-id").await.unwrap();
-
     let text = assert_info_overlay_open(tui, None);
-    assert!(
-        !text.contains("insufficient arguments"),
-        "Should not complain about insufficient arguments when single arg provided without active agent. Text: {}",
-        text
-    );
-    assert!(
-        !text.contains("No active session or insufficient arguments"),
-        "Should not give the default usage error"
-    );
-    assert!(
-        text.contains("Error:"),
-        "Should attempt to look up session and likely fail with 'Error: ... not found' instead of usage error. Text: {}",
-        text
-    );
+    assert!(text.contains("An explicit agent and session ID are required"));
 }
 
 #[tokio::test]
@@ -9007,13 +8983,13 @@ async fn test_start_prompt_does_not_arm_remote_cancel_without_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_start_prompt_arms_remote_cancel_with_real_session_id() {
+async fn test_start_prompt_arms_remote_cancel_with_agent_scoped_key() {
     let config = test_config();
     let session_id = {
         let mut guard = config.write();
         guard.remote_agent = Some(("remote_agent_name".to_string(), "cluster_name".to_string()));
         let session = harnx_runtime::config::session::new(&guard, "real-session", None).unwrap();
-        let session_id = session.id().to_string();
+        let session_id = session.storage_key();
         guard.session = Some(session);
         session_id
     };
@@ -9243,6 +9219,46 @@ fn tool_confirmation_json_fence_exceeds_content_backticks() {
     assert!(markdown.ends_with("\n`````"));
 }
 
+#[tokio::test]
+async fn explicit_remote_session_skips_agent_picker_without_local_agents() {
+    let config = test_config();
+    {
+        let mut cfg = config.write();
+        cfg.set_remote_agent("reviewer".into(), "prod".into());
+        cfg.use_session(Some("review-12345")).unwrap();
+    }
+    Tui::check_agents_available(&config, &[]).unwrap();
+    assert!(Tui::resolve_initial_modal(&config).await.is_none());
+    assert_eq!(
+        config.read().active_agent_ref().as_deref(),
+        Some("reviewer@prod")
+    );
+}
+
+#[tokio::test]
+async fn missing_picker_origin_keeps_selected_agent_and_picker() {
+    let config = test_config_with_mock_client_and_agent("selected-agent", None);
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.app.modal = Some(crate::types::ModalState::SessionPicker {
+        sessions: vec![],
+        selected: 0,
+        origin_agent: Some("nonexistent-origin-05d194".into()),
+        origin_session: Some("review-12345".into()),
+        error: None,
+    });
+    tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(
+        config.read().active_agent_ref().as_deref(),
+        Some("selected-agent")
+    );
+    assert!(matches!(
+        tui.app.modal,
+        Some(crate::types::ModalState::SessionPicker { error: Some(_), .. })
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn dump_session_without_active_session_shows_usage_error() {
     let config = test_config();
@@ -9287,4 +9303,23 @@ async fn info_session_without_active_session_shows_usage_error() {
         rendered.contains("Error:") || rendered.contains("Usage:"),
         "should show error or usage"
     );
+}
+
+#[tokio::test]
+async fn dump_session_requires_explicit_agent_even_with_active_session() {
+    let config = test_config_with_mock_client_and_agent("reviewer", Some("review-12345"));
+    let mut tui = Tui::init(&config).await.unwrap();
+    for command in [
+        ".dump session",
+        ".dump session review-12345",
+        ".dump session --format json",
+    ] {
+        tui.run_command(command).await.unwrap();
+        assert!(tui
+            .app
+            .detail_view_text
+            .as_ref()
+            .unwrap()
+            .contains("An explicit agent and session ID are required"));
+    }
 }

@@ -214,13 +214,14 @@ async fn ensure_session_metadata(
     session_id: &str,
     initializer: &SessionInitializer,
 ) -> Result<()> {
-    if let Some(record) = store.get(session_id).await? {
+    let key = initializer.session_key(session_id);
+    if let Some(record) = store.get(&key).await? {
         record.metadata.validate_initializer(initializer)?;
-        store.ensure_reserved_activity(session_id).await?;
+        store.ensure_reserved_activity(&key).await?;
         return Ok(());
     }
 
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.to_string());
+    let log = NatsSessionLog::new(jetstream.clone(), &key);
     let existing_entries = log
         .load_events_async()
         .await
@@ -237,11 +238,11 @@ async fn ensure_session_metadata(
 
     // Another client won the create race. Its immutable identity must agree
     // with ours before either client is allowed to append a first message.
-    let winner = store.get(session_id).await?.with_context(|| {
+    let winner = store.get(&key).await?.with_context(|| {
         format!("session metadata creation race for '{session_id}' had no winner")
     })?;
     winner.metadata.validate_initializer(initializer)?;
-    store.ensure_reserved_activity(session_id).await
+    store.ensure_reserved_activity(&key).await
 }
 
 /// Determine whether a durable request still needs worker execution.
@@ -300,6 +301,7 @@ fn requested_seq_status_with_effective(
 pub struct NatsSession {
     config: NatsSessionConfig,
     session_id: String,
+    storage_key: String,
     jetstream: jetstream::Context,
     client: async_nats::Client,
     abort_signal: AbortSignal,
@@ -418,6 +420,7 @@ impl NatsSession {
         .await?;
 
         Ok(Self {
+            storage_key: config.initializer.session_key(&session_id),
             config,
             session_id,
             jetstream: jetstream.clone(),
@@ -462,12 +465,12 @@ impl NatsSession {
         // `.set`, and title changes commit through CAS before local state moves.
         let backend = crate::nats_worker::NatsSessionLogBackend::new(
             nats_session.jetstream.clone(),
-            nats_session.session_id.clone(),
+            nats_session.storage_key.clone(),
         )
         .with_metadata_store(Some(nats_session.metadata_store.clone()));
         let sink = Arc::new(backend) as Arc<dyn crate::config::session::SessionAppendSink>;
         if let Some(active_session) = global_config.write().session.as_mut() {
-            if active_session.id() == nats_session.session_id {
+            if active_session.storage_key() == nats_session.storage_key {
                 active_session.runtime = Some(Arc::new(sink));
             }
         }
@@ -478,6 +481,11 @@ impl NatsSession {
     /// Get the session ID.
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Key shared by transcript, metadata, control, and recovery protocols.
+    pub fn storage_key(&self) -> &str {
+        &self.storage_key
     }
 
     /// Start a session-scoped confirmation route for this NATS connection.
@@ -512,7 +520,7 @@ impl NatsSession {
         let operation = self
             .execution_store
             .session(
-                &self.session_id,
+                &self.storage_key,
                 self.execution_parent.clone(),
                 self.invocation_id.as_deref(),
             )
@@ -520,7 +528,7 @@ impl NatsSession {
         self.execution_store
             .reserve_prompt(&operation.reference, &user_msg_id)
             .await?;
-        let log = NatsSessionLog::new(self.jetstream.clone(), self.session_id.clone());
+        let log = NatsSessionLog::new(self.jetstream.clone(), self.storage_key.clone());
         let user_entry = SessionLogEntry::Message {
             id: Some(user_msg_id.clone()),
             role: MessageRole::User,
@@ -537,8 +545,9 @@ impl NatsSession {
             .await?;
 
         log::info!(
-            "nats session: appended user message session_id={} len={}",
+            "nats session: appended user message session_id={} storage_key={} len={}",
             self.session_id,
+            self.storage_key,
             serde_json::to_string(&user_entry).map_or(0, |entry| entry.len())
         );
         Ok(AppendedPrompt {
@@ -550,7 +559,7 @@ impl NatsSession {
     }
 
     async fn existing_invocation_prompt(&self, invocation: &str) -> Result<Option<AppendedPrompt>> {
-        let Some(operation) = self.execution_store.current(&self.session_id).await? else {
+        let Some(operation) = self.execution_store.current(&self.storage_key).await? else {
             return Ok(None);
         };
         if operation.reference.execution_id != invocation {
@@ -618,7 +627,7 @@ impl NatsSession {
         let (execution_id, user_msg_seq) = execution;
         match &self.config.activation_route {
             SessionActivationRoute::ClusterShared => {
-                let activation = SessionActivate::new(&self.session_id)
+                let activation = SessionActivate::new(&self.storage_key)
                     .with_execution_id(execution_id)
                     .with_tool_confirmation_subject(tool_confirmation_subject)
                     .with_token_budget(token_budget);
@@ -631,7 +640,7 @@ impl NatsSession {
                 worker_id,
             } => {
                 let activation =
-                    SessionActivate::targeted(&self.session_id, user_msg_seq, worker_id)
+                    SessionActivate::targeted(&self.storage_key, user_msg_seq, worker_id)
                         .with_execution_id(execution_id)
                         .with_tool_confirmation_subject(tool_confirmation_subject)
                         .with_token_budget(token_budget);
@@ -646,8 +655,9 @@ impl NatsSession {
         }
 
         log::info!(
-            "nats session: published activation session_id={} cluster={}",
+            "nats session: published activation session_id={} storage_key={} cluster={}",
             self.session_id,
+            self.storage_key,
             self.config.cluster
         );
         Ok(())
@@ -733,7 +743,7 @@ impl NatsSession {
         &self,
         confirmation_subject: Option<&str>,
     ) -> Result<Option<u64>> {
-        let log = NatsSessionLog::new(self.jetstream.clone(), self.session_id.clone());
+        let log = NatsSessionLog::new(self.jetstream.clone(), self.storage_key.clone());
         let entries = log
             .load_events_latest_async()
             .await
@@ -754,7 +764,7 @@ impl NatsSession {
         let Some(operation) = cancellation::resolve_pending_execution(
             &self.execution_store,
             &self.jetstream,
-            &self.session_id,
+            &self.storage_key,
         )
         .await?
         else {
@@ -804,7 +814,7 @@ impl NatsSession {
         loop {
             if request_control_command(
                 &self.client,
-                &self.session_id,
+                &self.storage_key,
                 &command,
                 CONTROL_ACK_ATTEMPT_TIMEOUT,
             )
@@ -921,7 +931,7 @@ impl NatsSession {
             crate::nats_attachments::AttachmentLocation::new(
                 &self.jetstream,
                 self.attachment_replicas,
-                &self.session_id,
+                &self.storage_key,
             ),
             &mut content,
             source_dir,
@@ -949,7 +959,7 @@ impl NatsSession {
             crate::nats_attachments::AttachmentLocation::new(
                 &self.jetstream,
                 self.attachment_replicas,
-                &self.session_id,
+                &self.storage_key,
             ),
             &mut content,
             source_dir,
@@ -960,7 +970,7 @@ impl NatsSession {
         let events = SessionEventStream::attach(
             self.jetstream.clone(),
             self.client.clone(),
-            &self.session_id,
+            &self.storage_key,
         )
         .await?;
         let mut appended = self.append_user_content(content).await?;
@@ -1009,7 +1019,7 @@ impl NatsSession {
             crate::nats_attachments::AttachmentLocation::new(
                 &self.jetstream,
                 self.attachment_replicas,
-                &self.session_id,
+                &self.storage_key,
             ),
             &mut content,
             source_dir,
@@ -1069,7 +1079,7 @@ impl NatsSession {
             None => SessionEventStream::attach(
                 self.jetstream.clone(),
                 self.client.clone(),
-                &self.session_id,
+                &self.storage_key,
             )
             .await
             .context("failed to attach to session event stream")?,
@@ -1115,7 +1125,7 @@ impl NatsSession {
         let mut emitted_logical_seqs = HashSet::new();
         let mut completion_updates = Box::pin(completion::updates(
             self.jetstream.clone(),
-            self.session_id.clone(),
+            self.storage_key.clone(),
             event_stream.history().to_vec(),
         ));
         let mut completion_error = None;
@@ -1361,7 +1371,7 @@ impl NatsSession {
     /// # Returns
     /// The sequence number of the appended EditEntries entry.
     pub async fn retract_user_message(&self, seq: u64) -> Result<u64> {
-        let log = NatsSessionLog::new(self.jetstream.clone(), self.session_id.clone());
+        let log = NatsSessionLog::new(self.jetstream.clone(), self.storage_key.clone());
         let seq = usize::try_from(seq).context("JetStream seq does not fit into usize")?;
         let edit_entry = SessionLogEntry::EditEntries {
             from: seq,
@@ -1387,7 +1397,7 @@ impl NatsSession {
     /// # Returns
     /// The sequence number of the appended EditEntries entry.
     pub async fn edit_user_message(&self, seq: u64, new_text: String) -> Result<u64> {
-        let log = NatsSessionLog::new(self.jetstream.clone(), self.session_id.clone());
+        let log = NatsSessionLog::new(self.jetstream.clone(), self.storage_key.clone());
         let replacement_entry = SessionLogEntry::Message {
             id: Some(new_client_message_id()),
             role: MessageRole::User,
@@ -1410,7 +1420,7 @@ impl NatsSession {
 
     /// Load all durable entries from the session log.
     async fn load_durable_entries(&self) -> Result<Vec<(u64, SessionLogEntry)>> {
-        let log = NatsSessionLog::new(self.jetstream.clone(), self.session_id.clone());
+        let log = NatsSessionLog::new(self.jetstream.clone(), self.storage_key.clone());
         log.load_events_async()
             .await
             .context("failed to load durable session log")

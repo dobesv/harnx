@@ -29,7 +29,10 @@ async fn interrupted_state_is_reconstructed_from_durable_hitl_entries() {
         .nats_jetstream(LOCAL_CLUSTER_KEY)
         .await
         .expect("local JetStream");
-    let log = harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, session_id.clone());
+    let log = harnx_runtime::nats_session_log::NatsSessionLog::new(
+        jetstream,
+        harnx_core::session_identity::session_key(Some("plain"), &session_id),
+    );
     log.append_event_async(
         &harnx_core::session::SessionLogEntry::HitlApprovalRequested {
             tool_call_id: "derived-call".to_string(),
@@ -80,7 +83,7 @@ async fn history_load_uses_worker_lease_to_keep_tool_call_pending() {
         return;
     };
 
-    let (active, _entries) = crate::load_nats_session(&config, &session_id)
+    let (active, _entries) = crate::load_nats_session(&config, "plain", &session_id)
         .await
         .expect("load active session");
     let active_tool = active.messages.last().expect("pending tool message");
@@ -97,7 +100,7 @@ async fn history_load_uses_worker_lease_to_keep_tool_call_pending() {
     );
 
     lease.release().await.expect("release test lease");
-    let (interrupted, _entries) = crate::load_nats_session(&config, &session_id)
+    let (interrupted, _entries) = crate::load_nats_session(&config, "plain", &session_id)
         .await
         .expect("load interrupted session");
     let harnx_core::message::MessageContent::ToolCalls(interrupted_calls) = &interrupted
@@ -145,7 +148,7 @@ async fn seed_leased_pending_tool_call(
         .expect("local JetStream");
     let log = harnx_runtime::nats_session_log::NatsSessionLog::new(
         jetstream.clone(),
-        session_id.to_string(),
+        harnx_core::session_identity::session_key(Some("plain"), session_id),
     );
     log.append_event_async(&harnx_core::session::SessionLogEntry::ToolCalls {
         text: "still working".to_string(),
@@ -165,7 +168,7 @@ async fn seed_leased_pending_tool_call(
         harnx_runtime::nats_lease::NatsSessionLease::acquire(
             harnx_runtime::nats_lease::NatsLeaseAcquireParams {
                 jetstream,
-                session_id,
+                session_id: &harnx_core::session_identity::session_key(Some("plain"), session_id),
                 worker_id: "worker-history-test".to_string(),
                 generation: 1,
                 config: harnx_runtime::nats_lease::NatsLeaseConfig::default(),
@@ -451,10 +454,13 @@ async fn assert_cancel_reached_worker(config: &harnx_runtime::config::Config, se
         .nats_jetstream(LOCAL_CLUSTER_KEY)
         .await
         .expect("local JetStream");
-    let entries = harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, session_id)
-        .load_events_async()
-        .await
-        .expect("load cancelled session");
+    let entries = harnx_runtime::nats_session_log::NatsSessionLog::new(
+        jetstream,
+        harnx_core::session_identity::session_key(Some("plain"), session_id),
+    )
+    .load_events_async()
+    .await
+    .expect("load cancelled session");
     assert!(
         entries
             .iter()

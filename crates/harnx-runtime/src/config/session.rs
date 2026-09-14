@@ -46,6 +46,9 @@ pub fn new(config: &Config, name: &str, working_dir: Option<&std::path::Path>) -
         ..Default::default()
     };
     session.set_agent(&agent)?;
+    if let Some((remote_agent, _)) = &config.remote_agent {
+        session.agent_name = Some(remote_agent.clone());
+    }
     session.dirty = false;
     Ok(session)
 }
@@ -230,8 +233,7 @@ fn replay_log_entries_into_session(
                 let note = Message::new(
                     MessageRole::User,
                     MessageContent::Text(format!(
-                        "[Runtime note] Started sub-agent '{agent}' in session {session_id}. \
-                         Resume with session_prompt using this exact session_id; inspect with session_load."
+                        "[Runtime note] Started sub-agent '{agent}' in session {session_id}."
                     )),
                 )
                 .with_log_seq(seq);
@@ -1804,7 +1806,7 @@ content: work complete
                 Some("call-1"),
                 expected_output,
                 format!(
-                    "[Runtime note] Started sub-agent 'pantheon/plato' in session {child_session_id}. Resume with session_prompt using this exact session_id; inspect with session_load."
+                    "[Runtime note] Started sub-agent 'pantheon/plato' in session {child_session_id}."
                 ),
                 Some(1),
             )
@@ -1872,7 +1874,8 @@ invocation_id: invocation-direct
                 (MessageRole::User, "original request".to_string()),
                 (
                     MessageRole::User,
-                    "[Runtime note] Started sub-agent 'pantheon/plato' in session child-direct. Resume with session_prompt using this exact session_id; inspect with session_load.".to_string(),
+                    "[Runtime note] Started sub-agent 'pantheon/plato' in session child-direct."
+                        .to_string(),
                 ),
             ]
         );

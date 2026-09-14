@@ -117,6 +117,18 @@ async fn cancellation_worker_preparation_is_not_misreported_as_request_timeout()
     let local_worker = Arc::clone(&tui.local_worker);
     let worker_guard = local_worker.lock().await;
     let session_id = format!("cancel-lock-{}", uuid::Uuid::now_v7());
+    let snapshot = config.read().clone();
+    let jetstream = snapshot.nats_jetstream(LOCAL_CLUSTER_KEY).await.unwrap();
+    let initializer = harnx_runtime::SessionInitializer::from_config(&snapshot).unwrap();
+    let metadata =
+        harnx_runtime::nats_session_metadata::SessionMetadata::new(session_id, initializer);
+    let session_id = metadata.storage_key();
+    harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+        .await
+        .unwrap()
+        .create(&metadata)
+        .await
+        .unwrap();
     let cancellation = (tui.exit_cancel_factory)(
         config,
         Arc::clone(&local_worker),

@@ -320,7 +320,8 @@ The optional `session_id` follows the same rules as `{agent}_session_prompt`:
 - Omit it, or pass an empty/whitespace value, to generate a new target session.
 - Pass an unused ID to create that exact target session.
 - Pass an existing session owned by the target agent to continue its transcript.
-- Passing a session owned by another agent fails before the prompt is appended.
+- IDs are local to the target agent: another agent can use the same ID independently.
+  For example, two review agents can each use `review-12345` without sharing history.
 
 Do not invent an ID when a generated session is desired. The committed target
 ID is reported only after the prompt is persisted and worker activation is

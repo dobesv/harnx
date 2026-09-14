@@ -8,7 +8,10 @@ impl SessionMetadataStore {
         agent: &str,
     ) -> Result<Option<MetadataRecord>> {
         Ok(self
-            .get(session_id)
+            .get(&harnx_core::session_identity::session_key(
+                Some(agent),
+                session_id,
+            ))
             .await?
             .filter(|record| metadata_belongs_to_agent(&record.metadata, agent)))
     }

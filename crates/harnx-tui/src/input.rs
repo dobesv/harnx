@@ -9,37 +9,12 @@ use harnx_core::event::{AgentEvent, AgentSource};
 use harnx_render::pretty_error_string;
 use harnx_runtime::config::{
     dump_entries_jsonl, dump_entries_yaml, list_assistant_agents, load_session_for_render,
-    render_metadata_json, render_metadata_yaml, SessionFormat,
+    render_metadata_json, render_metadata_yaml, SessionFormat, SessionInspectionCommand,
 };
 use harnx_runtime::nats_session_log::NatsSessionLog;
-use harnx_runtime::nats_session_metadata::SessionMetadataStore;
 use harnx_runtime::utils::pretty_yaml_block;
 use ratatui_textarea::{Input as TextInput, Key};
 use std::path::Path;
-
-/// Parse tokens after `.info session` or `.dump session` into positional args and format.
-fn parse_session_tokens(tokens: &[String]) -> Result<(Vec<String>, SessionFormat)> {
-    let mut positional = Vec::new();
-    let mut format = SessionFormat::Text;
-    let mut format_next = false;
-    // Skip command tokens [".info", "session"] or [".dump", "session"]
-    for token in tokens.iter().skip(2) {
-        if format_next {
-            format = token.parse()?;
-            format_next = false;
-        } else if token == "--format" {
-            format_next = true;
-        } else if let Some(val) = token.strip_prefix("--format=") {
-            format = val.parse()?;
-        } else {
-            positional.push(token.clone());
-        }
-    }
-    if format_next {
-        anyhow::bail!("Missing value for --format");
-    }
-    Ok((positional, format))
-}
 
 /// Types of overlay content for info/dump commands.
 enum InfoOverlayType {
@@ -1362,7 +1337,7 @@ impl Tui {
         self.app.streaming_open = false;
         self.app.main_streamed_text_idx = None;
 
-        let (agent, cluster, session_id) = {
+        let (agent, cluster, session_target) = {
             let guard = self.config.read();
             let (agent, cluster) = guard.remote_agent.clone().unwrap_or_else(|| {
                 (
@@ -1374,13 +1349,13 @@ impl Tui {
                     harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
                 )
             });
-            let session_id = guard
+            let target = guard
                 .session
                 .as_ref()
-                .map(|session| session.id().to_string());
-            (agent, cluster, session_id)
+                .map(|session| (session.storage_key(), cluster.clone()));
+            (agent, cluster, target)
         };
-        self.active_remote_session = session_id.map(|id| (id, cluster.clone()));
+        self.active_remote_session = session_target;
 
         let event_tx = self.event_tx.clone();
 
@@ -1860,31 +1835,31 @@ impl Tui {
                     .collect();
             }
 
-            if matches!(cmd, ".agent" | ".session") && args.iter().all(|arg| arg.is_empty()) {
+            let (cmd, args) = match (cmd, args.as_slice()) {
+                (".info" | ".dump", ["session", _, ..]) => (".session", args[1..].to_vec()),
+                _ => (cmd, args),
+            };
+            if cmd == ".agent" && args.iter().all(|arg| arg.is_empty()) {
                 return vec![];
+            }
+
+            if cmd == ".session" && args.len() == 2 {
+                let cfg = self.config.read().clone();
+                let sessions = cfg.list_sessions_for_completion(args[0]).await;
+                return harnx_runtime::utils::fuzzy_filter(
+                    sessions.into_iter().map(|id| (id, None)).collect(),
+                    |value| value.0.as_str(),
+                    args[1],
+                );
             }
 
             // Fetch agents async outside the config lock to avoid holding a
             // parking_lot read guard across an await point.
-            let precomputed_agents = if cmd == ".agent" && args.len() == 1 {
+            let precomputed_agents = if matches!(cmd, ".agent" | ".session") && args.len() == 1 {
                 list_assistant_agents().await
             } else {
                 Vec::new()
             };
-
-            // Session completion always queries the NATS KV index. An absent
-            // remote-agent cluster means the shared local NATS cluster.
-            if cmd == ".session" && args.len() == 1 {
-                let cluster = self
-                    .config
-                    .read()
-                    .remote_agent
-                    .as_ref()
-                    .map(|(_, c)| c.clone());
-                let cfg = self.config.read().clone();
-                let sessions = cfg.list_sessions_for_completion(cluster.as_deref()).await;
-                return sessions.into_iter().map(|s| (s, None)).collect();
-            }
 
             return self
                 .config
@@ -1905,12 +1880,7 @@ impl Tui {
 
     pub(crate) async fn open_session_picker(&mut self) {
         let (sessions, fetch_error) = Self::picker_sessions(&self.config).await;
-        let origin_agent = self
-            .config
-            .read()
-            .agent
-            .as_ref()
-            .map(|a| a.name().to_string());
+        let origin_agent = self.config.read().active_agent_ref();
         let origin_session = self
             .config
             .read()
@@ -1935,10 +1905,7 @@ impl Tui {
             harnx_runtime::commands::CommandOutcome::Continue => {
                 let (curr_agent, session_missing) = {
                     let cfg = self.config.read();
-                    (
-                        cfg.agent.as_ref().map(|a| a.name().to_string()),
-                        cfg.session.is_none(),
-                    )
+                    (cfg.active_agent_ref(), cfg.session.is_none())
                 };
                 if prev_agent != curr_agent && session_missing {
                     self.open_session_picker().await;
@@ -1965,7 +1932,7 @@ impl Tui {
         let (curr_session, curr_agent) = {
             let cfg = self.config.read();
             let s = cfg.session.as_ref().map(|s| s.id().to_string());
-            let a = cfg.agent.as_ref().map(|a| a.name().to_string());
+            let a = cfg.active_agent_ref();
             (s, a)
         };
 
@@ -1995,6 +1962,44 @@ impl Tui {
         self.pin_transcript_to_bottom();
     }
 
+    async fn restore_picker_origin(&mut self) {
+        let Some(crate::types::ModalState::SessionPicker {
+            origin_agent: Some(agent),
+            origin_session,
+            ..
+        }) = self.app.modal.as_ref()
+        else {
+            return;
+        };
+        let (agent, session) = (agent.clone(), origin_session.clone());
+        // Prepare on a separate config so a missing origin agent cannot destroy
+        // the current selection. Picker switching runs while the prompt is idle.
+        let candidate = std::sync::Arc::new(parking_lot::RwLock::new(self.config.read().clone()));
+        match harnx_runtime::config::Config::use_agent(
+            &candidate,
+            &agent,
+            session.as_deref(),
+            self.abort_signal.clone(),
+        )
+        .await
+        {
+            Ok(()) => {
+                self.config
+                    .write()
+                    .apply_prepared_agent_selection(candidate.read().clone());
+                self.app.modal = None;
+                self.refresh_input_chrome();
+            }
+            Err(error) => {
+                if let Some(crate::types::ModalState::SessionPicker { error: message, .. }) =
+                    self.app.modal.as_mut()
+                {
+                    *message = Some(error.to_string());
+                }
+            }
+        }
+    }
+
     async fn try_handle_info_overlay(&mut self, line_cmd: &str) -> bool {
         let info_type = self.detect_info_overlay_type(line_cmd);
         if info_type.is_none() {
@@ -2014,6 +2019,25 @@ impl Tui {
         let title = info_type.title();
         self.open_info_overlay(display_text, title);
         true
+    }
+
+    fn resolve_info_agent_target(&self, tokens: &[String]) -> anyhow::Result<String> {
+        let agent_name = if tokens.len() > 2 {
+            tokens[2].clone()
+        } else {
+            match self.config.read().agent.as_ref() {
+                Some(a) => a.name().to_string(),
+                None => String::new(),
+            }
+        };
+
+        if agent_name.is_empty() {
+            Err(anyhow::anyhow!(
+                "No active agent and no agent name provided. Usage: .info agent [<name>]"
+            ))
+        } else {
+            Ok(agent_name)
+        }
     }
 
     fn detect_info_overlay_type(&self, line_cmd: &str) -> Option<InfoOverlayType> {
@@ -2048,38 +2072,25 @@ impl Tui {
 
     async fn render_info_session_overlay(&self, tokens: &[String]) -> Result<String> {
         let (agent_name, session_id, format) =
-            self.resolve_session_target_and_format(tokens, ".info session")?;
+            self.resolve_session_target_and_format(tokens, SessionInspectionCommand::Info)?;
         let cfg = self.config.read().clone();
-        let cluster = cfg
-            .remote_agent
-            .as_ref()
-            .map(|(_, cluster)| cluster.as_str())
-            .unwrap_or(harnx_runtime::config::LOCAL_CLUSTER_KEY)
-            .to_string();
-
+        let (agent, cluster) = harnx_runtime::config::resolve_session_agent(&agent_name)?;
         match format {
             SessionFormat::Text => {
-                let resolved_agent = agent_name.ok_or_else(|| {
-                    anyhow::anyhow!("No active agent or agent name provided for text metadata view")
-                })?;
                 let session =
-                    load_session_for_render(&cfg, Some(&cluster), &session_id, &resolved_agent)
-                        .await?;
+                    load_session_for_render(&cfg, Some(&cluster), &session_id, &agent).await?;
                 harnx_runtime::config::session::render(&session)
             }
             SessionFormat::Yaml | SessionFormat::Json => {
-                let jetstream = cfg.nats_jetstream(&cluster).await?;
-                let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-                let record = if let Some(agent) = agent_name.as_deref() {
-                    store.get_for_agent(&session_id, agent).await?
-                } else {
-                    store.get(&session_id).await?
-                };
-                let record = record
-                    .ok_or_else(|| anyhow::anyhow!("NATS session '{session_id}' was not found"))?;
+                let (_, metadata) = harnx_runtime::config::session_metadata_for_agent(
+                    &cfg,
+                    &agent_name,
+                    &session_id,
+                )
+                .await?;
                 match format {
-                    SessionFormat::Yaml => render_metadata_yaml(&record.metadata),
-                    SessionFormat::Json => render_metadata_json(&record.metadata),
+                    SessionFormat::Yaml => render_metadata_yaml(&metadata),
+                    SessionFormat::Json => render_metadata_json(&metadata),
                     SessionFormat::Text => unreachable!(),
                 }
             }
@@ -2088,34 +2099,12 @@ impl Tui {
 
     async fn render_dump_session_overlay(&self, tokens: &[String]) -> Result<String> {
         let (agent_name, session_id, format) =
-            self.resolve_session_target_and_format(tokens, ".dump session")?;
+            self.resolve_session_target_and_format(tokens, SessionInspectionCommand::Dump)?;
         let cfg = self.config.read().clone();
-        let cluster = cfg
-            .remote_agent
-            .as_ref()
-            .map(|(_, cluster)| cluster.as_str())
-            .unwrap_or(harnx_runtime::config::LOCAL_CLUSTER_KEY)
-            .to_string();
-
-        let jetstream = cfg.nats_jetstream(&cluster).await?;
-        let metadata_store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-        let metadata = metadata_store
-            .get(&session_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("NATS session '{session_id}' was not found"))?
-            .metadata;
-
-        if let Some(expected_agent) = agent_name.as_deref() {
-            let actual_agent = metadata.agent.name();
-            if actual_agent != Some(expected_agent) {
-                anyhow::bail!(
-                    "NATS session '{session_id}' belongs to agent '{}', not '{expected_agent}'",
-                    actual_agent.unwrap_or("<unknown>")
-                );
-            }
-        }
-
-        let log = NatsSessionLog::new(jetstream, session_id.to_string());
+        let (jetstream, metadata) =
+            harnx_runtime::config::session_metadata_for_agent(&cfg, &agent_name, &session_id)
+                .await?;
+        let log = NatsSessionLog::new(jetstream, metadata.storage_key());
         let raw = log
             .load_events_async()
             .await
@@ -2135,63 +2124,9 @@ impl Tui {
     fn resolve_session_target_and_format(
         &self,
         tokens: &[String],
-        cmd_prefix: &str,
-    ) -> Result<(Option<String>, String, SessionFormat)> {
-        let (positional, format) = parse_session_tokens(tokens)?;
-        let (agent_name, session_id) = self.resolve_agent_and_session(&positional)?;
-        if session_id.is_empty() {
-            anyhow::bail!(
-                "No active session or insufficient arguments. Usage: {cmd_prefix} [<agent> <id>] [--format text|yaml|json]"
-            );
-        }
-        Ok((agent_name, session_id, format))
-    }
-
-    fn resolve_agent_and_session(&self, positional: &[String]) -> Result<(Option<String>, String)> {
-        let cfg = self.config.read();
-        match positional.len() {
-            0 => {
-                let agent_name = cfg
-                    .agent
-                    .as_ref()
-                    .map(|x| x.name().to_string())
-                    .or_else(|| {
-                        cfg.session
-                            .as_ref()
-                            .and_then(|s| s.agent_name().map(str::to_string))
-                    });
-                let session_id = cfg
-                    .session
-                    .as_ref()
-                    .map(|x| x.id().to_string())
-                    .unwrap_or_default();
-                Ok((agent_name, session_id))
-            }
-            1 => {
-                let agent_name = cfg.agent.as_ref().map(|x| x.name().to_string());
-                Ok((agent_name, positional[0].clone()))
-            }
-            _ => Ok((Some(positional[0].clone()), positional[1].clone())),
-        }
-    }
-
-    fn resolve_info_agent_target(&self, tokens: &[String]) -> anyhow::Result<String> {
-        let agent_name = if tokens.len() > 2 {
-            tokens[2].clone()
-        } else {
-            match self.config.read().agent.as_ref() {
-                Some(a) => a.name().to_string(),
-                None => String::new(),
-            }
-        };
-
-        if agent_name.is_empty() {
-            Err(anyhow::anyhow!(
-                "No active agent and no agent name provided. Usage: .info agent [<name>]"
-            ))
-        } else {
-            Ok(agent_name)
-        }
+        command: SessionInspectionCommand,
+    ) -> Result<(String, String, SessionFormat)> {
+        harnx_runtime::config::parse_session_inspection_args(&tokens[2..], command)
     }
 
     fn open_info_overlay(&mut self, text: String, title: &str) {
@@ -2216,12 +2151,7 @@ impl Tui {
             .session
             .as_ref()
             .map(|s| s.id().to_string());
-        let prev_agent = self
-            .config
-            .read()
-            .agent
-            .as_ref()
-            .map(|a| a.name().to_string());
+        let prev_agent = self.config.read().active_agent_ref();
         // Run the command inside a block that owns the lock guards so they are
         // dropped before we touch `self` again for transcript / UI updates.
         let (result, captured) = {
@@ -2229,12 +2159,16 @@ impl Tui {
             let abort_signal = self.abort_signal.clone();
             let mut output = Vec::<u8>::new();
 
-            let result = harnx_runtime::commands::run_command_with_output_and_local_worker(
-                &config,
-                abort_signal,
-                line,
-                &mut output,
-                &self.local_worker,
+            // Command futures carry agent/session initialization state. Keep
+            // that frame off the nested TUI event-dispatch stack.
+            let result = Box::pin(
+                harnx_runtime::commands::run_command_with_output_and_local_worker(
+                    &config,
+                    abort_signal,
+                    line,
+                    &mut output,
+                    &self.local_worker,
+                ),
             )
             .await;
 
@@ -2452,12 +2386,7 @@ impl Tui {
                                 .session
                                 .as_ref()
                                 .map(|s| s.id().to_string());
-                            let prev_agent = self
-                                .config
-                                .read()
-                                .agent
-                                .as_ref()
-                                .map(|a| a.name().to_string());
+                            let prev_agent = self.config.read().active_agent_ref();
 
                             if let Err(e) = self.config.write().use_agent_by_name(&agent_name) {
                                 self.app.modal = Some(crate::types::ModalState::AgentPicker {
@@ -2580,7 +2509,7 @@ impl Tui {
                     self.app.modal,
                     Some(crate::types::ModalState::AgentPicker { .. })
                 ) {
-                    if self.config.read().agent.is_some() {
+                    if self.config.read().active_agent_ref().is_some() {
                         // Agent already active — mid-switch cancel: just dismiss the picker.
                         self.app.modal = None;
                     } else {
@@ -2601,28 +2530,7 @@ impl Tui {
                         query: String::new(),
                     });
                 } else if should_restore_origin {
-                    if let Some(crate::types::ModalState::SessionPicker {
-                        origin_agent,
-                        origin_session,
-                        ..
-                    }) = self.app.modal.take()
-                    {
-                        if let Some(agent) = origin_agent {
-                            let _ = self.config.write().use_agent_by_name(&agent);
-                        }
-                        if let Some(session) = origin_session {
-                            let _ = self.config.write().use_session(Some(&session));
-                        }
-
-                        let llm_busy = self.app.llm_busy;
-                        let pending = self.app.pending_message.is_some();
-                        Self::refresh_input_chrome_from_state(
-                            &self.config,
-                            &mut self.app,
-                            llm_busy,
-                            pending,
-                        );
-                    }
+                    self.restore_picker_origin().await;
                 }
             }
 

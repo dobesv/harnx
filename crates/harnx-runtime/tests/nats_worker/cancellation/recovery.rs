@@ -19,7 +19,7 @@ async fn replacement_confirms_durable_cancel_after_dead_owners_lease_expires() -
     };
     let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
         jetstream: js.clone(),
-        session_id: session.session_id(),
+        session_id: session.storage_key(),
         worker_id: "dead-owner".into(),
         generation: 1,
         config: lease_config.clone(),
@@ -29,7 +29,7 @@ async fn replacement_confirms_durable_cancel_after_dead_owners_lease_expires() -
     .context("acquire dead owner lease")?;
     let operation = session
         .execution_store()
-        .current(session.session_id())
+        .current(session.storage_key())
         .await?
         .unwrap();
     let old_fence = lease.fence_token();
@@ -64,11 +64,11 @@ async fn replacement_confirms_durable_cancel_after_dead_owners_lease_expires() -
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let recovered = session
         .execution_store()
-        .current(session.session_id())
+        .current(session.storage_key())
         .await?
         .unwrap();
     assert!(recovered.owner.unwrap().fence > old_fence);
-    let entries = NatsSessionLog::new(js, session.session_id())
+    let entries = NatsSessionLog::new(js, session.storage_key())
         .load_events_async()
         .await?;
     assert!(entries.iter().any(|(_, entry)| matches!(entry, SessionLogEntry::Cancel { fence_token } if *fence_token > old_fence)));

@@ -11,6 +11,10 @@ pub struct SessionInitializer {
 }
 
 impl SessionInitializer {
+    pub fn session_key(&self, session_id: &str) -> String {
+        harnx_core::session_identity::session_key(self.agent_name(), session_id)
+    }
+
     pub fn named(name: impl Into<String>, variables: AgentVariables) -> Self {
         Self {
             agent: SessionAgentSource::Named { name: name.into() },

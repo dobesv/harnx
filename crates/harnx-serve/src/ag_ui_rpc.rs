@@ -427,7 +427,7 @@ pub(crate) async fn route_hitl_decision(
 }
 
 async fn session_exists(config: &harnx_runtime::config::Config, key: &SessionKey) -> bool {
-    match load_nats_session(config, &key.session).await {
+    match load_nats_session(config, &key.agent, &key.session).await {
         Ok((session, _entries)) => {
             return session.agent_name.as_deref() == Some(key.agent.as_str())
         }

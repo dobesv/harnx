@@ -30,6 +30,36 @@ For production HA, run a NATS cluster with at least 3 nodes and set `replicas: 3
 in the cluster's `nats_servers/<cluster_key>.yaml` (see the production example
 below) so the buckets harnx creates survive losing a node.
 
+### Session identity
+
+A session is identified by its exact agent name and local session ID within a
+cluster. For example, `alpha/review-12345` and `beta/review-12345` have independent
+transcripts, metadata, leases, execution generations, cancellation, and attachments.
+Both components are case-sensitive. Commands require an explicit agent:
+
+```sh
+harnx --agent alpha --session review-12345 prompt "Review this change"
+harnx info session alpha review-12345
+harnx delete session review-12345 --agent alpha --cluster local
+```
+
+The TUI command is `.info session <agent> <id>`; it does not infer the selected
+agent. Agent-specific subagent tools already identify the agent in their toolset.
+
+`harnx_core::session_identity::session_key` hashes the JSON tuple
+`[agent, local_id]` to a lowercase SHA-256 key. Internal inline agents use JSON
+`null`, which is distinct from every named agent. All broker protocols use this
+key: transcript subjects, metadata/activity, leases, execution and parent references,
+invocation journals, controls, events, and attachment ownership. In the resource
+and protocol descriptions below, `{id}` and internal `session_id` fields refer to
+this storage key. Public metadata, tool results, and handoff targets retain the
+readable local ID and its agent. Hook and tool-confirmation payloads also retain
+the readable ID; their internal execution references carry the storage key. Derive a key once at the public boundary; never
+hash a key again as though it were a local ID or resolve a bare ID across agents.
+
+Earlier unscoped sessions are not migrated. Restart sessions after upgrading and
+upgrade clients and workers together.
+
 ### JetStream Resources
 Harnx automatically manages the following JetStream resources:
 - **KV Bucket**: `harnx_leases` — session leases with a tombstone marker
@@ -48,9 +78,15 @@ Harnx automatically manages the following JetStream resources:
   server discovery and its fail-closed fallback routes. Only the copies
   opened by the standalone `harnx-hookset-server` binary carry a TTL; the
   worker daemon's own copy of the same buckets does not set one.
-- **Streams**: `SESSION_<id>` (Subject: `sessions.{id}.log`) stores only the
+- **Streams**: `SESSION_<sha256(id)>` (Subject: `sessions.{id}.log`) stores only the
   durable append-only conversation history. Agent identity, settings, rendered
-  prompts, and titles do not belong in this stream.
+  prompts, and titles do not belong in this stream. Hash the exact, case-sensitive
+  storage key to lowercase hexadecimal with `stream_name_for_session`. JetStream
+  uses stream names as directory names, so simply preserving case still aliases
+  distinct IDs on case-insensitive filesystems. The fixed-length digest also
+  avoids filename length limits. Subjects carry the storage key; user-visible
+  local IDs remain unchanged.
+  Earlier stream names are not migrated; start fresh sessions after upgrading.
 - **Object Store**: `harnx_attachments` stores binary attachment payloads under
   session-scoped object names. Conversation entries contain only `cid:`
   references; workers hydrate the matching blobs into their local
@@ -420,7 +456,7 @@ This works from the CLI and TUI.
 
 - **New Sessions**: Canonical metadata and activity are reserved before the
   first user row is appended. The worker creates a lease only when activated.
-- **Resuming Sessions**: Clients attach to an existing `session_id`. Multiple clients can attach to the same session simultaneously (Multiplayer Mode).
+- **Resuming Sessions**: Clients attach with an explicit agent and local session ID. Multiple clients can attach to the same session simultaneously (Multiplayer Mode).
 
 Workers load agent identity from canonical metadata on every activation. Named
 agents are re-read from disk and then overlaid with persisted session variables
@@ -807,7 +843,7 @@ lease, every KV key under `sessions/{id}`, and every attachment object owned by
 the session. The periodic remote-session cleanup uses the same deletion path.
 
 ```bash
-harnx delete session <session_id> --cluster local
+harnx delete session <session_id> --agent <agent> --cluster local
 ```
 
 ## Observability

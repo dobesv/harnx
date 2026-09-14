@@ -217,7 +217,11 @@ async fn token_budget_stops_at_round_boundary_and_resets_for_next_activation() {
     assert_eq!((terminal.budgeted, terminal.budget), (3, 1));
     assert_eq!(call_count.load(Ordering::SeqCst), 1);
 
-    let log = NatsSessionLog::new(async_nats::jetstream::new(client.clone()), session_id);
+    let log = NatsSessionLog::for_agent(
+        async_nats::jetstream::new(client.clone()),
+        "metis",
+        &session_id,
+    );
     assert_budget_terminal_transcript(
         &log.load_events_async()
             .await
@@ -272,7 +276,7 @@ async fn subagent_timeout_returns_synthesized_result_and_same_session_retry_succ
             .nats_jetstream("local")
             .await
             .expect("timeout child log jetstream"),
-        session_id.clone(),
+        harnx_core::session_identity::session_key(Some("metis"), &session_id),
     );
     let entries = log
         .load_events_async()

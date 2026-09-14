@@ -68,10 +68,19 @@ fn resolve_list_sessions_target(remote_agent: Option<&(String, String)>) -> List
     }
 }
 
-/// Format session metadata as one ID per line.
+/// Format session metadata as an owner and readable ID per line.
 /// This helper is extracted for testability without touching stdout.
 fn format_sessions_for_output(sessions: &[SessionMeta]) -> String {
-    let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+    let ids: Vec<String> = sessions
+        .iter()
+        .map(|s| {
+            format!(
+                "{}\t{}",
+                s.agent_name.as_deref().unwrap_or("<inline>"),
+                s.id
+            )
+        })
+        .collect();
     ids.join("\n")
 }
 
@@ -183,8 +192,12 @@ async fn run_info_session(
     let config = Config::init(WorkingMode::Cmd, true).await?;
     match format {
         SessionFormat::Text => {
+            let (agent, cluster) = harnx_runtime::config::resolve_session_agent(agent_name)?;
             let session = harnx_runtime::config::load_session_for_render(
-                &config, None, session_id, agent_name,
+                &config,
+                Some(&cluster),
+                session_id,
+                &agent,
             )
             .await?;
             let out = harnx_runtime::config::session::render(&session)?;
@@ -208,16 +221,11 @@ async fn fetch_session_metadata(
     session_id: &str,
     agent_name: &str,
 ) -> Result<harnx_runtime::nats_session_metadata::SessionMetadata> {
-    let jetstream = config
-        .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
-        .await?;
-    let store =
-        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let record = store
-        .get_for_agent(session_id, agent_name)
-        .await?
-        .with_context(|| format!("Session '{session_id}' for agent '{agent_name}' not found"))?;
-    Ok(record.metadata)
+    Ok(
+        harnx_runtime::config::session_metadata_for_agent(config, agent_name, session_id)
+            .await?
+            .1,
+    )
 }
 
 async fn run_dump_command(dump_args: &crate::cli::DumpArgs) -> Result<()> {
@@ -243,20 +251,10 @@ async fn run_dump_session_once(
 ) -> Result<()> {
     let config = Config::init(WorkingMode::Cmd, true).await?;
 
-    // Validate session exists for this agent
-    let jetstream = config
-        .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
-        .await?;
-    let store =
-        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await?;
-    store
-        .get_for_agent(session_id, agent_name)
-        .await?
-        .with_context(|| format!("Session '{session_id}' for agent '{agent_name}' not found"))?;
-
-    // Load raw entries and reconstruct
+    let (jetstream, metadata) =
+        harnx_runtime::config::session_metadata_for_agent(&config, agent_name, session_id).await?;
     let log =
-        harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, session_id.to_string());
+        harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, metadata.storage_key());
     let raw = log.load_events_async().await?;
     let entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)?;
 
@@ -272,22 +270,16 @@ async fn run_dump_session_follow(
     use std::io::Write;
 
     let config = Config::init(WorkingMode::Cmd, true).await?;
-    let cluster = harnx_runtime::config::LOCAL_CLUSTER_KEY;
-
-    // Validate session exists for this agent and get jetstream context
-    let jetstream = config.nats_jetstream(cluster).await?;
-    let store =
-        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await?;
-    store
-        .get_for_agent(session_id, agent_name)
-        .await?
-        .with_context(|| format!("Session '{session_id}' for agent '{agent_name}' not found"))?;
-
-    // Attach to session event stream (uses same jetstream context)
-    let client = config.nats_client(cluster).await?;
-    let mut stream =
-        harnx_runtime::nats_event_sink::SessionEventStream::attach(jetstream, client, session_id)
-            .await?;
+    let (_, cluster) = harnx_runtime::config::resolve_session_agent(agent_name)?;
+    let (jetstream, metadata) =
+        harnx_runtime::config::session_metadata_for_agent(&config, agent_name, session_id).await?;
+    let client = config.nats_client(&cluster).await?;
+    let mut stream = harnx_runtime::nats_event_sink::SessionEventStream::attach(
+        jetstream,
+        client,
+        &metadata.storage_key(),
+    )
+    .await?;
 
     // Replay initial history
     replay_dump_entries(stream.history(), &format).await?;
@@ -414,9 +406,11 @@ async fn run_list_sessions(cli: &Cli) -> Result<()> {
 
 async fn run_session_delete_command(delete_args: &DeleteSessionArgs) -> Result<()> {
     let config = Config::init(WorkingMode::Cmd, true).await?;
+    let agent = delete_args.agent_name()?;
     let result = harnx_runtime::nats_admin::delete_remote_session(
         &config,
         &delete_args.cluster,
+        &agent,
         &delete_args.session_id,
     )
     .await?;
@@ -914,7 +908,7 @@ async fn resume_session_anyway(session: &harnx_runtime::NatsSession, enabled: bo
     }
     let Some(expected_execution_id) = session
         .execution_store()
-        .current(session.session_id())
+        .current(session.storage_key())
         .await?
         .map(|operation| operation.reference.execution_id)
     else {
@@ -1212,7 +1206,7 @@ mod tests_list_sessions_routing {
         SessionMeta {
             id: id.to_string(),
             session_id: Some(id.to_string()),
-            agent_name: None,
+            agent_name: Some("reviewer".into()),
             title: None,
             modified: None,
             contexts: vec![],
@@ -1271,7 +1265,19 @@ mod tests_list_sessions_routing {
     fn test_output_format_one_id_per_line() {
         let sessions = [session_meta("session-1"), session_meta("session-2")];
         let output = format_sessions_for_output(&sessions);
-        assert_eq!(output, "session-1\nsession-2");
+        assert_eq!(output, "reviewer\tsession-1\nreviewer\tsession-2");
+    }
+
+    #[test]
+    fn duplicate_session_ids_show_their_owners() {
+        let mut alpha = session_meta("review-12345");
+        alpha.agent_name = Some("alpha".into());
+        let mut beta = alpha.clone();
+        beta.agent_name = Some("beta".into());
+        assert_eq!(
+            format_sessions_for_output(&[alpha, beta]),
+            "alpha\treview-12345\nbeta\treview-12345"
+        );
     }
 
     /// Output formatting: empty sessions → empty string
@@ -1287,7 +1293,7 @@ mod tests_list_sessions_routing {
     fn test_output_format_single_session() {
         let sessions = [session_meta("only-session")];
         let output = format_sessions_for_output(&sessions);
-        assert_eq!(output, "only-session");
+        assert_eq!(output, "reviewer\tonly-session");
     }
 
     /// Remote list outcome: empty sessions → Print("") (not an error)
@@ -1307,7 +1313,7 @@ mod tests_list_sessions_routing {
         let outcome = remote_list_outcome(result);
         assert_eq!(
             outcome,
-            ListSessionsOutcome::Print("sess-a\nsess-b".to_string())
+            ListSessionsOutcome::Print("reviewer\tsess-a\nreviewer\tsess-b".to_string())
         );
     }
 

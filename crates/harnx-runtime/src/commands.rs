@@ -50,7 +50,11 @@ pub static COMMANDS: LazyLock<[Command; 49]> = LazyLock::new(|| {
         Command::new(".prompt", "Set a temporary agent using a prompt"),
         Command::new(".edit agent", "Modify current agent"),
         Command::new(".save agent", "Save current agent to file"),
-        Command::new(".session", "Start or switch to a session"),
+        Command::with_usage(
+            ".session",
+            "[<agent> <id>]",
+            "Open the session picker or switch to an explicitly named agent session",
+        ),
         Command::new(".empty session", "Clear session messages"),
         Command::new(
             ".reset session",
@@ -63,12 +67,12 @@ pub static COMMANDS: LazyLock<[Command; 49]> = LazyLock::new(|| {
         ),
         Command::with_usage(
             ".info session",
-            "[<agent> <id>] [--format text|yaml|json]",
+            "<agent> <id> [--format text|yaml|json]",
             "Show session info (metadata)",
         ),
         Command::with_usage(
             ".dump session",
-            "[<agent> <id>] [--format text|yaml|json]",
+            "<agent> <id> [--format text|yaml|json]",
             "Show session transcript dump",
         ),
         Command::new(
@@ -300,8 +304,8 @@ pub async fn run_command_with_output_and_local_worker(
                 _ => writeln!(output, "Usage: .title [generate|now]")?,
             },
             ".info" => match args {
-                Some("session") => {
-                    let info = config.read().session_info()?;
+                Some(text) if text.split_whitespace().next() == Some("session") => {
+                    let info = Box::pin(explicit_session_info(config, text)).await?;
                     write!(output, "{info}")?;
                 }
                 Some("model") => {
@@ -422,7 +426,10 @@ pub async fn run_command_with_output_and_local_worker(
                 if args.is_none() {
                     return Ok(CommandOutcome::OpenSessionPicker);
                 }
-                config.write().use_session(args)?;
+                let (agent, session) = explicit_session_target(args.unwrap(), ".session")?;
+                let candidate = Arc::new(parking_lot::RwLock::new(config.read().clone()));
+                Box::pin(Config::use_agent(&candidate, &agent, Some(&session), abort_signal.clone())).await?;
+                config.write().apply_prepared_agent_selection(candidate.read().clone());
             }
             ".rag" => {
                 Config::use_rag(config, args, abort_signal.clone()).await?;
@@ -836,9 +843,8 @@ pub async fn run_command_with_output_and_local_worker(
                     config
                         .session
                         .as_ref()
-                        .map(|session| session.id())
-                        .unwrap_or("default")
-                        .to_string(),
+                        .map(|session| session.id().to_string())
+                        .unwrap_or_else(|| "default".to_string()),
                     config.clone(),
                 )
             };
@@ -1741,5 +1747,106 @@ mod tests {
             split_args_text(r#".\file.txt C:\dir\file.txt"#, true),
             (vec![".\\file.txt".into(), "C:\\dir\\file.txt".into()], "")
         );
+    }
+}
+
+fn explicit_session_target(args: &str, command: &str) -> Result<(String, String)> {
+    let words = shell_words::split(args)?;
+    anyhow::ensure!(
+        words.len() == 2 && words.iter().all(|word| !word.trim().is_empty()),
+        "An explicit agent and session ID are required. Usage: {command} <agent> <id>"
+    );
+    Ok((words[0].clone(), words[1].clone()))
+}
+
+#[cfg(test)]
+mod session_target_tests {
+    #[tokio::test]
+    async fn failed_explicit_session_switch_preserves_current_selection() {
+        use super::*;
+        let mut cfg = Config::default();
+        let mut agent = crate::config::Agent::default();
+        agent.set_name("selected-agent");
+        cfg.use_agent_obj(agent).unwrap();
+        cfg.use_session(Some("review-12345")).unwrap();
+        let original_key = cfg.session.as_ref().unwrap().storage_key();
+        let config = Arc::new(parking_lot::RwLock::new(cfg));
+        let result = run_command_with_output(
+            &config,
+            crate::utils::create_abort_signal(),
+            ".session nonexistent-origin-05d194 another-id",
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(result.is_err());
+        let cfg = config.read();
+        assert_eq!(cfg.active_agent_ref().as_deref(), Some("selected-agent"));
+        assert_eq!(cfg.session.as_ref().unwrap().storage_key(), original_key);
+    }
+
+    #[tokio::test]
+    async fn explicit_session_switch_preserves_editor_hooks() {
+        use super::*;
+        let mut cfg = Config::default();
+        cfg.nats_servers
+            .push(serde_yaml::from_str("name: remote\nurl: nats://127.0.0.1:1\n").unwrap());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let before = calls.clone();
+        let after = calls.clone();
+        cfg.tui_before_editor = Some(Box::new(move || {
+            before.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        cfg.tui_after_editor = Some(Box::new(move || {
+            after.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let config = Arc::new(parking_lot::RwLock::new(cfg));
+        run_command_with_output(
+            &config,
+            crate::utils::create_abort_signal(),
+            ".session reviewer@remote review-12345",
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        let mut cfg = config.write();
+        cfg.tui_before_editor.as_mut().unwrap()();
+        cfg.tui_after_editor.as_mut().unwrap()();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(cfg.session.as_ref().unwrap().agent_name(), Some("reviewer"));
+    }
+
+    #[test]
+    fn bare_session_id_is_rejected_even_when_it_could_be_unambiguous() {
+        assert!(super::explicit_session_target("review-12345", ".session").is_err());
+        assert_eq!(
+            super::explicit_session_target("alpha review-12345", ".session").unwrap(),
+            ("alpha".into(), "review-12345".into())
+        );
+    }
+}
+
+async fn explicit_session_info(config: &GlobalConfig, args: &str) -> Result<String> {
+    use crate::config::{parse_session_inspection_args, SessionFormat, SessionInspectionCommand};
+    let tokens = shell_words::split(args)?;
+    let (agent, session, format) =
+        parse_session_inspection_args(&tokens[1..], SessionInspectionCommand::Info)?;
+    let snapshot = config.read().clone();
+    match format {
+        SessionFormat::Text => {
+            let (agent, cluster) = crate::config::resolve_session_agent(&agent)?;
+            let session =
+                crate::config::load_session_for_render(&snapshot, Some(&cluster), &session, &agent)
+                    .await?;
+            crate::config::session::render(&session)
+        }
+        SessionFormat::Yaml | SessionFormat::Json => {
+            let (_, metadata) =
+                crate::config::session_metadata_for_agent(&snapshot, &agent, &session).await?;
+            match format {
+                SessionFormat::Yaml => crate::config::render_metadata_yaml(&metadata),
+                SessionFormat::Json => crate::config::render_metadata_json(&metadata),
+                SessionFormat::Text => unreachable!(),
+            }
+        }
     }
 }

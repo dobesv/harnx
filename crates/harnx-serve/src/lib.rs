@@ -789,7 +789,7 @@ impl Server {
     }
 
     async fn session_history_json(&self, agent: &str, session: &str) -> Result<AppResponse> {
-        let (loaded_session, _entries) = load_nats_session(&self.config, session).await?;
+        let (loaded_session, _entries) = load_nats_session(&self.config, agent, session).await?;
         if loaded_session.agent_name.as_deref() != Some(agent) {
             bail!("Not Found");
         }
@@ -1390,18 +1390,21 @@ async fn agent_sessions_json(config: &Config, agent: &str) -> Result<Vec<Value>>
 /// for control-state hydration on promptless attach.
 pub(crate) async fn load_nats_session(
     config: &Config,
+    agent: &str,
     session: &str,
 ) -> Result<(
     harnx_core::session::Session,
     Vec<(u64, harnx_core::session::SessionLogEntry)>,
 )> {
-    let (loaded, entries, _base_session) = load_nats_session_with_base(config, session).await?;
+    let (loaded, entries, _base_session) =
+        load_nats_session_with_base(config, agent, session).await?;
     Ok((loaded, entries))
 }
 
 /// Load session history and retain canonical metadata state for replaying a fresher log snapshot.
 pub(crate) async fn load_nats_session_with_base(
     config: &Config,
+    agent: &str,
     session: &str,
 ) -> Result<(
     harnx_core::session::Session,
@@ -1412,8 +1415,9 @@ pub(crate) async fn load_nats_session_with_base(
     let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
     let metadata_store =
         harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let storage_key = harnx_core::session_identity::session_key(Some(agent), session);
     let metadata = metadata_store
-        .get(session)
+        .get(&storage_key)
         .await?
         .ok_or_else(|| anyhow!("Not Found"))?
         .metadata;
@@ -1421,12 +1425,15 @@ pub(crate) async fn load_nats_session_with_base(
     // Mirrors load_remote_transcript_for_render in harnx-runtime. A trailing
     // ToolCalls row is in flight (pending) rather than interrupted when either
     // sample shows an active lease.
-    let lease_was_active = harnx_runtime::nats_lease::session_has_active_lease(&jetstream, session)
-        .await
-        .map_err(|err| anyhow!("Failed to inspect worker lease for session '{session}': {err}"))?;
+    let lease_was_active =
+        harnx_runtime::nats_lease::session_has_active_lease(&jetstream, &storage_key)
+            .await
+            .map_err(|err| {
+                anyhow!("Failed to inspect worker lease for session '{session}': {err}")
+            })?;
     let log = harnx_runtime::nats_session_log::NatsSessionLog::new(
         jetstream.clone(),
-        session.to_string(),
+        storage_key.clone(),
     );
     let entries = log
         .load_events_async()
@@ -1437,7 +1444,7 @@ pub(crate) async fn load_nats_session_with_base(
     let preserve_pending = if lease_was_active {
         true
     } else {
-        harnx_runtime::nats_lease::session_has_active_lease(&jetstream, session)
+        harnx_runtime::nats_lease::session_has_active_lease(&jetstream, &storage_key)
             .await
             .map_err(|err| {
                 anyhow!("Failed to inspect worker lease for session '{session}': {err}")

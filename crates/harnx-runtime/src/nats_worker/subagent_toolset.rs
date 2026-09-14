@@ -267,14 +267,17 @@ impl SubagentToolset {
     }
 
     async fn turn_has_cancel(&self, result: &NatsTurnResult) -> bool {
-        NatsSessionLog::new(self.jetstream.clone(), result.session_id.clone())
-            .load_events_async()
-            .await
-            .is_ok_and(|events| {
-                events.iter().any(|(seq, entry)| {
-                    *seq > result.user_msg_seq && matches!(entry, SessionLogEntry::Cancel { .. })
-                })
+        NatsSessionLog::new(
+            self.jetstream.clone(),
+            harnx_core::session_identity::session_key(Some(&self.agent), &result.session_id),
+        )
+        .load_events_async()
+        .await
+        .is_ok_and(|events| {
+            events.iter().any(|(seq, entry)| {
+                *seq > result.user_msg_seq && matches!(entry, SessionLogEntry::Cancel { .. })
             })
+        })
     }
 
     async fn session_new(
@@ -336,14 +339,17 @@ impl SubagentToolset {
     async fn session_load(&self, args: Value) -> Result<Value, ToolInvokeError> {
         let args: SessionArgs = parse_args(SUBAGENT_SESSION_LOAD_TOOL, args)?;
         let session_id = required_session_id(args.session_id)?;
-        let events = NatsSessionLog::new(self.jetstream.clone(), session_id.clone())
-            .load_events_async()
-            .await
-            .map_err(|error| {
-                ToolInvokeError::Recoverable(format!(
-                    "load sub-agent session '{session_id}': {error:#}"
-                ))
-            })?;
+        let events = NatsSessionLog::new(
+            self.jetstream.clone(),
+            harnx_core::session_identity::session_key(Some(&self.agent), &session_id),
+        )
+        .load_events_async()
+        .await
+        .map_err(|error| {
+            ToolInvokeError::Recoverable(format!(
+                "load sub-agent session '{session_id}': {error:#}"
+            ))
+        })?;
         Ok(json!({ "session_id": session_id, "events": events }))
     }
 
@@ -575,7 +581,7 @@ fn session_prompt_spec(agent: &str) -> ToolSpec {
             cancellation_guarantee: Default::default(),
         name: SUBAGENT_SESSION_PROMPT_TOOL.to_string(),
         description: format!(
-            "Send a prompt to the '{agent}' agent. To continue a conversation, pass only the exact session_id returned by session_prompt or session_new. To start a new conversation, omit session_id; empty or whitespace-only values also start a new session. Do not invent a session ID."
+            "Send a prompt to the '{agent}' agent. Session IDs are case-sensitive and local to this agent. Pass an existing ID to continue its conversation, or an unused ID such as review-12345 to create that exact session. Omit session_id (or pass an empty value) for a generated ID."
         ),
         input_schema: json!({
             "type": "object",
@@ -586,7 +592,7 @@ fn session_prompt_spec(agent: &str) -> ToolSpec {
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "To continue a conversation, use the exact session ID returned by session_prompt or session_new"
+                    "description": "Optional ID local to this agent: reuse an exact existing ID to continue, supply an unused ID to create it, or omit for a generated ID"
                 },
                 "timeout_secs": {
                     "type": "integer",

@@ -202,7 +202,11 @@ impl NatsToolProvider {
         });
         let (tools, declarations) = build_registered_tools(active_package, registrations.clone());
         let parent_session_id = canonical_parent_session_id(
-            config.session.as_ref().map(|session| session.id()),
+            config
+                .session
+                .as_ref()
+                .map(|session| session.storage_key())
+                .as_deref(),
             config
                 .execution_control
                 .as_ref()

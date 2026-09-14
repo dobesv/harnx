@@ -312,6 +312,15 @@ impl Session {
         &self.id
     }
 
+    /// Identity for shared storage and execution; `id()` is local to the agent.
+    pub fn storage_key(&self) -> String {
+        crate::session_identity::session_key(
+            self.agent_name()
+                .filter(|name| !name.is_empty() && *name != TEMP_AGENT_NAME),
+            self.id(),
+        )
+    }
+
     pub fn agent_name(&self) -> Option<&str> {
         self.agent_name.as_deref()
     }

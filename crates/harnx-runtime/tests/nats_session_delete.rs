@@ -29,20 +29,14 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
     let config = local_nats_config(server.url());
     let jetstream = config.nats_jetstream("local").await?;
     let session_id = "delete-me";
-    let log = NatsSessionLog::new(jetstream.clone(), session_id);
-    log.append_event_async(&SessionLogEntry::Message {
-        id: None,
-        role: MessageRole::User,
-        content: MessageContent::Text("hello".to_string()),
-        timestamp: None,
-        fence_token: None,
-    })
-    .await?;
+    let storage_key = harnx_core::session_identity::session_key(Some("oracle"), session_id);
+    let log = NatsSessionLog::new(jetstream.clone(), &storage_key);
+    append_user_message(&log).await?;
 
     let lease = harnx_runtime::nats_lease::NatsSessionLease::acquire(
         harnx_runtime::nats_lease::NatsLeaseAcquireParams {
             jetstream: jetstream.clone(),
-            session_id,
+            session_id: &storage_key,
             worker_id: "w1".to_string(),
             generation: 1,
             config: NatsLeaseConfig::default(),
@@ -51,7 +45,7 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
     )
     .await?
     .expect("lease acquired");
-    let lease_key = NatsLeaseConfig::default().key_for_session(session_id);
+    let lease_key = NatsLeaseConfig::default().key_for_session(&storage_key);
     lease.stop_renewal_for_test().await;
 
     let metadata_store = SessionMetadataStore::ensure(&jetstream, 1).await?;
@@ -62,11 +56,11 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
         ))
         .await?;
 
-    let deleted = delete_remote_session(&config, "local", session_id).await?;
+    let deleted = delete_remote_session(&config, "local", "oracle", session_id).await?;
     assert!(deleted.stream_deleted);
     assert!(deleted.lease_deleted);
 
-    let stream_name = stream_name_for_session(session_id);
+    let stream_name = stream_name_for_session(&storage_key);
     let err = jetstream
         .get_stream(&stream_name)
         .await
@@ -89,12 +83,12 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
     );
 
     assert!(
-        metadata_store.get(session_id).await?.is_none(),
+        metadata_store.get(&storage_key).await?.is_none(),
         "session metadata should be removed"
     );
     assert_eq!(deleted.metadata_keys_deleted, 2);
 
-    let deleted_again = delete_remote_session(&config, "local", session_id).await?;
+    let deleted_again = delete_remote_session(&config, "local", "oracle", session_id).await?;
     assert!(!deleted_again.stream_deleted);
     assert!(!deleted_again.lease_deleted);
 
@@ -118,15 +112,19 @@ async fn session_delete_removes_attachments_and_is_idempotent() -> Result<()> {
         image_url: ImageUrl { url: data_url },
     }]);
     externalize_message_attachments(
-        AttachmentLocation::new(&jetstream, 1, session_id),
+        AttachmentLocation::new(
+            &jetstream,
+            1,
+            &harnx_core::session_identity::session_key(Some("oracle"), session_id),
+        ),
         &mut content,
         None,
     )
     .await?;
 
-    let deleted = delete_remote_session(&config, "local", session_id).await?;
+    let deleted = delete_remote_session(&config, "local", "oracle", session_id).await?;
     assert_eq!(deleted.attachments_deleted, 1);
-    let deleted_again = delete_remote_session(&config, "local", session_id).await?;
+    let deleted_again = delete_remote_session(&config, "local", "oracle", session_id).await?;
     assert_eq!(deleted_again.attachments_deleted, 0);
     Ok(())
 }
@@ -179,4 +177,16 @@ fn local_nats_config(url: &str) -> Config {
         }],
         ..Default::default()
     }
+}
+
+async fn append_user_message(log: &NatsSessionLog) -> Result<()> {
+    log.append_event_async(&SessionLogEntry::Message {
+        id: None,
+        role: MessageRole::User,
+        content: MessageContent::Text("hello".to_string()),
+        timestamp: None,
+        fence_token: None,
+    })
+    .await?;
+    Ok(())
 }

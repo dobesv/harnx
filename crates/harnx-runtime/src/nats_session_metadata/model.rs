@@ -23,8 +23,10 @@ impl SessionAgentSource {
 
     fn validate(&self) -> Result<()> {
         match self {
-            Self::Named { name } if name.trim().is_empty() => {
-                bail!("named session agent must not be empty")
+            Self::Named { name }
+                if name.trim().is_empty() || name == harnx_core::agent_config::TEMP_AGENT_NAME =>
+            {
+                bail!("named session agent must not be empty or the reserved inline-agent name")
             }
             _ => Ok(()),
         }
@@ -148,6 +150,19 @@ impl SessionMetadata {
             extensions,
             worker_fence_token: 0,
         }
+    }
+
+    pub fn storage_key(&self) -> String {
+        harnx_core::session_identity::session_key(self.agent.name(), &self.session_id)
+    }
+
+    pub fn validate_storage_key(&self, expected_key: &str) -> Result<()> {
+        self.validate(&self.session_id)?;
+        anyhow::ensure!(
+            self.storage_key() == expected_key,
+            "session metadata storage identity mismatch"
+        );
+        Ok(())
     }
 
     pub fn validate(&self, expected_session_id: &str) -> Result<()> {

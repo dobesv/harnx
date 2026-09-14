@@ -46,11 +46,8 @@ impl Config {
                     .into_iter()
                     .map(|v| (v.id(), Some(v.description())))
                     .collect(),
-                // Session completion is populated asynchronously from NATS by
-                // `list_sessions_for_completion`.
-                ".session" => vec![],
                 ".rag" => map_completion_values(Self::list_rags()),
-                ".agent" => map_completion_values(precomputed_agents),
+                ".agent" | ".session" => map_completion_values(precomputed_agents),
                 ".macro" => map_completion_values(Self::list_macros()),
                 ".starter" => match &self.agent {
                     Some(agent) => agent
@@ -157,27 +154,25 @@ impl Config {
         fuzzy_filter(values, |v| v.0.as_str(), filter)
     }
 
-    /// Generate tab-completion candidates for session IDs.
-    ///
-    /// This is the async variant that should be used from async contexts (TUI).
-    /// When a remote agent is in context, fetches session IDs from the remote
-    /// NATS KV index with a short timeout for snappy completion.
-    ///
-    /// # Arguments
-    /// * `cluster` - The remote cluster name, or `None` for shared local NATS
-    ///
-    /// # Returns
-    /// Session ID strings suitable for completion. Returns empty vec on timeout/error
-    /// (graceful degradation).
-    pub async fn list_sessions_for_completion(&self, cluster: Option<&str>) -> Vec<String> {
-        let cluster = cluster.unwrap_or(super::LOCAL_CLUSTER_KEY);
+    /// Complete session IDs owned by an explicit agent selector, with a short
+    /// timeout so an unreachable broker cannot block interactive completion.
+    pub async fn list_sessions_for_completion(&self, agent_ref: &str) -> Vec<String> {
+        use harnx_core::agent_ref::AgentRef;
+        let (agent, cluster) = match AgentRef::parse(agent_ref) {
+            AgentRef::Local(agent) => (agent, super::LOCAL_CLUSTER_KEY.into()),
+            AgentRef::Remote { agent, cluster } => (agent, cluster),
+        };
         match tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            self.list_remote_sessions_with_meta(cluster),
+            self.list_remote_sessions_with_meta(&cluster),
         )
         .await
         {
-            Ok(Ok(sessions)) => sessions.into_iter().map(|s| s.id).collect(),
+            Ok(Ok(sessions)) => sessions
+                .into_iter()
+                .filter(|session| session.agent_name.as_deref() == Some(agent.as_ref()))
+                .map(|session| session.id)
+                .collect(),
             Ok(Err(e)) => {
                 log::debug!("NATS session completion failed: {:#}", e);
                 vec![]
@@ -198,6 +193,15 @@ fn complete_bool(value: bool) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn session_first_argument_completes_agents() {
+        let config = Config::default();
+        assert_eq!(
+            config.command_complete(".session", &["alp"], vec!["alpha".into(), "beta".into()]),
+            vec![("alpha".into(), None)],
+        );
+    }
+
     /// Test that remote session completion gracefully degrades on unreachable cluster.
     ///
     /// Passes a bogus cluster name that has no NATS server; the method should:
@@ -212,7 +216,7 @@ mod tests {
 
         // Call with a bogus-unreachable cluster name (no live NATS at this address)
         let result = config
-            .list_sessions_for_completion(Some("bogus-unreachable-cluster-xyz-9f8e7d"))
+            .list_sessions_for_completion("alpha@bogus-unreachable-cluster-xyz-9f8e7d")
             .await;
 
         let elapsed = start.elapsed();

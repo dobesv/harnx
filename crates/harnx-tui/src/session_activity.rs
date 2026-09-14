@@ -238,7 +238,7 @@ impl Tui {
 
     pub(super) fn session_activity_destination(&self) -> Option<(String, String)> {
         let config = self.config.read();
-        let session_id = config.session.as_ref()?.id().to_string();
+        let session_id = config.session.as_ref()?.storage_key();
         let cluster = config
             .remote_agent
             .as_ref()

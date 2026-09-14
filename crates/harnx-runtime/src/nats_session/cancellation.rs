@@ -82,10 +82,10 @@ impl NatsSession {
             self.abort_signal.set_ctrlc();
         }
         let receipt = tokio::time::timeout(Duration::from_secs(2), async {
-            resolve_pending_execution(&self.execution_store, &self.jetstream, &self.session_id)
+            resolve_pending_execution(&self.execution_store, &self.jetstream, &self.storage_key)
                 .await?;
             self.execution_store
-                .request_cancel(&self.session_id, request)
+                .request_cancel(&self.storage_key, request)
                 .await
         })
         .await
@@ -99,7 +99,7 @@ impl NatsSession {
             let wake = async {
                 let operation = self
                     .execution_store
-                    .current(&self.session_id)
+                    .current(&self.storage_key)
                     .await?
                     .context("execution missing")?;
                 let through = operation
@@ -131,7 +131,7 @@ impl NatsSession {
                 cancellation_id: cancellation_id.clone(),
             };
             let client = self.client.clone();
-            let session = self.session_id.clone();
+            let session = self.storage_key.clone();
             tokio::spawn(async move {
                 let _ = publish_control_command(&client, &session, &command).await;
             });
@@ -143,7 +143,7 @@ impl NatsSession {
         let Some(execution_id) = receipt.execution_id.as_ref() else {
             return Ok(receipt.clone());
         };
-        let reference = OperationRef::new(&self.session_id, execution_id);
+        let reference = OperationRef::new(&self.storage_key, execution_id);
         let operation = self
             .execution_store
             .get(&reference)
@@ -163,7 +163,7 @@ impl NatsSession {
         expected_execution_id: &str,
     ) -> Result<CancelReceipt> {
         self.execution_store
-            .abandon_unconfirmed(&self.session_id, expected_execution_id)
+            .abandon_unconfirmed(&self.storage_key, expected_execution_id)
             .await
     }
 
@@ -191,7 +191,7 @@ impl NatsSession {
         if !operation.admissions_covered(cancel_seq) {
             return Ok(());
         }
-        if crate::nats_lease::session_has_active_lease(&self.jetstream, &self.session_id).await? {
+        if crate::nats_lease::session_has_active_lease(&self.jetstream, &self.storage_key).await? {
             return Ok(());
         }
         self.execution_store

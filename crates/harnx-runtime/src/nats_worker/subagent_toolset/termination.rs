@@ -16,9 +16,7 @@ use tokio_util::sync::CancellationToken;
 mod expired_replay_tests;
 
 pub(super) fn subagent_error_message(prefix: impl std::fmt::Display, session_id: &str) -> String {
-    format!(
-        "{prefix} (session_id: {session_id}; resume with session_prompt using this exact session_id, inspect with session_load)"
-    )
+    format!("{prefix} (session_id: {session_id})")
 }
 
 pub(super) struct PromptParams<'a> {
@@ -459,11 +457,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recoverable_subagent_errors_include_session_resume_guidance() {
+    fn recoverable_subagent_errors_include_session_id_without_tool_guidance() {
         let child_session_id = "child-error-session";
         assert_eq!(
             subagent_error_message("sub-agent turn was cancelled", child_session_id),
-            "sub-agent turn was cancelled (session_id: child-error-session; resume with session_prompt using this exact session_id, inspect with session_load)"
+            "sub-agent turn was cancelled (session_id: child-error-session)"
         );
 
         for (worker_error, expected_prefix) in [
@@ -488,8 +486,8 @@ mod tests {
 
             assert!(message.contains(expected_prefix));
             assert!(message.contains(child_session_id));
-            assert!(message.contains("resume with session_prompt"));
-            assert!(message.contains("inspect with session_load"));
+            assert!(!message.contains("session_prompt"));
+            assert!(!message.contains("session_load"));
         }
     }
 

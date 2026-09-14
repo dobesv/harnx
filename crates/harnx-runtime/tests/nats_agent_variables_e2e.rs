@@ -386,7 +386,7 @@ async fn load_entries(
     jetstream: &async_nats::jetstream::Context,
     session_id: &str,
 ) -> Result<Vec<(u64, SessionLogEntry)>> {
-    NatsSessionLog::new(jetstream.clone(), session_id)
+    NatsSessionLog::for_agent(jetstream.clone(), BROKEN_AGENT, session_id)
         .load_events_async()
         .await
 }
@@ -397,7 +397,7 @@ async fn persisted_agent_variables(
 ) -> Result<Vec<(String, String)>> {
     let record = SessionMetadataStore::ensure(jetstream, 1)
         .await?
-        .get(session_id)
+        .get_for_agent(session_id, FILE_VARIABLE_AGENT)
         .await?
         .context("session metadata must exist")?;
     Ok(record.metadata.variables.into_iter().collect())
@@ -722,7 +722,10 @@ async fn client_ends_turn_when_worker_vanishes_without_writing() -> Result<()> {
     let session_id = "agent-orphaned-turn";
     let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
         jetstream: env.jetstream().await?,
-        session_id,
+        session_id: &harnx_core::session_identity::session_key(
+            Some(FILE_VARIABLE_AGENT),
+            session_id,
+        ),
         worker_id: "worker-that-dies".to_string(),
         generation: 1,
         config: NatsLeaseConfig::default(),

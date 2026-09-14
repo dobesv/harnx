@@ -82,10 +82,10 @@ impl Tui {
                     ..
                 } = item
                 {
-                    if key.session_id == operation.reference.session_id
-                        && invocation_id.as_deref() == Some(&operation.reference.execution_id)
+                    if invocation_id.as_deref() == Some(&operation.reference.execution_id)
                         && (operation.state.cancelling()
                             || operation.state == OperationState::Cancelled)
+                        && key.matches_operation(&cluster, &operation.reference)
                     {
                         *row_status = status.clone();
                     }
@@ -94,17 +94,16 @@ impl Tui {
         };
         update_rows(&mut self.app.transcript);
         for (key, state) in &mut self.app.monitored_sessions {
-            if key.session_id == operation.reference.session_id && key.cluster == cluster {
+            if key.matches_operation(&cluster, &operation.reference) {
                 state.execution_id = Some(operation.reference.execution_id.clone());
                 state.status = status.clone();
             }
             update_rows(&mut state.transcript);
         }
         for view in &mut self.app.subagent_view_stack {
-            if view.key.session_id == operation.reference.session_id
-                && view.progress.as_ref().is_some_and(|progress| {
-                    progress.snapshot.invocation_id == operation.reference.execution_id
-                })
+            if view.progress.as_ref().is_some_and(|progress| {
+                progress.snapshot.invocation_id == operation.reference.execution_id
+            }) && view.key.matches_operation(&cluster, &operation.reference)
             {
                 view.status = status.clone();
             }

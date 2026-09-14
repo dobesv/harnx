@@ -19,9 +19,11 @@ impl SessionMetadataStore {
         agent: &str,
         patch: SessionMetadataPatch,
     ) -> Result<MetadataRecord> {
-        self.patch_guarded(session_id, PatchGuard::for_agent(agent), |metadata| {
-            apply_typed_patch(metadata, &patch)
-        })
+        self.patch_guarded(
+            &harnx_core::session_identity::session_key(Some(agent), session_id),
+            PatchGuard::for_agent(agent),
+            |metadata| apply_typed_patch(metadata, &patch),
+        )
         .await
     }
 
@@ -167,7 +169,7 @@ impl SessionMetadataStore {
                 "session identity, agent source, schema version, and creation time are immutable"
             );
             guard.apply_fence(&mut record.metadata);
-            record.metadata.validate(session_id)?;
+            record.metadata.validate_storage_key(session_id)?;
             match self
                 .update_metadata(&record.metadata, record.revision)
                 .await
@@ -204,7 +206,7 @@ impl SessionMetadataStore {
     }
 
     async fn update_metadata(&self, metadata: &SessionMetadata, revision: u64) -> Result<u64> {
-        let key = metadata_key(&metadata.session_id);
+        let key = metadata_key(&metadata.storage_key());
         let payload = serde_json::to_vec(metadata).with_context(|| {
             format!(
                 "Failed to serialize session metadata '{}'",

@@ -323,7 +323,14 @@ Mid-tool entries (arriving between `ToolCalls` and `ToolResults`) must be queued
 `messages_queued_during_tool` during reconstruction so tool_use→tool_result adjacency is
 preserved. See `SubAgentStarted` handling in `config/session.rs` for the pattern.
 
-Append to another session's log via `NatsSessionLog::new(jetstream, session_id)` with no
+Session identity is `(agent, local_id)` within a cluster. Use `Session::storage_key()`,
+`NatsSession::storage_key()`, or `SessionInitializer::session_key(local_id)` for all
+broker storage, control, execution, and parent references. Internal protocol fields
+named `session_id` carry this key; public metadata, tool results, hooks, and
+confirmation requests retain the local ID.
+See `docs/nats-ha.md` under “Session identity”. Do not pass a local ID to by-key APIs.
+
+Append to another session's log via `NatsSessionLog::new(jetstream, storage_key)` with no
 `fence_token`. Used when a tool/client needs durable state visible to a session it doesn't
 hold the lease for (e.g. sub-agent start entries in parent log).
 
