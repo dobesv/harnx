@@ -20,8 +20,22 @@ interface SessionCreationOptions {
 const errorMessage = (error: unknown, fallback: string) =>
   error instanceof Error && error.message ? error.message : fallback;
 
+const SESSION_LIST_RECONCILE_INTERVAL_MS = 30000; // 30 seconds
+
 function withoutListedSessions(ids: string[], sessions: SessionRef[]) {
   return ids.filter((id) => !sessions.some((session) => session.session_id === id));
+}
+
+function usePeriodicReconcile(callback: () => void, enabled: boolean) {
+  useEffect(() => {
+    if (!enabled) return;
+
+    const interval = setInterval(() => {
+      callback();
+    }, SESSION_LIST_RECONCILE_INTERVAL_MS);
+
+    return () => clearInterval(interval);
+  }, [enabled, callback]);
 }
 
 function useSessionList(
@@ -47,6 +61,14 @@ function useSessionList(
     setHasLoadedSessions(false);
   }
 
+  const resetForEmptyAgent = useCallback(() => {
+    setSessions([]);
+    setSessionsError(null);
+    setRequestLoading(false);
+    setSettledAgent('');
+    setHasLoadedSessions(false);
+  }, []);
+
   const refreshSessions = useCallback(() => {
     // Abort previous in-flight request before starting a fresh attempt
     if (abortControllerRef.current) {
@@ -56,11 +78,7 @@ function useSessionList(
 
     const request = ++sessionsRequestRef.current;
     if (!selectedAgent) {
-      setSessions([]);
-      setSessionsError(null);
-      setRequestLoading(false);
-      setSettledAgent('');
-      setHasLoadedSessions(false);
+      resetForEmptyAgent();
       return;
     }
 
@@ -69,7 +87,6 @@ function useSessionList(
 
     setRequestLoading(true);
     setSessionsError(null);
-
     listSessions(selectedAgent, { signal: controller.signal })
       .then((data) => {
         if (request !== sessionsRequestRef.current) return;
@@ -88,7 +105,10 @@ function useSessionList(
         setSettledAgent(selectedAgent);
         setRequestLoading(false);
       });
-  }, [selectedAgent, setFreshSessionIds]);
+  }, [selectedAgent, setFreshSessionIds, resetForEmptyAgent]);
+
+  // Periodic reconcile: refetch on interval
+  usePeriodicReconcile(refreshSessions, Boolean(selectedAgent));
 
   useEffect(() => {
     refreshSessions();
@@ -102,6 +122,7 @@ function useSessionList(
 
   return {
     sessions,
+    setSessions,
     sessionsError,
     setSessionsError,
     sessionsLoading: Boolean(selectedAgent) && (requestLoading || settledAgent !== selectedAgent),
@@ -163,6 +184,12 @@ export function useSessionDiscovery({
     setFreshSessionIds((previous) => previous.filter((id) => id !== sessionId));
   }, []);
 
+  const setSessionUnread = useCallback((sessionId: string, unread: boolean) => {
+    sessionList.setSessions((prev) =>
+      prev.map((s) => (s.session_id === sessionId ? { ...s, unread } : s)),
+    );
+  }, [sessionList.setSessions]);
+
   return {
     sessions: sessionList.sessions,
     sessionsError: sessionList.sessionsError,
@@ -171,6 +198,7 @@ export function useSessionDiscovery({
     isFreshSession: freshSessionIds.includes(selectedSessionId),
     markSessionNotFresh,
     refreshSessions: sessionList.refreshSessions,
+    setSessionUnread,
     selectSession,
     newChat,
   };

@@ -16,6 +16,8 @@ pub struct ListedSession {
     pub metadata: SessionMetadata,
     pub metadata_revision: u64,
     pub activity: Option<SessionActivity>,
+    /// Whether the session has unread attention (attention_seq > read_seq or manual_unread).
+    pub unread: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

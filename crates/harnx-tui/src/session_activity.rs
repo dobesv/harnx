@@ -1,4 +1,4 @@
-use crate::types::{Tui, TuiEvent};
+use crate::types::{ModalState, Tui, TuiEvent};
 use harnx_core::event::{AgentEvent, SessionEvent, TurnEvent};
 use harnx_core::session::SessionLogEntry;
 use harnx_runtime::config::{GlobalConfig, LOCAL_CLUSTER_KEY};
@@ -15,6 +15,7 @@ enum SessionActivityInput {
     Advisory(harnx_runtime::nats_event_sink::AdvisoryEnvelope),
     RefreshDurableHistory,
     SubscriptionClosed,
+    ReadInvalidation,
 }
 
 enum DurableRefreshOutcome {
@@ -74,6 +75,11 @@ impl SessionEventForwarder<'_> {
             .all(|progress| {
                 self.send_session_event(AgentEvent::Turn(TurnEvent::SubAgentProgress(progress)))
             })
+    }
+    fn send_session_read_invalidation(&self) -> bool {
+        self.send(TuiEvent::SessionReadInvalidation {
+            session_id: self.target.0.clone(),
+        })
     }
 
     fn send(&self, event: TuiEvent) -> bool {
@@ -246,6 +252,59 @@ impl Tui {
             .unwrap_or_else(|| LOCAL_CLUSTER_KEY.to_string());
         Some((session_id, cluster))
     }
+
+    /// Handle a read invalidation event for a session.
+    /// Updates current-session chrome and any open session picker from canonical state.
+    pub(super) async fn handle_session_read_invalidation(&mut self, session_id: &str) {
+        self.refresh_current_session_read_state(session_id).await;
+        self.refresh_session_picker_for_read_invalidation().await;
+    }
+
+    async fn refresh_current_session_read_state(&mut self, session_id: &str) {
+        let Some((current_session_id, cluster)) = self.session_activity_destination() else {
+            return;
+        };
+        if current_session_id != session_id {
+            return;
+        }
+        let config = self.config.read().clone();
+        let Ok(jetstream) = config.nats_jetstream(&cluster).await else {
+            return;
+        };
+        let Ok(store) =
+            harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await
+        else {
+            return;
+        };
+        let Ok(read_state) = store.get_read_state(session_id).await else {
+            return;
+        };
+        self.app.current_session_unread = read_state.is_unread();
+        self.refresh_input_chrome();
+    }
+
+    async fn refresh_session_picker_for_read_invalidation(&mut self) {
+        let (selected, origin_agent, origin_session) = {
+            let Some(ModalState::SessionPicker {
+                selected,
+                origin_agent,
+                origin_session,
+                ..
+            }) = &self.app.modal
+            else {
+                return;
+            };
+            (*selected, origin_agent.clone(), origin_session.clone())
+        };
+        let (sessions, fetch_error) = Self::picker_sessions(&self.config).await;
+        self.app.modal = Some(ModalState::SessionPicker {
+            sessions,
+            selected,
+            origin_agent,
+            origin_session,
+            error: fetch_error,
+        });
+    }
 }
 
 impl Drop for Tui {
@@ -287,8 +346,8 @@ async fn monitor_session_connection(
     event_tx: &UnboundedSender<TuiEvent>,
     target: &SessionTarget,
 ) -> bool {
-    let mut stream = match attach_session_event_stream(config, target).await {
-        Ok(stream) => stream,
+    let (mut stream, client) = match attach_session_event_stream(config, target).await {
+        Ok(result) => result,
         Err(error) => {
             log::debug!(
                 "failed to attach session activity monitor: session_id={} cluster={} error={error:#}",
@@ -313,28 +372,47 @@ async fn monitor_session_connection(
     {
         return false;
     }
-    forward_session_activity(&mut stream, &forwarder).await
+    forward_session_activity(&mut stream, &forwarder, client).await
 }
 
 pub(super) async fn attach_session_event_stream(
     config: &GlobalConfig,
     target: &SessionTarget,
-) -> anyhow::Result<SessionEventStream> {
+) -> anyhow::Result<(SessionEventStream, async_nats::Client)> {
     let config_snapshot = config.read().clone();
     let client = config_snapshot.nats_client(&target.1).await?;
     let jetstream = async_nats::jetstream::new(client.clone());
-    SessionEventStream::attach(jetstream, client, &target.0).await
+    let stream = SessionEventStream::attach(jetstream, client.clone(), &target.0).await?;
+    Ok((stream, client))
 }
 
 async fn forward_session_activity(
     stream: &mut SessionEventStream,
     forwarder: &SessionEventForwarder<'_>,
+    client: async_nats::Client,
 ) -> bool {
     let mut active = forwarder.attached_during_turn;
     let mut refresh = tokio::time::interval(DURABLE_REFRESH_INTERVAL);
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Subscribe to read invalidation notifications for this session
+    // Create a persistent subscriber that lives for the forwarder's lifetime
+    use futures_util::StreamExt;
+    use harnx_runtime::nats_session_metadata::read_invalidation_subject;
+
+    let subject = read_invalidation_subject(&forwarder.target.0);
+    let mut read_sub = match client.subscribe(subject.clone()).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            log::warn!("Failed to subscribe to read invalidation subject: {e:#}");
+            return false;
+        }
+    };
+
     loop {
-        match next_session_activity_input(stream.next(), active, &mut refresh).await {
+        match next_session_activity_input(stream.next(), active, &mut refresh, read_sub.next())
+            .await
+        {
             SessionActivityInput::Advisory(envelope) => {
                 if !forward_advisory(forwarder, envelope, &mut active) {
                     return false;
@@ -352,6 +430,12 @@ async fn forward_session_activity(
                 }
             }
             SessionActivityInput::SubscriptionClosed => return true,
+            SessionActivityInput::ReadInvalidation => {
+                if !forwarder.send_session_read_invalidation() {
+                    return false;
+                }
+                // Subscriber is persistent; no need to re-subscribe
+            }
         }
     }
 }
@@ -362,12 +446,14 @@ async fn next_session_activity_input(
     >,
     active: bool,
     refresh: &mut tokio::time::Interval,
+    read_invalidation: impl std::future::Future<Output = Option<async_nats::Message>>,
 ) -> SessionActivityInput {
     // A fresh timeout per advisory starves durable recovery while the parent
     // keeps streaming. The interval survives each advisory and wins when due.
     tokio::select! {
         biased;
         _ = refresh.tick(), if active => SessionActivityInput::RefreshDurableHistory,
+        _ = read_invalidation => SessionActivityInput::ReadInvalidation,
         envelope = advisory => envelope.map_or(
             SessionActivityInput::SubscriptionClosed,
             SessionActivityInput::Advisory,
@@ -490,7 +576,13 @@ mod tests {
                 AgentEvent::Turn(TurnEvent::Started),
             )));
         assert!(matches!(
-            next_session_activity_input(advisory, true, &mut refresh).await,
+            next_session_activity_input(
+                advisory,
+                true,
+                &mut refresh,
+                std::future::pending::<Option<async_nats::Message>>()
+            )
+            .await,
             SessionActivityInput::RefreshDurableHistory
         ));
     }
