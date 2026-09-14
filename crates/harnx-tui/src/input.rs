@@ -2,16 +2,60 @@ use crate::lifecycle::session_history_transcript_items;
 use crate::render_helpers::render_status_line;
 use crate::strip_ansi;
 use crate::types::{ExitPhase, ModalState, TranscriptItem, Tui, TuiEvent};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use crossterm::ExecutableCommand;
 use harnx_core::event::{AgentEvent, AgentSource};
 use harnx_render::pretty_error_string;
-use harnx_runtime::config::list_assistant_agents;
+use harnx_runtime::config::{
+    dump_entries_jsonl, dump_entries_yaml, list_assistant_agents, load_session_for_render,
+    render_metadata_json, render_metadata_yaml, SessionFormat,
+};
+use harnx_runtime::nats_session_log::NatsSessionLog;
 use harnx_runtime::utils::pretty_yaml_block;
 use ratatui_textarea::{Input as TextInput, Key};
 use std::path::Path;
 
+/// Parse tokens after `.info session` or `.dump session` into positional args and format.
+fn parse_session_tokens(tokens: &[String]) -> Result<(Vec<String>, SessionFormat)> {
+    let mut positional = Vec::new();
+    let mut format = SessionFormat::Text;
+    let mut format_next = false;
+    // Skip command tokens [".info", "session"] or [".dump", "session"]
+    for token in tokens.iter().skip(2) {
+        if format_next {
+            format = token.parse()?;
+            format_next = false;
+        } else if token == "--format" {
+            format_next = true;
+        } else if let Some(val) = token.strip_prefix("--format=") {
+            format = val.parse()?;
+        } else {
+            positional.push(token.clone());
+        }
+    }
+    if format_next {
+        anyhow::bail!("Missing value for --format");
+    }
+    Ok((positional, format))
+}
+
+/// Types of overlay content for info/dump commands.
+enum InfoOverlayType {
+    AgentInfo,
+    SessionInfo,
+    SessionDump,
+}
+
+impl InfoOverlayType {
+    fn title(&self) -> &'static str {
+        match self {
+            InfoOverlayType::AgentInfo => "Agent Info",
+            InfoOverlayType::SessionInfo => "Session Info",
+            InfoOverlayType::SessionDump => "Session Transcript",
+        }
+    }
+}
 /// Byte budget for an attachment preview. Applied via `truncate_output`'s
 /// `max_output_bytes` (and split across per-line head/tail byte limits), so it
 /// is measured in bytes rather than characters — multibyte text may crop a
@@ -1816,7 +1860,7 @@ impl Tui {
             }
 
             let (cmd, args) = match (cmd, args.as_slice()) {
-                (".info", ["session", _, ..]) => (".session", args[1..].to_vec()),
+                (".info" | ".dump", ["session", _, ..]) => (".session", args[1..].to_vec()),
                 _ => (cmd, args),
             };
             if cmd == ".agent" && args.iter().all(|arg| arg.is_empty()) {
@@ -1981,12 +2025,8 @@ impl Tui {
     }
 
     async fn try_handle_info_overlay(&mut self, line_cmd: &str) -> bool {
-        let is_info_agent =
-            line_cmd.starts_with(".info agent") || line_cmd.starts_with("/info agent");
-        let is_info_session =
-            line_cmd.starts_with(".info session") || line_cmd.starts_with("/info session");
-
-        if !is_info_agent && !is_info_session {
+        let info_type = self.detect_info_overlay_type(line_cmd);
+        if info_type.is_none() {
             return false;
         }
 
@@ -1997,32 +2037,10 @@ impl Tui {
             return true;
         };
 
-        let result = if is_info_agent {
-            self.resolve_info_agent_target(&tokens)
-                .and_then(|agent_name| {
-                    let cfg = self.config.read();
-                    harnx_runtime::config::render_agent_dump(&cfg, &agent_name)
-                })
-        } else {
-            async {
-                let (agent_name, session_id) = self.resolve_info_session_target(&tokens)?;
-                let cfg = self.config.read().clone();
-                harnx_runtime::config::render_session_dump_for_agent_ref(
-                    &cfg,
-                    &agent_name,
-                    &session_id,
-                )
-                .await
-            }
-            .await
-        };
-
+        let info_type = info_type.unwrap();
+        let result = self.render_info_overlay(&tokens, &info_type).await;
         let display_text = result.unwrap_or_else(|err| format!("Error: {}", err));
-        let title = if is_info_agent {
-            "Agent Info"
-        } else {
-            "Session Info"
-        };
+        let title = info_type.title();
         self.open_info_overlay(display_text, title);
         true
     }
@@ -2046,12 +2064,96 @@ impl Tui {
         }
     }
 
-    fn resolve_info_session_target(&self, tokens: &[String]) -> anyhow::Result<(String, String)> {
-        anyhow::ensure!(
-            tokens.len() == 4 && !tokens[2].is_empty() && !tokens[3].is_empty(),
-            "An explicit agent and session ID are required. Usage: .info session <agent> <id>"
-        );
-        Ok((tokens[2].clone(), tokens[3].clone()))
+    fn detect_info_overlay_type(&self, line_cmd: &str) -> Option<InfoOverlayType> {
+        if line_cmd.starts_with(".info agent") || line_cmd.starts_with("/info agent") {
+            Some(InfoOverlayType::AgentInfo)
+        } else if line_cmd.starts_with(".info session") || line_cmd.starts_with("/info session") {
+            Some(InfoOverlayType::SessionInfo)
+        } else if line_cmd.starts_with(".dump session") || line_cmd.starts_with("/dump session") {
+            Some(InfoOverlayType::SessionDump)
+        } else {
+            None
+        }
+    }
+
+    async fn render_info_overlay(
+        &self,
+        tokens: &[String],
+        info_type: &InfoOverlayType,
+    ) -> Result<String> {
+        match info_type {
+            InfoOverlayType::AgentInfo => {
+                self.resolve_info_agent_target(tokens)
+                    .and_then(|agent_name| {
+                        let cfg = self.config.read();
+                        harnx_runtime::config::render_agent_dump(&cfg, &agent_name)
+                    })
+            }
+            InfoOverlayType::SessionInfo => self.render_info_session_overlay(tokens).await,
+            InfoOverlayType::SessionDump => self.render_dump_session_overlay(tokens).await,
+        }
+    }
+
+    async fn render_info_session_overlay(&self, tokens: &[String]) -> Result<String> {
+        let (agent_name, session_id, format) =
+            self.resolve_session_target_and_format(tokens, ".info session")?;
+        let cfg = self.config.read().clone();
+        let (agent, cluster) = harnx_runtime::config::resolve_session_agent(&agent_name)?;
+        match format {
+            SessionFormat::Text => {
+                let session =
+                    load_session_for_render(&cfg, Some(&cluster), &session_id, &agent).await?;
+                harnx_runtime::config::session::render(&session)
+            }
+            SessionFormat::Yaml | SessionFormat::Json => {
+                let (_, metadata) = harnx_runtime::config::session_metadata_for_agent(
+                    &cfg,
+                    &agent_name,
+                    &session_id,
+                )
+                .await?;
+                match format {
+                    SessionFormat::Yaml => render_metadata_yaml(&metadata),
+                    SessionFormat::Json => render_metadata_json(&metadata),
+                    SessionFormat::Text => unreachable!(),
+                }
+            }
+        }
+    }
+
+    async fn render_dump_session_overlay(&self, tokens: &[String]) -> Result<String> {
+        let (agent_name, session_id, format) =
+            self.resolve_session_target_and_format(tokens, ".dump session")?;
+        let cfg = self.config.read().clone();
+        let (jetstream, metadata) =
+            harnx_runtime::config::session_metadata_for_agent(&cfg, &agent_name, &session_id)
+                .await?;
+        let log = NatsSessionLog::new(jetstream, metadata.storage_key());
+        let raw = log
+            .load_events_async()
+            .await
+            .with_context(|| format!("Failed to load NATS session '{session_id}'"))?;
+        let entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)?;
+
+        match format {
+            SessionFormat::Text => {
+                let lines = crate::session_overlay::render_transcript_text(&entries);
+                Ok(lines)
+            }
+            SessionFormat::Yaml => dump_entries_yaml(entries.iter().map(|(_, e)| e)),
+            SessionFormat::Json => dump_entries_jsonl(entries.iter().map(|(_, e)| e)),
+        }
+    }
+
+    fn resolve_session_target_and_format(
+        &self,
+        tokens: &[String],
+        cmd_prefix: &str,
+    ) -> Result<(String, String, SessionFormat)> {
+        let (positional, format) = parse_session_tokens(tokens)?;
+        anyhow::ensure!(positional.len() == 2 && positional.iter().all(|value| !value.trim().is_empty()),
+            "An explicit agent and session ID are required. Usage: {cmd_prefix} <agent> <id> [--format text|yaml|json]");
+        Ok((positional[0].clone(), positional[1].clone(), format))
     }
 
     fn open_info_overlay(&mut self, text: String, title: &str) {

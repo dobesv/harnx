@@ -979,6 +979,24 @@ async fn info_session_without_session_renders_in_tui_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn dump_session_without_session_renders_in_tui_snapshot() {
+    let config = test_config();
+    let mut harness = TuiTestHarness::with_size(60, 14).await;
+    harness.tui().config = config.clone();
+
+    harness.tui().run_command(".dump session").await.unwrap();
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(!rendered.is_empty());
+    assert!(harness.tui().app.detail_view_open);
+    insta::assert_snapshot!("dump_session_without_session_in_tui", rendered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn info_agent_overlay_renders_in_tui_snapshot() {
     let mut harness = TuiTestHarness::with_size(72, 20).await;
     {
@@ -9239,4 +9257,69 @@ async fn missing_picker_origin_keeps_selected_agent_and_picker() {
         tui.app.modal,
         Some(crate::types::ModalState::SessionPicker { error: Some(_), .. })
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dump_session_without_active_session_shows_usage_error() {
+    let config = test_config();
+    let mut harness = TuiTestHarness::with_size(60, 14).await;
+    harness.tui().config = config.clone();
+
+    harness.render();
+    harness.tui().run_command(".dump session").await.unwrap();
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(!rendered.is_empty());
+    assert!(harness.tui().app.detail_view_open);
+    // Verify error message is shown
+    assert!(
+        rendered.contains("Error:") || rendered.contains("Usage:"),
+        "should show error or usage"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn info_session_without_active_session_shows_usage_error() {
+    let config = test_config();
+    let mut harness = TuiTestHarness::with_size(60, 14).await;
+    harness.tui().config = config.clone();
+
+    harness.render();
+    harness.tui().run_command(".info session").await.unwrap();
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(!rendered.is_empty());
+    assert!(harness.tui().app.detail_view_open);
+    // Verify error message is shown
+    assert!(
+        rendered.contains("Error:") || rendered.contains("Usage:"),
+        "should show error or usage"
+    );
+}
+
+#[tokio::test]
+async fn dump_session_requires_explicit_agent_even_with_active_session() {
+    let config = test_config_with_mock_client_and_agent("reviewer", Some("review-12345"));
+    let mut tui = Tui::init(&config).await.unwrap();
+    for command in [
+        ".dump session",
+        ".dump session review-12345",
+        ".dump session --format json",
+    ] {
+        tui.run_command(command).await.unwrap();
+        assert!(tui
+            .app
+            .detail_view_text
+            .as_ref()
+            .unwrap()
+            .contains("An explicit agent and session ID are required"));
+    }
 }

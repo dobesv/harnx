@@ -30,7 +30,7 @@ pub enum CommandOutcome {
     OpenSessionPicker,
 }
 
-pub static COMMANDS: LazyLock<[Command; 48]> = LazyLock::new(|| {
+pub static COMMANDS: LazyLock<[Command; 49]> = LazyLock::new(|| {
     [
         Command::new(".help", "Show this help guide"),
         Command::new(".info", "Show system info"),
@@ -65,7 +65,16 @@ pub static COMMANDS: LazyLock<[Command; 48]> = LazyLock::new(|| {
             ".compact session",
             "Compact session messages using configured compaction agent",
         ),
-        Command::with_usage(".info session", "<agent> <id>", "Show session info"),
+        Command::with_usage(
+            ".info session",
+            "<agent> <id> [--format text|yaml|json]",
+            "Show session info (metadata)",
+        ),
+        Command::with_usage(
+            ".dump session",
+            "<agent> <id> [--format text|yaml|json]",
+            "Show session transcript dump",
+        ),
         Command::new(
             ".info model",
             "Show active model details (id, client, pricing, vision/tool-use, catalog source)",
@@ -1820,5 +1829,8 @@ async fn explicit_session_info(config: &GlobalConfig, args: &str) -> Result<Stri
     let (agent, session) =
         explicit_session_target(args.trim_start_matches("session").trim(), ".info session")?;
     let snapshot = config.read().clone();
-    crate::config::render_session_dump_for_agent_ref(&snapshot, &agent, &session).await
+    let (agent, cluster) = crate::config::resolve_session_agent(&agent)?;
+    let session =
+        crate::config::load_session_for_render(&snapshot, Some(&cluster), &session, &agent).await?;
+    crate::config::session::render(&session)
 }

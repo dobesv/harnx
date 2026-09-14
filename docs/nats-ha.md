@@ -40,7 +40,7 @@ Both components are case-sensitive. Commands require an explicit agent:
 ```sh
 harnx --agent alpha --session review-12345 prompt "Review this change"
 harnx info session alpha review-12345
-harnx session delete review-12345 --agent alpha --cluster local
+harnx delete session review-12345 --agent alpha --cluster local
 ```
 
 The TUI command is `.info session <agent> <id>`; it does not infer the selected
@@ -349,6 +349,18 @@ For the default local cluster you don't run this yourself: `harnx` and
 They look for it at `HARNX_WORKER_BIN` first, then next to the running
 front-end, then on `PATH` — so normally the worker just has to be installed
 alongside the front-end.
+
+When developing with `cargo run --bin harnx-serve`, build the worker too:
+`cargo build -p harnx-worker` (or `cargo build --workspace`). Cargo does not
+build the separate worker binary when it builds only the server. An explicit
+`HARNX_WORKER_BIN` must point to an existing binary; a missing override is an
+error, even if another worker is installed on `PATH`. Relative overrides are
+resolved from the server's working directory.
+
+If a Web UI message appears in the transcript without an agent response,
+check the displayed run error and the server's `session run failed` log entry.
+The prompt is saved before worker startup, so a saved message alone does not
+prove a worker was activated.
 
 `--cluster __local__` is rejected. The reserved name identifies shared local
 session state on the frontend side, but local worker execution uses a separate
@@ -831,7 +843,7 @@ lease, every KV key under `sessions/{id}`, and every attachment object owned by
 the session. The periodic remote-session cleanup uses the same deletion path.
 
 ```bash
-harnx session delete <session_id> --agent <agent> --cluster local
+harnx delete session <session_id> --agent <agent> --cluster local
 ```
 
 ## Observability

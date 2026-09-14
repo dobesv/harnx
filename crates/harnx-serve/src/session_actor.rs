@@ -527,10 +527,17 @@ impl SessionActor {
                 .await;
             }
             Err(err) => {
+                let message = format!("{err:#}");
+                log::error!(
+                    "session run failed: agent={} session_id={} run_id={}: {message}",
+                    self.key.agent,
+                    self.key.session,
+                    done.run_id,
+                );
                 done.sink.sink.close_text_segment();
                 let _ = self.broadcast_tx.send(Event::RunError(RunErrorEvent {
                     base: base_event(),
-                    message: err.to_string(),
+                    message,
                     code: None,
                 }));
                 self.state = SessionState::Idle;
@@ -1965,4 +1972,7 @@ mod tests {
     #[cfg(unix)]
     #[path = "session_actor_nats_tests.rs"]
     mod nats_tests;
+
+    #[path = "worker_startup_tests.rs"]
+    mod worker_startup_tests;
 }

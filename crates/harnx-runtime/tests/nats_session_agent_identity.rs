@@ -267,16 +267,17 @@ async fn explicit_agent_controls_completion_and_info_even_with_other_active_agen
         cfg.list_sessions_for_completion("beta@local").await,
         vec!["beta-only"]
     );
-    let dump =
-        harnx_runtime::config::render_session_dump_for_agent_ref(&cfg, "alpha@local", "alpha-only")
+    let (broker, metadata) =
+        harnx_runtime::config::session_metadata_for_agent(&cfg, "alpha@local", "alpha-only")
             .await?;
-    assert!(dump.contains("alpha"));
-    assert!(harnx_runtime::config::render_session_dump_for_agent_ref(
-        &cfg,
-        "beta@local",
-        "alpha-only"
-    )
-    .await
-    .is_err());
+    let entries = NatsSessionLog::new(broker, metadata.storage_key())
+        .load_events_async()
+        .await?;
+    assert!(serde_json::to_string(&entries)?.contains("alpha"));
+    assert!(
+        harnx_runtime::config::session_metadata_for_agent(&cfg, "beta@local", "alpha-only")
+            .await
+            .is_err()
+    );
     Ok(())
 }
