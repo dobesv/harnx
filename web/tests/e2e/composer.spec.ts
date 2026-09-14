@@ -73,6 +73,39 @@ test('composer responsive boundary', async ({ page }) => {
   await expect(mobileControls).toBeVisible();
 });
 
+test('composer container has spacing and no divider line (issue #1825)', async ({ page }) => {
+  // Active-session view: the composer sits below the status bar in .aui-thread-bottom.
+  await page.goto('/agents/coding%2Fcoder/sessions/session-1?scenario=happy');
+  const container = page.locator('.aui-composer-container');
+  await expect(container).toBeVisible();
+  // Wait for the transcript to hydrate: the empty-state layout
+  // (.aui-thread-empty .aui-composer-container) intentionally zeroes padding, so
+  // only assert once real messages are present and the base rule applies.
+  await expect(page.locator('.aui-message').first()).toBeVisible();
+
+  const styles = await container.evaluate((el) => {
+    const cs = getComputedStyle(el);
+    return {
+      borderTopWidth: parseFloat(cs.borderTopWidth) || 0,
+      paddingTop: parseFloat(cs.paddingTop) || 0,
+      paddingBottom: parseFloat(cs.paddingBottom) || 0,
+      paddingLeft: parseFloat(cs.paddingLeft) || 0,
+      paddingRight: parseFloat(cs.paddingRight) || 0,
+    };
+  });
+
+  // No divider line above/below the status bar: the container's border-top was the
+  // only border in the status-bar/composer stack, so it must be gone.
+  expect(styles.borderTopWidth).toBe(0);
+
+  // Breathing room around the message input on all sides (values asserted as
+  // > 0 rather than exact px so the test isn't brittle to spacing tweaks).
+  expect(styles.paddingTop).toBeGreaterThan(0);
+  expect(styles.paddingBottom).toBeGreaterThan(0);
+  expect(styles.paddingLeft).toBeGreaterThan(0);
+  expect(styles.paddingRight).toBeGreaterThan(0);
+});
+
 test('composer screenshots', async ({ page }) => {
   await page.goto('/agents/coding%2Fcoder/sessions/session-1?scenario=happy');
   
