@@ -1774,8 +1774,9 @@ async fn load_events_latest_async_reads_leader_authoritative_tail() -> Result<()
 #[test]
 fn injection_decision_points_use_leader_authoritative_read() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let agent_loop = std::fs::read_to_string(manifest_dir.join("src/nats_worker/agent_loop.rs"))
-        .expect("agent_loop.rs must be readable");
+    let agent_loop =
+        std::fs::read_to_string(manifest_dir.join("src/nats_worker/agent_loop/mod.rs"))
+            .expect("agent_loop/mod.rs must be readable");
 
     assert!(
         agent_loop.contains("build_mid_turn_injection_callback"),

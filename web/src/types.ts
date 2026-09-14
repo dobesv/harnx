@@ -10,6 +10,7 @@ export interface SessionRef {
   session_id: string;
   title?: string | null;
   updated_at?: string | number | null;
+  unread?: boolean;
   [key: string]: unknown;
 }
 

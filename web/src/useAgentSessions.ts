@@ -58,27 +58,11 @@ function useRouteSynchronization(
   }, [selectedAgent, selectedSessionId]);
 }
 
-export function useAgentSessions() {
-  const initial = selectionFromLocation();
-
-  const [agents, setAgents] = useState<Agent[]>([]);
-  const [agentsError, setAgentsError] = useState<string | null>(null);
-  const [hasLoadedAgents, setHasLoadedAgents] = useState(false);
-  const [selectedAgent, setSelectedAgent] = useState<string>(initial.agent);
-  const [selectedSessionId, setSelectedSessionId] = useState<string>(initial.session);
-  const discovery = useSessionDiscovery({
-    selectedAgent,
-    selectedSessionId,
-    setSelectedSessionId,
-  });
-  const selectSession = discovery.selectSession;
-  useRouteSynchronization(
-    selectedAgent,
-    selectedSessionId,
-    setSelectedAgent,
-    setSelectedSessionId,
-  );
-
+function useInitialAgentList(
+  setAgents: Dispatch<SetStateAction<Agent[]>>,
+  setAgentsError: Dispatch<SetStateAction<string | null>>,
+  setHasLoadedAgents: Dispatch<SetStateAction<boolean>>,
+) {
   useEffect(() => {
     let active = true;
     const controller = new AbortController();
@@ -103,7 +87,31 @@ export function useAgentSessions() {
       active = false;
       controller.abort();
     };
-  }, []);
+  }, [setAgents, setAgentsError, setHasLoadedAgents]);
+}
+
+export function useAgentSessions() {
+  const initial = selectionFromLocation();
+
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [agentsError, setAgentsError] = useState<string | null>(null);
+  const [hasLoadedAgents, setHasLoadedAgents] = useState(false);
+  const [selectedAgent, setSelectedAgent] = useState<string>(initial.agent);
+  const [selectedSessionId, setSelectedSessionId] = useState<string>(initial.session);
+  const discovery = useSessionDiscovery({
+    selectedAgent,
+    selectedSessionId,
+    setSelectedSessionId,
+  });
+  const selectSession = discovery.selectSession;
+  useRouteSynchronization(
+    selectedAgent,
+    selectedSessionId,
+    setSelectedAgent,
+    setSelectedSessionId,
+  );
+
+  useInitialAgentList(setAgents, setAgentsError, setHasLoadedAgents);
 
   const clearSession = useCallback(() => {
     setSelectedSessionId('');
@@ -143,6 +151,7 @@ export function useAgentSessions() {
     selectedSessionId,
     isFreshSession: discovery.isFreshSession,
     refreshSessions: discovery.refreshSessions,
+    setSessionUnread: discovery.setSessionUnread,
     markSessionNotFresh: discovery.markSessionNotFresh,
     selectAgent,
     selectSession,
