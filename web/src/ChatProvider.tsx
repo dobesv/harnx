@@ -160,6 +160,10 @@ export class HarnxHttpAgent extends HttpAgent {
     this.onSubAgentEvent(event);
     if (event?.type === 'CUSTOM') {
       this.handleCustomEvent(event.name, event.value);
+    } else if (event?.type === 'RUN_ERROR') {
+      // AG-UI delivers server failures as events; onRunFailed only handles
+      // failures of the client stream. Preserve the server's diagnostic text.
+      this.onRunFailedCb(event.message || 'Failed to send message');
     }
   }
 
