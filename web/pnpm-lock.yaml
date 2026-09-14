@@ -182,11 +182,11 @@ importers:
         specifier: 0.0.59
         version: 0.0.59(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@assistant-ui/tap@0.9.17(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(assistant-cloud@0.2.0)(react@19.3.0)(zod@4.5.4)
       '@assistant-ui/react-markdown':
-        specifier: 0.14.14
-        version: 0.14.14(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+        specifier: 0.14.15
+        version: 0.14.15(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
       '@assistant-ui/react-syntax-highlighter':
         specifier: 0.14.5
-        version: 0.14.5(@assistant-ui/react-markdown@0.14.14(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react@19.3.0)(react-syntax-highlighter@16.1.1(react@19.3.0))(react@19.3.0)
+        version: 0.14.5(@assistant-ui/react-markdown@0.14.15(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react@19.3.0)(react-syntax-highlighter@16.1.1(react@19.3.0))(react@19.3.0)
       '@radix-ui/react-dropdown-menu':
         specifier: 2.1.24
         version: 2.1.24(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
@@ -316,8 +316,8 @@ packages:
       '@types/react':
         optional: true
 
-  '@assistant-ui/react-markdown@0.14.14':
-    resolution: {integrity: sha512-hIydHkah5xUamtLBdWsezq/8b3xWvn1M3ixBXTUKfDihv3kBUPYH2AEgPlNrjSc9ZxYvoen9MzJDS+QTDaMOeg==}
+  '@assistant-ui/react-markdown@0.14.15':
+    resolution: {integrity: sha512-Hte+MSs8RZNx9+mbTqTRJcT0z4Vs54fNxPwEUrAd01+Qc9Dkx3wpgV6lG1gbDkiLkMVNPXRy6rQqett4xZ0cQw==}
     peerDependencies:
       '@assistant-ui/react': ^0.15.0
       '@types/react': '*'
@@ -1717,9 +1717,6 @@ packages:
     resolution: {integrity: sha512-Izi8RQcffqCeNVgFigKli1ssklIbpHnCYc6AknXGYoB6grJqyeby7jv12JUQgmTAnIDnbck1uxksT4dzN3PWBA==}
     engines: {node: '>=12'}
 
-  assistant-cloud@0.1.43:
-    resolution: {integrity: sha512-dq9kvqTCBwZtIzypi0zYZpylCtd6Hd/DTANeoesUjMhZ3vMjqtLaLW8Ce8mbD07f8MBrT0iUvd6fTJRU8cV97A==}
-
   assistant-cloud@0.2.0:
     resolution: {integrity: sha512-LMvPaufIfZ0dpByMsNeuPFY6UeKQ1oiSBktUJuhjL/2eTZLSzzjIWumiLALlpdvUZbbJCRHy8j0ZgzlZJJlEfQ==}
     peerDependencies:
@@ -2893,7 +2890,7 @@ snapshots:
       - ioredis
       - redis
 
-  '@assistant-ui/react-markdown@0.14.14(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)':
+  '@assistant-ui/react-markdown@0.14.15(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)':
     dependencies:
       '@assistant-ui/react': 0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
       '@radix-ui/react-primitive': 2.1.10(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
@@ -2909,10 +2906,10 @@ snapshots:
       - react-dom
       - supports-color
 
-  '@assistant-ui/react-syntax-highlighter@0.14.5(@assistant-ui/react-markdown@0.14.14(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react@19.3.0)(react-syntax-highlighter@16.1.1(react@19.3.0))(react@19.3.0)':
+  '@assistant-ui/react-syntax-highlighter@0.14.5(@assistant-ui/react-markdown@0.14.15(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react@19.3.0)(react-syntax-highlighter@16.1.1(react@19.3.0))(react@19.3.0)':
     dependencies:
       '@assistant-ui/react': 0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
-      '@assistant-ui/react-markdown': 0.14.14(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+      '@assistant-ui/react-markdown': 0.14.15(@assistant-ui/react@0.15.19(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
       react: 19.3.0
       react-syntax-highlighter: 16.1.1(react@19.3.0)
     optionalDependencies:
@@ -4126,13 +4123,6 @@ snapshots:
   aria-query@5.3.2: {}
 
   assertion-error@2.0.1: {}
-
-  assistant-cloud@0.1.43:
-    dependencies:
-      assistant-stream: 0.3.42
-    transitivePeerDependencies:
-      - ioredis
-      - redis
 
   assistant-cloud@0.2.0:
     dependencies:
