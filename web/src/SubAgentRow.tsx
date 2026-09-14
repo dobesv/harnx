@@ -159,6 +159,11 @@ export function SubAgentRow({ note, nowMs, onOpen }: { note: SubAgentNote; nowMs
                 <span className="aui-sub-agent-name">{note.agent}</span>
                 <span className="aui-sub-agent-session">{note.sessionId}</span>
               </span>
+              {note.title?.trim() ? (
+                <span className="aui-sub-agent-title" title={note.title}>
+                  {note.title}
+                </span>
+              ) : null}
               <span className="aui-sub-agent-metrics">
                 <span>{formatElapsed(displayedElapsedMs)}</span>
                 <span>in {formatTokens(note.inputTokens)}</span>

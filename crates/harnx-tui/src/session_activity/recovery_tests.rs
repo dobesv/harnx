@@ -168,6 +168,7 @@ fn completed_child_progress() -> harnx_core::event::SubAgentProgress {
         elapsed_ms: 375_177,
         usage: harnx_core::api_types::CompletionTokenUsage::new(Some(1200), Some(345), Some(67)),
         tool_call_count: 56,
+        title: None,
     }
 }
 

@@ -204,13 +204,15 @@ impl SubagentToolset {
             }
             None => None,
         };
-        Ok(SubagentProgressReporter::spawn(
+        Ok(SubagentProgressReporter::start(
             self.agent.clone(),
             start.child_session_id,
             start.invocation_id,
             parent_sink,
+            self.session_metadata.clone(),
             self.progress_heartbeat,
-        ))
+        )
+        .await)
     }
 
     async fn emit_parent_subagent_started(

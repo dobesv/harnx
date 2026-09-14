@@ -87,6 +87,7 @@ fn subagent_progress(
         elapsed_ms,
         usage: CompletionTokenUsage::new(Some(1_200), Some(345), Some(67)),
         tool_call_count: 4,
+        title: None,
     }
 }
 
@@ -199,7 +200,7 @@ async fn progress_animates_counts_elapsed_and_freezes_terminal_metrics() {
     harness.render();
     let first_frame = harness.screen_contents();
     assert!(first_frame.contains('⠋'));
-    assert!(first_frame.contains("in 1200  out 345  cache 67  tools 4"));
+    assert!(first_frame.contains("↘ 1200  ↗ 345  ◌ 67  ◔ 4"));
     harness.tui().app.spinner_index = 1;
     harness.render();
     assert!(harness.screen_contents().contains('⠙'));
