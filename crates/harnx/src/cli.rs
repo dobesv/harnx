@@ -20,7 +20,7 @@ pub struct Cli {
     #[clap(long, global = true, hide = true)]
     pub prompt: Option<String>,
     /// Start or join a session
-    #[clap(short = 's', long, global = true, hide = true)]
+    #[clap(short = 's', long, global = true, hide = true, requires = "agent")]
     pub session: Option<Option<String>>,
     /// Ensure the session is empty
     #[clap(long, global = true, hide = true)]
@@ -136,6 +136,9 @@ pub enum SessionSubcommands {
 
 #[derive(Args, Debug, PartialEq, Eq)]
 pub struct DeleteSessionArgs {
+    /// Agent that owns the session
+    #[arg(long)]
+    pub agent: String,
     pub session_id: String,
     /// Cluster key from nats_servers/<name>.yaml
     #[arg(long)]
@@ -226,12 +229,21 @@ mod tests {
 
     #[test]
     fn parses_session_delete_subcommand() {
-        let cli =
-            Cli::try_parse_from(["harnx", "session", "delete", "sess-1", "--cluster", "local"])
-                .unwrap();
+        let cli = Cli::try_parse_from([
+            "harnx",
+            "session",
+            "delete",
+            "sess-1",
+            "--agent",
+            "oracle",
+            "--cluster",
+            "local",
+        ])
+        .unwrap();
         match cli.command {
             Some(Commands::Session(args)) => match args.command {
                 SessionSubcommands::Delete(delete) => {
+                    assert_eq!(delete.agent, "oracle");
                     assert_eq!(delete.session_id, "sess-1");
                     assert_eq!(delete.cluster, "local");
                 }
@@ -260,6 +272,23 @@ mod tests {
                 }))
             );
         }
+    }
+
+    #[test]
+    fn session_commands_require_an_explicit_agent() {
+        assert!(
+            Cli::try_parse_from(["harnx", "--session", "review-12345", "prompt", "hello"]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "harnx",
+            "session",
+            "delete",
+            "review-12345",
+            "--cluster",
+            "local"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["harnx", "info", "session", "review-12345"]).is_err());
     }
 
     #[test]

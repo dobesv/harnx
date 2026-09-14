@@ -74,7 +74,7 @@ impl SessionMetadataStore {
 
     pub async fn create(&self, metadata: &SessionMetadata) -> Result<Option<u64>> {
         metadata.validate(&metadata.session_id)?;
-        let key = metadata_key(&metadata.session_id);
+        let key = metadata_key(&metadata.storage_key());
         let payload = serde_json::to_vec(metadata).with_context(|| {
             format!(
                 "Failed to serialize session metadata '{}'",
@@ -83,7 +83,7 @@ impl SessionMetadataStore {
         })?;
         match self.store.create(&key, payload.into()).await {
             Ok(revision) => {
-                if let Err(error) = self.ensure_reserved_activity(&metadata.session_id).await {
+                if let Err(error) = self.ensure_reserved_activity(&metadata.storage_key()).await {
                     // Metadata + activity span two KV keys. Roll back only the
                     // exact revision we created so a concurrent winner or patch
                     // can never be deleted by this failed reservation.
@@ -106,13 +106,14 @@ impl SessionMetadataStore {
         }
     }
 
+    /// Read by agent-scoped storage key. Use `get_for_agent` at a public boundary.
     pub async fn get(&self, session_id: &str) -> Result<Option<MetadataRecord>> {
         let key = metadata_key(session_id);
         match self.store.entry(key.clone()).await {
             Ok(Some(entry)) if matches!(entry.operation, kv::Operation::Put) => {
                 let metadata: SessionMetadata = serde_json::from_slice(&entry.value)
                     .with_context(|| format!("Failed to deserialize session metadata '{key}'"))?;
-                metadata.validate(session_id)?;
+                metadata.validate_storage_key(session_id)?;
                 Ok(Some(MetadataRecord {
                     metadata,
                     revision: entry.revision,

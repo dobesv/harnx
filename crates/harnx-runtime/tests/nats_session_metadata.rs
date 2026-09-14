@@ -92,13 +92,8 @@ async fn metadata_and_activity_cas_updates_do_not_contend() -> Result<()> {
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-activity-{}", uuid::Uuid::new_v4());
-    store
-        .create(&SessionMetadata::new(
-            &session_id,
-            SessionInitializer::named("metis", Default::default()),
-        ))
-        .await?;
+    let local_id = format!("metadata-activity-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
 
     let title_store = store.clone();
     let title_session = session_id.clone();
@@ -139,13 +134,8 @@ async fn purge_removes_metadata_activity_extensions_and_future_cursors() -> Resu
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-purge-{}", uuid::Uuid::new_v4());
-    store
-        .create(&SessionMetadata::new(
-            &session_id,
-            SessionInitializer::named("metis", Default::default()),
-        ))
-        .await?;
+    let local_id = format!("metadata-purge-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
     store
         .replace_extension(
             &session_id,
@@ -191,13 +181,8 @@ async fn concurrent_title_updates_retry_cas_conflicts() -> Result<()> {
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-title-race-{}", uuid::Uuid::new_v4());
-    store
-        .create(&SessionMetadata::new(
-            &session_id,
-            SessionInitializer::named("metis", Default::default()),
-        ))
-        .await?;
+    let local_id = format!("metadata-title-race-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
 
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(6));
     let mut updates = Vec::new();
@@ -235,13 +220,8 @@ async fn concurrent_override_fields_are_merged() -> Result<()> {
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-overrides-{}", uuid::Uuid::new_v4());
-    store
-        .create(&SessionMetadata::new(
-            &session_id,
-            SessionInitializer::named("metis", Default::default()),
-        ))
-        .await?;
+    let local_id = format!("metadata-overrides-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
 
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
     let model_update = {
@@ -290,13 +270,8 @@ async fn stale_worker_fence_cannot_overwrite_metadata() -> Result<()> {
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-fence-{}", uuid::Uuid::new_v4());
-    store
-        .create(&SessionMetadata::new(
-            &session_id,
-            SessionInitializer::named("metis", Default::default()),
-        ))
-        .await?;
+    let local_id = format!("metadata-fence-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
 
     store
         .patch_with_fence(&session_id, 20, |metadata| {
@@ -331,26 +306,26 @@ async fn agent_bound_mutations_hide_other_agents_sessions() -> Result<()> {
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-agent-{}", uuid::Uuid::new_v4());
+    let local_id = format!("metadata-agent-{}", uuid::Uuid::new_v4());
     store
         .create(&SessionMetadata::new(
-            &session_id,
+            &local_id,
             SessionInitializer::named("metis", Default::default()),
         ))
         .await?;
 
     assert!(store
-        .get_for_agent(&session_id, "aristarchus")
+        .get_for_agent(&local_id, "aristarchus")
         .await?
         .is_none());
     let error = store
-        .apply_patch_for_agent(&session_id, "aristarchus", SessionMetadataPatch::default())
+        .apply_patch_for_agent(&local_id, "aristarchus", SessionMetadataPatch::default())
         .await
         .expect_err("another agent must not mutate the session");
     assert_eq!(error.to_string(), "Not Found");
     store
         .replace_extension_for_agent(
-            &session_id,
+            &local_id,
             "metis",
             SessionExtensionUpdate {
                 namespace: "client",
@@ -370,13 +345,8 @@ async fn execution_context_merges_with_concurrent_metadata_and_evicts_oldest() -
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-context-{}", uuid::Uuid::new_v4());
-    store
-        .create(&SessionMetadata::new(
-            &session_id,
-            SessionInitializer::named("metis", Default::default()),
-        ))
-        .await?;
+    let local_id = format!("metadata-context-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
 
     run_concurrent_context_updates(&store, &session_id).await?;
 
@@ -437,13 +407,8 @@ async fn execution_context_namespace_is_reserved_and_fenced() -> Result<()> {
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-context-fence-{}", uuid::Uuid::new_v4());
-    store
-        .create(&SessionMetadata::new(
-            &session_id,
-            SessionInitializer::named("metis", Default::default()),
-        ))
-        .await?;
+    let local_id = format!("metadata-context-fence-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
     assert!(store
         .replace_extension(&session_id, EXECUTION_CONTEXT_NAMESPACE, json!({}))
         .await
@@ -485,13 +450,8 @@ async fn private_tool_context_updates_are_reserved_and_merge_concurrently() -> R
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-tool-context-{}", uuid::Uuid::new_v4());
-    store
-        .create(&SessionMetadata::new(
-            &session_id,
-            SessionInitializer::named("metis", Default::default()),
-        ))
-        .await?;
+    let local_id = format!("metadata-tool-context-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
 
     assert!(store
         .replace_extension(&session_id, TOOL_CONTEXT_NAMESPACE, json!({}))
@@ -545,4 +505,13 @@ async fn private_tool_context_updates_are_reserved_and_merge_concurrently() -> R
     assert!(!context.values.contains_key("sandbox"));
     assert!(context.values.contains_key("workspace"));
     Ok(())
+}
+
+async fn seed_metadata(store: &SessionMetadataStore, local_id: &str) -> Result<String> {
+    let metadata = SessionMetadata::new(
+        local_id,
+        SessionInitializer::named("metis", Default::default()),
+    );
+    store.create(&metadata).await?;
+    Ok(metadata.storage_key())
 }

@@ -51,16 +51,7 @@ pub(super) async fn nats_session_for_target(
         abort_signal.clone(),
     )
     .await?;
-    let initializer = {
-        let config = config.read();
-        let agent = config
-            .remote_agent
-            .as_ref()
-            .map(|(agent, _)| agent.clone())
-            .or_else(|| config.agent.as_ref().map(|agent| agent.name().to_string()))
-            .unwrap_or_default();
-        harnx_runtime::SessionInitializer::named_from_config(agent, &config)
-    };
+    let (session_id, initializer) = target_initializer(config, &cluster, &session_id).await?;
     NatsSession::from_global_config(
         NatsSessionConfig {
             cluster,
@@ -82,16 +73,7 @@ pub(super) async fn cancellation_status_session_for_target(
     cluster: String,
 ) -> Result<NatsSession> {
     let abort_signal = harnx_runtime::utils::create_abort_signal();
-    let initializer = {
-        let config = config.read();
-        let agent = config
-            .remote_agent
-            .as_ref()
-            .map(|(agent, _)| agent.clone())
-            .or_else(|| config.agent.as_ref().map(|agent| agent.name().to_string()))
-            .unwrap_or_default();
-        harnx_runtime::SessionInitializer::named_from_config(agent, &config)
-    };
+    let (session_id, initializer) = target_initializer(config, &cluster, &session_id).await?;
     NatsSession::from_global_config(
         NatsSessionConfig {
             cluster,
@@ -103,6 +85,38 @@ pub(super) async fn cancellation_status_session_for_target(
         abort_signal,
     )
     .await
+}
+
+// Targets retain the storage identity even after the user changes agents.
+// Reload its canonical owner instead of resolving a local ID in the new agent.
+async fn target_initializer(
+    config: &GlobalConfig,
+    cluster: &str,
+    storage_key: &str,
+) -> Result<(String, harnx_runtime::SessionInitializer)> {
+    use anyhow::Context;
+    let snapshot = config.read().clone();
+    let replicas = if cluster == LOCAL_CLUSTER_KEY {
+        1
+    } else {
+        snapshot.nats_server(cluster)?.resolved_replicas()
+    };
+    let jetstream = snapshot.nats_jetstream(cluster).await?;
+    let store =
+        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, replicas)
+            .await?;
+    let metadata = store
+        .get(storage_key)
+        .await?
+        .context("session target no longer exists")?
+        .metadata;
+    let initializer = harnx_runtime::SessionInitializer {
+        agent: metadata.agent.clone(),
+        variables: metadata.variables.clone(),
+        overrides: metadata.overrides.clone(),
+        tool_context: harnx_runtime::nats_session_metadata::tool_context(&metadata)?,
+    };
+    Ok((metadata.session_id, initializer))
 }
 
 pub(crate) fn default_exit_cancel_factory() -> ExitCancelFactory {

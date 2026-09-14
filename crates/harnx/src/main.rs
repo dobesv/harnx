@@ -155,11 +155,8 @@ async fn run_command(command: &Commands) -> Result<()> {
                 session_id,
             } => {
                 let config = Config::init(WorkingMode::Cmd, true).await?;
-                let out = harnx_runtime::config::render_session_dump_for_agent(
-                    &config,
-                    harnx_runtime::config::LOCAL_CLUSTER_KEY,
-                    session_id,
-                    Some(agent_name),
+                let out = harnx_runtime::config::render_session_dump_for_agent_ref(
+                    &config, agent_name, session_id,
                 )
                 .await?;
                 println!("{out}");
@@ -179,6 +176,7 @@ async fn run_session_delete_command(delete_args: &DeleteSessionArgs) -> Result<(
     let result = harnx_runtime::nats_admin::delete_remote_session(
         &config,
         &delete_args.cluster,
+        &delete_args.agent,
         &delete_args.session_id,
     )
     .await?;
@@ -716,7 +714,7 @@ async fn resume_session_anyway(session: &harnx_runtime::NatsSession, enabled: bo
     }
     let Some(expected_execution_id) = session
         .execution_store()
-        .current(session.session_id())
+        .current(session.storage_key())
         .await?
         .map(|operation| operation.reference.execution_id)
     else {

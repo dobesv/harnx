@@ -33,6 +33,7 @@ pub mod provider_config;
 pub mod retry_config;
 pub mod safety;
 pub mod session;
+pub mod session_identity;
 pub mod session_log;
 pub mod session_reconstruct;
 pub mod sink;

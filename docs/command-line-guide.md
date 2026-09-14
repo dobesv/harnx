@@ -125,7 +125,7 @@ The single stderr JSON line provides a stable, machine-readable contract for dow
 
 Field reference:
 - `kind`: `"timeout"` or `"budget_exceeded"`.
-- `session_id`: Session ID of the cancelled turn. Pass this ID on a subsequent prompt command to retry in the same session.
+- `session_id`: Session ID of the cancelled turn. Pass this ID together with the same explicit `--agent` on a subsequent prompt command to retry in the same session.
 - `usage`: Object containing token metrics for the cancelled turn:
   - `input_uncached`: Uncached input tokens.
   - `cache_write`: Tokens written to prompt cache.
@@ -197,6 +197,14 @@ harnx-serve --agent-variable env production --agent-variable debug true
 ## Inspect Agents and Sessions
 
 Use the `info` subcommand to inspect the state of agents and sessions.
+
+Session IDs are local to an agent and case-sensitive. Different agents can each
+use `review-12345`. Always supply the agent when addressing a session, including
+`harnx --agent alpha --session review-12345 prompt "Continue the review"`,
+`harnx session delete review-12345 --agent alpha --cluster local`, and the TUI
+command `.info session alpha review-12345`. No agent is inferred for these commands.
+For remote session inspection, use an explicit selector such as
+`harnx info session alpha@prod review-12345`.
 
 ### `harnx info agent <name>`
 

@@ -300,7 +300,7 @@ impl ToolProvider for SessionHistoryProvider {
                 .as_ref()
                 .map(|(_, cluster)| cluster.clone())
                 .unwrap_or_else(|| crate::config::LOCAL_CLUSTER_KEY.to_string());
-            (guard.clone(), session.id().to_string(), cluster)
+            (guard.clone(), session.storage_key(), cluster)
         };
         let operation = async {
             let jetstream = config.nats_jetstream(&cluster).await?;

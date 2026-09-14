@@ -156,3 +156,47 @@ fn handoff_tool_declarations_append_catalog_description_for_local_and_remote_age
         "Finish the current agent session and hand off to the 'atlas@local' agent. Omit `session_id` (or pass an empty value) to create a generated target session. Pass an unused ID to create that exact target session, or the exact ID of an existing session owned by this target to continue its transcript. Do not invent a session ID when you want a generated session. Include enough context in `prompt` for a new session."
     );
 }
+
+#[test]
+fn agent_switches_drop_the_old_session_and_preserve_new_remote_identity() {
+    let mut config = Config::default();
+    let mut local = Agent::default();
+    local.set_name("alpha");
+    config.use_agent_obj(local.clone()).unwrap();
+    config.use_session(Some("review-12345")).unwrap();
+    let alpha_key = config.session.as_ref().unwrap().storage_key();
+    let mut clients: Vec<ClientConfig> = serde_yaml::from_str(
+        "- type: openai\n  models:\n  - name: test-embedding\n    type: embedding\n",
+    )
+    .unwrap();
+    clients[0].set_name("openai".into());
+    config.rag = Some(
+        harnx_rag::Rag::create(
+            &clients,
+            "alpha-rag",
+            std::path::Path::new("unused.yaml"),
+            harnx_rag::RagData::new("openai:test-embedding".into(), 256, 0, None, 5, None),
+        )
+        .unwrap()
+        .into(),
+    );
+    config.set_remote_agent("beta".into(), "remote".into());
+    assert!(config.session.is_none());
+    assert!(config.agent.is_none());
+    assert!(config.rag.is_none());
+    config.use_session(Some("review-12345")).unwrap();
+    let session = config.session.as_ref().unwrap();
+    assert_eq!(session.agent_name(), Some("beta"));
+    assert_ne!(session.storage_key(), alpha_key);
+    assert_eq!(
+        session.storage_key(),
+        crate::SessionInitializer::from_config(&config)
+            .unwrap()
+            .session_key("review-12345")
+    );
+    config.use_agent_obj(local).unwrap();
+    assert!(config.session.is_none());
+    assert!(config.remote_agent.is_none());
+    config.use_session(Some("review-12345")).unwrap();
+    assert_eq!(config.session.as_ref().unwrap().storage_key(), alpha_key);
+}

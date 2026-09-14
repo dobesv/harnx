@@ -70,10 +70,11 @@ openai:gpt-4o     128000 /     4096  |       5 /     15    👁 ⚒
 ### `.session` - session management
 
 ```
-.session                 Start or switch to a session
+.session                 Open the session picker
+.session <agent> <id>    Switch to an explicitly identified agent session
 .empty session           Clear session messages
 .compact session         Compact session messages using configured compaction agent
-.info session [<agent> <id>] Show session state in overlay
+.info session <agent> <id> Show session state in overlay
 .edit session            Modify current session
 .save session            Save current session to file
 ```
@@ -173,8 +174,8 @@ The `.info agent` and `.info session` commands display detailed information in a
   - If `<name>` is omitted, it defaults to the active agent.
   - **Note:** This replaces the old raw source view. To view the raw agent file, use `cat ~/.config/harnx/agents/<name>.md`.
   - During expansion, if an MCP server fails, a warning is logged to stderr and the process continues with remaining tools.
-- **`.info session [<agent> <id>]`**: Shows the session state (history, tokens, variables, etc.).
-  - If arguments are omitted and a session is active, it shows the active session.
+- **`.info session <agent> <id>`**: Shows the session state (history, tokens, variables, etc.).
+  - Both arguments are required, even when a session is active. Use `agent@cluster` for a remote agent.
   - Does **not** include the system prompt and does **not** launch MCP servers.
 - **`.info`**, **`.info rag`**, **`.info tools`**: These commands continue to append information directly to the chat transcript.
 

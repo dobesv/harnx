@@ -1286,7 +1286,7 @@ pub async fn ag_ui_run_with_call_fn(
     let stream = if let Some(stream) = crate::ag_ui_remote_follow::resolve_event_stream(
         crate::ag_ui_remote_follow::EventStreamParams {
             config: base_config,
-            session_id: session,
+            session_id: &harnx_core::session_identity::session_key(Some(agent), session),
             run_id: &run_id,
             thread_id: &thread_id_text,
             subscription: &subscription,

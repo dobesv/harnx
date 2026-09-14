@@ -1159,9 +1159,9 @@ async fn load_or_repair_session(
         entries_vec: &mut entries_vec,
     })
     .await?;
-    let mut session = crate::config::session::new(&config.read(), session_id, None)?;
-    session.id = session_id.to_string();
-    session.session_id = Some(session_id.to_string());
+    let mut session = crate::config::session::new(&config.read(), &metadata.session_id, None)?;
+    session.id = metadata.session_id.clone();
+    session.session_id = Some(metadata.session_id.clone());
     session.working_dir = None;
     session.git_branch = None;
     session.git_remote = None;

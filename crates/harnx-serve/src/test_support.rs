@@ -174,7 +174,10 @@ pub async fn seed_nats_session(config: &Config, seed: NatsSessionSeed<'_>) -> bo
         ))
         .await
         .expect("create session metadata");
-    let log = NatsSessionLog::new(jetstream.clone(), seed.session_id.to_string());
+    let log = NatsSessionLog::new(
+        jetstream.clone(),
+        harnx_core::session_identity::session_key(Some(seed.agent), seed.session_id),
+    );
     for message in seed.messages {
         log.append_event_async(&SessionLogEntry::Message {
             id: message.id.clone(),

@@ -56,7 +56,7 @@ async fn accepted_cancellation_survives_recovery_activation_failure() -> Result<
     .await?;
     session
         .execution_store()
-        .session(session.session_id(), None, None)
+        .session(session.storage_key(), None, None)
         .await?;
 
     let receipt = session.request_cancel(CancelRequest::default()).await?;
@@ -129,7 +129,7 @@ async fn durable_watch_cancels_streaming_without_a_core_command() -> Result<()> 
     // Deliberately bypass the Core NATS latency path.
     let receipt = session
         .execution_store()
-        .request_cancel(session.session_id(), CancelRequest::default())
+        .request_cancel(session.storage_key(), CancelRequest::default())
         .await?;
     let status = session
         .wait_for_cancel(&receipt, tokio::time::Instant::now() + CI_SAFE_TIMEOUT)

@@ -27,7 +27,10 @@ impl ToolsetFixture {
             metadata
                 .replace_tool_context_value(
                     ToolContextEntry {
-                        session_id,
+                        session_id: &harnx_core::session_identity::session_key(
+                            Some("coder"),
+                            session_id,
+                        ),
                         key: SANDBOX_CONTEXT_KEY,
                     },
                     json!({"version": 1, "sandbox_id": sandbox_id}),
@@ -64,6 +67,14 @@ pub(super) async fn bound_sandbox(
     session_id: &str,
 ) -> Result<SandboxBinding> {
     Ok(serde_json::from_value(
-        metadata.get_tool_context(session_id).await?.unwrap().values[SANDBOX_CONTEXT_KEY].clone(),
+        metadata
+            .get_tool_context(&harnx_core::session_identity::session_key(
+                Some("coder"),
+                session_id,
+            ))
+            .await?
+            .unwrap()
+            .values[SANDBOX_CONTEXT_KEY]
+            .clone(),
     )?)
 }

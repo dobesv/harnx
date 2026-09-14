@@ -95,7 +95,7 @@ impl TargetedFixture {
         harnx_runtime::nats_lease::NatsSessionLease::acquire(
             harnx_runtime::nats_lease::NatsLeaseAcquireParams {
                 jetstream: self.jetstream.clone(),
-                session_id,
+                session_id: &harnx_core::session_identity::session_key(None, session_id),
                 worker_id: worker_id.to_string(),
                 generation: 1,
                 config: NatsLeaseConfig::default(),
@@ -167,7 +167,10 @@ impl TargetedFixture {
     async fn assert_retained_wakeup_survives_foreign_holder(&self) -> Result<()> {
         let session_id = "target-retained-after-lease";
         let _initialized = self.session(session_id, WORKER_B).await?;
-        let log = NatsSessionLog::new(self.jetstream.clone(), session_id);
+        let log = NatsSessionLog::new(
+            self.jetstream.clone(),
+            harnx_core::session_identity::session_key(None, session_id),
+        );
         let requested_seq = log
             .append_event_async(&append_user_message_entry("retained", "run after release"))
             .await?;
@@ -175,7 +178,11 @@ impl TargetedFixture {
         publish_targeted_session_activate(
             &self.jetstream,
             LocalWorkerTarget::new("__local__", WORKER_B)?,
-            &SessionActivate::targeted(session_id, requested_seq, WORKER_B),
+            &SessionActivate::targeted(
+                harnx_core::session_identity::session_key(None, session_id),
+                requested_seq,
+                WORKER_B,
+            ),
         )
         .await?;
         wait_for_consumer_redelivery(&self.jetstream, WORKER_B).await?;
@@ -319,7 +326,10 @@ async fn wait_for_user_count(
     session_id: &str,
     expected: usize,
 ) -> Result<()> {
-    let log = NatsSessionLog::new(jetstream.clone(), session_id);
+    let log = NatsSessionLog::new(
+        jetstream.clone(),
+        harnx_core::session_identity::session_key(None, session_id),
+    );
     tokio::time::timeout(CI_SAFE_TIMEOUT, async {
         loop {
             if user_message_texts(&log.load_events_async().await?).len() == expected {

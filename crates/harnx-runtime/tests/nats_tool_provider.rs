@@ -332,8 +332,8 @@ async fn assert_context_flows_from_tool_to_session_enumeration(
         SessionInitializer::named("metis", Default::default()),
     );
     store.create(&metadata).await?;
-    let backend =
-        NatsSessionLogBackend::new(jetstream, &session_id).with_metadata_store(Some(store.clone()));
+    let backend = NatsSessionLogBackend::new(jetstream, metadata.storage_key())
+        .with_metadata_store(Some(store.clone()));
     let mut session = metadata.base_session();
     let sink = Arc::new(backend) as Arc<dyn harnx_runtime::config::session::SessionAppendSink>;
     session.runtime = Some(Arc::new(sink));

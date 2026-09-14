@@ -108,3 +108,61 @@ async fn read_releases_shared_client_lock_while_actor_handles_command() {
     drop(guard);
     assert!(matches!(poller.next().await, Some(Ok(None))));
 }
+
+#[tokio::test]
+async fn broker_poller_observes_only_its_agents_execution() {
+    harnx_core::require_nextest();
+    let sandbox = crate::test_support::TestConfigSandbox::new();
+    if !crate::test_support::ensure_test_nats().await {
+        return;
+    }
+    let config = sandbox.config();
+    let js = config.nats_jetstream(LOCAL_CLUSTER_KEY).await.unwrap();
+    let store = ExecutionStore::ensure(&js, 1).await.unwrap();
+    let local_id = format!("review-{}", uuid::Uuid::new_v4());
+    let alpha = SessionKey {
+        agent: "alpha".into(),
+        session: local_id.clone(),
+    };
+    let beta = SessionKey {
+        agent: "beta".into(),
+        session: local_id.clone(),
+    };
+    for key in [&alpha, &beta] {
+        store.session(&key.storage_key(), None, None).await.unwrap();
+    }
+    let actor_config = SessionActorConfig {
+        base_config: config,
+        call_fn: None,
+        local_worker: Arc::new(Mutex::new(None)),
+    };
+    let mut alpha_poll = poller(actor_config.clone(), alpha.clone());
+    let mut beta_poll = poller(actor_config, beta.clone());
+    let first = alpha_poll.next().await.unwrap().unwrap().unwrap();
+    assert_eq!(first.reference.session_id, alpha.storage_key());
+    store
+        .request_cancel(&alpha.storage_key(), Default::default())
+        .await
+        .unwrap();
+    // One in-flight read may predate the request. Subsequent polls must converge.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if alpha_poll
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .cancellation
+                .is_some()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("periodic poll must see alpha cancellation");
+    let other = beta_poll.next().await.unwrap().unwrap().unwrap();
+    assert_eq!(other.reference.session_id, beta.storage_key());
+    assert!(other.cancellation.is_none());
+}

@@ -652,7 +652,7 @@ async fn root_session_change_aborts_child_monitors_and_discards_child_views() {
     assert_eq!(
         tui.subagent_monitor_root,
         Some((
-            "root-two".to_string(),
+            config.read().session.as_ref().unwrap().storage_key(),
             harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string()
         ))
     );
@@ -799,7 +799,7 @@ async fn tui_switches_only_after_committed_handoff_and_ignores_late_source_compl
     assert_eq!(
         tui.active_remote_session,
         Some((
-            "target-session".into(),
+            harnx_core::session_identity::session_key(Some("target"), "target-session"),
             harnx_runtime::config::LOCAL_CLUSTER_KEY.into()
         ))
     );

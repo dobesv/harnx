@@ -284,6 +284,20 @@ pub struct MonitoredSessionKey {
     pub session_id: String,
 }
 
+impl MonitoredSessionKey {
+    pub fn matches_operation(
+        &self,
+        cluster: &str,
+        operation: &harnx_execution_control::OperationRef,
+    ) -> bool {
+        self.cluster == cluster && self.storage_key() == operation.session_id
+    }
+
+    pub fn storage_key(&self) -> String {
+        harnx_core::session_identity::session_key(Some(&self.agent), &self.session_id)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct SubAgentView {
     pub key: MonitoredSessionKey,

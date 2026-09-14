@@ -107,10 +107,7 @@ fn tool_discovery_key(
     ToolDiscoveryKey {
         instance_id: instance_id.clone(),
         active_package: active_package.map(str::to_string),
-        parent_session_id: config
-            .session
-            .as_ref()
-            .map(|session| session.id().to_string()),
+        parent_session_id: config.session.as_ref().map(|session| session.storage_key()),
         execution: config
             .execution_control
             .as_ref()
@@ -348,6 +345,21 @@ mod tests {
     }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn discovery_cache_separates_agents_with_the_same_local_session_id() {
+        let mut config = Config::default();
+        let scope = ServerScope::from_string("same-process");
+        config.session = Some(harnx_core::session::Session {
+            id: "review-12345".into(),
+            agent_name: Some("alpha".into()),
+            ..Default::default()
+        });
+        let alpha = tool_discovery_key(&config, &scope, None);
+        config.session.as_mut().unwrap().agent_name = Some("beta".into());
+        let beta = tool_discovery_key(&config, &scope, None);
+        assert_ne!(alpha, beta);
+    }
 
     /// Without a broker address the refresh must return without touching NATS —
     /// otherwise a plain front-end would start a shared server to build a tool list.

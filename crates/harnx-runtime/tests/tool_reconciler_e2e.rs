@@ -433,7 +433,7 @@ async fn a_session_only_starts_the_servers_its_agent_uses() -> anyhow::Result<()
     reserve_named_session(&metadata_store, "s1", AGENT_TIME.name).await?;
     reserve_named_session(&metadata_store, "s2", AGENT_PLANS.name).await?;
 
-    activate(&jetstream, &SessionActivate::new("s1")).await?;
+    AGENT_TIME.activate(&jetstream, "s1").await?;
     await_registered(&client, "time").await?;
 
     assert!(
@@ -444,7 +444,7 @@ async fn a_session_only_starts_the_servers_its_agent_uses() -> anyhow::Result<()
         "no active session uses the plans server, so it must not be running"
     );
 
-    activate(&jetstream, &SessionActivate::new("s2")).await?;
+    AGENT_PLANS.activate(&jetstream, "s2").await?;
     await_registered(&client, "plans").await?;
     assert!(
         registered_config_names(&client)
@@ -583,4 +583,11 @@ async fn stopping_a_server_actually_removes_its_registration() -> anyhow::Result
 
     reconciler.session_ended("s1").await;
     await_deregistered(&client, "time").await
+}
+
+impl AgentFixture {
+    async fn activate(&self, js: &async_nats::jetstream::Context, id: &str) -> anyhow::Result<()> {
+        let key = harnx_core::session_identity::session_key(Some(self.name), id);
+        activate(js, &SessionActivate::new(key)).await
+    }
 }

@@ -92,7 +92,7 @@ async fn run_nats_turn_with_tui_confirmation(
     ctx: &PromptTaskContext,
 ) -> Result<harnx_runtime::nats_session::NatsTurnResult> {
     let sink = Arc::new(TuiAgentEventSink::new(ctx.event_tx.clone()));
-    let target = (session.session_id().to_string(), cluster.to_string());
+    let target = (session.storage_key().to_string(), cluster.to_string());
     let route = ensure_tool_confirmation_route(
         session,
         target,

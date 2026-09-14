@@ -10,6 +10,12 @@ pub struct SessionKey {
     pub session: String,
 }
 
+impl SessionKey {
+    pub(crate) fn storage_key(&self) -> String {
+        harnx_core::session_identity::session_key(Some(&self.agent), &self.session)
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionHandle {
     pub tx: mpsc::Sender<SessionCommand>,

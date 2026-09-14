@@ -29,7 +29,22 @@ impl SessionDeleteResult {
     }
 }
 
+/// Delete exactly one agent's session. A local ID alone is never sufficient.
 pub async fn delete_remote_session(
+    config: &Config,
+    cluster: &str,
+    agent: &str,
+    session_id: &str,
+) -> Result<SessionDeleteResult> {
+    anyhow::ensure!(
+        !agent.trim().is_empty() && agent != harnx_core::agent_config::TEMP_AGENT_NAME,
+        "an explicit agent is required"
+    );
+    let key = harnx_core::session_identity::session_key(Some(agent), session_id);
+    delete_remote_session_by_key(config, cluster, &key).await
+}
+
+pub(crate) async fn delete_remote_session_by_key(
     config: &Config,
     cluster: &str,
     session_id: &str,

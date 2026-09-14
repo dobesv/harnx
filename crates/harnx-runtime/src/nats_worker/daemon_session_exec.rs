@@ -53,7 +53,7 @@ impl WorkerRuntime {
             let confirm = crate::nats_tool_confirmation::nats_confirm_tool_use(
                 self.client.clone(),
                 subject.clone(),
-                activation.session_id.clone(),
+                metadata.session_id.clone(),
                 abort_signal.clone(),
             );
             per_session.write().set_tui_confirm_tool_use(Some(confirm));

@@ -60,7 +60,7 @@ async fn remote_transcript_marks_trailing_tool_call_pending_only_while_leased() 
         harnx_runtime::utils::create_abort_signal(),
     )
     .await?;
-    NatsSessionLog::new(jetstream.clone(), session_id.clone())
+    NatsSessionLog::new(jetstream.clone(), session.storage_key())
         .append_event_async(&SessionLogEntry::ToolCalls {
             text: "running tool".to_string(),
             thought: None,
@@ -77,7 +77,7 @@ async fn remote_transcript_marks_trailing_tool_call_pending_only_while_leased() 
 
     let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
         jetstream,
-        session_id: &session_id,
+        session_id: session.storage_key(),
         worker_id: "worker-a".to_string(),
         generation: 1,
         config: NatsLeaseConfig {

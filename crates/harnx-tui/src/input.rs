@@ -1317,7 +1317,7 @@ impl Tui {
         self.app.streaming_open = false;
         self.app.main_streamed_text_idx = None;
 
-        let (agent, cluster, session_id) = {
+        let (agent, cluster, session_target) = {
             let guard = self.config.read();
             let (agent, cluster) = guard.remote_agent.clone().unwrap_or_else(|| {
                 (
@@ -1329,13 +1329,13 @@ impl Tui {
                     harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
                 )
             });
-            let session_id = guard
+            let target = guard
                 .session
                 .as_ref()
-                .map(|session| session.id().to_string());
-            (agent, cluster, session_id)
+                .map(|session| (session.storage_key(), cluster.clone()));
+            (agent, cluster, target)
         };
-        self.active_remote_session = session_id.map(|id| (id, cluster.clone()));
+        self.active_remote_session = session_target;
 
         let event_tx = self.event_tx.clone();
 
@@ -1815,31 +1815,31 @@ impl Tui {
                     .collect();
             }
 
-            if matches!(cmd, ".agent" | ".session") && args.iter().all(|arg| arg.is_empty()) {
+            let (cmd, args) = match (cmd, args.as_slice()) {
+                (".info", ["session", _, ..]) => (".session", args[1..].to_vec()),
+                _ => (cmd, args),
+            };
+            if cmd == ".agent" && args.iter().all(|arg| arg.is_empty()) {
                 return vec![];
+            }
+
+            if cmd == ".session" && args.len() == 2 {
+                let cfg = self.config.read().clone();
+                let sessions = cfg.list_sessions_for_completion(args[0]).await;
+                return harnx_runtime::utils::fuzzy_filter(
+                    sessions.into_iter().map(|id| (id, None)).collect(),
+                    |value| value.0.as_str(),
+                    args[1],
+                );
             }
 
             // Fetch agents async outside the config lock to avoid holding a
             // parking_lot read guard across an await point.
-            let precomputed_agents = if cmd == ".agent" && args.len() == 1 {
+            let precomputed_agents = if matches!(cmd, ".agent" | ".session") && args.len() == 1 {
                 list_assistant_agents().await
             } else {
                 Vec::new()
             };
-
-            // Session completion always queries the NATS KV index. An absent
-            // remote-agent cluster means the shared local NATS cluster.
-            if cmd == ".session" && args.len() == 1 {
-                let cluster = self
-                    .config
-                    .read()
-                    .remote_agent
-                    .as_ref()
-                    .map(|(_, c)| c.clone());
-                let cfg = self.config.read().clone();
-                let sessions = cfg.list_sessions_for_completion(cluster.as_deref()).await;
-                return sessions.into_iter().map(|s| (s, None)).collect();
-            }
 
             return self
                 .config
@@ -1860,12 +1860,7 @@ impl Tui {
 
     pub(crate) async fn open_session_picker(&mut self) {
         let (sessions, fetch_error) = Self::picker_sessions(&self.config).await;
-        let origin_agent = self
-            .config
-            .read()
-            .agent
-            .as_ref()
-            .map(|a| a.name().to_string());
+        let origin_agent = self.config.read().active_agent_ref();
         let origin_session = self
             .config
             .read()
@@ -1890,10 +1885,7 @@ impl Tui {
             harnx_runtime::commands::CommandOutcome::Continue => {
                 let (curr_agent, session_missing) = {
                     let cfg = self.config.read();
-                    (
-                        cfg.agent.as_ref().map(|a| a.name().to_string()),
-                        cfg.session.is_none(),
-                    )
+                    (cfg.active_agent_ref(), cfg.session.is_none())
                 };
                 if prev_agent != curr_agent && session_missing {
                     self.open_session_picker().await;
@@ -1920,7 +1912,7 @@ impl Tui {
         let (curr_session, curr_agent) = {
             let cfg = self.config.read();
             let s = cfg.session.as_ref().map(|s| s.id().to_string());
-            let a = cfg.agent.as_ref().map(|a| a.name().to_string());
+            let a = cfg.active_agent_ref();
             (s, a)
         };
 
@@ -1950,6 +1942,44 @@ impl Tui {
         self.pin_transcript_to_bottom();
     }
 
+    async fn restore_picker_origin(&mut self) {
+        let Some(crate::types::ModalState::SessionPicker {
+            origin_agent: Some(agent),
+            origin_session,
+            ..
+        }) = self.app.modal.as_ref()
+        else {
+            return;
+        };
+        let (agent, session) = (agent.clone(), origin_session.clone());
+        // Prepare on a separate config so a missing origin agent cannot destroy
+        // the current selection. Picker switching runs while the prompt is idle.
+        let candidate = std::sync::Arc::new(parking_lot::RwLock::new(self.config.read().clone()));
+        match harnx_runtime::config::Config::use_agent(
+            &candidate,
+            &agent,
+            session.as_deref(),
+            self.abort_signal.clone(),
+        )
+        .await
+        {
+            Ok(()) => {
+                self.config
+                    .write()
+                    .apply_prepared_agent_selection(candidate.read().clone());
+                self.app.modal = None;
+                self.refresh_input_chrome();
+            }
+            Err(error) => {
+                if let Some(crate::types::ModalState::SessionPicker { error: message, .. }) =
+                    self.app.modal.as_mut()
+                {
+                    *message = Some(error.to_string());
+                }
+            }
+        }
+    }
+
     async fn try_handle_info_overlay(&mut self, line_cmd: &str) -> bool {
         let is_info_agent =
             line_cmd.starts_with(".info agent") || line_cmd.starts_with("/info agent");
@@ -1975,15 +2005,14 @@ impl Tui {
                 })
         } else {
             async {
-                let (_agent_name, session_id) = self.resolve_info_session_target(&tokens)?;
+                let (agent_name, session_id) = self.resolve_info_session_target(&tokens)?;
                 let cfg = self.config.read().clone();
-                let cluster = cfg
-                    .remote_agent
-                    .as_ref()
-                    .map(|(_, cluster)| cluster.as_str())
-                    .unwrap_or(harnx_runtime::config::LOCAL_CLUSTER_KEY)
-                    .to_string();
-                harnx_runtime::config::render_session_dump(&cfg, &cluster, &session_id).await
+                harnx_runtime::config::render_session_dump_for_agent_ref(
+                    &cfg,
+                    &agent_name,
+                    &session_id,
+                )
+                .await
             }
             .await
         };
@@ -2017,33 +2046,12 @@ impl Tui {
         }
     }
 
-    fn resolve_info_session_target(
-        &self,
-        tokens: &[String],
-    ) -> anyhow::Result<(Option<String>, String)> {
-        let (agent_name, session_id) = if tokens.len() > 3 {
-            (Some(tokens[2].clone()), tokens[3].clone())
-        } else if tokens.len() == 3 {
-            let cfg = self.config.read();
-            let a = cfg.agent.as_ref().map(|x| x.name().to_string());
-            (a, tokens[2].clone())
-        } else {
-            let cfg = self.config.read();
-            let a = cfg.agent.as_ref().map(|x| x.name().to_string());
-            let s = cfg.session.as_ref().map(|x| x.id().to_string());
-            match (a, s) {
-                (a_opt, Some(session)) => (a_opt, session),
-                _ => (None, String::new()),
-            }
-        };
-
-        if session_id.is_empty() {
-            Err(anyhow::anyhow!(
-                "No active session or insufficient arguments. Usage: .info session [<agent> <id>]"
-            ))
-        } else {
-            Ok((agent_name, session_id))
-        }
+    fn resolve_info_session_target(&self, tokens: &[String]) -> anyhow::Result<(String, String)> {
+        anyhow::ensure!(
+            tokens.len() == 4 && !tokens[2].is_empty() && !tokens[3].is_empty(),
+            "An explicit agent and session ID are required. Usage: .info session <agent> <id>"
+        );
+        Ok((tokens[2].clone(), tokens[3].clone()))
     }
 
     fn open_info_overlay(&mut self, text: String, title: &str) {
@@ -2068,12 +2076,7 @@ impl Tui {
             .session
             .as_ref()
             .map(|s| s.id().to_string());
-        let prev_agent = self
-            .config
-            .read()
-            .agent
-            .as_ref()
-            .map(|a| a.name().to_string());
+        let prev_agent = self.config.read().active_agent_ref();
         // Run the command inside a block that owns the lock guards so they are
         // dropped before we touch `self` again for transcript / UI updates.
         let (result, captured) = {
@@ -2081,12 +2084,16 @@ impl Tui {
             let abort_signal = self.abort_signal.clone();
             let mut output = Vec::<u8>::new();
 
-            let result = harnx_runtime::commands::run_command_with_output_and_local_worker(
-                &config,
-                abort_signal,
-                line,
-                &mut output,
-                &self.local_worker,
+            // Command futures carry agent/session initialization state. Keep
+            // that frame off the nested TUI event-dispatch stack.
+            let result = Box::pin(
+                harnx_runtime::commands::run_command_with_output_and_local_worker(
+                    &config,
+                    abort_signal,
+                    line,
+                    &mut output,
+                    &self.local_worker,
+                ),
             )
             .await;
 
@@ -2304,12 +2311,7 @@ impl Tui {
                                 .session
                                 .as_ref()
                                 .map(|s| s.id().to_string());
-                            let prev_agent = self
-                                .config
-                                .read()
-                                .agent
-                                .as_ref()
-                                .map(|a| a.name().to_string());
+                            let prev_agent = self.config.read().active_agent_ref();
 
                             if let Err(e) = self.config.write().use_agent_by_name(&agent_name) {
                                 self.app.modal = Some(crate::types::ModalState::AgentPicker {
@@ -2432,7 +2434,7 @@ impl Tui {
                     self.app.modal,
                     Some(crate::types::ModalState::AgentPicker { .. })
                 ) {
-                    if self.config.read().agent.is_some() {
+                    if self.config.read().active_agent_ref().is_some() {
                         // Agent already active — mid-switch cancel: just dismiss the picker.
                         self.app.modal = None;
                     } else {
@@ -2453,28 +2455,7 @@ impl Tui {
                         query: String::new(),
                     });
                 } else if should_restore_origin {
-                    if let Some(crate::types::ModalState::SessionPicker {
-                        origin_agent,
-                        origin_session,
-                        ..
-                    }) = self.app.modal.take()
-                    {
-                        if let Some(agent) = origin_agent {
-                            let _ = self.config.write().use_agent_by_name(&agent);
-                        }
-                        if let Some(session) = origin_session {
-                            let _ = self.config.write().use_session(Some(&session));
-                        }
-
-                        let llm_busy = self.app.llm_busy;
-                        let pending = self.app.pending_message.is_some();
-                        Self::refresh_input_chrome_from_state(
-                            &self.config,
-                            &mut self.app,
-                            llm_busy,
-                            pending,
-                        );
-                    }
+                    self.restore_picker_origin().await;
                 }
             }
 

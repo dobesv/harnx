@@ -118,7 +118,7 @@ fn spawn_subagent_monitor(
     invocation_id: Option<String>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let target = (key.session_id.clone(), key.cluster.clone());
+        let target = (key.storage_key(), key.cluster.clone());
         tokio::join!(
             crate::cancellation::monitor_execution(&config, &event_tx, &target),
             monitor_subagent_session(config.clone(), event_tx.clone(), key, invocation_id)
@@ -132,7 +132,7 @@ async fn monitor_subagent_session(
     key: MonitoredSessionKey,
     invocation_id: Option<String>,
 ) {
-    let target = (key.session_id.clone(), key.cluster.clone());
+    let target = (key.storage_key(), key.cluster.clone());
     let mut reconnect_delay = RECONNECT_DELAY;
     loop {
         let outcome = monitor_subagent_attachment(
@@ -247,7 +247,7 @@ async fn monitor_subagent_attachment(
                     .await;
                     return AttachmentOutcome::Terminal;
                 }
-                if let Some(reason) = lease_watchdog.check(&jetstream, &key.session_id).await {
+                if let Some(reason) = lease_watchdog.check(&jetstream, &target.0).await {
                     if let Some(invocation_id) = invocation_id {
                         let _ = event_tx.send(TuiEvent::SubAgentInvocationFailed {
                             key: key.clone(),
@@ -280,7 +280,7 @@ async fn refresh_terminal_subagent_snapshot(
     let client = stream_client(config, &key.cluster).await?;
     let log = harnx_runtime::nats_session_log::NatsSessionLog::new(
         async_nats::jetstream::new(client),
-        key.session_id.clone(),
+        key.storage_key(),
     );
     for _ in 0..10 {
         tokio::time::sleep(Duration::from_millis(25)).await;

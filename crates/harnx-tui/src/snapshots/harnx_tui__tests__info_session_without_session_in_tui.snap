@@ -1,10 +1,11 @@
 ---
 source: crates/harnx-tui/src/tests.rs
+assertion_line: 978
 expression: rendered
 ---
 Session Info────────────────────────────────────────────────
-Error: No active session or insufficient arguments. Usage:
-.info session [<agent> <id>]
+Error: An explicit agent and session ID are required. Usage:
+.info session <agent> <id>
 
 
 

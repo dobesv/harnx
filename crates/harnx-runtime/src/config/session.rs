@@ -46,6 +46,9 @@ pub fn new(config: &Config, name: &str, working_dir: Option<&std::path::Path>) -
         ..Default::default()
     };
     session.set_agent(&agent)?;
+    if let Some((remote_agent, _)) = &config.remote_agent {
+        session.agent_name = Some(remote_agent.clone());
+    }
     session.dirty = false;
     Ok(session)
 }

@@ -57,7 +57,7 @@ impl Server {
                     .get_for_agent(target.session, target.agent)
                     .await?
                     .context("Not Found")?;
-                metadata_response(&store, target.session, record).await
+                metadata_response(&store, record).await
             }
             (&Method::PATCH, SessionMetadataRoute::Metadata) => {
                 let Some(body) = collect_metadata_request_body(req, "metadata patch").await? else {
@@ -68,7 +68,7 @@ impl Server {
                 let record = store
                     .apply_patch_for_agent(target.session, target.agent, patch)
                     .await?;
-                metadata_response(&store, target.session, record).await
+                metadata_response(&store, record).await
             }
             (&Method::PUT, SessionMetadataRoute::Extension(namespace)) => {
                 let Some(body) = collect_metadata_request_body(req, "extension body").await? else {
@@ -86,13 +86,13 @@ impl Server {
                         },
                     )
                     .await?;
-                metadata_response(&store, target.session, record).await
+                metadata_response(&store, record).await
             }
             (&Method::DELETE, SessionMetadataRoute::Extension(namespace)) => {
                 let record = store
                     .delete_extension_for_agent(target.session, target.agent, &namespace)
                     .await?;
-                metadata_response(&store, target.session, record).await
+                metadata_response(&store, record).await
             }
             _ => bail!("Method Not Allowed"),
         }
@@ -152,10 +152,9 @@ impl Server {
 
 async fn metadata_response(
     store: &harnx_runtime::nats_session_metadata::SessionMetadataStore,
-    session_id: &str,
     record: harnx_runtime::nats_session_metadata::MetadataRecord,
 ) -> Result<AppResponse> {
-    let activity = store.get_activity(session_id).await?;
+    let activity = store.get_activity(&record.metadata.storage_key()).await?;
     let redacted =
         harnx_runtime::nats_session_metadata::RedactedSessionMetadata::new(record, activity);
     json_response(serde_json::to_value(redacted)?)
@@ -243,7 +242,7 @@ pub(crate) async fn attach_agent_session(
     let event_stream = harnx_runtime::nats_event_sink::SessionEventStream::attach(
         jetstream,
         client,
-        target.session,
+        &harnx_core::session_identity::session_key(Some(target.agent), target.session),
     )
     .await?;
     let current = store
@@ -357,7 +356,7 @@ mod tests {
         session_id: &str,
     ) {
         let stored = store
-            .get(session_id)
+            .get_for_agent(session_id, "metadata-mutations")
             .await
             .expect("read stored metadata")
             .expect("stored metadata");
@@ -372,17 +371,20 @@ mod tests {
         session_id: &str,
     ) {
         store
-            .patch(session_id, |metadata| {
-                metadata
-                    .variables
-                    .insert("TOKEN".to_string(), "secret-value".to_string());
-                Ok(())
-            })
+            .patch(
+                &harnx_core::session_identity::session_key(Some("metadata-redaction"), session_id),
+                |metadata| {
+                    metadata
+                        .variables
+                        .insert("TOKEN".to_string(), "secret-value".to_string());
+                    Ok(())
+                },
+            )
             .await
             .expect("persist secret variable");
         store
             .replace_extension(
-                session_id,
+                &harnx_core::session_identity::session_key(Some("metadata-redaction"), session_id),
                 "example.client",
                 serde_json::json!({"visible": "client-state"}),
             )
@@ -414,6 +416,43 @@ mod tests {
             parse_session_metadata_route("/v1/agents/metis/sessions/thread-1/metadata/extra"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn same_local_id_loads_history_and_metadata_for_the_requested_agent() {
+        harnx_core::require_nextest();
+        let sandbox = TestConfigSandbox::new();
+        for agent in ["alpha", "beta"] {
+            sandbox.write_agent(agent, "Review a change.");
+        }
+        let config = sandbox.config();
+        for agent in ["alpha", "beta"] {
+            let message = harnx_core::message::Message::new(
+                harnx_core::message::MessageRole::User,
+                harnx_core::message::MessageContent::Text(agent.to_string()),
+            );
+            if !crate::test_support::seed_nats_session(
+                &config,
+                NatsSessionSeed {
+                    agent,
+                    session_id: "review-12345",
+                    messages: &[message],
+                },
+            )
+            .await
+            {
+                return;
+            }
+        }
+        for agent in ["alpha", "beta"] {
+            let (loaded, _) = crate::load_nats_session(&config, agent, "review-12345")
+                .await
+                .unwrap();
+            assert_eq!(loaded.id(), "review-12345");
+            assert_eq!(loaded.agent_name.as_deref(), Some(agent));
+            assert_eq!(loaded.messages.len(), 1);
+            assert_eq!(loaded.messages[0].content.to_text(), agent);
+        }
     }
 
     #[tokio::test]
@@ -662,7 +701,7 @@ mod tests {
             .await
             .expect("metadata bucket");
 
-        let error = crate::load_nats_session(&config, "missing-canonical-metadata")
+        let error = crate::load_nats_session(&config, "plain", "missing-canonical-metadata")
             .await
             .expect_err("history without canonical metadata must be hidden");
         assert_eq!(error.to_string(), "Not Found");

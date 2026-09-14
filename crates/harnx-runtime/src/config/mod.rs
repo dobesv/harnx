@@ -61,7 +61,7 @@ pub const DEFAULT_BUCKET_REPLICAS: usize = 1;
 /// shared local cluster. Useful when the worker is not installed next to the
 /// front-end, and for tests that build both into a scratch directory.
 pub const HARNX_WORKER_BIN_ENV: &str = "HARNX_WORKER_BIN";
-pub use self::session_dump::{render_session_dump, render_session_dump_for_agent};
+pub use self::session_dump::{render_session_dump_for_agent, render_session_dump_for_agent_ref};
 
 pub use self::agent::TEMP_AGENT_NAME;
 pub use self::agent::{
@@ -503,16 +503,6 @@ impl Default for Config {
 pub type GlobalConfig = Arc<RwLock<Config>>;
 
 impl Config {
-    /// Set the agent and cluster for the active session.
-    pub fn set_remote_agent(&mut self, agent: String, cluster: String) {
-        self.remote_agent = Some((agent, cluster));
-    }
-
-    /// Check whether the active agent ref names a cluster.
-    pub fn is_remote_agent(&self) -> bool {
-        self.remote_agent.is_some()
-    }
-
     pub fn state(&self) -> StateFlags {
         let mut flags = StateFlags::empty();
         if let Some(session) = &self.session {

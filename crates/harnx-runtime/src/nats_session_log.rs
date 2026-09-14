@@ -23,6 +23,16 @@ pub struct NatsSessionLog {
 }
 
 impl NatsSessionLog {
+    /// Open a named agent's local session ID. Internal workers already carry
+    /// the derived storage key and use `new` directly.
+    pub fn for_agent(jetstream: jetstream::Context, agent: &str, session_id: &str) -> Self {
+        Self::new(
+            jetstream,
+            harnx_core::session_identity::session_key(Some(agent), session_id),
+        )
+    }
+
+    /// Open a transcript by its agent-scoped storage key.
     pub fn new(jetstream: jetstream::Context, session_id: impl Into<String>) -> Self {
         let session_id = session_id.into();
         Self {

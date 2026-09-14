@@ -319,7 +319,7 @@ impl SessionActor {
     }
 
     async fn start(self) {
-        let poll = cancellation::poller(self.actor_config.clone(), self.key.session.clone());
+        let poll = cancellation::poller(self.actor_config.clone(), self.key.clone());
         self.run(poll).await;
     }
 
@@ -757,6 +757,7 @@ impl SessionActor {
         } else {
             match crate::load_nats_session_with_base(
                 &self.actor_config.base_config,
+                &self.key.agent,
                 &self.key.session,
             )
             .await

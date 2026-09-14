@@ -194,7 +194,7 @@ impl Tui {
     /// installed on disk. Extracted so it can be called and tested independently
     /// of the full `init()` path.
     pub(crate) fn check_agents_available(config: &GlobalConfig, agents: &[String]) -> Result<()> {
-        if config.read().agent.is_none() && agents.is_empty() {
+        if config.read().active_agent_ref().is_none() && agents.is_empty() {
             anyhow::bail!(
                 "No agents configured. Create an agent file in the agents/ directory first."
             );
@@ -255,7 +255,7 @@ impl Tui {
 
     pub(crate) async fn resolve_initial_modal(config: &GlobalConfig) -> Option<ModalState> {
         let agents = list_assistant_agents().await;
-        if config.read().agent.is_none() {
+        if config.read().active_agent_ref().is_none() {
             if agents.is_empty() {
                 return None;
             }
@@ -269,7 +269,7 @@ impl Tui {
             let (sessions, fetch_error) = Self::picker_sessions(config).await;
             // Always show picker when agent active but no session — even empty list
             // because picker now always has a "New session" first item
-            let origin_agent = config.read().agent.as_ref().map(|a| a.name().to_string());
+            let origin_agent = config.read().active_agent_ref();
             let origin_session = config.read().session.as_ref().map(|s| s.id().to_string());
             return Some(ModalState::SessionPicker {
                 sessions,

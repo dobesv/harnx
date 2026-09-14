@@ -19,6 +19,10 @@ use harnx_runtime::{
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
+fn storage_key(id: &str) -> String {
+    harnx_core::session_identity::session_key(Some("test-agent"), id)
+}
+
 fn new_remote_session_id() -> String {
     format!("test-{}", Uuid::new_v4())
 }
@@ -107,7 +111,7 @@ async fn append_new_reply_after_current_turn_user(
             outcome: TurnOutcome::default(),
         }),
     );
-    let subject = events_subject(&session_id);
+    let subject = events_subject(&storage_key(&session_id));
     let payload = ended.to_bytes()?;
     // Legacy workers had no durable TurnEnd marker. Repeat their lossy
     // advisory in this compatibility test so it cannot race the client's
@@ -211,7 +215,7 @@ async fn user_message_has_client_id() -> Result<()> {
     let jetstream = async_nats::jetstream::new(client.clone());
 
     let session_id = new_remote_session_id();
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::new(jetstream.clone(), storage_key(&session_id));
 
     // Create a NATS session (mirrors retract test pattern)
     let config = resumed_session_config(session_id.clone());
@@ -271,7 +275,7 @@ async fn enqueue_text_preserves_durable_sequence_after_activation_failure() -> R
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client.clone());
     let session_id = new_remote_session_id();
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::new(jetstream.clone(), storage_key(&session_id));
     let session = NatsSession::new(
         resumed_session_config(session_id),
         client,
@@ -334,7 +338,7 @@ async fn retract_queued_user_message() -> Result<()> {
     let jetstream = async_nats::jetstream::new(client.clone());
 
     let session_id = new_remote_session_id();
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::new(jetstream.clone(), storage_key(&session_id));
 
     let config = resumed_session_config(session_id.clone());
     let abort_signal = harnx_runtime::utils::create_abort_signal();
@@ -439,7 +443,7 @@ async fn edit_queued_user_message_replaces_text_in_reconstructed_state() -> Resu
     let jetstream = async_nats::jetstream::new(client.clone());
 
     let session_id = new_remote_session_id();
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::new(jetstream.clone(), storage_key(&session_id));
 
     let config = resumed_session_config(session_id.clone());
     let abort_signal = harnx_runtime::utils::create_abort_signal();
@@ -533,7 +537,7 @@ async fn resumed_session_run_turn_ignores_stale_prior_reply_and_returns_new_repl
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client.clone());
     let session_id = new_remote_session_id();
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::new(jetstream.clone(), storage_key(&session_id));
 
     let abort_signal = harnx_runtime::utils::create_abort_signal();
     let session = NatsSession::new(
@@ -593,7 +597,7 @@ async fn lazy_arbitrary_id_creation_precedes_the_first_user_entry() -> Result<()
 
     let metadata_store = SessionMetadataStore::ensure(&jetstream, 1).await?;
     let metadata = metadata_store
-        .get(&session_id)
+        .get(&storage_key(&session_id))
         .await?
         .expect("lazy construction creates metadata");
     assert_eq!(
@@ -602,9 +606,12 @@ async fn lazy_arbitrary_id_creation_precedes_the_first_user_entry() -> Result<()
             name: "test-agent".to_string()
         }
     );
-    assert!(metadata_store.get_activity(&session_id).await?.is_some());
+    assert!(metadata_store
+        .get_activity(&storage_key(&session_id))
+        .await?
+        .is_some());
 
-    let log = NatsSessionLog::new(jetstream, session_id);
+    let log = NatsSessionLog::new(jetstream, storage_key(&session_id));
     assert!(log.load_events_async().await?.is_empty());
     let turn = tokio::spawn(async move {
         session
@@ -640,7 +647,7 @@ async fn lazy_arbitrary_id_creation_precedes_the_first_user_entry() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_creation_validates_the_winning_identity() -> Result<()> {
+async fn concurrent_creation_scopes_the_same_local_id_to_each_agent() -> Result<()> {
     require_nextest();
     let Some(server) = spawn_nats_server().await? else {
         return Ok(());
@@ -668,20 +675,18 @@ async fn concurrent_creation_validates_the_winning_identity() -> Result<()> {
             harnx_runtime::utils::create_abort_signal(),
         )
     );
-    assert_ne!(
-        first.is_ok(),
-        second.is_ok(),
-        "exactly one identity must win"
-    );
-    let record = SessionMetadataStore::ensure(&jetstream, 1)
-        .await?
-        .get(&session_id)
-        .await?
-        .expect("winning metadata exists");
-    assert!(matches!(
-        record.metadata.agent,
-        SessionAgentSource::Named { ref name } if name == "alpha" || name == "beta"
-    ));
+    let first = first?;
+    let second = second?;
+    assert_eq!(first.session_id(), second.session_id());
+    assert_ne!(first.storage_key(), second.storage_key());
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    for (agent, session) in [("alpha", first), ("beta", second)] {
+        let record = store
+            .get_for_agent(&session_id, agent)
+            .await?
+            .expect("independent metadata");
+        assert_eq!(record.metadata.storage_key(), session.storage_key());
+    }
     Ok(())
 }
 
@@ -714,7 +719,7 @@ async fn concurrent_creation_with_the_same_identity_reloads_the_winner() -> Resu
     assert!(second.is_ok(), "race loser failed: {:?}", second.err());
     assert!(SessionMetadataStore::ensure(&jetstream, 1)
         .await?
-        .get(&session_id)
+        .get(&storage_key(&session_id))
         .await?
         .is_some());
     Ok(())
@@ -743,13 +748,19 @@ async fn metadata_creation_failure_leaves_the_transcript_empty() -> Result<()> {
     )
     .await;
     assert!(result.is_err(), "invalid metadata must reject construction");
-    assert!(NatsSessionLog::new(jetstream.clone(), &session_id)
-        .load_events_async()
-        .await?
-        .is_empty());
+    assert!(NatsSessionLog::new(
+        jetstream.clone(),
+        harnx_core::session_identity::session_key(Some(""), &session_id)
+    )
+    .load_events_async()
+    .await?
+    .is_empty());
     assert!(SessionMetadataStore::ensure(&jetstream, 1)
         .await?
-        .get(&session_id)
+        .get(&harnx_core::session_identity::session_key(
+            Some(""),
+            &session_id
+        ))
         .await?
         .is_none());
     Ok(())
@@ -765,7 +776,10 @@ async fn transcript_without_metadata_is_rejected_without_an_append() -> Result<(
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client.clone());
     let session_id = format!("legacy-headerless-{}", Uuid::new_v4());
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::new(
+        jetstream.clone(),
+        harnx_core::session_identity::session_key(Some("test-agent"), &session_id),
+    );
     log.append_event_async(&SessionLogEntry::Message {
         id: Some(Uuid::new_v4().to_string()),
         role: MessageRole::User,
@@ -792,7 +806,10 @@ async fn transcript_without_metadata_is_rejected_without_an_append() -> Result<(
     assert_eq!(log.load_events_async().await?.len(), 1);
     assert!(SessionMetadataStore::ensure(&jetstream, 1)
         .await?
-        .get(&session_id)
+        .get(&harnx_core::session_identity::session_key(
+            Some("test-agent"),
+            &session_id
+        ))
         .await?
         .is_none());
     Ok(())
