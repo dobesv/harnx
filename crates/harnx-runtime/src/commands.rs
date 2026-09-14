@@ -1826,11 +1826,27 @@ mod session_target_tests {
 }
 
 async fn explicit_session_info(config: &GlobalConfig, args: &str) -> Result<String> {
-    let (agent, session) =
-        explicit_session_target(args.trim_start_matches("session").trim(), ".info session")?;
+    use crate::config::{parse_session_inspection_args, SessionFormat, SessionInspectionCommand};
+    let tokens = shell_words::split(args)?;
+    let (agent, session, format) =
+        parse_session_inspection_args(&tokens[1..], SessionInspectionCommand::Info)?;
     let snapshot = config.read().clone();
-    let (agent, cluster) = crate::config::resolve_session_agent(&agent)?;
-    let session =
-        crate::config::load_session_for_render(&snapshot, Some(&cluster), &session, &agent).await?;
-    crate::config::session::render(&session)
+    match format {
+        SessionFormat::Text => {
+            let (agent, cluster) = crate::config::resolve_session_agent(&agent)?;
+            let session =
+                crate::config::load_session_for_render(&snapshot, Some(&cluster), &session, &agent)
+                    .await?;
+            crate::config::session::render(&session)
+        }
+        SessionFormat::Yaml | SessionFormat::Json => {
+            let (_, metadata) =
+                crate::config::session_metadata_for_agent(&snapshot, &agent, &session).await?;
+            match format {
+                SessionFormat::Yaml => crate::config::render_metadata_yaml(&metadata),
+                SessionFormat::Json => crate::config::render_metadata_json(&metadata),
+                SessionFormat::Text => unreachable!(),
+            }
+        }
+    }
 }

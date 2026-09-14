@@ -43,7 +43,7 @@ harnx info session agent1 session1             # View session metadata
 harnx dump session agent1 session1             # Dump session transcript
 harnx dump session agent1 session1 --follow    # Follow transcript live
 harnx list sessions                            # List sessions
-harnx delete session session1 --cluster local  # Delete session
+harnx delete session session1 --agent myagent --cluster local  # Delete session
 harnx --info                                   # View system info
 harnx --rag rag1 --info                        # View RAG info
 
@@ -229,8 +229,8 @@ Live tail with `--follow`:
 
 ### `harnx list sessions`
 
-Lists available sessions. For local agents, lists sessions in the local NATS store. When targeting a remote agent via `--agent <remote-agent>`, lists sessions in that remote cluster. (Replaces the deprecated `--list-sessions` flag.)
+Lists available sessions as tab-separated agent names and session IDs, one session per line. `<inline>` identifies sessions without a named agent. For local agents, lists sessions in the local NATS store. When targeting a remote agent via `--agent <remote-agent>`, lists sessions in that remote cluster. (Replaces the deprecated `--list-sessions` flag.)
 
 ### `harnx delete session <session-id> --agent <agent> --cluster <cluster>`
 
-Deletes a remote NATS session log stream and its lease key from the specified cluster. (Replaces the old `harnx session delete` command.)
+Deletes the specified agent’s NATS session from the specified cluster. If the agent selector includes `@cluster`, it must match `--cluster`. (Replaces the old `harnx session delete` command.)

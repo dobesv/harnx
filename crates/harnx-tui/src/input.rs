@@ -9,36 +9,12 @@ use harnx_core::event::{AgentEvent, AgentSource};
 use harnx_render::pretty_error_string;
 use harnx_runtime::config::{
     dump_entries_jsonl, dump_entries_yaml, list_assistant_agents, load_session_for_render,
-    render_metadata_json, render_metadata_yaml, SessionFormat,
+    render_metadata_json, render_metadata_yaml, SessionFormat, SessionInspectionCommand,
 };
 use harnx_runtime::nats_session_log::NatsSessionLog;
 use harnx_runtime::utils::pretty_yaml_block;
 use ratatui_textarea::{Input as TextInput, Key};
 use std::path::Path;
-
-/// Parse tokens after `.info session` or `.dump session` into positional args and format.
-fn parse_session_tokens(tokens: &[String]) -> Result<(Vec<String>, SessionFormat)> {
-    let mut positional = Vec::new();
-    let mut format = SessionFormat::Text;
-    let mut format_next = false;
-    // Skip command tokens [".info", "session"] or [".dump", "session"]
-    for token in tokens.iter().skip(2) {
-        if format_next {
-            format = token.parse()?;
-            format_next = false;
-        } else if token == "--format" {
-            format_next = true;
-        } else if let Some(val) = token.strip_prefix("--format=") {
-            format = val.parse()?;
-        } else {
-            positional.push(token.clone());
-        }
-    }
-    if format_next {
-        anyhow::bail!("Missing value for --format");
-    }
-    Ok((positional, format))
-}
 
 /// Types of overlay content for info/dump commands.
 enum InfoOverlayType {
@@ -2096,7 +2072,7 @@ impl Tui {
 
     async fn render_info_session_overlay(&self, tokens: &[String]) -> Result<String> {
         let (agent_name, session_id, format) =
-            self.resolve_session_target_and_format(tokens, ".info session")?;
+            self.resolve_session_target_and_format(tokens, SessionInspectionCommand::Info)?;
         let cfg = self.config.read().clone();
         let (agent, cluster) = harnx_runtime::config::resolve_session_agent(&agent_name)?;
         match format {
@@ -2123,7 +2099,7 @@ impl Tui {
 
     async fn render_dump_session_overlay(&self, tokens: &[String]) -> Result<String> {
         let (agent_name, session_id, format) =
-            self.resolve_session_target_and_format(tokens, ".dump session")?;
+            self.resolve_session_target_and_format(tokens, SessionInspectionCommand::Dump)?;
         let cfg = self.config.read().clone();
         let (jetstream, metadata) =
             harnx_runtime::config::session_metadata_for_agent(&cfg, &agent_name, &session_id)
@@ -2148,12 +2124,9 @@ impl Tui {
     fn resolve_session_target_and_format(
         &self,
         tokens: &[String],
-        cmd_prefix: &str,
+        command: SessionInspectionCommand,
     ) -> Result<(String, String, SessionFormat)> {
-        let (positional, format) = parse_session_tokens(tokens)?;
-        anyhow::ensure!(positional.len() == 2 && positional.iter().all(|value| !value.trim().is_empty()),
-            "An explicit agent and session ID are required. Usage: {cmd_prefix} <agent> <id> [--format text|yaml|json]");
-        Ok((positional[0].clone(), positional[1].clone(), format))
+        harnx_runtime::config::parse_session_inspection_args(&tokens[2..], command)
     }
 
     fn open_info_overlay(&mut self, text: String, title: &str) {

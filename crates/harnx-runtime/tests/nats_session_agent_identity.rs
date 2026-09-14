@@ -279,5 +279,19 @@ async fn explicit_agent_controls_completion_and_info_even_with_other_active_agen
             .await
             .is_err()
     );
+    let global = std::sync::Arc::new(parking_lot::RwLock::new(cfg));
+    for format in ["json", "yaml"] {
+        let mut output = Vec::new();
+        harnx_runtime::commands::run_command_with_output(
+            &global,
+            harnx_runtime::utils::create_abort_signal(),
+            &format!(".info session alpha@local alpha-only --format {format}"),
+            &mut output,
+        )
+        .await?;
+        let rendered: serde_json::Value = serde_yaml::from_slice(&output)?;
+        assert_eq!(rendered["session_id"], "alpha-only");
+        assert_eq!(rendered["agent"]["name"], "alpha");
+    }
     Ok(())
 }

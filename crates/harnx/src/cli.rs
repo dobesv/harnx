@@ -147,6 +147,21 @@ pub struct DeleteSessionArgs {
     pub cluster: String,
 }
 
+impl DeleteSessionArgs {
+    /// An embedded cluster must agree with the explicitly selected deletion cluster.
+    pub fn agent_name(&self) -> anyhow::Result<String> {
+        let (agent, cluster) = harnx_runtime::config::resolve_session_agent(&self.agent)?;
+        if self.agent.contains('@') {
+            anyhow::ensure!(
+                cluster == self.cluster,
+                "Agent cluster '{cluster}' conflicts with --cluster '{}'",
+                self.cluster
+            );
+        }
+        Ok(agent)
+    }
+}
+
 #[derive(Args, Debug, PartialEq, Eq)]
 pub struct ListArgs {
     #[command(subcommand)]
@@ -308,6 +323,20 @@ mod tests {
             },
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn delete_normalizes_agent_and_rejects_conflicting_cluster() {
+        let mut args = DeleteSessionArgs {
+            agent: "reviewer@prod".into(),
+            session_id: "review-12345".into(),
+            cluster: "prod".into(),
+        };
+        assert_eq!(args.agent_name().unwrap(), "reviewer");
+        args.cluster = "local".into();
+        assert!(args.agent_name().is_err());
+        args.agent = "reviewer".into();
+        assert_eq!(args.agent_name().unwrap(), "reviewer");
     }
 
     #[test]

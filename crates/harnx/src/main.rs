@@ -68,10 +68,19 @@ fn resolve_list_sessions_target(remote_agent: Option<&(String, String)>) -> List
     }
 }
 
-/// Format session metadata as one ID per line.
+/// Format session metadata as an owner and readable ID per line.
 /// This helper is extracted for testability without touching stdout.
 fn format_sessions_for_output(sessions: &[SessionMeta]) -> String {
-    let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+    let ids: Vec<String> = sessions
+        .iter()
+        .map(|s| {
+            format!(
+                "{}\t{}",
+                s.agent_name.as_deref().unwrap_or("<inline>"),
+                s.id
+            )
+        })
+        .collect();
     ids.join("\n")
 }
 
@@ -397,10 +406,11 @@ async fn run_list_sessions(cli: &Cli) -> Result<()> {
 
 async fn run_session_delete_command(delete_args: &DeleteSessionArgs) -> Result<()> {
     let config = Config::init(WorkingMode::Cmd, true).await?;
+    let agent = delete_args.agent_name()?;
     let result = harnx_runtime::nats_admin::delete_remote_session(
         &config,
         &delete_args.cluster,
-        &delete_args.agent,
+        &agent,
         &delete_args.session_id,
     )
     .await?;
@@ -1196,7 +1206,7 @@ mod tests_list_sessions_routing {
         SessionMeta {
             id: id.to_string(),
             session_id: Some(id.to_string()),
-            agent_name: None,
+            agent_name: Some("reviewer".into()),
             title: None,
             modified: None,
             contexts: vec![],
@@ -1255,7 +1265,19 @@ mod tests_list_sessions_routing {
     fn test_output_format_one_id_per_line() {
         let sessions = [session_meta("session-1"), session_meta("session-2")];
         let output = format_sessions_for_output(&sessions);
-        assert_eq!(output, "session-1\nsession-2");
+        assert_eq!(output, "reviewer\tsession-1\nreviewer\tsession-2");
+    }
+
+    #[test]
+    fn duplicate_session_ids_show_their_owners() {
+        let mut alpha = session_meta("review-12345");
+        alpha.agent_name = Some("alpha".into());
+        let mut beta = alpha.clone();
+        beta.agent_name = Some("beta".into());
+        assert_eq!(
+            format_sessions_for_output(&[alpha, beta]),
+            "alpha\treview-12345\nbeta\treview-12345"
+        );
     }
 
     /// Output formatting: empty sessions → empty string
@@ -1271,7 +1293,7 @@ mod tests_list_sessions_routing {
     fn test_output_format_single_session() {
         let sessions = [session_meta("only-session")];
         let output = format_sessions_for_output(&sessions);
-        assert_eq!(output, "only-session");
+        assert_eq!(output, "reviewer\tonly-session");
     }
 
     /// Remote list outcome: empty sessions → Print("") (not an error)
@@ -1291,7 +1313,7 @@ mod tests_list_sessions_routing {
         let outcome = remote_list_outcome(result);
         assert_eq!(
             outcome,
-            ListSessionsOutcome::Print("sess-a\nsess-b".to_string())
+            ListSessionsOutcome::Print("reviewer\tsess-a\nreviewer\tsess-b".to_string())
         );
     }
 

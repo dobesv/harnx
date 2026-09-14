@@ -130,6 +130,15 @@ struct SessionActor {
     actor_config: SessionActorConfig,
 }
 
+#[derive(Default)]
+struct LoadedHistorySnapshot {
+    messages: Vec<AgUiMessage>,
+    warnings: Vec<String>,
+    entries: Option<Vec<(u64, harnx_core::session::SessionLogEntry)>>,
+    tokens_usage: Option<crate::ag_ui::UsageContextSnapshot>,
+    session_base: Option<harnx_core::session::Session>,
+}
+
 fn spawn_session_actor(
     key: SessionKey,
     registry: SessionMap,
@@ -743,67 +752,9 @@ impl SessionActor {
     }
 
     async fn refresh_history_snapshot(&mut self) {
-        let (snapshot, warnings, log_entries, session_tokens_usage, session_base) = if self
-            .actor_config
-            .call_fn
-            .is_some()
-        {
-            let prompt_config = prompt_config_for_agent_session_from_global(
-                &self.actor_config.base_config,
-                &self.key,
-                true,
-            );
-            let snapshot = prompt_config
-                .read()
-                .session
-                .as_ref()
-                .map(|session| crate::ag_ui::history_messages_for_snapshot(&session.messages))
-                .unwrap_or_default();
-            // Test executor path: no NATS log entries available
-            (snapshot, Vec::new(), None, None, None)
-        } else {
-            match crate::load_nats_session_with_base(
-                &self.actor_config.base_config,
-                &self.key.agent,
-                &self.key.session,
-            )
-            .await
-            {
-                Ok((session, entries, base_session)) if session.agent_name.as_deref() == Some(self.key.agent.as_str()) => {
-                    // Capture session tokens usage for context fields on hydrated usage events
-                    let tokens_usage = Some(crate::ag_ui::UsageContextSnapshot::from_session(&session));
-                    (
-                        crate::ag_ui::history_messages_for_snapshot(&session.messages),
-                        session.replay_warnings,
-                        Some(entries),
-                        tokens_usage,
-                        Some(base_session),
-                    )
-                }
-                Ok((session, _entries, _base_session)) => (
-                    Vec::new(),
-                    vec![format!(
-                        "Failed to load session history: session belongs to agent '{}' rather than '{}'",
-                        session.agent_name.as_deref().unwrap_or("unknown"),
-                        self.key.agent
-                    )],
-                    None,
-                    None,
-                    None,
-                ),
-                Err(error) if error.to_string().contains("Not Found") => {
-                    (Vec::new(), Vec::new(), None, None, None)
-                }
-                Err(error) => (
-                    Vec::new(),
-                    vec![format!("Failed to load session history: {error:#}")],
-                    None,
-                    None,
-                    None,
-                ),
-            }
-        };
-        let derived_interrupt = log_entries
+        let loaded = self.load_history_snapshot().await;
+        let derived_interrupt = loaded
+            .entries
             .as_deref()
             .and_then(crate::ag_ui::derive_hitl_interrupt_outcome)
             .map(|metadata| SessionState::Interrupted {
@@ -812,11 +763,63 @@ impl SessionActor {
         if self.active_run.is_none() {
             self.state = derived_interrupt.unwrap_or(SessionState::Idle);
         }
-        self.history_snapshot = snapshot;
-        self.history_warnings = warnings;
-        self.log_entries = log_entries;
-        self.tokens_usage = session_tokens_usage;
-        self.session_base = session_base;
+        self.history_snapshot = loaded.messages;
+        self.history_warnings = loaded.warnings;
+        self.log_entries = loaded.entries;
+        self.tokens_usage = loaded.tokens_usage;
+        self.session_base = loaded.session_base;
+    }
+
+    async fn load_history_snapshot(&self) -> LoadedHistorySnapshot {
+        if self.actor_config.call_fn.is_some() {
+            return self.test_history_snapshot();
+        }
+        match crate::load_nats_session_with_base(
+            &self.actor_config.base_config,
+            &self.key.agent,
+            &self.key.session,
+        ).await {
+            Ok((session, entries, base_session)) if session.agent_name.as_deref() == Some(self.key.agent.as_str()) => {
+                LoadedHistorySnapshot {
+                    messages: crate::ag_ui::history_messages_for_snapshot(&session.messages),
+                    tokens_usage: Some(crate::ag_ui::UsageContextSnapshot::from_session(&session)),
+                    warnings: session.replay_warnings,
+                    entries: Some(entries),
+                    session_base: Some(base_session),
+                }
+            }
+            Ok((session, _, _)) => LoadedHistorySnapshot {
+                warnings: vec![format!(
+                    "Failed to load session history: session belongs to agent '{}' rather than '{}'",
+                    session.agent_name.as_deref().unwrap_or("unknown"), self.key.agent
+                )],
+                ..Default::default()
+            },
+            Err(error) if error.to_string().contains("Not Found") => Default::default(),
+            Err(error) => LoadedHistorySnapshot {
+                warnings: vec![format!("Failed to load session history: {error:#}")],
+                ..Default::default()
+            },
+        }
+    }
+
+    fn test_history_snapshot(&self) -> LoadedHistorySnapshot {
+        let prompt_config = prompt_config_for_agent_session_from_global(
+            &self.actor_config.base_config,
+            &self.key,
+            true,
+        );
+        let messages = prompt_config
+            .read()
+            .session
+            .as_ref()
+            .map(|session| crate::ag_ui::history_messages_for_snapshot(&session.messages))
+            .unwrap_or_default();
+        // The test executor has no durable NATS log or metadata base.
+        LoadedHistorySnapshot {
+            messages,
+            ..Default::default()
+        }
     }
 }
 

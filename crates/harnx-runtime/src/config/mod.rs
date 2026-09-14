@@ -63,8 +63,9 @@ pub const DEFAULT_BUCKET_REPLICAS: usize = 1;
 pub const HARNX_WORKER_BIN_ENV: &str = "HARNX_WORKER_BIN";
 pub use self::session_format::{
     dump_entries_jsonl, dump_entries_yaml, jsonl_line, load_session_for_render,
-    render_metadata_json, render_metadata_yaml, resolve_session_agent, session_metadata_for_agent,
-    yaml_doc, SessionFormat,
+    parse_session_inspection_args, render_metadata_json, render_metadata_yaml,
+    resolve_session_agent, session_metadata_for_agent, yaml_doc, SessionFormat,
+    SessionInspectionCommand,
 };
 
 pub use self::agent::TEMP_AGENT_NAME;
