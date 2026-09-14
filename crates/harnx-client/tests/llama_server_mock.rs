@@ -266,8 +266,9 @@ async fn llama_server_mock_multi_model_distinct_processes() -> Result<()> {
     // For this test, the key verification is that:
     // 1. Both clients successfully communicated through distinct sockets
     // 2. Two sockets exist (proving two distinct processes)
-    // The global registry deliberately keeps processes alive for reuse.
-    // Socket cleanup will happen on harnx exit.
+    // The global registry deliberately keeps processes alive for reuse. On Linux
+    // the kernel retires each one when this process exits, which the
+    // parent_death tests cover; elsewhere they outlive it.
 
     Ok(())
 }
@@ -390,6 +391,137 @@ async fn llama_server_mock_name_as_hf_repo() -> Result<()> {
     assert!(socket_path.exists(), "socket should exist");
 
     Ok(())
+}
+
+/// Parent-death coverage for servers held by the global registry.
+///
+/// Linux-only. The guarantee comes from `PR_SET_PDEATHSIG`, which has no
+/// portable equivalent, so elsewhere a registry-held server still outlives the
+/// process that spawned it.
+#[cfg(target_os = "linux")]
+mod parent_death {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    /// Env vars handing the helper process its paths. See
+    /// [`llama_server_child_does_not_outlive_parent_process`].
+    const HELPER_SOCKET_ENV: &str = "HARNX_LLAMA_ORPHAN_HELPER_SOCKET";
+    const HELPER_SCRIPT_ENV: &str = "HARNX_LLAMA_ORPHAN_HELPER_SCRIPT";
+    const HELPER_BIN_ENV: &str = "HARNX_LLAMA_ORPHAN_HELPER_BIN";
+
+    /// A llama-server spawned through the global registry must not outlive the
+    /// process that spawned it.
+    ///
+    /// The registry keeps its managers in a `static`, and Rust never runs
+    /// destructors on statics at process exit, so `kill_on_drop` alone never
+    /// fires: every exit used to strand a live `llama-server`. The child has to be
+    /// tied to its parent by the kernel instead.
+    ///
+    /// Re-runs this test binary to get a parent we are allowed to kill, then
+    /// checks the socket stops accepting connections once that parent is gone.
+    #[tokio::test]
+    async fn llama_server_child_does_not_outlive_parent_process() -> Result<()> {
+        ensure_mock_binary_built()?;
+
+        let temp_dir = TempDir::new()?;
+        let socket_path = temp_dir.path().join("orphan-check.sock");
+        let script_path = write_mock_script(temp_dir.path())?;
+        let binary_path = resolve_mock_binary_path()?;
+
+        let status = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "parent_death::spawn_registry_server_then_exit",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(HELPER_SOCKET_ENV, &socket_path)
+            .env(HELPER_SCRIPT_ENV, &script_path)
+            .env(HELPER_BIN_ENV, &binary_path)
+            .status()
+            .context("failed to run helper process")?;
+        assert!(status.success(), "helper process failed with {status}");
+
+        // The helper proved the server was serving before it exited, so a refused
+        // connection now means the child died with its parent rather than never
+        // having started.
+        let mut gone = false;
+        for _ in 0..100 {
+            if UnixStream::connect(&socket_path).is_err() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            gone,
+            "llama-server on {} outlived the process that spawned it",
+            socket_path.display()
+        );
+
+        Ok(())
+    }
+
+    /// Helper process for [`llama_server_child_does_not_outlive_parent_process`],
+    /// not a standalone test.
+    ///
+    /// Drives a chat through the global registry so a `llama-server` is spawned and
+    /// health-checked, then returns without any cleanup — exactly what production
+    /// code does, and what used to strand the child.
+    #[tokio::test]
+    #[ignore = "helper process for llama_server_child_does_not_outlive_parent_process"]
+    async fn spawn_registry_server_then_exit() {
+        let (Ok(socket_path), Ok(script_path), Ok(binary_path)) = (
+            std::env::var(HELPER_SOCKET_ENV),
+            std::env::var(HELPER_SCRIPT_ENV),
+            std::env::var(HELPER_BIN_ENV),
+        ) else {
+            // Run directly (e.g. `cargo test -- --ignored`) rather than by the test
+            // above, so there is nothing to drive.
+            return;
+        };
+
+        let model_data = ModelData::new("orphan-check-model")
+            .with_model_path(script_path.clone())
+            .with_socket_path(socket_path.clone())
+            .with_ctx_size(256)
+            .with_threads(1)
+            .with_extra_args(vec!["--script".to_string(), script_path]);
+
+        let provider = LlamaServerConfig {
+            name: "orphan-check".to_string(),
+            models: vec![model_data],
+            binary_path: Some(binary_path),
+            ..Default::default()
+        };
+
+        let models = Model::from_config("orphan-check", &provider.models);
+        let model = models
+            .into_iter()
+            .next()
+            .expect("orphan-check model should exist");
+        let client = LlamaServerClient::init(&[ClientConfig::LlamaServerConfig(provider)], &model)
+            .expect("init orphan-check client");
+
+        let response = client
+            .chat_completions_inner(
+                &reqwest::Client::new(),
+                ChatCompletionsData {
+                    messages: vec![user_message("spawn please")],
+                    temperature: None,
+                    top_p: None,
+                    functions: None,
+                    stream: false,
+                    attachments_dir: None,
+                },
+            )
+            .await
+            .expect("chat through registry-spawned server");
+        assert_eq!(response.text, "mock non streaming reply");
+
+        UnixStream::connect(&socket_path)
+            .expect("server should be serving before the helper exits");
+    }
 }
 
 fn build_client(config: &LlamaServerProcessConfig, model_name: &str) -> Option<Box<dyn Client>> {

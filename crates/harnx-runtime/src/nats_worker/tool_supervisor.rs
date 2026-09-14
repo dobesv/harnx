@@ -1,5 +1,4 @@
 use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
-use super::process_manager::ChildProcessManager;
 use super::tool_registry::{
     ensure_registry_bucket, log_registry_contents, remove_registrations_for_config,
     wait_for_registration, RegistrationWait, SupervisedProcesses, SupervisedServer,
@@ -10,6 +9,7 @@ use crate::config::{
 use crate::nats_tool_provider::NatsInFlightCalls;
 use anyhow::{Context, Result};
 use async_nats::jetstream::kv;
+use harnx_core::child_process::ChildProcessManager;
 use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_core::sink::emit_agent_event;
