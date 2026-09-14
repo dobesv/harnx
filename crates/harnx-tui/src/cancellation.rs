@@ -1,10 +1,11 @@
 //! Cancellation is operational state, independent of transcript completion.
-use crate::types::{CancellationAction, ModalState, Tui};
+use crate::types::{CancellationAction, Tui};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_execution_control::{CancelDisposition, CancelReceipt};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
@@ -20,11 +21,12 @@ pub(crate) enum CancellationPhase {
 
 pub(crate) struct CancellationTray {
     pub phase: CancellationPhase,
-    session_id: String,
-    cluster: String,
-    expected: Option<String>,
-    execution_id: Option<String>,
-    updates: Option<mpsc::UnboundedReceiver<CancelReceipt>>,
+    pub(crate) session_id: String,
+    pub(crate) cluster: String,
+    pub(crate) expected: Option<String>,
+    pub execution_id: Option<String>,
+    pub(crate) updates: Option<mpsc::UnboundedReceiver<CancelReceipt>>,
+    pub editor_restored: bool,
 }
 
 impl Tui {
@@ -42,6 +44,12 @@ impl Tui {
         self.cancellation
             .as_ref()
             .is_some_and(|tray| tray.expected.is_none())
+    }
+
+    pub(crate) fn cancellation_editor_restored(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|tray| tray.expected.is_none() && tray.editor_restored)
     }
 
     pub(crate) fn handle_cancellation_or_child_key(&mut self, key: KeyEvent) -> bool {
@@ -142,6 +150,17 @@ impl Tui {
         cluster: String,
         expected: Option<String>,
     ) {
+        let (execution_id, editor_restored) = self
+            .cancellation
+            .as_ref()
+            .map(|t| {
+                (
+                    t.execution_id.clone().or_else(|| expected.clone()),
+                    t.editor_restored,
+                )
+            })
+            .unwrap_or_else(|| (expected.clone(), false));
+
         self.pending_exit_cancel = Some((self.exit_cancel_factory)(
             self.config.clone(),
             self.local_worker.clone(),
@@ -155,9 +174,10 @@ impl Tui {
             phase: CancellationPhase::Requesting,
             session_id,
             cluster,
-            execution_id: expected.clone(),
+            execution_id,
             expected,
             updates: None,
+            editor_restored,
         });
         if let Some(abort) = &self.current_prompt_abort {
             if self
@@ -280,65 +300,51 @@ impl Tui {
             return false;
         }
         match (key.code, key.modifiers) {
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => self.app.should_quit = true,
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                self.app.should_quit = true;
+                true
+            }
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 let tray = self.cancellation.as_ref().unwrap();
                 if matches!(
                     tray.phase,
                     CancellationPhase::Unconfirmed | CancellationPhase::Failed(_)
                 ) {
-                    self.start_cancellation(
-                        tray.session_id.clone(),
-                        tray.cluster.clone(),
-                        tray.expected.clone(),
-                    );
+                    let session_id = tray.session_id.clone();
+                    let cluster = tray.cluster.clone();
+                    let expected = tray.expected.clone();
+                    self.start_cancellation(session_id, cluster, expected);
                 }
+                true
             }
-            (KeyCode::Esc, KeyModifiers::NONE)
-                if self.cancellation.as_ref().is_some_and(|tray| {
-                    tray.execution_id.is_some()
-                        && matches!(
-                            tray.phase,
-                            CancellationPhase::Unconfirmed | CancellationPhase::Failed(_)
-                        )
-                }) =>
-            {
-                self.app.modal = Some(ModalState::ConfirmAbandonCancellation);
+            (KeyCode::Esc, KeyModifiers::NONE) => {
+                let tray = self.cancellation.as_mut().unwrap();
+                tray.editor_restored = true;
+                if tray.execution_id.is_some()
+                    && matches!(
+                        tray.phase,
+                        CancellationPhase::Unconfirmed | CancellationPhase::Failed(_)
+                    )
+                {
+                    self.start_cancellation_abandonment();
+                }
+                true
             }
-            _ => {}
+            _ => {
+                let editor_restored = self
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(|tray| tray.editor_restored);
+                !editor_restored
+            }
         }
-        true
     }
 
     pub(crate) fn render_cancellation_tray(&self, frame: &mut Frame<'_>, area: Rect) {
         let Some(tray) = &self.cancellation else {
             return;
         };
-        let message = match &tray.phase {
-            CancellationPhase::Requesting => {
-                "Requesting cancellation…  Ctrl+D: exit immediately".into()
-            }
-            CancellationPhase::Abandoning => {
-                "Resuming with a new execution…  Prior work may still be running".into()
-            }
-            CancellationPhase::Stopping => {
-                "Stopping…  Waiting for execution and child operations to stop.  Ctrl+D: exit"
-                    .into()
-            }
-            CancellationPhase::Unconfirmed => {
-                "Cancellation unconfirmed. Work may still be running.  Ctrl+C: retry  Esc: resume anyway  Ctrl+D: exit".into()
-            }
-            CancellationPhase::Failed(error) => {
-                let resume = tray
-                    .execution_id
-                    .as_ref()
-                    .map(|_| "  Esc: resume anyway")
-                    .unwrap_or_default();
-                format!(
-                    "Cancellation request failed: {error}  Ctrl+C: retry{resume}  Ctrl+D: exit"
-                )
-            }
-        };
+        let message = self.cancellation_message(tray, false);
         frame.render_widget(
             Paragraph::new(message).wrap(Wrap { trim: true }).block(
                 Block::default()
@@ -348,6 +354,78 @@ impl Tui {
             ),
             area,
         );
+    }
+
+    pub(crate) fn render_compact_cancellation_status(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(tray) = &self.cancellation else {
+            return;
+        };
+        let message = format!("  {}", self.cancellation_message(tray, true));
+        let status = Paragraph::new(Line::from(Span::styled(
+            message,
+            Style::default().fg(Color::Yellow),
+        )));
+        frame.render_widget(status, area);
+    }
+
+    pub(crate) fn cancellation_message(&self, tray: &CancellationTray, compact: bool) -> String {
+        if compact {
+            compact_cancellation_message(&tray.phase, tray.execution_id.is_some())
+        } else {
+            full_cancellation_message(&tray.phase, tray.execution_id.is_some())
+        }
+    }
+}
+
+fn compact_cancellation_message(phase: &CancellationPhase, has_execution_id: bool) -> String {
+    match (phase, has_execution_id) {
+        (CancellationPhase::Requesting, _) => {
+            "Cancellation unresolved; draft retained. Requesting…".into()
+        }
+        (CancellationPhase::Stopping, _) => {
+            "Cancellation unresolved; draft retained. Stopping…".into()
+        }
+        (CancellationPhase::Abandoning, _) => {
+            "Resuming… Prior work may still run. Draft retained.".into()
+        }
+        (CancellationPhase::Unconfirmed, true) => {
+            "Unconfirmed; draft retained. Work may run.  Ctrl+C: retry  Esc: resume anyway".into()
+        }
+        (CancellationPhase::Unconfirmed, false) => {
+            "Cancellation unresolved; draft retained. Ctrl+C: retry.".into()
+        }
+        (CancellationPhase::Failed(error), true) => {
+            format!("Ctrl+C: retry  Esc: resume anyway  —  Failed: {error}. Draft retained.")
+        }
+        (CancellationPhase::Failed(error), false) => {
+            format!("Ctrl+C: retry  —  Failed: {error}. Draft retained.")
+        }
+    }
+}
+
+fn full_cancellation_message(phase: &CancellationPhase, has_execution_id: bool) -> String {
+    match (phase, has_execution_id) {
+        (CancellationPhase::Requesting, _) => {
+            "Requesting cancellation…  Esc: back to editor  Ctrl+D: exit immediately".into()
+        }
+        (CancellationPhase::Abandoning, _) => {
+            "Resuming with a new execution…  Prior work may still be running.  Esc: back to editor  Ctrl+D: exit".into()
+        }
+        (CancellationPhase::Stopping, _) => {
+            "Stopping…  Waiting for execution and child operations to stop.  Esc: back to editor  Ctrl+D: exit".into()
+        }
+        (CancellationPhase::Unconfirmed, true) => {
+            "Cancellation unconfirmed. Prior work may still be running.  Ctrl+C: retry  Esc: resume anyway  Ctrl+D: exit".into()
+        }
+        (CancellationPhase::Unconfirmed, false) => {
+            "Cancellation unconfirmed. Prior work may still be running.  Ctrl+C: retry  Esc: back to editor  Ctrl+D: exit".into()
+        }
+        (CancellationPhase::Failed(error), true) => {
+            format!("Cancellation request failed: {error}  Prior work may still be running.  Ctrl+C: retry  Esc: resume anyway  Ctrl+D: exit")
+        }
+        (CancellationPhase::Failed(error), false) => {
+            format!("Cancellation request failed: {error}  Prior work may still be running.  Ctrl+C: retry  Esc: back to editor  Ctrl+D: exit")
+        }
     }
 }
 

@@ -205,13 +205,7 @@ async fn failed_automatic_recovery_can_abandon_the_observed_generation() {
     ));
 
     tui.handle_key(esc()).await.unwrap();
-    assert!(matches!(
-        tui.app.modal,
-        Some(ModalState::ConfirmAbandonCancellation)
-    ));
-    tui.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-        .await
-        .unwrap();
+    assert!(tui.app.modal.is_none());
 
     assert_eq!(
         *actions.lock().unwrap(),
@@ -523,7 +517,8 @@ async fn root_cancellation_blocks_editing_and_has_static_unconfirmed_tray() {
     assert!(harness
         .screen_contents()
         .contains("Cancellation unconfirmed"));
-    assert!(harness.screen_contents().contains("Esc: resume anyway"));
+    assert!(harness.screen_contents().contains("Esc: back to editor"));
+    assert!(!harness.screen_contents().contains("Esc: resume anyway"));
     harness
         .tui()
         .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
@@ -561,14 +556,6 @@ async fn unconfirmed_cancellation_can_be_explicitly_abandoned() {
     tui.cancellation.as_mut().unwrap().phase = crate::cancellation::CancellationPhase::Unconfirmed;
 
     tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-        .await
-        .unwrap();
-    assert!(matches!(
-        tui.app.modal,
-        Some(ModalState::ConfirmAbandonCancellation)
-    ));
-
-    tui.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
         .await
         .unwrap();
     assert!(tui.app.modal.is_none());

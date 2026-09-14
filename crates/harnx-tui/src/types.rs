@@ -435,9 +435,6 @@ pub(super) enum ModalState {
         worker_state: ExitWorkerState,
         phase: ExitPhase,
     },
-    /// Confirmation for making an unconfirmed cancellation terminal even
-    /// though work outside the control plane may still be running.
-    ConfirmAbandonCancellation,
     /// Agent selection
     AgentPicker {
         agents: Vec<String>,
@@ -473,9 +470,6 @@ impl ModalState {
             }
             Self::ConfirmDelete { from, to } => Some(format!("Delete entries {from}–{to}? [y/N]")),
             Self::ConfirmRewind { seq, .. } => Some(format!("Rewind to entry {seq}? [y/N]")),
-            Self::ConfirmAbandonCancellation => {
-                Some("Resume anyway? Prior work may still be running. [y/N]".into())
-            }
             _ => None,
         }
     }

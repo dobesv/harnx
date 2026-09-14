@@ -432,71 +432,7 @@ impl Tui {
                 self.open_focused_root_item();
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
-                if self.try_handle_attach_command().await {
-                    return Ok(());
-                }
-                self.app.completions.clear();
-                let text = self.app.input.lines().join("\n");
-                if !text.trim().is_empty() || !self.app.attachments.is_empty() {
-                    // Reset abort signal before each new submission (fix #3)
-                    self.abort_signal.reset();
-                    // Add to history (fix #4)
-                    self.push_history(text.clone());
-                    if self.app.llm_busy {
-                        self.queue_busy_input(text).await;
-                    } else if text.trim_start().starts_with('.') {
-                        // Dot-command: route through command handler
-                        let attachments_snapshot = self.app.attachments.clone();
-                        self.app.transcript.push(TranscriptItem::UserText {
-                            text: text.clone(),
-                            seq: None,
-                            timestamp: Some(chrono::Utc::now()),
-                        });
-                        self.render_submitted_attachments(&attachments_snapshot)
-                            .await;
-                        self.pin_transcript_to_bottom();
-                        self.app.input = Self::new_input();
-                        self.run_command(&text).await?;
-                        self.refresh_input_chrome();
-                    } else {
-                        // Guard: agent and session must both be active before
-                        // submitting a prompt. If not, open the appropriate picker
-                        // and keep the text in the input so the user can retry.
-                        // The in-memory check (agent/session None) is always safe;
-                        // resolve_initial_modal is only called when the check fires.
-                        {
-                            let needs_picker = {
-                                let cfg = self.config.read();
-                                cfg.agent.is_none() || cfg.session.is_none()
-                            };
-                            if needs_picker {
-                                if let Some(modal) =
-                                    crate::types::Tui::resolve_initial_modal(&self.config).await
-                                {
-                                    self.app.modal = Some(modal);
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        let attachments_snapshot = self.app.attachments.clone();
-                        self.app.transcript.push(TranscriptItem::UserText {
-                            text: text.clone(),
-                            seq: None,
-                            timestamp: Some(chrono::Utc::now()),
-                        });
-                        self.render_submitted_attachments(&attachments_snapshot)
-                            .await;
-                        self.pin_transcript_to_bottom();
-                        self.app.input = Self::new_input();
-                        let msg = crate::types::PendingMessage {
-                            text,
-                            attachments: std::mem::take(&mut self.app.attachments),
-                            attachment_dir: self.app.attachment_dir.take(),
-                            paste_count: self.app.paste_count,
-                        };
-                        self.start_prompt(msg).await?;
-                    }
-                }
+                self.handle_enter_key().await?;
             }
             (KeyCode::Enter, KeyModifiers::SHIFT) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
                 // Shift+Enter / Ctrl+J inserts a newline - clear pending if any
@@ -553,6 +489,82 @@ impl Tui {
             }
         }
         Ok(())
+    }
+
+    fn can_accept_paste(&self) -> bool {
+        let overlay_open = self.app.detail_view_open
+            || self.app.transcript_browsing
+            || !self.app.subagent_view_stack.is_empty();
+        !overlay_open && (!self.has_root_cancellation() || self.cancellation_editor_restored())
+    }
+
+    async fn handle_enter_key(&mut self) -> Result<()> {
+        if self.try_handle_attach_command().await || self.has_root_cancellation() {
+            return Ok(());
+        }
+        self.app.completions.clear();
+        let text = self.app.input.lines().join("\n");
+        if text.trim().is_empty() && self.app.attachments.is_empty() {
+            return Ok(());
+        }
+        self.abort_signal.reset();
+        self.push_history(text.clone());
+        if self.app.llm_busy {
+            self.queue_busy_input(text).await;
+            return Ok(());
+        }
+        if text.trim_start().starts_with('.') {
+            return self.submit_dot_command(text).await;
+        }
+        if let Some(modal) = self.check_picker_modal().await {
+            self.app.modal = Some(modal);
+            return Ok(());
+        }
+        let attachments_snapshot = self.app.attachments.clone();
+        self.app.transcript.push(TranscriptItem::UserText {
+            text: text.clone(),
+            seq: None,
+            timestamp: Some(chrono::Utc::now()),
+        });
+        self.render_submitted_attachments(&attachments_snapshot)
+            .await;
+        self.pin_transcript_to_bottom();
+        self.app.input = Self::new_input();
+        let msg = crate::types::PendingMessage {
+            text,
+            attachments: std::mem::take(&mut self.app.attachments),
+            attachment_dir: self.app.attachment_dir.take(),
+            paste_count: self.app.paste_count,
+        };
+        self.start_prompt(msg).await
+    }
+
+    async fn submit_dot_command(&mut self, text: String) -> Result<()> {
+        let attachments_snapshot = self.app.attachments.clone();
+        self.app.transcript.push(TranscriptItem::UserText {
+            text: text.clone(),
+            seq: None,
+            timestamp: Some(chrono::Utc::now()),
+        });
+        self.render_submitted_attachments(&attachments_snapshot)
+            .await;
+        self.pin_transcript_to_bottom();
+        self.app.input = Self::new_input();
+        self.run_command(&text).await?;
+        self.refresh_input_chrome();
+        Ok(())
+    }
+
+    async fn check_picker_modal(&self) -> Option<ModalState> {
+        let (no_agent, no_session) = {
+            let cfg = self.config.read();
+            (cfg.agent.is_none(), cfg.session.is_none())
+        };
+        if no_agent || no_session {
+            crate::types::Tui::resolve_initial_modal(&self.config).await
+        } else {
+            None
+        }
     }
 
     async fn handle_exclusive_view_key(&mut self, key: KeyEvent) -> Option<Result<()>> {
@@ -684,12 +696,7 @@ impl Tui {
     }
 
     pub(super) async fn handle_paste(&mut self, text: String) {
-        // Ignore paste while the detail view or browsing view is open — same isolation
-        // policy as handle_key: these overlays hide the input field.
-        let overlay_depth = usize::from(self.app.detail_view_open)
-            + usize::from(self.app.transcript_browsing)
-            + self.app.subagent_view_stack.len();
-        if overlay_depth > 0 {
+        if !self.can_accept_paste() {
             return;
         }
         if let Some(pending) = self.app.pending_message.take() {
@@ -2697,9 +2704,6 @@ impl Tui {
                     self.app.transcript_browsing = false;
                     self.app.transcript_focus = None;
                     self.app.transcript_selection_anchor = None;
-                }
-                crate::types::ModalState::ConfirmAbandonCancellation => {
-                    self.start_cancellation_abandonment();
                 }
                 _ => {}
             }

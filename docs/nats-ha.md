@@ -576,12 +576,24 @@ until replacement; session deletion purges its entire control prefix.
 ### Frontend behavior
 
 The TUI replaces the composer with a cancellation tray for root cancellation.
-Unconfirmed state is static and offers `Ctrl+C` to retry or `Esc` to open an
-explicitly confirmed `resume anyway` abandonment. The confirmation warns that
-prior work may still be running. After local abandonment, the frontend retires
-its managed worker and tool-server process tree so the next prompt starts on a fresh worker. Child Ctrl+C
-targets the viewed or focused invocation only when its monitored execution ID
-matches. Worker
+From any phase, `Esc` restores an editable input while keeping the cancellation
+workflow alive; `Ctrl+C` retries the cancellation request, and `Ctrl+D` exits
+immediately. Restoring the editor is separate from admitting a new prompt:
+while a root cancellation is unresolved, `Enter` and paste are guarded to
+prevent submission, avoiding backend rejection for "session already belongs to
+another active invocation." The draft is preserved; no auto-submit occurs when
+the cancellation resolves.
+
+When the execution ID is known, `Esc` from `Unconfirmed` or `Failed` phases
+abandons directly without a confirmation modal — the "prior work may still
+run" warning appears only in the tray status. When the execution ID is unknown,
+`Esc` only restores the editor (no abandonment; the cancellation workflow
+continues in the background). After abandonment, the frontend retires its
+managed worker and tool-server process tree so the next prompt starts on a
+fresh worker.
+
+Child Ctrl+C targets the viewed or focused invocation only when its monitored
+execution ID matches. Worker
 preparation is outside the two-second durable-acceptance bound, and local retries
 retain their frontend-targeted activation route. Attaching to a session whose
 operation is already cancelling automatically retries recovery; accepted

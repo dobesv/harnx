@@ -20,6 +20,7 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::Notify;
 
+mod cancellation_escape_tests;
 mod command_completion;
 mod delegation_tests;
 mod exit_interrupt_tests;
