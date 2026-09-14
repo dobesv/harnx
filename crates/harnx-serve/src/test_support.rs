@@ -56,6 +56,7 @@ impl TestConfigSandbox {
             // Saved so the `remove_var` below is restored on drop rather than
             // leaking the deletion to the rest of the process.
             ("HARNX_CONFIG_FILE", std::env::var_os("HARNX_CONFIG_FILE")),
+            ("HARNX_WORKER_BIN", std::env::var_os("HARNX_WORKER_BIN")),
         ];
         unsafe {
             std::env::set_var("HARNX_CONFIG_DIR", &root);

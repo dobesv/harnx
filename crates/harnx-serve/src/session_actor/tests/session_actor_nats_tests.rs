@@ -189,21 +189,13 @@ fn live_worker_binary() -> Option<std::path::PathBuf> {
         eprintln!("skipping serve NATS smoke: nats-server not available");
         return None;
     }
-    if let Some(path) = std::env::var_os("HARNX_WORKER_BIN").map(std::path::PathBuf::from) {
-        if path.is_file() {
-            return Some(path);
+    match harnx_runtime::local_orchestrator::resolve_worker_binary() {
+        Ok(binary) => Some(binary),
+        Err(error) => {
+            eprintln!("skipping serve NATS smoke: {error:#}");
+            None
         }
     }
-    let mut directory = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    if directory.file_name().is_some_and(|name| name == "deps") {
-        directory.pop();
-    }
-    let binary = directory.join(if cfg!(windows) {
-        "harnx-worker.exe"
-    } else {
-        "harnx-worker"
-    });
-    binary.is_file().then_some(binary)
 }
 
 async fn reserve_session(config: &Config, agent: &str) -> String {
@@ -352,7 +344,7 @@ async fn serve_replays_prompt_queued_during_active_run() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reserved_session_accepts_events_and_rpc_prompt_before_header_exists() {
     harnx_core::require_nextest();
-    let Some(binary) = live_worker_binary() else {
+    let Some(_binary) = live_worker_binary() else {
         return;
     };
     let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
@@ -377,10 +369,9 @@ async fn reserved_session_accepts_events_and_rpc_prompt_before_header_exists() {
     assert!(event_stream.history().is_empty());
     let mut updates = Box::pin(crate::session_routes::session_updates(event_stream));
 
-    let supervisor = LocalWorkerSupervisor::start_with_worker_binary(binary, create_abort_signal())
-        .await
-        .expect("start local worker");
-    let registry = SessionRegistry::new_with_local_worker_for_tests(config.clone(), supervisor);
+    // Exercise production's lazy worker startup after the browser has already
+    // attached, rather than injecting an already-ready worker into the registry.
+    let registry = SessionRegistry::new(config.clone());
     let response = crate::ag_ui_rpc::handle_ag_ui_rpc_bytes(
         http::Method::POST,
         "plain",
