@@ -82,6 +82,92 @@ describe('SubAgentSessionNotes', () => {
     expect(onOpen).toHaveBeenLastCalledWith('researcher', 'child-session-done');
   });
 
+  describe('subagent title', () => {
+    it('renders the title element when note.title is set', () => {
+      render(
+        <SubAgentSessionNotes
+          notes={[{ ...note('running'), title: 'Searching codebase for patterns' }]}
+          onOpen={() => {}}
+        />,
+      );
+
+      const titleEl = screen.getByText('Searching codebase for patterns');
+      expect(titleEl).toBeVisible();
+      expect(titleEl).toHaveClass('aui-sub-agent-title');
+      expect(titleEl).toHaveAttribute('title', 'Searching codebase for patterns');
+    });
+
+    it('does not render the title element when note.title is undefined', () => {
+      const { container } = render(
+        <SubAgentSessionNotes
+          notes={[note('running')]}
+          onOpen={() => {}}
+        />,
+      );
+
+      expect(container.querySelector('.aui-sub-agent-title')).not.toBeInTheDocument();
+    });
+
+    it('does not render the title element when note.title is empty or whitespace', () => {
+      const { container } = render(
+        <SubAgentSessionNotes
+          notes={[
+            { ...note('running', 'child-empty'), title: '' },
+            { ...note('done', 'child-whitespace'), title: '   ' },
+          ]}
+          onOpen={() => {}}
+        />,
+      );
+
+      expect(container.querySelector('.aui-sub-agent-title')).not.toBeInTheDocument();
+    });
+
+    it('updates the title when new progress arrives with an updated title', () => {
+      const initialNote: SubAgentNote = {
+        ...note('running'),
+        title: 'Initial Title',
+      };
+      const { rerender } = render(
+        <SubAgentSessionNotes notes={[initialNote]} onOpen={() => {}} />,
+      );
+
+      expect(screen.getByText('Initial Title')).toBeVisible();
+
+      const updatedNote: SubAgentNote = {
+        ...initialNote,
+        title: 'Updated Progress Title',
+      };
+      rerender(<SubAgentSessionNotes notes={[updatedNote]} onOpen={() => {}} />);
+
+      expect(screen.queryByText('Initial Title')).not.toBeInTheDocument();
+      const updatedEl = screen.getByText('Updated Progress Title');
+      expect(updatedEl).toBeVisible();
+      expect(updatedEl).toHaveAttribute('title', 'Updated Progress Title');
+    });
+
+    it('defines CSS truncation and ellipsis styling for .aui-sub-agent-title in chat.css', async () => {
+      const fsMod = 'node:fs';
+      const pathMod = 'node:path';
+      const fs = (await import(/* @vite-ignore */ fsMod)) as unknown as {
+        readFileSync: (file: string, encoding: string) => string;
+      };
+      const path = (await import(/* @vite-ignore */ pathMod)) as unknown as {
+        resolve: (...parts: string[]) => string;
+      };
+      const g = globalThis as unknown as { process?: { cwd: () => string } };
+      const cwd = g.process ? g.process.cwd() : '.';
+      const css = fs.readFileSync(path.resolve(cwd, 'src/chat.css'), 'utf8');
+      const ruleMatch = css.match(/\.aui-sub-agent-title\s*\{([^}]+)\}/);
+      expect(ruleMatch).not.toBeNull();
+      const body = ruleMatch ? ruleMatch[1] : '';
+      expect(body).toMatch(/text-overflow:\s*ellipsis;/);
+      expect(body).toMatch(/overflow:\s*hidden;/);
+      expect(body).toMatch(/white-space:\s*nowrap;/);
+      expect(body).toMatch(/min-width:\s*0;/);
+      expect(body).toMatch(/max-width:\s*100%;/);
+    });
+  });
+
   describe('ChildMetricsSubscriber', () => {
     it('dispatches CHILD_TERMINAL with status done when RUN_FINISHED is received', () => {
       const dispatch = vi.fn();

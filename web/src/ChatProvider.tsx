@@ -96,6 +96,7 @@ export interface HarnxHttpAgentOptions {
   onHandoff?: (agent: string, sessionId: string) => void;
   onSubAgentEvent: (event: unknown) => void;
   onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
+  isForeground?: boolean;
 }
 
 const TRANSPORT_ERROR_PATTERN =
@@ -124,6 +125,7 @@ export class HarnxHttpAgent extends HttpAgent {
   private readonly onHandoff?: (agent: string, sessionId: string) => void;
   private readonly onSubAgentEvent: (event: unknown) => void;
   private readonly onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
+  private readonly isForeground: boolean;
   private handoffBoundarySeq?: number;
 
   constructor(options: HarnxHttpAgentOptions) {
@@ -135,6 +137,7 @@ export class HarnxHttpAgent extends HttpAgent {
     this.onHandoff = options.onHandoff;
     this.onSubAgentEvent = options.onSubAgentEvent;
     this.onHitlPendingApproval = options.onHitlPendingApproval;
+    this.isForeground = options.isForeground !== false;
   }
 
   private handleCustomEvent(name: string, value: unknown) {
@@ -153,6 +156,7 @@ export class HarnxHttpAgent extends HttpAgent {
         }
       },
       onHitlPendingApproval: this.onHitlPendingApproval,
+      isForeground: this.isForeground,
     });
   }
 
@@ -324,6 +328,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
       }
     },
     onHandoff,
+    isForeground: true,
     onHitlPendingApproval: (toolCallId, summary) =>
       addHydratedApproval({ toolCallId, summary }),
     onSubAgentEvent: (event: any) => {

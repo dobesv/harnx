@@ -32,6 +32,7 @@ function ChildMetricsSubscriber({ note, dispatch }: { note: SubAgentNote; dispat
     url: `/v1/agents/${encodeURIComponent(note.agent)}/sessions/${encodeURIComponent(note.sessionId)}`,
     onStatus: () => {},
     onRunFailed: () => {},
+    isForeground: false,
     onUsage: (usage) => {
       const current = noteRef.current;
       const elapsed = current.startedAtMs

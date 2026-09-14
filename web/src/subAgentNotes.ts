@@ -5,6 +5,7 @@ export interface SubAgentNote {
   invocationId?: string;
   toolCallId?: string;
   agent: string;
+  title?: string;
   sessionId: string;
   parentMessageId: string;
   status: SubAgentNoteStatus;
@@ -42,6 +43,7 @@ interface SubAgentIdentity {
 }
 
 interface SubAgentProgressValue extends SubAgentIdentity {
+  title?: string;
   invocationId: string;
   status: SubAgentNoteStatus;
   elapsedMs: number;
@@ -157,6 +159,7 @@ function subAgentProgress(value: unknown): SubAgentProgressValue | undefined {
   return {
     ...identity,
     ...metrics,
+    title: typeof progress.title === 'string' ? progress.title : undefined,
     invocationId: identity.invocationId,
     status,
   };
@@ -217,6 +220,7 @@ function snapshotNote(
     invocationId: progress?.invocationId,
     toolCallId: context.callId,
     agent: marker.agent,
+    title: progress?.title,
     sessionId: marker.sessionId,
     parentMessageId: context.parentMessageId,
     status: progress?.status ?? 'done',
@@ -354,6 +358,7 @@ function noteFromProgress(
     invocationId: progress.invocationId,
     toolCallId: progress.toolCallId ?? existingNote?.toolCallId,
     agent: progress.agent,
+    title: progress.title ?? existingNote?.title,
     sessionId: progress.sessionId,
     parentMessageId,
     status: progress.status,
@@ -408,6 +413,7 @@ function completeNote(state: SubAgentNotesState, content: unknown): SubAgentNote
   if (progress) return applyProgress(state, {
     invocation_id: progress.invocationId,
     agent: progress.agent,
+    title: progress.title,
     session_id: progress.sessionId,
     status: progress.status,
     elapsed_ms: progress.elapsedMs,

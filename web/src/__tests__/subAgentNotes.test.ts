@@ -30,12 +30,14 @@ const progress = (
   invocationId: string,
   status: 'running' | 'done' | 'failed',
   elapsedMs: number,
+  title?: string,
 ) => ({
   type: 'CUSTOM',
   name: 'sub_agent_progress',
   value: {
     invocation_id: invocationId,
     agent: 'researcher',
+    ...(title === undefined ? {} : { title }),
     session_id: 'child-session-0001',
     status,
     elapsed_ms: elapsedMs,
@@ -61,6 +63,7 @@ function snapshotEvent() {
           sub_agent_progress: {
             invocation_id: 'snapshot-inv-1',
             agent: 'researcher',
+            title: 'Snapshot researcher',
             session_id: 'reused-child',
             status: 'done',
             elapsed_ms: 12_345,
@@ -159,13 +162,14 @@ describe('reduceSubAgentNotes', () => {
           invocation_id: 'inv-1',
         },
       },
-      progress('inv-1', 'running', 10_000),
+      progress('inv-1', 'running', 10_000, 'Research child'),
       progress('inv-1', 'done', 12_345),
     );
 
     expect(state.notes).toEqual([expect.objectContaining({
       id: 'live:inv-1',
       invocationId: 'inv-1',
+      title: 'Research child',
       status: 'done',
       elapsedMs: 12_345,
       inputTokens: 120,
@@ -173,6 +177,34 @@ describe('reduceSubAgentNotes', () => {
       cachedTokens: 30,
       toolCallCount: 3,
     })]);
+  });
+
+  it('preserves title through terminal recovery from a durable tool result', () => {
+    const state = apply(
+      toolStart(),
+      started('researcher', 'child-session-0001'),
+      progress('inv-terminal', 'running', 10_000, 'Terminal child'),
+      {
+        type: 'TOOL_CALL_RESULT',
+        content: JSON.stringify({
+          sub_agent_progress: {
+            invocation_id: 'inv-terminal',
+            agent: 'researcher',
+            title: 'Terminal child',
+            session_id: 'child-session-0001',
+            status: 'done',
+            elapsed_ms: 12_345,
+            usage: { input_tokens: 120, output_tokens: 45, cached_tokens: 30 },
+            tool_call_count: 3,
+          },
+        }),
+      },
+    );
+
+    expect(state.notes.find((note) => note.invocationId === 'inv-terminal')).toEqual(expect.objectContaining({
+      title: 'Terminal child',
+      status: 'done',
+    }));
   });
 
   it('does not reopen a terminal invocation after late running events', () => {
@@ -499,6 +531,7 @@ describe('reduceSubAgentNotes', () => {
       expect.objectContaining({
         id: 'snapshot:assistant-1:call-1',
         invocationId: 'snapshot-inv-1',
+        title: 'Snapshot researcher',
         agent: 'researcher',
         sessionId: 'reused-child',
         parentMessageId: 'assistant-1',

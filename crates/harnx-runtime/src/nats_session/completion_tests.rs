@@ -153,6 +153,7 @@ fn durable_child_completion_repairs_a_lost_event_once_without_ending_parent_turn
         elapsed_ms: 123,
         usage: CompletionTokenUsage::default(),
         tool_call_count: 3,
+        title: None,
     };
     let entries = vec![(
         3,
@@ -181,4 +182,43 @@ fn durable_child_completion_repairs_a_lost_event_once_without_ending_parent_turn
     assert!(
         matches!(events.as_slice(), [AgentEvent::Turn(TurnEvent::SubAgentProgress(snapshot))] if snapshot.invocation_id == "invocation" && snapshot.status == SubAgentProgressStatus::Done)
     );
+}
+
+#[test]
+fn terminal_tool_result_recovery_preserves_title() {
+    let sink = Arc::new(Sink::default());
+    let event_sink: Arc<dyn AgentEventSink> = sink.clone();
+    let progress = SubAgentProgress {
+        invocation_id: "invocation-with-title".into(),
+        agent: "athena".into(),
+        session_id: "child".into(),
+        status: SubAgentProgressStatus::Done,
+        elapsed_ms: 456,
+        usage: CompletionTokenUsage::new(Some(100), Some(50), Some(20)),
+        tool_call_count: 5,
+        title: Some("Research task".into()),
+    };
+    let entries = vec![(
+        5,
+        SessionLogEntry::ToolResults {
+            results: vec![ToolOutput {
+                id: Some("call".into()),
+                name: "session_prompt".into(),
+                output: json!({"response": "done", "sub_agent_progress": progress}),
+                markdown: None,
+                content: vec![],
+                switch_agent: None,
+            }],
+            timestamp: None,
+        },
+    )];
+    let mut emitted = HashSet::new();
+    reconcile_subagent_progress(&entries, 0, &event_sink, &mut emitted);
+    let events = sink.0.lock().unwrap();
+    let [AgentEvent::Turn(TurnEvent::SubAgentProgress(recovered))] = events.as_slice() else {
+        panic!("expected single SubAgentProgress event");
+    };
+    assert_eq!(recovered.invocation_id, "invocation-with-title");
+    assert_eq!(recovered.title, Some("Research task".into()));
+    assert_eq!(recovered.elapsed_ms, 456);
 }

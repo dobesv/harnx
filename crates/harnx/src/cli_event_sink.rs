@@ -750,6 +750,7 @@ mod tests {
             elapsed_ms,
             usage: harnx_core::api_types::CompletionTokenUsage::new(Some(120), Some(45), Some(30)),
             tool_call_count: 3,
+            title: None,
         }
     }
 
