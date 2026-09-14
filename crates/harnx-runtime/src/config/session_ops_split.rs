@@ -30,6 +30,7 @@ fn listed_session_to_meta(record: &ListedSession) -> SessionMeta {
                 );
                 Vec::new()
             }),
+        unread: record.unread,
     }
 }
 
@@ -282,6 +283,7 @@ mod tests_remote_sessions {
                 first_activation_at: None,
                 last_activity_at: Utc.timestamp_opt(1_719_531_234, 0).unwrap(),
             }),
+            unread: true,
         };
 
         let meta = listed_session_to_meta(&record);
@@ -296,5 +298,6 @@ mod tests_remote_sessions {
             modified.duration_since(UNIX_EPOCH).unwrap().as_secs(),
             1_719_531_234_u64
         );
+        assert!(meta.unread);
     }
 }

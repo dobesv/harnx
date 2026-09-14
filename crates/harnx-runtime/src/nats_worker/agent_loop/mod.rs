@@ -1,8 +1,7 @@
 //! Agent loop entrypoint for NATS-backed sessions.
 
+mod hitl_attention;
 mod tool_recovery;
-use tool_recovery::repair_single_orphan;
-
 use super::backend::{FencedSessionLogSink, NatsSessionLogBackend};
 use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use crate::agent_loop::OnToolRoundFn;
@@ -24,6 +23,7 @@ use harnx_core::message::Message;
 use harnx_core::session::SessionLogEntry;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use tool_recovery::repair_single_orphan;
 
 #[derive(Clone)]
 pub struct RunAgentLoopArgs<'a> {
@@ -111,6 +111,27 @@ pub(crate) fn derive_pending_hitl_approvals(
             _ => None,
         })
         .collect())
+}
+
+/// Derive the attention sequence from log entries.
+///
+/// Returns the max stream seq among attention-producing entries:
+/// - `TurnEnd` with `through_seq > 0` (final message turn boundary)
+/// - `HitlApprovalRequested` (HITL approval request)
+///
+/// Used by `reconcile_attention_from_log` to repair lost bumps.
+pub fn derive_attention_seq(entries: &[(u64, SessionLogEntry)]) -> u64 {
+    entries
+        .iter()
+        .filter_map(|(seq, entry)| match entry {
+            // TurnEnd with through_seq > 0 marks a complete turn
+            SessionLogEntry::TurnEnd { through_seq, .. } if *through_seq > 0 => Some(*seq),
+            // HitlApprovalRequested always bumps attention
+            SessionLogEntry::HitlApprovalRequested { .. } => Some(*seq),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn tool_round_entries(
@@ -209,72 +230,7 @@ fn derive_hitl_tool_round_continuation(
         decisions,
     }))
 }
-fn build_hitl_approval_request_callback(
-    jetstream: &jetstream::Context,
-    session_id: &str,
-    lease: &Arc<NatsSessionLease>,
-    event_sink: Option<&Arc<NatsEventSink>>,
-    after_seq_observer: Option<&Arc<AtomicU64>>,
-) -> crate::agent_loop::OnHitlApprovalRequiredFn {
-    let backend = NatsSessionLogBackend::new(jetstream.clone(), session_id)
-        .with_after_seq_observer(
-            after_seq_observer
-                .cloned()
-                .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
-        );
-    let sink = FencedSessionLogSink::new(backend.clone(), Arc::clone(lease));
-    let lease = Arc::clone(lease);
-    let event_sink = event_sink.cloned();
-    Arc::new(move |deferred| {
-        anyhow::ensure!(
-            lease.is_held(),
-            "session lease lost before HITL approval request"
-        );
-        let tool_call_id = deferred
-            .call
-            .id
-            .clone()
-            .context("deferred tool call has no tool_call_id")?;
-        let summary = deferred
-            .reason
-            .clone()
-            .filter(|reason| !reason.trim().is_empty())
-            .unwrap_or_else(|| format!("Approve tool call `{}`", deferred.call.name));
-        let entry = SessionLogEntry::HitlApprovalRequested {
-            tool_call_id: tool_call_id.clone(),
-            summary,
-            fence_token: lease.fence_token(),
-        };
-        for _ in 0..3 {
-            anyhow::ensure!(
-                lease.is_held(),
-                "session lease lost before HITL approval request"
-            );
-            let entries = backend.load_events_blocking()?;
-            let pending = derive_pending_hitl_approvals(&entries)?;
-            if let Some(oldest) = pending.first() {
-                log::warn!(
-                    "session already has pending HITL approval; retaining oldest request: tool_call_id={} seq={}",
-                    oldest.tool_call_id,
-                    oldest.seq
-                );
-                return Ok(oldest.tool_call_id.clone());
-            }
-            let expected_last_sequence = entries.last().map_or(0, |(seq, _)| *seq);
-            if sink
-                .append_hitl_event_cas_blocking(&entry, expected_last_sequence)?
-                .is_some()
-            {
-                if let Some(event_sink) = &event_sink {
-                    event_sink.publish_session_updated();
-                }
-                return Ok(tool_call_id);
-            }
-        }
-        anyhow::bail!("HITL approval request lost repeated concurrent append races")
-    })
-}
-
+/// Build the HITL approval request callback that appends entry and bumps attention.
 fn fold_user_messages(messages: &[Message]) -> String {
     messages
         .iter()
@@ -427,6 +383,7 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
         on_tool_round,
         working_dir,
     } = args;
+
     let (jetstream_ctx, session_origin, attachment_sync) =
         prepare_agent_session(PrepareAgentSessionParams {
             cluster_key,
@@ -440,27 +397,26 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
         })
         .await?;
 
-    let hook_start_config =
-        resolve_agent_hook_start_config(manage_servers, &config, &jetstream_ctx, &instance_id)
-            .await;
-    let mut hook_supervisor = None;
-    reconcile_agent_hooks(
-        &mut hook_supervisor,
-        hook_start_config.as_ref(),
+    let hook_supervisor = setup_agent_hooks(
+        manage_servers,
         &config,
+        &jetstream_ctx,
+        &instance_id,
         session_id,
     )
     .await;
 
     let on_hitl_approval_required = lease.as_ref().map(|lease| {
-        build_hitl_approval_request_callback(
-            &jetstream_ctx,
+        hitl_attention::build_hitl_approval_request_callback(hitl_attention::HitlCallbackContext {
+            jetstream: &jetstream_ctx,
             session_id,
             lease,
-            event_sink.as_ref(),
-            after_seq_observer.as_ref(),
-        )
+            event_sink: event_sink.as_ref(),
+            after_seq_observer: after_seq_observer.as_ref(),
+            metadata_store: session_metadata,
+        })
     });
+
     let ctx = build_agent_loop_context(AgentContextParams {
         config: config.clone(),
         instance_id,
@@ -473,12 +429,11 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
     })
     .await;
 
-    // After hook reconciliation and provider discovery so the dispatch reaches
-    // both global and agent hook servers.
     dispatch_context_session_start(&ctx, session_origin, session_id).await;
 
     let backend = NatsSessionLogBackend::new(jetstream_ctx.clone(), session_id);
     let hitl_continuation = derive_hitl_tool_round_continuation(&backend.load_events_blocking()?)?;
+
     let segment_args = AgentLoopSegmentArgs {
         source_session_id: session_id,
         cluster_key,
@@ -491,12 +446,35 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
         event_sink,
         lease,
     };
-    let result = if let Some(continuation) = hitl_continuation {
-        run_hitl_continuation_segment(segment_args, continuation).await
-    } else {
-        run_agent_loop_segment(segment_args).await
+
+    let result = match hitl_continuation {
+        Some(continuation) => run_hitl_continuation_segment(segment_args, continuation).await,
+        None => run_agent_loop_segment(segment_args).await,
     };
+
     finish_agent_loop(hook_supervisor, attachment_sync, result).await
+}
+
+/// Set up agent-level hook servers for this session.
+async fn setup_agent_hooks(
+    manage_servers: bool,
+    config: &GlobalConfig,
+    jetstream_ctx: &jetstream::Context,
+    instance_id: &harnx_core::instance::ServerScope,
+    session_id: &str,
+) -> Option<HookServerSupervisor> {
+    let hook_start_config =
+        resolve_agent_hook_start_config(manage_servers, config, jetstream_ctx, instance_id).await;
+
+    let mut hook_supervisor = None;
+    reconcile_agent_hooks(
+        &mut hook_supervisor,
+        hook_start_config.as_ref(),
+        config,
+        session_id,
+    )
+    .await;
+    hook_supervisor
 }
 
 async fn finish_agent_loop(
@@ -1976,5 +1954,106 @@ mod tests {
             Some(4),
             "latest_seq must track max consumed user-message seq"
         );
+    }
+}
+
+/// Tests for `build_hitl_approval_request_callback` attention bump.
+#[cfg(test)]
+mod hitl_attention_tests {
+    use super::hitl_attention::{
+        build_hitl_approval_request_callback_for_test, HitlCallbackContext,
+    };
+    use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
+    use crate::nats_session_metadata::{SessionInitializer, SessionMetadata, SessionMetadataStore};
+    use crate::tool::DeferredToolCall;
+    use harnx_core::require_nextest;
+    use harnx_core::tool::ToolCall;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    /// Test that `build_hitl_approval_request_callback_for_test` appends
+    /// `HitlApprovalRequested` and bumps attention directly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hitl_approval_callback_bumps_attention_directly() {
+        require_nextest();
+        let Some((url, mut child, _store_dir)) = crate::nats_worker::tests::spawn_test_nats().await
+        else {
+            return;
+        };
+
+        let client = async_nats::connect(&url).await.unwrap();
+        let jetstream = async_nats::jetstream::new(client);
+        let store = SessionMetadataStore::ensure(&jetstream, 1).await.unwrap();
+        let session_id = crate::nats_worker::new_remote_session_id();
+        let storage_key = harnx_core::session_identity::session_key(Some("metis"), &session_id);
+
+        // Create session metadata
+        store
+            .create(&SessionMetadata::new(
+                &session_id,
+                SessionInitializer::named("metis", Default::default()),
+            ))
+            .await
+            .unwrap();
+
+        // Acquire a lease for the session
+        let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
+            jetstream: jetstream.clone(),
+            session_id: &storage_key,
+            worker_id: "test-worker".to_string(),
+            generation: 1,
+            config: NatsLeaseConfig {
+                ttl: std::time::Duration::from_secs(5),
+                renew_interval: std::time::Duration::from_millis(500),
+                replicas: 1,
+                ..Default::default()
+            },
+            session_metadata: Some(store.clone()),
+        })
+        .await
+        .unwrap()
+        .expect("lease should be acquired");
+        let lease = Arc::new(lease);
+        let after_seq_observer = Arc::new(AtomicU64::new(0));
+
+        // Build the callback with metadata store attached
+        let ctx = HitlCallbackContext {
+            jetstream: &jetstream,
+            session_id: &storage_key,
+            lease: &lease,
+            event_sink: None,
+            after_seq_observer: Some(&after_seq_observer),
+            metadata_store: Some(&store),
+        };
+        let callback = build_hitl_approval_request_callback_for_test(ctx);
+
+        // Invoke the callback with a deferred tool call
+        let deferred = DeferredToolCall {
+            call: ToolCall::new(
+                "test_tool".to_string(),
+                serde_json::json!({"arg": "value"}),
+                Some("call-123".to_string()),
+                None,
+            ),
+            arguments: serde_json::json!({"arg": "value"}),
+            reason: Some("Test approval".to_string()),
+        };
+        let result = callback(&deferred).unwrap();
+        assert_eq!(result, "call-123");
+
+        // Verify session is now unread with correct attention seq
+        let state = store.get_read_state(&storage_key).await.unwrap();
+        assert!(
+            state.is_unread(),
+            "session should be unread after HITL approval request callback"
+        );
+        assert!(
+            state.last_attention_seq >= 1,
+            "last_attention_seq should be at least 1"
+        );
+
+        lease.release().await.unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

@@ -774,9 +774,15 @@ impl Tui {
         self.app.main_streamed_text_idx = None;
     }
 
+    fn input_unread_indicator(unread: bool) -> Option<Span<'static>> {
+        unread.then(|| Span::styled("● ", Style::default().fg(Color::Yellow)))
+    }
+
     pub(super) fn build_input_title(&self) -> Line<'static> {
         let config_read = self.config.read();
-        let mut spans = vec![];
+        let mut spans: Vec<_> = Self::input_unread_indicator(self.app.current_session_unread)
+            .into_iter()
+            .collect();
 
         let spinner = if self.app.llm_busy && !self.cancellation_unconfirmed() {
             SPINNER_FRAMES[self.app.spinner_index]
@@ -921,7 +927,7 @@ impl Tui {
                 ..
             } => {
                 let title = "Select Session";
-                let footer = "↑↓ navigate  Enter select  Esc cancel";
+                let footer = "↑↓ navigate  Enter select  u/unread  Esc cancel";
                 let mut items: Vec<String> = vec!["✦ New session".to_string()];
                 items.extend(sessions.iter().map(|session| session.picker_label()));
                 // Prepend error message if present (visible in picker)
