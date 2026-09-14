@@ -166,7 +166,7 @@ overrides:
   '@ag-ui/client': 0.0.59
   '@assistant-ui/core': 0.3.17
   '@assistant-ui/store': 0.3.12
-  assistant-stream: 0.3.41
+  assistant-stream: 0.3.42
 
 importers:
 
@@ -1720,8 +1720,8 @@ packages:
   assistant-cloud@0.1.43:
     resolution: {integrity: sha512-dq9kvqTCBwZtIzypi0zYZpylCtd6Hd/DTANeoesUjMhZ3vMjqtLaLW8Ce8mbD07f8MBrT0iUvd6fTJRU8cV97A==}
 
-  assistant-stream@0.3.41:
-    resolution: {integrity: sha512-YyX9jPnxhKmzoJVzRNxcxfb66JbxTi+lwIyvq/N7hq1+6yaXYAeIfHU9PvAXWYfAS4zowJKj3rgCDGFtgpBMdw==}
+  assistant-stream@0.3.42:
+    resolution: {integrity: sha512-5dQxc7XX92LuJ8wuHaOi/vkHitz2DARABzoE364O7o4jiePWalDpDpqU9bN+bXTvnSiRrpesy6t3Z3oDqRkdQw==}
     peerDependencies:
       ioredis: ^5.10.1 || ^6.0.0
       redis: ^5.12.1
@@ -2838,7 +2838,7 @@ snapshots:
     dependencies:
       '@assistant-ui/store': 0.3.12(@assistant-ui/tap@0.9.16(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)
       '@assistant-ui/tap': 0.9.16(@types/react@19.3.0)(react@19.3.0)
-      assistant-stream: 0.3.41
+      assistant-stream: 0.3.42
       nanoid: 6.0.1
     optionalDependencies:
       '@types/react': 19.3.0
@@ -2854,7 +2854,7 @@ snapshots:
       '@assistant-ui/core': 0.3.17(@assistant-ui/store@0.3.12(@assistant-ui/tap@0.9.16(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0))(@assistant-ui/tap@0.9.16(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(assistant-cloud@0.1.43)(react@19.3.0)
       '@assistant-ui/react-generative-ui': 0.0.17(@assistant-ui/react@0.15.18(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)(zod@4.5.4)
       '@assistant-ui/store': 0.3.12(@assistant-ui/tap@0.9.16(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)
-      assistant-stream: 0.3.41
+      assistant-stream: 0.3.42
       fast-json-patch: 3.1.1
       react: 19.3.0
     optionalDependencies:
@@ -2870,7 +2870,7 @@ snapshots:
   '@assistant-ui/react-generative-ui@0.0.17(@assistant-ui/react@0.15.18(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)(zod@4.5.4)':
     dependencies:
       '@assistant-ui/react': 0.15.18(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
-      assistant-stream: 0.3.41
+      assistant-stream: 0.3.42
       react: 19.3.0
       zod: 4.5.4
     optionalDependencies:
@@ -2910,7 +2910,7 @@ snapshots:
       '@assistant-ui/store': 0.3.12(@assistant-ui/tap@0.9.16(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)
       '@assistant-ui/tap': 0.9.16(@types/react@19.3.0)(react@19.3.0)
       assistant-cloud: 0.1.43
-      assistant-stream: 0.3.41
+      assistant-stream: 0.3.42
       radix-ui: 1.6.7(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
       react: 19.3.0
       react-dom: 19.3.0(react@19.3.0)
@@ -4112,12 +4112,12 @@ snapshots:
 
   assistant-cloud@0.1.43:
     dependencies:
-      assistant-stream: 0.3.41
+      assistant-stream: 0.3.42
     transitivePeerDependencies:
       - ioredis
       - redis
 
-  assistant-stream@0.3.41:
+  assistant-stream@0.3.42:
     dependencies:
       '@standard-schema/spec': 1.1.0
       nanoid: 6.0.1
