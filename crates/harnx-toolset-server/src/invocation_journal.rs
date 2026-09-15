@@ -7,6 +7,9 @@ use futures_util::TryStreamExt;
 use harnx_toolset::{ToolReply, ToolRequest};
 use serde::{Deserialize, Serialize};
 
+mod replies;
+pub use crate::reply_fence::CommittedReply;
+
 pub const BUCKET: &str = "harnx_tool_invocations";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -19,11 +22,15 @@ pub struct RecordedInvocation {
     pub started_at_ms: u64,
     pub reply: Option<ToolReply>,
     #[serde(default)]
+    pub reply_commit: Option<harnx_execution_control::CommitReceipt>,
+    #[serde(default)]
+    pub reply_producer: Option<harnx_execution_control::ExecutionContext>,
+    #[serde(default)]
     pub checkpoint: Option<serde_json::Value>,
 }
 
 #[derive(Clone)]
-pub struct InvocationJournal(kv::Store);
+pub struct InvocationJournal(kv::Store, Option<harnx_execution_control::ExecutionStore>);
 
 /// Reconcile durability away from the request path, including replica changes
 /// made to the execution store after this server started. Retain the future
@@ -73,11 +80,14 @@ impl InvocationJournal {
                 js.get_key_value(BUCKET).await?
             }
         };
-        Ok(Self(store))
+        Ok(Self(
+            store,
+            Some(harnx_execution_control::ExecutionStore::ensure(js, replicas).await?),
+        ))
     }
 
     pub fn from_store(store: kv::Store) -> Self {
-        Self(store)
+        Self(store, None)
     }
 
     pub async fn record(
@@ -98,6 +108,8 @@ impl InvocationJournal {
                 .as_millis()
                 .try_into()?,
             reply: None,
+            reply_commit: None,
+            reply_producer: None,
             checkpoint: None,
         };
         self.0
@@ -129,6 +141,7 @@ impl InvocationJournal {
             .context("replay has no durable invocation")?;
         let mut original = request.clone();
         original.replay = None;
+        original.replay_execution = None;
         ensure!(
             original == record.request,
             "replay does not match the original invocation"
@@ -188,12 +201,6 @@ impl InvocationJournal {
             }
         }
         Ok(found)
-    }
-
-    /// The first persisted result is authoritative for every replay observer.
-    pub async fn complete(&self, request: &ToolRequest, reply: ToolReply) -> Result<ToolReply> {
-        self.first_value(key(request), reply, |record| &mut record.reply)
-            .await
     }
 
     async fn first_value<T: Clone>(
@@ -261,6 +268,13 @@ impl InvocationJournal {
             .await?;
         for key in self.session_keys(session).await? {
             self.0.purge(key).await?;
+        }
+        let prefix = format!("blobs/sessions/{session}/");
+        let mut keys = self.0.keys().await?;
+        while let Some(key) = keys.try_next().await? {
+            if key.starts_with(&prefix) {
+                self.0.purge(key).await?;
+            }
         }
         Ok(())
     }

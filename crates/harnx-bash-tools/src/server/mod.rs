@@ -46,6 +46,7 @@ mod command;
 mod env;
 mod exec;
 mod exec_log;
+mod foreground_cleanup;
 mod handler;
 mod handlers;
 mod lifecycle;

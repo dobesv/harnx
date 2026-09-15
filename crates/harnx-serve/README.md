@@ -216,9 +216,13 @@ remote-follow):
 - **Messages snapshot resets guard:** When a live `MESSAGES_SNAPSHOT` replaces
   a lagged broadcast stream, the guard must finalize any open lifecycles first
   so subsequent END events don't appear orphaned.
-- **No frame drops:** Lifecycle frames are ordered; dropping an END without its
-  START invalidates every later frame. Remote-follow uses awaited backpressured
-  sends instead of `try_send`-and-drop.
+- **Generation-aware queue:** Remote-follow retains the attached prompt's
+  generation through its backpressured event queue. Accepted root interruption
+  ends the run without waiting for lease release or `TurnEnd`; a replacement
+  generation cannot prolong that run or send its events under the old run ID.
+  The lifecycle guard runs at wire emission, after stopped-generation events are
+  discarded. It closes only lifecycles actually sent, so discarding a queued
+  START cannot leave an orphan END.
 
 See `ag_ui_lifecycle.rs` for the guard implementation and
 `ag_ui_remote_follow.rs` for remote-follow integration. Tests in
@@ -270,9 +274,12 @@ decision can resume the tool round; the server does not retain a continuation.
 - **Web UI / JSON-RPC**: Submit one tool decision at a time using
   `session/hitl_decision` with params
   `{tool_call_id, approved, note?}`. The result is `{applied: true}` when the worker
-  acknowledges applying the decision, or `{applied: false}` when no matching
-  approval remains pending. Clients remove the resolved gate and refresh from the
-  durable log; errors leave the gate available for retry.
+  acknowledges the decision or the durable log already contains the same approval
+  for that request. Retries recover a lost acknowledgement without executing the
+  tool twice. A conflicting decision or an unresolved request that is no longer
+  pending returns `{applied: false}`. Decisions from an older tool round do not
+  authorize a reused tool-call ID in a newer round. Clients remove the resolved
+  gate and refresh from the durable log; errors leave it available for retry.
 - **Legacy SSE resume path**: The client sends a prompted run with `resume: [{interruptId, status, payload: {approved}}]`
   in the AG-UI input. `interruptId` identifies the pending tool call.
 - **Legacy JSON-RPC resume path**: Same resume field in `session/prompt` params. Both legacy paths parse via

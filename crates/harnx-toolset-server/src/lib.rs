@@ -1,15 +1,28 @@
 //! Server-side adapters for hosting a [`harnx_toolset::Toolset`].
 
+pub mod cancellation_client;
 mod control;
 use control::handle_control;
 mod aggregate;
 pub mod content;
 mod drain;
 mod execution;
+mod invocation;
+use invocation::invoke_uncached_tool;
+#[cfg(test)]
+use invocation::{
+    accepts_parent_session_id, add_parent_context_args, metric_tool_name, tool_exec_span,
+};
+mod mcp;
+#[cfg(test)]
+use mcp::call_tool_result_from_value;
+use mcp::McpToolsetAdapter;
 mod lifecycle;
 mod registration_identity;
 pub mod schema;
 mod subscriptions;
+mod tool_observation;
+use tool_observation::*;
 
 pub use aggregate::serve_many_with_shutdown;
 pub use lifecycle::ServeLifecycle;
@@ -26,9 +39,9 @@ use harnx_core::execution_context::{
 use harnx_core::instance::ServerScope;
 use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{
-    server_identity_token, ControlKind, ControlMessage, Registration, ToolErrorPayload,
-    ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolReply, ToolRequest, Toolset,
-    HDR_CALL_ID, HDR_IDEMPOTENCY_KEY, SUBAGENT_SESSION_NEW_TOOL, SUBAGENT_SESSION_PROMPT_TOOL,
+    server_identity_token, ControlMessage, Registration, ToolErrorPayload, ToolInvocation,
+    ToolInvocationContext, ToolInvokeError, ToolReply, ToolRequest, Toolset, HDR_CALL_ID,
+    HDR_IDEMPOTENCY_KEY, SUBAGENT_SESSION_NEW_TOOL, SUBAGENT_SESSION_PROMPT_TOOL,
 };
 use opentelemetry::Context as OtelContext;
 use rmcp::model::{
@@ -47,10 +60,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 pub const TOOL_REGISTRY_BUCKET: &str = "harnx_tool_registry";
-pub const TOOL_PROTOCOL_VERSION: u32 = 3;
+pub use harnx_toolset::TOOL_PROTOCOL_VERSION;
 
+pub mod invocation_admission;
 pub mod invocation_journal;
 mod recovery;
+mod reply_cache;
+pub mod reply_fence;
+use reply_cache::*;
 pub const TOOL_SCHEMA_VERSION: u32 = 1;
 
 const IDEMPOTENCY_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -58,25 +75,6 @@ const IDEMPOTENCY_CACHE_MAX_ENTRIES: usize = 1_024;
 const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 type InFlight = Arc<Mutex<HashMap<String, execution::ActiveCall>>>;
-type ReplyCache = Arc<Mutex<HashMap<String, ReplyCacheEntry>>>;
-
-enum ReplyCacheEntry {
-    InProgress {
-        reply: watch::Receiver<Option<ToolReply>>,
-    },
-    Complete {
-        created: Instant,
-        reply: ToolReply,
-    },
-}
-
-enum CacheReservation {
-    Execute(watch::Sender<Option<ToolReply>>),
-    Wait(watch::Receiver<Option<ToolReply>>),
-    Complete(ToolReply),
-    Full,
-}
-
 #[derive(Clone)]
 struct ToolRequestContext {
     client: async_nats::Client,
@@ -90,6 +88,7 @@ struct ToolRequestContext {
     server_identity: String,
     execution_store: harnx_execution_control::ExecutionStore,
     journal: invocation_journal::InvocationJournal,
+    cleanup: Arc<harnx_execution_control::CleanupTasks>,
 }
 
 struct ValidatedToolRequest {
@@ -97,24 +96,6 @@ struct ValidatedToolRequest {
     request: ToolRequest,
     idempotency_key: String,
     parent_cx: OtelContext,
-}
-
-fn tool_exec_span(tool_name: &str, parent_cx: OtelContext) -> tracing::Span {
-    let span = tracing::info_span!(
-        "tool_exec",
-        otel.kind = "server",
-        harnx.tool.name = tool_name,
-    );
-    harnx_telemetry::set_span_parent(&span, parent_cx);
-    span
-}
-
-fn metric_tool_name<'a>(toolset: &dyn Toolset, requested: &'a str) -> &'a str {
-    if toolset.tools().iter().any(|tool| tool.name == requested) {
-        requested
-    } else {
-        "unknown"
-    }
 }
 
 struct ServeSettings {
@@ -290,17 +271,11 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
     signal_started(started);
 
     let (active_requests, active_requests_rx) = InFlightRequests::new();
-    let request_context = ToolRequestContext {
-        client: client.clone(),
-        toolset,
-        in_flight: Arc::new(Mutex::new(HashMap::new())),
-        reply_cache: Arc::new(Mutex::new(HashMap::new())),
-        active_requests,
-        server_scope: instance_id.clone(),
-        server_identity: identity_token.clone(),
-        execution_store,
-        journal,
-    };
+    let request_context = request_context(
+        (&client, toolset),
+        (&instance_id, identity_token.clone()),
+        (active_requests, execution_store, journal),
+    );
 
     let outcome = serve_requests(
         &request_context,
@@ -333,6 +308,29 @@ async fn serve_configured(toolset: Arc<dyn Toolset>, settings: ServeSettings) ->
     let key = registration_key(&instance_id, &identity_token);
     delete_own_registration(&registry, &key, revision).await;
     outcome
+}
+
+fn request_context(
+    (client, toolset): (&async_nats::Client, Arc<dyn Toolset>),
+    (instance_id, server_identity): (&ServerScope, String),
+    (active_requests, execution_store, journal): (
+        InFlightRequests,
+        harnx_execution_control::ExecutionStore,
+        invocation_journal::InvocationJournal,
+    ),
+) -> ToolRequestContext {
+    ToolRequestContext {
+        client: client.clone(),
+        toolset,
+        in_flight: Arc::default(),
+        reply_cache: Arc::default(),
+        active_requests,
+        server_scope: instance_id.clone(),
+        server_identity,
+        execution_store,
+        journal,
+        cleanup: Arc::default(),
+    }
 }
 
 fn signal_started(started: Option<tokio::sync::oneshot::Sender<()>>) {
@@ -433,23 +431,22 @@ async fn process_tool_request(
     };
     let ValidatedToolRequest {
         reply_subject,
-        mut request,
+        request,
         idempotency_key,
         parent_cx,
     } = validated;
-    let completion = match reserve_cache_entry(&context.reply_cache, &idempotency_key).await {
-        CacheReservation::Complete(mut reply) => {
-            execution::complete_without_invocation(context, &request).await?;
-            reply.call_id.clone_from(&request.call_id);
-            finalize_execution_context(context, &request, &mut reply);
-            return publish_reply(&context.client, reply_subject, &reply).await;
+    let completion = match reserve_cache_entry(
+        &context.reply_cache,
+        &cache_key(&request, &idempotency_key)?,
+    )
+    .await
+    {
+        CacheReservation::Complete(saved) => {
+            return serve_cached(context, &request, reply_subject, Ok(saved)).await;
         }
         CacheReservation::Wait(reply) => {
-            let mut reply = wait_for_cached_reply(reply).await?;
-            execution::complete_without_invocation(context, &request).await?;
-            reply.call_id.clone_from(&request.call_id);
-            finalize_execution_context(context, &request, &mut reply);
-            return publish_reply(&context.client, reply_subject, &reply).await;
+            let saved = wait_for_cached_reply(reply).await?;
+            return serve_cached(context, &request, reply_subject, saved).await;
         }
         CacheReservation::Full => {
             execution::complete_without_invocation(context, &request).await?;
@@ -464,218 +461,20 @@ async fn process_tool_request(
         CacheReservation::Execute(completion) => completion,
     };
 
-    let request_attestation = RequestAttestation {
-        call_id: request.call_id.clone(),
-        tool: request.tool.clone(),
-        capabilities: request.capabilities.clone(),
-    };
-    let result = invoke_uncached_tool(context, &mut request, parent_cx).await;
-
+    let result = invoke_uncached_tool(context, &request, parent_cx).await;
     let reply = ToolReply {
-        call_id: request.call_id,
+        call_id: request.call_id.clone(),
         result: result.map_err(map_invoke_error),
     };
+    let saved = cache_completion(context, &request, reply).await;
     complete_cache_entry(
         &context.reply_cache,
-        idempotency_key,
-        reply.clone(),
+        cache_key(&request, &idempotency_key)?,
+        saved.clone(),
         completion,
     )
     .await;
-    let mut published_reply = reply;
-    finalize_execution_context_for_attestation(context, &request_attestation, &mut published_reply);
-    publish_reply(&context.client, reply_subject, &published_reply).await
-}
-
-async fn invoke_uncached_tool(
-    context: &ToolRequestContext,
-    request: &mut ToolRequest,
-    parent_cx: OtelContext,
-) -> Result<Value, ToolInvokeError> {
-    let recovery = recovery::InvocationRecovery::load(context, request).await?;
-    if let Some(reply) = recovery.completed_reply(context).await? {
-        return reply_result(reply);
-    }
-    recovery.check_policy(context).await?;
-    let execution = execution::InvocationExecution::claim(
-        &context.execution_store,
-        request,
-        &context.server_identity,
-    )
-    .await
-    .map_err(|error| ToolInvokeError::Fatal(format!("register tool execution: {error:#}")))?;
-    let cancel = CancellationToken::new();
-    let (stopped, stopped_rx) = watch::channel(false);
-    context.in_flight.lock().await.insert(
-        request.call_id.clone(),
-        execution::ActiveCall {
-            reference: execution.reference.clone(),
-            cancel: cancel.clone(),
-            stopped: stopped_rx,
-        },
-    );
-    let mut args = std::mem::take(&mut request.args);
-    let invocation_context = ToolInvocationContext {
-        operation: Some(execution.reference.clone()),
-        call_id: request.call_id.clone(),
-        invoking_session_id: request.parent_session_id.clone(),
-        capabilities: request.capabilities.clone(),
-    };
-    add_parent_context_args(
-        &request.tool,
-        request.parent_session_id.take(),
-        request.tool_call_id.take(),
-        &mut args,
-    );
-    let metric_tool = metric_tool_name(context.toolset.as_ref(), &request.tool);
-    let start = Instant::now();
-    let guarantee = context
-        .toolset
-        .tools()
-        .iter()
-        .find(|spec| spec.name == request.tool)
-        .map(|spec| spec.cancellation_guarantee)
-        .unwrap_or_default();
-    let invocation = ToolInvocation {
-        tool: request.tool.clone(),
-        args,
-        context: invocation_context,
-        cancel: cancel.clone(),
-    };
-    let invocation = recovery
-        .invoke(context.toolset.as_ref(), invocation)
-        .instrument(tool_exec_span(&request.tool, parent_cx));
-    let result = execution
-        .invoke(cancel, guarantee, invocation, stopped)
-        .await;
-    context.in_flight.lock().await.remove(&request.call_id);
-    let elapsed = start.elapsed();
-    let is_ok = result.is_ok();
-    harnx_metrics::record_tool_call(metric_tool, is_ok, elapsed);
-    result
-}
-
-fn reply_result(reply: ToolReply) -> Result<Value, ToolInvokeError> {
-    reply.result.map_err(|error| match error {
-        ToolErrorPayload::Recoverable(message) => ToolInvokeError::Recoverable(message),
-        ToolErrorPayload::Fatal(message) => ToolInvokeError::Fatal(message),
-    })
-}
-
-struct RequestAttestation {
-    call_id: String,
-    tool: String,
-    capabilities: std::collections::BTreeSet<String>,
-}
-
-fn finalize_execution_context(
-    context: &ToolRequestContext,
-    request: &ToolRequest,
-    reply: &mut ToolReply,
-) {
-    finalize_execution_context_for_attestation(
-        context,
-        &RequestAttestation {
-            call_id: request.call_id.clone(),
-            tool: request.tool.clone(),
-            capabilities: request.capabilities.clone(),
-        },
-        reply,
-    );
-}
-
-fn finalize_execution_context_for_attestation(
-    context: &ToolRequestContext,
-    request: &RequestAttestation,
-    reply: &mut ToolReply,
-) {
-    let Ok(result) = &mut reply.result else {
-        return;
-    };
-    finalize_execution_context_value(
-        context.server_scope.as_str(),
-        &context.server_identity,
-        request,
-        result,
-    );
-}
-
-fn finalize_execution_context_value(
-    server_scope: &str,
-    server_identity: &str,
-    request: &RequestAttestation,
-    result: &mut Value,
-) {
-    let raw_context = take_result_execution_context(result);
-    if !request.capabilities.contains(EXECUTION_CONTEXT_NAMESPACE) {
-        return;
-    }
-    let Some(raw_context) = raw_context else {
-        return;
-    };
-    let mut observation = match serde_json::from_value::<ExecutionContextObservation>(raw_context) {
-        Ok(observation) => observation,
-        Err(error) => {
-            log::warn!(
-                "stripping malformed execution context from tool result: server={} tool={} error={error}",
-                server_identity,
-                request.tool
-            );
-            return;
-        }
-    };
-    observation.provenance = Some(ToolObservationProvenance::new(
-        server_scope,
-        server_identity,
-        request.tool.clone(),
-        request.call_id.clone(),
-    ));
-    if let Err(error) = observation.validate() {
-        log::warn!(
-            "stripping invalid execution context from tool result: server={} tool={} error={error:#}",
-            server_identity,
-            request.tool
-        );
-        return;
-    }
-    if let Ok(value) = serde_json::to_value(observation) {
-        put_result_execution_context(result, value);
-    }
-}
-
-fn add_parent_context_args(
-    tool: &str,
-    parent_session_id: Option<String>,
-    tool_call_id: Option<String>,
-    args: &mut Value,
-) {
-    let Some(args) = args.as_object_mut() else {
-        return;
-    };
-    // These are transport-owned arguments. Always discard model-supplied
-    // values before optionally replacing them with context from ToolRequest.
-    args.remove("__harnx_parent_session_id");
-    args.remove("__harnx_tool_call_id");
-    if let Some(parent_session_id) = parent_session_id.filter(|_| accepts_parent_session_id(tool)) {
-        args.insert(
-            "__harnx_parent_session_id".to_string(),
-            Value::String(parent_session_id),
-        );
-        if let Some(tool_call_id) = tool_call_id {
-            args.insert(
-                "__harnx_tool_call_id".to_string(),
-                Value::String(tool_call_id),
-            );
-        }
-    }
-}
-
-fn accepts_parent_session_id(tool: &str) -> bool {
-    // Sub-agent toolsets reserve these raw names for calls that start a child turn.
-    matches!(
-        tool,
-        SUBAGENT_SESSION_PROMPT_TOOL | SUBAGENT_SESSION_NEW_TOOL
-    )
+    serve_cached(context, &request, reply_subject, saved).await
 }
 
 async fn validate_tool_request(
@@ -689,7 +488,7 @@ async fn validate_tool_request(
         .unwrap_or_default();
     let reply_subject = harnx_nats_common::rpc::ReplyTarget::from_message(&message)?;
     let header_call_id = header_value(&message, HDR_CALL_ID);
-    let request: ToolRequest = match serde_json::from_slice(&message.payload) {
+    let mut request: ToolRequest = match serde_json::from_slice(&message.payload) {
         Ok(request) => request,
         Err(error) => {
             publish_recoverable_reply(
@@ -724,15 +523,19 @@ async fn validate_tool_request(
         .await?;
         return Ok(None);
     };
-    if let Err(error) = recovery::validate_replay(context, &request).await {
-        return publish_recoverable_reply(
-            &context.client,
-            reply_subject,
-            request.call_id,
-            format!("reject tool replay: {error:#}"),
-        )
-        .await
-        .map(|_| None);
+    let validation = async {
+        invocation_admission::prepare(context, &mut request).await?;
+        recovery::validate_replay(context, &request).await
+    }
+    .await;
+    if let Err(error) = validation {
+        let reply = ToolReply {
+            call_id: request.call_id,
+            result: Err(map_invoke_error(reply_fence::invoke_error(error))),
+        };
+        return publish_reply(&context.client, reply_subject, &reply)
+            .await
+            .map(|_| None);
     }
     Ok(Some(ValidatedToolRequest {
         reply_subject,
@@ -740,76 +543,6 @@ async fn validate_tool_request(
         idempotency_key,
         parent_cx,
     }))
-}
-
-async fn reserve_cache_entry(cache: &ReplyCache, key: &str) -> CacheReservation {
-    let mut cache = cache.lock().await;
-    remove_expired_replies(&mut cache, Instant::now());
-    if let Some(entry) = cache.get(key) {
-        return match entry {
-            ReplyCacheEntry::InProgress { reply, .. } => CacheReservation::Wait(reply.clone()),
-            ReplyCacheEntry::Complete { reply, .. } => CacheReservation::Complete(reply.clone()),
-        };
-    }
-    if cache.len() >= IDEMPOTENCY_CACHE_MAX_ENTRIES {
-        evict_oldest_completed_reply(&mut cache);
-    }
-    if cache.len() >= IDEMPOTENCY_CACHE_MAX_ENTRIES {
-        return CacheReservation::Full;
-    }
-    let (completion, reply) = watch::channel(None);
-    cache.insert(key.to_string(), ReplyCacheEntry::InProgress { reply });
-    CacheReservation::Execute(completion)
-}
-
-fn remove_expired_replies(cache: &mut HashMap<String, ReplyCacheEntry>, now: Instant) {
-    cache.retain(|_, entry| match entry {
-        ReplyCacheEntry::InProgress { .. } => true,
-        ReplyCacheEntry::Complete { created, .. } => {
-            now.duration_since(*created) < IDEMPOTENCY_CACHE_TTL
-        }
-    });
-}
-
-fn evict_oldest_completed_reply(cache: &mut HashMap<String, ReplyCacheEntry>) {
-    let oldest = cache
-        .iter()
-        .filter_map(|(key, entry)| match entry {
-            ReplyCacheEntry::Complete { created, .. } => Some((key.clone(), *created)),
-            ReplyCacheEntry::InProgress { .. } => None,
-        })
-        .min_by_key(|(_, created)| *created)
-        .map(|(key, _)| key);
-    if let Some(key) = oldest {
-        cache.remove(&key);
-    }
-}
-
-async fn wait_for_cached_reply(mut reply: watch::Receiver<Option<ToolReply>>) -> Result<ToolReply> {
-    if reply.borrow().is_none() {
-        reply
-            .changed()
-            .await
-            .context("original idempotent tool request ended without a reply")?;
-    }
-    let cached = reply.borrow().clone();
-    cached.context("original idempotent tool request ended without a reply")
-}
-
-async fn complete_cache_entry(
-    cache: &ReplyCache,
-    key: String,
-    reply: ToolReply,
-    completion: watch::Sender<Option<ToolReply>>,
-) {
-    cache.lock().await.insert(
-        key,
-        ReplyCacheEntry::Complete {
-            created: Instant::now(),
-            reply: reply.clone(),
-        },
-    );
-    let _ = completion.send(Some(reply));
 }
 
 async fn publish_recoverable_reply(
@@ -834,6 +567,7 @@ fn map_invoke_error(error: ToolInvokeError) -> ToolErrorPayload {
     match error {
         ToolInvokeError::Recoverable(message) => ToolErrorPayload::Recoverable(message),
         ToolInvokeError::Fatal(message) => ToolErrorPayload::Fatal(message),
+        ToolInvokeError::Interrupted(interrupted) => ToolErrorPayload::Interrupted(interrupted),
     }
 }
 
@@ -991,466 +725,8 @@ where
     result
 }
 
-#[derive(Clone)]
-struct McpToolsetAdapter {
-    toolset: Arc<dyn Toolset>,
-}
-
-impl ServerHandler for McpToolsetAdapter {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
-            Implementation::new(
-                format!("harnx-{}-server", self.toolset.name()),
-                env!("CARGO_PKG_VERSION"),
-            ),
-        )
-    }
-
-    async fn list_tools(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, ErrorData> {
-        let tools = self
-            .toolset
-            .tools()
-            .into_iter()
-            .map(|spec| {
-                let input_schema = match spec.input_schema {
-                    Value::Object(schema) => schema,
-                    _ => Map::new(),
-                };
-                let mut tool = Tool::new(spec.name, spec.description, input_schema).annotate(
-                    ToolAnnotations::new()
-                        .read_only(spec.read_only_hint)
-                        .idempotent(spec.idempotent_hint),
-                );
-                tool.meta = spec.meta.map(MetaObject);
-                tool
-            })
-            .collect();
-        Ok(ListToolsResult::with_all_items(tools))
-    }
-
-    async fn call_tool(
-        &self,
-        request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResponse, ErrorData> {
-        let parent_cx = harnx_telemetry::propagate::extract_context_from_mcp_meta(&context.meta);
-        let span = tool_exec_span(&request.name, parent_cx);
-        self.dispatch_call_tool(request, context)
-            .instrument(span)
-            .await
-            .map(Into::into)
-    }
-}
-
-impl McpToolsetAdapter {
-    /// The tool dispatch, which always finishes in a single step.
-    ///
-    /// `call_tool` must return `CallToolResponse`, whose other variants cover
-    /// elicitation and long-running tasks that this server does not use.
-    /// Dispatching separately keeps every arm returning a plain
-    /// `CallToolResult`.
-    ///
-    /// Tool dispatch forks: `run_toolset_main` has two mutually exclusive paths:
-    /// NATS → `invoke_uncached_tool`, and MCP stdio → this method (calls
-    /// `toolset.invoke_with_context` directly). Any cross-cutting concern (metrics, tracing, auth)
-    /// added at one seam does NOT automatically cover the other. rmcp `--http` servers
-    /// use their own `ServerHandler::call_tool`, a third seam.
-    async fn dispatch_call_tool(
-        &self,
-        request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let tool_name = request.name.clone();
-        let args = Value::Object(request.arguments.unwrap_or_default());
-        let capabilities = context
-            .meta
-            .contains_key(EXECUTION_CONTEXT_NAMESPACE)
-            .then(|| EXECUTION_CONTEXT_NAMESPACE.to_string())
-            .into_iter()
-            .collect();
-        let invocation_context = ToolInvocationContext {
-            operation: None,
-            call_id: format!("{:?}", context.id),
-            invoking_session_id: None,
-            capabilities,
-        };
-        let attestation = RequestAttestation {
-            call_id: invocation_context.call_id.clone(),
-            tool: tool_name.to_string(),
-            capabilities: invocation_context.capabilities.clone(),
-        };
-        let metric_tool = metric_tool_name(self.toolset.as_ref(), &tool_name);
-        let started = Instant::now();
-        let mut result = self
-            .toolset
-            .invoke_with_context(ToolInvocation {
-                tool: tool_name.to_string(),
-                args,
-                context: invocation_context.clone(),
-                cancel: CancellationToken::new(),
-            })
-            .await;
-        harnx_metrics::record_tool_call(metric_tool, result.is_ok(), started.elapsed());
-
-        if let Ok(value) = &mut result {
-            finalize_execution_context_value("mcp", self.toolset.name(), &attestation, value);
-        }
-        match result {
-            Ok(value) => Ok(call_tool_result_from_value(value)),
-            Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(
-                error.to_string(),
-            )])),
-        }
-    }
-}
-
-fn call_tool_result_from_value(value: Value) -> CallToolResult {
-    if let Ok(result) = serde_json::from_value::<CallToolResult>(value.clone()) {
-        return result;
-    }
-    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-    CallToolResult::success(vec![ContentBlock::text(text)])
-}
-
 #[cfg(test)]
-mod tests {
-    use opentelemetry::trace::{SpanId, SpanKind, TraceId};
-    use rmcp::model::RequestParamsMeta;
-
-    use super::*;
-
-    #[test]
-    fn parent_session_argument_only_uses_transport_context() {
-        let mut untrusted = serde_json::json!({
-            "__harnx_parent_session_id": "other-session",
-            "__harnx_tool_call_id": "model-supplied-call",
-        });
-        add_parent_context_args(SUBAGENT_SESSION_NEW_TOOL, None, None, &mut untrusted);
-        assert!(untrusted.get("__harnx_parent_session_id").is_none());
-        assert!(untrusted.get("__harnx_tool_call_id").is_none());
-
-        add_parent_context_args(
-            SUBAGENT_SESSION_NEW_TOOL,
-            Some("attested-session".to_string()),
-            None,
-            &mut untrusted,
-        );
-        assert_eq!(
-            untrusted,
-            serde_json::json!({"__harnx_parent_session_id": "attested-session"})
-        );
-    }
-
-    #[test]
-    fn mcp_adapter_preserves_serialized_call_tool_results() {
-        let value = serde_json::json!({
-            "content": [{"type": "text", "text": "hello"}],
-            "structuredContent": {"answer": 42},
-            "isError": true,
-            "_meta": {"private": "value"}
-        });
-        let result = call_tool_result_from_value(value.clone());
-        assert_eq!(serde_json::to_value(result).unwrap(), value);
-    }
-
-    #[test]
-    fn mcp_adapter_wraps_raw_json_values_as_text() {
-        let result = call_tool_result_from_value(serde_json::json!({"answer": 42}));
-        assert_eq!(result.is_error, Some(false));
-        assert_eq!(result.content.len(), 1);
-        assert!(serde_json::to_value(&result.content[0]).unwrap()["text"]
-            .as_str()
-            .unwrap()
-            .contains("\"answer\": 42"));
-    }
-
-    fn result_with_execution_context() -> Value {
-        let observation = ExecutionContextObservation::observe(
-            std::path::Path::new("/workspace"),
-            std::path::Path::new("/workspace"),
-        );
-        serde_json::json!({
-            "content": [],
-            "_meta": {EXECUTION_CONTEXT_NAMESPACE: observation}
-        })
-    }
-
-    #[test]
-    fn mcp_adapter_strips_unrequested_execution_context() {
-        let mut result = result_with_execution_context();
-        finalize_execution_context_value(
-            "mcp",
-            "bash",
-            &RequestAttestation {
-                call_id: "request-1".to_string(),
-                tool: "exec".to_string(),
-                capabilities: Default::default(),
-            },
-            &mut result,
-        );
-
-        assert!(result.get("_meta").is_none());
-    }
-
-    #[test]
-    fn mcp_adapter_attests_requested_execution_context() {
-        let mut result = result_with_execution_context();
-        finalize_execution_context_value(
-            "mcp",
-            "bash",
-            &RequestAttestation {
-                call_id: "request-1".to_string(),
-                tool: "exec".to_string(),
-                capabilities: std::collections::BTreeSet::from([
-                    EXECUTION_CONTEXT_NAMESPACE.to_string()
-                ]),
-            },
-            &mut result,
-        );
-
-        let provenance = &result["_meta"][EXECUTION_CONTEXT_NAMESPACE]["provenance"];
-        assert_eq!(provenance["server_scope"], "mcp");
-        assert_eq!(provenance["server_identity"], "bash");
-        assert_eq!(provenance["tool_name"], "exec");
-        assert_eq!(provenance["call_id"], "request-1");
-    }
-
-    const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
-    const PARENT_SPAN_ID: &str = "00f067aa0ba902b7";
-    const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-
-    fn assert_tool_exec_parent(extract_parent: impl FnOnce() -> OtelContext) {
-        let spans = harnx_telemetry::collect_test_spans(|| {
-            drop(tool_exec_span("test_tool", extract_parent()));
-        });
-        assert_eq!(spans.len(), 1);
-        let span = &spans[0];
-        assert_eq!(span.name, "tool_exec");
-        assert_eq!(span.span_kind, SpanKind::Server);
-        assert!(span.attributes.contains(&opentelemetry::KeyValue::new(
-            "harnx.tool.name",
-            "test_tool"
-        )));
-        assert_eq!(
-            span.span_context.trace_id(),
-            TraceId::from_hex(TRACE_ID).expect("fixed trace ID")
-        );
-        assert_eq!(
-            span.parent_span_id,
-            SpanId::from_hex(PARENT_SPAN_ID).expect("fixed parent span ID")
-        );
-        assert!(span.parent_span_is_remote);
-    }
-
-    #[test]
-    fn nats_tool_exec_span_continues_extracted_parent() {
-        harnx_core::require_nextest();
-        let mut headers = async_nats::HeaderMap::new();
-        headers.insert("traceparent", TRACEPARENT);
-
-        assert_tool_exec_parent(|| harnx_telemetry::propagate::extract_context_from_nats(&headers));
-    }
-
-    #[test]
-    fn mcp_tool_exec_span_continues_extracted_parent() {
-        harnx_core::require_nextest();
-        let mut params = CallToolRequestParams::new("test_tool");
-        params.set_traceparent(TRACEPARENT);
-
-        assert_tool_exec_parent(|| harnx_telemetry::propagate::extract_context_from_mcp(&params));
-    }
-
-    #[tokio::test]
-    async fn idempotency_cache_rejects_growth_past_cap() {
-        harnx_core::require_nextest();
-        let cache: ReplyCache = Arc::new(Mutex::new(HashMap::new()));
-        for index in 0..IDEMPOTENCY_CACHE_MAX_ENTRIES {
-            assert!(matches!(
-                reserve_cache_entry(&cache, &format!("key-{index}")).await,
-                CacheReservation::Execute(_)
-            ));
-        }
-        assert!(matches!(
-            reserve_cache_entry(&cache, "overflow").await,
-            CacheReservation::Full
-        ));
-        assert_eq!(cache.lock().await.len(), IDEMPOTENCY_CACHE_MAX_ENTRIES);
-    }
-
-    #[test]
-    fn parent_session_id_supports_raw_session_start_tools() {
-        for tool in ["session_prompt", "session_new"] {
-            assert!(
-                accepts_parent_session_id(tool),
-                "expected support for {tool}"
-            );
-        }
-        assert!(!accepts_parent_session_id("session_load"));
-        assert!(!accepts_parent_session_id("prompt"));
-        assert!(!accepts_parent_session_id("agent_session_prompt"));
-    }
-
-    #[test]
-    fn parent_context_args_include_parent_tool_call_id() {
-        let mut args = serde_json::json!({ "message": "delegate" });
-
-        add_parent_context_args(
-            SUBAGENT_SESSION_PROMPT_TOOL,
-            Some("parent-session".to_string()),
-            Some("parent-tool-call".to_string()),
-            &mut args,
-        );
-
-        assert_eq!(args["__harnx_parent_session_id"], "parent-session");
-        assert_eq!(args["__harnx_tool_call_id"], "parent-tool-call");
-    }
-
-    struct MetricsTestToolset;
-
-    #[async_trait::async_trait]
-    impl Toolset for MetricsTestToolset {
-        fn name(&self) -> &str {
-            "metrics-test"
-        }
-
-        fn tools(&self) -> Vec<harnx_toolset::ToolSpec> {
-            vec![harnx_toolset::ToolSpec {
-                cancellation_guarantee: Default::default(),
-                name: "known".to_owned(),
-                description: "known test tool".to_owned(),
-                input_schema: serde_json::json!({ "type": "object" }),
-                idempotent_hint: false,
-                read_only_hint: true,
-                timeout_secs: None,
-                meta: None,
-            }]
-        }
-
-        async fn invoke(
-            &self,
-            _tool: &str,
-            _args: Value,
-            _cancel: CancellationToken,
-        ) -> Result<Value, ToolInvokeError> {
-            unreachable!("metric label test does not invoke tools")
-        }
-    }
-
-    #[test]
-    fn distinct_unknown_tools_share_one_metric_series() {
-        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-
-        harnx_core::require_nextest();
-        let toolset = MetricsTestToolset;
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        metrics::with_local_recorder(&recorder, || {
-            for requested in ["attacker-tool-one", "attacker-tool-two"] {
-                harnx_metrics::record_tool_call(
-                    metric_tool_name(&toolset, requested),
-                    false,
-                    Duration::from_millis(1),
-                );
-            }
-        });
-
-        let snapshot = snapshotter.snapshot().into_vec();
-        assert_eq!(snapshot.len(), 2, "unknown names must share both series");
-        assert!(snapshot.iter().all(|(key, _, _, _)| key
-            .key()
-            .labels()
-            .any(|label| label.key() == "tool" && label.value() == "unknown")));
-        assert!(snapshot.iter().any(|(key, _, _, value)| {
-            key.key().name() == harnx_metrics::TOOL_CALLS_TOTAL && *value == DebugValue::Counter(2)
-        }));
-        assert!(snapshot.iter().any(|(key, _, _, value)| {
-            key.key().name() == harnx_metrics::TOOL_CALL_DURATION_SECONDS
-                && matches!(value, DebugValue::Histogram(samples) if samples.len() == 2)
-        }));
-    }
-
-    fn assert_success_and_error_tool_metric_snapshot() {
-        use metrics::{Key, Label};
-        use metrics_util::{
-            debugging::{DebugValue, DebuggingRecorder},
-            CompositeKey, MetricKind,
-        };
-
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let ok_elapsed = Duration::from_millis(100);
-        let error_elapsed = Duration::from_millis(50);
-        metrics::with_local_recorder(&recorder, || {
-            harnx_metrics::record_tool_call("test_tool_ok", true, ok_elapsed);
-            harnx_metrics::record_tool_call("test_tool_err", false, error_elapsed);
-        });
-
-        let key = |kind, name, labels: &[(&str, &str)]| {
-            CompositeKey::new(
-                kind,
-                Key::from_parts(
-                    name,
-                    labels
-                        .iter()
-                        .map(|(key, value)| Label::new((*key).to_owned(), (*value).to_owned()))
-                        .collect::<Vec<_>>(),
-                ),
-            )
-        };
-        assert_eq!(
-            snapshotter.snapshot().into_vec(),
-            vec![
-                (
-                    key(
-                        MetricKind::Counter,
-                        harnx_metrics::TOOL_CALLS_TOTAL,
-                        &[("tool", "test_tool_ok"), ("status", "ok")],
-                    ),
-                    None,
-                    None,
-                    DebugValue::Counter(1),
-                ),
-                (
-                    key(
-                        MetricKind::Histogram,
-                        harnx_metrics::TOOL_CALL_DURATION_SECONDS,
-                        &[("tool", "test_tool_ok")],
-                    ),
-                    None,
-                    None,
-                    DebugValue::Histogram(vec![ok_elapsed.as_secs_f64().into()]),
-                ),
-                (
-                    key(
-                        MetricKind::Counter,
-                        harnx_metrics::TOOL_CALLS_TOTAL,
-                        &[("tool", "test_tool_err"), ("status", "error")],
-                    ),
-                    None,
-                    None,
-                    DebugValue::Counter(1),
-                ),
-                (
-                    key(
-                        MetricKind::Histogram,
-                        harnx_metrics::TOOL_CALL_DURATION_SECONDS,
-                        &[("tool", "test_tool_err")],
-                    ),
-                    None,
-                    None,
-                    DebugValue::Histogram(vec![error_elapsed.as_secs_f64().into()]),
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn tool_call_metrics_recorded_on_success_and_error() {
-        harnx_core::require_nextest();
-        assert_success_and_error_tool_metric_snapshot();
-    }
-}
+#[path = "../../harnx-runtime/tests/common/mod.rs"]
+mod nats_test_common;
+#[cfg(test)]
+mod tests;

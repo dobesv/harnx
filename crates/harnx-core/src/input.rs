@@ -50,6 +50,11 @@ pub struct Input {
     /// already present in the loaded `session.messages`, so the LLM still sees
     /// them; only the redundant durable append is suppressed.
     pub skip_user_log_append: bool,
+    /// History length before this round's input was persisted. Request building
+    /// uses that prefix plus this Input, so request-only patches still reach the
+    /// model without duplicating the durable user message. Runtime-local cursor,
+    /// not execution authority; reset for a new tool round or injected message.
+    pub session_input_start: Option<usize>,
     pub preferred_assistant_message_id: Option<String>,
 }
 
@@ -78,6 +83,7 @@ impl Input {
             inject_system_prompt: true,
             injected_user_text: None,
             skip_user_log_append: false,
+            session_input_start: None,
             preferred_assistant_message_id: None,
         }
     }
@@ -146,6 +152,7 @@ impl Input {
         thought: Option<String>,
         tool_results: Vec<ToolResult>,
     ) -> Self {
+        self.session_input_start = None;
         match self.tool_calls.as_mut() {
             Some(exist_tool_results) => {
                 exist_tool_results.merge(tool_results, output, thought);
@@ -158,6 +165,7 @@ impl Input {
     }
 
     pub fn set_injected_user_text(&mut self, text: String) {
+        self.session_input_start = None;
         self.injected_user_text = Some(text);
     }
 

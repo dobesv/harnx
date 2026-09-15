@@ -6,7 +6,15 @@
 //! this module follows the remote worker's advisory event stream instead of
 //! terminating immediately with a synthetic `RUN_FINISHED`.
 
-use std::{pin::Pin, sync::Arc, time::Duration};
+mod frames;
+mod isolation;
+
+#[cfg(test)]
+#[path = "ag_ui_remote_follow/isolation_tests.rs"]
+mod isolation_tests;
+pub(crate) use frames::{event_frames, QueuedEvent};
+use isolation::RemoteGeneration;
+use std::{pin::Pin, time::Duration};
 
 use ag_ui_core::event::Event;
 use anyhow::Result;
@@ -17,10 +25,7 @@ use harnx_runtime::{
     nats_event_sink::{AdvisoryEnvelope, JetstreamContext, SessionEventStream},
     nats_lease::session_has_active_lease,
 };
-use tokio::sync::{
-    mpsc::{UnboundedReceiver, UnboundedSender},
-    Notify,
-};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_stream::{Stream, StreamExt as _};
 
 use crate::ag_ui::UsageContextSnapshot;
@@ -28,7 +33,6 @@ use crate::ag_ui::UsageContextSnapshot;
 use crate::{
     ag_ui::{frame_event, AgUiError, AgUiSink},
     ag_ui_attach::{session_attach_boundary_event, snapshot_event},
-    ag_ui_lifecycle::{frame_guarded_live_event, LiveStreamGuard},
     ag_ui_sync::{frame_run_boundary_event, history_warning_event},
     session_actor::SubscribeResult,
 };
@@ -164,8 +168,10 @@ async fn build_remote_follow_event_stream(
 ) -> Result<AgUiEventStream> {
     let client = params.config.nats_client(LOCAL_CLUSTER_KEY).await?;
     let jetstream = params.config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
-    let event_stream =
+    let mut event_stream =
         SessionEventStream::attach(jetstream.clone(), client, params.session_id).await?;
+    let generation =
+        RemoteGeneration::bind(&mut event_stream, &jetstream, params.session_id).await?;
     let started_frame = Bytes::from(frame_run_boundary_event(
         "RUN_STARTED",
         params.thread_id,
@@ -199,6 +205,7 @@ async fn build_remote_follow_event_stream(
     }
 
     Ok(build_live_follow_stream(LiveFollowParams {
+        generation,
         event_stream,
         jetstream,
         session_id: params.session_id.to_string(),
@@ -221,6 +228,7 @@ struct RemoteEventStreamParams<'a> {
 }
 
 struct LiveFollowParams {
+    generation: Option<RemoteGeneration>,
     event_stream: SessionEventStream,
     jetstream: JetstreamContext,
     session_id: String,
@@ -233,7 +241,7 @@ struct LiveFollowParams {
 }
 
 fn build_live_follow_stream(params: LiveFollowParams) -> AgUiEventStream {
-    let finished = Arc::new(Notify::new());
+    let live = params.event_stream.live_state().clone();
     let (tx, rx) = tokio::sync::mpsc::channel(FRAME_CHANNEL_SIZE);
 
     // Control-state hydration for remote-follow: emit control CUSTOM events after snapshot
@@ -248,11 +256,11 @@ fn build_live_follow_stream(params: LiveFollowParams) -> AgUiEventStream {
         .collect();
 
     spawn_follow_task(FollowTaskParams {
+        generation: params.generation,
         event_stream: params.event_stream,
         jetstream: params.jetstream,
         session_id: params.session_id,
         tx,
-        finished: finished.clone(),
         through_seq: params.through_seq,
     });
 
@@ -260,8 +268,12 @@ fn build_live_follow_stream(params: LiveFollowParams) -> AgUiEventStream {
         .into_iter()
         .chain(params.snapshot_frame)
         .chain(control_frames);
-    let event_frames = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let finished_stream = finished_event_stream(finished, params.thread_id, params.run_id);
+    let event_frames = event_frames(rx, live);
+    let finished_stream = tokio_stream::once(Bytes::from(frame_run_boundary_event(
+        "RUN_FINISHED",
+        &params.thread_id,
+        &params.run_id,
+    )));
 
     Box::pin(
         tokio_stream::iter(initial_frames)
@@ -287,48 +299,13 @@ pub(crate) fn completed_remote_stream(
     Box::pin(tokio_stream::iter(frames))
 }
 
-fn finished_event_stream(
-    finished: Arc<Notify>,
-    thread_id: String,
-    run_id: String,
-) -> impl Stream<Item = Bytes> + Send + Sync + 'static {
-    tokio_stream::once(()).then(move |_| {
-        let finished = Arc::clone(&finished);
-        let thread_id = thread_id.clone();
-        let run_id = run_id.clone();
-        async move {
-            finished.notified().await;
-            Bytes::from(frame_run_boundary_event(
-                "RUN_FINISHED",
-                &thread_id,
-                &run_id,
-            ))
-        }
-    })
-}
-
 struct FollowTaskParams {
+    generation: Option<RemoteGeneration>,
     event_stream: SessionEventStream,
     jetstream: JetstreamContext,
     session_id: String,
-    tx: tokio::sync::mpsc::Sender<Bytes>,
-    finished: Arc<Notify>,
+    tx: tokio::sync::mpsc::Sender<QueuedEvent>,
     through_seq: u64,
-}
-
-/// RAII guard that ensures `finished.notify_one()` is called on drop.
-///
-/// Essential for robust stream termination: an early-return error path that
-/// skips the notify would hang the client's SSE connection forever in a busy
-/// state. Binding this guard as the first statement in the follow task ensures
-/// every exit path (Ok, Err via `?`, or panic unwind) signals the `Notify` that
-/// gates the terminal `RUN_FINISHED` frame.
-struct NotifyOnDrop(Arc<Notify>);
-
-impl Drop for NotifyOnDrop {
-    fn drop(&mut self) {
-        self.0.notify_one();
-    }
 }
 
 fn spawn_follow_task(params: FollowTaskParams) {
@@ -340,7 +317,21 @@ fn spawn_follow_task(params: FollowTaskParams) {
 }
 
 async fn remote_follow_task(mut params: FollowTaskParams) -> Result<()> {
-    let _finished_guard = NotifyOnDrop(Arc::clone(&params.finished));
+    let generation = params.generation.take();
+    let live = params.event_stream.live_state().clone();
+    // Stop observation must stay pollable while history reads or a full output
+    // queue hold the follower. Closing the channel settles the wire lifecycle.
+    tokio::select! {
+        biased;
+        result = isolation::wait_for_stop(generation) => {
+            live.retire();
+            result
+        }
+        result = follow_remote_turn(params) => result,
+    }
+}
+
+async fn follow_remote_turn(mut params: FollowTaskParams) -> Result<()> {
     let tx_for_close = params.tx.clone();
     let mut forwarder = AdvisoryForwarder::new(params.tx);
     let mut poller = RemoteTurnPoller::new(
@@ -351,7 +342,7 @@ async fn remote_follow_task(mut params: FollowTaskParams) -> Result<()> {
     let mut lease_poll_interval = tokio::time::interval(LEASE_POLL_INTERVAL);
     lease_poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let result = loop {
+    loop {
         tokio::select! {
             envelope = params.event_stream.next() => {
                 if !forwarder
@@ -370,32 +361,23 @@ async fn remote_follow_task(mut params: FollowTaskParams) -> Result<()> {
             }
             _ = tx_for_close.closed() => break Ok(()),
         }
-    };
-
-    // NotifyOnDrop exposes the synthetic RUN_FINISHED only after every lifecycle
-    // close has entered the ordered frame channel.
-    if !forwarder.finalize().await {
-        return Ok(());
     }
-    result
 }
 
 pub(crate) struct AdvisoryForwarder {
     sink: AgUiSink,
     event_rx: UnboundedReceiver<Event>,
-    tx: tokio::sync::mpsc::Sender<Bytes>,
-    guard: LiveStreamGuard,
+    tx: tokio::sync::mpsc::Sender<QueuedEvent>,
 }
 
 impl AdvisoryForwarder {
-    pub(crate) fn new(tx: tokio::sync::mpsc::Sender<Bytes>) -> Self {
+    pub(crate) fn new(tx: tokio::sync::mpsc::Sender<QueuedEvent>) -> Self {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let message_id = ag_ui_core::types::ids::MessageId::random();
         Self {
             sink: AgUiSink::new_for_remote_follow(event_tx, message_id),
             event_rx,
             tx,
-            guard: LiveStreamGuard::default(),
         }
     }
 
@@ -412,16 +394,21 @@ impl AdvisoryForwarder {
         if !event_stream.should_render(&envelope) {
             return true;
         }
+        let Some(generation) = envelope.execution_id else {
+            return true;
+        };
         self.sink.emit(envelope.event);
-        self.drain_events().await
+        self.drain_events(&generation).await
     }
 
-    async fn drain_events(&mut self) -> bool {
+    async fn drain_events(&mut self, generation: &str) -> bool {
         while let Ok(event) = self.event_rx.try_recv() {
-            if let Some(frame) = frame_guarded_live_event(event, &mut self.guard) {
-                if self.tx.send(frame).await.is_err() {
-                    return false;
-                }
+            let queued = QueuedEvent {
+                generation: generation.into(),
+                event,
+            };
+            if self.tx.send(queued).await.is_err() {
+                return false;
             }
         }
         true
@@ -433,12 +420,7 @@ impl AdvisoryForwarder {
         event: harnx_core::event::AgentEvent,
     ) -> bool {
         self.sink.emit(event);
-        self.drain_events().await
-    }
-
-    pub(crate) async fn finalize(&mut self) -> bool {
-        let closes = self.guard.finalize_open_lifecycles();
-        closes.is_empty() || self.tx.send(closes).await.is_ok()
+        self.drain_events("test-generation").await
     }
 }
 

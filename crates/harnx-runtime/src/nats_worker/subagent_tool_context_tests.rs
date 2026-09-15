@@ -94,6 +94,7 @@ async fn create_inheriting_child(toolset: &SubagentToolset, parent_session_id: &
             args: json!({}),
             context: ToolInvocationContext {
                 operation: None,
+                execution: None,
                 call_id: "parent-delegation".to_string(),
                 invoking_session_id: Some(parent_session_id.to_string()),
                 capabilities: Default::default(),

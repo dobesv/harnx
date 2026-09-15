@@ -68,7 +68,7 @@ pub struct SessionOverrides {
 /// Runtime `.set` and `.model` commands use this representation so concurrent
 /// changes to different settings are merged by the metadata CAS loop instead
 /// of replacing an override snapshot read before another writer committed.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SessionOverrideUpdate {
     Model(Option<String>),
     Temperature(Option<f64>),
@@ -126,6 +126,8 @@ pub struct SessionMetadata {
     /// deliberately omitted from the HTTP redacted view.
     #[serde(default)]
     pub(super) worker_fence_token: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) worker_projection: Option<harnx_execution_control::CommitReceipt>,
 }
 
 impl SessionMetadata {
@@ -149,6 +151,7 @@ impl SessionMetadata {
             title: SessionTitle::default(),
             extensions,
             worker_fence_token: 0,
+            worker_projection: None,
         }
     }
 

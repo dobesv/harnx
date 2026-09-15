@@ -97,6 +97,8 @@ pub async fn execute_tool_round_with_persistence(
         pending_async_context,
     } = params;
     let dry_run = config.read().dry_run;
+    let fence = config.read().generation_fence.clone();
+    crate::execution_fence::check(fence.as_ref(), abort_signal, "tool-round-start").await?;
 
     if persistence.persist_tool_calls && !dry_run {
         config.write().append_session_tool_calls(
@@ -124,22 +126,75 @@ pub async fn execute_tool_round_with_persistence(
     .await;
     let results = match eval_tool_calls(&eval_ctx, tool_calls.clone(), abort_signal).await {
         Ok(results) => results,
-        Err(err) => {
-            if ToolApprovalInterrupt::from_error(&err).is_some() {
-                return Err(err);
-            }
-            if !dry_run {
-                persist_failed_tool_results(config, tool_calls, &eval_ctx, &err).await?;
-            }
-            return Err(err);
+        Err(error) => {
+            return fail_tool_round(
+                ToolFailure {
+                    config,
+                    calls: tool_calls,
+                    eval: &eval_ctx,
+                    abort: abort_signal,
+                    fence: fence.as_ref(),
+                },
+                error,
+            )
+            .await
         }
     };
+    commit_tool_results(fence.as_ref(), abort_signal, &results).await?;
     let results = populate_result_markdown(results, &eval_ctx);
     if !dry_run {
         let persistence = { config.write().prepare_session_tool_results(&results)? };
         persistence.persist().await;
     }
     Ok(results)
+}
+
+struct ToolFailure<'a> {
+    config: &'a GlobalConfig,
+    calls: Vec<ToolCall>,
+    eval: &'a ToolEvalContext,
+    abort: &'a harnx_core::abort::AbortSignal,
+    fence: Option<&'a crate::execution_fence::GenerationFence>,
+}
+
+async fn fail_tool_round(
+    failure: ToolFailure<'_>,
+    error: anyhow::Error,
+) -> Result<Vec<ToolResult>> {
+    if terminal_tool_interruption(failure.abort, &error) {
+        return Err(error);
+    }
+    crate::execution_fence::check(failure.fence, failure.abort, "tool-round-failure").await?;
+    if !failure.config.read().dry_run {
+        persist_failed_tool_results(failure.config, failure.calls, failure.eval, &error).await?;
+    }
+    Err(error)
+}
+
+fn terminal_tool_interruption(
+    abort: &harnx_core::abort::AbortSignal,
+    error: &anyhow::Error,
+) -> bool {
+    abort.aborted()
+        || error.is::<harnx_execution_control::Interrupted>()
+        || ToolApprovalInterrupt::from_error(error).is_some()
+}
+
+async fn commit_tool_results(
+    fence: Option<&crate::execution_fence::GenerationFence>,
+    abort: &harnx_core::abort::AbortSignal,
+    results: &[ToolResult],
+) -> Result<()> {
+    crate::execution_fence::check(fence, abort, "tool-round-results").await?;
+    if let Some(fence) = fence {
+        fence
+            .output(
+                harnx_execution_control::OutputKind::Progress,
+                serde_json::to_value(results)?,
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 async fn persist_failed_tool_results(
@@ -183,9 +238,10 @@ fn build_dispatch_hook_fn(
     let (config, session_name) = session;
     let execution = config
         .read()
-        .execution_control
+        .generation_fence
         .as_ref()
-        .map(|(_, reference)| reference.clone());
+        .map(|fence| fence.context.clone());
+    let abort = config.read().maintenance_abort.clone();
     let session_id = session_name.unwrap_or("cmd").to_string();
     let cwd = working_dir
         .map(std::path::Path::to_path_buf)
@@ -193,6 +249,7 @@ fn build_dispatch_hook_fn(
     Arc::new(move |event: HookEvent| {
         let session_id = session_id.clone();
         let execution = execution.clone();
+        let abort = abort.clone();
         let cwd = cwd.clone();
         let nats_hook_provider = nats_hook_provider.clone();
         let pending_async_context = pending_async_context.clone();
@@ -205,6 +262,7 @@ fn build_dispatch_hook_fn(
                 event,
                 provider: nats_hook_provider.as_deref(),
                 meta: HookDispatchMeta {
+                    abort,
                     execution,
                     session_id,
                     cwd,
@@ -310,6 +368,9 @@ pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> 
     );
     let (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn) = build_emit_fns(&decl_map);
     ToolEvalContext {
+        work_boundary: crate::execution_fence::tool_boundary(
+            config_snapshot.generation_fence.clone(),
+        ),
         instance_id: instance_id.clone(),
         render: Some(ToolEvalRenderContext {
             decl_map: Arc::clone(&decl_map),
@@ -945,6 +1006,7 @@ mod tests {
             make_decl_with_templates("bash_exec", None, Some("OK: {{ result.content[0].text }}")),
         );
         let eval_ctx = ToolEvalContext {
+            work_boundary: None,
             instance_id: harnx_core::instance::ServerScope::new(),
             render: Some(ToolEvalRenderContext {
                 decl_map: Arc::new(decl_map),

@@ -330,20 +330,44 @@ named `session_id` carry this key; public metadata, tool results, hooks, and
 confirmation requests retain the local ID.
 See `docs/nats-ha.md` under “Session identity”. Do not pass a local ID to by-key APIs.
 
-Append to another session's log via `NatsSessionLog::new(jetstream, storage_key)` with no
-`fence_token`. Used when a tool/client needs durable state visible to a session it doesn't
-hold the lease for (e.g. sub-agent start entries in parent log).
+Client/control code can append to another session's log via
+`NatsSessionLog::new(jetstream, storage_key)`. Worker/tool output must instead use
+`append_output` with its creation-time `GenerationFence`. A sub-agent start in the
+parent log uses the invoking tool's context, including the parent's generation-owner
+fence. Never resolve the current generation when a delayed reply arrives.
 
 The worker appends the durable `HandoffCommitted` entry **before** emitting the advisory
 `SessionEvent::HandoffCommitted` (see `agent_loop.rs:979-1001`). This guarantees a live
 handoff's sequence is strictly greater than any attach boundary captured before the commit,
 enabling clients to gate navigation on `after_seq > attached_seq`.
 
-Worker-written control entries (`HandoffCommitted`, `HitlApprovalRequested`,
-`HitlApprovalDecision`) use `FencedSessionLogSink`, which stamps the lease revision as
-`fence_token`. HITL entries additionally require stream-tail CAS because `is_held()` is not
-broker-authoritative—a stale worker can race after TTL expiry. See
-`nats_worker/backend.rs:FencedSessionLogSink` for the CAS + ownership-revalidation pattern.
+Worker appends use a generation-bound backend/`FencedSessionLogSink`. The gate commits
+exact `Transcript` output before the private projector appends it. The projector drains
+in gate order, checks durable commit IDs in stream headers, and uses stream-tail CAS;
+JetStream's finite dedup window alone is not enough. HITL retains its expected-tail
+condition and ownership revalidation at execution. `Cancel` is a restricted
+`RecordCancellation` control projection, never normal output. See
+`nats_session_log/projection.rs` and `docs/nats-ha.md` (Stage 4).
+
+### Interrupt acceptance and cleanup
+
+Tool protocol v4 separates `CancelAcceptance` from `CleanupStatus`. A root stop
+receipt, not a tool acknowledgement or process exit, establishes interruption.
+Record physical evidence with the generation-scoped gate `CleanupUpdate`; don't
+add a parallel cleanup flag or use missing metadata as shutdown confirmation.
+
+Resource owners keep cleanup handles outside turn/reply futures. A dropped
+`JoinHandle` detaches its task, and started `spawn_blocking` work can't be aborted.
+Old cleanup must retain its original generation and must not release G2's lease,
+clear G2's state or remove G2's tool-server user claim. MCP cancellation closes
+only the request waiter; never restart shared infrastructure to cancel a call.
+See `nats_worker/cleanup_supervisor.rs` and `docs/nats-ha.md` (Stages 7-8). TUI,
+one-shot and followers return on durable root acceptance. Don't reintroduce a
+cleanup/status wait or a session-current retry that can interrupt G2.
+
+Build the workspace before cross-process tests after changing gate or tool wire
+types. Those tests launch workspace sidecars as well as linked test code; a stale
+hook or tool binary can fail decoding even when a per-crate build succeeds.
 
 ### TUI transcript items are TUI-local
 

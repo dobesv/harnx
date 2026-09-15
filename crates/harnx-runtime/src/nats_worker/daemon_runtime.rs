@@ -95,6 +95,7 @@ fn agent_activation_span(
 }
 
 pub(super) struct WorkerRuntime {
+    pub(super) _cleanup: super::cleanup_supervisor::CleanupSupervisor,
     pub(super) config: GlobalConfig,
     pub(super) instance_id: harnx_core::instance::ServerScope,
     pub(super) _background_services: Arc<Mutex<Option<BackgroundServices>>>,
@@ -171,7 +172,14 @@ impl WorkerRuntime {
             return;
         }
         let to_start = reconciler
-            .claim_users(&activation.session_id, servers)
+            .claim_users(
+                &format!(
+                    "{}/{}",
+                    activation.session_id,
+                    activation.execution_id.as_deref().unwrap_or("unclaimed")
+                ),
+                servers,
+            )
             .await;
         if to_start.is_empty() {
             return;
@@ -202,9 +210,17 @@ impl WorkerRuntime {
         }
     }
 
-    pub(super) async fn end_session_tool_servers(&self, session_id: &str) {
+    pub(super) async fn end_session_tool_servers(
+        &self,
+        reference: &harnx_execution_control::OperationRef,
+    ) {
         if let Some(reconciler) = &self.server_reconciler {
-            reconciler.session_ended(session_id).await;
+            reconciler
+                .session_ended(&format!(
+                    "{}/{}",
+                    reference.session_id, reference.execution_id
+                ))
+                .await;
         }
     }
 
@@ -213,14 +229,17 @@ impl WorkerRuntime {
         activation: &SessionActivate,
     ) -> Result<Option<Arc<NatsSessionLease>>> {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst);
-        let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
-            jetstream: self.jetstream.clone(),
-            session_id: &activation.session_id,
-            worker_id: self.worker_id.clone(),
-            generation,
-            config: self.lease.clone(),
-            session_metadata: Some(self.session_metadata.clone()),
-        })
+        let lease = NatsSessionLease::acquire_for_execution(
+            NatsLeaseAcquireParams {
+                jetstream: self.jetstream.clone(),
+                session_id: &activation.session_id,
+                worker_id: self.worker_id.clone(),
+                generation,
+                config: self.lease.clone(),
+                session_metadata: Some(self.session_metadata.clone()),
+            },
+            activation.execution_id.clone(),
+        )
         .await?;
         Ok(lease.map(Arc::new))
     }
@@ -356,7 +375,8 @@ impl WorkerRuntime {
             execution,
             ..
         } = *ctx;
-        let backend = NatsSessionLogBackend::new(self.jetstream.clone(), &activation.session_id);
+        let backend = NatsSessionLogBackend::new(self.jetstream.clone(), &activation.session_id)
+            .with_execution(execution.fence.clone());
         match Self::spawn_control_listener(ControlListenerCtx {
             client: &self.client,
             jetstream: &self.jetstream,
@@ -390,7 +410,7 @@ impl WorkerRuntime {
         let control = match self.prepare_activation_control(&ctx).await {
             Ok(control) => control,
             Err(error) => {
-                self.end_session_tool_servers(&ctx.activation.session_id)
+                self.end_session_tool_servers(&ctx.execution.reference)
                     .await;
                 return Err(error);
             }
@@ -398,7 +418,7 @@ impl WorkerRuntime {
         if let Err(error) = ctx.message.ack_with(AckKind::Progress).await {
             control.task.abort();
             let _ = ctx.lease.release().await;
-            self.end_session_tool_servers(&ctx.activation.session_id)
+            self.end_session_tool_servers(&ctx.execution.reference)
                 .await;
             return Err(anyhow::anyhow!("ack SessionActivate: {error}"));
         }
@@ -406,7 +426,7 @@ impl WorkerRuntime {
     }
 
     async fn prepare_claimed_activation(
-        &self,
+        self: &Arc<Self>,
         claimed: ClaimedActivation,
         message: &async_nats::jetstream::Message,
     ) -> Result<PreparedActivation> {
@@ -447,17 +467,15 @@ impl WorkerRuntime {
                 execution: &execution,
             })
             .await?;
-        if execution
-            .store
-            .check_ancestors(&execution.reference)
-            .await
-            .is_ok()
+        if !execution.cancelled().await?
+            && execution
+                .store
+                .check_ancestors(&execution.reference)
+                .await
+                .is_ok()
         {
-            self.start_session_tool_servers(&activation).await;
-            super::daemon_background::await_initial_background_services(
-                &self.background_services_attempted,
-            )
-            .await;
+            self.prepare_session_services(&activation, &abort_signal)
+                .await;
         } else {
             abort_signal.set_ctrlc();
         }
@@ -472,7 +490,43 @@ impl WorkerRuntime {
         })
     }
 
-    async fn spawn_session_task(self: &Arc<Self>, prepared: PreparedActivation) {
+    async fn prepare_session_services(
+        self: &Arc<Self>,
+        activation: &SessionActivate,
+        abort: &crate::utils::AbortSignal,
+    ) {
+        let worker = Arc::clone(self);
+        let activation = activation.clone();
+        let stopped = abort.clone();
+        let mut startup = tokio::spawn(async move {
+            worker.start_session_tool_servers(&activation).await;
+            if stopped.aborted() {
+                if let Some(id) = &activation.execution_id {
+                    worker
+                        .end_session_tool_servers(&harnx_execution_control::OperationRef::new(
+                            &activation.session_id,
+                            id,
+                        ))
+                        .await;
+                }
+            }
+        });
+        tokio::select! {
+            _ = crate::utils::wait_abort_signal(abort) => {
+                // Keep the registration task: its final G1-only release repairs
+                // claims that arrive after logical acceptance, without touching G2.
+                harnx_execution_control::CleanupTasks::process().spawn(async move { let _ = startup.await; });
+                return;
+            }
+            _ = &mut startup => {},
+        }
+        tokio::select! {
+            _ = crate::utils::wait_abort_signal(abort) => {},
+            _ = super::daemon_background::await_initial_background_services(&self.background_services_attempted) => {},
+        }
+    }
+
+    async fn run_session_task(self: &Arc<Self>, prepared: PreparedActivation) {
         let PreparedActivation {
             activation,
             lease,
@@ -485,9 +539,10 @@ impl WorkerRuntime {
         let worker = Arc::clone(self);
         let session_id = activation.session_id.clone();
         let task_session_id = session_id.clone();
+        let cleanup_execution = execution.clone();
+        let server_reconciler = self.server_reconciler.clone();
         nats_metrics::active_session_started();
-        let handle = tokio::spawn(
-            async move {
+        async move {
                 let snapshot = nats_metrics::snapshot();
                 log::info!(
                     "active session started: session_id={} worker_id={} revision={} active_sessions_per_worker={}",
@@ -511,8 +566,12 @@ impl WorkerRuntime {
                 } else { let _ = Self::delayed_nak(&message).await; }
                 // A cooperative call may still own work. Keep its shared server
                 // alive until durable reconciliation observes the whole subtree.
-                if result.as_ref().is_ok_and(|terminal| *terminal) {
-                    worker.end_session_tool_servers(&task_session_id).await;
+                if result.as_ref().is_ok_and(|terminal| *terminal)
+                    || cleanup_execution.cancelled().await.unwrap_or(false)
+                {
+                    // G2 admission can make G1's redundant Cancel projection
+                    // fail. Its accepted stop still owns supervised claim cleanup.
+                    super::cleanup_supervisor::release_server_claim_when_clean(server_reconciler, cleanup_execution);
                 }
                 nats_metrics::active_session_finished();
                 let snapshot = nats_metrics::snapshot();
@@ -526,10 +585,7 @@ impl WorkerRuntime {
                 if let Err(error) = result {
                     log::warn!("worker session execution failed: {error:#}");
                 }
-            }
-            .instrument(span),
-        );
-        self.active.lock().await.insert(session_id, handle);
+            }.instrument(span).await;
     }
 
     pub(super) async fn handle_activation(
@@ -553,19 +609,28 @@ impl WorkerRuntime {
             return Ok(());
         };
 
-        // Core-NATS control is subscribed before this acknowledges the
-        // activation. The spawned task owns cleanup of the session's servers.
-        let prepared = self
-            .prepare_claimed_activation(
-                ClaimedActivation {
-                    activation,
-                    lease,
-                    span,
-                },
-                &message,
-            )
-            .await?;
-        self.spawn_session_task(prepared).await;
+        let worker = Arc::clone(self);
+        let session_id = activation.session_id.clone();
+        let handle = tokio::spawn(async move {
+            let prepared = worker
+                .prepare_claimed_activation(
+                    ClaimedActivation {
+                        activation,
+                        lease,
+                        span,
+                    },
+                    &message,
+                )
+                .await;
+            match prepared {
+                Ok(prepared) => worker.run_session_task(prepared).await,
+                Err(error) => {
+                    log::warn!("session preparation failed: {error:#}");
+                    let _ = Self::delayed_nak(&message).await;
+                }
+            }
+        });
+        self.active.lock().await.insert(session_id, handle);
         Ok(())
     }
 

@@ -83,7 +83,7 @@ async fn cancelling_child_progress_can_converge_to_cancelled() {
         SubAgentProgressStatus::Unconfirmed,
         SubAgentProgressStatus::Cancelled,
     ] {
-        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+        tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
             TurnEvent::SubAgentProgress(subagent_progress(&key, "active", status, 10)),
         )))
         .await

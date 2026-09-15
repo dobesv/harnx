@@ -19,6 +19,9 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+#[cfg(test)]
+#[path = "hook_cleanup_tests.rs"]
+mod cleanup_tests;
 const HOOK_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HOOKS_PER_SUPERVISOR: usize = 999;
 
@@ -163,12 +166,43 @@ impl HookServerSupervisor {
         for task in &self.tasks {
             task.abort();
         }
-        for task in std::mem::take(&mut self.tasks) {
+        // Keep each handle/registration in self until its await finishes. If a
+        // turn is aborted inside shutdown, Drop must still own the unfinished
+        // cleanup, including a partially completed registry deletion.
+        while let Some(task) = self.tasks.last_mut() {
             let _ = task.await;
+            self.tasks.pop();
         }
-        for server in std::mem::take(&mut self.registrations) {
-            remove_registration_and_expectation(&self.client, &self.instance_id, &server).await;
+        while let Some(server) = self.registrations.last() {
+            remove_registration_and_expectation(&self.client, &self.instance_id, server).await;
+            self.registrations.pop();
         }
+    }
+}
+
+impl Drop for HookServerSupervisor {
+    fn drop(&mut self) {
+        let tasks = std::mem::take(&mut self.tasks);
+        let registrations = std::mem::take(&mut self.registrations);
+        if tasks.is_empty() && registrations.is_empty() {
+            return;
+        }
+        let client = self.client.clone();
+        let instance_id = self.instance_id.clone();
+        let manager = self._process_manager.clone();
+        // Names are generated per supervisor. Old cleanup cannot deregister G2.
+        harnx_execution_control::CleanupTasks::process().spawn(async move {
+            for task in &tasks {
+                task.abort();
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
+            for server in registrations {
+                remove_registration_and_expectation(&client, &instance_id, &server).await;
+            }
+            drop(manager);
+        });
     }
 }
 

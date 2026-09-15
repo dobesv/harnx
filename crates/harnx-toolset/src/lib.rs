@@ -35,12 +35,9 @@ pub enum CancellationGuarantee {
     Cooperative,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CancellationAcknowledgement {
-    pub operation_id: String,
-    pub cancellation_id: String,
-    pub stopped: bool,
-}
+mod cancellation;
+pub use cancellation::*;
+pub mod cleanup;
 
 /// Schema and execution hints for one tool.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,12 +122,14 @@ impl ToolSpec {
 pub enum ToolInvokeError {
     Recoverable(String),
     Fatal(String),
+    Interrupted(Box<harnx_execution_control::Interrupted>),
 }
 
 impl fmt::Display for ToolInvokeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Recoverable(message) | Self::Fatal(message) => message.fmt(f),
+            Self::Interrupted(interrupted) => interrupted.fmt(f),
         }
     }
 }
@@ -145,6 +144,7 @@ impl std::error::Error for ToolInvokeError {}
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ToolInvocationContext {
     pub operation: Option<harnx_execution_control::OperationRef>,
+    pub execution: Option<harnx_execution_control::ExecutionContext>,
     pub call_id: String,
     pub invoking_session_id: Option<String>,
     pub capabilities: BTreeSet<String>,
@@ -206,6 +206,12 @@ pub trait Toolset: Send + Sync {
 /// Request body for one tool invocation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRequest {
+    /// Original producer and receiving generation, captured before dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ToolExecution>,
+    /// New attempt identity, attested at replay creation. Original execution is retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_execution: Option<ToolExecution>,
     /// A replay is attested by the current parent execution owner. It preserves
     /// call_id/operation_id and never silently falls through to normal invoke.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -224,6 +230,13 @@ pub struct ToolRequest {
     pub capabilities: BTreeSet<String>,
 }
 
+/// Authority carried by an invocation, not inferred when its result arrives.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExecution {
+    pub producer: harnx_execution_control::ExecutionContext,
+    pub consumer: harnx_execution_control::ExecutionContext,
+}
+
 /// Raw tool name for creating a sub-agent session.
 pub const SUBAGENT_SESSION_NEW_TOOL: &str = "session_new";
 /// Raw tool name for prompting a sub-agent session.
@@ -239,6 +252,7 @@ pub const SUBAGENT_SESSION_CANCEL_TOOL: &str = "session_cancel";
 pub enum ToolErrorPayload {
     Recoverable(String),
     Fatal(String),
+    Interrupted(Box<harnx_execution_control::Interrupted>),
 }
 
 /// Reply body for one tool invocation.
@@ -246,22 +260,6 @@ pub enum ToolErrorPayload {
 pub struct ToolReply {
     pub call_id: String,
     pub result: Result<Value, ToolErrorPayload>,
-}
-
-/// Per-instance control message.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ControlMessage {
-    pub operation_id: String,
-    pub cancellation_id: String,
-    pub call_id: String,
-    pub kind: ControlKind,
-}
-
-/// Kind discriminator for a [`ControlMessage`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ControlKind {
-    Cancel,
 }
 
 /// Progress update published on the per-instance control subject.
@@ -330,6 +328,21 @@ mod tests {
         let encoded = serde_json::to_vec(&value).expect("serialize wire type");
         let decoded: T = serde_json::from_slice(&encoded).expect("deserialize wire type");
         assert_eq!(decoded, value);
+    }
+
+    fn test_execution() -> harnx_execution_control::ExecutionContext {
+        use harnx_execution_control::{ExecutionContext, OperationRef, Owner};
+        let generation = OperationRef::new("test", "g1");
+        let owner = Owner {
+            instance_id: "worker".into(),
+            fence: 1,
+        };
+        ExecutionContext::new(
+            generation.clone(),
+            generation,
+            OperationRef::new("test", "call-1"),
+            (owner.clone(), owner),
+        )
     }
 
     fn tool_spec() -> ToolSpec {
@@ -413,9 +426,50 @@ mod tests {
     }
 
     #[test]
+    fn v4_acceptance_and_cleanup_are_independent_wire_fields() {
+        use harnx_execution_control::{CleanupStatus, StopReceipt};
+        let execution = test_execution();
+        let stop: StopReceipt = serde_json::from_value(json!({
+            "scope": execution.operation(),
+            "decision": {"cancellation_id": "stop", "accepted_at": "2026-09-14T00:00:00Z", "reason": "interrupt"},
+            "commit": {"gate_root": execution.gate_root(), "commit_id": "01980000-0000-7000-8000-000000000001", "sequence": 1}
+        })).unwrap();
+        let control = ControlMessage::cancel(execution, "test".into(), "stop".into());
+        for (acceptance, tag) in [
+            (CancelAcceptance::Accepted { stop }, "accepted"),
+            (CancelAcceptance::AlreadyFinished, "already_finished"),
+            (
+                CancelAcceptance::Rejected {
+                    reason: "wrong generation".into(),
+                },
+                "rejected",
+            ),
+            (
+                CancelAcceptance::Unknown {
+                    reason: "lost acknowledgement".into(),
+                },
+                "unknown",
+            ),
+        ] {
+            let ack = control.acknowledgement(
+                acceptance,
+                Some(CleanupStatus::unconfirmed("owner unreachable")),
+            );
+            let wire = serde_json::to_value(&ack).unwrap();
+            assert_eq!(wire["protocol_version"], 4);
+            assert_eq!(wire["acceptance"]["kind"], tag);
+            assert_eq!(wire["cleanup"]["state"], "unconfirmed");
+            assert!(wire.get("stopped").is_none());
+            assert_round_trip(ack);
+        }
+    }
+
+    #[test]
     fn wire_types_round_trip_through_serde() {
         assert_round_trip(tool_spec());
         assert_round_trip(ToolRequest {
+            execution: None,
+            replay_execution: None,
             replay: None,
             operation_id: "call-1".to_string(),
             call_id: "call-1".to_string(),
@@ -436,6 +490,9 @@ mod tests {
             )),
         });
         assert_round_trip(ControlMessage {
+            execution: test_execution(),
+            protocol_version: TOOL_PROTOCOL_VERSION,
+            server: "test".into(),
             operation_id: "call-1".to_string(),
             cancellation_id: "cancel-test".into(),
             call_id: "call-1".to_string(),
@@ -487,6 +544,9 @@ mod tests {
     #[test]
     fn control_subject_messages_are_tagged_by_kind() {
         let cancel = serde_json::to_value(ControlMessage {
+            execution: test_execution(),
+            protocol_version: TOOL_PROTOCOL_VERSION,
+            server: "test".into(),
             operation_id: "call-1".to_string(),
             cancellation_id: "cancel-test".into(),
             call_id: "call-1".to_string(),

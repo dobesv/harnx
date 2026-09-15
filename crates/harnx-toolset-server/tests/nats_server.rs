@@ -28,6 +28,8 @@ async fn assert_registration(harness: &TestHarness) -> Result<()> {
 async fn assert_idempotent_replay(harness: &TestHarness) -> Result<()> {
     let invocations_before = harness.toolset.echo_invocations.load(Ordering::SeqCst);
     let request = ToolRequest {
+        execution: None,
+        replay_execution: None,
         replay: None,
         operation_id: "call-echo".to_string(),
         call_id: "call-echo".to_string(),
@@ -61,6 +63,8 @@ async fn assert_idempotent_replay(harness: &TestHarness) -> Result<()> {
 
 async fn assert_invocation_context(harness: &TestHarness) -> Result<()> {
     let request = ToolRequest {
+        execution: None,
+        replay_execution: None,
         replay: None,
         operation_id: "call-invocation-context".to_string(),
         call_id: "call-invocation-context".to_string(),
@@ -78,9 +82,12 @@ async fn assert_invocation_context(harness: &TestHarness) -> Result<()> {
             serde_json::to_vec(&request)?.into(),
         )
         .await?;
+    let captured = harness.toolset.last_context.lock().await.clone().unwrap();
+    assert!(captured.execution.is_some());
     assert_eq!(
-        harness.toolset.last_context.lock().await.as_ref(),
+        Some(&captured),
         Some(&harnx_toolset::ToolInvocationContext {
+            execution: captured.execution.clone(),
             operation: Some(harnx_execution_control::OperationRef::new(
                 "session-123",
                 &request.operation_id
@@ -103,6 +110,8 @@ async fn assert_execution_context_capability_is_per_request(harness: &TestHarnes
         }
     });
     let opted_in = ToolRequest {
+        execution: None,
+        replay_execution: None,
         replay: None,
         operation_id: "call-context-enabled".to_string(),
         call_id: "call-context-enabled".to_string(),
@@ -127,6 +136,8 @@ async fn assert_execution_context_capability_is_per_request(harness: &TestHarnes
     assert_eq!(provenance["call_id"], opted_in.call_id);
 
     let opted_out = ToolRequest {
+        execution: None,
+        replay_execution: None,
         replay: None,
         operation_id: "call-context-disabled".to_string(),
         call_id: "call-context-disabled".to_string(),
@@ -157,6 +168,8 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
     let invocations_before = harness.toolset.echo_invocations.load(Ordering::SeqCst);
     let args = json!({ "value": 43, "delay_ms": 100 });
     let first = ToolRequest {
+        execution: None,
+        replay_execution: None,
         replay: None,
         operation_id: "call-concurrent-a".to_string(),
         call_id: "call-concurrent-a".to_string(),
@@ -167,6 +180,8 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
         capabilities: Default::default(),
     };
     let second = ToolRequest {
+        execution: None,
+        replay_execution: None,
         replay: None,
         operation_id: "call-concurrent-b".to_string(),
         call_id: "call-concurrent-b".to_string(),
@@ -197,8 +212,8 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
     }
     assert_eq!(
         harness.toolset.echo_invocations.load(Ordering::SeqCst),
-        invocations_before + 1,
-        "concurrent duplicate must execute once"
+        invocations_before + 2,
+        "different call identities must not share authorization or payload"
     );
     Ok(())
 }
@@ -238,6 +253,8 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
     )
     .await?;
     let mismatched = ToolRequest {
+        execution: None,
+        replay_execution: None,
         replay: None,
         operation_id: "payload-call".to_string(),
         call_id: "payload-call".to_string(),
@@ -255,6 +272,8 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
     )
     .await?;
     let missing_key = ToolRequest {
+        execution: None,
+        replay_execution: None,
         replay: None,
         operation_id: "call-missing-key".to_string(),
         call_id: "call-missing-key".to_string(),
@@ -277,6 +296,8 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
 
 async fn assert_cancellation(harness: &TestHarness) -> Result<()> {
     let request = ToolRequest {
+        execution: None,
+        replay_execution: None,
         replay: None,
         operation_id: "call-slow".to_string(),
         call_id: "call-slow".to_string(),
@@ -297,6 +318,18 @@ async fn assert_cancellation(harness: &TestHarness) -> Result<()> {
         result = &mut slow_request => anyhow::bail!("slow request completed before cancellation: {result:?}"),
     }
     let control = ControlMessage {
+        protocol_version: harnx_toolset::TOOL_PROTOCOL_VERSION,
+        execution: harness
+            .toolset
+            .last_context
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .execution
+            .clone()
+            .unwrap(),
+        server: "____test".into(),
         operation_id: request.call_id.clone(),
         cancellation_id: "cancel-test".into(),
         call_id: request.call_id.clone(),
@@ -315,7 +348,7 @@ async fn assert_cancellation(harness: &TestHarness) -> Result<()> {
     let reply: ToolReply = serde_json::from_slice(&message.payload)?;
     assert!(matches!(
         reply.result,
-        Err(harnx_toolset::ToolErrorPayload::Fatal(_))
+        Err(harnx_toolset::ToolErrorPayload::Interrupted(_))
     ));
     Ok(())
 }
@@ -504,6 +537,8 @@ async fn shutdown_drains_in_flight_requests_before_deregistering() -> Result<()>
     assert_registration(&harness).await?;
 
     let request = ToolRequest {
+        execution: None,
+        replay_execution: None,
         replay: None,
         operation_id: "call-drain".to_string(),
         call_id: "call-drain".to_string(),

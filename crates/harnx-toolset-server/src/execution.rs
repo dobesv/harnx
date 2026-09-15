@@ -1,26 +1,31 @@
-//! An invocation retains ownership until its future and registered children stop.
-use anyhow::{ensure, Context, Result};
+//! The owner task outlives its reply. Acceptance never waits for handler cleanup.
+use anyhow::{ensure, Result};
 use futures_util::StreamExt;
-use harnx_execution_control::{ExecutionStore, Operation, OperationKind, OperationRef, Owner};
+use harnx_execution_control::{
+    ExecutionContext, ExecutionStore, InterruptScope, Interrupted, OperationRef, Owner,
+};
 use harnx_toolset::{CancellationGuarantee, ToolInvokeError, ToolRequest};
 use serde_json::Value;
 use std::{future::Future, time::Duration};
-use tokio::sync::watch;
+use tokio::sync::oneshot;
+
+#[cfg(test)]
+#[path = "execution_tests.rs"]
+mod tests;
 use tokio_util::sync::CancellationToken;
 
-const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+const CLEANUP_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub(super) struct ActiveCall {
-    pub reference: OperationRef,
+    pub producer: ExecutionContext,
     pub cancel: CancellationToken,
-    pub stopped: watch::Receiver<bool>,
 }
 
 pub(super) struct InvocationExecution {
     store: ExecutionStore,
     pub reference: OperationRef,
-    owner: Owner,
+    pub producer: ExecutionContext,
     watch: harnx_nats_common::recovery::KvUpdates,
 }
 
@@ -39,161 +44,165 @@ impl InvocationExecution {
             .as_deref()
             .unwrap_or(&request.call_id);
         let reference = OperationRef::new(session, &request.operation_id);
-        if store.get(&reference).await?.is_none() {
-            // Standalone tool clients have no worker execution. A worker's calls
-            // must already be registered: never attach a late call to a new turn.
-            ensure!(
-                store.current(session).await?.is_none(),
-                "tool operation was not registered by its execution owner"
-            );
-            store
-                .create(&Operation::preparing(
-                    reference.clone(),
-                    OperationKind::Tool,
-                    None,
-                ))
-                .await?;
-        }
-        let owner = Owner::invocation(server);
+        let producer = crate::reply_fence::claim_producer(store, request, server).await?;
+        let owner = producer.owner().clone();
         match &request.replay {
             Some(parent_owner) => {
-                store
-                    .claim_replay(&reference, parent_owner, owner.clone())
-                    .await?;
+                store.claim_replay(&reference, parent_owner, owner).await?;
             }
             None => {
-                store.claim(&reference, owner.clone()).await?;
+                store.claim(&reference, owner).await?;
             }
         }
+        crate::reply_fence::admit_producer(store, request, &producer).await?;
         let watch = store.watch().await?;
         Ok(Self {
             store: store.clone(),
             reference,
-            owner,
+            producer,
             watch,
         })
     }
 
-    async fn begin_cancel(&mut self, cancel: &CancellationToken) -> Result<()> {
-        // Signal first: broker latency must not delay local cooperative cleanup.
-        cancel.cancel();
-        self.store
-            .cancel_operation(&self.reference, None, false)
-            .await?;
-        self.store.quiesce(&self.reference, &self.owner).await?;
-        Ok(())
+    async fn interruption(&mut self) -> Result<Value, ToolInvokeError> {
+        let acceptance = async {
+            if let Some(stop) = self
+                .store
+                .gate_stop(self.producer.gate_root(), &self.reference)
+                .await?
+            {
+                return Ok(stop);
+            }
+            self.store
+                .interrupt(
+                    &InterruptScope {
+                        gate_root: self.producer.gate_root().clone(),
+                        operation: self.reference.clone(),
+                        reason: "tool invocation cancelled".into(),
+                    },
+                    &uuid::Uuid::now_v7().to_string(),
+                )
+                .await
+        };
+        match tokio::time::timeout(Duration::from_secs(2), acceptance).await {
+            Ok(Ok(stop)) => Err(ToolInvokeError::Interrupted(Box::new(Interrupted { stop }))),
+            result => Err(ToolInvokeError::Fatal(format!(
+                "tool interrupted; stop acceptance unknown: {result:?}"
+            ))),
+        }
     }
 
+    /// Called only in the server-lifetime CleanupTasks set. It owns the future,
+    /// while the request path owns only a oneshot receiver.
     pub async fn invoke(
         mut self,
         cancel: CancellationToken,
         guarantee: CancellationGuarantee,
         future: impl Future<Output = Result<Value, ToolInvokeError>>,
-        stopped: watch::Sender<bool>,
-    ) -> Result<Value, ToolInvokeError> {
-        let result = self.run(&cancel, guarantee, future).await;
-        // A child can lose its lease without recording owner_stopped. Waiting
-        // forever here used to hide even an already-produced error/answer from
-        // the caller. Bound confirmation, while retaining the durable blocker
-        // and withholding the stopped acknowledgement when cleanup is unknown.
-        let completion = self.finish().await;
-        completion.map_err(|error| {
-            let detail = match &result {
-                Err(original) => format!("; invocation error: {original}"),
-                Ok(_) => {
-                    "; invocation returned a result but descendant shutdown could not be confirmed"
-                        .to_string()
-                }
-            };
-            ToolInvokeError::Fatal(format!("tool shutdown unconfirmed: {error:#}{detail}"))
-        })?;
-        stopped.send_replace(true);
-        result
+        reply: oneshot::Sender<Result<Value, ToolInvokeError>>,
+    ) {
+        let cleanup = harnx_toolset::cleanup::InvocationCleanup::default();
+        let mut future =
+            Box::pin(harnx_toolset::cleanup::INVOCATION_CLEANUP.scope(cleanup.clone(), future));
+        let mut started = false;
+        let result = {
+            let mut observed = Box::pin(std::future::poll_fn(|cx| {
+                started = true;
+                future.as_mut().poll(cx)
+            }));
+            self.run(&cancel, observed.as_mut()).await
+        };
+        let interrupted = result.is_none();
+        let result = match result {
+            Some(result) => result,
+            None => self.interruption().await,
+        };
+        let _ = reply.send(result);
+        if interrupted {
+            // Project bookkeeping after sending the logical outcome. The gate
+            // stop already fences replies, admissions and descendants.
+            let _ = self
+                .store
+                .cancel_operation(&self.reference, None, false)
+                .await;
+            // Retain work already started, but never start an unpolled handler
+            // merely to clean it up after acceptance.
+            if started && guarantee == CancellationGuarantee::Cooperative {
+                self.drain_handler(future.as_mut()).await;
+            }
+        }
+        drop(future);
+        self.finish_owner(cleanup.last_error()).await;
     }
 
-    async fn run(
+    async fn run<F>(
         &mut self,
         cancel: &CancellationToken,
-        guarantee: CancellationGuarantee,
-        future: impl Future<Output = Result<Value, ToolInvokeError>>,
-    ) -> Result<Value, ToolInvokeError> {
+        mut future: std::pin::Pin<&mut F>,
+    ) -> Option<Result<Value, ToolInvokeError>>
+    where
+        F: Future<Output = Result<Value, ToolInvokeError>>,
+    {
         if self.store.check_ancestors(&self.reference).await.is_err() {
-            self.begin_cancel(cancel).await.map_err(control_error)?;
-            return Err(ToolInvokeError::Recoverable(
-                "tool cancelled before activation".into(),
-            ));
+            cancel.cancel();
         }
-        tokio::pin!(future);
-        let mut cancelling = false;
-        let mut progress = tokio::time::interval(Duration::from_millis(100));
         loop {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled(), if !cancelling => {
-                    if let Err(error) = self.begin_cancel(cancel).await {
-                        log::warn!("cannot persist tool cancellation: {error:#}");
-                    }
-                    cancelling = true;
-                    if guarantee == CancellationGuarantee::HardOnDrop {
-                        return Err(ToolInvokeError::Recoverable("tool cancelled".into()));
-                    }
-                }
-                result = &mut future => return result,
-                update = self.watch.next(), if !cancelling => {
+                _ = cancel.cancelled() => return None,
+                result = &mut future => return Some(result),
+                update = self.watch.next() => {
                     if !matches!(update, Some(Ok(_))) || self.store.check_ancestors(&self.reference).await.is_err() {
                         cancel.cancel();
                     }
                 }
-                _ = progress.tick(), if cancelling => {
-                    // A stubborn cooperative future stays alive; its durable
-                    // blocker becomes static after five seconds and may recover.
-                    if let Err(error) = self.store.status(&self.reference).await {
-                        log::warn!("cannot reconcile cancelling tool: {error:#}");
-                    }
-                }
             }
         }
     }
 
-    async fn finish(&mut self) -> Result<()> {
-        let operation = self
-            .store
-            .owner_stopped(&self.reference, &self.owner)
-            .await?;
-        if operation.state.is_terminal() {
-            return Ok(());
-        }
-        tokio::time::timeout(COMPLETION_TIMEOUT, self.wait_for_children())
+    async fn drain_handler<F>(&mut self, mut future: std::pin::Pin<&mut F>)
+    where
+        F: Future<Output = Result<Value, ToolInvokeError>>,
+    {
+        if tokio::time::timeout(CLEANUP_BUDGET, &mut future)
             .await
-            .context("timed out waiting for registered children to stop")?
+            .is_err()
+        {
+            let _ = self
+                .store
+                .unconfirm_cleanup_owner(
+                    &self.producer,
+                    "tool handler has not stopped within cleanup budget".into(),
+                )
+                .await;
+            // Retain and poll a cooperative future, even forever. Dropping a
+            // JoinHandle would detach it; aborting spawn_blocking cannot stop it.
+            let _ = future.await;
+        }
     }
 
-    async fn wait_for_children(&mut self) -> Result<()> {
-        // A completed invocation may still be waiting for its child's lease
-        // release. Normal cleanup must not turn that success into cancellation.
+    async fn finish_owner(&mut self, unconfirmed: Option<String>) {
+        let mut backoff = Duration::from_millis(100);
         loop {
-            let operation = self.store.status(&self.reference).await?;
-            if operation.state.is_terminal() {
-                return Ok(());
+            let result = match &unconfirmed {
+                Some(reason) => {
+                    self.store
+                        .unconfirm_cleanup_owner(&self.producer, reason.clone())
+                        .await
+                }
+                None => self.store.finish_cleanup_owner(&self.producer).await,
+            };
+            match result {
+                Ok(()) => return,
+                Err(error) => log::warn!("tool cleanup evidence not recorded; retrying: {error:#}"),
             }
-            ensure!(
-                operation.state != harnx_execution_control::OperationState::Unconfirmed,
-                "{}",
-                operation
-                    .blocker
-                    .context("registered child has not stopped")?
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
         }
     }
 }
 
-fn control_error(error: anyhow::Error) -> ToolInvokeError {
-    ToolInvokeError::Fatal(format!("tool execution control failed: {error:#}"))
-}
-
-/// Cached replies and rejected calls own no new invocation work. Reconcile a
-/// separately registered alias only after the original cached future returned.
+/// Rejected calls own no new invocation work. Never take over an existing owner.
 pub(super) async fn complete_without_invocation(
     context: &super::ToolRequestContext,
     request: &ToolRequest,

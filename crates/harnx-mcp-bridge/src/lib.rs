@@ -484,6 +484,9 @@ impl Toolset for BridgeToolset {
             .await
             .map_err(|err| match err {
                 ServiceError::TransportClosed | ServiceError::TransportSend(_) => {
+                    harnx_toolset::cleanup::unconfirmed(
+                        "MCP transport lost; remote operation shutdown unconfirmed",
+                    );
                     ToolInvokeError::Fatal(format!(
                         "MCP server '{}' exited during call",
                         self.server_name
@@ -500,32 +503,26 @@ impl BridgeToolset {
         params: CallToolRequestParams,
         cancel: CancellationToken,
     ) -> Result<Value, ServiceError> {
-        use rmcp::model::{CallToolRequest, ClientRequest, CustomNotification, ServerResult};
-        let request = self
+        use rmcp::model::{CallToolRequest, ClientRequest, ServerResult};
+        let mut request = self
             .peer
             .send_cancellable_request(
                 ClientRequest::CallToolRequest(CallToolRequest::new(params)),
                 rmcp::service::PeerRequestOptions::no_options(),
             )
             .await?;
-        let request_id = request.id.clone();
-        let response = request.await_response();
-        tokio::pin!(response);
         let result = tokio::select! {
-            result = &mut response => result?,
+            biased;
             _ = cancel.cancelled() => {
-                // RMCP's typed CancelledNotification removes the local response
-                // waiter as soon as the notification is sent. That is not a
-                // shutdown acknowledgement. Send the same wire notification
-                // through its raw variant to retain the actual server response.
-                let notification = CustomNotification::new("notifications/cancelled", Some(serde_json::json!({
-                    "requestId": request_id, "reason": "invocation cancelled",
-                })));
-                let _ = self.peer.send_notification(notification.into()).await;
-                // A notification is only a request. Retain the response future:
-                // an unresponsive shared server must remain an explicit blocker.
-                response.await?
+                harnx_toolset::cleanup::unconfirmed("MCP cancellation notified best-effort; remote shutdown not confirmed");
+                // Close this receiver first. Typed cancellation unregisters RMCP's
+                // request waiter; a late response cannot affect any other call.
+                // Sending the notification is not a remote shutdown receipt.
+                request.rx.close();
+                let _ = tokio::time::timeout(Duration::from_millis(250), request.cancel(Some("invocation cancelled".into()))).await;
+                return Err(ServiceError::Cancelled { reason: Some("invocation cancelled".into()) });
             }
+            result = &mut request.rx => result.map_err(|_| ServiceError::TransportClosed)??,
         };
         match result {
             ServerResult::CallToolResult(result) => {

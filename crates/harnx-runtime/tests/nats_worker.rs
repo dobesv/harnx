@@ -2,9 +2,15 @@
 //!
 //! Validates end-to-end persistence of a full turn via NatsSessionLog.
 
+#[path = "common/admitted_log.rs"]
+mod admitted_log;
 #[path = "nats_worker/cancellation.rs"]
 mod cancellation;
 mod common;
+use admitted_log::AdmittedSessionLog as NatsSessionLog;
+#[allow(dead_code)]
+#[path = "common/generation.rs"]
+mod generation;
 #[path = "nats_worker/multi_round_resume.rs"]
 mod multi_round_resume;
 #[path = "nats_worker/session_completion.rs"]
@@ -27,7 +33,6 @@ use harnx_runtime::{
     client::CompletionTokenUsage,
     config::{Config, NatsServerConfig},
     nats_lease::{lease_holder_in, open_lease_bucket, NatsLeaseConfig},
-    nats_session_log::NatsSessionLog,
     nats_session_metadata::{
         SessionInitializer, SessionMetadata, SessionMetadataStore, SessionOverrides,
     },
@@ -63,7 +68,7 @@ static RETRACTED_ORPHAN_ACTIVATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 use parking_lot::RwLock;
 use serde_json::json;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
@@ -348,18 +353,15 @@ async fn spawn_worker_daemon_with_call_fn(
 
 fn abort_blocked_call_fn(
     entered: Arc<Notify>,
-    saw_abort: Arc<AtomicBool>,
+    model_dropped: tokio_util::sync::CancellationToken,
 ) -> harnx_runtime::agent_loop::AgentCallFn {
-    Arc::new(move |_input, _config, abort| {
+    Arc::new(move |_input, _config, _abort| {
         let entered = Arc::clone(&entered);
-        let saw_abort = Arc::clone(&saw_abort);
+        let model_dropped = model_dropped.clone();
         Box::pin(async move {
+            let _drop = model_dropped.drop_guard();
             entered.notify_one();
-            harnx_core::abort::wait_abort_signal(&abort).await;
-            saw_abort.store(true, Ordering::SeqCst);
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
+            std::future::pending().await
         })
     })
 }
@@ -1255,7 +1257,17 @@ async fn fenced_sink_rejects_append_when_lease_lost() -> Result<()> {
         .expect("acquire"),
     );
 
-    let backend = NatsSessionLogBackend::new(js.clone(), storage_key(session_id));
+    let fence = generation::generation_fence(
+        &js,
+        &storage_key(session_id),
+        harnx_execution_control::Owner {
+            instance_id: lease.worker_id().into(),
+            fence: lease.fence_token(),
+        },
+    )
+    .await?;
+    let backend =
+        NatsSessionLogBackend::new(js.clone(), storage_key(session_id)).with_execution(Some(fence));
     let sink = FencedSessionLogSink::new(backend, Arc::clone(&lease));
 
     // Held lease: an assistant append succeeds and is fence-stamped.
@@ -1351,7 +1363,6 @@ fn assert_resume_fenced(result: Result<()>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
-    use harnx_runtime::nats_session_log::NatsSessionLog;
     use harnx_runtime::nats_worker::run_agent_loop_with_nats_inner;
     let Some(server) = require_nats_server().await? else {
         return Ok(());
@@ -1399,7 +1410,6 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
 /// instead of a stale tail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn after_seq_observer_advances_and_consistent_read_honors_it() -> Result<()> {
-    use harnx_runtime::nats_worker::NatsSessionLogBackend;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     let Some(server) = require_nats_server().await? else {
@@ -1409,7 +1419,8 @@ async fn after_seq_observer_advances_and_consistent_read_honors_it() -> Result<(
     let session_id = "ryw-observer";
 
     let observer = Arc::new(AtomicU64::new(0));
-    let backend = NatsSessionLogBackend::new(js.clone(), storage_key(session_id))
+    let backend = generation::output_backend(&js, &storage_key(session_id))
+        .await?
         .with_after_seq_observer(Arc::clone(&observer));
 
     // Append two entries; the observer must advance to the durable ack seq of
@@ -1598,7 +1609,7 @@ async fn rewind_truncates_worker_visible_tail_before_activation() -> Result<()> 
 
     assert_single_prompt(&prompts, "first prompt").await;
 
-    let entries = log.load_events_async().await?;
+    let entries = wait_for_turn_end(&log).await?;
     let assistant_texts = final_assistant_texts(&entries);
     assert_single_assistant_contains(&entries, "first prompt");
     assert!(
@@ -1795,22 +1806,27 @@ fn injection_decision_points_use_leader_authoritative_read() {
     // split across the daemon_* siblings it was extracted into (turn-input
     // derivation and session execution), so check the whole family rather
     // than one file that no longer contains all three decision points.
-    let daemon_family = ["daemon", "daemon_turn_input", "daemon_session_exec"]
-        .iter()
-        .map(|name| {
-            std::fs::read_to_string(manifest_dir.join(format!("src/nats_worker/{name}.rs")))
-                .unwrap_or_else(|error| panic!("{name}.rs must be readable: {error}"))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let daemon_family = [
+        "daemon",
+        "daemon_turn_input",
+        "daemon_session_exec",
+        "session_turn",
+    ]
+    .iter()
+    .map(|name| {
+        std::fs::read_to_string(manifest_dir.join(format!("src/nats_worker/{name}.rs")))
+            .unwrap_or_else(|error| panic!("{name}.rs must be readable: {error}"))
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
 
     assert_eq!(
         daemon_family
             .lines()
             .filter(|line| line.contains("load_events_latest_async()"))
             .count(),
-        5,
-        "turn decisions and failure coverage must use leader-authoritative reads"
+        4,
+        "turn decisions use leader reads; failure coverage uses its exact committed Error sequence"
     );
     assert_eq!(
         daemon_family
@@ -1870,7 +1886,7 @@ async fn retracted_user_message_is_not_executed_by_worker() -> Result<()> {
     assert_single_prompt(&prompts, "hello world").await;
 
     // Verify the durable log: no assistant turn for the retracted message.
-    let entries = log.load_events_async().await?;
+    let entries = wait_for_turn_end(&log).await?;
     assert_single_assistant_contains(&entries, "hello world");
 
     daemon.abort();
@@ -1902,12 +1918,12 @@ async fn abort_signal_cancels_blocked_worker_and_persists_tombstone() -> Result<
     };
 
     let entered = Arc::new(Notify::new());
-    let saw_abort = Arc::new(AtomicBool::new(false));
+    let model_dropped = tokio_util::sync::CancellationToken::new();
     let config = local_nats_runtime_config(server.url());
     let daemon = spawn_worker_daemon_with_call_fn(
         config,
         "worker-abort-cancel",
-        abort_blocked_call_fn(Arc::clone(&entered), Arc::clone(&saw_abort)),
+        abort_blocked_call_fn(Arc::clone(&entered), model_dropped.clone()),
     )
     .await;
 
@@ -1948,12 +1964,7 @@ async fn abort_signal_cancels_blocked_worker_and_persists_tombstone() -> Result<
 
     let log = NatsSessionLog::new(jetstream, storage_key(session_id));
     let entries = wait_for_cancel(&log).await?;
-    tokio::time::timeout(CI_SAFE_TIMEOUT, async {
-        while !saw_abort.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await?;
+    tokio::time::timeout(CI_SAFE_TIMEOUT, model_dropped.cancelled()).await?;
     let cancel_fence = entries.iter().find_map(|(_, entry)| match entry {
         SessionLogEntry::Cancel { fence_token } => Some(*fence_token),
         _ => None,
@@ -2034,4 +2045,20 @@ async fn cancel_immediately_after_activation_ack_is_not_lost() -> Result<()> {
     daemon.abort();
     let _ = daemon.await;
     Ok(())
+}
+
+async fn wait_for_turn_end(log: &NatsSessionLog) -> Result<Vec<(u64, SessionLogEntry)>> {
+    tokio::time::timeout(CI_SAFE_TIMEOUT, async {
+        loop {
+            let entries = log.load_events_latest_async().await?;
+            if entries
+                .iter()
+                .any(|(_, entry)| matches!(entry, SessionLogEntry::TurnEnd { .. }))
+            {
+                return Ok(entries);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?
 }

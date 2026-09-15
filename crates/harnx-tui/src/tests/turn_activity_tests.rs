@@ -35,7 +35,7 @@ async fn sub_agent_error_does_not_clear_llm_busy() {
     tui.app.llm_busy = true;
     tui.queue_pending_message("follow up".to_string()).await;
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
         sub_agent_source(),
         AgentEvent::Model(ModelEvent::Error("sub-agent exploded".to_string())),
     )))
@@ -57,7 +57,7 @@ async fn sub_agent_final_does_not_clear_llm_busy() {
     tui.app.llm_busy = true;
     tui.queue_pending_message("follow up".to_string()).await;
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
         sub_agent_source(),
         AgentEvent::Model(ModelEvent::Final {
             output: "sub-agent final text".to_string(),
@@ -80,7 +80,7 @@ async fn final_waits_for_turn_end_before_clearing_busy() {
     let config = test_config();
     let mut tui = Tui::init(&config).await.unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(TurnEvent::Started)))
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(TurnEvent::Started)))
         .await
         .unwrap();
 
@@ -89,7 +89,7 @@ async fn final_waits_for_turn_end_before_clearing_busy() {
         .iter()
         .any(|frame| line_to_plain(&tui.build_input_title()).starts_with(frame)));
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(ModelEvent::Final {
         output: "main final text".to_string(),
         usage: Default::default(),
     })))
@@ -101,7 +101,7 @@ async fn final_waits_for_turn_end_before_clearing_busy() {
         "Final renders output but does not end a turn"
     );
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(TurnEvent::Ended {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(TurnEvent::Ended {
         outcome: Default::default(),
     })))
     .await
@@ -114,9 +114,12 @@ async fn final_waits_for_turn_end_before_clearing_busy() {
 async fn shared_session_activity_starts_and_stops_spinner() {
     let config = test_config();
     let mut tui = Tui::init(&config).await.unwrap();
+    tui.live_events.select(Some("shared-generation".into()));
     tui.session_activity_target = Some(("session-1".to_string(), "cluster-1".to_string()));
 
     tui.handle_tui_event(TuiEvent::SessionActivity {
+        historical: false,
+        stamp: crate::event_isolation::EventStamp::snapshot(&tui.live_events),
         session_id: "session-1".to_string(),
         cluster: "cluster-1".to_string(),
         active: true,
@@ -134,6 +137,8 @@ async fn shared_session_activity_starts_and_stops_spinner() {
         .any(|frame| line_to_plain(&tui.build_input_title()).starts_with(frame)));
 
     tui.handle_tui_event(TuiEvent::SessionActivity {
+        historical: false,
+        stamp: crate::event_isolation::EventStamp::snapshot(&tui.live_events),
         session_id: "session-1".to_string(),
         cluster: "cluster-1".to_string(),
         active: false,

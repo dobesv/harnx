@@ -536,16 +536,7 @@ fn spawn_remote_session_cleanup(config: &GlobalConfig) {
     });
 }
 
-async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()> {
-    let abort_signal = create_abort_signal();
-
-    // Install a process-wide SIGINT watcher ONLY for one-shot (Cmd) mode:
-    // set the abort flag that `eval_tool_calls` and sibling async sites
-    // poll, letting the in-flight work exit cleanly with a non-zero status.
-    // TUI has its own Ctrl-C path via the terminal; server processes run on a
-    // separate thread with its own runtime — for it we let SIGINT use the
-    // default handler (kill the process) so the parent sees a terminated
-    // child within the expected window.
+fn spawn_cmd_sigint_watcher(config: &GlobalConfig, abort_signal: &AbortSignal) {
     let working_mode = config.read().working_mode.clone();
     if matches!(working_mode, WorkingMode::Cmd) {
         let abort_for_signal = abort_signal.clone();
@@ -555,54 +546,66 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
             }
         });
     }
+}
 
+async fn handle_sync_or_list_commands(
+    config: &GlobalConfig,
+    cli: &Cli,
+    abort_signal: &AbortSignal,
+) -> Result<bool> {
     if cli.sync_models {
         let url = config.read().sync_models_url();
-        return Config::sync_models(&url, abort_signal.clone()).await;
+        Config::sync_models(&url, abort_signal.clone()).await?;
+        return Ok(true);
     }
-
     if cli.list_models {
         for model in list_models(&config.read().clients, ModelType::Chat) {
             println!("{}", model.id());
         }
-        return Ok(());
+        return Ok(true);
     }
     if cli.list_agents {
-        let agents = list_agents().join("\n");
-        println!("{agents}");
-        return Ok(());
+        println!("{}", list_agents().join("\n"));
+        return Ok(true);
     }
     if cli.list_assistant_agents {
-        let agents = list_assistant_agents().await.join("\n");
-        println!("{agents}");
-        return Ok(());
+        println!("{}", list_assistant_agents().await.join("\n"));
+        return Ok(true);
     }
     if cli.list_rags {
-        let rags = Config::list_rags().join("\n");
-        println!("{rags}");
-        return Ok(());
+        println!("{}", Config::list_rags().join("\n"));
+        return Ok(true);
     }
     if cli.list_macros {
-        let macros = Config::list_macros().join("\n");
-        println!("{macros}");
-        return Ok(());
+        println!("{}", Config::list_macros().join("\n"));
+        return Ok(true);
     }
+    Ok(false)
+}
 
+async fn configure_agent_and_session(
+    config: &GlobalConfig,
+    cli: &Cli,
+    abort_signal: &AbortSignal,
+) -> Result<()> {
     if cli.dry_run {
         config.write().dry_run = true;
     }
-
     if let Some(agent) = &cli.agent {
-        activate_cli_agent(&config, &cli, agent, &abort_signal).await?;
+        activate_cli_agent(config, cli, agent, abort_signal).await?;
     } else {
         if let Some(prompt) = &cli.prompt {
             config.write().use_prompt(prompt)?;
         }
-        apply_session_arg(&config, &cli).await?;
+        apply_session_arg(config, cli).await?;
         if let Some(rag) = &cli.rag {
-            Config::use_rag(&config, Some(rag), abort_signal.clone()).await?;
+            Config::use_rag(config, Some(rag), abort_signal.clone()).await?;
         }
     }
+    Ok(())
+}
+
+fn apply_cli_model_and_tool_options(config: &GlobalConfig, cli: &Cli) -> Result<()> {
     if let Some(model_id) = &cli.model {
         config.write().set_model(model_id)?;
     }
@@ -626,37 +629,59 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     if cli.empty_session {
         config.write().empty_session()?;
     }
+    Ok(())
+}
+
+async fn start_tui_mode(config: &GlobalConfig) -> Result<()> {
+    if !*IS_STDOUT_TERMINAL {
+        bail!("No TTY for TUI")
+    }
+    start_interactive(config).await
+}
+
+async fn run_mode(
+    config: &GlobalConfig,
+    cli: &Cli,
+    text: Option<String>,
+    abort_signal: &AbortSignal,
+) -> Result<()> {
+    let is_tui = config.read().working_mode.is_tui();
+    if cli.rebuild_rag {
+        Config::rebuild_rag(config, abort_signal.clone()).await?;
+    }
+    if cli.rebuild_rag && is_tui {
+        return Ok(());
+    }
+    if let Some(name) = &cli.macro_name {
+        macro_execute(config, name, text.as_deref(), abort_signal.clone()).await?;
+        return Ok(());
+    }
+    if is_tui {
+        start_tui_mode(config).await
+    } else {
+        run_one_shot(config, cli, text, abort_signal.clone()).await
+    }
+}
+
+async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()> {
+    let abort_signal = create_abort_signal();
+    spawn_cmd_sigint_watcher(&config, &abort_signal);
+
+    if handle_sync_or_list_commands(&config, &cli, &abort_signal).await? {
+        return Ok(());
+    }
+
+    configure_agent_and_session(&config, &cli, &abort_signal).await?;
+
+    apply_cli_model_and_tool_options(&config, &cli)?;
     if cli.info {
         let info = config.read().info()?;
         println!("{info}");
         return Ok(());
     }
 
-    // Spawn remote session cleanup background task if enabled.
-    // MUST run before command/TUI branching so cleanup runs in all harnx modes.
-    // The task is best-effort and never panics; deletions are fault-tolerant.
     spawn_remote_session_cleanup(&config);
-
-    let is_tui = config.read().working_mode.is_tui();
-    if cli.rebuild_rag {
-        Config::rebuild_rag(&config, abort_signal.clone()).await?;
-        if is_tui {
-            return Ok(());
-        }
-    }
-    if let Some(name) = &cli.macro_name {
-        macro_execute(&config, name, text.as_deref(), abort_signal.clone()).await?;
-        return Ok(());
-    }
-    match is_tui {
-        false => run_one_shot(&config, &cli, text, abort_signal).await,
-        true => {
-            if !*IS_STDOUT_TERMINAL {
-                bail!("No TTY for TUI")
-            }
-            start_interactive(&config).await
-        }
-    }
+    run_mode(&config, &cli, text, &abort_signal).await
 }
 
 async fn run_one_shot(

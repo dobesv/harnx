@@ -1,5 +1,8 @@
 #[allow(dead_code)]
 mod common;
+#[allow(dead_code)]
+#[path = "common/generation.rs"]
+mod generation;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -15,7 +18,6 @@ use harnx_runtime::nats_session_metadata::{
     execution_contexts, SessionInitializer, SessionMetadata, SessionMetadataStore,
 };
 use harnx_runtime::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
-use harnx_runtime::nats_worker::NatsSessionLogBackend;
 use harnx_time_server::TimeToolset;
 use harnx_toolset::{server_identity_token, Registration, ToolInvokeError, ToolSpec, Toolset};
 use harnx_toolset_server::{
@@ -332,7 +334,8 @@ async fn assert_context_flows_from_tool_to_session_enumeration(
         SessionInitializer::named("metis", Default::default()),
     );
     store.create(&metadata).await?;
-    let backend = NatsSessionLogBackend::new(jetstream, metadata.storage_key())
+    let backend = generation::output_backend(&jetstream, &metadata.storage_key())
+        .await?
         .with_metadata_store(Some(store.clone()));
     let mut session = metadata.base_session();
     let sink = Arc::new(backend) as Arc<dyn harnx_runtime::config::session::SessionAppendSink>;

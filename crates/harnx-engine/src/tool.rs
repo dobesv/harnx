@@ -87,7 +87,19 @@ pub struct ToolEvalRenderContext {
     pub decl_map: Arc<HashMap<String, harnx_core::tool::ToolDeclaration>>,
 }
 
+#[derive(Clone, Copy)]
+pub enum WorkBoundary {
+    Start,
+    Accept,
+}
+
+/// Runtime implements this with the creation-time execution gate, never a GET.
+pub type WorkBoundaryFn = dyn Fn(WorkBoundary, ToolCall) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
+    + Send
+    + Sync;
+
 pub struct ToolEvalContext {
+    pub work_boundary: Option<Arc<WorkBoundaryFn>>,
     /// Worker instance that scopes NATS tool subjects for this evaluation.
     pub instance_id: harnx_core::instance::ServerScope,
     pub render: Option<ToolEvalRenderContext>,
@@ -174,9 +186,7 @@ pub async fn eval_tool_calls_with_authorization(
     let all_calls = calls.clone();
 
     for call in calls {
-        if abort_signal.aborted() {
-            bail!("interrupted during pre-tool phase");
-        }
+        work_boundary(ctx, &call, abort_signal, WorkBoundary::Accept).await?;
 
         let json_data = match parse_call_arguments(&call) {
             Ok(json_data) => json_data,
@@ -208,9 +218,7 @@ pub async fn eval_tool_calls_with_authorization(
                 result: HookResult::default(),
             },
         };
-        if abort_signal.aborted() {
-            bail!("interrupted during pre-tool hook");
-        }
+        work_boundary(ctx, &call, abort_signal, WorkBoundary::Accept).await?;
         if let HookResultControl::Block { reason } = pre_outcome.control {
             let blocked_result = json!({"error": reason, "blocked_by_hook": true});
             (ctx.emit_tool_blocked_fn)(&call, &blocked_result);
@@ -250,6 +258,7 @@ pub async fn eval_tool_calls_with_authorization(
             }
         }
 
+        work_boundary(ctx, &call, abort_signal, WorkBoundary::Accept).await?;
         (ctx.emit_tool_call_fn)(&call, &json_data);
         approved.push(ApprovedToolCall {
             call,
@@ -267,13 +276,11 @@ pub async fn eval_tool_calls_with_authorization(
         .iter()
         .map(|call| dispatch_authorized_call(call, ctx, abort_signal, authorization));
     let dispatch_results = join_all(dispatch_futures).await;
-    let (completed, dispatched_all_null, fatal_err) =
-        collect_dispatch_results(ctx, approved, dispatch_results).await;
+    let (completed, dispatched_all_null) =
+        collect_dispatch_results(ctx, approved, dispatch_results, abort_signal).await?;
     output.extend(completed);
     is_all_null &= dispatched_all_null;
-    if let Some(err) = fatal_err {
-        return Err(err);
-    }
+
     if is_all_null {
         output = vec![];
     }
@@ -289,6 +296,11 @@ async fn dispatch_authorized_call(
     if let Some(authorization) = authorization {
         authorization.revalidate().await.map_err(ToolError::Fatal)?;
     }
+    let mut admitted_call = call.call.clone();
+    admitted_call.arguments = call.json_data.clone();
+    work_boundary(ctx, &admitted_call, abort_signal, WorkBoundary::Start)
+        .await
+        .map_err(ToolError::Fatal)?;
     dispatch_tool_call(call.call.clone(), call.json_data.clone(), ctx, abort_signal).await
 }
 
@@ -296,51 +308,78 @@ async fn collect_dispatch_results(
     ctx: &ToolEvalContext,
     approved: Vec<ApprovedToolCall>,
     dispatch_results: Vec<Result<ToolProviderOutput, ToolError>>,
-) -> (Vec<ToolResult>, bool, Option<anyhow::Error>) {
+    abort_signal: &AbortSignal,
+) -> Result<(Vec<ToolResult>, bool)> {
+    // Don't turn a terminal provider outcome into sibling post-hooks/results.
+    let results = dispatch_results
+        .into_iter()
+        .map(|result| match result {
+            Err(ToolError::Fatal(error)) => Err(error),
+            other => Ok(other),
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut output = Vec::new();
     let mut all_null = true;
-    let mut fatal_err = None;
-    for (approved_call, result) in approved.into_iter().zip(dispatch_results) {
-        match result {
+    for (approved_call, result) in approved.into_iter().zip(results) {
+        work_boundary(ctx, &approved_call.call, abort_signal, WorkBoundary::Accept).await?;
+        let (completed, was_null) = match result {
             Ok(provider_output) => {
-                let (completed, was_null) =
-                    complete_successful_tool_call(ctx, &approved_call, provider_output).await;
-                all_null &= was_null;
-                output.push(completed);
+                complete_successful_tool_call(ctx, &approved_call, provider_output, abort_signal)
+                    .await?
             }
-            Err(ToolError::Recoverable(err)) => {
-                let error_display = format!("{err:#}");
-                let fail_event = HookEvent::PostToolUseFailure {
-                    tool_name: approved_call.call.name.clone(),
-                    tool_input: approved_call.tool_input.clone(),
-                    tool_use_id: approved_call.tool_use_id.clone(),
-                    error: error_display.clone(),
-                };
-                let _ = (ctx.dispatch_hook_fn)(fail_event).await;
-
-                all_null = false;
-                let error_result = json!({
-                    "is_error": true,
-                    "error": error_display,
-                });
-                (ctx.emit_tool_result_fn)(&approved_call.call, &error_result);
-                output.push(ToolResult::new(approved_call.call, error_result));
+            Err(ToolError::Recoverable(error)) => {
+                let completed =
+                    complete_failed_tool_call(ctx, approved_call, error, abort_signal).await?;
+                (completed, false)
             }
-            Err(ToolError::Fatal(err)) => {
-                if fatal_err.is_none() {
-                    fatal_err = Some(err);
-                }
-            }
-        }
+            Err(ToolError::Fatal(error)) => return Err(error),
+        };
+        all_null &= was_null;
+        output.push(completed);
     }
-    (output, all_null, fatal_err)
+    Ok((output, all_null))
+}
+
+async fn complete_failed_tool_call(
+    ctx: &ToolEvalContext,
+    call: ApprovedToolCall,
+    error: anyhow::Error,
+    abort: &AbortSignal,
+) -> Result<ToolResult> {
+    let error_display = format!("{error:#}");
+    let _ = (ctx.dispatch_hook_fn)(HookEvent::PostToolUseFailure {
+        tool_name: call.call.name.clone(),
+        tool_input: call.tool_input,
+        tool_use_id: call.tool_use_id,
+        error: error_display.clone(),
+    })
+    .await;
+    work_boundary(ctx, &call.call, abort, WorkBoundary::Accept).await?;
+    let value = json!({"is_error": true, "error": error_display});
+    (ctx.emit_tool_result_fn)(&call.call, &value);
+    Ok(ToolResult::new(call.call, value))
+}
+
+async fn work_boundary(
+    ctx: &ToolEvalContext,
+    call: &ToolCall,
+    abort: &AbortSignal,
+    boundary: WorkBoundary,
+) -> Result<()> {
+    anyhow::ensure!(!abort.aborted(), "interrupted during tool execution");
+    if let Some(commit) = &ctx.work_boundary {
+        commit(boundary, call.clone()).await?;
+    }
+    anyhow::ensure!(!abort.aborted(), "interrupted during tool execution");
+    Ok(())
 }
 
 async fn complete_successful_tool_call(
     ctx: &ToolEvalContext,
     approved: &ApprovedToolCall,
     provider_output: ToolProviderOutput,
-) -> (ToolResult, bool) {
+    abort: &AbortSignal,
+) -> Result<(ToolResult, bool)> {
     let (mut value, execution_context) = provider_output.into_parts();
     let post_event = HookEvent::PostToolUse {
         tool_name: approved.call.name.clone(),
@@ -349,6 +388,7 @@ async fn complete_successful_tool_call(
         tool_response: value.clone(),
     };
     let post_outcome = (ctx.dispatch_hook_fn)(post_event).await;
+    work_boundary(ctx, &approved.call, abort, WorkBoundary::Accept).await?;
     if let Some(mutated_response) = post_outcome.result.mutated_tool_response {
         value = mutated_response;
     }
@@ -361,10 +401,10 @@ async fn complete_successful_tool_call(
     if was_null {
         value = json!("DONE");
     }
-    (
+    Ok((
         completed_tool_result(approved.call.clone(), value, images, execution_context),
         was_null,
-    )
+    ))
 }
 
 /// Recover a tool response without repeating approval or post-use hooks whose
@@ -384,6 +424,7 @@ pub async fn replay_tool_call(
                 ToolProviderOutput::new(json!({"is_error": true, "error": error.to_string()}))
             }
         };
+        work_boundary(ctx, call, abort, WorkBoundary::Accept).await?;
         let (mut value, observation) = output.into_parts();
         let images = crate::media::extract_image_parts(&value);
         if !images.is_empty() {
@@ -875,6 +916,7 @@ mod tests {
         emit_tool_blocked: impl Fn(&ToolCall, &Value) + Send + Sync + 'static,
     ) -> ToolEvalContext {
         ToolEvalContext {
+            work_boundary: None,
             instance_id: harnx_core::instance::ServerScope::new(),
             render: None,
             providers,

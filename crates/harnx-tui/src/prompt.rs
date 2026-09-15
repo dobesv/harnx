@@ -21,9 +21,12 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::agent_event_sink::TuiAgentEventSink;
 
+mod task;
+
 pub(super) struct PromptTaskContext {
     pub(super) config: GlobalConfig,
     pub(super) abort_signal: AbortSignal,
+    pub(super) live_events: harnx_runtime::nats_event_sink::LiveEventState,
     #[cfg(test)]
     pub(super) shared_pending_message: Arc<Mutex<Option<PendingMessage>>>,
     pub(super) local_worker:
@@ -74,12 +77,13 @@ async fn ensure_tool_confirmation_route(
         return Ok(route);
     }
 
-    let handler = crate::lifecycle::nats_tool_confirmation_handler(event_tx);
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handler = crate::lifecycle::nats_tool_confirmation_handler(event_tx, closed.clone());
     let created = Arc::new(session.tool_confirmation_route(handler).await?);
     install_tool_confirmation_route(
         routes,
         target,
-        ToolConfirmationRouteHandle::Nats(Arc::clone(&created)),
+        ToolConfirmationRouteHandle::Nats(Arc::clone(&created), closed),
     )
     .nats()
     .context("tool confirmation slot contained a non-NATS route")
@@ -91,7 +95,6 @@ async fn run_nats_turn_with_tui_confirmation(
     cluster: &str,
     ctx: &PromptTaskContext,
 ) -> Result<harnx_runtime::nats_session::NatsTurnResult> {
-    let sink = Arc::new(TuiAgentEventSink::new(ctx.event_tx.clone()));
     let target = (session.storage_key().to_string(), cluster.to_string());
     let route = ensure_tool_confirmation_route(
         session,
@@ -100,8 +103,24 @@ async fn run_nats_turn_with_tui_confirmation(
         ctx.event_tx.clone(),
     )
     .await?;
+    let appended = session
+        .admit_input_with_tool_confirmation_route(input, &route)
+        .await?
+        .with_live_state(ctx.live_events.clone());
+    let sink = Arc::new(TuiAgentEventSink::for_prompt(
+        ctx.event_tx.clone(),
+        ctx.abort_signal.clone(),
+        ctx.live_events.clone(),
+        appended.execution_id().into(),
+    ));
     session
-        .run_turn_input_with_tool_confirmation_route(input, None, sink, None, &route)
+        .follow_admitted_prompt(
+            appended,
+            sink,
+            None,
+            Some(route.subject()),
+            Default::default(),
+        )
         .await
 }
 
@@ -137,6 +156,7 @@ fn test_agent_loop_context(
     on_text_response: harnx_runtime::OnTextResponseFn,
 ) -> harnx_runtime::AgentLoopContext {
     harnx_runtime::AgentLoopContext {
+        generation_fence: ctx.config.read().generation_fence.clone(),
         instance_id: harnx_core::instance::ServerScope::new(),
         config: ctx.config.clone(),
         abort_signal: ctx.abort_signal.clone(),
@@ -334,9 +354,23 @@ impl Tui {
             return;
         }
 
+        if self
+            .live_events
+            .active()
+            .is_some_and(|id| self.live_events.is_stopped(&id))
+        {
+            // Includes stops accepted by another frontend while this follower ran.
+            self.cancellation = None;
+            self.pending_exit_cancel = None;
+            self.settle_interrupted_prompt();
+            return;
+        }
         self.current_prompt_abort = None;
         if task.aborted() {
             self.clear_tool_confirmation_route();
+            if self.app.pending_confirm_reply.is_some() {
+                self.resolve_tool_confirm(false);
+            }
         }
         if let Some(error) = error {
             self.finish_main_prompt_error(error).await;
@@ -450,18 +484,18 @@ impl Tui {
         let on_tool_round = test_tool_round_callback(&ctx);
 
         let event_tx = ctx.event_tx.clone();
-        let on_text_response: harnx_runtime::OnTextResponseFn = Arc::new(
-            move |output: String, usage: harnx_runtime::client::CompletionTokenUsage| {
-                let event_tx = event_tx.clone();
-                Box::pin(async move {
-                    use harnx_core::event::{AgentEvent, ModelEvent};
-                    let _ = event_tx.send(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
-                        output,
-                        usage,
-                    })));
-                })
-            },
-        );
+        let on_text_response: harnx_runtime::OnTextResponseFn =
+            Arc::new(
+                move |output: String, usage: harnx_runtime::client::CompletionTokenUsage| {
+                    let event_tx = event_tx.clone();
+                    Box::pin(async move {
+                        use harnx_core::event::{AgentEvent, ModelEvent};
+                        let _ = event_tx.send(TuiEvent::LocalAgent(AgentEvent::Model(
+                            ModelEvent::Final { output, usage },
+                        )));
+                    })
+                },
+            );
         let loop_ctx = test_agent_loop_context(&ctx, call_fn, on_tool_round, on_text_response);
 
         harnx_runtime::run_agent_loop_with_local_handoff(&loop_ctx, input).await
@@ -527,14 +561,32 @@ impl Tui {
         .context("failed to create NATS session")?;
 
         let result = run_nats_turn_with_tui_confirmation(&session, &input, &cluster, &ctx).await?;
-        harnx_runtime::commands::update_last_message_after_nats_turn(&ctx.config, input, &result);
+        Self::record_nats_prompt_result(&ctx, input, &result, &cluster);
+        Ok(())
+    }
+
+    fn record_nats_prompt_result(
+        ctx: &PromptTaskContext,
+        input: harnx_runtime::config::Input,
+        result: &harnx_runtime::NatsTurnResult,
+        cluster: &str,
+    ) {
+        if result.was_cancelled {
+            ctx.abort_signal.set_ctrlc();
+        }
+        if !ctx.abort_signal.aborted() {
+            harnx_runtime::commands::update_last_message_after_nats_turn(
+                &ctx.config,
+                input,
+                result,
+            );
+        }
         log::info!(
             "prompt completed: cluster={} session_id={} cancelled={}",
             cluster,
             result.session_id,
             result.was_cancelled
         );
-        Ok(())
     }
 
     #[cfg(test)]

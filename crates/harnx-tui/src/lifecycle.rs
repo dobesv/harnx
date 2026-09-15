@@ -238,6 +238,7 @@ impl Tui {
             shared_pending_message: Arc::new(Mutex::new(None)),
             local_worker: Arc::new(Mutex::new(None)),
             current_prompt_abort: None,
+            live_events: Default::default(),
             current_prompt_handle: None,
             active_remote_session: None,
             exit_cancel_factory: crate::remote_session::default_exit_cancel_factory(),
@@ -1346,9 +1347,11 @@ impl Drop for ToolConfirmationDismissGuard {
 /// decision without blocking the TUI event loop.
 pub(crate) fn nats_tool_confirmation_handler(
     event_tx: tokio::sync::mpsc::UnboundedSender<TuiEvent>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
 ) -> Arc<harnx_runtime::nats_tool_confirmation::ToolConfirmationHandler> {
     Arc::new(move |request| {
         let event_tx = event_tx.clone();
+        let closed = closed.clone();
         Box::pin(async move {
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<bool>();
             let confirmation_id = next_tool_confirmation_id();
@@ -1357,7 +1360,10 @@ pub(crate) fn nats_tool_confirmation_handler(
                 tool_name: request.tool_name,
                 input_preview: confirm_input_preview(&request.arguments),
                 reason: request.reason,
-                reply: ToolConfirmationReply::Async(reply_tx),
+                reply: ToolConfirmationReply::Routed {
+                    reply: reply_tx,
+                    closed,
+                },
             });
             if event_tx.send(event).is_err() {
                 return false;

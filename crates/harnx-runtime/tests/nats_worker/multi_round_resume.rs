@@ -151,22 +151,38 @@ async fn seed_resume_fixture(server_url: &str) -> Result<ResumeFixture> {
     seed_session_metadata(&js, SESSION_ID).await?;
     log.append_event_async(&append_user_message_entry("user-1", "original request"))
         .await?;
-    log.append_event_async(&tool_calls("first_tool", "call-complete", "first round"))
-        .await?;
-    log.append_event_async(&successful_tool_result("first_tool", "call-complete"))
-        .await?;
-    log.append_event_async(&tool_calls(
-        "non_idempotent_unknown_tool",
-        "call-orphan",
-        "second round",
-    ))
+    let lease = acquire_test_lease(js.clone(), SESSION_ID, "crashed-worker").await?;
+    let fence = generation::generation_fence(
+        &js,
+        &storage_key(SESSION_ID),
+        harnx_execution_control::Owner {
+            instance_id: lease.worker_id().into(),
+            fence: lease.fence_token(),
+        },
+    )
     .await?;
+    let backend =
+        NatsSessionLogBackend::new(js.clone(), storage_key(SESSION_ID)).with_execution(Some(fence));
+    backend
+        .append_event(&tool_calls("first_tool", "call-complete", "first round"))
+        .await?;
+    backend
+        .append_event(&successful_tool_result("first_tool", "call-complete"))
+        .await?;
+    backend
+        .append_event(&tool_calls(
+            "non_idempotent_unknown_tool",
+            "call-orphan",
+            "second round",
+        ))
+        .await?;
     let queued_user_seq = log
         .append_event_async(&append_user_message_entry(
             "user-queued",
             "queued correction",
         ))
         .await?;
+    lease.release().await?; // Owner exited without requesting interruption.
     let session = NatsSession::new(
         NatsSessionConfig {
             cluster: "local".to_string(),

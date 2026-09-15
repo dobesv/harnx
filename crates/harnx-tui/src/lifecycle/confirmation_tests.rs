@@ -58,7 +58,7 @@ async fn check_in_process_confirmation(mut runtime_builder: tokio::runtime::Buil
 #[tokio::test(start_paused = true)]
 async fn nats_confirmation_handler_accepts_approval_after_a_day() {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let handler = nats_tool_confirmation_handler(event_tx);
+    let handler = nats_tool_confirmation_handler(event_tx, Default::default());
     let decision = tokio::spawn(handler(
         harnx_runtime::nats_tool_confirmation::ToolConfirmationRequest {
             session_id: "session-1".to_string(),
@@ -94,7 +94,7 @@ async fn nats_confirmation_handler_accepts_approval_after_a_day() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelled_nats_confirmation_requests_modal_dismissal() {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let handler = nats_tool_confirmation_handler(event_tx);
+    let handler = nats_tool_confirmation_handler(event_tx, Default::default());
     let decision = tokio::spawn(handler(
         harnx_runtime::nats_tool_confirmation::ToolConfirmationRequest {
             session_id: "session-1".to_string(),
@@ -127,7 +127,7 @@ async fn cancelled_nats_confirmation_requests_modal_dismissal() {
 
     // Cancellation must release the waiter even before the TUI processes
     // the queued dismissal event.
-    let ToolConfirmationReply::Async(reply) = reply else {
+    let ToolConfirmationReply::Routed { reply, .. } = reply else {
         panic!("NATS confirmation must use an async reply");
     };
     assert!(reply.is_closed());

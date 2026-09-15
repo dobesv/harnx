@@ -516,7 +516,7 @@ accepting parent. Work starts only after registration and an ancestor preflight.
 Cancellation CAS freezes new children and prompt reservations. Owners watch the
 operation and ancestor chain, so cancellation survives a requester or
 intermediate owner disappearing. Direct child cancellation only travels down;
-the parent receives a recoverable cancelled-tool result.
+gated tool replies carry a typed interrupted outcome, not a recoverable tool failure.
 
 Every activation and cancellation latency hint carries an execution ID. A stale
 child row supplies `expected_execution_id` and cannot cancel a later invocation
@@ -527,14 +527,326 @@ Session owners use the lease fence; tool and hook owners use fresh invocation
 owner identities. A replacement server's routing name alone cannot authorize
 it to claim or acknowledge an invocation still owned by another process.
 
+### Logical stop model (#1878, Stage 1)
+
+Execution control now exposes separate logical and physical dimensions:
+
+- `LogicalState::{Preparing, Running, Completed, Interrupted}`. An accepted
+  `StopDecision { cancellation_id, accepted_at, reason }` makes the exact
+  generation `Interrupted`, permanently. Cleanup and cancellation retries cannot
+  reopen it. `can_replace_generation()` permits `Completed` or `Interrupted`.
+- `CleanupState::{Pending, Confirmed, Unconfirmed}` reports owner/child shutdown.
+  Neither an accepted stop nor `cancel_recorded` confirms physical cleanup.
+  `cancel_recorded` tracks transcript projection coverage only.
+
+The views derive from the persisted stop decision and existing lifecycle facts;
+there are no duplicate mutable state fields for old writers to leave stale.
+`OperationState` remains the compatibility lifecycle. Its terminal predicate is
+not broadened: `can_prune()` still requires legacy completion (including its
+explicit abandonment override), never logical interruption alone.
+
+Retirement CAS-compacts a physical record on its original generation key, keeping
+its identity, parent lineage, and stop decision until session deletion. Installing
+another generation does not remove that evidence. `ExecutionStore::get` returns
+no physical operation for a retired node; `stop_decision` and `is_stop_fenced`
+resolve stops through both live and retired ancestry. Missing lineage is an error,
+not permission to replay. Retired generation IDs cannot be reused.
+
+`accept_interrupt` is the initial single-record state API. Production
+`request_cancel` bridges interruption to the tree-wide gate below. Stages 2-7
+establish the output, recovery and cleanup fences; Stage 8 enables frontend
+return on acceptance. A negative stop query is a snapshot, not authority for a
+later write. No transcript variant changes in this protocol.
+
+### Tree-wide commit gate (#1878, Stage 2)
+
+`harnx-execution-control::gate` provides the commit mechanism. Stage 3 opts tool
+invocations and their lineage into it through an activation CAS (below).
+`open_gate` alone initializes new logical authority; it is not a live-graph or
+lease-GET import.
+
+`ExecutionContext` captures the session generation, stable gate root, operation,
+operation owner and generation-owner fence at creation. `commit_if_admissible`
+and `interrupt(scope, cancellation_id)` serialize on the same per-tree key:
+`sessions/{root.session_id}/gates/{root.execution_id}/head`. The library persists
+an immutable candidate with its exact context, action/payload, previous head and
+expected KV revision before CAS-publishing it. Candidates that lose CAS are not
+committed or consumable. Even a positive idempotency retry CAS-validates its
+snapshot, so stale `Running` reads cannot authorize post-stop work.
+
+Actions include child registration plus exact input (`StartWork`), exact typed
+output (`CommitOutput`), committed reply consumption (`ConsumeReply`), physical
+cleanup progress (`CleanupUpdate`), and conditional historical projection
+(`ProjectCommitted`). Generation and owner changes use this same gate. Root
+interruption changes only its scope record; ancestor traversal fences descendants
+without a cancellation walk. A normally completed producer's reply still requires
+admissible consumption under the receiving generation.
+
+Receipts prove history, never permission to append arbitrary future data. Use
+`committed_action` to reconcile a lost action response after interruption;
+`commit_if_admissible` rejects stopped work, including positive retries. Repeating
+`interrupt` with the original scope and cancellation ID returns the original stop,
+including after G2. `gate_stop` reads retained gate lineage independently of
+physical-node pruning.
+
+A persistent crit-bit index bounds individual KV values to 128 KiB (actions to
+64 KiB); the anchor does not accumulate the log. `checkpoint_gate` CAS-switches
+index epochs before collecting obsolete paths and losing candidates. Historical
+payloads/proofs remain session-lifetime while replay and sink retention rules are
+not yet installed. `projection_cursor` tracks each named projector. A cursor is
+not sink deduplication: adapters must conditionally append the exact commit ID and
+recover a crash between append and cursor acknowledgement.
+
+Stages 3-6 must adapt journal/transcript/event writers, recovery and lease/session
+lifecycle changes to this authority before enabling gated execution. Separate
+lease writes cannot revoke a gate owner; the handover must commit here. Deletion
+must stop the affected scope before removing its physical projection. Stage 1
+`accept_interrupt` is still legacy-only and must not be mixed with gated output.
+Cross-gate session migration is rejected pending an explicit handover protocol.
+A GC race may invalidate an old snapshot; readers fail closed and retry rather
+than treating missing index nodes as an unfenced generation.
+
+### Journal, cache and replay fencing (#1878, Stage 3)
+
+Tool requests now carry `execution` (producer and receiving `ExecutionContext`),
+captured before dispatch. `replay_execution` carries an explicitly created replay
+attempt without changing the original request identity. A tool server CAS-transfers
+the reserved producer to a fresh owner before claiming physical cleanup ownership.
+It keeps that context through handler completion; it never adopts the current
+owner when a delayed reply arrives. Concurrent replacement servers cannot reuse
+the reservation to execute the same call.
+
+The bridge in `gate/bridge.rs` CAS-marks each physical operation with an immutable
+`gate_registration` before materializing its gate registration. `cancel_operation`
+serializes with that marker: cancellation before activation prevents import;
+cancellation after the marker helps finish registration and commits `interrupt`
+on the governing tree. The per-node cancellation write is cleanup bookkeeping,
+not logical acceptance. Successful cancellation returns only after the gate stop
+is durable. `accept_interrupt` rejects marked operations to prevent mixing Stage 1
+per-node acceptance with gate output commits. Session owner handovers and generation
+replacement also enter the gate; physical completion can project `FinishWork`.
+The compatibility cancellation acknowledgement still waits for cleanup.
+
+`harnx_tool_invocations` stores requests, checkpoint handles and reply history.
+Completion stages an immutable content-addressed reply blob, then commits
+`CommitOutput { ToolReply }` with its SHA-256 digest. Only that gate slot determines
+the winning reply. The journal's `reply`, `reply_commit` and `reply_producer` fields
+are a conditional projection, not a second commit boundary. Restart can recover a
+committed blob even if the server died before updating these fields. A losing blob
+has no committed proof and is never consumed. Blob storage avoids putting large
+tool replies into the gate's bounded action records.
+
+Every saved-reply/cache success requires a fresh `ConsumeReply` under the receiving
+context. Positive idempotency retries still perform gate CAS. The in-process cache
+key includes generation, operation, owner and call identity; its value includes
+the exact committed producer and proof. A late cache insertion of previously
+committed bytes is harmless: it supplies payload, not authorization. Cache eviction
+is not part of the fence. Calls with different operation/call identities no longer
+share a result merely because their `Idempotency-Key` headers match.
+
+Recovery resolves original generation/lineage before looking for a reply or
+admitting a replay. `AdmitWork` and the replay owner transfer race interruption on
+the same gate. A pruned physical operation is acceptable only with retained gate
+authority and a valid committed reply. Unknown legacy records fail closed rather
+than attaching to the current generation. Retained stop evidence can still yield
+an interrupted outcome when legacy metadata is missing. Runtime rejects successful
+wire replies without a committed proof in a controlled invocation.
+
+`ToolErrorPayload::Interrupted` and `ToolInvokeError::Interrupted` carry a durable
+stop receipt. Runtime preserves `harnx_execution_control::Interrupted` as a typed
+`anyhow` error inside the terminal `ToolError::Fatal` carrier. It is never converted
+to the model's recoverable `is_error` result. No `SessionLogEntry` variant or
+transcript wire format changed. Upgrade worker and tool-server readers together;
+protocol v4 acknowledgement and cleanup changes remain Stage 7.
+
+Stage 4 adds the transcript/model/hook/sub-agent boundaries below. Generation-first
+recovery and event isolation are described in Stages 5-6. Cleanup supervision and
+early return are described in Stages 7-8. A checkpoint handle is still bookkeeping,
+not permission to restart work. Cross-gate session migration remains rejected. Gate proofs and blobs
+remain until session deletion; standalone clients also need an explicit retention
+policy before high-volume use. Stage 8 enables frontend early return and G2
+while physical cleanup is still pending.
+
+### Transcript, model and work boundaries (#1878, Stage 4)
+
+`WorkerExecution::claim` activates the gate before constructing the control listener,
+per-session config, or append sinks. Direct NATS loop callers activate before
+reconstruction. Each captures a `GenerationFence`; late callbacks never resolve a
+new current generation. Session worker handover enters the same gate, including
+handover for projecting cancellation on a stopped session. Handover changes the
+owner, not the retained stop decision. Gate owner fences stay fixed for an attempt;
+lease renewals advance the transcript audit revision. Cancellation projection records
+that current audit revision without rebinding execution authority.
+
+Worker transcript writes commit `CommitOutput { Transcript }` with exact content
+before projection. Large outputs use immutable SHA-256-addressed 64-KiB chunks
+under the gate's session namespace; only the gate CAS accepts their digest. Large
+work and hook inputs use committed blob references in their admission actions too.
+The private projector reads committed decisions in sequence, filters by destination
+session, and conditionally appends using the stream tail. Durable `Nats-Msg-Id`
+headers prove which commit was appended after a crash; the finite broker dedup
+window is not the proof. The gate cursor acknowledges projection, never authorizes
+new output. An older projector cannot append G1 output behind G2: G2 first drains
+all earlier committed decisions, and later G1 retries find their durable IDs.
+Missing stream evidence fails closed. Session streams must retain these headers
+until deletion; a future retention policy needs an explicit projection watermark.
+
+This preserves `ToolCalls` → `SubAgentStarted` → `ToolResults` ordering. Existing
+reconstruction still queues mid-tool messages to keep tool-use/result adjacency.
+HITL output retains its expected-tail condition; a losing conditional projection
+returns no append and forces the caller to re-derive state. `RecordCancellation`
+is a separate control action: it requires an already stopped, current session
+generation and its owner, contains no worker output, and projects `Cancel` in the
+same ordered drain. `cancel_recorded` remains coverage/projection bookkeeping.
+
+User input is committed history before model work, not output authorized by a
+model response. `NatsSession` reserves the prompt on its generation, appends the
+user row, then commits its sequence before activation. Workers retain
+`skip_user_log_append` for that already-durable input. The shared in-process
+agent loop also prepares input before calling the model; assistant/tool persistence
+must not be the first place a user's prompt is saved. Its request-local history
+cursor prevents duplicate appends while keeping prompt patches out of durable
+history. `Cancel` leaves user rows in history but closes their pending/replay
+status. Retained Stage 5 admissions still bind them to their original generation.
+
+Model resolution first rechecks local abort, then commits exact `ModelResponse`
+through the gate before assistant persistence, shared conversation mutation, final
+emission, or returned tool dispatch. Tool evaluation commits `StartWork` at
+handoff and checks admission after handlers and post-hooks. Interrupted outcomes
+are terminal for the generation, not synthesized model-visible tool failures;
+no normal final/turn-end is emitted. Background metadata (title, settings and
+tool-observed execution contexts) uses `SessionMetadata` output in the same drain.
+Its metadata CAS records `worker_projection`, preventing an old projector retry
+from overwriting newer metadata.
+
+Controlled hooks carry creation-time execution context, claim their invocation
+through gate owner transfer/admission, commit the reply, and require `ConsumeReply`
+before the caller accepts it. Sub-agent creation checks local cancellation and
+commits work admission before allocation/creation, fences `SubAgentStarted` using
+the invoking tool's context, and checks again before child activation. Child
+session execution joins the parent's gate through the existing activation bridge.
+Constructor/local-tool admissions are gate-only work records; physical handler
+ownership still belongs to the existing execution graph.
+
+No `SessionLogEntry` variant or field changed. Stream headers are additive. The
+optional metadata `worker_projection`, gate action/output kinds, and controlled
+hook header/reply shape require a coordinated worker/hook-server deployment.
+Protocol v4 acceptance acknowledgements remain Stage 7. This stage does not enable
+early return, overlapping generations, or asynchronous cleanup. Generation-first
+orphan recovery and pending-prompt adoption are handled by Stage 5 below.
+Remaining legacy lifecycle/cleanup adapters are deferred to Stage 7. Live event
+envelopes/render isolation are described in Stage 6 below.
+Historical committed output may be projected after stop, but only in its original
+place before later generation output. New output from that stopped generation is
+rejected.
+
+### Recovery and legacy ownership (#1878, Stage 5)
+
+Recovery resolves the original generation before reconstructing a model turn.
+Worker claim reconciles an unfinished gate registration, reads retained stop
+lineage, and projects a missing `Cancel` before reconstructing model state. A gate
+stop is authoritative even when physical cancellation has not reached the worker
+or its descendants. Direct loop callers follow the same order; they cannot create
+a new generation to resume an old stopped prompt.
+
+Prompt reservations already bind message IDs to an execution before the client
+appends them. Those reservations, worker-fence history and gate registration now
+survive physical-node retirement on the original operation CAS key. Recovery
+follows retained `previous_generation` links, not a key listing of the busy KV
+bucket. It backfills a lost prompt sequence acknowledgement from its reserved
+message ID.
+It does not reserve an uncovered old prompt on a new generation. Missing or
+ambiguous ownership requires explicit history repair instead of automatic adoption.
+
+Tool-call ownership comes from the Stage 4 committed transcript proof in the
+existing message-ID header. Older rounds can use their original invocation journal
+contexts or an unambiguous retained worker fence. An idempotent/read-only hint is
+considered only after resolving that authority and passing a gate admission.
+Unknown calls fail closed without invoking a tool. `Cancel` closes orphan discovery;
+model-history reconstruction can balance the unresolved call in memory, without
+appending a late successful `ToolResults` on behalf of the stopped generation.
+
+`AdmitRecovery` is the common CAS boundary before saved-reply consumption or replay.
+It validates the receiving owner and original generation and checks the original
+operation's retained stop scope. The saved branch still uses `ConsumeReply`; the
+replay branch still transfers ownership and uses `AdmitWork`/`StartWork` before
+dispatch. All these actions race cancellation on the same gate. `Interrupted`
+remains terminal, including through the legacy rerun error path. An exit without
+interruption keeps its generation and remains resumable.
+
+A child whose first claim happens after its parent's stop can recover its original
+lineage using `RegisterStoppedWork`. This control-only registration starts in
+`Interrupted`, carries no work input, and cannot authorize model/tool output.
+Retained gate registrations allow ancestry resolution after physical pruning.
+
+New prompt admission reconciles the previous stop projection before replacing the
+generation. `RecordCancellation` projection uses its recorded transcript tail as a
+conditional append, so a delayed projector cannot cover a newer prompt. Recovery
+refuses ambiguous mixed-generation history rather than moving the old stop boundary
+past new input. Stage 8 uses this ordered boundary when admitting overlapping generations.
+
+No `SessionLogEntry` variant or field changed. Gate records have additive ownership
+fields and new action tags; upgrade workers and tool servers together. Existing
+pre-gate history without reliable binding is not granted execution authority.
+Live event isolation is described below. Protocol v4 and asynchronous cleanup are
+in Stage 7; early return/G2 overlap is enabled by Stage 8. Session-lifetime
+ownership retention and recovery scans still need a later retention/indexing policy.
+
+### Live event and UI isolation (#1878, Stage 6)
+
+`AdvisoryEnvelope.execution_id` is the existing execution/operation generation ID.
+It wraps every live `AgentEvent`, including `SessionEvent`, model final/error/chunks,
+tool completion/progress and turn lifecycle signals. It's optional on the wire
+(`serde(default, skip_serializing_if)`), so old payloads still decode. Live consumers
+fail closed when the ID is absent. No durable `SessionLogEntry` field or variant changed.
+
+Workers bind their `NatsEventSink` to the creation-time `GenerationFence`. The emitter
+stamps the envelope before enqueueing; the publisher never resolves a new identity
+for an old event. Enqueue rejects locally stopped producers. The ordered publisher
+rechecks the captured generation and retained gate stop before sending buffered
+output. Required-event transport/authority errors still reach the flush barrier;
+stale-generation discards are intentional, not publish failures.
+
+Subscribers load gate authority after subscribing and before draining the buffered
+advisories. Generation mismatch or accepted stop rejects a live event regardless of
+`after_seq`. The existing durable sequence filter also applies (the shared observer
+uses its attachment boundary, since its recovery cursor doesn't render transcript
+rows). The dedicated follower keeps its admitted generation when projecting live
+status, sequence assignments and errors. Its post-cancellation final flush drops
+stopped or replaced generations before any decoration or sink emission.
+
+The TUI carries the original generation through its own event queue. Prompt events
+also carry the prompt task's abort-signal identity, checked like `PromptTaskFinished`.
+Shared observers and child monitors carry attachment identity. These checks precede
+all live reducers, so an old Final, Completed, Ended, error or progress update cannot
+append transcript rows or clear a replacement turn's spinner. No new turn epoch is
+introduced: attachment/task pointers only prevent detached readers from updating a
+replacement reader; generation identity still comes from the execution gate.
+
+Accepted cancellation receipts immediately populate a local stopped-ID set. Forked
+attachments retain that set. Reconnect reloads the durable fence before any buffered
+live event is eligible, including when the frontend has lost all local memory. The
+stopped set is a rejection cache, never permission for durable output or recovery.
+Historical transcript replay remains separate and still displays committed output
+from interrupted generations. Durable activity resolves the latest effective user
+row's original generation from retained prompt admissions. It can settle its own
+stopped turn, but an old TurnEnd cannot become a replacement turn's idle transition.
+
+Remote AG-UI followers now retain the attached prompt's generation through their
+output queue (Stage 8 below). Browser-side isolation remains a separate follow-up:
+reducers in `ChatProvider.tsx`, `RuntimeSessionSubscriber.tsx` and
+`SubAgentSessionNotes.tsx` still need envelope identity and receipt-driven stop
+handling for events already in browser queues. No web source changed in Stage 6.
+
 ### Acceptance versus shutdown
 
 `NatsSession::request_cancel` bounds durable acceptance to two seconds without
 waiting for shutdown or recovery activation. Once its KV CAS succeeds, a slow or
 failed activation wake-up cannot turn the accepted request into a persistence
-failure. `cancel_status` and `wait_for_cancel` report convergence;
-`cancel_pending_turn` remains the blocking compatibility wrapper. An idle cancel
-succeeds without appending a transcript entry.
+failure. `cancel_pending_turn` returns the receipt's acceptance boolean without
+waiting. `cancel_status` and `wait_for_cancel` remain explicit cleanup diagnostics,
+not frontend completion APIs. An idle cancel succeeds without appending a
+transcript entry.
 
 Status reconciliation propagates an accepted cancellation through registered
 descendants. An ownerless operation still in `Preparing` never started work and
@@ -544,7 +856,9 @@ descendants retain their normal owner cleanup requirements.
 
 The state machine is preparing → running → completed for normal completion, or
 cancel_requested → quiescing → cancelled for cancellation. Five seconds without
-progress produces **unconfirmed**, which remains nonterminal and blocks prompts.
+progress produces **unconfirmed**, which remains nonterminal in the compatibility
+lifecycle. Gated backend admission can replace an interrupted generation; the
+TUI and CLI no longer wait for cleanup before returning control.
 It may later converge to cancelled. Retry can move unconfirmed back to requested.
 Closing normal prompt admission does not itself cancel already-registered work.
 
@@ -556,11 +870,11 @@ updates, and the next prompt installs a fresh execution generation. This overrid
 is generation-scoped and is never available before cancellation becomes
 unconfirmed.
 
-The worker signals local abort immediately, writes the existing fenced
-`SessionLogEntry::Cancel`, drains owned work, releases its lease, and confirms cancellation only when
-all registered children are terminal. The transcript marker alone is not proof
-of shutdown. Recovery requires a covering marker from the execution's lease fence
-and no active lease; unresolved prompt reservations still prevent confirmation.
+The worker signals local abort and writes the existing fenced
+`SessionLogEntry::Cancel`. Stage 7 releases execution separately from supervised
+cleanup. The compatibility status still converges only after owner/descendant
+evidence and transcript coverage. A transcript marker or absent lease alone
+is not proof of physical shutdown for a gated execution.
 
 Prompt IDs are allocated before append. A CAS reservation decides whether a
 concurrent prompt belongs to the cancelling execution. An admitted message is
@@ -572,71 +886,231 @@ marker requires another fenced recovery pass.
 Admission subscribes to advisory events before appending and publishing activation.
 Its receipt retains that subscription until the frontend follows the admitted
 prompt. A fast worker can finish before the frontend's follow task starts;
-durable completion must drain already-buffered events before closing that turn.
+durable completion drains eligible already-buffered events before closing that turn.
+Accepted-stop and generation checks also apply to this final drain.
 
-### Tool and hook shutdown
+### Cleanup supervisor and protocol v4 (#1878, Stage 7)
 
-The internal tool protocol is v3 and requires an atomic frontend/worker/server
-upgrade. Registrations using earlier versions are rejected. `ToolRequest.operation_id` and
-control acknowledgements identify the invocation; a cancellation acknowledgement
-is sent only after invocation cleanup and registered-child completion.
+The internal tool protocol is **v4**. Deploy workers, frontends and tool servers
+together; registrations with another version are rejected. No durable
+`SessionLogEntry` variant changed. The v4 cancellation acknowledgement is:
 
-Returning a tool result and confirming descendant shutdown are separate steps.
-After the handler returns, the server allows five seconds for execution-control
-cleanup. If a vanished child cannot confirm shutdown, the caller receives a
-`tool shutdown unconfirmed` error, including the handler's original error when
-present. The unresolved execution remains durable and no stopped acknowledgement
-is sent. Do not remove this deadline: a child lease watchdog can return an error
-while its execution record still has a live descendant, otherwise hiding that
-error from the parent indefinitely (`InvocationExecution::invoke`).
+```rust
+struct CancellationAcknowledgement {
+    protocol_version: u32, // 4
+    generation: OperationRef,
+    operation_id: String,
+    cancellation_id: String,
+    acceptance: CancelAcceptance,
+    cleanup: Option<CleanupStatus>,
+}
+// acceptance (tagged by "kind", snake_case):
+// Accepted { stop: StopReceipt } | AlreadyFinished |
+// Rejected { reason: String } | Unknown { reason: String }
+// cleanup: { state: Pending | Confirmed | Unconfirmed,
+//            owner_stopped: bool, remaining: usize, last_error: Option<String> }
+```
 
-`CancellationGuarantee::Cooperative` is the default. A handler that ignores its
-token remains owned and can become unconfirmed. `HardOnDrop` is reserved for
-implementations whose future owns and stops all per-call work on drop. Foreground
-bash cancellation kills its process group and waits for the child and output
-readers. Controlled hook requests retain their handler future through cancellation.
-The MCP bridge cancels the individual request and waits for its response; it does
-not restart a shared MCP server to force cancellation.
+`stopped: bool` is removed. Control requests include `protocol_version`, the
+creation-time `ExecutionContext`, server identity, operation/call IDs and the
+stable cancellation ID. Server identity prevents another subscriber on the
+shared control subject from answering for this invocation.
 
-RMCP's typed cancellation notification resolves its local response waiter when
-the notification is sent. That local result is not proof of remote shutdown.
-The bridge uses the raw notification variant with the same MCP wire payload to
-retain the real response waiter. Preserve this distinction when updating RMCP;
-the shared-call cancellation regression test exercises a handler that ignores
-its cancellation token while another call continues on the same server.
-An MCP server that suppresses the cancelled call's response supplies no shutdown
-acknowledgement; that operation remains unconfirmed even if its handler may have
-finished. The bridge must not infer completion from the notification or restart
-shared infrastructure to force it.
-The Kubernetes gateway follows the same rule for remote sandbox MCP calls and
-retains in-flight sandbox lifecycle operations until their futures settle.
+The tool server validates identity, cancels its local token, then commits the
+scope stop through the gate or proves an existing ancestor stop. It immediately
+returns `Accepted { stop }`, normally with cleanup `Pending`. It doesn't wait
+for the handler or descendants, or perform a cleanup-status read after obtaining
+the receipt. Cleanup bookkeeping follows independently through `CleanupUpdate`.
+A response timeout is `Unknown` **acceptance**: retry the same identity to recover
+the committed receipt. `Unconfirmed` **cleanup** says nothing about whether the
+stop was accepted. Session cancellation depends on root acceptance, never on
+these per-tool acknowledgements. Recovery activations and owner notifications
+run after the root receipt, not in its return path.
 
-Completed background commands, sandbox resources, committed handoffs, and
-completed side effects retain their existing lifecycle. Terminal child records
-are removed after their parent observes them. The current session record remains
-until replacement; session deletion purges its entire control prefix.
+Every worker starts a cleanup reconciler before serving turns. Its task is held
+by `WorkerRuntime`, outside individual turns. Retained gate scopes are its durable
+queue: startup and periodic scans recover stops even if a worker died between
+acceptance and the first wake-up. Watches reduce latency but aren't authoritative.
+The reconciler traverses physical resources under each interrupted scope, sends
+idempotent generation-bound owner requests with backoff (up to 30 seconds), and
+records aggregate `CleanupUpdate` status on that scope's gate. Five seconds
+without confirmation produces `Unconfirmed`. Later owner evidence may advance
+it to `Confirmed`; confirmed cleanup never reopens. Missing operation metadata,
+a missing process handle, an absent lease or a transcript Cancel isn't proof of
+shutdown. Recovery-only workers don't claim that a prior worker's resources have
+stopped. Old gate records containing only a cleanup label still decode, but a
+legacy confirmation without owner evidence is treated as unconfirmed.
+
+Resource owners retain their own handles:
+
+- **Tool invocation:** a server-lifetime supervised task owns the handler. The
+  request path owns a reply receiver only. A cooperative handler can stay pending
+  forever without delaying acceptance or the interrupted reply. Its cleanup
+  budget expires independently. Normal success or handler errors aren't replaced
+  by cleanup-derived Fatal errors. `HardOnDrop` remains a promise that dropping
+  the owned future stops all per-call work, not merely its reply stream.
+- **MCP:** bounded best-effort typed `notifications/cancelled`, close/unregister
+  this request's waiter and ignore late responses. No wait for a remote reply,
+  and no shared-server kill/restart to cancel one call. Lack of remote termination
+  evidence is `Unconfirmed`. The Kubernetes sandbox MCP adapter follows the same
+  rule without invalidating its shared session on cancellation.
+- **Sub-agent:** fence the original invocation subtree and transfer the owned
+  turn/follower handle to supervision. The foreground no longer waits for that
+  turn or calls the blocking five-second compatibility wrapper. Child timeouts
+  close a child-only admission token, so a late startup cannot create new work
+  and a delayed G1 cancellation cannot target G2.
+- **Foreground bash:** signal the owned process group, allow bounded TERM grace,
+  then escalate to group KILL and reap in the invocation owner task. The leader
+  isn't reaped during grace. Linux checks its start-time identity as well as the
+  owned child handle; no cleanup request reconstructs a reusable PID. Failed
+  identity checks remain unconfirmed rather than signalling an unrelated process.
+- **Model:** abort/drop the turn's model future. The lease supervisor doesn't wait
+  for the turn's physical drop; it retains the join handle in cleanup. A started
+  `spawn_blocking` cannot be aborted. Dropping a `JoinHandle` only detaches it.
+
+The session lease/control supervisor is outside the turn task. Each activation
+has a fresh cancellation signal, generation-bound sinks, per-turn config and
+completion channels. Interrupted cleanup retains G1-only state, not the active
+session slot, and never releases the lease serving G2. Tool-server user keys
+include the execution ID; old cleanup cannot release G2's server claim. Shared
+servers remain owned while invocation cleanup is unconfirmed. Activation
+preparation also runs outside the command dispatcher so slow server startup
+can't block other sessions or cleanup.
+
+Dropping a reply cannot undo an already-applied external side effect. Logical
+interruption rejects further Harnx output/work; it doesn't promise that arbitrary
+external work rolled back. Session deletion is still explicit. Stop, reply and
+cleanup evidence remain generation-scoped until retention permits deletion.
+
+### Early return and overlapping generations (#1878, Stage 8)
+
+TUI, one-shot CLI and NATS prompt followers complete interruption on durable
+**root acceptance**, not physical shutdown. `NatsSession::request_cancel` returns
+only after execution control has committed the stop through the governing gate.
+Its `CancelReceipt.cancelled` field means accepted, even when `disposition` still
+says requested, quiescing or unconfirmed. It does not mean every resource stopped.
+Tool acknowledgements, model future drop, transcript `Cancel`, lease release and
+cleanup confirmation are not prerequisites for returning this receipt.
+
+A dedicated follower watches its **admitted execution ID** through retained gate
+lineage. The watch stays independently pollable during attachment, activation
+and final history reads. Root acceptance returns `NatsTurnResult` with
+`was_cancelled: true`, no response and no error; it skips the final transcript
+reload and advisory flush. A follower attaching after G2 still resolves G1's stop,
+never G2's final response. An incomplete registration means keep waiting, not
+accepted cancellation or permission to run. Unreadable authority is an error.
+One-shot timeout signals this same generation-bound follower and preserves its
+timeout output/exit-code contract. It never sends a second session-current cancel
+that could accidentally interrupt G2.
+
+After acceptance the TUI dismisses the cancellation tray and confirmation modal,
+clears logical busy state and restores the composer. G2 can be submitted immediately.
+The previous frontend follower is aborted and its join is supervised asynchronously;
+there is no 500ms drain. Each prompt has fresh abort, event and pending-message
+state. Receipt-driven stop and generation/task checks reject late G1 events.
+Closing a tool-confirmation route synchronously invalidates its queued requests,
+so a delayed G1 modal cannot cover G2's composer.
+
+G2 admission still reconciles G1's ordered stop projection before appending new
+input. This is a durable ordering boundary, not a wait for handler shutdown.
+Every cancellation projection validates retained prompt ownership, including the
+worker/control path. G2 input can exist before G2's worker installs its gate member;
+gate-current G1 alone isn't permission to cover that input. Ownership validation
+and expected-tail projection CAS fence both sides of this interval.
+The worker transfers G1's turn join and resource cleanup to the Stage 7 supervisor
+and releases its session lease/active slot independently of G1 physical drop.
+G2 runs on the same worker while a cooperative G1 handler, model drop or external
+resource remains pending. Only one execution-control lease is held per session;
+cleanup has no authority to release G2's lease or mutate G2's state. G1 tool replies,
+model results, hooks and advisories retain their creation-time fences.
+
+New worker lease records also carry `execution_id`, preserved by renewal. If a
+frontend exits or a worker crashes after acceptance but before releasing its lease,
+the next worker reads that lease's original execution stop and revokes only that
+exact lease revision. Normal create-CAS then arbitrates replacement ownership;
+a renewal or intervening G2 lease defeats the revocation CAS. A pre-registration
+cancellation can revoke its bound lease too: the same operation CAS permanently
+closed gate registration. Missing execution identity never permits takeover, so
+unattributed legacy leases still require expiry. Lease takeover is not output
+permission; the replacement must claim its generation/owner through the gate.
+
+Normal success still requires durable `TurnEnd` coverage. An assistant row plus
+`Turn::Ended` is no longer a completion shortcut: both can precede the worker's
+durable `Error`. Failure cleanup stops leftover child scopes without turning the
+root failure into a user interruption. This keeps one-shot terminal errors visible.
+
+No opt-in flag is required for gated generations after the deterministic race
+suite passes. Legacy history without gate authority remains fail-closed: it needs
+reconciliation or explicit repair, not an invented acceptance proof. Cleanup
+`Unconfirmed` cannot revoke an accepted gate stop or block replacement. Acceptance
+`Unknown` (for example, a persistence timeout) cannot promise safe retry; retain
+the original execution/cancellation identity when reconciling it.
+
+Cleanup continues asynchronously and is recovered from retained stops after a
+worker restart or crash immediately after acceptance. Interrupt-and-exit returns
+on acceptance for local workers too. Exiting a local frontend still tears down its
+owned process tree; unavailable physical evidence remains unconfirmed rather than
+blocking the next gated generation. Cancellation cannot roll back external side
+effects already applied.
+
+Deterministic coverage includes same-worker G2 execution while G1 model drop is
+held at a barrier, a cooperative tool handler held past G2 completion, followers
+without a transcript stop marker, and delayed G1 followers/confirmation requests.
+
+Remote AG-UI SSE runs also bind to the generation that owns the attached prompt,
+not the session's current generation when an event arrives. A separate retained
+stop watch ends G1 even while history reads or a full output channel are blocked.
+G2 taking the session lease cannot prolong G1's stream or send G2 content under
+G1's run ID. Queue entries retain generation identity until wire emission. The
+lifecycle guard runs after that final filter, closing only segments sent to the
+client; discarded queued starts cannot produce orphan ends. Unknown legacy
+ownership stays history-only and cannot adopt a later generation's live events.
+Tests cover a retained stop without any transcript Cancel/TurnEnd, an active G2
+lease, channel backpressure, and cancellation before/after a queued lifecycle start.
+
+The Stages 1-7 suites cover journal/model/registration/dispatch races, stale KV,
+lost CAS acknowledgements, old high-sequence advisories, crash recovery, pruning,
+projection retry and late cleanup. Tests use barriers or explicit phase inputs;
+timeouts only bound failures.
 
 ### Frontend behavior
 
-The TUI replaces the composer with a cancellation tray for root cancellation.
-Unconfirmed state is static and offers `Ctrl+C` to retry or `Esc` to open an
-explicitly confirmed `resume anyway` abandonment. The confirmation warns that
-prior work may still be running. After local abandonment, the frontend retires
-its managed worker and tool-server process tree so the next prompt starts on a fresh worker. Child Ctrl+C
-targets the viewed or focused invocation only when its monitored execution ID
-matches. Worker
-preparation is outside the two-second durable-acceptance bound, and local retries
-retain their frontend-targeted activation route. Attaching to a session whose
-operation is already cancelling automatically retries recovery; accepted
-cancellation cannot be undone because descendants may already have stopped.
-Abandonment starts a new execution instead of reviving the old one.
-While requesting
-interrupt-and-exit, Esc in the exit confirmation stays in the TUI and keeps cancellation running, Ctrl+D
-exits immediately, and durable acceptance triggers automatic exit when the worker
-is remote or owned by another frontend. A worker owned by this TUI remains alive
-until the operation graph confirms cancellation, then the TUI exits automatically;
-this prevents frontend teardown from stranding registered child operations in an
-unconfirmed state. Persistence failure keeps an actionable tray.
+The TUI shows a root cancellation tray only until durable acceptance. From any
+unresolved phase, `Esc` restores an editable input while keeping the cancellation
+workflow alive. A compact status line retains progress, errors and retry hints.
+Restoring the editor is separate from admitting a new prompt: `Enter` cannot
+submit or queue a prompt while root cancellation is unresolved. Paste is ignored
+while the tray hides the editor; after `Esc`, paste edits only the retained draft.
+Acceptance clears the tray and submission guard immediately, without waiting for
+physical cleanup or auto-submitting the draft. G2 can then be submitted while G1
+cleanup continues as described in Stage 8.
+
+When the execution ID is known, `Esc` from `Unconfirmed` or `Failed` abandons
+directly without a confirmation modal. The prior-work warning remains in the
+tray status. With an unknown ID, `Esc` only restores the editor; it does not
+abandon work. `Ctrl+C` retries from these unresolved phases, retaining the
+observed session, cluster, execution ID and restored-editor state. It never
+retargets a delayed G1 request to the current G2. Repeated keys do not restart an
+in-flight request or abandonment. `Ctrl+D` exits immediately.
+
+Explicit abandonment remains available for unresolved historical cancellation;
+it permits a new execution instead of reviving the old one. After local
+abandonment, the frontend retires its managed worker and tool-server process
+tree so the next prompt starts on a fresh worker. Ordinary accepted interruption
+needs neither abandonment nor a resume-anyway confirmation.
+
+Child Ctrl+C targets only the viewed or focused invocation whose monitored
+execution ID matches, without clearing the root composer's state. Worker
+preparation remains outside the two-second durable-acceptance bound, and local
+retries retain their frontend-targeted activation route. Read-only attachment
+resolves gate acceptance before treating physical cleanup as logical activity;
+an unresolved observed cancellation can retry recovery for that same generation.
+
+While requesting interrupt-and-exit, Esc stays in the TUI and keeps cancellation
+running; Ctrl+D exits immediately. Acceptance exits automatically unless Esc
+cancelled that exit intent. Local worker ownership does not add a shutdown wait.
+The Web UI keeps its existing cancellation/abandonment controls; its browser
+reducer isolation remains the separate follow-up described in Stage 6.
 
 `session/cancel` accepts optional `expected_execution_id`. Its response retains
 `cancelled` and adds `disposition`, `cancellation_id`, `execution_id`,
@@ -669,10 +1143,11 @@ follows a different path than the local-actor case:
 - **Local actor running**: the SSE stream follows the `SessionActor` broadcast,
   which emits real-time `AgentEvent`s from the model/tool loop.
 - **Local actor idle + remote lease active**: the AG-UI endpoint attaches to
-  `SessionEventStream` advisories, translates them to AG-UI frames, and
-  terminates when a durable `TurnEnd` matching the snapshot's last `User`
-  sequence is observed. A sustained lease absence (5 consecutive 1s polls with
-  no `TurnEnd`) is treated as worker crash and forces finish.
+  `SessionEventStream` advisories and binds to the generation owning the
+  snapshot's last `User` row. It translates eligible events to AG-UI frames and
+  terminates on that generation's durable root stop or matching `TurnEnd` coverage. A
+  sustained lease absence (5 consecutive 1s polls with no `TurnEnd`) remains a
+  worker-crash fallback, never proof of cancellation or physical cleanup.
 
 The session metadata watch endpoint (`GET .../events`, `session_updates` in the
 serve implementation) is separate from the AG-UI `/run` stream and provides

@@ -17,7 +17,7 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
-const CI_SAFE_TIMEOUT: Duration = Duration::from_secs(30);
+const CI_SAFE_TIMEOUT: Duration = Duration::from_secs(60);
 use anyhow::Context;
 use harnx_execution_control::{ExecutionStore, OperationRef, OperationState, Owner};
 
@@ -59,8 +59,8 @@ async fn detached_delegation(
         .context("parent execution")?;
     claim_departed_owner(js, store, &root.reference).await?;
     let tool = OperationRef::new(storage_key(PARENT), CALL);
+    store.child(tool.clone(), root.reference).await?;
     if dispatched {
-        store.child(tool.clone(), root.reference).await?;
         store
             .claim(&tool, Owner::invocation("departed-subagent-server"))
             .await?;
@@ -68,6 +68,8 @@ async fn detached_delegation(
     let log = NatsSessionLog::for_agent(js.clone(), "metis", PARENT);
     let tool_round = append_detached_tool_round(&log, dispatched).await?;
     let request = harnx_toolset::ToolRequest {
+        execution: Some(harnx_toolset_server::invocation_admission::capture(store, &tool).await?),
+        replay_execution: None,
         replay: None,
         operation_id: CALL.into(),
         call_id: CALL.into(),
@@ -286,7 +288,8 @@ async fn verify_recovered_delegation(
     assert_eq!(results.len(), 1);
     assert_eq!(
         results[0].output["response"], "child result",
-        "recover the original delegation instead of synthesizing an interruption"
+        "recover the original delegation instead of synthesizing an interruption: {:?}",
+        results[0].output
     );
     assert_eq!(child_calls.load(Ordering::SeqCst), 1);
     let child_entries = NatsSessionLog::for_agent(js.clone(), "metis", CHILD)

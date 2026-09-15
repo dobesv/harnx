@@ -15,6 +15,8 @@ mod activity;
 mod execution_context;
 mod initializer;
 mod model;
+mod projection;
+pub(crate) use projection::MetadataOutput;
 mod read_state;
 mod store;
 mod tool_context;

@@ -16,6 +16,7 @@ pub mod bootstrap;
 pub mod client;
 pub mod commands;
 pub mod config;
+pub mod execution_fence;
 mod file_lock;
 pub mod local_orchestrator;
 pub mod nats_admin;
@@ -63,3 +64,7 @@ pub use agent_loop::{
 };
 
 pub use tool::{ConfirmToolUseFn, ToolApprovalInterrupt, ToolUseConfirmation};
+
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod nats_test_common;

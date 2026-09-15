@@ -18,6 +18,89 @@ use harnx_runtime::{
     },
 };
 
+struct TestSessionSetup {
+    // Preserve the lease until deletion; Drop otherwise releases it first.
+    _lease: harnx_runtime::nats_lease::NatsSessionLease,
+    lease_key: String,
+    metadata_store: SessionMetadataStore,
+}
+
+impl TestSessionSetup {
+    async fn prepare(
+        jetstream: &async_nats::jetstream::Context,
+        storage_key: &str,
+        session_id: &str,
+    ) -> Result<Self> {
+        let log = NatsSessionLog::new(jetstream.clone(), storage_key);
+        append_user_message(&log).await?;
+
+        let lease = harnx_runtime::nats_lease::NatsSessionLease::acquire(
+            harnx_runtime::nats_lease::NatsLeaseAcquireParams {
+                jetstream: jetstream.clone(),
+                session_id: storage_key,
+                worker_id: "w1".to_string(),
+                generation: 1,
+                config: NatsLeaseConfig::default(),
+                session_metadata: None,
+            },
+        )
+        .await?
+        .expect("lease acquired");
+        let lease_key = NatsLeaseConfig::default().key_for_session(storage_key);
+        lease.stop_renewal_for_test().await;
+
+        let metadata_store = SessionMetadataStore::ensure(jetstream, 1).await?;
+        metadata_store
+            .create(&SessionMetadata::new(
+                session_id,
+                SessionInitializer::named("oracle", Default::default()),
+            ))
+            .await?;
+
+        Ok(Self {
+            _lease: lease,
+            lease_key,
+            metadata_store,
+        })
+    }
+
+    async fn assert_deleted(
+        &self,
+        config: &Config,
+        jetstream: &async_nats::jetstream::Context,
+        storage_key: &str,
+    ) -> Result<()> {
+        let stream_name = stream_name_for_session(storage_key);
+        let err = jetstream
+            .get_stream(&stream_name)
+            .await
+            .expect_err("stream should be gone");
+        assert!(
+            err.to_string().contains("stream not found")
+                || err.to_string().contains("no responders")
+        );
+
+        let leases = config.nats_kv_bucket("local", "harnx_leases").await?;
+        let lease_entry = leases
+            .entry(self.lease_key.clone())
+            .await
+            .context("load deleted lease entry")?;
+        assert!(
+            lease_entry.is_none()
+                || !matches!(
+                    lease_entry.unwrap().operation,
+                    async_nats::jetstream::kv::Operation::Put
+                )
+        );
+
+        assert!(
+            self.metadata_store.get(storage_key).await?.is_none(),
+            "session metadata should be removed"
+        );
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<()> {
     require_nextest();
@@ -30,63 +113,16 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
     let jetstream = config.nats_jetstream("local").await?;
     let session_id = "delete-me";
     let storage_key = harnx_core::session_identity::session_key(Some("oracle"), session_id);
-    let log = NatsSessionLog::new(jetstream.clone(), &storage_key);
-    append_user_message(&log).await?;
-
-    let lease = harnx_runtime::nats_lease::NatsSessionLease::acquire(
-        harnx_runtime::nats_lease::NatsLeaseAcquireParams {
-            jetstream: jetstream.clone(),
-            session_id: &storage_key,
-            worker_id: "w1".to_string(),
-            generation: 1,
-            config: NatsLeaseConfig::default(),
-            session_metadata: None,
-        },
-    )
-    .await?
-    .expect("lease acquired");
-    let lease_key = NatsLeaseConfig::default().key_for_session(&storage_key);
-    lease.stop_renewal_for_test().await;
-
-    let metadata_store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    metadata_store
-        .create(&SessionMetadata::new(
-            session_id,
-            SessionInitializer::named("oracle", Default::default()),
-        ))
-        .await?;
+    let setup = TestSessionSetup::prepare(&jetstream, &storage_key, session_id).await?;
 
     let deleted = delete_remote_session(&config, "local", "oracle", session_id).await?;
     assert!(deleted.stream_deleted);
     assert!(deleted.lease_deleted);
-
-    let stream_name = stream_name_for_session(&storage_key);
-    let err = jetstream
-        .get_stream(&stream_name)
-        .await
-        .expect_err("stream should be gone");
-    assert!(
-        err.to_string().contains("stream not found") || err.to_string().contains("no responders")
-    );
-
-    let leases = config.nats_kv_bucket("local", "harnx_leases").await?;
-    let lease_entry = leases
-        .entry(lease_key.clone())
-        .await
-        .context("load deleted lease entry")?;
-    assert!(
-        lease_entry.is_none()
-            || !matches!(
-                lease_entry.unwrap().operation,
-                async_nats::jetstream::kv::Operation::Put
-            )
-    );
-
-    assert!(
-        metadata_store.get(&storage_key).await?.is_none(),
-        "session metadata should be removed"
-    );
     assert_eq!(deleted.metadata_keys_deleted, 2);
+
+    setup
+        .assert_deleted(&config, &jetstream, &storage_key)
+        .await?;
 
     let deleted_again = delete_remote_session(&config, "local", "oracle", session_id).await?;
     assert!(!deleted_again.stream_deleted);

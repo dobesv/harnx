@@ -216,8 +216,17 @@ impl Tui {
     pub(super) fn handle_subagent_session_event(
         &mut self,
         key: MonitoredSessionKey,
+        stamp: crate::event_isolation::EventStamp,
         event: AgentEvent,
     ) {
+        if !self
+            .app
+            .monitored_sessions
+            .get(&key)
+            .is_some_and(|state| stamp.allows(&state.live_events))
+        {
+            return;
+        }
         let event = flatten_subagent_event(event);
         if self.handle_nested_session_marker(&key, &event) {
             return;
