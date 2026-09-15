@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SubAgentSessionNotes } from './SubAgentSessionNotes';
 import { cancel, sessionControl } from './api';
@@ -55,31 +56,54 @@ describe('SubAgentSessionNotes', () => {
     );
 
     expect(screen.getByText(fullSessionId)).toBeVisible();
-    expect(screen.getByText('Running').closest('button')).toHaveAttribute('data-status', 'running');
-    expect(screen.getByText('Done').closest('button')).toHaveAttribute('data-status', 'done');
-    expect(screen.getByText('Failed').closest('button')).toHaveAttribute('data-status', 'failed');
+    expect(screen.getByText('Running').closest('.aui-sub-agent-row')).toHaveAttribute('data-status', 'running');
+    expect(screen.getByText('Done').closest('.aui-sub-agent-row')).toHaveAttribute('data-status', 'done');
+    expect(screen.getByText('Failed').closest('.aui-sub-agent-row')).toHaveAttribute('data-status', 'failed');
     expect(screen.getAllByText('in 120')).toHaveLength(3);
     expect(screen.getAllByText('out 45')).toHaveLength(3);
     expect(screen.getAllByText('cache 30')).toHaveLength(3);
     expect(screen.getAllByText('tools 3')).toHaveLength(3);
     expect(screen.getAllByText('2s')).toHaveLength(2);
     expect(screen.queryByText('2.5s')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', {
+    const runningLink = screen.getByRole('link', {
       name: `Open researcher sub-agent session ${fullSessionId} (running)`,
-    })).toBeVisible();
+    });
+    expect(runningLink).toBeVisible();
+    expect(runningLink).toHaveAttribute('href', `/agents/researcher/sessions/${fullSessionId}`);
   });
 
-  it('opens a child session by click, Enter, or Space', () => {
+  it('opens a child session by click or Enter, but not Space', async () => {
+    const user = userEvent.setup();
     const onOpen = vi.fn();
     render(<SubAgentSessionNotes notes={[note('done')]} onOpen={onOpen} />);
-    const button = screen.getByRole('button');
+    const link = screen.getByRole('link', {
+      name: 'Open researcher sub-agent session child-session-done (done)',
+    });
 
-    fireEvent.click(button);
-    fireEvent.keyDown(button, { key: 'Enter' });
-    fireEvent.keyDown(button, { key: ' ' });
-
-    expect(onOpen).toHaveBeenCalledTimes(3);
+    await user.click(link);
+    expect(onOpen).toHaveBeenCalledTimes(1);
     expect(onOpen).toHaveBeenLastCalledWith('researcher', 'child-session-done');
+
+    link.focus();
+    await user.keyboard('{Enter}');
+    expect(onOpen).toHaveBeenCalledTimes(2);
+    expect(onOpen).toHaveBeenLastCalledWith('researcher', 'child-session-done');
+
+    await user.keyboard(' ');
+    expect(onOpen).toHaveBeenCalledTimes(2);
+  });
+
+  it('renders open session affordance as an anchor link with properly encoded href', () => {
+    const customNote: SubAgentNote = {
+      ...note('done', 'child/session?#1'),
+      agent: 'special/agent',
+    };
+    render(<SubAgentSessionNotes notes={[customNote]} onOpen={() => {}} />);
+    const link = screen.getByRole('link');
+    expect(link).toHaveAttribute(
+      'href',
+      '/agents/special%2Fagent/sessions/child%2Fsession%3F%231',
+    );
   });
 
   describe('subagent title', () => {
@@ -385,14 +409,14 @@ describe('SubAgentSessionNotes', () => {
         startedAtMs: startTime,
       };
 
-      render(
+      const { container } = render(
         <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
       );
 
       // Displayed elapsed time must reflect startedAtMs (~4s), not stale elapsedMs (1s)
-      const button = screen.getByRole('button');
-      expect(button).toHaveAttribute('data-elapsed-ms');
-      const elapsedAttr = Number(button.getAttribute('data-elapsed-ms'));
+      const row = container.querySelector('.aui-sub-agent-row');
+      expect(row).toHaveAttribute('data-elapsed-ms');
+      const elapsedAttr = Number(row?.getAttribute('data-elapsed-ms'));
       expect(elapsedAttr).toBeGreaterThanOrEqual(3900);
     });
   });

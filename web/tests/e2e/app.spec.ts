@@ -75,9 +75,10 @@ test('sub-agent row transitions, opens the child, and browser Back returns to th
   await page.locator('.aui-composer-input').fill('delegate to researcher');
   await page.locator('.aui-composer-send').click();
 
-  const childRows = page.getByRole('button', {
+  const childLinks = page.getByRole('link', {
     name: /Open researcher sub-agent session child-session-0001/,
   });
+  const childRows = page.locator('.aui-sub-agent-row');
   const childRow = childRows.first();
   await expect(childRow).toHaveAttribute('data-status', 'running');
   await expect(childRow).toContainText('child-session-0001');
@@ -91,10 +92,10 @@ test('sub-agent row transitions, opens the child, and browser Back returns to th
 
   await page.locator('.aui-composer-input').fill('delegate to researcher');
   await page.locator('.aui-composer-send').click();
-  await expect(childRows).toHaveCount(2);
+  await expect(childLinks).toHaveCount(2);
   await expect(childRows.last()).toHaveAttribute('data-status', 'done', { timeout: 10000 });
 
-  await childRows.last().click();
+  await childLinks.last().click();
   await expect(page).toHaveURL(/\/agents\/researcher\/sessions\/child-session-0001/);
   await expect(page.locator('.aui-user-message')).toContainText('Research this task');
   await expect(page.locator('.aui-assistant-message')).toContainText('Child task complete.');
@@ -102,7 +103,7 @@ test('sub-agent row transitions, opens the child, and browser Back returns to th
   await page.goBack();
   await expect(page).toHaveURL(/\/agents\/coding%2Fcoder\/sessions\/session-1/);
   await expect(page.locator('.aui-user-message')).toHaveCount(2);
-  await expect(page.getByRole('button', {
+  await expect(page.getByRole('link', {
     name: /Open researcher sub-agent session child-session-0001 \(done\)/,
   })).toHaveCount(2);
 });
