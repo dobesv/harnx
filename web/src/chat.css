@@ -595,18 +595,7 @@ body {
   background: var(--muted);
   border: 1px solid var(--border);
   border-radius: 6px;
-  cursor: pointer;
   text-align: left;
-}
-
-.aui-sub-agent-note:hover {
-  border-color: var(--accent);
-  background: var(--surface-hover);
-}
-
-.aui-sub-agent-note:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
 }
 
 .aui-sub-agent-identity {
@@ -1202,6 +1191,35 @@ body {
 
 .aui-sub-agent-row { display: flex; align-items: center; gap: .5rem; }
 .aui-sub-agent-row .aui-sub-agent-note { flex: 1; min-width: 0; }
+.aui-sub-agent-open {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.4rem;
+  border-radius: var(--radius-md, 6px);
+  border: 1px solid var(--border);
+  background: var(--muted);
+  color: var(--text);
+  text-decoration: none;
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  flex: 0 0 auto;
+  transition: all 0.2s;
+}
+.aui-sub-agent-open:hover {
+  border-color: var(--accent);
+  background: var(--surface-hover);
+  color: var(--text-h);
+  text-decoration: none;
+}
+.aui-sub-agent-open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.aui-sub-agent-open:active {
+  transform: translateY(1px);
+}
 .aui-sub-agent-stop { padding: .4rem .7rem; cursor: pointer; }
 .aui-sub-agent-status-unconfirmed .aui-sub-agent-status-icon { animation: none; }
 
