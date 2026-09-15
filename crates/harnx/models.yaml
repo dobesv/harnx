@@ -693,6 +693,19 @@
       patches:
       - del(.body.temperature) | del(.body.top_p)
       endpoint: responses
+    - name: gpt-6-astra:high
+      real_name: gpt-6-astra
+      max_input_tokens: 922000
+      max_output_tokens: 128000
+      input_price: 10
+      output_price: 50
+      cache_read_price: 1
+      cache_write_price: 12.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.reasoning = {"effort":"high"}
+      endpoint: responses
     - name: gpt-6-astra:max
       real_name: gpt-6-astra
       max_input_tokens: 922000

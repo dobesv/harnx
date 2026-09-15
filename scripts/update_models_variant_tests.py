@@ -50,16 +50,21 @@ class TestOpenAIEffortVariants(unittest.TestCase):
                 um.apply_openai_base_patches(model, "openai")
                 self.assertEqual(model["patches"], [um.OPENAI_NO_SAMPLING_PATCH])
 
-    def test_astra_max_preserves_endpoint_and_refreshed_prices(self) -> None:
+    def test_astra_exposes_high_and_max_with_refreshed_prices(self) -> None:
         base = self._base("gpt-6-astra")
         base.update(input_price=10, output_price=50)
         variants = um.openai_effort_variants(base, "openai")
-        self.assertEqual([v["name"] for v in variants], ["gpt-6-astra:max"])
-        self.assertEqual(variants[0]["real_name"], "gpt-6-astra")
-        self.assertEqual(variants[0]["input_price"], 10)
-        self.assertEqual(variants[0]["output_price"], 50)
-        self.assertEqual(variants[0]["endpoint"], "responses")
-        self.assertIn('"effort":"max"', variants[0]["patches"][0])
+        self.assertEqual(
+            [v["name"] for v in variants],
+            ["gpt-6-astra:high", "gpt-6-astra:max"],
+        )
+        for variant in variants:
+            effort = variant["name"].rsplit(":", 1)[1]
+            self.assertEqual(variant["real_name"], "gpt-6-astra")
+            self.assertEqual(variant["input_price"], 10)
+            self.assertEqual(variant["output_price"], 50)
+            self.assertEqual(variant["endpoint"], "responses")
+            self.assertIn(f'"effort":"{effort}"', variant["patches"][0])
 
     def test_terra_only_exposes_the_curated_high_alias(self) -> None:
         variants = um.openai_effort_variants(self._base("gpt-5.6-terra"), "openai")
