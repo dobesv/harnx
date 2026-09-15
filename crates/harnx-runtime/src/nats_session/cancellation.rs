@@ -30,20 +30,17 @@ pub(crate) async fn resolve_pending_execution(
     session_id: &str,
 ) -> Result<Option<Operation>> {
     let previous = store.current(session_id).await?;
-    if let Some(operation) = &previous {
-        if !operation.state.is_terminal() {
-            return Ok(Some(operation.clone()));
-        }
-    }
-    let entries = NatsSessionLog::new(jetstream.clone(), session_id)
-        .load_events_latest_async()
-        .await?;
+    let log = NatsSessionLog::new(jetstream.clone(), session_id);
+    restore_selected_stop(&log, store, previous.as_ref()).await?;
+    let entries = log.load_events_latest_async().await?;
     let pending = entries.iter().rev().find_map(|(seq, entry)| match entry {
         SessionLogEntry::Message { id, role, .. } if role.is_user() => Some((*seq, id.clone())),
         _ => None,
     });
     let Some((seq, message_id)) = pending else {
-        return Ok(None);
+        // Control can target an existing owner before its first transcript entry.
+        // This never creates a generation or adopts a prompt.
+        return Ok(previous.filter(|operation| !operation.state.is_terminal()));
     };
     // An inherited cancellation can stop an ownerless child before a worker
     // has a fence with which to append a transcript Cancel entry. Its terminal
@@ -52,18 +49,82 @@ pub(crate) async fn resolve_pending_execution(
     if pending_prompt_is_covered(&entries, previous.as_ref(), seq)? {
         return Ok(None);
     }
-    let operation = store.session(session_id, None, None).await?;
-    let message_id = message_id.unwrap_or_else(|| format!("legacy-{seq}"));
-    store
-        .reserve_prompt(&operation.reference, &message_id)
-        .await?;
-    store
-        .commit_prompt(&operation.reference, &message_id, seq)
-        .await?;
+    let history = store.recovery_history(session_id).await?;
+    let owner =
+        crate::nats_session_log::recovery::prompt_owner(&history, message_id.as_deref(), seq)?
+            .with_context(|| {
+                format!(
+            "unknown pending prompt generation; automatic adoption refused: session={} seq={seq}",
+            session_id
+        )
+            })?;
+    resolve_owned_prompt(store, &log, owner, previous).await
+}
+
+async fn restore_selected_stop(
+    log: &NatsSessionLog,
+    store: &ExecutionStore,
+    previous: Option<&Operation>,
+) -> Result<()> {
+    if let Some(operation) = previous.filter(|op| op.gate_registration.is_some()) {
+        log.recover_stop(store, &operation.reference).await?;
+    }
+    Ok(())
+}
+
+async fn resolve_owned_prompt(
+    store: &ExecutionStore,
+    log: &NatsSessionLog,
+    owner: &harnx_execution_control::RecoveryHistory,
+    previous: Option<Operation>,
+) -> Result<Option<Operation>> {
+    if pending_owner_stopped(log, store, owner).await? {
+        return Ok(previous.filter(|operation| {
+            operation.reference == owner.reference && !operation.state.is_terminal()
+        }));
+    }
+    let operation = store
+        .get(&owner.reference)
+        .await?
+        .context("pending prompt owner retired")?;
+    // Physical cancellation can win before the gate marker exists, or after
+    // the history snapshot above. Return only the original cleanup owner; a
+    // closed record never justifies installing another generation.
+    if operation.state.is_terminal() {
+        return Ok(None);
+    }
     Ok(Some(operation))
 }
 
+async fn pending_owner_stopped(
+    log: &NatsSessionLog,
+    store: &ExecutionStore,
+    owner: &harnx_execution_control::RecoveryHistory,
+) -> Result<bool> {
+    if owner.gate_registration.is_some()
+        && log.recover_stop(store, &owner.reference).await?.is_some()
+    {
+        return Ok(true);
+    }
+    store.is_stop_fenced(&owner.reference).await
+}
+
 impl NatsSession {
+    pub(super) async fn reconcile_previous_stop(&self) -> Result<()> {
+        let Some(previous) = self
+            .execution_store
+            .current(&self.storage_key)
+            .await?
+            .filter(|operation| operation.gate_registration.is_some())
+        else {
+            return Ok(());
+        };
+        NatsSessionLog::new(self.jetstream.clone(), &self.storage_key)
+            .recover_stop(&self.execution_store, &previous.reference)
+            .await?;
+        Ok(())
+    }
+
     pub fn execution_store(&self) -> &ExecutionStore {
         &self.execution_store
     }
@@ -74,6 +135,20 @@ impl NatsSession {
         self
     }
 
+    /// A sub-agent follower can only interrupt the invocation it was created for.
+    /// Never turn delayed G1 cleanup into a request against a session's current G2.
+    pub(crate) async fn request_invocation_cancel(&self) -> Result<CancelReceipt> {
+        if let Some(cancel) = &self.parent_cancel {
+            cancel.cancel();
+        }
+        self.abort_signal.set_ctrlc();
+        self.request_cancel(CancelRequest {
+            expected_execution_id: self.invocation_id.clone(),
+            retry: false,
+        })
+        .await
+    }
+
     /// Acceptance is the KV CAS, bounded independently of execution shutdown.
     pub async fn request_cancel(&self, request: CancelRequest) -> Result<CancelReceipt> {
         // A generation-scoped request may come from an old child row. Only
@@ -81,69 +156,71 @@ impl NatsSession {
         if request.expected_execution_id.is_none() {
             self.abort_signal.set_ctrlc();
         }
-        let receipt = tokio::time::timeout(Duration::from_secs(2), async {
-            resolve_pending_execution(&self.execution_store, &self.jetstream, &self.session_id)
-                .await?;
+        // Prompt admission already binds the selected execution. Recovery and
+        // transcript projection must not delay (or invalidate) a root receipt.
+        let receipt = tokio::time::timeout(
+            Duration::from_secs(2),
             self.execution_store
-                .request_cancel(&self.session_id, request)
-                .await
-        })
+                .request_cancel(&self.storage_key, request),
+        )
         .await
         .context("timed out persisting cancellation request; retry to reconcile")??;
         if receipt.cancelled {
             self.abort_signal.set_ctrlc();
-            // The cancellation CAS above is already authoritative. Activation
-            // only wakes a replacement worker when no active owner is watching
-            // the graph, so a slow or failed publish must not turn an accepted
-            // cancellation into a request failure.
+            self.wake_cancelled_generation(receipt.clone());
+        }
+        Ok(receipt)
+    }
+
+    fn wake_cancelled_generation(&self, receipt: CancelReceipt) {
+        let session = self.clone();
+        harnx_execution_control::CleanupTasks::process().spawn(async move {
+            let Some(execution_id) = receipt.execution_id else {
+                return;
+            };
+            let reference = OperationRef::new(&session.storage_key, &execution_id);
             let wake = async {
-                let operation = self
+                let operation = session
                     .execution_store
-                    .current(&self.session_id)
+                    .get(&reference)
                     .await?
-                    .context("execution missing")?;
+                    .context("cancelled execution missing")?;
                 let through = operation
                     .admissions
                     .values()
                     .filter_map(|seq| *seq)
                     .max()
                     .unwrap_or(0);
-                self.publish_activation((&operation.reference.execution_id, through), None, None)
+                session
+                    .publish_control_activation((&execution_id, through), None, None)
                     .await
             };
-            match tokio::time::timeout(Duration::from_secs(2), wake).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    log::warn!("failed to publish cancellation recovery activation: {error:#}");
+            let notify = async {
+                if let Some(cancellation_id) = receipt.cancellation_id {
+                    let command = ControlCommand::CancelExecution {
+                        execution_id: execution_id.clone(),
+                        cancellation_id,
+                    };
+                    let _ =
+                        publish_control_command(&session.client, &session.storage_key, &command)
+                            .await;
                 }
-                Err(_) => {
-                    log::warn!("timed out publishing cancellation recovery activation");
-                }
-            }
-        }
-        // The operation is already durable. Failure to publish a latency hint
-        // must never turn accepted cancellation into a request-failed UI.
-        if let (Some(execution_id), Some(cancellation_id)) =
-            (&receipt.execution_id, &receipt.cancellation_id)
-        {
-            let command = ControlCommand::CancelExecution {
-                execution_id: execution_id.clone(),
-                cancellation_id: cancellation_id.clone(),
             };
-            let client = self.client.clone();
-            let session = self.session_id.clone();
-            tokio::spawn(async move {
-                let _ = publish_control_command(&client, &session, &command).await;
-            });
-        }
-        Ok(receipt)
+            // A slow recovery activation must not hold the live owner's stop
+            // hint behind it. The durable watch recovers either lost wakeup.
+            let (activation, ()) =
+                tokio::join!(tokio::time::timeout(Duration::from_secs(2), wake), notify);
+            if let Err(error) = activation {
+                log::warn!("cancellation recovery activation timed out: {error}");
+            }
+        });
     }
 
     pub async fn cancel_status(&self, receipt: &CancelReceipt) -> Result<CancellationStatus> {
         let Some(execution_id) = receipt.execution_id.as_ref() else {
             return Ok(receipt.clone());
         };
-        let reference = OperationRef::new(&self.session_id, execution_id);
+        let reference = OperationRef::new(&self.storage_key, execution_id);
         let operation = self
             .execution_store
             .get(&reference)
@@ -163,11 +240,15 @@ impl NatsSession {
         expected_execution_id: &str,
     ) -> Result<CancelReceipt> {
         self.execution_store
-            .abandon_unconfirmed(&self.session_id, expected_execution_id)
+            .abandon_unconfirmed(&self.storage_key, expected_execution_id)
             .await
     }
 
     async fn reconcile_cancelled_owner(&self, operation: &Operation) -> Result<()> {
+        // Gated executions require owner evidence from the cleanup supervisor.
+        if operation.gate_registration.is_some() {
+            return Ok(());
+        }
         if !operation.state.cancelling() || operation.owner.is_none() {
             return Ok(());
         }
@@ -191,7 +272,7 @@ impl NatsSession {
         if !operation.admissions_covered(cancel_seq) {
             return Ok(());
         }
-        if crate::nats_lease::session_has_active_lease(&self.jetstream, &self.session_id).await? {
+        if crate::nats_lease::session_has_active_lease(&self.jetstream, &self.storage_key).await? {
             return Ok(());
         }
         self.execution_store
@@ -232,22 +313,27 @@ impl NatsSession {
         }
     }
 
-    /// Blocking compatibility wrapper. A durable request alone is not success.
+    /// Return on durable acceptance. Physical cleanup is reported separately by
+    /// `cancel_status` / `wait_for_cancel` and never delays a caller's return.
     pub async fn cancel_pending_turn(&self) -> Result<bool> {
-        let receipt = self.request_cancel(CancelRequest::default()).await?;
-        let status = self
-            .wait_for_cancel(
-                &receipt,
-                tokio::time::Instant::now() + Duration::from_secs(5),
-            )
-            .await?;
-        match status.disposition {
-            CancelDisposition::Idle => Ok(false),
-            CancelDisposition::Cancelled => Ok(true),
-            _ => anyhow::bail!(
-                "cancellation unconfirmed for session '{}'; retry cancellation before prompting",
-                self.session_id
-            ),
+        Ok(self
+            .request_cancel(CancelRequest::default())
+            .await?
+            .cancelled)
+    }
+
+    /// Observe the admitted generation, not whichever generation is current when
+    /// an update arrives. Retained gate stops survive pruning and replacement.
+    pub(super) async fn wait_for_root_stop(&self, execution_id: &str) -> Result<()> {
+        let reference = OperationRef::new(&self.storage_key, execution_id);
+        let mut updates = self.execution_store.watch().await?;
+        loop {
+            if let Some(stop) = self.execution_store.accepted_stop(&reference).await? {
+                log::info!("nats session: root interruption accepted: execution={} cancellation={} reason={}",
+                    execution_id, stop.decision.cancellation_id, stop.decision.reason);
+                return Ok(());
+            }
+            updates.next().await.context("root stop watch closed")??;
         }
     }
 }

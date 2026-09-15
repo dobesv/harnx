@@ -10,9 +10,11 @@ async-nats.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 harnx-nats-common.workspace = true
+log.workspace = true
 metrics.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 uuid.workspace = true
 

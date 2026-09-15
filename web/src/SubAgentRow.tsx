@@ -1,7 +1,8 @@
 import { cancel, sessionControl } from './api';
 import { isAbortError } from './httpClient';
 import { useEffect, useRef, useState } from 'react';
-import type { KeyboardEvent } from 'react';
+import { LinkButton } from './LinkButton';
+import { OpenInNewIcon } from './icons';
 import type { SubAgentNote } from './subAgentNotes';
 import type { SubAgentSessionNotesProps } from './SubAgentSessionNotes';
 
@@ -13,16 +14,6 @@ const STATUS_LABEL = {
   cancelled: 'Cancelled',
   unconfirmed: 'Unconfirmed',
 } as const;
-
-function activateOnKey(
-  event: KeyboardEvent<HTMLButtonElement>,
-  action: () => void,
-) {
-  if (event.key === 'Enter' || event.key === ' ') {
-    event.preventDefault();
-    action();
-  }
-}
 
 function elapsedMs(note: SubAgentNote, nowMs: number) {
   if (note.status !== 'running') return note.elapsedMs;
@@ -141,40 +132,50 @@ export function SubAgentRow({ note, nowMs, onOpen }: { note: SubAgentNote; nowMs
     }
   };
         const statusLabel = STATUS_LABEL[localStatus ?? note.status];
-        const open = () => onOpen(note.agent, note.sessionId);
         const displayedElapsedMs = elapsedMs(note, localStatus ? (stoppedAt ?? note.updatedAtMs) : nowMs);
+        const sessionHref = `/agents/${encodeURIComponent(note.agent)}/sessions/${encodeURIComponent(note.sessionId)}`;
         return (
-          <div className="aui-sub-agent-row">
-          <button
-            type="button"
-            className="aui-sub-agent-note"
+          <div
+            className="aui-sub-agent-row"
             data-status={localStatus ?? note.status}
             data-elapsed-ms={Math.floor(displayedElapsedMs)}
-            aria-label={`Open ${note.agent} sub-agent session ${note.sessionId} (${statusLabel.toLowerCase()})`}
-            onClick={open}
-            onKeyDown={(event) => activateOnKey(event, open)}
           >
-            <span className="aui-sub-agent-identity">
-              <span className="aui-sub-agent-identity-line">
-                <span className="aui-sub-agent-name">{note.agent}</span>
-                <span className="aui-sub-agent-session">{note.sessionId}</span>
+            <div className="aui-sub-agent-note">
+              <span className="aui-sub-agent-identity">
+                <span className="aui-sub-agent-identity-line">
+                  <span className="aui-sub-agent-name">{note.agent}</span>
+                  <span className="aui-sub-agent-session">{note.sessionId}</span>
+                </span>
+                {note.title?.trim() ? (
+                  <span className="aui-sub-agent-title" title={note.title}>
+                    {note.title}
+                  </span>
+                ) : null}
+                <span className="aui-sub-agent-metrics">
+                  <span>{formatElapsed(displayedElapsedMs)}</span>
+                  <span>in {formatTokens(note.inputTokens)}</span>
+                  <span>out {formatTokens(note.outputTokens)}</span>
+                  <span>cache {formatTokens(note.cachedTokens)}</span>
+                  <span>tools {note.toolCallCount}</span>
+                </span>
               </span>
-              <span className="aui-sub-agent-metrics">
-                <span>{formatElapsed(displayedElapsedMs)}</span>
-                <span>in {formatTokens(note.inputTokens)}</span>
-                <span>out {formatTokens(note.outputTokens)}</span>
-                <span>cache {formatTokens(note.cachedTokens)}</span>
-                <span>tools {note.toolCallCount}</span>
+              <span className={`aui-sub-agent-status aui-sub-agent-status-${localStatus ?? note.status}`}>
+                <span className="aui-sub-agent-status-icon" aria-hidden="true" />
+                {statusLabel}
               </span>
-            </span>
-            <span className={`aui-sub-agent-status aui-sub-agent-status-${localStatus ?? note.status}`}>
-              <span className="aui-sub-agent-status-icon" aria-hidden="true" />
-              {statusLabel}
-            </span>
-          </button>
-          {canStop && <button type="button" className="aui-sub-agent-stop" aria-label={`Stop ${note.agent} sub-agent session ${note.sessionId}`} onClick={() => void stop()}>Stop</button>}
-          {localStatus === 'unconfirmed' && <button type="button" aria-label={`Retry stopping ${note.agent}`} onClick={() => void stop()}>Retry</button>}
-          {error && <span role="alert">{error}</span>}
+            </div>
+            <LinkButton
+              href={sessionHref}
+              onNavigate={() => onOpen(note.agent, note.sessionId)}
+              className="aui-sub-agent-open"
+              aria-label={`Open ${note.agent} sub-agent session ${note.sessionId} (${statusLabel.toLowerCase()})`}
+              title={`Open ${note.agent} sub-agent session ${note.sessionId}`}
+            >
+              <OpenInNewIcon />
+            </LinkButton>
+            {canStop && <button type="button" className="aui-sub-agent-stop" aria-label={`Stop ${note.agent} sub-agent session ${note.sessionId}`} onClick={() => void stop()}>Stop</button>}
+            {localStatus === 'unconfirmed' && <button type="button" aria-label={`Retry stopping ${note.agent}`} onClick={() => void stop()}>Retry</button>}
+            {error && <span role="alert">{error}</span>}
           </div>
         );
 

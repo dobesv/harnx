@@ -137,6 +137,8 @@ pub async fn handle_ag_ui_rpc_bytes(
         "session/cancel" | "session/abandon_cancellation" => {
             cancellation::handle((&rpc.method, rpc.id, rpc.params), (config, registry, key)).await
         }
+        "session/mark_read" => handle_mark_read(rpc.id, config, key).await,
+        "session/mark_unread" => handle_mark_unread(rpc.id, config, key).await,
         _ => json_rpc_response(
             StatusCode::OK,
             json_rpc_error(rpc.id, -32601, "method not found", None),
@@ -427,7 +429,7 @@ pub(crate) async fn route_hitl_decision(
 }
 
 async fn session_exists(config: &harnx_runtime::config::Config, key: &SessionKey) -> bool {
-    match load_nats_session(config, &key.session).await {
+    match load_nats_session(config, &key.agent, &key.session).await {
         Ok((session, _entries)) => {
             return session.agent_name.as_deref() == Some(key.agent.as_str())
         }
@@ -443,6 +445,87 @@ async fn session_exists(config: &harnx_runtime::config::Config, key: &SessionKey
     )
     .await
     .unwrap_or(false)
+}
+
+async fn handle_mark_read(
+    id: Value,
+    config: &harnx_runtime::config::Config,
+    key: SessionKey,
+) -> anyhow::Result<AppResponse> {
+    handle_mark_read_state(id, config, key, MarkReadOp::Read).await
+}
+
+async fn handle_mark_unread(
+    id: Value,
+    config: &harnx_runtime::config::Config,
+    key: SessionKey,
+) -> anyhow::Result<AppResponse> {
+    handle_mark_read_state(id, config, key, MarkReadOp::Unread).await
+}
+
+/// Operation type for mark read/unread handlers.
+enum MarkReadOp {
+    Read,
+    Unread,
+}
+
+impl MarkReadOp {
+    fn error_message(&self) -> &'static str {
+        match self {
+            MarkReadOp::Read => "Failed to mark session as read",
+            MarkReadOp::Unread => "Failed to mark session as unread",
+        }
+    }
+}
+
+/// Shared handler for session/mark_read and session/mark_unread RPC methods.
+async fn handle_mark_read_state(
+    id: Value,
+    config: &harnx_runtime::config::Config,
+    key: SessionKey,
+    op: MarkReadOp,
+) -> anyhow::Result<AppResponse> {
+    if !session_exists(config, &key).await {
+        return json_rpc_response(
+            StatusCode::NOT_FOUND,
+            json_rpc_error(
+                id,
+                JSON_RPC_UNKNOWN_SESSION_CODE,
+                "session not found",
+                Some(json!({ "agent": key.agent, "session": key.session })),
+            ),
+        );
+    }
+
+    let jetstream = config
+        .nats_jetstream(crate::LOCAL_CLUSTER_KEY)
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to connect to NATS: {err}"))?;
+    let metadata_store =
+        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to get metadata store: {err}"))?;
+
+    let storage_key = key.storage_key();
+    match op {
+        MarkReadOp::Read => {
+            metadata_store
+                .mark_read(&storage_key)
+                .await
+                .map_err(|err| anyhow::anyhow!("{}: {err}", op.error_message()))?;
+        }
+        MarkReadOp::Unread => {
+            metadata_store
+                .mark_unread(&storage_key)
+                .await
+                .map_err(|err| anyhow::anyhow!("{}: {err}", op.error_message()))?;
+        }
+    }
+
+    json_rpc_response(
+        StatusCode::OK,
+        json!({ "jsonrpc": "2.0", "id": id, "result": { "status": "ok" } }),
+    )
 }
 
 fn session_state_json(state: &SessionState) -> Value {

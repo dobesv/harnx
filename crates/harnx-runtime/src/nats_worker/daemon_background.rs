@@ -245,6 +245,7 @@ async fn start_subagent_toolset(start: SubagentToolsetStart) -> Result<JoinHandl
 }
 
 pub(super) struct WorkerServices {
+    pub(super) cleanup: super::cleanup_supervisor::CleanupSupervisor,
     pub(super) background: Arc<Mutex<Option<BackgroundServices>>>,
     pub(super) session_metadata: crate::nats_session_metadata::SessionMetadataStore,
     pub(super) background_services_attempted: tokio::sync::watch::Receiver<bool>,
@@ -350,7 +351,11 @@ pub(super) async fn launch_worker_services(
         session_metadata: session_metadata.clone(),
     });
 
+    let cleanup =
+        super::cleanup_supervisor::CleanupSupervisor::start(&startup.jetstream, startup.replicas)
+            .await?;
     Ok(WorkerServices {
+        cleanup,
         background,
         session_metadata,
         background_services_attempted,

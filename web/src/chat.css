@@ -63,6 +63,84 @@ body {
   color: var(--text-h);
 }
 
+.session-item-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.session-item-header h3 {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-unread-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.15rem 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+  color: var(--accent-contrast);
+  flex-shrink: 0;
+}
+
+.session-item-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  margin-top: 0.75rem;
+}
+
+.session-item-main {
+  cursor: pointer;
+}
+
+.session-item-main:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.session-mark-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 0.25rem 0.5rem;
+  font-size: 0.75rem;
+  min-height: 24px;
+  min-width: 24px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.session-mark-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--surface-hover);
+}
+
+.session-mark-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.session-unread-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+}
+
 .grid-item p {
   margin: 0;
   font-size: 0.9rem;
@@ -166,7 +244,6 @@ body {
 
 .aui-thread-empty .aui-composer-container {
   background: transparent;
-  border-top: none;
   padding: 0;
 }
 
@@ -193,9 +270,8 @@ body {
 .aui-composer-container {
   position: relative;
   width: 100%;
-  padding: 0;
+  padding: 0.75rem 1.5rem 1rem;
   background: var(--bg);
-  border-top: 1px solid var(--border);
 }
 
 .aui-message {
@@ -519,18 +595,7 @@ body {
   background: var(--muted);
   border: 1px solid var(--border);
   border-radius: 6px;
-  cursor: pointer;
   text-align: left;
-}
-
-.aui-sub-agent-note:hover {
-  border-color: var(--accent);
-  background: var(--surface-hover);
-}
-
-.aui-sub-agent-note:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
 }
 
 .aui-sub-agent-identity {
@@ -567,6 +632,15 @@ body {
   min-width: 0;
   font-family: var(--mono);
   overflow-wrap: anywhere;
+}
+
+.aui-sub-agent-title {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
 }
 
 .aui-sub-agent-status {
@@ -758,6 +832,7 @@ body {
 }
 
 .aui-composer-menu-trigger-icon {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1116,6 +1191,35 @@ body {
 
 .aui-sub-agent-row { display: flex; align-items: center; gap: .5rem; }
 .aui-sub-agent-row .aui-sub-agent-note { flex: 1; min-width: 0; }
+.aui-sub-agent-open {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.4rem;
+  border-radius: var(--radius-md, 6px);
+  border: 1px solid var(--border);
+  background: var(--muted);
+  color: var(--text);
+  text-decoration: none;
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  flex: 0 0 auto;
+  transition: all 0.2s;
+}
+.aui-sub-agent-open:hover {
+  border-color: var(--accent);
+  background: var(--surface-hover);
+  color: var(--text-h);
+  text-decoration: none;
+}
+.aui-sub-agent-open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.aui-sub-agent-open:active {
+  transform: translateY(1px);
+}
 .aui-sub-agent-stop { padding: .4rem .7rem; cursor: pointer; }
 .aui-sub-agent-status-unconfirmed .aui-sub-agent-status-icon { animation: none; }
 

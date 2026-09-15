@@ -121,6 +121,8 @@ async fn registrations_present(registry: &kv::Store, keys: &[String]) -> Result<
 
 async fn invoke_named(client: &async_nats::Client, scope: &ServerScope, name: &str) -> Result<()> {
     let request = ToolRequest {
+        execution: None,
+        replay_execution: None,
         replay: None,
         operation_id: format!("call-{name}"),
         call_id: format!("call-{name}"),

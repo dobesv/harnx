@@ -15,17 +15,7 @@ async fn nats_durable_refresh_preserves_queued_handoff() {
     let client = config.nats_client(LOCAL_CLUSTER_KEY).await.unwrap();
     let jetstream = async_nats::jetstream::new(client.clone());
     let target = ("source-session".to_string(), LOCAL_CLUSTER_KEY.to_string());
-    let log = NatsSessionLog::new(jetstream.clone(), &target.0);
-    let user_seq = log
-        .append_event_async(&SessionLogEntry::Message {
-            id: None,
-            role: MessageRole::User,
-            content: MessageContent::Text("delegate".into()),
-            timestamp: None,
-            fence_token: None,
-        })
-        .await
-        .unwrap();
+    let (log, user_seq) = admit_source_user(&jetstream, &target.0).await;
     let mut stream = SessionEventStream::attach(jetstream, client.clone(), &target.0)
         .await
         .unwrap();
@@ -33,6 +23,7 @@ async fn nats_durable_refresh_preserves_queued_handoff() {
     let forwarder = SessionEventForwarder {
         event_tx: &event_tx,
         target: &target,
+        live: stream.live_state().clone(),
         attached_seq: stream.last_applied_seq(),
         attached_during_turn: true,
     };
@@ -43,7 +34,13 @@ async fn nats_durable_refresh_preserves_queued_handoff() {
     refresh.tick().await;
     tokio::time::sleep(Duration::from_millis(5)).await;
     assert!(matches!(
-        next_session_activity_input(stream.next(), active, &mut refresh).await,
+        next_session_activity_input(
+            stream.next(),
+            active,
+            &mut refresh,
+            std::future::pending::<Option<async_nats::Message>>()
+        )
+        .await,
         SessionActivityInput::RefreshDurableHistory
     ));
     assert!(matches!(
@@ -109,6 +106,7 @@ async fn assert_child_result_recovery(compacted: bool) {
     let forwarder = SessionEventForwarder {
         event_tx: &event_tx,
         target: &target,
+        live: tui.live_events.clone(),
         attached_seq: 1,
         attached_during_turn: true,
     };
@@ -168,6 +166,7 @@ fn completed_child_progress() -> harnx_core::event::SubAgentProgress {
         elapsed_ms: 375_177,
         usage: harnx_core::api_types::CompletionTokenUsage::new(Some(1200), Some(345), Some(67)),
         tool_call_count: 56,
+        title: None,
     }
 }
 
@@ -212,7 +211,8 @@ async fn queue_completed_handoff(
             handoff_tool_call_id: None,
             after_seq: Some(handoff_seq),
         }),
-    );
+    )
+    .with_execution_id("source-generation");
     client
         .publish(
             events_subject(session_id),
@@ -231,4 +231,70 @@ async fn queue_completed_handoff(
     .unwrap();
 
     handoff_seq
+}
+
+#[test]
+fn old_advisory_with_high_after_seq_never_reaches_shared_queue() {
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let target = ("session".into(), "cluster".into());
+    let live = LiveEventState::default();
+    live.select(Some("g2".into()));
+    let forwarder = SessionEventForwarder {
+        event_tx: &event_tx,
+        target: &target,
+        live: live.clone(),
+        attached_seq: 1,
+        attached_during_turn: true,
+    };
+    let mut active = true;
+    for event in crate::event_isolation::tests::old_events() {
+        let envelope = AdvisoryEnvelope::new(u64::MAX, event).with_execution_id("g1");
+        assert!(forward_advisory(&forwarder, envelope, &mut active));
+        assert!(active, "old Turn::Ended changed shared activity");
+        assert!(event_rx.try_recv().is_err());
+    }
+    live.stop("g2");
+    for event in crate::event_isolation::tests::old_events() {
+        assert!(forward_advisory(
+            &forwarder,
+            AdvisoryEnvelope::new(u64::MAX, event).with_execution_id("g2"),
+            &mut active
+        ));
+    }
+    assert!(active);
+    assert!(event_rx.try_recv().is_err());
+}
+
+async fn admit_source_user(
+    jetstream: &async_nats::jetstream::Context,
+    session: &str,
+) -> (NatsSessionLog, u64) {
+    let store = harnx_execution_control::ExecutionStore::ensure(jetstream, 1)
+        .await
+        .unwrap();
+    store
+        .session(session, None, Some("source-generation"))
+        .await
+        .unwrap();
+    let operation = store.current(session).await.unwrap().unwrap();
+    store
+        .reserve_prompt(&operation.reference, "user")
+        .await
+        .unwrap();
+    let log = NatsSessionLog::new(jetstream.clone(), session);
+    let user_seq = log
+        .append_event_async(&SessionLogEntry::Message {
+            id: Some("user".into()),
+            role: MessageRole::User,
+            content: MessageContent::Text("delegate".into()),
+            timestamp: None,
+            fence_token: None,
+        })
+        .await
+        .unwrap();
+    store
+        .commit_prompt(&operation.reference, "user", user_seq)
+        .await
+        .unwrap();
+    (log, user_seq)
 }

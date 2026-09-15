@@ -5,6 +5,7 @@
 
 pub mod agent_event_sink;
 mod cancellation;
+mod event_isolation;
 pub mod event_source;
 mod exit_confirmation;
 pub mod input;

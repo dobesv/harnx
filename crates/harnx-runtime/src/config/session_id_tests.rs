@@ -9,23 +9,26 @@ async fn new_session_has_short_id_and_durable_reservation() {
     };
     let session_id = Config::reserve_new_session_id(&config).await.unwrap();
     let snapshot = config.read().clone();
+    let storage_key = crate::SessionInitializer::from_config(&snapshot)
+        .unwrap()
+        .session_key(&session_id);
     let jetstream = snapshot.nats_jetstream(TEST_CLUSTER).await.unwrap();
     let metadata_store = crate::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
         .await
         .unwrap();
     let metadata = metadata_store
-        .get(&session_id)
+        .get(&storage_key)
         .await
         .unwrap()
         .expect("reservation creates complete metadata");
     assert_eq!(metadata.metadata.session_id, session_id);
     assert!(metadata_store
-        .get_activity(&session_id)
+        .get_activity(&storage_key)
         .await
         .unwrap()
         .is_some());
     assert!(
-        crate::nats_session_log::NatsSessionLog::new(jetstream, &session_id)
+        crate::nats_session_log::NatsSessionLog::new(jetstream, &storage_key)
             .load_events_async()
             .await
             .unwrap()

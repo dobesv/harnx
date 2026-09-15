@@ -15,10 +15,12 @@ use tokio_util::sync::CancellationToken;
 #[path = "expired_replay_tests.rs"]
 mod expired_replay_tests;
 
+#[cfg(test)]
+#[path = "detach_tests.rs"]
+mod detach_tests;
+
 pub(super) fn subagent_error_message(prefix: impl std::fmt::Display, session_id: &str) -> String {
-    format!(
-        "{prefix} (session_id: {session_id}; resume with session_prompt using this exact session_id, inspect with session_load)"
-    )
+    format!("{prefix} (session_id: {session_id})")
 }
 
 pub(super) struct PromptParams<'a> {
@@ -36,14 +38,23 @@ pub(super) async fn run_prompt(
     toolset: &SubagentToolset,
     params: PromptParams<'_>,
 ) -> Result<CompletedSubagentTurn, ToolInvokeError> {
-    let (session, deadline) = checkpointed_session(toolset, &params).await?;
+    let admission =
+        super::admission::Admission::capture(toolset, &params.context, params.cancel.clone())
+            .await?;
+    let (session, deadline) = checkpointed_session(toolset, &params, &admission).await?;
+    // The child timeout can close its own admission capability without
+    // cancelling the parent tool (which returns the timeout result).
+    let session =
+        session.with_parent_fence(admission.fence.clone(), admission.cancel.child_token());
     let session = match params.context.operation {
         Some(parent) => session.with_execution_parent(parent, params.context.call_id.clone()),
         None => session,
     };
+    let session = Arc::new(session);
     let child_session_id = session.session_id().to_string();
     let reporter = toolset
         .start_progress_reporter(ProgressReporterStart {
+            admission: admission.clone(),
             child_session_id: child_session_id.clone(),
             parent_session_id: params.parent_session_id,
             invocation_id: params.context.call_id,
@@ -65,6 +76,11 @@ pub(super) async fn run_prompt(
     )
     .await;
 
+    // A late child completion cannot resume the stopped parent.
+    if let Err(error) = admission.check("child-completion").await {
+        let _ = reporter.finish(SubAgentProgressStatus::Cancelled).await;
+        return Err(error);
+    }
     match turn {
         PromptTurn::Completed(Ok(result)) => {
             finish_completed_turn(CompletedTurnParams {
@@ -91,6 +107,7 @@ pub(super) async fn run_prompt(
 async fn checkpointed_session(
     toolset: &SubagentToolset,
     params: &PromptParams<'_>,
+    admission: &super::admission::Admission,
 ) -> Result<(NatsSession, Option<tokio::time::Instant>), ToolInvokeError> {
     if params.context.operation.is_none() {
         let deadline = remaining_timeout(params.timeout_secs, None)
@@ -99,6 +116,7 @@ async fn checkpointed_session(
             .create_session(
                 params.session_id.clone(),
                 params.parent_session_id.as_deref(),
+                Some(admission),
             )
             .await?;
         return Ok((session, deadline));
@@ -126,22 +144,23 @@ async fn checkpointed_session(
     .map(|remaining| tokio::time::Instant::now() + remaining);
     let Some(record) = record else {
         let session = toolset
-            .create_session(params.session_id.clone(), parent)
+            .create_session(params.session_id.clone(), parent, Some(admission))
             .await?;
         return Ok((session, timeout));
     };
     Ok((
-        checkpointed_handle(toolset, params, &journal, record).await?,
+        checkpointed_handle(toolset, (params, admission), &journal, record).await?,
         timeout,
     ))
 }
 
 async fn checkpointed_handle(
     toolset: &SubagentToolset,
-    params: &PromptParams<'_>,
+    request: (&PromptParams<'_>, &super::admission::Admission),
     journal: &harnx_toolset_server::invocation_journal::InvocationJournal,
     record: harnx_toolset_server::invocation_journal::RecordedInvocation,
 ) -> Result<NatsSession, ToolInvokeError> {
+    let (params, admission) = request;
     let parent = params.parent_session_id.as_deref();
     let checkpoint = record.checkpoint;
     let mut session_id = checkpoint
@@ -151,6 +170,7 @@ async fn checkpointed_handle(
         .or_else(|| params.session_id.clone());
     if session_id.is_none() {
         let config = toolset.session_config(None, parent).await?;
+        admission.start(serde_json::json!({"kind": "reserve-child-session", "invocation": params.context.call_id})).await?;
         let allocation = format!("{}/{}", parent.unwrap_or(""), params.context.call_id);
         session_id = Some(
             crate::utils::session_name::reserve_invocation_session_id(
@@ -165,7 +185,9 @@ async fn checkpointed_handle(
             })?,
         );
     }
-    let session = toolset.create_session(session_id, parent).await?;
+    let session = toolset
+        .create_session(session_id, parent, Some(admission))
+        .await?;
     if let Some(parent) = parent {
         let checkpoint = journal
             .checkpoint(
@@ -181,7 +203,9 @@ async fn checkpointed_handle(
             .as_str()
             .ok_or_else(|| ToolInvokeError::Fatal("invalid sub-agent checkpoint".into()))?;
         if id != session.session_id() {
-            return toolset.create_session(Some(id.into()), Some(parent)).await;
+            return toolset
+                .create_session(Some(id.into()), Some(parent), Some(admission))
+                .await;
         }
     }
     Ok(session)
@@ -206,7 +230,7 @@ struct AwaitTurnParams<'a> {
 }
 
 async fn await_prompt_turn(
-    toolset: &SubagentToolset,
+    _toolset: &SubagentToolset,
     session: &NatsSession,
     buffering_sink: &Arc<InvocationBufferingSink>,
     params: AwaitTurnParams<'_>,
@@ -226,41 +250,64 @@ async fn await_prompt_turn(
         }
     }
     let (cancel_tx, cancel_rx) = mpsc::channel(1);
-    let run_turn = session.run_turn_with_options(
-        params.message,
-        buffering_sink.clone(),
-        Some(cancel_rx),
-        RunTurnOptions {
-            token_budget: params.token_budget.filter(|budget| *budget > 0),
-        },
-    );
-    tokio::pin!(run_turn);
+    let child = session.clone();
+    let message = params.message.to_owned();
+    let sink = buffering_sink.clone();
+    let run_turn = tokio::spawn(async move {
+        child
+            .run_turn_with_options(
+                &message,
+                sink,
+                Some(cancel_rx),
+                RunTurnOptions {
+                    token_budget: params.token_budget.filter(|budget| *budget > 0),
+                },
+            )
+            .await
+    });
+    await_owned_turn(session, run_turn, cancel_tx, params).await
+}
+
+async fn await_owned_turn(
+    session: &NatsSession,
+    mut run_turn: tokio::task::JoinHandle<anyhow::Result<NatsTurnResult>>,
+    cancel_tx: mpsc::Sender<()>,
+    params: AwaitTurnParams<'_>,
+) -> PromptTurn {
     let deadline = invocation_deadline(params.timeout);
     tokio::pin!(deadline);
 
     let turn = tokio::select! {
-        result = &mut run_turn => PromptTurn::Completed(result.map_err(|error| {
+        result = &mut run_turn => PromptTurn::Completed(result.unwrap_or_else(|error| Err(error.into())).map_err(|error| {
             ToolInvokeError::Recoverable(subagent_error_message(
                 format_args!("run sub-agent turn: {error:#}"),
                 session.session_id(),
             ))
         })),
         _ = params.cancel.cancelled() => {
-            let _ = cancel_tx.send(()).await;
-            let _ = (&mut run_turn).await;
-            let _ = ensure_timeout_cancellation(toolset, session).await;
+            let _ = cancel_tx.try_send(());
+            supervise_turn(run_turn);
+            let _ = ensure_timeout_cancellation(session).await;
             PromptTurn::Aborted(ToolInvokeError::Fatal(
                 "sub-agent tool call aborted".to_string(),
             ))
         }
         _ = &mut deadline => {
-            let _ = cancel_tx.send(()).await;
-            let _ = (&mut run_turn).await;
-            PromptTurn::TimedOut(ensure_timeout_cancellation(toolset, session).await)
+            let _ = cancel_tx.try_send(());
+            supervise_turn(run_turn);
+            PromptTurn::TimedOut(ensure_timeout_cancellation(session).await)
         }
     };
 
     turn
+}
+
+fn supervise_turn(turn: tokio::task::JoinHandle<anyhow::Result<NatsTurnResult>>) {
+    // The owned follower is G1-bound. It cannot release a worker lease or mutate
+    // another session/generation. Dropping a JoinHandle would merely detach it.
+    harnx_execution_control::CleanupTasks::process().spawn(async move {
+        let _ = turn.await;
+    });
 }
 
 async fn invocation_deadline(timeout: Option<Duration>) {
@@ -270,12 +317,9 @@ async fn invocation_deadline(timeout: Option<Duration>) {
     }
 }
 
-async fn ensure_timeout_cancellation(
-    _toolset: &SubagentToolset,
-    session: &NatsSession,
-) -> Result<(), ToolInvokeError> {
+async fn ensure_timeout_cancellation(session: &NatsSession) -> Result<(), ToolInvokeError> {
     let session_id = session.session_id();
-    session.cancel_pending_turn().await.map_err(|error| {
+    session.request_invocation_cancel().await.map_err(|error| {
         timeout_cancellation_error(
             session_id,
             format!("cancellation request failed: {error:#}"),
@@ -296,8 +340,8 @@ async fn finish_timed_out_turn(
     buffering_sink: &InvocationBufferingSink,
     cancellation: Result<(), ToolInvokeError>,
 ) -> Result<CompletedSubagentTurn, ToolInvokeError> {
-    // A timeout result promises same-session retry. Finish reporting first, but
-    // don't emit that result unless durable cancellation and lease release were confirmed.
+    // A timeout promises logical stop, not physical termination. The worker
+    // releases execution independently; a late remote side effect cannot be undone.
     let status = if cancellation.is_ok() {
         SubAgentProgressStatus::Cancelled
     } else {
@@ -459,11 +503,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recoverable_subagent_errors_include_session_resume_guidance() {
+    fn recoverable_subagent_errors_include_session_id_without_tool_guidance() {
         let child_session_id = "child-error-session";
         assert_eq!(
             subagent_error_message("sub-agent turn was cancelled", child_session_id),
-            "sub-agent turn was cancelled (session_id: child-error-session; resume with session_prompt using this exact session_id, inspect with session_load)"
+            "sub-agent turn was cancelled (session_id: child-error-session)"
         );
 
         for (worker_error, expected_prefix) in [
@@ -488,8 +532,8 @@ mod tests {
 
             assert!(message.contains(expected_prefix));
             assert!(message.contains(child_session_id));
-            assert!(message.contains("resume with session_prompt"));
-            assert!(message.contains("inspect with session_load"));
+            assert!(!message.contains("session_prompt"));
+            assert!(!message.contains("session_load"));
         }
     }
 

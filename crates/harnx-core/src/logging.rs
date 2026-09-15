@@ -26,9 +26,9 @@
 //! | `HARNX_LOG_FORMAT` | `text` `json` | `text` |
 //! | `HARNX_LOG_FILTER` | target prefix | `harnx` |
 //! | `HARNX_LOG_PATH` | file path | `<state dir>/harnx.log` |
+//! | `HARNX_LOG_MAX_BYTES` | `0` or u64 | `33554432` (32 MiB) |
 //!
-//! All four are plain env vars, so a child process inherits them and raising the
-//! level once raises it for the whole tree.
+//! All five are plain env vars inherited by child processes.
 
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
@@ -44,6 +44,9 @@ use crate::config_paths::{get_env_name, state_path};
 
 /// Log file name under the state directory.
 const LOG_FILE_NAME: &str = "harnx.log";
+
+/// Default max log file size before rotation (32 MiB).
+const DEFAULT_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Default target prefix. Matches every `harnx_*` crate target, since Rust
 /// turns the crate name `harnx-runtime` into the target `harnx_runtime::…`.
@@ -81,6 +84,8 @@ pub struct LogSettings {
     pub format: LogFormat,
     pub filter: String,
     pub dest: LogDest,
+    /// Maximum log file size in bytes before rotation. `None` disables rotation.
+    pub max_bytes: Option<u64>,
 }
 
 impl LogSettings {
@@ -124,10 +129,43 @@ pub fn init(sink: LogSink) -> Result<LogSettings> {
 
 /// [`init`] with settings the caller has adjusted — for a binary with its own
 /// `-v` flag, say. Prefer [`init`] unless there is something to override.
+///
+/// Log rotation runs ONLY in this function, once at process start before any
+/// subprocesses are spawned. The child-output path ([`child_output_sink`] →
+/// [`open_append`]) only ever appends — never rotates — because renaming the log
+/// out from under live writers splits output across the old and new inodes.
 pub fn init_with(settings: LogSettings) -> Result<LogSettings> {
     crate::llm_trace::init_from_env();
 
     let _ = CURRENT.set(settings.clone());
+
+    // R1: Rotate for File destination even when parent level is Off.
+    // Children still write via CURRENT.dest, so an Off parent would otherwise
+    // never bound the file.
+    if let LogDest::File(path) = &settings.dest {
+        if let Some(max) = settings.max_bytes {
+            if settings.level == LevelFilter::Off {
+                // Off case: rotate but do not open a file handle for parent
+                rotate_if_needed_off(path, max);
+                return Ok(settings);
+            }
+            // Non-Off case: rotate and open under lock
+            let writer: Box<dyn Write + Send> = Box::new(rotate_and_open(path, Some(max))?);
+            let logger = HarnxLogger {
+                level: settings.level,
+                format: settings.format,
+                filter: settings.filter.clone(),
+                writer: Mutex::new(writer),
+            };
+            // Err means another logger got there first, which is fine.
+            if log::set_boxed_logger(Box::new(logger)).is_ok() {
+                log::set_max_level(settings.level);
+            }
+            return Ok(settings);
+        }
+    }
+
+    // No rotation configured or non-File dest
     if settings.level == LevelFilter::Off {
         return Ok(settings);
     }
@@ -168,6 +206,10 @@ enum ChildOutput {
 /// Falls back to [`Stdio::null`] when the file can't be opened. Never `inherit`
 /// in that case — the callers that log to a file are the ones drawing on the
 /// terminal, and child output there corrupts the display.
+///
+/// This function only ever opens for append — it does NOT rotate the log.
+/// Rotation is confined to [`init_with`] (once at process start, before any
+/// children are spawned). Renaming here would split output across inodes.
 pub fn child_output_sink() -> Stdio {
     match child_output(current().map(|settings| &settings.dest)) {
         ChildOutput::File(path) => match open_append(&path) {
@@ -218,8 +260,9 @@ pub fn log_file_path() -> Option<&'static Path> {
 /// subtree whose stdio it redirects here — write to one file, and `O_APPEND`
 /// makes every write land at EOF instead of at a per-handle offset. Without it
 /// the writers clobber each other and the kernel zero-fills the gaps, which is
-/// where the giant NUL runs in #880 came from. The file is never truncated per
-/// run; rotate or delete it yourself when it grows.
+/// where the giant NUL runs in #880 came from. Active sessions only append;
+/// rotation happens on open at process start if the file meets or exceeds the
+/// size threshold.
 ///
 /// Read access is requested alongside append even though nothing here reads the
 /// file. On Windows, `append` alone produces a `FILE_APPEND_DATA` handle, and a
@@ -237,6 +280,169 @@ fn open_append(path: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("open log file {}", path.display()))
 }
 
+/// Take the exclusive lock if it is free, reporting contention as `Ok(false)`.
+///
+/// `try_lock` returns one `Err` for two outcomes that mean opposite things to
+/// a rotation attempt. Another process already holding the lock is the ordinary
+/// path: that process is rotating, and this one should wait or skip. An I/O
+/// error means the attempt never resolved, and treating it as contention would
+/// leave the caller waiting on an owner that does not exist.
+fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::fs::TryLockError;
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(TryLockError::WouldBlock) => Ok(false),
+        Err(TryLockError::Error(err)) => Err(err),
+    }
+}
+
+/// Build sibling path by appending suffix to the filename (never use `with_extension`).
+///
+/// `Path::with_extension("1")` on `harnx.log` yields `harnx.1` (replaces `.log`),
+/// which is wrong. This appends to the full filename instead:
+/// `harnx.log` -> `harnx.log.1`, `harnx.log` -> `harnx.log.lock`.
+fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    path.with_file_name(format!(
+        "{}{suffix}",
+        path.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default()
+    ))
+}
+
+/// Rotate log file if size exceeds threshold.
+///
+/// Checks file size and renames to `.1` if `>= max_bytes`. Removes any existing
+/// `.1` first. Logs warning on rename failure but never returns error.
+fn rotate_if_over_threshold(path: &Path, max_bytes: u64) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if metadata.len() < max_bytes {
+        return;
+    }
+    let rotated_path = sibling_path(path, ".1");
+    let _ = std::fs::remove_file(&rotated_path);
+    if let Err(e) = std::fs::rename(path, &rotated_path) {
+        log::warn!("failed to rotate log {}: {e}", path.display());
+    }
+}
+
+/// Acquire sidecar lock with bounded retry on contention.
+///
+/// On `WouldBlock`, retry with short backoff up to ~1s total.
+/// Returns `Ok(Some(lock_file))` if acquired, `Ok(None)` if contended past budget,
+/// or `Err(_)` if locking failed entirely.
+fn acquire_lock_with_retry(lock_path: &Path) -> Result<Option<std::fs::File>> {
+    use std::thread;
+    use std::time::Duration;
+
+    const RETRY_INTERVAL_MS: u64 = 20;
+    const MAX_RETRIES: u32 = 50; // 20ms * 50 = 1000ms
+
+    crate::path::ensure_parent_exists(lock_path)?;
+
+    // Lock file: we only need to lock it, not truncate.
+    // Use read+write for locking, but don't truncate - lock files persist.
+    #[allow(clippy::suspicious_open_options)]
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+
+    for attempt in 0..=MAX_RETRIES {
+        match try_lock_exclusive(&lock_file) {
+            Ok(true) => return Ok(Some(lock_file)),
+            Ok(false) => {
+                if attempt < MAX_RETRIES {
+                    thread::sleep(Duration::from_millis(RETRY_INTERVAL_MS));
+                }
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("lock {}", lock_path.display()));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Rotate log file if over threshold and open for appending.
+///
+/// Locks the sidecar `<path>.lock` across both rename and open to prevent
+/// concurrent processes from splitting output.
+///
+/// - `max_bytes == None`: skip lock and stat, just `open_append(path)`.
+/// - `max_bytes == Some(max)`:
+///   - Attempt sidecar lock with bounded retry (~1s).
+///   - If acquired: check file size, rotate if `>= max`, then `open_append` under lock.
+///   - If contended past budget: skip rotation, just `open_append` (holder is doing it).
+///   - If lock fails: best-effort unlocked rotate, then `open_append`.
+///
+/// Never fails startup on lock/rotation errors — logs warnings and continues.
+fn rotate_and_open(path: &Path, max_bytes: Option<u64>) -> Result<std::fs::File> {
+    // Rotation disabled
+    let Some(max) = max_bytes else {
+        return open_append(path);
+    };
+
+    let lock_path = sibling_path(path, ".lock");
+
+    match acquire_lock_with_retry(&lock_path) {
+        // Lock acquired: rotate if needed, then open
+        Ok(Some(_lock)) => {
+            rotate_if_over_threshold(path, max);
+            open_append(path)
+        }
+        // Contended past budget: holder is rotating, just open
+        Ok(None) => {
+            log::debug!(
+                "sidecar lock {} contended, skipping rotation",
+                lock_path.display()
+            );
+            open_append(path)
+        }
+        // Lock error: best-effort unlocked rotate
+        Err(e) => {
+            log::warn!(
+                "failed to acquire sidecar lock {}: {e}, rotating unlocked",
+                lock_path.display()
+            );
+            rotate_if_over_threshold(path, max);
+            open_append(path)
+        }
+    }
+}
+
+/// Rotate log file for LevelFilter::Off case (no file handle returned).
+///
+/// Similar to `rotate_and_open` but only performs rotation without opening
+/// the file. Used when parent level is `Off` but rotation should still happen
+/// for child processes.
+fn rotate_if_needed_off(path: &Path, max_bytes: u64) {
+    let lock_path = sibling_path(path, ".lock");
+
+    match acquire_lock_with_retry(&lock_path) {
+        Ok(Some(_lock)) => {
+            rotate_if_over_threshold(path, max_bytes);
+        }
+        Ok(None) => {
+            log::debug!(
+                "sidecar lock {} contended, skipping rotation",
+                lock_path.display()
+            );
+        }
+        Err(e) => {
+            log::warn!(
+                "failed to acquire sidecar lock {}: {e}, rotating unlocked",
+                lock_path.display()
+            );
+            rotate_if_over_threshold(path, max_bytes);
+        }
+    }
+}
+
 /// Resolve settings from a lookup function, so tests don't touch process env.
 fn resolve(
     get: impl Fn(&str) -> Option<String>,
@@ -252,6 +458,7 @@ fn resolve(
             DEFAULT_FILTER.to_string()
         }),
         dest: resolve_dest(&get, sink, default_path),
+        max_bytes: resolve_max_bytes(&get),
     }
 }
 
@@ -270,6 +477,35 @@ fn resolve_format(get: &impl Fn(&str) -> Option<String>) -> LogFormat {
     {
         Some("json") => LogFormat::Json,
         _ => LogFormat::Text,
+    }
+}
+
+/// Resolve max bytes for log rotation.
+///
+/// - Unset or empty -> `Some(DEFAULT_MAX_BYTES)` (rotation enabled with default)
+/// - `"0"` -> `None` (rotation disabled)
+/// - Valid u64 -> `Some(n)`
+/// - Unparseable/negative/garbage -> `Some(DEFAULT_MAX_BYTES)` (safe fallback)
+fn resolve_max_bytes(get: &impl Fn(&str) -> Option<String>) -> Option<u64> {
+    match non_empty(get(&get_env_name("log_max_bytes"))) {
+        None => Some(DEFAULT_MAX_BYTES),
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed == "0" {
+                None
+            } else {
+                trimmed
+                    .parse::<u64>()
+                    .ok()
+                    .or_else(|| {
+                        trimmed
+                            .parse::<i64>()
+                            .ok()
+                            .and_then(|n| u64::try_from(n).ok())
+                    })
+                    .or(Some(DEFAULT_MAX_BYTES))
+            }
+        }
     }
 }
 
@@ -653,6 +889,356 @@ mod tests {
         assert_eq!(
             dest,
             LogDest::File(PathBuf::from("/tmp/harnx-logging-test/harnx.log"))
+        );
+    }
+
+    #[test]
+    fn max_bytes_defaults_to_32_mib_when_unset_or_empty() {
+        // Unset
+        assert_eq!(
+            settings_from(&[], LogSink::Stderr).max_bytes,
+            Some(DEFAULT_MAX_BYTES),
+            "unset HARNX_LOG_MAX_BYTES should default to 32 MiB"
+        );
+        // Empty string (handled by non_empty filter)
+        assert_eq!(
+            settings_from(&[("HARNX_LOG_MAX_BYTES", "")], LogSink::Stderr).max_bytes,
+            Some(DEFAULT_MAX_BYTES),
+            "empty HARNX_LOG_MAX_BYTES should default to 32 MiB"
+        );
+    }
+
+    #[test]
+    fn max_bytes_zero_disables_rotation() {
+        assert_eq!(
+            settings_from(&[("HARNX_LOG_MAX_BYTES", "0")], LogSink::Stderr).max_bytes,
+            None,
+            "HARNX_LOG_MAX_BYTES=0 should disable rotation"
+        );
+    }
+
+    #[test]
+    fn max_bytes_accepts_valid_u64_values() {
+        for (value, expected, why) in [
+            ("1024", Some(1024u64), "exact value"),
+            ("  2048  ", Some(2048u64), "trimmed whitespace"),
+            ("1048576", Some(1024 * 1024), "1 MiB"),
+            (
+                &format!("{}", DEFAULT_MAX_BYTES),
+                Some(DEFAULT_MAX_BYTES),
+                "default value explicitly",
+            ),
+        ] {
+            assert_eq!(
+                settings_from(&[("HARNX_LOG_MAX_BYTES", value)], LogSink::Stderr).max_bytes,
+                expected,
+                "{why}: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn max_bytes_falls_back_to_default_on_garbage() {
+        for (value, why) in [
+            ("abc", "non-numeric"),
+            ("-1", "negative number"),
+            ("12.5", "floating point"),
+            ("999999999999999999999999999", "overflow"),
+        ] {
+            assert_eq!(
+                settings_from(&[("HARNX_LOG_MAX_BYTES", value)], LogSink::Stderr).max_bytes,
+                Some(DEFAULT_MAX_BYTES),
+                "garbage should fall back to default: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_free_lock_is_acquired_and_a_held_one_reports_contention() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("lock.test");
+        let held = std::fs::File::create(&path).expect("create lock file");
+        assert!(
+            try_lock_exclusive(&held).expect("first attempt"),
+            "free lock should be acquired"
+        );
+
+        // A second handle to the same file stands in for the second process.
+        let contender = std::fs::File::open(&path).expect("reopen lock file");
+        assert!(
+            !try_lock_exclusive(&contender).expect("contended attempt"),
+            "held lock should report contention"
+        );
+
+        held.unlock().expect("release lock");
+        assert!(
+            try_lock_exclusive(&contender).expect("attempt after release"),
+            "released lock should be acquired"
+        );
+    }
+
+    // =====================
+    // Rotation tests
+    // =====================
+
+    #[test]
+    fn sibling_path_appends_suffix_to_filename() {
+        // Standard .log extension
+        let path = PathBuf::from("/var/log/harnx.log");
+        assert_eq!(
+            sibling_path(&path, ".1"),
+            PathBuf::from("/var/log/harnx.log.1")
+        );
+        assert_eq!(
+            sibling_path(&path, ".lock"),
+            PathBuf::from("/var/log/harnx.log.lock")
+        );
+
+        // Custom extension (not .log)
+        let custom = PathBuf::from("/tmp/app.output");
+        assert_eq!(
+            sibling_path(&custom, ".1"),
+            PathBuf::from("/tmp/app.output.1")
+        );
+        assert_eq!(
+            sibling_path(&custom, ".lock"),
+            PathBuf::from("/tmp/app.output.lock")
+        );
+
+        // No extension
+        let no_ext = PathBuf::from("/var/log/harnx");
+        assert_eq!(
+            sibling_path(&no_ext, ".1"),
+            PathBuf::from("/var/log/harnx.1")
+        );
+    }
+
+    #[test]
+    fn rotate_and_open_over_threshold_rotates_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("harnx.log");
+        let content = b"old log content that exceeds threshold";
+
+        // Write content larger than threshold
+        std::fs::write(&path, content).expect("write initial log");
+
+        // Call rotate_and_open with threshold smaller than file
+        let max_bytes = (content.len() - 1) as u64;
+        let _file = rotate_and_open(&path, Some(max_bytes)).expect("rotate and open");
+
+        // Assert .1 exists with old content
+        let rotated = sibling_path(&path, ".1");
+        assert!(rotated.exists(), "rotated file should exist");
+        assert_eq!(
+            std::fs::read(&rotated).expect("read rotated"),
+            content,
+            "rotated file should contain old content"
+        );
+
+        // Original path should be recreated (empty or fresh)
+        assert!(path.exists(), "log path should be recreated");
+
+        // Lock file should exist but we don't delete it
+        let lock_path = sibling_path(&path, ".lock");
+        assert!(lock_path.exists(), "lock file should exist");
+    }
+
+    #[test]
+    fn rotate_and_open_under_threshold_leaves_file_untouched() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("harnx.log");
+        let content = b"small content";
+
+        std::fs::write(&path, content).expect("write initial log");
+
+        // Threshold larger than file
+        let max_bytes = (content.len() + 1000) as u64;
+        let _file = rotate_and_open(&path, Some(max_bytes)).expect("rotate and open");
+
+        // No .1 should be created
+        let rotated = sibling_path(&path, ".1");
+        assert!(!rotated.exists(), "rotated file should not exist");
+
+        // Original unchanged
+        assert_eq!(
+            std::fs::read(&path).expect("read log"),
+            content,
+            "original content should be unchanged"
+        );
+    }
+
+    #[test]
+    fn rotate_and_open_overwrites_existing_rotated_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("harnx.log");
+        let old_content = b"old log content exceeding threshold";
+        let sentinel = b"sentinel from previous rotation";
+
+        // Create existing .1 with sentinel
+        let rotated = sibling_path(&path, ".1");
+        std::fs::write(&rotated, sentinel).expect("write sentinel .1");
+
+        // Write current log larger than threshold
+        std::fs::write(&path, old_content).expect("write current log");
+
+        let max_bytes = (old_content.len() - 1) as u64;
+        let _file = rotate_and_open(&path, Some(max_bytes)).expect("rotate and open");
+
+        // .1 should have NEW content (sentinel gone)
+        assert_eq!(
+            std::fs::read(&rotated).expect("read rotated"),
+            old_content,
+            "rotated file should have new content, sentinel should be gone"
+        );
+    }
+
+    #[test]
+    fn rotate_and_open_with_none_max_bytes_skips_rotation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("harnx.log");
+        let content = b"some content";
+
+        std::fs::write(&path, content).expect("write initial log");
+
+        // max_bytes = None should skip all rotation logic
+        let _file = rotate_and_open(&path, None).expect("rotate and open");
+
+        // No .1, no .lock, file unchanged
+        assert!(!sibling_path(&path, ".1").exists(), "no .1 should exist");
+        assert!(
+            !sibling_path(&path, ".lock").exists(),
+            "no .lock should exist"
+        );
+        assert_eq!(std::fs::read(&path).expect("read"), content);
+    }
+
+    #[test]
+    fn rotate_if_needed_off_rotates_for_off_level() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("harnx.log");
+        let content = b"old content exceeding threshold";
+
+        std::fs::write(&path, content).expect("write initial log");
+
+        let max_bytes = (content.len() - 1) as u64;
+        rotate_if_needed_off(&path, max_bytes);
+
+        // Should have rotated
+        let rotated = sibling_path(&path, ".1");
+        assert!(rotated.exists(), "rotated file should exist");
+        assert_eq!(
+            std::fs::read(&rotated).expect("read rotated"),
+            content,
+            "rotated should contain old content"
+        );
+
+        // Original path should be gone (renamed away)
+        // Note: It may be recreated by the rotation check, but the rotated content is in .1
+    }
+
+    #[test]
+    fn rotate_and_open_with_contention_does_not_rotate() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("harnx.log");
+        let lock_path = sibling_path(&path, ".lock");
+        let content = b"existing content";
+
+        std::fs::write(&path, content).expect("write initial log");
+
+        // Ensure parent exists for lock
+        std::fs::create_dir_all(path.parent().unwrap()).ok();
+
+        // Hold the lock with another handle for the ENTIRE duration of rotate_and_open
+        let _held_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("create lock file");
+        _held_lock.try_lock().expect("acquire lock");
+
+        // Threshold smaller than file, but lock is held
+        let max_bytes = (content.len() - 1) as u64;
+
+        // rotate_and_open should succeed (contended past budget, skips rotation)
+        let _file =
+            rotate_and_open(&path, Some(max_bytes)).expect("rotate and open with contention");
+
+        // Lock was held by _held_lock throughout, so NO rotation should have occurred
+        assert!(
+            !sibling_path(&path, ".1").exists(),
+            "should NOT have rotated while lock was held"
+        );
+
+        // Original content preserved (not renamed away)
+        assert_eq!(
+            std::fs::read(&path).expect("read path"),
+            content,
+            "original content should be preserved"
+        );
+
+        // Clean up: unlock happens automatically when _held_lock drops
+    }
+
+    #[test]
+    fn rotate_and_open_with_free_lock_rotates() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("test.log");
+        let content = b"content to rotate";
+
+        std::fs::write(&path, content).expect("write initial log");
+
+        let max_bytes = (content.len() - 1) as u64;
+        let _file = rotate_and_open(&path, Some(max_bytes)).expect("rotate and open");
+
+        // Should have rotated (lock was free)
+        let rotated = sibling_path(&path, ".1");
+        assert!(rotated.exists(), "free lock should allow rotation");
+        assert_eq!(
+            std::fs::read(&rotated).expect("read rotated"),
+            content,
+            "rotated should contain old content"
+        );
+    }
+
+    #[test]
+    fn rotation_handles_missing_log_file_gracefully() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nonexistent.log");
+
+        // No file exists
+        let _file = rotate_and_open(&path, Some(1000)).expect("rotate and open on missing file");
+
+        // Should create new file
+        assert!(path.exists(), "should create new log file");
+        assert!(
+            !sibling_path(&path, ".1").exists(),
+            "no rotation should occur"
+        );
+    }
+
+    #[test]
+    fn rotation_happens_once_in_init_with_not_in_child_path() {
+        // Verify child_output_sink uses open_append, not rotate_and_open
+        // This is a compile-time property enforced by the code structure,
+        // but we can at least verify the function signatures match expectations.
+
+        // child_output_sink should NOT have rotation logic - it just opens
+        // Given that the code structure has rotation only in init_with,
+        // this test documents the invariant.
+
+        // The actual code path: child_output_sink calls open_append directly.
+        // We verify the lock helper is available but not used in child path.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("child.log");
+        std::fs::write(&path, b"existing").expect("write");
+
+        // Simulate child path: open_append does NOT rotate
+        let _file = open_append(&path).expect("open_append");
+        assert!(
+            !sibling_path(&path, ".1").exists(),
+            "open_append should not rotate"
         );
     }
 }

@@ -4,8 +4,10 @@
 # `release.yaml`, which builds and uploads the platform binaries.
 #
 # Setup required (one-time, see this workflow's PR for full instructions):
-#   1. Create a GitHub App with `contents: write` permission and install it
-#      on this repo.
+#   1. Create a GitHub App with `contents: write` and `pull_requests: write`
+#      permissions and install it on this repo. The same App opens the
+#      weekly models.yaml pull request in update-models.yml, which is why
+#      it needs pull-request access as well.
 #   2. Add the App as a Bypass actor on the `main` branch ruleset, so the
 #      release commit pushes directly to `main` without going through a PR.
 #   3. Set repo variable  `RELEASE_BOT_APP_ID`     (the App's numeric ID)

@@ -65,6 +65,7 @@ impl Tui {
                 elapsed_ms: 0,
                 usage: CompletionTokenUsage::default(),
                 tool_call_count: 0,
+                title: None,
             })
         });
         self.upsert_subagent_row(

@@ -1,6 +1,4 @@
-//! TUI-side `AgentEventSink` implementation. Moved from `harnx::agent_event_sink`
-//! (plan P49). The `TuiAgentEventSink` is a pure forwarder that pushes
-//! `TuiEvent::Agent(event)` directly into the TUI event loop.
+//! Local command events and generation-bound prompt output enter separate UI paths.
 
 use std::sync::Arc;
 
@@ -9,23 +7,63 @@ use harnx_core::sink::install_agent_event_sink;
 
 use crate::types::TuiEvent;
 
-/// Sink used by the interactive TUI mode. Pure forwarder: carries an
-/// `UnboundedSender<TuiEvent>` and pushes `TuiEvent::Agent(event)`
-/// directly into the TUI event loop where `render_agent_event` dispatches
-/// on the structured `AgentEvent` variants. No translation happens here.
+/// Prompt sinks retain the admitted generation and task identity across the
+/// frontend queue. The startup sink is reserved for local commands/notices.
 pub(crate) struct TuiAgentEventSink {
     tx: tokio::sync::mpsc::UnboundedSender<TuiEvent>,
+    prompt: Option<(
+        harnx_core::abort::AbortSignal,
+        crate::event_isolation::EventStamp,
+    )>,
 }
 
 impl TuiAgentEventSink {
     pub(crate) fn new(tx: tokio::sync::mpsc::UnboundedSender<TuiEvent>) -> Self {
-        Self { tx }
+        Self { tx, prompt: None }
+    }
+}
+
+impl TuiAgentEventSink {
+    pub(crate) fn for_prompt(
+        tx: tokio::sync::mpsc::UnboundedSender<TuiEvent>,
+        task: harnx_core::abort::AbortSignal,
+        state: harnx_runtime::nats_event_sink::LiveEventState,
+        execution_id: String,
+    ) -> Self {
+        Self {
+            tx,
+            prompt: Some((
+                task,
+                crate::event_isolation::EventStamp::live(&state, Some(execution_id)),
+            )),
+        }
     }
 }
 
 impl AgentEventSink for TuiAgentEventSink {
     fn emit(&self, event: AgentEvent) {
-        let _ = self.tx.send(TuiEvent::Agent(event));
+        match &self.prompt {
+            Some((_, stamp)) => self.emit_live(
+                event,
+                stamp.execution_id.as_deref().expect("prompt identity"),
+            ),
+            None => {
+                let _ = self.tx.send(TuiEvent::LocalAgent(event));
+            }
+        }
+    }
+
+    fn emit_live(&self, event: AgentEvent, execution_id: &str) {
+        let Some((task, stamp)) = &self.prompt else {
+            return;
+        };
+        if stamp.execution_id.as_deref() == Some(execution_id) && stamp.allows(&stamp.state) {
+            let _ = self.tx.send(TuiEvent::Agent {
+                task: task.clone(),
+                stamp: stamp.clone(),
+                event,
+            });
+        }
     }
 }
 
@@ -73,7 +111,7 @@ mod tests {
         ));
         let ev = rx.try_recv().expect("tui event");
         match ev {
-            TuiEvent::Agent(AgentEvent::SubAgent { source, event }) => {
+            TuiEvent::LocalAgent(AgentEvent::SubAgent { source, event }) => {
                 let AgentEvent::Model(ModelEvent::MessageChunk { blocks }) = *event else {
                     panic!("unexpected nested AgentEvent");
                 };
@@ -96,7 +134,7 @@ mod tests {
         sink.emit(AgentEvent::Notice(NoticeEvent::Info("hi".into())));
         let ev = rx.try_recv().expect("tui event");
         match ev {
-            TuiEvent::Agent(AgentEvent::Notice(NoticeEvent::Info(msg))) => {
+            TuiEvent::LocalAgent(AgentEvent::Notice(NoticeEvent::Info(msg))) => {
                 assert_eq!(msg, "hi");
             }
             _ => panic!("unexpected TuiEvent"),
@@ -121,7 +159,7 @@ mod tests {
         ));
         let ev = rx.try_recv().expect("tui event");
         match ev {
-            TuiEvent::Agent(AgentEvent::SubAgent { source, event }) => {
+            TuiEvent::LocalAgent(AgentEvent::SubAgent { source, event }) => {
                 assert!(matches!(
                     *event,
                     AgentEvent::Tool(ToolEvent::Completed { .. })

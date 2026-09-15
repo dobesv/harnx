@@ -195,7 +195,7 @@ impl SessionActor {
         }
         let result = bounded_refresh(read_cancellation(
             &self.actor_config.base_config,
-            &self.key.session,
+            &self.key.storage_key(),
         ))
         .await;
         self.apply_cancellation_refresh(result);

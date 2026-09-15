@@ -33,6 +33,10 @@ async fn interrupted_call(
     };
     store.claim(&root.reference, owner.clone()).await?;
     let mut request = ToolRequest {
+        execution: Some(
+            harnx_toolset_server::invocation_admission::capture(&store, &reference).await?,
+        ),
+        replay_execution: None,
         replay: None,
         operation_id: "original-call".into(),
         call_id: "original-call".into(),
@@ -51,6 +55,9 @@ async fn interrupted_call(
         )
         .await?;
     request.replay = Some(owner);
+    let consumer = request.execution.as_ref().unwrap().consumer.clone();
+    harnx_toolset_server::invocation_admission::prepare_replay(&store, &mut request, consumer)
+        .await?;
     Ok((journal, request))
 }
 
@@ -233,6 +240,17 @@ async fn journal_separates_standalone_calls_and_requires_persisted_records() -> 
     let (journal, mut request) = interrupted_call(&harness, "echo").await?;
     request.replay = None;
     request.parent_session_id = None;
+    request.replay_execution = None;
+    let js = async_nats::jetstream::new(harness.client.clone());
+    let store = ExecutionStore::ensure(&js, 1).await?;
+    let root = store.session(&request.call_id, None, None).await?;
+    store
+        .claim(&root.reference, Owner::invocation("standalone"))
+        .await?;
+    let reference = OperationRef::new(&request.call_id, &request.call_id);
+    store.child(reference.clone(), root.reference).await?;
+    request.execution =
+        Some(harnx_toolset_server::invocation_admission::capture(&store, &reference).await?);
     journal
         .record(&request, ("test_echo", "test-scope", "____test"), 1)
         .await?;

@@ -42,7 +42,7 @@ async fn focused_child_stop_uses_expected_generation_and_preserves_parent() {
     assert!(tui.cancel_selected_child());
     assert_eq!(
         *targets.lock().unwrap(),
-        vec![(key.session_id, Some("active".into()))]
+        vec![(key.storage_key(), Some("active".into()))]
     );
     assert!(!tui.current_prompt_abort.as_ref().unwrap().aborted());
     assert!(tui.app.llm_busy);
@@ -71,7 +71,7 @@ async fn fullscreen_child_takes_precedence_over_root_row_focus() {
     assert!(tui.cancel_selected_child());
     assert_eq!(
         *targets.lock().unwrap(),
-        vec![(key.session_id, Some("active".into()))]
+        vec![(key.storage_key(), Some("active".into()))]
     );
 }
 
@@ -83,7 +83,7 @@ async fn cancelling_child_progress_can_converge_to_cancelled() {
         SubAgentProgressStatus::Unconfirmed,
         SubAgentProgressStatus::Cancelled,
     ] {
-        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+        tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
             TurnEvent::SubAgentProgress(subagent_progress(&key, "active", status, 10)),
         )))
         .await
@@ -93,6 +93,40 @@ async fn cancelling_child_progress_can_converge_to_cancelled() {
         &tui.app.transcript[0],
         TranscriptItem::SubAgentSession {
             status: SubAgentStatus::Cancelled,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn execution_hydration_does_not_update_the_same_agent_and_id_on_another_cluster() {
+    let (mut tui, key, _) = child_tui().await;
+    let mut other = key.clone();
+    other.cluster = "other-cluster".into();
+    tui.app.transcript.push(TranscriptItem::SubAgentSession {
+        key: other.clone(),
+        status: SubAgentStatus::Running,
+        invocation_id: Some("active".into()),
+        progress: None,
+    });
+    let mut operation = harnx_execution_control::Operation::preparing(
+        harnx_execution_control::OperationRef::new(key.storage_key(), "active"),
+        harnx_execution_control::OperationKind::Session,
+        None,
+    );
+    operation.state = harnx_execution_control::OperationState::CancelRequested;
+    tui.hydrate_execution_state(key.cluster.clone(), operation);
+    assert!(matches!(
+        &tui.app.transcript[0],
+        TranscriptItem::SubAgentSession {
+            status: SubAgentStatus::Cancelling,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &tui.app.transcript[1],
+        TranscriptItem::SubAgentSession {
+            status: SubAgentStatus::Running,
             ..
         }
     ));

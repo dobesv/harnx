@@ -12,7 +12,7 @@ pub(crate) async fn clear_remote_session(
     let session = remote_nats_session(config, abort_signal).await?;
     let log = NatsSessionLog::new(
         session.jetstream().clone(),
-        session.session_id().to_string(),
+        session.storage_key().to_string(),
     );
     log.append_event_async(&SessionLogEntry::Clear)
         .await
@@ -439,7 +439,7 @@ pub async fn load_remote_transcript_for_render(
     // mid-read would be captured by the second sample; the first sample
     // preserves pending state for a lease released during the read.
     let lease_was_active =
-        crate::nats_lease::session_has_active_lease(session.jetstream(), session.session_id())
+        crate::nats_lease::session_has_active_lease(session.jetstream(), session.storage_key())
             .await
             .with_context(|| {
                 format!(
@@ -449,7 +449,7 @@ pub async fn load_remote_transcript_for_render(
             })?;
     let log = NatsSessionLog::new(
         session.jetstream().clone(),
-        session.session_id().to_string(),
+        session.storage_key().to_string(),
     );
     let entries = log.load_events_async().await?;
     // If the first sample was idle, check again for a worker that acquired the
@@ -457,7 +457,7 @@ pub async fn load_remote_transcript_for_render(
     let preserve_pending = if lease_was_active {
         true
     } else {
-        crate::nats_lease::session_has_active_lease(session.jetstream(), session.session_id())
+        crate::nats_lease::session_has_active_lease(session.jetstream(), session.storage_key())
             .await
             .with_context(|| {
                 format!(
@@ -553,7 +553,7 @@ where
     const MAX_CAS_ATTEMPTS: usize = 10;
     let log = NatsSessionLog::new(
         session.jetstream().clone(),
-        session.session_id().to_string(),
+        session.storage_key().to_string(),
     );
     for attempt in 1..=MAX_CAS_ATTEMPTS {
         let state = load_remote_session_for_render(session).await?;
@@ -642,7 +642,7 @@ pub(crate) async fn load_remote_session_for_render(
 ) -> Result<RemoteRenderState> {
     let log = NatsSessionLog::new(
         session.jetstream().clone(),
-        session.session_id().to_string(),
+        session.storage_key().to_string(),
     );
     let entries = log.load_events_async().await?;
     let rendered = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)

@@ -250,6 +250,8 @@ mod tests {
             }
         );
 
-        server.await.unwrap();
+        // The upload deadline can win before connect, leaving accept() pending.
+        server.abort();
+        let _ = server.await;
     }
 }

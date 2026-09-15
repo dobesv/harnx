@@ -99,6 +99,7 @@ fn package_openai_models_use_responses_without_sampling_parameters() {
         "gpt-5.6-sol:high",
         "gpt-5.6-sol:max",
         "gpt-6-astra",
+        "gpt-6-astra:high",
         "gpt-6-astra:max",
     ] {
         let model = Model::from_config("openai", &openai.models)

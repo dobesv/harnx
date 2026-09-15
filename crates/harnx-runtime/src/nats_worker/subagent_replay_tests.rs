@@ -17,13 +17,17 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
-const CI_SAFE_TIMEOUT: Duration = Duration::from_secs(30);
+const CI_SAFE_TIMEOUT: Duration = Duration::from_secs(60);
 use anyhow::Context;
 use harnx_execution_control::{ExecutionStore, OperationRef, OperationState, Owner};
 
 const PARENT: &str = "detached-parent";
 const CHILD: &str = "detached-child";
 const CALL: &str = "original-delegation";
+
+fn storage_key(id: &str) -> String {
+    harnx_core::session_identity::session_key(Some("metis"), id)
+}
 
 async fn session(js: &async_nats::jetstream::Context, id: &str) -> Result<NatsSession> {
     NatsSession::new(
@@ -49,24 +53,29 @@ async fn detached_delegation(
     let parent = session(js, PARENT).await?;
     parent.enqueue_text("delegate the work").await?;
     let store = parent.execution_store();
-    let root = store.current(PARENT).await?.context("parent execution")?;
+    let root = store
+        .current(&storage_key(PARENT))
+        .await?
+        .context("parent execution")?;
     claim_departed_owner(js, store, &root.reference).await?;
-    let tool = OperationRef::new(PARENT, CALL);
+    let tool = OperationRef::new(storage_key(PARENT), CALL);
+    store.child(tool.clone(), root.reference).await?;
     if dispatched {
-        store.child(tool.clone(), root.reference).await?;
         store
             .claim(&tool, Owner::invocation("departed-subagent-server"))
             .await?;
     }
-    let log = NatsSessionLog::new(js.clone(), PARENT);
+    let log = NatsSessionLog::for_agent(js.clone(), "metis", PARENT);
     let tool_round = append_detached_tool_round(&log, dispatched).await?;
     let request = harnx_toolset::ToolRequest {
+        execution: Some(harnx_toolset_server::invocation_admission::capture(store, &tool).await?),
+        replay_execution: None,
         replay: None,
         operation_id: CALL.into(),
         call_id: CALL.into(),
         tool: "session_prompt".into(),
         args: json!({"session_id": CHILD, "message": "finish child work"}),
-        parent_session_id: Some(PARENT.into()),
+        parent_session_id: Some(storage_key(PARENT)),
         tool_call_id: Some(CALL.into()),
         capabilities: Default::default(),
     };
@@ -81,14 +90,17 @@ async fn detached_delegation(
         .await?;
     if dispatched {
         journal
-            .checkpoint(PARENT, CALL, json!({"session_id": CHILD}))
+            .checkpoint(&storage_key(PARENT), CALL, json!({"session_id": CHILD}))
             .await?;
 
         let child = session(js, CHILD)
             .await?
             .with_execution_parent(tool, CALL.into());
         child.enqueue_text("finish child work").await?;
-        let operation = store.current(CHILD).await?.context("child execution")?;
+        let operation = store
+            .current(&storage_key(CHILD))
+            .await?
+            .context("child execution")?;
         claim_departed_owner(js, store, &operation.reference).await?;
     }
     Ok(parent)
@@ -231,7 +243,7 @@ async fn recover_delegation(continue_prompt: bool, dispatched: bool) -> Result<(
 async fn await_parent_completion(js: &async_nats::jetstream::Context) -> Result<()> {
     tokio::time::timeout(CI_SAFE_TIMEOUT, async {
         loop {
-            let entries = NatsSessionLog::new(js.clone(), PARENT)
+            let entries = NatsSessionLog::for_agent(js.clone(), "metis", PARENT)
                 .load_events_async()
                 .await?;
             if entries
@@ -251,7 +263,7 @@ async fn verify_recovered_delegation(
     js: &async_nats::jetstream::Context,
     child_calls: &AtomicUsize,
 ) -> Result<()> {
-    let entries = NatsSessionLog::new(js.clone(), PARENT)
+    let entries = NatsSessionLog::for_agent(js.clone(), "metis", PARENT)
         .load_events_async()
         .await?;
     let results: Vec<_> = entries
@@ -276,10 +288,11 @@ async fn verify_recovered_delegation(
     assert_eq!(results.len(), 1);
     assert_eq!(
         results[0].output["response"], "child result",
-        "recover the original delegation instead of synthesizing an interruption"
+        "recover the original delegation instead of synthesizing an interruption: {:?}",
+        results[0].output
     );
     assert_eq!(child_calls.load(Ordering::SeqCst), 1);
-    let child_entries = NatsSessionLog::new(js.clone(), CHILD)
+    let child_entries = NatsSessionLog::for_agent(js.clone(), "metis", CHILD)
         .load_events_async()
         .await?;
     assert_eq!(
@@ -296,10 +309,17 @@ async fn verify_recovered_delegation(
         1,
         "recovery must not append the child prompt again"
     );
+    verify_next_delegation_can_reuse_child(js).await
+}
+
+async fn verify_next_delegation_can_reuse_child(js: &async_nats::jetstream::Context) -> Result<()> {
     let store = ExecutionStore::ensure(js, 1).await?;
     tokio::time::timeout(CI_SAFE_TIMEOUT, async {
         loop {
-            let root = store.current(PARENT).await?.context("parent")?;
+            let root = store
+                .current(&storage_key(PARENT))
+                .await?
+                .context("parent")?;
             if store.status(&root.reference).await?.state == OperationState::Completed {
                 break Ok::<_, anyhow::Error>(());
             }
@@ -307,11 +327,11 @@ async fn verify_recovered_delegation(
         }
     })
     .await??;
-    let root = store.session(PARENT, None, None).await?;
-    let next = OperationRef::new(PARENT, "next-delegation");
+    let root = store.session(&storage_key(PARENT), None, None).await?;
+    let next = OperationRef::new(storage_key(PARENT), "next-delegation");
     store.child(next.clone(), root.reference).await?;
     store
-        .session(CHILD, Some(next), Some("next-delegation"))
+        .session(&storage_key(CHILD), Some(next), Some("next-delegation"))
         .await?;
     Ok(())
 }

@@ -43,6 +43,54 @@ impl fmt::Display for SessionFormat {
     }
 }
 
+/// Session inspection command used to report the matching argument syntax.
+#[derive(Debug, Clone, Copy)]
+pub enum SessionInspectionCommand {
+    Info,
+    Dump,
+}
+
+impl fmt::Display for SessionInspectionCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Info => ".info session",
+            Self::Dump => ".dump session",
+        })
+    }
+}
+
+/// Parse the explicit agent, session ID, and optional format used by dot commands.
+pub fn parse_session_inspection_args(
+    args: &[String],
+    command: SessionInspectionCommand,
+) -> Result<(String, String, SessionFormat)> {
+    let mut positional = Vec::new();
+    let mut format = None;
+    let mut tokens = args.iter();
+    while let Some(token) = tokens.next() {
+        if token.starts_with("--format=") || token == "--format" {
+            anyhow::ensure!(format.is_none(), "Duplicate --format option");
+            let value = token.strip_prefix("--format=").map(Ok).unwrap_or_else(|| {
+                tokens
+                    .next()
+                    .map(String::as_str)
+                    .context("Missing value for --format")
+            })?;
+            format = Some(value.parse()?);
+        } else {
+            anyhow::ensure!(!token.starts_with('-'), "Unknown session option '{token}'");
+            positional.push(token.clone());
+        }
+    }
+    anyhow::ensure!(positional.len() == 2 && positional.iter().all(|value| !value.trim().is_empty()),
+        "An explicit agent and session ID are required. Usage: {command} <agent> <id> [--format text|yaml|json]");
+    Ok((
+        positional.remove(0),
+        positional.remove(0),
+        format.unwrap_or_default(),
+    ))
+}
+
 /// Serialize one entry, including control entries, as a YAML document.
 /// The leading marker keeps concatenated dump and follow batches valid YAML.
 pub fn yaml_doc(entry: &SessionLogEntry) -> Result<String> {
@@ -82,6 +130,42 @@ pub fn render_metadata_json(metadata: &SessionMetadata) -> Result<String> {
     serde_json::to_string(metadata).context("Failed to render session metadata as JSON")
 }
 
+/// Resolve an explicit agent selector independently of the active frontend agent.
+pub fn resolve_session_agent(agent_ref: &str) -> Result<(String, String)> {
+    use harnx_core::agent_ref::AgentRef;
+    let (agent, cluster) = match AgentRef::parse(agent_ref) {
+        AgentRef::Local(agent) => (agent, LOCAL_CLUSTER_KEY.into()),
+        AgentRef::Remote { agent, cluster } => (agent, cluster),
+    };
+    anyhow::ensure!(
+        !agent.trim().is_empty() && agent != harnx_core::agent_config::TEMP_AGENT_NAME,
+        "an explicit named agent is required"
+    );
+    anyhow::ensure!(!cluster.trim().is_empty(), "cluster must not be empty");
+    Ok((agent.into_owned(), cluster.into_owned()))
+}
+
+/// Read one explicitly named agent's metadata and return its broker context.
+pub async fn session_metadata_for_agent(
+    config: &Config,
+    agent_ref: &str,
+    session_id: &str,
+) -> Result<(async_nats::jetstream::Context, SessionMetadata)> {
+    let (agent, cluster) = resolve_session_agent(agent_ref)?;
+    let jetstream = config.nats_jetstream(&cluster).await?;
+    let replicas = config
+        .resolve_nats_server(&cluster)
+        .await?
+        .resolved_replicas();
+    let store = SessionMetadataStore::ensure(&jetstream, replicas).await?;
+    let metadata = store
+        .get_for_agent(session_id, &agent)
+        .await?
+        .with_context(|| format!("Session '{session_id}' for agent '{agent_ref}' not found"))?
+        .metadata;
+    Ok((jetstream, metadata))
+}
+
 /// Load a named session with its resolved model and transcript-derived token counts.
 /// Pass the result to [`super::session::render`] for the runtime metadata view.
 /// `None` selects the shared local NATS cluster. Inline agents are unsupported.
@@ -91,10 +175,13 @@ pub async fn load_session_for_render(
     session_id: &str,
     expected_agent: &str,
 ) -> Result<Session> {
-    let jetstream = config
-        .nats_jetstream(cluster.unwrap_or(LOCAL_CLUSTER_KEY))
-        .await?;
-    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let cluster = cluster.unwrap_or(LOCAL_CLUSTER_KEY);
+    let jetstream = config.nats_jetstream(cluster).await?;
+    let replicas = config
+        .resolve_nats_server(cluster)
+        .await?
+        .resolved_replicas();
+    let store = SessionMetadataStore::ensure(&jetstream, replicas).await?;
     let metadata = store
         .get_for_agent(session_id, expected_agent)
         .await?
@@ -114,7 +201,7 @@ pub async fn load_session_for_render(
     base.model_id = model.id();
     base.model = model;
 
-    let raw = NatsSessionLog::new(jetstream, session_id.to_string())
+    let raw = NatsSessionLog::new(jetstream, metadata.storage_key())
         .load_events_async()
         .await
         .with_context(|| format!("Failed to load NATS session '{session_id}'"))?;
@@ -133,6 +220,42 @@ mod tests {
     use harnx_core::tool::ToolCall;
     use serde::Deserialize;
     use serde_json::{json, Value};
+
+    #[test]
+    fn inspection_arguments_require_agent_and_validate_options() {
+        for args in [
+            "id",
+            "--bogus id",
+            "agent id --format",
+            "agent id --format yaml --format json",
+        ] {
+            assert!(
+                parse_session_inspection_args(
+                    &shell_words::split(args).unwrap(),
+                    SessionInspectionCommand::Info
+                )
+                .is_err(),
+                "{args}"
+            );
+        }
+        for args in [
+            "reviewer@prod review-12345 --format=json",
+            "--format json reviewer@prod review-12345",
+        ] {
+            assert_eq!(
+                parse_session_inspection_args(
+                    &shell_words::split(args).unwrap(),
+                    SessionInspectionCommand::Info
+                )
+                .unwrap(),
+                (
+                    "reviewer@prod".into(),
+                    "review-12345".into(),
+                    SessionFormat::Json
+                )
+            );
+        }
+    }
 
     fn message_and_tool_entries() -> Vec<SessionLogEntry> {
         vec![

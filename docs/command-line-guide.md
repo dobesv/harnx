@@ -43,7 +43,7 @@ harnx info session agent1 session1             # View session metadata
 harnx dump session agent1 session1             # Dump session transcript
 harnx dump session agent1 session1 --follow    # Follow transcript live
 harnx list sessions                            # List sessions
-harnx delete session session1 --cluster local  # Delete session
+harnx delete session session1 --agent myagent --cluster local  # Delete session
 harnx --info                                   # View system info
 harnx --rag rag1 --info                        # View RAG info
 
@@ -110,7 +110,7 @@ The single stderr JSON line provides a stable, machine-readable contract for dow
 
 Field reference:
 - `kind`: `"timeout"` or `"budget_exceeded"`.
-- `session_id`: Session ID of the cancelled turn. Pass this ID on a subsequent prompt command to retry in the same session.
+- `session_id`: Session ID of the cancelled turn. Pass this ID together with the same explicit `--agent` on a subsequent prompt command to retry in the same session.
 - `usage`: Object containing token metrics for the cancelled turn:
   - `input_uncached`: Uncached input tokens.
   - `cache_write`: Tokens written to prompt cache.
@@ -183,6 +183,14 @@ harnx-serve --agent-variable env production --agent-variable debug true
 
 Use `harnx info agent` to inspect rendered agent configuration.
 
+Session IDs are local to an agent and case-sensitive. Different agents can each
+use `review-12345`. Always supply the agent when addressing a session, including
+`harnx --agent alpha --session review-12345 prompt "Continue the review"`,
+`harnx delete session review-12345 --agent alpha --cluster local`, and the TUI
+command `.info session alpha review-12345`. No agent is inferred for these commands.
+For remote session inspection, use an explicit selector such as
+`harnx info session alpha@prod review-12345`.
+
 ### `harnx info agent <name>`
 
 Prints the fully-rendered agent configuration to stdout. This includes:
@@ -221,8 +229,8 @@ Live tail with `--follow`:
 
 ### `harnx list sessions`
 
-Lists available sessions. For local agents, lists sessions in the local NATS store. When targeting a remote agent via `--agent <remote-agent>`, lists sessions in that remote cluster. (Replaces the deprecated `--list-sessions` flag.)
+Lists available sessions as tab-separated agent names and session IDs, one session per line. `<inline>` identifies sessions without a named agent. For local agents, lists sessions in the local NATS store. When targeting a remote agent via `--agent <remote-agent>`, lists sessions in that remote cluster. (Replaces the deprecated `--list-sessions` flag.)
 
-### `harnx delete session <session-id> --cluster <cluster>`
+### `harnx delete session <session-id> --agent <agent> --cluster <cluster>`
 
-Deletes a remote NATS session log stream and its lease key from the specified cluster. (Replaces the old `harnx session delete` command.)
+Deletes the specified agent’s NATS session from the specified cluster. If the agent selector includes `@cluster`, it must match `--cluster`. (Replaces the old `harnx session delete` command.)

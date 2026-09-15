@@ -1,7 +1,7 @@
 use crate::lifecycle::session_history_transcript_items;
 use crate::render_helpers::render_status_line;
 use crate::strip_ansi;
-use crate::types::{ExitPhase, ModalState, TranscriptItem, Tui, TuiEvent};
+use crate::types::{ExitPhase, ModalState, TranscriptItem, Tui};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use crossterm::ExecutableCommand;
@@ -9,37 +9,13 @@ use harnx_core::event::{AgentEvent, AgentSource};
 use harnx_render::pretty_error_string;
 use harnx_runtime::config::{
     dump_entries_jsonl, dump_entries_yaml, list_assistant_agents, load_session_for_render,
-    render_metadata_json, render_metadata_yaml, SessionFormat,
+    render_metadata_json, render_metadata_yaml, SessionFormat, SessionInspectionCommand,
 };
 use harnx_runtime::nats_session_log::NatsSessionLog;
 use harnx_runtime::nats_session_metadata::SessionMetadataStore;
 use harnx_runtime::utils::pretty_yaml_block;
 use ratatui_textarea::{Input as TextInput, Key};
 use std::path::Path;
-
-/// Parse tokens after `.info session` or `.dump session` into positional args and format.
-fn parse_session_tokens(tokens: &[String]) -> Result<(Vec<String>, SessionFormat)> {
-    let mut positional = Vec::new();
-    let mut format = SessionFormat::Text;
-    let mut format_next = false;
-    // Skip command tokens [".info", "session"] or [".dump", "session"]
-    for token in tokens.iter().skip(2) {
-        if format_next {
-            format = token.parse()?;
-            format_next = false;
-        } else if token == "--format" {
-            format_next = true;
-        } else if let Some(val) = token.strip_prefix("--format=") {
-            format = val.parse()?;
-        } else {
-            positional.push(token.clone());
-        }
-    }
-    if format_next {
-        anyhow::bail!("Missing value for --format");
-    }
-    Ok((positional, format))
-}
 
 /// Types of overlay content for info/dump commands.
 enum InfoOverlayType {
@@ -86,13 +62,6 @@ fn paste_should_attach(text: &str) -> bool {
     let line_count = text.lines().count();
     line_count > PASTE_ATTACHMENT_MAX_LINES || text.chars().count() > PASTE_ATTACHMENT_MAX_CHARS
 }
-
-/// How long `start_prompt` waits for a prior prompt task to finish
-/// cooperatively (after signalling its abort) before force-cancelling it
-/// via `JoinHandle::abort`. Long enough for `bash_wait` and similar
-/// cooperative tools to observe the abort and return; short enough that
-/// the user does not feel a stall.
-const PROMPT_TASK_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PickerCommand {
@@ -261,6 +230,8 @@ impl Tui {
         if !self.app.llm_busy {
             self.abort_signal.set_ctrld();
         }
+        // Mark current session as read before exiting (if unread)
+        self.mark_current_session_read_if_unread().await;
         self.request_exit().await;
     }
 
@@ -284,17 +255,15 @@ impl Tui {
         // task was running.
         self.app.pending_message = None;
         *self.shared_pending_message.lock().await = None;
-        // `llm_busy` stays true while a prompt task is still
-        // winding down; the Final/Error event from that task is
-        // what flips it off. Flipping it eagerly here is what
-        // produced Bug 2 — the next Enter would race a fresh
-        // prompt task against the still-running old one. When no
-        // prompt task is in flight (idle Ctrl+C) we still clear
-        // the flag for parity with the prior UX.
+        // A local signal isn't durable acceptance. The requesting tray stays
+        // until the receipt settles the prompt, independently of physical cleanup.
+        // Idle Ctrl+C can clear local activity without a follower to retire.
         if self.current_prompt_handle.is_none() {
             self.app.llm_busy = false;
             self.active_remote_session = None;
         }
+        // Mark current session as read before clearing state (if unread)
+        self.mark_current_session_read_if_unread().await;
     }
 
     async fn handle_browsing_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -405,8 +374,13 @@ impl Tui {
                     self.app.transcript_selection_anchor = None;
                     self.app.transcript_browsing = false;
                     self.app.scroll_state.follow = true;
+                    // Mark read on exit from transcript focus (if unread)
+                    self.mark_current_session_read_if_unread().await;
                 } else if !self.app.completions.is_empty() {
                     self.app.completions.clear();
+                } else {
+                    // ESC with no special state: mark read (if unread)
+                    self.mark_current_session_read_if_unread().await;
                 }
             }
             // D4: Keyboard actions on selected transcript item(s)
@@ -432,71 +406,7 @@ impl Tui {
                 self.open_focused_root_item();
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
-                if self.try_handle_attach_command().await {
-                    return Ok(());
-                }
-                self.app.completions.clear();
-                let text = self.app.input.lines().join("\n");
-                if !text.trim().is_empty() || !self.app.attachments.is_empty() {
-                    // Reset abort signal before each new submission (fix #3)
-                    self.abort_signal.reset();
-                    // Add to history (fix #4)
-                    self.push_history(text.clone());
-                    if self.app.llm_busy {
-                        self.queue_busy_input(text).await;
-                    } else if text.trim_start().starts_with('.') {
-                        // Dot-command: route through command handler
-                        let attachments_snapshot = self.app.attachments.clone();
-                        self.app.transcript.push(TranscriptItem::UserText {
-                            text: text.clone(),
-                            seq: None,
-                            timestamp: Some(chrono::Utc::now()),
-                        });
-                        self.render_submitted_attachments(&attachments_snapshot)
-                            .await;
-                        self.pin_transcript_to_bottom();
-                        self.app.input = Self::new_input();
-                        self.run_command(&text).await?;
-                        self.refresh_input_chrome();
-                    } else {
-                        // Guard: agent and session must both be active before
-                        // submitting a prompt. If not, open the appropriate picker
-                        // and keep the text in the input so the user can retry.
-                        // The in-memory check (agent/session None) is always safe;
-                        // resolve_initial_modal is only called when the check fires.
-                        {
-                            let needs_picker = {
-                                let cfg = self.config.read();
-                                cfg.agent.is_none() || cfg.session.is_none()
-                            };
-                            if needs_picker {
-                                if let Some(modal) =
-                                    crate::types::Tui::resolve_initial_modal(&self.config).await
-                                {
-                                    self.app.modal = Some(modal);
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        let attachments_snapshot = self.app.attachments.clone();
-                        self.app.transcript.push(TranscriptItem::UserText {
-                            text: text.clone(),
-                            seq: None,
-                            timestamp: Some(chrono::Utc::now()),
-                        });
-                        self.render_submitted_attachments(&attachments_snapshot)
-                            .await;
-                        self.pin_transcript_to_bottom();
-                        self.app.input = Self::new_input();
-                        let msg = crate::types::PendingMessage {
-                            text,
-                            attachments: std::mem::take(&mut self.app.attachments),
-                            attachment_dir: self.app.attachment_dir.take(),
-                            paste_count: self.app.paste_count,
-                        };
-                        self.start_prompt(msg).await?;
-                    }
-                }
+                self.handle_enter_key().await?;
             }
             (KeyCode::Enter, KeyModifiers::SHIFT) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
                 // Shift+Enter / Ctrl+J inserts a newline - clear pending if any
@@ -531,6 +441,8 @@ impl Tui {
                 if self.app.transcript_focus.is_some() {
                     return Ok(());
                 }
+                // First character typed marks the current session read when needed.
+                self.mark_current_session_read_if_unread().await;
                 // Exit history preview on any editing key — keep current content as new draft
                 if self.app.history_preview {
                     self.app.history_index = None;
@@ -553,6 +465,83 @@ impl Tui {
             }
         }
         Ok(())
+    }
+
+    fn can_accept_paste(&self) -> bool {
+        let overlay_open = self.app.detail_view_open
+            || self.app.transcript_browsing
+            || !self.app.subagent_view_stack.is_empty();
+        !overlay_open && (!self.has_root_cancellation() || self.cancellation_editor_restored())
+    }
+
+    async fn handle_enter_key(&mut self) -> Result<()> {
+        if self.try_handle_attach_command().await || self.has_root_cancellation() {
+            return Ok(());
+        }
+        self.app.completions.clear();
+        let text = self.app.input.lines().join("\n");
+        if text.trim().is_empty() && self.app.attachments.is_empty() {
+            return Ok(());
+        }
+        self.mark_current_session_read_if_unread().await;
+        self.abort_signal.reset();
+        self.push_history(text.clone());
+        if self.app.llm_busy {
+            self.queue_busy_input(text).await;
+            return Ok(());
+        }
+        if text.trim_start().starts_with('.') {
+            return self.submit_dot_command(text).await;
+        }
+        if let Some(modal) = self.check_picker_modal().await {
+            self.app.modal = Some(modal);
+            return Ok(());
+        }
+        let attachments_snapshot = self.app.attachments.clone();
+        self.app.transcript.push(TranscriptItem::UserText {
+            text: text.clone(),
+            seq: None,
+            timestamp: Some(chrono::Utc::now()),
+        });
+        self.render_submitted_attachments(&attachments_snapshot)
+            .await;
+        self.pin_transcript_to_bottom();
+        self.app.input = Self::new_input();
+        let msg = crate::types::PendingMessage {
+            text,
+            attachments: std::mem::take(&mut self.app.attachments),
+            attachment_dir: self.app.attachment_dir.take(),
+            paste_count: self.app.paste_count,
+        };
+        self.start_prompt(msg).await
+    }
+
+    async fn submit_dot_command(&mut self, text: String) -> Result<()> {
+        let attachments_snapshot = self.app.attachments.clone();
+        self.app.transcript.push(TranscriptItem::UserText {
+            text: text.clone(),
+            seq: None,
+            timestamp: Some(chrono::Utc::now()),
+        });
+        self.render_submitted_attachments(&attachments_snapshot)
+            .await;
+        self.pin_transcript_to_bottom();
+        self.app.input = Self::new_input();
+        self.run_command(&text).await?;
+        self.refresh_input_chrome();
+        Ok(())
+    }
+
+    async fn check_picker_modal(&self) -> Option<ModalState> {
+        let (no_agent, no_session) = {
+            let cfg = self.config.read();
+            (cfg.agent.is_none(), cfg.session.is_none())
+        };
+        if no_agent || no_session {
+            crate::types::Tui::resolve_initial_modal(&self.config).await
+        } else {
+            None
+        }
     }
 
     async fn handle_exclusive_view_key(&mut self, key: KeyEvent) -> Option<Result<()>> {
@@ -684,12 +673,7 @@ impl Tui {
     }
 
     pub(super) async fn handle_paste(&mut self, text: String) {
-        // Ignore paste while the detail view or browsing view is open — same isolation
-        // policy as handle_key: these overlays hide the input field.
-        let overlay_depth = usize::from(self.app.detail_view_open)
-            + usize::from(self.app.transcript_browsing)
-            + self.app.subagent_view_stack.len();
-        if overlay_depth > 0 {
+        if !self.can_accept_paste() {
             return;
         }
         if let Some(pending) = self.app.pending_message.take() {
@@ -767,81 +751,6 @@ impl Tui {
         }
     }
 
-    pub(crate) async fn handle_tui_event(&mut self, event: TuiEvent) -> Result<()> {
-        self.handle_tui_event_inner(event).await
-    }
-
-    async fn handle_tui_event_inner(&mut self, event: TuiEvent) -> Result<()> {
-        match event {
-            TuiEvent::Agent(event) => {
-                self.render_agent_event(event).await;
-            }
-            TuiEvent::PromptTaskFinished { task, error } => {
-                self.finish_prompt_task(task, error).await;
-            }
-            TuiEvent::ExecutionState { cluster, operation } => {
-                self.hydrate_execution_state(cluster, operation)
-            }
-            TuiEvent::SessionActivity {
-                session_id,
-                cluster,
-                active,
-            } => {
-                self.handle_session_activity(session_id, cluster, active)
-                    .await;
-            }
-            TuiEvent::SessionAgent {
-                session_id,
-                cluster,
-                event,
-            } => {
-                self.handle_shared_session_agent_event(session_id, cluster, event)
-                    .await;
-            }
-            TuiEvent::SubAgentSessionSnapshot { key, snapshot } => {
-                self.handle_subagent_snapshot(key, snapshot);
-            }
-            TuiEvent::SubAgentSessionEvent { key, event } => {
-                self.handle_subagent_session_event(key, event);
-            }
-            TuiEvent::SubAgentInvocationFailed { key, invocation_id } => {
-                self.fail_monitored_invocation(&key, &invocation_id);
-            }
-            TuiEvent::ToolRoundComplete => {
-                // Intermediate tool round — prompt loop continues, don't clear llm_busy.
-                // Flush any pending thought so follow-up thought after tool results
-                // starts a fresh block instead of appending to the earlier one.
-                self.flush_pending_thought();
-                // Reset streaming index so the next LLM turn creates a fresh
-                // AssistantText item instead of appending to the previous one.
-                // This keeps tool-call rows visually between the two turns.
-                self.app.streaming_open = false;
-                self.pin_transcript_to_bottom();
-            }
-            TuiEvent::PendingMessageConsumed(pending) => {
-                // The prompt task consumed our pending message during a tool
-                // round.  Clear the local pending state, reset the input field,
-                // and show the consumed text (and any attachments) in the
-                // transcript.
-                self.app.pending_message = None;
-                self.app.input = Self::new_input();
-                self.app.transcript.push(TranscriptItem::UserText {
-                    text: pending.text.clone(),
-                    seq: None,
-                    timestamp: Some(chrono::Utc::now()),
-                });
-                self.render_submitted_attachments(&pending.attachments)
-                    .await;
-                self.pin_transcript_to_bottom();
-                self.refresh_input_chrome();
-            }
-            TuiEvent::ToolConfirmation(event) => {
-                self.handle_tool_confirmation_event(event);
-            }
-        }
-        Ok(())
-    }
-
     #[cfg(test)]
     pub(crate) async fn submit_pending_message(
         &mut self,
@@ -875,7 +784,8 @@ impl Tui {
             self.app.attachments = pending.attachments;
             self.app.attachment_dir = pending.attachment_dir;
             self.app.paste_count = pending.paste_count;
-            self.run_command(&pending.text).await?;
+            // Pending commands run under the already-deep turn-end event chain.
+            Box::pin(self.run_command(&pending.text)).await?;
             self.refresh_input_chrome();
         } else {
             self.start_prompt(pending).await?;
@@ -889,7 +799,10 @@ impl Tui {
         *self.shared_pending_message.lock().await = None;
     }
 
-    async fn render_submitted_attachments(&mut self, attachments: &[crate::types::Attachment]) {
+    pub(super) async fn render_submitted_attachments(
+        &mut self,
+        attachments: &[crate::types::Attachment],
+    ) {
         if attachments.is_empty() {
             return;
         }
@@ -1337,125 +1250,6 @@ impl Tui {
         }
     }
 
-    pub(super) async fn start_prompt(&mut self, msg: crate::types::PendingMessage) -> Result<()> {
-        // Drain any prior prompt task BEFORE spawning the new one. Two
-        // prompt tasks must never run concurrently against the same
-        // session — they would interleave append_session_tool_calls /
-        // append_session_tool_results writes and corrupt the in-memory
-        // pending Tool message (see Bug 2: orphan tool_calls in the
-        // session log around line 24785/24794 of the reproducing
-        // session).
-        self.drain_previous_prompt_task().await;
-
-        // Allocate a fresh abort signal for this task. Subsequent Ctrl+C
-        // will signal exactly this task; later submissions get their
-        // own fresh signal so that nothing in this branch can be
-        // un-aborted by a future `abort_signal.reset()`.
-        let new_abort = harnx_runtime::utils::create_abort_signal();
-        self.current_prompt_abort = Some(new_abort.clone());
-        // This prompt receives its worker events directly through
-        // TuiAgentEventSink. Pause the shared observer before activating the
-        // worker so its advisory copy cannot be queued and rendered later.
-        self.sync_session_activity_monitor();
-
-        self.app.llm_busy = true;
-        self.app.streaming_open = false;
-        self.app.main_streamed_text_idx = None;
-
-        let (agent, cluster, session_id) = {
-            let guard = self.config.read();
-            let (agent, cluster) = guard.remote_agent.clone().unwrap_or_else(|| {
-                (
-                    guard
-                        .agent
-                        .as_ref()
-                        .map(|agent| agent.name().to_string())
-                        .unwrap_or_default(),
-                    harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
-                )
-            });
-            let session_id = guard
-                .session
-                .as_ref()
-                .map(|session| session.id().to_string());
-            (agent, cluster, session_id)
-        };
-        self.active_remote_session = session_id.map(|id| (id, cluster.clone()));
-
-        let event_tx = self.event_tx.clone();
-
-        let ctx = crate::prompt::PromptTaskContext {
-            config: self.config.clone(),
-            abort_signal: new_abort.clone(),
-            #[cfg(test)]
-            shared_pending_message: self.shared_pending_message.clone(),
-            local_worker: self.local_worker.clone(),
-            event_tx: event_tx.clone(),
-            tool_confirmation_route: self.tool_confirmation_route.clone(),
-        };
-
-        let handle = tokio::spawn(async move {
-            #[cfg(test)]
-            let result: Result<()> = if cluster == harnx_runtime::config::LOCAL_CLUSTER_KEY {
-                Self::run_test_prompt_task(msg, ctx).await
-            } else {
-                Self::run_nats_prompt_task(msg, ctx, agent, cluster).await
-            };
-            #[cfg(not(test))]
-            let result: Result<()> = Self::run_nats_prompt_task(msg, ctx, agent, cluster).await;
-
-            let error = match result {
-                Err(_) if new_abort.aborted() => None,
-                Err(err) => Some(pretty_error_string(&err)),
-                Ok(()) => None,
-            };
-            let _ = event_tx.send(TuiEvent::PromptTaskFinished {
-                task: new_abort,
-                error,
-            });
-        });
-        self.current_prompt_handle = Some(handle);
-
-        Ok(())
-    }
-
-    /// Wait for any prior prompt task to finish before spawning a new
-    /// one. Cooperative shutdown via the prior task's abort signal is
-    /// tried first with a short timeout; if the task does not exit
-    /// within `PROMPT_TASK_DRAIN_TIMEOUT`, force-cancel it via
-    /// `JoinHandle::abort`.
-    async fn drain_previous_prompt_task(&mut self) {
-        // Signal cooperative abort first (if a signal is around). This is
-        // a no-op if the prior task has already finished and we just
-        // never cleared the signal.
-        if let Some(abort) = self.current_prompt_abort.take() {
-            abort.set_ctrlc();
-        }
-
-        let Some(handle) = self.current_prompt_handle.take() else {
-            return;
-        };
-
-        // Already-completed handle resolves immediately; live handle is
-        // given up to PROMPT_TASK_DRAIN_TIMEOUT to wind down before we
-        // hard-cancel it.
-        let abort_handle = handle.abort_handle();
-        match tokio::time::timeout(PROMPT_TASK_DRAIN_TIMEOUT, handle).await {
-            Ok(Ok(())) => {} // task ended cleanly
-            Ok(Err(_)) => {
-                // Task panicked or was already cancelled; the unwound
-                // task can no longer touch session state, so we move on.
-            }
-            Err(_) => {
-                // Cooperative shutdown timed out — force the task to
-                // stop. The corresponding future is dropped at its next
-                // .await; until then it's wedged on something
-                // synchronous (block_in_place / a non-cooperative tool).
-                abort_handle.abort();
-            }
-        }
-    }
-
     fn push_history(&mut self, text: String) {
         // Avoid duplicate of last entry
         if self.app.history.first().map(|s| s.as_str()) != Some(text.as_str()) {
@@ -1860,31 +1654,31 @@ impl Tui {
                     .collect();
             }
 
-            if matches!(cmd, ".agent" | ".session") && args.iter().all(|arg| arg.is_empty()) {
+            let (cmd, args) = match (cmd, args.as_slice()) {
+                (".info" | ".dump", ["session", _, ..]) => (".session", args[1..].to_vec()),
+                _ => (cmd, args),
+            };
+            if cmd == ".agent" && args.iter().all(|arg| arg.is_empty()) {
                 return vec![];
+            }
+
+            if cmd == ".session" && args.len() == 2 {
+                let cfg = self.config.read().clone();
+                let sessions = cfg.list_sessions_for_completion(args[0]).await;
+                return harnx_runtime::utils::fuzzy_filter(
+                    sessions.into_iter().map(|id| (id, None)).collect(),
+                    |value| value.0.as_str(),
+                    args[1],
+                );
             }
 
             // Fetch agents async outside the config lock to avoid holding a
             // parking_lot read guard across an await point.
-            let precomputed_agents = if cmd == ".agent" && args.len() == 1 {
+            let precomputed_agents = if matches!(cmd, ".agent" | ".session") && args.len() == 1 {
                 list_assistant_agents().await
             } else {
                 Vec::new()
             };
-
-            // Session completion always queries the NATS KV index. An absent
-            // remote-agent cluster means the shared local NATS cluster.
-            if cmd == ".session" && args.len() == 1 {
-                let cluster = self
-                    .config
-                    .read()
-                    .remote_agent
-                    .as_ref()
-                    .map(|(_, c)| c.clone());
-                let cfg = self.config.read().clone();
-                let sessions = cfg.list_sessions_for_completion(cluster.as_deref()).await;
-                return sessions.into_iter().map(|s| (s, None)).collect();
-            }
 
             return self
                 .config
@@ -1905,12 +1699,7 @@ impl Tui {
 
     pub(crate) async fn open_session_picker(&mut self) {
         let (sessions, fetch_error) = Self::picker_sessions(&self.config).await;
-        let origin_agent = self
-            .config
-            .read()
-            .agent
-            .as_ref()
-            .map(|a| a.name().to_string());
+        let origin_agent = self.config.read().active_agent_ref();
         let origin_session = self
             .config
             .read()
@@ -1935,10 +1724,7 @@ impl Tui {
             harnx_runtime::commands::CommandOutcome::Continue => {
                 let (curr_agent, session_missing) = {
                     let cfg = self.config.read();
-                    (
-                        cfg.agent.as_ref().map(|a| a.name().to_string()),
-                        cfg.session.is_none(),
-                    )
+                    (cfg.active_agent_ref(), cfg.session.is_none())
                 };
                 if prev_agent != curr_agent && session_missing {
                     self.open_session_picker().await;
@@ -1965,7 +1751,7 @@ impl Tui {
         let (curr_session, curr_agent) = {
             let cfg = self.config.read();
             let s = cfg.session.as_ref().map(|s| s.id().to_string());
-            let a = cfg.agent.as_ref().map(|a| a.name().to_string());
+            let a = cfg.active_agent_ref();
             (s, a)
         };
 
@@ -1995,6 +1781,44 @@ impl Tui {
         self.pin_transcript_to_bottom();
     }
 
+    async fn restore_picker_origin(&mut self) {
+        let Some(crate::types::ModalState::SessionPicker {
+            origin_agent: Some(agent),
+            origin_session,
+            ..
+        }) = self.app.modal.as_ref()
+        else {
+            return;
+        };
+        let (agent, session) = (agent.clone(), origin_session.clone());
+        // Prepare on a separate config so a missing origin agent cannot destroy
+        // the current selection. Picker switching runs while the prompt is idle.
+        let candidate = std::sync::Arc::new(parking_lot::RwLock::new(self.config.read().clone()));
+        match harnx_runtime::config::Config::use_agent(
+            &candidate,
+            &agent,
+            session.as_deref(),
+            self.abort_signal.clone(),
+        )
+        .await
+        {
+            Ok(()) => {
+                self.config
+                    .write()
+                    .apply_prepared_agent_selection(candidate.read().clone());
+                self.app.modal = None;
+                self.refresh_input_chrome();
+            }
+            Err(error) => {
+                if let Some(crate::types::ModalState::SessionPicker { error: message, .. }) =
+                    self.app.modal.as_mut()
+                {
+                    *message = Some(error.to_string());
+                }
+            }
+        }
+    }
+
     async fn try_handle_info_overlay(&mut self, line_cmd: &str) -> bool {
         let info_type = self.detect_info_overlay_type(line_cmd);
         if info_type.is_none() {
@@ -2014,6 +1838,25 @@ impl Tui {
         let title = info_type.title();
         self.open_info_overlay(display_text, title);
         true
+    }
+
+    fn resolve_info_agent_target(&self, tokens: &[String]) -> anyhow::Result<String> {
+        let agent_name = if tokens.len() > 2 {
+            tokens[2].clone()
+        } else {
+            match self.config.read().agent.as_ref() {
+                Some(a) => a.name().to_string(),
+                None => String::new(),
+            }
+        };
+
+        if agent_name.is_empty() {
+            Err(anyhow::anyhow!(
+                "No active agent and no agent name provided. Usage: .info agent [<name>]"
+            ))
+        } else {
+            Ok(agent_name)
+        }
     }
 
     fn detect_info_overlay_type(&self, line_cmd: &str) -> Option<InfoOverlayType> {
@@ -2048,38 +1891,25 @@ impl Tui {
 
     async fn render_info_session_overlay(&self, tokens: &[String]) -> Result<String> {
         let (agent_name, session_id, format) =
-            self.resolve_session_target_and_format(tokens, ".info session")?;
+            self.resolve_session_target_and_format(tokens, SessionInspectionCommand::Info)?;
         let cfg = self.config.read().clone();
-        let cluster = cfg
-            .remote_agent
-            .as_ref()
-            .map(|(_, cluster)| cluster.as_str())
-            .unwrap_or(harnx_runtime::config::LOCAL_CLUSTER_KEY)
-            .to_string();
-
+        let (agent, cluster) = harnx_runtime::config::resolve_session_agent(&agent_name)?;
         match format {
             SessionFormat::Text => {
-                let resolved_agent = agent_name.ok_or_else(|| {
-                    anyhow::anyhow!("No active agent or agent name provided for text metadata view")
-                })?;
                 let session =
-                    load_session_for_render(&cfg, Some(&cluster), &session_id, &resolved_agent)
-                        .await?;
+                    load_session_for_render(&cfg, Some(&cluster), &session_id, &agent).await?;
                 harnx_runtime::config::session::render(&session)
             }
             SessionFormat::Yaml | SessionFormat::Json => {
-                let jetstream = cfg.nats_jetstream(&cluster).await?;
-                let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-                let record = if let Some(agent) = agent_name.as_deref() {
-                    store.get_for_agent(&session_id, agent).await?
-                } else {
-                    store.get(&session_id).await?
-                };
-                let record = record
-                    .ok_or_else(|| anyhow::anyhow!("NATS session '{session_id}' was not found"))?;
+                let (_, metadata) = harnx_runtime::config::session_metadata_for_agent(
+                    &cfg,
+                    &agent_name,
+                    &session_id,
+                )
+                .await?;
                 match format {
-                    SessionFormat::Yaml => render_metadata_yaml(&record.metadata),
-                    SessionFormat::Json => render_metadata_json(&record.metadata),
+                    SessionFormat::Yaml => render_metadata_yaml(&metadata),
+                    SessionFormat::Json => render_metadata_json(&metadata),
                     SessionFormat::Text => unreachable!(),
                 }
             }
@@ -2088,34 +1918,12 @@ impl Tui {
 
     async fn render_dump_session_overlay(&self, tokens: &[String]) -> Result<String> {
         let (agent_name, session_id, format) =
-            self.resolve_session_target_and_format(tokens, ".dump session")?;
+            self.resolve_session_target_and_format(tokens, SessionInspectionCommand::Dump)?;
         let cfg = self.config.read().clone();
-        let cluster = cfg
-            .remote_agent
-            .as_ref()
-            .map(|(_, cluster)| cluster.as_str())
-            .unwrap_or(harnx_runtime::config::LOCAL_CLUSTER_KEY)
-            .to_string();
-
-        let jetstream = cfg.nats_jetstream(&cluster).await?;
-        let metadata_store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-        let metadata = metadata_store
-            .get(&session_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("NATS session '{session_id}' was not found"))?
-            .metadata;
-
-        if let Some(expected_agent) = agent_name.as_deref() {
-            let actual_agent = metadata.agent.name();
-            if actual_agent != Some(expected_agent) {
-                anyhow::bail!(
-                    "NATS session '{session_id}' belongs to agent '{}', not '{expected_agent}'",
-                    actual_agent.unwrap_or("<unknown>")
-                );
-            }
-        }
-
-        let log = NatsSessionLog::new(jetstream, session_id.to_string());
+        let (jetstream, metadata) =
+            harnx_runtime::config::session_metadata_for_agent(&cfg, &agent_name, &session_id)
+                .await?;
+        let log = NatsSessionLog::new(jetstream, metadata.storage_key());
         let raw = log
             .load_events_async()
             .await
@@ -2135,63 +1943,9 @@ impl Tui {
     fn resolve_session_target_and_format(
         &self,
         tokens: &[String],
-        cmd_prefix: &str,
-    ) -> Result<(Option<String>, String, SessionFormat)> {
-        let (positional, format) = parse_session_tokens(tokens)?;
-        let (agent_name, session_id) = self.resolve_agent_and_session(&positional)?;
-        if session_id.is_empty() {
-            anyhow::bail!(
-                "No active session or insufficient arguments. Usage: {cmd_prefix} [<agent> <id>] [--format text|yaml|json]"
-            );
-        }
-        Ok((agent_name, session_id, format))
-    }
-
-    fn resolve_agent_and_session(&self, positional: &[String]) -> Result<(Option<String>, String)> {
-        let cfg = self.config.read();
-        match positional.len() {
-            0 => {
-                let agent_name = cfg
-                    .agent
-                    .as_ref()
-                    .map(|x| x.name().to_string())
-                    .or_else(|| {
-                        cfg.session
-                            .as_ref()
-                            .and_then(|s| s.agent_name().map(str::to_string))
-                    });
-                let session_id = cfg
-                    .session
-                    .as_ref()
-                    .map(|x| x.id().to_string())
-                    .unwrap_or_default();
-                Ok((agent_name, session_id))
-            }
-            1 => {
-                let agent_name = cfg.agent.as_ref().map(|x| x.name().to_string());
-                Ok((agent_name, positional[0].clone()))
-            }
-            _ => Ok((Some(positional[0].clone()), positional[1].clone())),
-        }
-    }
-
-    fn resolve_info_agent_target(&self, tokens: &[String]) -> anyhow::Result<String> {
-        let agent_name = if tokens.len() > 2 {
-            tokens[2].clone()
-        } else {
-            match self.config.read().agent.as_ref() {
-                Some(a) => a.name().to_string(),
-                None => String::new(),
-            }
-        };
-
-        if agent_name.is_empty() {
-            Err(anyhow::anyhow!(
-                "No active agent and no agent name provided. Usage: .info agent [<name>]"
-            ))
-        } else {
-            Ok(agent_name)
-        }
+        command: SessionInspectionCommand,
+    ) -> Result<(String, String, SessionFormat)> {
+        harnx_runtime::config::parse_session_inspection_args(&tokens[2..], command)
     }
 
     fn open_info_overlay(&mut self, text: String, title: &str) {
@@ -2216,12 +1970,7 @@ impl Tui {
             .session
             .as_ref()
             .map(|s| s.id().to_string());
-        let prev_agent = self
-            .config
-            .read()
-            .agent
-            .as_ref()
-            .map(|a| a.name().to_string());
+        let prev_agent = self.config.read().active_agent_ref();
         // Run the command inside a block that owns the lock guards so they are
         // dropped before we touch `self` again for transcript / UI updates.
         let (result, captured) = {
@@ -2229,12 +1978,16 @@ impl Tui {
             let abort_signal = self.abort_signal.clone();
             let mut output = Vec::<u8>::new();
 
-            let result = harnx_runtime::commands::run_command_with_output_and_local_worker(
-                &config,
-                abort_signal,
-                line,
-                &mut output,
-                &self.local_worker,
+            // Command futures carry agent/session initialization state. Keep
+            // that frame off the nested TUI event-dispatch stack.
+            let result = Box::pin(
+                harnx_runtime::commands::run_command_with_output_and_local_worker(
+                    &config,
+                    abort_signal,
+                    line,
+                    &mut output,
+                    &self.local_worker,
+                ),
             )
             .await;
 
@@ -2390,8 +2143,8 @@ impl Tui {
             self.request_exit().await;
             return Ok(());
         }
-        match key.code {
-            KeyCode::Up => {
+        match (key.code, key.modifiers) {
+            (KeyCode::Up, _) => {
                 if let Some(crate::types::ModalState::AgentPicker { selected, .. })
                 | Some(crate::types::ModalState::SessionPicker { selected, .. }) =
                     self.app.modal.as_mut()
@@ -2399,7 +2152,7 @@ impl Tui {
                     *selected = selected.saturating_sub(1);
                 }
             }
-            KeyCode::Down => {
+            (KeyCode::Down, _) => {
                 if let Some(crate::types::ModalState::AgentPicker {
                     selected,
                     agents,
@@ -2424,7 +2177,16 @@ impl Tui {
                     }
                 }
             }
-            KeyCode::Enter => {
+            // Guard keeps u/U available for AgentPicker filtering.
+            (KeyCode::Char('u' | 'U'), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                if matches!(
+                    self.app.modal,
+                    Some(crate::types::ModalState::SessionPicker { .. })
+                ) =>
+            {
+                self.handle_picker_mark_unread_toggle().await;
+            }
+            (KeyCode::Enter, _) => {
                 let modal = self.app.modal.take();
                 match modal {
                     Some(crate::types::ModalState::AgentPicker {
@@ -2452,12 +2214,7 @@ impl Tui {
                                 .session
                                 .as_ref()
                                 .map(|s| s.id().to_string());
-                            let prev_agent = self
-                                .config
-                                .read()
-                                .agent
-                                .as_ref()
-                                .map(|a| a.name().to_string());
+                            let prev_agent = self.config.read().active_agent_ref();
 
                             if let Err(e) = self.config.write().use_agent_by_name(&agent_name) {
                                 self.app.modal = Some(crate::types::ModalState::AgentPicker {
@@ -2468,7 +2225,9 @@ impl Tui {
                                 return Err(e);
                             }
 
-                            let (sessions, fetch_error) = Self::picker_sessions(&self.config).await;
+                            // Box::pin to avoid stack overflow in the picker handler
+                            let (sessions, fetch_error) =
+                                Box::pin(async { Self::picker_sessions(&self.config).await }).await;
                             // Always show SessionPicker so the user can pick "New session"
                             // (index 0) or an existing session. Carry the pre-activation
                             // origin state so reconcile_transcript_after_command sees the
@@ -2510,6 +2269,7 @@ impl Tui {
                         } else {
                             // Existing session at sessions[selected - 1].
                             let session_name = sessions[selected - 1].id.clone();
+                            let session_unread = sessions[selected - 1].unread;
 
                             if let Err(e) = self.config.write().use_session(Some(&session_name)) {
                                 self.app.modal = Some(crate::types::ModalState::SessionPicker {
@@ -2521,6 +2281,9 @@ impl Tui {
                                 });
                                 return Err(e);
                             }
+
+                            // Update cached unread state for the newly selected session
+                            self.app.current_session_unread = session_unread;
 
                             let llm_busy = self.app.llm_busy;
                             let pending = self.app.pending_message.is_some();
@@ -2545,7 +2308,7 @@ impl Tui {
                     }
                 }
             }
-            KeyCode::Esc => {
+            (KeyCode::Esc, _) => {
                 // ESC behaviour depends on which picker is open and how it was reached.
                 //
                 // SessionPicker:
@@ -2580,7 +2343,7 @@ impl Tui {
                     self.app.modal,
                     Some(crate::types::ModalState::AgentPicker { .. })
                 ) {
-                    if self.config.read().agent.is_some() {
+                    if self.config.read().active_agent_ref().is_some() {
                         // Agent already active — mid-switch cancel: just dismiss the picker.
                         self.app.modal = None;
                     } else {
@@ -2601,35 +2364,12 @@ impl Tui {
                         query: String::new(),
                     });
                 } else if should_restore_origin {
-                    if let Some(crate::types::ModalState::SessionPicker {
-                        origin_agent,
-                        origin_session,
-                        ..
-                    }) = self.app.modal.take()
-                    {
-                        if let Some(agent) = origin_agent {
-                            let _ = self.config.write().use_agent_by_name(&agent);
-                        }
-                        if let Some(session) = origin_session {
-                            let _ = self.config.write().use_session(Some(&session));
-                        }
-
-                        let llm_busy = self.app.llm_busy;
-                        let pending = self.app.pending_message.is_some();
-                        Self::refresh_input_chrome_from_state(
-                            &self.config,
-                            &mut self.app,
-                            llm_busy,
-                            pending,
-                        );
-                    }
+                    self.restore_picker_origin().await;
                 }
             }
 
             // Typing characters filters the AgentPicker list.
-            KeyCode::Char(c)
-                if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT =>
-            {
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 if let Some(crate::types::ModalState::AgentPicker {
                     query, selected, ..
                 }) = self.app.modal.as_mut()
@@ -2638,7 +2378,7 @@ impl Tui {
                     *selected = 0; // reset to top of filtered list
                 }
             }
-            KeyCode::Backspace => {
+            (KeyCode::Backspace, _) => {
                 if let Some(crate::types::ModalState::AgentPicker {
                     query, selected, ..
                 }) = self.app.modal.as_mut()
@@ -2651,6 +2391,97 @@ impl Tui {
             _ => {}
         }
         Ok(())
+    }
+
+    async fn handle_picker_mark_unread_toggle(&mut self) {
+        let (session_id, storage_key, new_unread, selected) = {
+            let Some(crate::types::ModalState::SessionPicker {
+                sessions, selected, ..
+            }) = &self.app.modal
+            else {
+                return;
+            };
+            // Index 0 is "New session".
+            let Some(session) = selected
+                .checked_sub(1)
+                .and_then(|index| sessions.get(index))
+            else {
+                return;
+            };
+            (
+                session.id.clone(),
+                harnx_core::session_identity::session_key(
+                    session.agent_name.as_deref(),
+                    &session.id,
+                ),
+                !session.unread,
+                *selected,
+            )
+        };
+        let cluster = self
+            .config
+            .read()
+            .remote_agent
+            .as_ref()
+            .map(|(_, cluster)| cluster.clone())
+            .unwrap_or_else(|| harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string());
+        let Some(store) = self.picker_session_metadata_store(&cluster).await else {
+            return;
+        };
+        if new_unread {
+            if let Err(error) = store.mark_unread(&storage_key).await {
+                log::warn!("Failed to mark session as unread in picker: {error:#}");
+            }
+        } else if let Err(error) = store.mark_read(&storage_key).await {
+            log::warn!("Failed to mark session as read in picker: {error:#}");
+        }
+
+        self.refresh_picker_after_unread_toggle(&session_id, selected)
+            .await;
+    }
+
+    async fn picker_session_metadata_store(&self, cluster: &str) -> Option<SessionMetadataStore> {
+        let config = self.config.read().clone();
+        let jetstream = match config.nats_jetstream(cluster).await {
+            Ok(jetstream) => jetstream,
+            Err(error) => {
+                log::warn!("Failed to get jetstream for picker mark-unread: {error:#}");
+                return None;
+            }
+        };
+        match SessionMetadataStore::ensure(&jetstream, 1).await {
+            Ok(store) => Some(store),
+            Err(error) => {
+                log::warn!("Failed to ensure metadata store for picker mark-unread: {error:#}");
+                None
+            }
+        }
+    }
+
+    async fn refresh_picker_after_unread_toggle(&mut self, session_id: &str, selected: usize) {
+        // Boxed to keep the picker handler's future frame compact.
+        let (sessions, fetch_error) =
+            Box::pin(async { Self::picker_sessions(&self.config).await }).await;
+        let origin = match &self.app.modal {
+            Some(crate::types::ModalState::SessionPicker {
+                origin_agent,
+                origin_session,
+                ..
+            }) => (origin_agent.clone(), origin_session.clone()),
+            _ => (None, None),
+        };
+        let new_selected = sessions
+            .iter()
+            .position(|session| session.id == session_id)
+            .map(|index| index + 1)
+            .unwrap_or_else(|| selected.min(sessions.len()));
+        self.app.modal = Some(crate::types::ModalState::SessionPicker {
+            sessions,
+            selected: new_selected,
+            origin_agent: origin.0,
+            origin_session: origin.1,
+            error: fetch_error,
+        });
     }
 
     /// Execute the action associated with the current modal and clear it.
@@ -2698,9 +2529,6 @@ impl Tui {
                     self.app.transcript_focus = None;
                     self.app.transcript_selection_anchor = None;
                 }
-                crate::types::ModalState::ConfirmAbandonCancellation => {
-                    self.start_cancellation_abandonment();
-                }
                 _ => {}
             }
         }
@@ -2735,6 +2563,47 @@ impl Tui {
             (Some(from), Some(to)) => Some((from.min(to), from.max(to))),
             _ => None,
         }
+    }
+
+    /// Mark the current session as read if it's currently marked unread.
+    /// Called on user presence actions: ESC, CTRL-C, CTRL-D, Enter (submit), first text input.
+    ///
+    /// Boxed to keep `handle_key`'s future frame compact and avoid stack overflow in tests
+    /// (the async body contains await chains that inflate the stack size).
+    fn mark_current_session_read_if_unread(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if !self.app.current_session_unread {
+                return;
+            }
+            // Use session_activity_destination to resolve the current session even when idle
+            // (when user presence typing, ESC, CTRL-C, etc. occur, active_remote_session may be None).
+            let Some((session_id, cluster)) = self.session_activity_destination() else {
+                return;
+            };
+            let config = self.config.read().clone();
+            let jetstream = match config.nats_jetstream(&cluster).await {
+                Ok(js) => js,
+                Err(e) => {
+                    log::warn!("Failed to get jetstream for mark-read: {e:#}");
+                    return;
+                }
+            };
+            let store = match SessionMetadataStore::ensure(&jetstream, 1).await {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("Failed to ensure metadata store for mark-read: {e:#}");
+                    return;
+                }
+            };
+            if let Err(e) = store.mark_read(&session_id).await {
+                log::warn!("Failed to mark session as read: {e:#}");
+                return;
+            }
+            self.app.current_session_unread = false;
+            self.refresh_input_chrome();
+        })
     }
 
     /// Get text content from transcript item for copy/insert operations.

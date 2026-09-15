@@ -8,17 +8,20 @@ use harnx_core::execution_context::{ToolObservationProvenance, EXECUTION_CONTEXT
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_core::tool::{JsonSchema, ToolDeclaration, ToolError, ToolProvider, ToolProviderOutput};
 use harnx_toolset::{
-    ControlKind, ControlMessage, Registration, ToolErrorPayload, ToolReply, ToolRequest, ToolSpec,
-    HDR_CALL_ID, HDR_CONTENT_TYPE, HDR_IDEMPOTENCY_KEY, HDR_INSTANCE_ID,
+    ControlMessage, Registration, ToolErrorPayload, ToolReply, ToolRequest, ToolSpec, HDR_CALL_ID,
+    HDR_CONTENT_TYPE, HDR_IDEMPOTENCY_KEY, HDR_INSTANCE_ID,
 };
 use harnx_toolset_server::{registration_key, TOOL_REGISTRY_BUCKET};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
+mod cancellation;
+mod in_flight;
+use in_flight::InFlightFailure;
+pub use in_flight::NatsInFlightCalls;
 mod execution_context;
 mod replay;
 mod request;
@@ -57,80 +60,6 @@ struct PendingToolRequest {
     registration_key: String,
     subject: String,
     request: async_nats::Request,
-}
-
-#[derive(Clone, Debug)]
-enum InFlightFailure {
-    Unavailable(String),
-}
-
-type InFlightMap = Mutex<HashMap<String, InFlightCall>>;
-static INSTANCE_IN_FLIGHT: OnceLock<std::sync::Mutex<HashMap<ServerScope, Weak<InFlightMap>>>> =
-    OnceLock::new();
-
-/// Shared handle used by tool-process supervision to fail active NATS calls.
-#[derive(Clone, Default)]
-pub struct NatsInFlightCalls {
-    calls: Arc<InFlightMap>,
-}
-
-struct InFlightCall {
-    server: String,
-    failure: oneshot::Sender<InFlightFailure>,
-}
-
-impl NatsInFlightCalls {
-    /// Return the process-wide handle shared by provider and supervisor for an instance.
-    pub fn for_instance(instance_id: &ServerScope) -> Self {
-        let registry = INSTANCE_IN_FLIGHT.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-        let mut registry = registry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        registry.retain(|_, calls| calls.strong_count() > 0);
-        if let Some(calls) = registry.get(instance_id).and_then(Weak::upgrade) {
-            return Self { calls };
-        }
-        let calls = Arc::new(Mutex::new(HashMap::new()));
-        registry.insert(instance_id.clone(), Arc::downgrade(&calls));
-        Self { calls }
-    }
-
-    async fn register(
-        &self,
-        call_id: String,
-        server: String,
-    ) -> oneshot::Receiver<InFlightFailure> {
-        let (failure, receiver) = oneshot::channel();
-        self.calls
-            .lock()
-            .await
-            .insert(call_id, InFlightCall { server, failure });
-        receiver
-    }
-
-    async fn complete(&self, call_id: &str) {
-        self.calls.lock().await.remove(call_id);
-    }
-
-    /// Fail current calls routed to a supervised server that became unavailable.
-    pub async fn fail_server_unavailable(&self, server: &str, message: impl Into<String>) {
-        let message = message.into();
-        let failures = {
-            let mut calls = self.calls.lock().await;
-            let call_ids = calls
-                .iter()
-                .filter(|(_, call)| call.server == server)
-                .map(|(call_id, _)| call_id.clone())
-                .collect::<Vec<_>>();
-            call_ids
-                .into_iter()
-                .filter_map(|call_id| calls.remove(&call_id).map(|call| call.failure))
-                .collect::<Vec<_>>()
-        };
-        for failure in failures {
-            let _ = failure.send(InFlightFailure::Unavailable(message.clone()));
-        }
-    }
 }
 
 /// Core-NATS tool provider built from one turn's KV registration snapshot.
@@ -202,7 +131,11 @@ impl NatsToolProvider {
         });
         let (tools, declarations) = build_registered_tools(active_package, registrations.clone());
         let parent_session_id = canonical_parent_session_id(
-            config.session.as_ref().map(|session| session.id()),
+            config
+                .session
+                .as_ref()
+                .map(|session| session.storage_key())
+                .as_deref(),
             config
                 .execution_control
                 .as_ref()
@@ -306,45 +239,6 @@ impl NatsToolProvider {
         Ok(())
     }
 
-    async fn request_operation_cancel(&self, call_id: &str) -> anyhow::Result<String> {
-        if let Some((store, parent)) = &self.execution_control {
-            let reference = harnx_execution_control::OperationRef::new(&parent.session_id, call_id);
-            let operation = store.cancel_operation(&reference, None, false).await?;
-            return Ok(operation
-                .cancellation
-                .context("tool cancellation missing")?
-                .cancellation_id);
-        }
-        Ok(Uuid::new_v4().to_string())
-    }
-
-    async fn publish_cancel(&self, call_id: &str) -> anyhow::Result<()> {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let cancellation_id = self.request_operation_cancel(call_id).await?;
-            let control = ControlMessage {
-                operation_id: call_id.to_string(),
-                cancellation_id,
-                call_id: call_id.to_string(),
-                kind: ControlKind::Cancel,
-            };
-            let mut headers = async_nats::HeaderMap::new();
-            headers.insert(HDR_CALL_ID, call_id);
-            headers.insert(HDR_INSTANCE_ID, self.instance_id.as_str());
-            headers.insert(HDR_CONTENT_TYPE, JSON_CONTENT_TYPE);
-            self.client
-                .publish_with_headers(
-                    self.instance_id.control_subject(),
-                    headers,
-                    serde_json::to_vec(&control)?.into(),
-                )
-                .await?;
-            self.client.flush().await?;
-            Ok(())
-        })
-        .await
-        .context("tool cancellation publication timed out; shutdown is unconfirmed")?
-    }
-
     async fn wait_for_registration_loss(&self, key: &str) -> String {
         let Some(registry) = self.registry.as_ref() else {
             std::future::pending::<()>().await;
@@ -386,22 +280,18 @@ impl NatsToolProvider {
             registration_key,
             subject,
             request,
-            durable: _,
+            durable,
         } = pending;
-        let mut supervised_failure = self.in_flight.register(call_id.clone(), server).await;
+        let mut supervised_failure = self
+            .in_flight
+            .register(call_id.clone(), server.clone())
+            .await;
         let request = harnx_nats_common::rpc::request(&self.client, subject, request);
         tokio::pin!(request);
         let response = tokio::select! {
             _ = wait_abort_signal(abort) => {
                 self.in_flight.complete(&call_id).await;
-                if let Err(error) = self.publish_cancel(&call_id).await {
-                    return Err(ToolError::Fatal(anyhow!(
-                        "tool call aborted; failed to publish cancellation: {error}"
-                    )));
-                }
-                if tokio::time::timeout(Duration::from_secs(5), &mut request).await.is_err() {
-                    return Err(ToolError::Fatal(anyhow!("tool cancellation unconfirmed; invocation has not acknowledged shutdown")));
-                }
+                self.schedule_cancel(&durable, &server);
                 return Err(ToolError::Fatal(anyhow!("tool call aborted")));
             }
             failure = &mut supervised_failure => {
@@ -410,30 +300,31 @@ impl NatsToolProvider {
                     Ok(InFlightFailure::Unavailable(message)) => message,
                     Err(_) => "tool server unavailable".to_string(),
                 };
-                return Err(self.transport_failure(&call_id, message).await);
+                return Err(self.transport_failure(&durable, &server, message));
             }
             message = self.wait_for_registration_loss(&registration_key) => {
                 self.in_flight.complete(&call_id).await;
-                return Err(self.transport_failure(&call_id, message).await);
+                return Err(self.transport_failure(&durable, &server, message));
             }
             response = &mut request => response,
         };
         self.in_flight.complete(&call_id).await;
         match response {
             Ok(message) => Ok(message),
-            Err(error) => Err(self
-                .transport_failure(&call_id, format!("tool server unavailable: {error}"))
-                .await),
+            Err(error) => Err(self.transport_failure(
+                &durable,
+                &server,
+                format!("tool server unavailable: {error}"),
+            )),
         }
     }
-    async fn transport_failure(&self, call_id: &str, message: String) -> ToolError {
+    fn transport_failure(&self, request: &ToolRequest, server: &str, message: String) -> ToolError {
+        self.schedule_cancel(request, server);
         if self.execution_control.is_none() {
-            return ToolError::Recoverable(anyhow!(message));
+            ToolError::Recoverable(anyhow!(message))
+        } else {
+            ToolError::Fatal(anyhow!(message))
         }
-        // A failed backend must not turn error reporting into another
-        // unbounded wait for cancellation delivery.
-        let _ = self.publish_cancel(call_id).await;
-        ToolError::Fatal(anyhow!("{message}; tool shutdown is unconfirmed"))
     }
 }
 
@@ -568,7 +459,7 @@ impl ToolProvider for NatsToolProvider {
         replay: harnx_core::tool::ToolReplay<'_>,
         abort: &AbortSignal,
     ) -> Result<Option<ToolProviderOutput>, ToolError> {
-        self.replay_recorded_call(replay, abort)
+        Box::pin(self.replay_recorded_call(replay, abort))
             .await
             .map_err(ToolError::Fatal)
     }
@@ -598,14 +489,14 @@ impl ToolProvider for NatsToolProvider {
         tool_call_id: Option<&str>,
         abort: &AbortSignal,
     ) -> Result<ToolProviderOutput, ToolError> {
-        self.call_registered_tool(
+        Box::pin(self.call_registered_tool(
             request::ToolCallInput {
                 name: tool_name,
                 arguments,
                 id: tool_call_id,
             },
             abort,
-        )
+        ))
         .await
     }
 }

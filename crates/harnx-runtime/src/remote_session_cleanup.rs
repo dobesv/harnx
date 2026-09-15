@@ -180,8 +180,12 @@ async fn handle_candidate(
             stats.skipped_active += 1;
         }
         Ok(false) => {
-            match nats_admin::delete_remote_session(context.config, context.cluster, session_id)
-                .await
+            match nats_admin::delete_remote_session_by_key(
+                context.config,
+                context.cluster,
+                session_id,
+            )
+            .await
             {
                 Ok(_) => stats.deleted += 1,
                 Err(error) => {
@@ -248,7 +252,7 @@ fn candidate_session_ids(records: &[ListedSession], threshold: u64) -> Vec<Strin
     records
         .iter()
         .filter(|record| is_cleanup_candidate(record, threshold))
-        .map(|record| record.metadata.session_id.clone())
+        .map(|record| record.metadata.storage_key())
         .collect()
 }
 
@@ -289,6 +293,10 @@ mod tests {
     use async_nats::jetstream::stream;
     use chrono::{TimeZone, Utc};
 
+    fn storage_key(id: &str) -> String {
+        harnx_core::session_identity::session_key(Some("hephaestus"), id)
+    }
+
     fn sample_record(session_id: &str, last_activity: u64) -> ListedSession {
         ListedSession {
             metadata: SessionMetadata::new(
@@ -300,6 +308,7 @@ mod tests {
                 first_activation_at: None,
                 last_activity_at: Utc.timestamp_opt(last_activity as i64, 0).unwrap(),
             }),
+            unread: false,
         }
     }
 
@@ -317,7 +326,7 @@ mod tests {
         store
             .kv_store()
             .put(
-                activity_key(&record.metadata.session_id),
+                activity_key(&record.metadata.storage_key()),
                 serde_json::to_vec(record.activity.as_ref().unwrap())
                     .unwrap()
                     .into(),
@@ -336,7 +345,7 @@ mod tests {
         assert_eq!(stats.errors, 0);
         assert!(!stream_exists(jetstream, session_id).await);
         assert!(metadata_store
-            .get(session_id)
+            .get(&storage_key(session_id))
             .await
             .expect("get metadata")
             .is_none());
@@ -360,7 +369,7 @@ mod tests {
 
         assert_eq!(
             candidate_session_ids(&records, 100),
-            vec!["old".to_string(), "missing-stale".to_string()]
+            vec![storage_key("old"), storage_key("missing-stale")]
         );
     }
 
@@ -439,12 +448,12 @@ mod tests {
 
         assert_session_deleted(stats, &jetstream, &metadata_store, &session_id).await;
         assert!(metadata_store
-            .get_activity(&session_id)
+            .get_activity(&storage_key(&session_id))
             .await
             .expect("get activity")
             .is_none());
         assert!(lease_store
-            .entry(NatsLeaseConfig::default().key_for_session(&session_id))
+            .entry(NatsLeaseConfig::default().key_for_session(&storage_key(&session_id)))
             .await
             .expect("lease entry")
             .is_none());
@@ -469,7 +478,7 @@ mod tests {
         let metadata_store = put_test_metadata(&jetstream, &record).await;
         metadata_store
             .kv_store()
-            .purge(activity_key(&session_id))
+            .purge(activity_key(&storage_key(&session_id)))
             .await
             .expect("purge activity");
 
@@ -503,7 +512,7 @@ mod tests {
         let metadata_store = put_test_metadata(&jetstream, &record).await;
         metadata_store
             .kv_store()
-            .put(activity_key(&session_id), "not-json".into())
+            .put(activity_key(&storage_key(&session_id)), "not-json".into())
             .await
             .expect("corrupt activity");
 
@@ -543,7 +552,7 @@ mod tests {
         assert_eq!(stats.errors, 0);
         assert!(stream_exists(&jetstream, &session_id).await);
         assert!(metadata_store
-            .get(&session_id)
+            .get(&storage_key(&session_id))
             .await
             .expect("get metadata")
             .is_some());
@@ -564,7 +573,7 @@ mod tests {
         let metadata_store = put_test_metadata(&jetstream, &sample_record(&session_id, 1)).await;
         let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
             jetstream: jetstream.clone(),
-            session_id: &session_id,
+            session_id: &storage_key(&session_id),
             worker_id: "lease-holder".to_string(),
             generation: 1,
             config: NatsLeaseConfig::default(),
@@ -586,7 +595,7 @@ mod tests {
         assert!(stats.skipped_active >= 1);
         assert!(stream_exists(&jetstream, &session_id).await);
         assert!(metadata_store
-            .get(&session_id)
+            .get(&storage_key(&session_id))
             .await
             .expect("get metadata")
             .is_some());
@@ -623,7 +632,7 @@ mod tests {
         assert_eq!(second.errors, 0);
         assert!(!stream_exists(&jetstream, &session_id).await);
         assert!(metadata_store
-            .get(&session_id)
+            .get(&storage_key(&session_id))
             .await
             .expect("get metadata")
             .is_none());
@@ -663,7 +672,8 @@ mod tests {
     }
 
     async fn put_test_stream(jetstream: &async_nats::jetstream::Context, session_id: &str) {
-        let stream_name = stream_name_for_session(session_id);
+        let session_id = storage_key(session_id);
+        let stream_name = stream_name_for_session(&session_id);
         jetstream
             .create_stream(stream::Config {
                 name: stream_name.clone(),
@@ -690,7 +700,7 @@ mod tests {
             .nats_kv_bucket(cluster, "harnx_leases")
             .await
             .expect("lease bucket");
-        let lease_key = NatsLeaseConfig::default().key_for_session(session_id);
+        let lease_key = NatsLeaseConfig::default().key_for_session(&storage_key(session_id));
         lease_store
             .entry(lease_key)
             .await
@@ -700,7 +710,7 @@ mod tests {
 
     async fn stream_exists(jetstream: &async_nats::jetstream::Context, session_id: &str) -> bool {
         jetstream
-            .get_stream(&stream_name_for_session(session_id))
+            .get_stream(&stream_name_for_session(&storage_key(session_id)))
             .await
             .is_ok()
     }

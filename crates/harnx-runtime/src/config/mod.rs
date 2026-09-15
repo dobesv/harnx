@@ -63,7 +63,9 @@ pub const DEFAULT_BUCKET_REPLICAS: usize = 1;
 pub const HARNX_WORKER_BIN_ENV: &str = "HARNX_WORKER_BIN";
 pub use self::session_format::{
     dump_entries_jsonl, dump_entries_yaml, jsonl_line, load_session_for_render,
-    render_metadata_json, render_metadata_yaml, yaml_doc, SessionFormat,
+    parse_session_inspection_args, render_metadata_json, render_metadata_yaml,
+    resolve_session_agent, session_metadata_for_agent, yaml_doc, SessionFormat,
+    SessionInspectionCommand,
 };
 
 pub use self::agent::TEMP_AGENT_NAME;
@@ -332,6 +334,8 @@ pub struct Config {
         harnx_execution_control::ExecutionStore,
         harnx_execution_control::OperationRef,
     )>,
+    /// Captured when this worker claims its execution, never rebound on output.
+    pub generation_fence: Option<crate::execution_fence::GenerationFence>,
     pub maintenance_abort: Option<crate::utils::AbortSignal>,
     pub rag: Option<Arc<Rag>>,
     pub agent: Option<Agent>,
@@ -407,6 +411,7 @@ impl Clone for Config {
             session: self.session.clone(),
             maintenance_abort: self.maintenance_abort.clone(),
             execution_control: self.execution_control.clone(),
+            generation_fence: self.generation_fence.clone(),
             rag: self.rag.clone(),
             agent: self.agent.clone(),
             remote_agent: self.remote_agent.clone(),
@@ -453,6 +458,7 @@ impl Config {
             session: None,
             maintenance_abort: None,
             execution_control: None,
+            generation_fence: None,
             rag: self.rag.clone(),
             agent: self.agent.clone(),
             remote_agent: self.remote_agent.clone(),
@@ -492,6 +498,7 @@ impl Default for Config {
             session: None,
             maintenance_abort: None,
             execution_control: None,
+            generation_fence: None,
             rag: None,
             agent: None,
             remote_agent: None,
@@ -506,16 +513,6 @@ impl Default for Config {
 pub type GlobalConfig = Arc<RwLock<Config>>;
 
 impl Config {
-    /// Set the agent and cluster for the active session.
-    pub fn set_remote_agent(&mut self, agent: String, cluster: String) {
-        self.remote_agent = Some((agent, cluster));
-    }
-
-    /// Check whether the active agent ref names a cluster.
-    pub fn is_remote_agent(&self) -> bool {
-        self.remote_agent.is_some()
-    }
-
     pub fn state(&self) -> StateFlags {
         let mut flags = StateFlags::empty();
         if let Some(session) = &self.session {
@@ -1083,7 +1080,12 @@ impl Config {
         Ok(())
     }
 
-    pub fn before_chat_completion(&mut self, input: &Input) -> Result<()> {
+    pub fn before_chat_completion(&mut self, input: &mut Input) -> Result<()> {
+        if !self.dry_run && input.with_session() {
+            if let Some(session) = self.session.as_mut() {
+                session::prepare_input(session, input)?;
+            }
+        }
         self.last_message = Some(LastMessage::new(input.clone(), String::new()));
         Ok(())
     }

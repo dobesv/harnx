@@ -3,6 +3,8 @@ use anyhow::{anyhow, bail, Context, Result};
 #[cfg(unix)]
 use bytes::Bytes;
 #[cfg(unix)]
+use harnx_core::child_process::ChildProcessManager;
+#[cfg(unix)]
 use harnx_core::config_paths::data_dir;
 #[cfg(unix)]
 use http_body_util::{BodyExt, Empty};
@@ -83,8 +85,13 @@ pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// `llama-server` lives for the whole harnx process and is reused across
 /// requests (callers obtain the manager per request and drop their `Arc`
 /// immediately, so a `Weak` registry would tear the child down after every
-/// call and force a model reload on the next one). The child is reaped on
-/// process exit via `kill_on_drop(true)` on the spawned `Command`.
+/// call and force a model reload on the next one).
+///
+/// Nothing ever drops this static — Rust does not run destructors on statics at
+/// process exit — so `kill_on_drop(true)` cannot be what retires the child, and
+/// relying on it stranded a live `llama-server` on every exit. Each server is
+/// instead spawned through a [`ChildProcessManager`], which asks the kernel to
+/// signal the child once its parent goes away.
 #[cfg(unix)]
 static MANAGERS: OnceLock<std::sync::Mutex<HashMap<ProcessIdentity, Arc<LlamaServerProcessManager>>>> =
     OnceLock::new();
@@ -200,6 +207,9 @@ pub struct LlamaServerProcessManager {
     config: LlamaServerProcessConfig,
     state: Mutex<Option<Arc<RunningServer>>>,
     spawn_count: Arc<AtomicUsize>,
+    /// Spawns from a stable OS thread so the kernel's parent-death signal
+    /// tracks this manager rather than a Tokio worker that may retire early.
+    spawner: ChildProcessManager,
 }
 
 #[cfg(unix)]
@@ -222,6 +232,7 @@ impl LlamaServerProcessManager {
             config,
             state: Mutex::new(None),
             spawn_count: Arc::new(AtomicUsize::new(0)),
+            spawner: ChildProcessManager::new(),
         })
     }
 
@@ -243,7 +254,7 @@ impl LlamaServerProcessManager {
             state.take();
         }
 
-        let mut running = spawn_server(self.config.clone()).await?;
+        let mut running = spawn_server(&self.spawner, self.config.clone()).await?;
         wait_until_ready(&mut running, self.config.ready_timeout).await?;
         self.spawn_count.fetch_add(1, Ordering::SeqCst);
         let running = Arc::new(running);
@@ -360,7 +371,10 @@ fn resolve_socket_path(configured_path: Option<&Path>, identity: &ProcessIdentit
 }
 
 #[cfg(unix)]
-async fn spawn_server(config: LlamaServerProcessConfig) -> Result<RunningServer> {
+async fn spawn_server(
+    spawner: &ChildProcessManager,
+    config: LlamaServerProcessConfig,
+) -> Result<RunningServer> {
     let binary_path = discover_binary_path(config.binary_path.as_deref()).await?;
     let identity = ProcessIdentity::from_config(&config)?;
     let socket_path = resolve_socket_path(config.socket_path.as_deref(), &identity);
@@ -394,7 +408,7 @@ async fn spawn_server(config: LlamaServerProcessConfig) -> Result<RunningServer>
         .stderr(Stdio::piped());
 
     debug!("spawning llama-server: {:?}", command);
-    let mut child = command.spawn().with_context(|| {
+    let mut child = spawner.spawn(command).await.with_context(|| {
         format!(
             "Failed to spawn llama-server binary `{}`",
             binary_path.display()
@@ -770,6 +784,7 @@ mod tests {
             config: test_config("/models/live.gguf"),
             state: Mutex::new(Some(fake.clone())),
             spawn_count: Arc::new(AtomicUsize::new(0)),
+            spawner: ChildProcessManager::new(),
         };
 
         let (a, b) = tokio::join!(manager.ensure_ready(), manager.ensure_ready());

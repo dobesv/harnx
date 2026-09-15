@@ -48,7 +48,7 @@ async fn parent_cancellation_waits_for_blocking_hook_future() -> Result<()> {
     };
     store.claim(&root.reference, owner.clone()).await?;
     let child = OperationRef::new("hook-parent", "blocking-hook");
-    store.child(child.clone(), root.reference.clone()).await?;
+    let producer = register_hook(&store, &root.reference, &child).await?;
     let hook = Arc::new(GatedHook::default());
     let scope = ServerScope::new();
     let shutdown = CancellationToken::new();
@@ -65,7 +65,7 @@ async fn parent_cancellation_waits_for_blocking_hook_future() -> Result<()> {
     let mut headers = async_nats::HeaderMap::new();
     headers.insert(
         "Harnx-Hook-Operation",
-        serde_json::to_string(&child)?.as_str(),
+        serde_json::to_string(&producer)?.as_str(),
     );
     let payload = HookPayload {
         session_id: "hook-parent".into(),
@@ -73,7 +73,7 @@ async fn parent_cancellation_waits_for_blocking_hook_future() -> Result<()> {
         resume_count: 0,
         hook_event: HookEvent::PreToolUse {
             tool_name: "example".into(),
-            tool_input: json!({}),
+            tool_input: json!({"text": "x".repeat(96 * 1024)}),
             tool_use_id: "call".into(),
         },
     };
@@ -105,7 +105,7 @@ async fn parent_cancellation_waits_for_blocking_hook_future() -> Result<()> {
         OperationState::Unconfirmed
     );
     hook.release.notify_one();
-    tokio::time::timeout(Duration::from_secs(2), &mut invoke).await??;
+    assert_interrupted_reply(tokio::time::timeout(Duration::from_secs(2), &mut invoke).await??)?;
     assert_eq!(
         store.status(&root.reference).await?.state,
         OperationState::Cancelled
@@ -113,4 +113,22 @@ async fn parent_cancellation_waits_for_blocking_hook_future() -> Result<()> {
     shutdown.cancel();
     task.await??;
     Ok(())
+}
+
+fn assert_interrupted_reply(reply: async_nats::Message) -> Result<()> {
+    let value: serde_json::Value = serde_json::from_slice(&reply.payload)?;
+    assert!(
+        value.get("interrupted").is_some(),
+        "late hook output must be suppressed: {value}"
+    );
+    Ok(())
+}
+
+async fn register_hook(
+    store: &ExecutionStore,
+    root: &OperationRef,
+    child: &OperationRef,
+) -> Result<harnx_execution_control::ExecutionContext> {
+    store.child(child.clone(), root.clone()).await?;
+    store.activate_gate(child).await
 }

@@ -216,9 +216,13 @@ remote-follow):
 - **Messages snapshot resets guard:** When a live `MESSAGES_SNAPSHOT` replaces
   a lagged broadcast stream, the guard must finalize any open lifecycles first
   so subsequent END events don't appear orphaned.
-- **No frame drops:** Lifecycle frames are ordered; dropping an END without its
-  START invalidates every later frame. Remote-follow uses awaited backpressured
-  sends instead of `try_send`-and-drop.
+- **Generation-aware queue:** Remote-follow retains the attached prompt's
+  generation through its backpressured event queue. Accepted root interruption
+  ends the run without waiting for lease release or `TurnEnd`; a replacement
+  generation cannot prolong that run or send its events under the old run ID.
+  The lifecycle guard runs at wire emission, after stopped-generation events are
+  discarded. It closes only lifecycles actually sent, so discarding a queued
+  START cannot leave an orphan END.
 
 See `ag_ui_lifecycle.rs` for the guard implementation and
 `ag_ui_remote_follow.rs` for remote-follow integration. Tests in
@@ -237,7 +241,7 @@ Cross-process live synchronization and durable session persistence use NATS.
 | `Model::ThoughtChunk` | `THINKING_START`, `THINKING_TEXT_MESSAGE_START`, `THINKING_TEXT_MESSAGE_CONTENT`, `THINKING_TEXT_MESSAGE_END`, `THINKING_END` | Sink keeps per-run thinking state so multi-chunk reasoning stays one segment. |
 | `Tool::*` | `TOOL_CALL_START`, `TOOL_CALL_ARGS`, `TOOL_CALL_END`, `TOOL_CALL_RESULT` | Progress/update still dropped as too noisy. |
 | `Turn::Started` / `Turn::Ended` | `STEP_STARTED` / `STEP_FINISHED` | Step names use `turn-N`. |
-| `Turn::SubAgentStarted` / `SubAgentProgress` | `CUSTOM` | Names: `sub_agent_started`, `sub_agent_progress`. The optional invocation ID correlates reused child sessions; progress carries running/done/failed status, elapsed milliseconds, direct token usage, and direct tool-call count. |
+| `Turn::SubAgentStarted` / `SubAgentProgress` | `CUSTOM` | Names: `sub_agent_started`, `sub_agent_progress`. The optional invocation ID correlates reused child sessions; progress carries running/done/failed status, elapsed milliseconds, direct token usage, direct tool-call count, and optional `title` (present when the sub-agent reported a session title). |
 | `Turn::RetryAttempt` / `ModelFallback` / `HandoffRequested` | `CUSTOM` | Names: `turn_retry_attempt`, `turn_model_fallback`, `turn_handoff_requested`. A handoff request is informational and may carry no session ID; clients must not navigate on it. |
 | `Session::HandoffCommitted` | `CUSTOM` | Name: `session_handoff`. Emitted only after the target prompt is accepted for dispatch, with nonempty `agent`, resolved `session_id`, optional `handoff_tool_call_id`, and optional durable `after_seq`. Hydration always sets `after_seq` from the handoff log entry's sequence. |
 | Attach boundary | `CUSTOM` | Name: `session_attach_boundary`. Emitted immediately after `RUN_STARTED` with `attached_seq` set to the durable log tail observed at attach time, before snapshot, hydrated control, or live events. |
@@ -270,9 +274,12 @@ decision can resume the tool round; the server does not retain a continuation.
 - **Web UI / JSON-RPC**: Submit one tool decision at a time using
   `session/hitl_decision` with params
   `{tool_call_id, approved, note?}`. The result is `{applied: true}` when the worker
-  acknowledges applying the decision, or `{applied: false}` when no matching
-  approval remains pending. Clients remove the resolved gate and refresh from the
-  durable log; errors leave the gate available for retry.
+  acknowledges the decision or the durable log already contains the same approval
+  for that request. Retries recover a lost acknowledgement without executing the
+  tool twice. A conflicting decision or an unresolved request that is no longer
+  pending returns `{applied: false}`. Decisions from an older tool round do not
+  authorize a reused tool-call ID in a newer round. Clients remove the resolved
+  gate and refresh from the durable log; errors leave it available for retry.
 - **Legacy SSE resume path**: The client sends a prompted run with `resume: [{interruptId, status, payload: {approved}}]`
   in the AG-UI input. `interruptId` identifies the pending tool call.
 - **Legacy JSON-RPC resume path**: Same resume field in `session/prompt` params. Both legacy paths parse via

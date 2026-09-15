@@ -152,4 +152,48 @@ export async function submitHitlDecision(
   return json?.result || { applied: false };
 }
 
+export interface SessionTarget {
+  agent: string;
+  session: string;
+}
+
+async function sessionRpcStatusCall(
+  target: SessionTarget,
+  method: string,
+): Promise<{ status: string }> {
+  const { agent, session } = target;
+  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method,
+    }),
+  });
+  let json: JsonRpcResponse<{ status: string }> | undefined;
+  try {
+    json = await res.json() as JsonRpcResponse<{ status: string }>;
+  } catch {
+    json = undefined;
+  }
+  if (json?.error) throw new Error(`RPC Error: ${json.error.message || json.error.code}`);
+  if (!res.ok) throw new Error(`RPC call failed with HTTP ${res.status}`);
+  return json?.result || { status: 'ok' };
+}
+
+export async function markRead(
+  agent: string,
+  session: string,
+): Promise<{ status: string }> {
+  return sessionRpcStatusCall({ agent, session }, 'session/mark_read');
+}
+
+export async function markUnread(
+  agent: string,
+  session: string,
+): Promise<{ status: string }> {
+  return sessionRpcStatusCall({ agent, session }, 'session/mark_unread');
+}
+
 export { abandonCancellation, cancel, sessionControl, CANCELLATION_TIMEOUT_MS } from './cancellationApi';

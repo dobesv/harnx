@@ -8,7 +8,7 @@
 //! ## Timeout vs Budget Asymmetry
 //!
 //! Timeout (`timeout_secs`) is enforced **caller-side only**. It fires the existing
-//! cancellation path (AbortSignal → ControlCommand::Cancel → cancel_pending_turn) for
+//! cancellation path (AbortSignal → generation-scoped root acceptance) for
 //! invocations whose caller remains alive. There is NO worker-side deadline timer.
 //!
 //! Budget (`token_budget`) is enforced **worker-side** at the pre-model-call boundary.

@@ -60,7 +60,7 @@ async fn seed_test_log_entries(
     jetstream: &async_nats::jetstream::Context,
     session_id: &str,
 ) -> Result<NatsSessionLog> {
-    let log = NatsSessionLog::new(jetstream.clone(), session_id);
+    let log = NatsSessionLog::for_agent(jetstream.clone(), "test-agent", session_id);
     log.append_event_async(&SessionLogEntry::Message {
         id: Some("m1".to_string()),
         role: MessageRole::User,

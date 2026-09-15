@@ -25,6 +25,7 @@ mod activation;
 mod activation_transport;
 mod agent_loop;
 mod backend;
+mod cleanup_supervisor;
 mod control;
 mod daemon;
 mod daemon_background;
@@ -37,8 +38,8 @@ mod hook_crash;
 mod hook_process;
 mod hook_registration;
 mod hook_supervisor;
-mod process_manager;
 pub mod server_reconciler;
+mod session_turn;
 mod subagent_progress;
 mod subagent_toolset;
 mod tool_registry;
@@ -55,7 +56,8 @@ mod subagent_tool_context_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 
-// Re-export public items to preserve the `crate::nats_worker::X` path
+// Re-export test-only items for integration tests
+pub use agent_loop::derive_attention_seq;
 pub(crate) use agent_loop::derive_pending_hitl_approvals;
 pub use agent_loop::{
     reconcile_hook_supervisor, run_agent_loop_with_nats, run_agent_loop_with_nats_inner,

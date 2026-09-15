@@ -48,10 +48,13 @@ fn budget_boundary_call_fn(call_count: Arc<AtomicUsize>) -> crate::agent_loop::A
 }
 
 fn timeout_then_reply_call_fn(call_count: Arc<AtomicUsize>) -> crate::agent_loop::AgentCallFn {
-    Arc::new(move |_input, _config, abort| {
-        let call_index = call_count.fetch_add(1, Ordering::SeqCst);
+    Arc::new(move |input, _config, abort| {
+        call_count.fetch_add(1, Ordering::SeqCst);
+        // The deadline can win before G1 reaches the model. G2 must not inherit
+        // the first-call stall merely because startup was slower under load.
+        let timed_prompt = input.text() == "work until the invocation deadline";
         Box::pin(async move {
-            if call_index == 0 {
+            if timed_prompt {
                 harnx_core::abort::wait_abort_signal(&abort).await;
                 bail!("timed-out child call aborted")
             }
@@ -170,10 +173,11 @@ async fn assert_subagent_retry(
     expected_response: &str,
     call_count: &AtomicUsize,
 ) {
+    let before = call_count.load(Ordering::SeqCst);
     let retry = invoke_subagent_prompt(toolset, arguments).await;
     assert_eq!(retry["response"], expected_response);
     assert!(retry.get("termination").is_none());
-    assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    assert_eq!(call_count.load(Ordering::SeqCst), before + 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -217,7 +221,11 @@ async fn token_budget_stops_at_round_boundary_and_resets_for_next_activation() {
     assert_eq!((terminal.budgeted, terminal.budget), (3, 1));
     assert_eq!(call_count.load(Ordering::SeqCst), 1);
 
-    let log = NatsSessionLog::new(async_nats::jetstream::new(client.clone()), session_id);
+    let log = NatsSessionLog::for_agent(
+        async_nats::jetstream::new(client.clone()),
+        "metis",
+        &session_id,
+    );
     assert_budget_terminal_transcript(
         &log.load_events_async()
             .await
@@ -266,21 +274,21 @@ async fn subagent_timeout_returns_synthesized_result_and_same_session_retry_succ
     .await;
     assert_timeout_result(&stopped, &session_id);
 
-    let log = NatsSessionLog::new(
-        seeded
-            .parent_config
-            .nats_jetstream("local")
-            .await
-            .expect("timeout child log jetstream"),
-        session_id.clone(),
-    );
-    let entries = log
-        .load_events_async()
+    let js = seeded.parent_config.nats_jetstream("local").await.unwrap();
+    let store = harnx_execution_control::ExecutionStore::ensure(&js, 1)
         .await
-        .expect("load timeout child log");
-    assert!(entries
-        .iter()
-        .any(|(_, entry)| matches!(entry, SessionLogEntry::Cancel { .. })));
+        .unwrap();
+    let storage_key = harnx_core::session_identity::session_key(Some("metis"), &session_id);
+    let original = store.current(&storage_key).await.unwrap().unwrap();
+    assert!(original.cancellation.is_some());
+    assert!(!original.allows_continuation());
+    if original.gate_registration.is_some() {
+        assert!(store
+            .accepted_stop(&original.reference)
+            .await
+            .unwrap()
+            .is_some());
+    }
 
     assert_subagent_retry(
         &toolset,

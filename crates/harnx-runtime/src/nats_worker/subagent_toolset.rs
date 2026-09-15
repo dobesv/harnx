@@ -1,5 +1,6 @@
 //! NATS toolset for nested sub-agent sessions.
 
+mod admission;
 mod termination;
 
 use super::subagent_progress::SubagentProgressReporter;
@@ -64,6 +65,8 @@ pub(crate) struct SubagentToolset {
     jetstream: jetstream::Context,
     session_metadata: crate::nats_session_metadata::SessionMetadataStore,
     progress_heartbeat: Duration,
+    #[cfg(test)]
+    admission_barrier: Option<std::sync::Arc<admission::AdmissionBarrier>>,
 }
 
 pub(crate) struct SubagentNats {
@@ -87,12 +90,14 @@ impl SubagentNats {
 }
 
 struct SubagentStart<'a> {
+    admission: &'a admission::Admission,
     child_session_id: &'a str,
     invocation_id: &'a str,
     tool_call_id: Option<&'a str>,
 }
 
 struct ProgressReporterStart {
+    admission: admission::Admission,
     child_session_id: String,
     parent_session_id: Option<String>,
     invocation_id: String,
@@ -117,6 +122,8 @@ impl SubagentToolset {
             jetstream: nats.jetstream,
             session_metadata: nats.session_metadata,
             progress_heartbeat: SUBAGENT_PROGRESS_HEARTBEAT,
+            #[cfg(test)]
+            admission_barrier: None,
         }
     }
 
@@ -130,8 +137,14 @@ impl SubagentToolset {
         &self,
         session_id: Option<String>,
         parent_session_id: Option<&str>,
+        admission: Option<&admission::Admission>,
     ) -> Result<NatsSession, ToolInvokeError> {
-        let config = self.session_config(session_id, parent_session_id).await?;
+        let config = self
+            .session_config(session_id.clone(), parent_session_id)
+            .await?;
+        if let Some(admission) = admission {
+            admission.start(json!({"kind": "subagent-session", "session_id": session_id, "agent": self.agent})).await?;
+        }
         NatsSession::new(
             config,
             self.client.clone(),
@@ -175,13 +188,14 @@ impl SubagentToolset {
         &self,
         params: termination::PromptParams<'_>,
     ) -> Result<CompletedSubagentTurn, ToolInvokeError> {
-        termination::run_prompt(self, params).await
+        Box::pin(termination::run_prompt(self, params)).await
     }
 
     async fn start_progress_reporter(
         &self,
         start: ProgressReporterStart,
     ) -> Result<SubagentProgressReporter, ToolInvokeError> {
+        start.admission.check("subagent-started").await?;
         let parent_sink = match start.parent_session_id {
             Some(parent_session_id) => {
                 let sink = NatsEventSink::new(
@@ -189,11 +203,13 @@ impl SubagentToolset {
                     self.jetstream.clone(),
                     parent_session_id.clone(),
                 )
-                .await;
+                .await
+                .with_execution(start.admission.fence.clone());
                 self.emit_parent_subagent_started(
                     &sink,
                     &parent_session_id,
                     SubagentStart {
+                        admission: &start.admission,
                         child_session_id: &start.child_session_id,
                         invocation_id: &start.invocation_id,
                         tool_call_id: start.tool_call_id.as_deref(),
@@ -204,13 +220,15 @@ impl SubagentToolset {
             }
             None => None,
         };
-        Ok(SubagentProgressReporter::spawn(
+        Ok(SubagentProgressReporter::start(
             self.agent.clone(),
             start.child_session_id,
             start.invocation_id,
             parent_sink,
+            self.session_metadata.clone(),
             self.progress_heartbeat,
-        ))
+        )
+        .await)
     }
 
     async fn emit_parent_subagent_started(
@@ -220,6 +238,7 @@ impl SubagentToolset {
         start: SubagentStart<'_>,
     ) -> Result<(), ToolInvokeError> {
         let SubagentStart {
+            admission,
             child_session_id,
             invocation_id,
             tool_call_id,
@@ -231,18 +250,13 @@ impl SubagentToolset {
             tool_call_id: tool_call_id.map(str::to_string),
             started_at: Some(chrono::Utc::now()),
         };
-        let (_, inserted) = crate::nats_session::append_invocation_entry(
-            &NatsSessionLog::new(self.jetstream.clone(), parent_session_id),
-            &entry,
-            invocation_id,
-        )
-        .await
-        .map_err(|error| {
-            ToolInvokeError::Recoverable(format!("persist sub-agent start: {error:#}"))
-        })?;
+        let inserted =
+            admission::append_started(self, (parent_session_id, invocation_id), &entry, admission)
+                .await?;
         if !inserted {
             return Ok(());
         }
+        admission.check("subagent-start-event").await?;
         let source = AgentSource {
             agent: self.agent.clone(),
             session_id: Some(child_session_id.to_string()),
@@ -267,14 +281,17 @@ impl SubagentToolset {
     }
 
     async fn turn_has_cancel(&self, result: &NatsTurnResult) -> bool {
-        NatsSessionLog::new(self.jetstream.clone(), result.session_id.clone())
-            .load_events_async()
-            .await
-            .is_ok_and(|events| {
-                events.iter().any(|(seq, entry)| {
-                    *seq > result.user_msg_seq && matches!(entry, SessionLogEntry::Cancel { .. })
-                })
+        NatsSessionLog::new(
+            self.jetstream.clone(),
+            harnx_core::session_identity::session_key(Some(&self.agent), &result.session_id),
+        )
+        .load_events_async()
+        .await
+        .is_ok_and(|events| {
+            events.iter().any(|(seq, entry)| {
+                *seq > result.user_msg_seq && matches!(entry, SessionLogEntry::Cancel { .. })
             })
+        })
     }
 
     async fn session_new(
@@ -336,21 +353,26 @@ impl SubagentToolset {
     async fn session_load(&self, args: Value) -> Result<Value, ToolInvokeError> {
         let args: SessionArgs = parse_args(SUBAGENT_SESSION_LOAD_TOOL, args)?;
         let session_id = required_session_id(args.session_id)?;
-        let events = NatsSessionLog::new(self.jetstream.clone(), session_id.clone())
-            .load_events_async()
-            .await
-            .map_err(|error| {
-                ToolInvokeError::Recoverable(format!(
-                    "load sub-agent session '{session_id}': {error:#}"
-                ))
-            })?;
+        let events = NatsSessionLog::new(
+            self.jetstream.clone(),
+            harnx_core::session_identity::session_key(Some(&self.agent), &session_id),
+        )
+        .load_events_async()
+        .await
+        .map_err(|error| {
+            ToolInvokeError::Recoverable(format!(
+                "load sub-agent session '{session_id}': {error:#}"
+            ))
+        })?;
         Ok(json!({ "session_id": session_id, "events": events }))
     }
 
     async fn session_cancel(&self, args: Value) -> Result<Value, ToolInvokeError> {
         let args: SessionArgs = parse_args(SUBAGENT_SESSION_CANCEL_TOOL, args)?;
         let session_id = required_session_id(args.session_id)?;
-        let session = self.create_session(Some(session_id.clone()), None).await?;
+        let session = self
+            .create_session(Some(session_id.clone()), None, None)
+            .await?;
         let receipt = session
             .request_cancel(crate::nats_session::CancelRequest {
                 expected_execution_id: args.expected_execution_id,
@@ -575,7 +597,7 @@ fn session_prompt_spec(agent: &str) -> ToolSpec {
             cancellation_guarantee: Default::default(),
         name: SUBAGENT_SESSION_PROMPT_TOOL.to_string(),
         description: format!(
-            "Send a prompt to the '{agent}' agent. To continue a conversation, pass only the exact session_id returned by session_prompt or session_new. To start a new conversation, omit session_id; empty or whitespace-only values also start a new session. Do not invent a session ID."
+            "Send a prompt to the '{agent}' agent. Session IDs are case-sensitive and local to this agent. Pass an existing ID to continue its conversation, or an unused ID such as review-12345 to create that exact session. Omit session_id (or pass an empty value) for a generated ID."
         ),
         input_schema: json!({
             "type": "object",
@@ -586,7 +608,7 @@ fn session_prompt_spec(agent: &str) -> ToolSpec {
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "To continue a conversation, use the exact session ID returned by session_prompt or session_new"
+                    "description": "Optional ID local to this agent: reuse an exact existing ID to continue, supply an unused ID to create it, or omit for a generated ID"
                 },
                 "timeout_secs": {
                     "type": "integer",
@@ -675,6 +697,7 @@ fn standalone_context() -> ToolInvocationContext {
     ToolInvocationContext {
         call_id: uuid::Uuid::now_v7().to_string(),
         operation: None,
+        execution: None,
         invoking_session_id: None,
         capabilities: Default::default(),
     }

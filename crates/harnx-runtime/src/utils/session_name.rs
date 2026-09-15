@@ -85,7 +85,7 @@ pub async fn reserve_invocation_session_id(
     let mut seconds = started_at_ms / 1000;
     loop {
         let candidate = encode_timestamp_session_id(seconds);
-        if let Some(existing) = store.get(&candidate).await? {
+        if let Some(existing) = store.get(&initializer.session_key(&candidate)).await? {
             if existing.metadata.creation_invocation.as_deref() == Some(invocation) {
                 existing.metadata.validate_initializer(initializer)?;
                 return Ok(candidate);

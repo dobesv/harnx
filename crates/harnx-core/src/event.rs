@@ -290,6 +290,8 @@ pub struct SubAgentProgress {
     pub elapsed_ms: u64,
     pub usage: CompletionTokenUsage,
     pub tool_call_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -331,6 +333,12 @@ pub struct AgentHandoff {
 /// sink can be held as `Arc<dyn AgentEventSink>`.
 pub trait AgentEventSink: Send + Sync {
     fn emit(&self, event: AgentEvent);
+
+    /// Forward live output without replacing its creation-time execution ID.
+    /// Historical replay and local UI notices continue to use `emit`.
+    fn emit_live(&self, event: AgentEvent, _execution_id: &str) {
+        self.emit(event);
+    }
 }
 
 /// A no-op sink useful for tests or code paths that run before a real sink
@@ -381,6 +389,7 @@ mod tests {
             elapsed_ms: 12_345,
             usage: CompletionTokenUsage::new(Some(11), Some(7), Some(3)),
             tool_call_count: 2,
+            title: None,
         }));
 
         let value = serde_json::to_value(&event).unwrap();
@@ -388,6 +397,7 @@ mod tests {
             value["Turn"]["SubAgentProgress"]["status"],
             serde_json::json!("running")
         );
+        assert!(value["Turn"]["SubAgentProgress"].get("title").is_none());
         let decoded: AgentEvent = serde_json::from_value(value).unwrap();
         assert!(matches!(
             decoded,

@@ -27,8 +27,12 @@ async fn proxy_requires_or_resolves_an_ambient_session_binding() -> Result<()> {
             args: json!({"command": "pwd"}),
             context: ToolInvocationContext {
                 operation: None,
+                execution: None,
                 call_id: "call-1".to_string(),
-                invoking_session_id: Some("session-1".to_string()),
+                invoking_session_id: Some(harnx_core::session_identity::session_key(
+                    Some("coder"),
+                    "session-1",
+                )),
                 capabilities: BTreeSet::from([
                     harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE.to_string(),
                 ]),
@@ -70,8 +74,12 @@ async fn proxy_explicit_override_is_one_call_and_not_forwarded() -> Result<()> {
             args: json!({"command": "pwd", "sandbox_id": "claim-explicit"}),
             context: ToolInvocationContext {
                 operation: None,
+                execution: None,
                 call_id: "call-explicit".to_string(),
-                invoking_session_id: Some("session-1".to_string()),
+                invoking_session_id: Some(harnx_core::session_identity::session_key(
+                    Some("coder"),
+                    "session-1",
+                )),
                 capabilities: BTreeSet::new(),
             },
             cancel: CancellationToken::new(),
@@ -105,8 +113,12 @@ async fn proxy_forwards_cancellation_after_the_mcp_call_starts() -> Result<()> {
             args: json!({"command": "sleep 30"}),
             context: ToolInvocationContext {
                 operation: None,
+                execution: None,
                 call_id: "call-cancel".to_string(),
-                invoking_session_id: Some("session-cancel".to_string()),
+                invoking_session_id: Some(harnx_core::session_identity::session_key(
+                    Some("coder"),
+                    "session-cancel",
+                )),
                 capabilities: BTreeSet::new(),
             },
             cancel: invocation_cancel,

@@ -1,4 +1,4 @@
-//! Replay validation and durable results are independent of the live reply cache.
+//! Recovery uses original generation authority before either saved-reply or work admission.
 use super::*;
 use invocation_journal::InvocationJournal;
 
@@ -6,35 +6,43 @@ pub(super) async fn validate_replay(
     context: &ToolRequestContext,
     request: &ToolRequest,
 ) -> Result<()> {
-    let journal = &context.journal;
-    journal.check_session_retained(request).await?;
-    if request.replay.is_some() || journal.get(request).await?.is_some() {
-        journal.validate_replay(request).await?;
+    reply_fence::check_request_stop(&context.execution_store, request).await?;
+    context.journal.check_session_retained(request).await?;
+    context.journal.validate_replay(request).await?;
+    let execution = reply_fence::identity(request)?;
+    reply_fence::check_stop(&context.execution_store, execution).await?;
+    if let Some(owner) = &request.replay {
+        anyhow::ensure!(
+            request.replay_execution.is_some(),
+            "replay attempt identity missing"
+        );
+        // Exact original receiver, never whichever execution is current now.
+        let parent = context
+            .execution_store
+            .get(execution.consumer.operation())
+            .await?
+            .context("replay parent missing")?;
+        parent.check_owner(owner)?;
+        anyhow::ensure!(
+            execution.consumer.owner() == owner,
+            "replay consumer owner mismatch"
+        );
+        context
+            .execution_store
+            .check_ancestors(&parent.reference)
+            .await?;
+    } else {
+        anyhow::ensure!(
+            request.replay_execution.is_none(),
+            "replay identity without owner attestation"
+        );
     }
-    let Some(owner) = &request.replay else {
-        return Ok(());
-    };
-    let session = request
-        .parent_session_id
-        .as_deref()
-        .context("replay requires a parent session")?;
-    let parent = context
-        .execution_store
-        .current(session)
-        .await?
-        .context("replay parent missing")?;
-    parent.check_owner(owner)?;
-    context
-        .execution_store
-        .check_ancestors(&parent.reference)
-        .await
+    reply_fence::admit_recovery(&context.execution_store, request).await
 }
 
 pub(super) struct InvocationRecovery {
     request: ToolRequest,
     journal: InvocationJournal,
-    saved_reply: Option<ToolReply>,
-    recorded: bool,
 }
 
 impl InvocationRecovery {
@@ -42,93 +50,64 @@ impl InvocationRecovery {
         context: &ToolRequestContext,
         request: &ToolRequest,
     ) -> Result<Self, ToolInvokeError> {
-        let journal = context.journal.clone();
-        let record = journal.get(request).await.map_err(journal_error)?;
-        if record.is_some() {
-            journal
-                .validate_replay(request)
-                .await
-                .map_err(journal_error)?;
-        }
-        let recorded = record.is_some();
-        let saved_reply = record.and_then(|record| record.reply);
+        validate_replay(context, request)
+            .await
+            .map_err(reply_fence::invoke_error)?;
         Ok(Self {
             request: request.clone(),
-            journal,
-            saved_reply,
-            recorded,
+            journal: context.journal.clone(),
         })
     }
 
     pub async fn completed_reply(
         &self,
-        context: &ToolRequestContext,
+        _context: &ToolRequestContext,
     ) -> Result<Option<ToolReply>, ToolInvokeError> {
-        let Some(reply) = &self.saved_reply else {
-            return Ok(None);
-        };
-        let reference = harnx_execution_control::OperationRef::new(
-            self.request
-                .parent_session_id
-                .as_deref()
-                .unwrap_or(&self.request.call_id),
-            &self.request.operation_id,
-        );
-        let operation = context
-            .execution_store
-            .get(&reference)
+        self.journal
+            .completed_reply(&self.request)
             .await
-            .map_err(journal_error)?;
-        Ok(operation
-            .is_none_or(|op| op.state.is_terminal())
-            .then(|| reply.clone()))
+            .map_err(reply_fence::invoke_error)
     }
 
     pub async fn check_policy(&self, context: &ToolRequestContext) -> Result<(), ToolInvokeError> {
-        if self.request.replay.is_none() || self.saved_reply.is_some() {
+        if self.request.replay.is_none() || context.toolset.can_replay(&self.request.tool) {
             return Ok(());
         }
-        if context.toolset.can_replay(&self.request.tool) {
-            return Ok(());
-        }
-        // A request saved before dispatch may have no owner at all. Rejecting
-        // it must close that unstarted registration, without declaring an old
-        // handler or its unknown descendants stopped.
         execution::complete_without_invocation(context, &self.request)
             .await
-            .map_err(journal_error)?;
-        Err(ToolInvokeError::Recoverable("tool response lost (session was interrupted before results were persisted); this tool cannot replay the interrupted operation".into()))
+            .map_err(reply_fence::invoke_error)?;
+        Err(ToolInvokeError::Recoverable(
+            "tool response lost; this tool cannot replay the operation".into(),
+        ))
     }
 
     pub async fn invoke(
         self,
         toolset: &dyn Toolset,
         invocation: ToolInvocation,
+        producer: harnx_execution_control::ExecutionContext,
     ) -> Result<Value, ToolInvokeError> {
-        let result = match self.saved_reply {
-            Some(reply) => reply_result(reply),
-            None if self.request.replay.is_some() => toolset.replay(invocation).await,
-            None => toolset.invoke_with_context(invocation).await,
+        let result = if self.request.replay.is_some() {
+            toolset.replay(invocation).await
+        } else {
+            toolset.invoke_with_context(invocation).await
         };
-        if !self.recorded {
-            // Direct tool clients do not participate in worker transcript recovery.
-            return result;
-        }
-        // Persist before owner_stopped: the execution graph may be pruned before
-        // the parent appends ToolResults, and an in-memory cache dies on restart.
         let reply = ToolReply {
             call_id: self.request.call_id.clone(),
             result: result.map_err(map_invoke_error),
         };
         reply_result(
-            self.journal
-                .complete(&self.request, reply)
+            Box::pin(self.journal.complete_from(&self.request, &producer, reply))
                 .await
-                .map_err(journal_error)?,
+                .map_err(reply_fence::invoke_error)?,
         )
     }
 }
 
-fn journal_error(error: anyhow::Error) -> ToolInvokeError {
-    ToolInvokeError::Fatal(format!("tool invocation recovery: {error:#}"))
+pub(super) fn reply_result(reply: ToolReply) -> Result<Value, ToolInvokeError> {
+    reply.result.map_err(|error| match error {
+        ToolErrorPayload::Recoverable(message) => ToolInvokeError::Recoverable(message),
+        ToolErrorPayload::Fatal(message) => ToolInvokeError::Fatal(message),
+        ToolErrorPayload::Interrupted(interrupted) => ToolInvokeError::Interrupted(interrupted),
+    })
 }

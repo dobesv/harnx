@@ -1,5 +1,13 @@
 use super::*;
 
+async fn collect_remote_frames(
+    rx: tokio::sync::mpsc::Receiver<crate::ag_ui_remote_follow::QueuedEvent>,
+) -> Vec<Bytes> {
+    let live = harnx_runtime::nats_event_sink::LiveEventState::default();
+    live.select(Some("test-generation".into()));
+    tokio_stream::StreamExt::collect(crate::ag_ui_remote_follow::event_frames(rx, live)).await
+}
+
 #[tokio::test]
 async fn completed_remote_path_orders_boundary_before_hydrated_handoff() {
     use harnx_core::session::SessionLogEntry;
@@ -135,7 +143,6 @@ async fn remote_attach_suppresses_completed_tool_tail_without_forwarded_start() 
             }))
             .await
     );
-    assert!(forwarder.finalize().await);
     drop(forwarder);
 
     let mut chunks = vec![Bytes::from(frame_run_boundary_event(
@@ -143,10 +150,7 @@ async fn remote_attach_suppresses_completed_tool_tail_without_forwarded_start() 
         &thread_id,
         &run_id,
     ))];
-    chunks.extend(
-        tokio_stream::StreamExt::collect::<Vec<_>>(tokio_stream::wrappers::ReceiverStream::new(rx))
-            .await,
-    );
+    chunks.extend(collect_remote_frames(rx).await);
     chunks.push(Bytes::from(frame_run_boundary_event(
         "RUN_FINISHED",
         &thread_id,
@@ -180,7 +184,6 @@ async fn remote_poll_terminal_closes_text_when_final_advisory_is_missing() {
             }))
             .await
     );
-    assert!(forwarder.finalize().await);
     drop(forwarder);
 
     let mut chunks = vec![Bytes::from(frame_run_boundary_event(
@@ -188,10 +191,7 @@ async fn remote_poll_terminal_closes_text_when_final_advisory_is_missing() {
         &thread_id,
         &run_id,
     ))];
-    chunks.extend(
-        tokio_stream::StreamExt::collect::<Vec<_>>(tokio_stream::wrappers::ReceiverStream::new(rx))
-            .await,
-    );
+    chunks.extend(collect_remote_frames(rx).await);
     chunks.push(Bytes::from(frame_run_boundary_event(
         "RUN_FINISHED",
         &thread_id,
@@ -210,6 +210,65 @@ async fn remote_poll_terminal_closes_text_when_final_advisory_is_missing() {
     assert!(
         text_end < run_finished,
         "text must close before run terminal"
+    );
+    assert_strict_lifecycle_valid(&events);
+}
+
+#[tokio::test]
+async fn queued_remote_start_is_discarded_without_an_orphan_end_after_stop() {
+    use crate::ag_ui_remote_follow::{event_frames, AdvisoryForwarder};
+    use harnx_core::event::{AgentEvent, ContentBlock, ModelEvent};
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let mut forwarder = AdvisoryForwarder::new(tx);
+    assert!(
+        forwarder
+            .forward_agent_event(AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text("queued before stop".into())],
+            }))
+            .await
+    );
+    drop(forwarder);
+    let live = harnx_runtime::nats_event_sink::LiveEventState::default();
+    live.select(Some("test-generation".into()));
+    live.stop("test-generation");
+    let frames: Vec<_> = tokio_stream::StreamExt::collect(event_frames(rx, live)).await;
+    assert!(
+        frames.is_empty(),
+        "unsent START must not produce a synthetic END"
+    );
+}
+
+#[tokio::test]
+async fn stopped_remote_queue_closes_only_the_lifecycle_already_sent() {
+    use crate::ag_ui_remote_follow::{event_frames, AdvisoryForwarder};
+    use harnx_core::event::{AgentEvent, ContentBlock, ModelEvent};
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let mut forwarder = AdvisoryForwarder::new(tx);
+    assert!(
+        forwarder
+            .forward_agent_event(AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text("not sent before stop".into())],
+            }))
+            .await
+    );
+    drop(forwarder);
+    let live = harnx_runtime::nats_event_sink::LiveEventState::default();
+    live.select(Some("test-generation".into()));
+    let stream = event_frames(rx, live.clone());
+    tokio::pin!(stream);
+    let start = tokio_stream::StreamExt::next(&mut stream).await.unwrap();
+    live.stop("test-generation");
+    let mut frames = vec![start];
+    frames.extend(tokio_stream::StreamExt::collect::<Vec<_>>(stream).await);
+    frames.push(Bytes::from(frame_run_boundary_event(
+        "RUN_FINISHED",
+        &Uuid::new_v4().to_string(),
+        &Uuid::new_v4().to_string(),
+    )));
+    let events = decode_sse_bytes_chunks(frames);
+    assert_event_type_sequence(
+        &events,
+        &["TEXT_MESSAGE_START", "TEXT_MESSAGE_END", "RUN_FINISHED"],
     );
     assert_strict_lifecycle_valid(&events);
 }

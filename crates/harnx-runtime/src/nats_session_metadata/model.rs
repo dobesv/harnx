@@ -23,8 +23,10 @@ impl SessionAgentSource {
 
     fn validate(&self) -> Result<()> {
         match self {
-            Self::Named { name } if name.trim().is_empty() => {
-                bail!("named session agent must not be empty")
+            Self::Named { name }
+                if name.trim().is_empty() || name == harnx_core::agent_config::TEMP_AGENT_NAME =>
+            {
+                bail!("named session agent must not be empty or the reserved inline-agent name")
             }
             _ => Ok(()),
         }
@@ -66,7 +68,7 @@ pub struct SessionOverrides {
 /// Runtime `.set` and `.model` commands use this representation so concurrent
 /// changes to different settings are merged by the metadata CAS loop instead
 /// of replacing an override snapshot read before another writer committed.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SessionOverrideUpdate {
     Model(Option<String>),
     Temperature(Option<f64>),
@@ -124,6 +126,8 @@ pub struct SessionMetadata {
     /// deliberately omitted from the HTTP redacted view.
     #[serde(default)]
     pub(super) worker_fence_token: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) worker_projection: Option<harnx_execution_control::CommitReceipt>,
 }
 
 impl SessionMetadata {
@@ -147,7 +151,21 @@ impl SessionMetadata {
             title: SessionTitle::default(),
             extensions,
             worker_fence_token: 0,
+            worker_projection: None,
         }
+    }
+
+    pub fn storage_key(&self) -> String {
+        harnx_core::session_identity::session_key(self.agent.name(), &self.session_id)
+    }
+
+    pub fn validate_storage_key(&self, expected_key: &str) -> Result<()> {
+        self.validate(&self.session_id)?;
+        anyhow::ensure!(
+            self.storage_key() == expected_key,
+            "session metadata storage identity mismatch"
+        );
+        Ok(())
     }
 
     pub fn validate(&self, expected_session_id: &str) -> Result<()> {

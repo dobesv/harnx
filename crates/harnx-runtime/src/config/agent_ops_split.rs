@@ -12,6 +12,38 @@ struct UseRemoteAgentParams<'a> {
 use harnx_core::agent_ref::AgentRef;
 
 impl Config {
+    /// Set the agent and cluster for the active session.
+    pub fn set_remote_agent(&mut self, agent: String, cluster: String) {
+        // Agent switches cannot carry another namespace's session or local
+        // agent configuration into the next prompt/cancellation target.
+        self.session = None;
+        self.agent = None;
+        self.rag = None;
+        self.discontinuous_last_message();
+        self.remote_agent = Some((agent, cluster));
+    }
+
+    /// Selected agent reference for frontend navigation, including its cluster.
+    pub fn active_agent_ref(&self) -> Option<String> {
+        self.remote_agent
+            .as_ref()
+            .map(|(agent, cluster)| format!("{agent}@{cluster}"))
+            .or_else(|| self.agent.as_ref().map(|agent| agent.name().to_string()))
+    }
+
+    /// Commit a prepared frontend selection without dropping non-cloneable
+    /// terminal lifecycle hooks from the live config.
+    pub fn apply_prepared_agent_selection(&mut self, mut prepared: Config) {
+        prepared.tui_before_editor = self.tui_before_editor.take();
+        prepared.tui_after_editor = self.tui_after_editor.take();
+        *self = prepared;
+    }
+
+    /// Check whether the active agent ref names a cluster.
+    pub fn is_remote_agent(&self) -> bool {
+        self.remote_agent.is_some()
+    }
+
     pub fn use_prompt(&mut self, prompt: &str) -> Result<()> {
         let mut agent = Agent::new(AgentConfig::from_prompt(prompt));
         agent.set_model(self.current_model().clone());
@@ -91,6 +123,10 @@ impl Config {
 
     /// Install an already-built agent as the active agent.
     pub(super) fn set_active_agent(&mut self, agent: Agent) {
+        self.remote_agent = None;
+        self.session = None;
+        self.rag = agent.rag();
+        self.discontinuous_last_message();
         self.agent = Some(agent);
     }
 
@@ -242,13 +278,10 @@ impl Config {
 
         // Store remote agent metadata in config for use during prompt processing
         // The actual NatsSession is created when the user sends a prompt
-        config
-            .write()
-            .set_remote_agent(agent.to_string(), cluster.to_string());
-
-        // If a session name was provided, set it (this is for future resume/attach)
+        let mut cfg = config.write();
+        cfg.set_remote_agent(agent.to_string(), cluster.to_string());
         if let Some(session) = session_name {
-            config.write().use_session(Some(session))?;
+            cfg.use_session(Some(session))?;
         }
 
         Ok(())
@@ -269,7 +302,6 @@ impl Config {
         // Tools are now loaded via NATS tool_servers, not direct MCP
         let agent = self::agent::init(config, agent_name, abort_signal).await?;
         let session = session_name.map(|v| v.to_string());
-        config.write().rag = agent.rag();
         config.write().set_active_agent(agent);
         // Populate shared_variables from resolved file-backed defaults and
         // any --agent-variable overrides before any code path that renders

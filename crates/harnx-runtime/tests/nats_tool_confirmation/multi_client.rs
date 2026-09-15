@@ -63,9 +63,13 @@ async fn assert_observer_matches_source(
     observer: &SessionEventStream,
     attached_seq: u64,
 ) -> Result<()> {
-    let source_entries = NatsSessionLog::new(harness.jetstream.clone(), SOURCE_SESSION_ID)
-        .load_events_async()
-        .await?;
+    let source_entries = harnx_runtime::nats_session_log::NatsSessionLog::for_agent(
+        harness.jetstream.clone(),
+        "approval-gated",
+        SOURCE_SESSION_ID,
+    )
+    .load_events_async()
+    .await?;
     assert_eq!(observer.history().len(), source_entries.len());
     assert_eq!(
         observer.last_applied_seq(),
@@ -133,7 +137,7 @@ async fn approval_by_owning_frontend_propagates_to_second_observer() -> Result<(
     let mut observer = SessionEventStream::attach(
         harness.jetstream.clone(),
         harness.client.clone(),
-        SOURCE_SESSION_ID,
+        harness.source.storage_key(),
     )
     .await?;
     let observer_attached_seq = observer.last_applied_seq();
@@ -148,7 +152,7 @@ async fn approval_by_owning_frontend_propagates_to_second_observer() -> Result<(
     drop(observer_route);
     wait_for_target_turn(&NatsSessionLog::new(
         harness.jetstream.clone(),
-        TARGET_SESSION_ID,
+        harnx_core::session_identity::session_key(Some("target"), TARGET_SESSION_ID),
     ))
     .await?;
     Ok(())

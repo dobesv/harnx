@@ -16,6 +16,12 @@ export interface HarnxCustomEventCallbacks {
   onHandoff?: (agent: string, sessionId: string, afterSeq: number) => void;
   /** Called when a hitl_pending_approval CUSTOM event is received. */
   onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
+  /**
+   * Whether events belong to the session currently shown in the foreground.
+   * When `false`, the `session_title_updated` handler skips `setDocumentTitle`
+   * so child-session observers do not overwrite the browser tab title.
+   */
+  isForeground?: boolean;
 }
 
 type CustomEventHandler = (callbacks: HarnxCustomEventCallbacks, value: unknown) => void;
@@ -85,9 +91,9 @@ const handlers: Record<string, CustomEventHandler> = {
     const summary = stringField(value, 'markdown');
     if (id !== undefined && summary !== undefined) callbacks.onToolSummary(id, summary);
   },
-  session_title_updated: (_callbacks, value) => {
+  session_title_updated: (callbacks, value) => {
     const title = stringField(value, 'title');
-    if (title !== undefined) setDocumentTitle(title);
+    if (callbacks.isForeground !== false && title !== undefined) setDocumentTitle(title);
   },
   session_title_generation_failed: (callbacks, value) => {
     const error = stringField(value, 'error');

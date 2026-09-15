@@ -5,8 +5,8 @@ use harnx_runtime::AgentCallFn;
 
 async fn enqueue_child(parent: &NatsSession, url: &str, id: &str) -> Result<NatsSession> {
     let store = parent.execution_store();
-    let parent_operation = store.current(parent.session_id()).await?.unwrap();
-    let invocation = OperationRef::new(parent.session_id(), format!("invoke-{id}"));
+    let parent_operation = store.current(parent.storage_key()).await?.unwrap();
+    let invocation = OperationRef::new(parent.storage_key(), format!("invoke-{id}"));
     store
         .child(invocation.clone(), parent_operation.reference)
         .await?;
@@ -25,15 +25,23 @@ async fn enqueue_child(parent: &NatsSession, url: &str, id: &str) -> Result<Nats
     Ok(child)
 }
 
+struct ModelStopped(Arc<AtomicUsize>);
+impl Drop for ModelStopped {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 fn waiting_model(entered: Arc<AtomicUsize>, stopped: Arc<AtomicUsize>) -> AgentCallFn {
-    Arc::new(move |_, _, abort| {
+    Arc::new(move |_, _, _abort| {
         let entered = entered.clone();
         let stopped = stopped.clone();
         Box::pin(async move {
+            let _stopped = ModelStopped(stopped);
             entered.fetch_add(1, Ordering::SeqCst);
-            harnx_core::abort::wait_abort_signal(&abort).await;
-            stopped.fetch_add(1, Ordering::SeqCst);
-            anyhow::bail!("model cancelled")
+            // Models are dropped on interruption. They need not cooperate by
+            // polling another cancellation branch before control can return.
+            std::future::pending().await
         })
     })
 }
@@ -42,7 +50,7 @@ async fn confirmed_cancel(session: &NatsSession) -> Result<()> {
     // KV only: neither the requester nor a tool handler traverses descendants.
     let receipt = session
         .execution_store()
-        .request_cancel(session.session_id(), CancelRequest::default())
+        .request_cancel(session.storage_key(), CancelRequest::default())
         .await?;
     let status = session
         .wait_for_cancel(&receipt, tokio::time::Instant::now() + CI_SAFE_TIMEOUT)
@@ -82,7 +90,7 @@ async fn exercise_hierarchy(cancel_root: bool) -> Result<()> {
         assert_eq!(
             child
                 .execution_store()
-                .current(child.session_id())
+                .current(child.storage_key())
                 .await?
                 .unwrap()
                 .state,
@@ -92,7 +100,7 @@ async fn exercise_hierarchy(cancel_root: bool) -> Result<()> {
     if !cancel_root {
         assert_eq!(
             root.execution_store()
-                .current(root.session_id())
+                .current(root.storage_key())
                 .await?
                 .unwrap()
                 .state,
@@ -125,20 +133,20 @@ async fn cancelled_ownerless_child_prompt_is_not_replayed_when_reopened() -> Res
         .context("nats-server required")?;
     let root = session(server.url(), "ownerless-cancel-root").await?;
     let store = root.execution_store();
-    let root_operation = store.session(root.session_id(), None, None).await?;
+    let root_operation = store.session(root.storage_key(), None, None).await?;
     let child = enqueue_child(&root, server.url(), "ownerless-cancel-child").await?;
     let child_execution_id = store
-        .current(child.session_id())
+        .current(child.storage_key())
         .await?
         .unwrap()
         .reference
         .execution_id;
 
     store
-        .request_cancel(root.session_id(), CancelRequest::default())
+        .request_cancel(root.storage_key(), CancelRequest::default())
         .await?;
     store.status(&root_operation.reference).await?;
-    let cancelled_child = store.current(child.session_id()).await?.unwrap();
+    let cancelled_child = store.current(child.storage_key()).await?.unwrap();
     assert_eq!(cancelled_child.state, OperationState::Cancelled);
     assert!(cancelled_child.cancel_recorded);
 
@@ -146,7 +154,7 @@ async fn cancelled_ownerless_child_prompt_is_not_replayed_when_reopened() -> Res
     assert_eq!(reopened.activate_pending_turn().await?, None);
     assert_eq!(
         store
-            .current(child.session_id())
+            .current(child.storage_key())
             .await?
             .unwrap()
             .reference

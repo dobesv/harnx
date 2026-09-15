@@ -9,7 +9,10 @@ use harnx_core::{
     session_reconstruct::{reconstruct_state, TurnStatus},
     tool::ToolCall,
 };
-use harnx_runtime::{config::Config, nats_session_log::NatsSessionLog};
+use harnx_runtime::{
+    config::Config,
+    nats_session_log::{stream_name_for_session, NatsSessionLog},
+};
 use serde_json::json;
 
 /// Only an explicit missing-message response is a retention gap. A broker
@@ -26,7 +29,13 @@ async fn nats_session_log_rejects_transport_errors_instead_of_skipping_entries()
     log.append_event_async(&SessionLogEntry::Cancel { fence_token: 1 })
         .await?;
     let info = client
-        .request("$JS.API.STREAM.INFO.SESSION_READ-FAILURE", "{}".into())
+        .request(
+            format!(
+                "$JS.API.STREAM.INFO.{}",
+                stream_name_for_session("read-failure")
+            ),
+            "{}".into(),
+        )
         .await?
         .payload;
     let mut requests = client.subscribe("FAULT.>".to_string()).await?;
@@ -68,7 +77,7 @@ async fn nats_session_log_still_skips_confirmed_retention_gaps() -> Result<()> {
         log.append_event_async(&SessionLogEntry::Cancel { fence_token })
             .await?;
     }
-    js.get_stream("SESSION_READ-GAP")
+    js.get_stream(stream_name_for_session("read-gap"))
         .await?
         .delete_message(2)
         .await?;

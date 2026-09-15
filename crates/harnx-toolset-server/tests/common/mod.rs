@@ -146,6 +146,7 @@ pub(crate) struct TestToolset {
     pub(crate) slow_cancelled: Arc<Notify>,
     pub(crate) allow_cleanup: Arc<Notify>,
     pub(crate) last_context: Arc<Mutex<Option<ToolInvocationContext>>>,
+    pub(crate) reply_barriers: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
 }
 
 impl Default for TestToolset {
@@ -164,6 +165,7 @@ impl TestToolset {
             slow_cancelled: Arc::default(),
             allow_cleanup: Arc::default(),
             last_context: Arc::default(),
+            reply_barriers: None,
         }
     }
 }
@@ -206,7 +208,15 @@ impl Toolset for TestToolset {
                 if let Some(error) = args.get("error").and_then(Value::as_str) {
                     return Err(ToolInvokeError::Recoverable(error.to_string()));
                 }
+                if let Some((ready, release)) = &self.reply_barriers {
+                    ready.wait().await;
+                    release.wait().await;
+                }
                 Ok(args)
+            }
+            "never" => {
+                self.slow_started.notify_one();
+                std::future::pending().await
             }
             "slow" => {
                 self.slow_started.notify_one();

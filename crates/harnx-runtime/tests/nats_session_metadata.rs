@@ -2,6 +2,7 @@ mod common;
 
 use anyhow::Result;
 use common::spawn_nats_server;
+use futures_util::StreamExt;
 use harnx_core::execution_context::{
     ExecutionContextObservation, GitRemoteObservation, GitRepositoryObservation,
     ToolObservationProvenance, EXECUTION_CONTEXT_MAX_RETAINED, EXECUTION_CONTEXT_NAMESPACE,
@@ -9,9 +10,9 @@ use harnx_core::execution_context::{
 };
 use harnx_core::require_nextest;
 use harnx_runtime::nats_session_metadata::{
-    read_cursor_key, SessionExtensionUpdate, SessionInitializer, SessionMetadata,
-    SessionMetadataPatch, SessionMetadataStore, SessionOverrideUpdate, ToolContextEntry,
-    TOOL_CONTEXT_NAMESPACE,
+    read_cursor_key, read_invalidation_subject, SessionExtensionUpdate, SessionInitializer,
+    SessionMetadata, SessionMetadataPatch, SessionMetadataStore, SessionOverrideUpdate,
+    SessionReadState, ToolContextEntry, TOOL_CONTEXT_NAMESPACE,
 };
 use serde_json::json;
 
@@ -83,6 +84,36 @@ async fn run_concurrent_context_updates(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Read state test helpers
+// ---------------------------------------------------------------------------
+
+/// Helper for read-state tests: spawn NATS, connect, ensure store.
+/// Returns the server handle which must be kept alive for the test duration.
+/// Returns None if no NATS server is available (early return pattern).
+async fn setup_read_state_test() -> Result<
+    Option<(
+        common::NatsServerHandle,
+        SessionMetadataStore,
+        async_nats::Client,
+    )>,
+> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(None);
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    Ok(Some((server, store, client)))
+}
+
+/// Generate a unique agent-scoped storage key for read-state tests.
+fn read_state_storage_key(prefix: &str) -> String {
+    let local_id = format!("{}-{}", prefix, uuid::Uuid::new_v4());
+    harnx_core::session_identity::session_key(Some("metis"), &local_id)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metadata_and_activity_cas_updates_do_not_contend() -> Result<()> {
     require_nextest();
@@ -92,13 +123,8 @@ async fn metadata_and_activity_cas_updates_do_not_contend() -> Result<()> {
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-activity-{}", uuid::Uuid::new_v4());
-    store
-        .create(&SessionMetadata::new(
-            &session_id,
-            SessionInitializer::named("metis", Default::default()),
-        ))
-        .await?;
+    let local_id = format!("metadata-activity-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
 
     let title_store = store.clone();
     let title_session = session_id.clone();
@@ -139,13 +165,8 @@ async fn purge_removes_metadata_activity_extensions_and_future_cursors() -> Resu
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-purge-{}", uuid::Uuid::new_v4());
-    store
-        .create(&SessionMetadata::new(
-            &session_id,
-            SessionInitializer::named("metis", Default::default()),
-        ))
-        .await?;
+    let local_id = format!("metadata-purge-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
     store
         .replace_extension(
             &session_id,
@@ -191,13 +212,8 @@ async fn concurrent_title_updates_retry_cas_conflicts() -> Result<()> {
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-title-race-{}", uuid::Uuid::new_v4());
-    store
-        .create(&SessionMetadata::new(
-            &session_id,
-            SessionInitializer::named("metis", Default::default()),
-        ))
-        .await?;
+    let local_id = format!("metadata-title-race-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
 
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(6));
     let mut updates = Vec::new();
@@ -235,13 +251,8 @@ async fn concurrent_override_fields_are_merged() -> Result<()> {
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-overrides-{}", uuid::Uuid::new_v4());
-    store
-        .create(&SessionMetadata::new(
-            &session_id,
-            SessionInitializer::named("metis", Default::default()),
-        ))
-        .await?;
+    let local_id = format!("metadata-overrides-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
 
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
     let model_update = {
@@ -290,13 +301,8 @@ async fn stale_worker_fence_cannot_overwrite_metadata() -> Result<()> {
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-fence-{}", uuid::Uuid::new_v4());
-    store
-        .create(&SessionMetadata::new(
-            &session_id,
-            SessionInitializer::named("metis", Default::default()),
-        ))
-        .await?;
+    let local_id = format!("metadata-fence-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
 
     store
         .patch_with_fence(&session_id, 20, |metadata| {
@@ -331,26 +337,26 @@ async fn agent_bound_mutations_hide_other_agents_sessions() -> Result<()> {
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-agent-{}", uuid::Uuid::new_v4());
+    let local_id = format!("metadata-agent-{}", uuid::Uuid::new_v4());
     store
         .create(&SessionMetadata::new(
-            &session_id,
+            &local_id,
             SessionInitializer::named("metis", Default::default()),
         ))
         .await?;
 
     assert!(store
-        .get_for_agent(&session_id, "aristarchus")
+        .get_for_agent(&local_id, "aristarchus")
         .await?
         .is_none());
     let error = store
-        .apply_patch_for_agent(&session_id, "aristarchus", SessionMetadataPatch::default())
+        .apply_patch_for_agent(&local_id, "aristarchus", SessionMetadataPatch::default())
         .await
         .expect_err("another agent must not mutate the session");
     assert_eq!(error.to_string(), "Not Found");
     store
         .replace_extension_for_agent(
-            &session_id,
+            &local_id,
             "metis",
             SessionExtensionUpdate {
                 namespace: "client",
@@ -364,19 +370,11 @@ async fn agent_bound_mutations_hide_other_agents_sessions() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn execution_context_merges_with_concurrent_metadata_and_evicts_oldest() -> Result<()> {
     require_nextest();
-    let Some(server) = spawn_nats_server().await? else {
+    let Some((_server, store, _client)) = setup_read_state_test().await? else {
         return Ok(());
     };
-    let client = async_nats::connect(server.url()).await?;
-    let jetstream = async_nats::jetstream::new(client);
-    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-context-{}", uuid::Uuid::new_v4());
-    store
-        .create(&SessionMetadata::new(
-            &session_id,
-            SessionInitializer::named("metis", Default::default()),
-        ))
-        .await?;
+    let local_id = format!("metadata-context-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
 
     run_concurrent_context_updates(&store, &session_id).await?;
 
@@ -437,13 +435,8 @@ async fn execution_context_namespace_is_reserved_and_fenced() -> Result<()> {
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-context-fence-{}", uuid::Uuid::new_v4());
-    store
-        .create(&SessionMetadata::new(
-            &session_id,
-            SessionInitializer::named("metis", Default::default()),
-        ))
-        .await?;
+    let local_id = format!("metadata-context-fence-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
     assert!(store
         .replace_extension(&session_id, EXECUTION_CONTEXT_NAMESPACE, json!({}))
         .await
@@ -485,13 +478,8 @@ async fn private_tool_context_updates_are_reserved_and_merge_concurrently() -> R
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client);
     let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let session_id = format!("metadata-tool-context-{}", uuid::Uuid::new_v4());
-    store
-        .create(&SessionMetadata::new(
-            &session_id,
-            SessionInitializer::named("metis", Default::default()),
-        ))
-        .await?;
+    let local_id = format!("metadata-tool-context-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
 
     assert!(store
         .replace_extension(&session_id, TOOL_CONTEXT_NAMESPACE, json!({}))
@@ -545,4 +533,179 @@ async fn private_tool_context_updates_are_reserved_and_merge_concurrently() -> R
     assert!(!context.values.contains_key("sandbox"));
     assert!(context.values.contains_key("workspace"));
     Ok(())
+}
+
+// ============================================================================
+// Read-state integration tests
+// ============================================================================
+
+/// Assert read-state matches expected values.
+async fn assert_read_state(
+    store: &SessionMetadataStore,
+    storage_key: &str,
+    expected: &SessionReadState,
+) -> Result<()> {
+    let state = store.get_read_state(storage_key).await?;
+    assert_eq!(
+        state.last_read_seq, expected.last_read_seq,
+        "last_read_seq mismatch"
+    );
+    assert_eq!(
+        state.is_unread(),
+        expected.is_unread(),
+        "is_unread mismatch"
+    );
+    assert_eq!(
+        state.manual_unread, expected.manual_unread,
+        "manual_unread mismatch"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_read_state_returns_default_for_missing_key() -> Result<()> {
+    require_nextest();
+    let Some((_server, store, _client)) = setup_read_state_test().await? else {
+        return Ok(());
+    };
+    let storage_key = read_state_storage_key("read-state-missing");
+
+    // No read-state key exists yet
+    let state = store.get_read_state(&storage_key).await?;
+    assert_eq!(state, SessionReadState::default());
+    assert!(!state.is_unread());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bump_attention_advances_cursor_and_publishes_invalidation() -> Result<()> {
+    require_nextest();
+    let Some((_server, store, client)) = setup_read_state_test().await? else {
+        return Ok(());
+    };
+    let storage_key = read_state_storage_key("read-state-bump");
+
+    // Subscribe to read invalidation subject before mutation
+    let subject = read_invalidation_subject(&storage_key);
+    let mut subscriber = client.subscribe(subject.clone()).await?;
+
+    // First bump creates key
+    store.bump_attention(&storage_key, 10).await?;
+    let state = store.get_read_state(&storage_key).await?;
+    assert_eq!(state.last_attention_seq, 10);
+    assert!(state.is_unread());
+
+    // Check invalidation was published
+    let msg = tokio::time::timeout(std::time::Duration::from_millis(500), subscriber.next())
+        .await?
+        .expect("invalidation message");
+    let payload: serde_json::Value = serde_json::from_slice(&msg.payload)?;
+    assert_eq!(payload["session_id"], storage_key);
+    assert!(payload["revision"].as_u64().unwrap() > 0);
+
+    // Stale bump is idempotent no-op
+    store.bump_attention(&storage_key, 5).await?;
+    let state2 = store.get_read_state(&storage_key).await?;
+    assert_eq!(state2.last_attention_seq, 10);
+
+    // No invalidation for stale bump
+    let result =
+        tokio::time::timeout(std::time::Duration::from_millis(100), subscriber.next()).await;
+    assert!(result.is_err(), "no invalidation for stale bump");
+
+    // Higher bump advances
+    store.bump_attention(&storage_key, 20).await?;
+    let state3 = store.get_read_state(&storage_key).await?;
+    assert_eq!(state3.last_attention_seq, 20);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mark_read_advances_cursor_clears_flag() -> Result<()> {
+    require_nextest();
+    let Some((_server, store, _client)) = setup_read_state_test().await? else {
+        return Ok(());
+    };
+    let storage_key = read_state_storage_key("read-state-mark-read");
+
+    // Set up attention and manual unread
+    store.bump_attention(&storage_key, 15).await?;
+    store.mark_unread(&storage_key).await?;
+    let before = store.get_read_state(&storage_key).await?;
+    assert!(before.is_unread());
+    assert!(before.manual_unread);
+
+    // Mark read clears flag + advances cursor
+    store.mark_read(&storage_key).await?;
+    assert_read_state(&store, &storage_key, &SessionReadState::read_at(15)).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mark_unread_sets_flag_without_touching_cursor() -> Result<()> {
+    require_nextest();
+    let Some((_server, store, _client)) = setup_read_state_test().await? else {
+        return Ok(());
+    };
+    let storage_key = read_state_storage_key("read-state-mark-unread");
+
+    // Start with attention = read
+    store.bump_attention(&storage_key, 10).await?;
+    store.mark_read(&storage_key).await?;
+    let before = store.get_read_state(&storage_key).await?;
+    assert_eq!(before.last_read_seq, 10);
+    assert!(!before.is_unread());
+
+    // Mark unread sets flag only
+    store.mark_unread(&storage_key).await?;
+    assert_read_state(
+        &store,
+        &storage_key,
+        &SessionReadState::manual_unread_at(10),
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_state_survives_marker_cycles() -> Result<()> {
+    require_nextest();
+    let Some((_server, store, _client)) = setup_read_state_test().await? else {
+        return Ok(());
+    };
+    let storage_key = read_state_storage_key("read-state-cycle");
+
+    // Initial attention bump
+    store.bump_attention(&storage_key, 100).await?;
+    assert!(store.get_read_state(&storage_key).await?.is_unread());
+
+    // Mark read
+    store.mark_read(&storage_key).await?;
+    assert!(!store.get_read_state(&storage_key).await?.is_unread());
+
+    // Mark unread
+    store.mark_unread(&storage_key).await?;
+    assert!(store.get_read_state(&storage_key).await?.is_unread());
+
+    // Mark read again (should not move cursor backward)
+    store.mark_read(&storage_key).await?;
+    let state = store.get_read_state(&storage_key).await?;
+    assert!(!state.is_unread());
+    assert_eq!(state.last_read_seq, 100); // cursor preserved
+
+    // Stale attention bump is idempotent
+    store.bump_attention(&storage_key, 50).await?;
+    let state2 = store.get_read_state(&storage_key).await?;
+    assert_eq!(state2.last_attention_seq, 100);
+    assert!(!state2.is_unread());
+    Ok(())
+}
+
+async fn seed_metadata(store: &SessionMetadataStore, local_id: &str) -> Result<String> {
+    let metadata = SessionMetadata::new(
+        local_id,
+        SessionInitializer::named("metis", Default::default()),
+    );
+    store.create(&metadata).await?;
+    Ok(metadata.storage_key())
 }

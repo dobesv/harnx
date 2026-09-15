@@ -28,8 +28,12 @@ impl SessionMetadataStore {
         agent: &str,
         update: SessionExtensionUpdate<'_>,
     ) -> Result<MetadataRecord> {
-        self.replace_extension_guarded(session_id, Some(agent), update)
-            .await
+        self.replace_extension_guarded(
+            &harnx_core::session_identity::session_key(Some(agent), session_id),
+            Some(agent),
+            update,
+        )
+        .await
     }
 
     async fn replace_extension_guarded(
@@ -74,8 +78,12 @@ impl SessionMetadataStore {
         agent: &str,
         namespace: &str,
     ) -> Result<MetadataRecord> {
-        self.delete_extension_guarded(session_id, Some(agent), namespace)
-            .await
+        self.delete_extension_guarded(
+            &harnx_core::session_identity::session_key(Some(agent), session_id),
+            Some(agent),
+            namespace,
+        )
+        .await
     }
 
     async fn delete_extension_guarded(

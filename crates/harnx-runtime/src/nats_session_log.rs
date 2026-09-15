@@ -1,3 +1,6 @@
+mod projection;
+pub(crate) mod recovery;
+
 use anyhow::{bail, Context, Result};
 use async_nats::jetstream::{
     self,
@@ -23,6 +26,16 @@ pub struct NatsSessionLog {
 }
 
 impl NatsSessionLog {
+    /// Open a named agent's local session ID. Internal workers already carry
+    /// the derived storage key and use `new` directly.
+    pub fn for_agent(jetstream: jetstream::Context, agent: &str, session_id: &str) -> Self {
+        Self::new(
+            jetstream,
+            harnx_core::session_identity::session_key(Some(agent), session_id),
+        )
+    }
+
+    /// Open a transcript by its agent-scoped storage key.
     pub fn new(jetstream: jetstream::Context, session_id: impl Into<String>) -> Self {
         let session_id = session_id.into();
         Self {
@@ -379,24 +392,13 @@ pub fn subject_for_session(session_id: &str) -> String {
 }
 
 pub fn stream_name_for_session(session_id: &str) -> String {
-    let mut name = String::with_capacity(STREAM_NAME_PREFIX.len() + session_id.len());
-    name.push_str(STREAM_NAME_PREFIX);
-    for ch in session_id.chars() {
-        name.push(sanitize_stream_name_char(ch));
-    }
-    name
-}
-
-fn sanitize_stream_name_char(ch: char) -> char {
-    if is_valid_stream_name_char(ch) {
-        ch.to_ascii_uppercase()
-    } else {
-        '_'
-    }
-}
-
-fn is_valid_stream_name_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')
+    // JetStream uses stream names as directory names. Hash the exact ID so
+    // case-sensitive IDs stay distinct on case-insensitive filesystems, and
+    // long IDs cannot exceed the filesystem's filename limit after encoding.
+    format!(
+        "{STREAM_NAME_PREFIX}{}",
+        harnx_core::crypto::sha256(session_id)
+    )
 }
 
 /// Unique idempotency key for a single append.

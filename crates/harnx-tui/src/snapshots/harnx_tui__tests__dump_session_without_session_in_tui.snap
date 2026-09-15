@@ -3,8 +3,8 @@ source: crates/harnx-tui/src/tests.rs
 expression: rendered
 ---
 Session Transcript──────────────────────────────────────────
-Error: No active session or insufficient arguments. Usage:
-.dump session [<agent> <id>] [--format text|yaml|json]
+Error: An explicit agent and session ID are required. Usage:
+.dump session <agent> <id> [--format text|yaml|json]
 
 
 

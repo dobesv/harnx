@@ -169,6 +169,7 @@ async fn dispatch_event(
             event,
             None,
             HookDispatchMeta {
+                abort: None,
                 execution: None,
                 session_id: request_id.0.to_string(),
                 cwd: std::env::current_dir()?,
@@ -616,6 +617,7 @@ async fn healthy_closed_hook_with_expectation_dispatches_normally() -> Result<()
             },
             None,
             HookDispatchMeta {
+                abort: None,
                 execution: None,
                 session_id: "healthy-hook".to_string(),
                 cwd: std::env::current_dir()?,

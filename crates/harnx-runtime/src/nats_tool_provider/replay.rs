@@ -10,26 +10,15 @@ impl NatsToolProvider {
         if self.execution_control.is_none() {
             return Ok(());
         }
-        let (Some(session), Some(call_id)) = (&request.parent_session_id, &request.tool_call_id)
-        else {
-            return Ok(());
-        };
+        let session = request
+            .parent_session_id
+            .as_deref()
+            .context("controlled tool session missing")?;
         let js = async_nats::jetstream::new(self.client.clone());
-        let entries = crate::nats_session_log::NatsSessionLog::new(js.clone(), session)
-            .load_events_latest_async()
-            .await?;
-        let round = entries
-            .iter()
-            .rev()
-            .find_map(|(seq, entry)| match entry {
-                harnx_core::session::SessionLogEntry::ToolCalls { calls, .. }
-                    if calls.iter().any(|call| call.id.as_deref() == Some(call_id)) =>
-                {
-                    Some(*seq)
-                }
-                _ => None,
-            })
-            .context("tool invocation has no durable call round")?;
+        let round = match request.tool_call_id.as_deref() {
+            Some(call_id) => invocation_round(&js, session, call_id).await?,
+            None => 0,
+        };
         harnx_toolset_server::invocation_journal::InvocationJournal::ensure(&js)
             .await?
             .record(
@@ -49,7 +38,6 @@ impl NatsToolProvider {
             session_id: session,
             tool_round: round,
             call,
-            authorization,
             ..
         } = replay;
         let Some(call_id) = call.id.as_deref() else {
@@ -62,11 +50,14 @@ impl NatsToolProvider {
             return Ok(None);
         };
         anyhow::ensure!(record.tool_name == call.name, "replayed tool name changed");
-        let (store, owner) = self.replay_owner(replay).await?;
-        if let Some(reply) = record.reply {
-            let reference =
-                harnx_execution_control::OperationRef::new(session, &record.request.call_id);
-            acknowledge_saved_handler(store, &reference).await?;
+        let (store, request) = self.replay_request(&record, replay).await?;
+        harnx_toolset_server::reply_fence::admit_recovery(store, &request).await?;
+        if let Some(reply) = journal.completed_reply(&request).await? {
+            let saved = journal
+                .committed_reply(&request)
+                .await?
+                .context("reply proof missing")?;
+            acknowledge_saved_handler(store, &saved).await?;
             return recovered_output(Self::decode_recorded_reply(
                 reply,
                 ToolObservationProvenance::new(
@@ -77,27 +68,52 @@ impl NatsToolProvider {
                 ),
             ));
         }
+        self.dispatch_replay((record, request), replay, abort).await
+    }
+
+    async fn dispatch_replay(
+        &self,
+        invocation: (
+            harnx_toolset_server::invocation_journal::RecordedInvocation,
+            ToolRequest,
+        ),
+        replay: harnx_core::tool::ToolReplay<'_>,
+        abort: &AbortSignal,
+    ) -> anyhow::Result<Option<ToolProviderOutput>> {
+        let (record, mut request) = invocation;
+        let store = &self
+            .execution_control
+            .as_ref()
+            .context("replay execution missing")?
+            .0;
+        let journal = harnx_toolset_server::invocation_journal::InvocationJournal::ensure(
+            &async_nats::jetstream::new(self.client.clone()),
+        )
+        .await?;
         let route = self
             .resolve_route(&record.tool_name)
             .context("replayed tool unavailable; keeping the pending invocation for recovery")?;
         // Scope identifies a process lifetime and must change across restart.
         // The logical server identity and raw tool must still be the same.
         validate_replay_route(&route, &record)?;
-        let mut request = record.request;
-        request.replay = Some(owner);
+        let consumer = request
+            .replay_execution
+            .as_ref()
+            .context("replay identity missing")?
+            .consumer
+            .clone();
+        harnx_toolset_server::invocation_admission::prepare_replay(store, &mut request, consumer)
+            .await?;
         let id = request.call_id.clone();
-        // Registration can be interrupted after the durable request is saved.
-        // Recreate only an absent operation, retaining existing terminal work.
-        let reference = harnx_execution_control::OperationRef::new(session, &id);
-        if store.get(&reference).await?.is_none() {
-            self.register_operation(&id).await?;
-        }
+        harnx_toolset_server::reply_fence::admit(store, &request).await?;
+        let receiving_request = request.clone();
         let pending =
             self.prepare_recorded_request(request, &route)
                 .map_err(|error| match error {
                     ToolError::Fatal(error) | ToolError::Recoverable(error) => error,
                 })?;
-        authorization
+        replay
+            .authorization
             .context("replay requires a live session lease")?
             .revalidate()
             .await?;
@@ -108,7 +124,51 @@ impl NatsToolProvider {
             .map_err(|error| match error {
                 ToolError::Fatal(error) | ToolError::Recoverable(error) => error,
             })?;
+        if let Some(reply) = journal.completed_reply(&receiving_request).await? {
+            return recovered_output(Self::decode_recorded_reply(
+                reply,
+                ToolObservationProvenance::new(
+                    self.instance_id.to_string(),
+                    route.server,
+                    route.raw_name,
+                    id,
+                ),
+            ));
+        }
         recovered_output(self.decode_reply(message, id, route))
+    }
+
+    async fn replay_request(
+        &self,
+        record: &harnx_toolset_server::invocation_journal::RecordedInvocation,
+        replay: harnx_core::tool::ToolReplay<'_>,
+    ) -> anyhow::Result<(&harnx_execution_control::ExecutionStore, ToolRequest)> {
+        let (store, parent) = self
+            .execution_control
+            .as_ref()
+            .context("replay requires execution control")?;
+        harnx_toolset_server::reply_fence::check_request_stop(store, &record.request).await?;
+        let original = record
+            .request
+            .execution
+            .as_ref()
+            .context("legacy replay has no retained generation authority")?;
+        anyhow::ensure!(
+            parent == original.consumer.operation(),
+            "replay cannot adopt another generation"
+        );
+        let (store, owner) = self.replay_owner(replay).await?;
+        let consumer = store
+            .gate_context(original.consumer.gate_root(), parent)
+            .await?;
+        anyhow::ensure!(consumer.owner() == &owner, "replay gate owner mismatch");
+        let mut request = record.request.clone();
+        request.replay = Some(owner);
+        request.replay_execution = Some(harnx_toolset::ToolExecution {
+            producer: original.producer.clone(),
+            consumer: consumer.clone(),
+        });
+        Ok((store, request))
     }
 
     async fn replay_owner(
@@ -143,6 +203,29 @@ impl NatsToolProvider {
     }
 }
 
+async fn invocation_round(
+    js: &async_nats::jetstream::Context,
+    session: &str,
+    call_id: &str,
+) -> anyhow::Result<u64> {
+    let entries = crate::nats_session_log::NatsSessionLog::new(js.clone(), session)
+        .load_events_latest_async()
+        .await?;
+    let round = entries
+        .iter()
+        .rev()
+        .find_map(|(seq, entry)| match entry {
+            harnx_core::session::SessionLogEntry::ToolCalls { calls, .. }
+                if calls.iter().any(|call| call.id.as_deref() == Some(call_id)) =>
+            {
+                Some(*seq)
+            }
+            _ => None,
+        })
+        .context("tool invocation has no durable call round")?;
+    Ok(round)
+}
+
 fn validate_replay_route(
     route: &RegisteredTool,
     record: &harnx_toolset_server::invocation_journal::RecordedInvocation,
@@ -156,16 +239,18 @@ fn validate_replay_route(
 
 async fn acknowledge_saved_handler(
     store: &harnx_execution_control::ExecutionStore,
-    reference: &harnx_execution_control::OperationRef,
+    saved: &harnx_toolset_server::invocation_journal::CommittedReply,
 ) -> anyhow::Result<()> {
-    // The durable reply proves the handler returned. Descendants remain blockers.
+    // Only the committed producer returned. Never acknowledge a replacement
+    // handler using an old reply. Descendants remain physical blockers.
+    let reference = saved.producer.operation();
     let Some(operation) = store.get(reference).await? else {
         return Ok(());
     };
-    if !operation.state.is_terminal() {
-        if let Some(owner) = &operation.owner {
-            store.owner_stopped(reference, owner).await?;
-        }
+    if !operation.state.is_terminal() && operation.owner.as_ref() == Some(saved.producer.owner()) {
+        store
+            .owner_stopped(reference, saved.producer.owner())
+            .await?;
     }
     Ok(())
 }
@@ -183,134 +268,5 @@ fn recovered_output(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use harnx_execution_control::{ExecutionStore, OperationRef, OperationState, Owner};
-    use harnx_toolset_server::invocation_journal::InvocationJournal;
-    use serde_json::json;
-
-    #[test]
-    fn replay_route_preserves_logical_identity_across_process_scopes() -> anyhow::Result<()> {
-        let record = serde_json::from_value(json!({
-            "request": {"call_id": "original", "operation_id": "original", "tool": "echo", "args": {}},
-            "tool_name": "echo", "server": "configured-server", "server_scope": "departed-process",
-            "tool_round": 1, "started_at_ms": 1, "reply": null
-        }))?;
-        let route = RegisteredTool {
-            server: "configured-server".into(),
-            selector_server: "configured-server".into(),
-            raw_name: "echo".into(),
-            request_timeout: None,
-        };
-        validate_replay_route(&route, &record)?;
-        let mut wrong_server = route.clone();
-        wrong_server.server = "new-alias-winner".into();
-        assert!(validate_replay_route(&wrong_server, &record).is_err());
-        let mut wrong_tool = route;
-        wrong_tool.raw_name = "different-tool".into();
-        assert!(validate_replay_route(&wrong_tool, &record).is_err());
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn saved_reply_recovers_without_a_registered_server() -> anyhow::Result<()> {
-        let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
-            .await
-            .context("nats-server required")?;
-        let client = async_nats::connect(&url).await?;
-        let js = async_nats::jetstream::new(client.clone());
-        let store = ExecutionStore::ensure(&js, 1).await?;
-        let parent = store.session("parent", None, None).await?;
-        let owner = Owner {
-            instance_id: "worker".into(),
-            fence: 1,
-        };
-        store.claim(&parent.reference, owner.clone()).await?;
-        let operation = save_reply(&js, &store, &parent.reference).await?;
-        let instance_id = ServerScope::new();
-        let subscription = client.subscribe(instance_id.control_subject()).await?;
-        let provider = NatsToolProvider {
-            client,
-            instance_id,
-            parent_session_id: Some("parent".into()),
-            execution_control: Some((store.clone(), parent.reference)),
-            tools: HashMap::new(),
-            registrations: Vec::new(),
-            active_package: None,
-            declarations: Vec::new(),
-            registry: None,
-            _control_subscription: Mutex::new(subscription),
-            in_flight: NatsInFlightCalls::default(),
-        };
-        let call = harnx_core::tool::ToolCall::new(
-            "retired_echo".into(),
-            json!({}),
-            Some("model-call".into()),
-            None,
-        );
-        assert!(!provider.has_tool(&call.name));
-        let result = provider
-            .replay_recorded_call(
-                harnx_core::tool::ToolReplay {
-                    session_id: "parent",
-                    tool_round: 5,
-                    call: &call,
-                    worker_id: Some("worker"),
-                    fence_token: Some(1),
-                    authorization: None,
-                },
-                &harnx_core::abort::create_abort_signal(),
-            )
-            .await?
-            .context("recovered reply")?;
-        assert_eq!(result.value, json!({"answer": "saved"}));
-        let provenance = result.execution_context.unwrap().provenance.unwrap();
-        assert_eq!(provenance.server_scope, "original-scope");
-        assert_eq!(provenance.server_identity, "retired");
-        assert_eq!(
-            store.get(&operation).await?.unwrap().state,
-            OperationState::Completed
-        );
-        let _ = nats.kill();
-        let _ = nats.wait();
-        Ok(())
-    }
-    async fn save_reply(
-        js: &async_nats::jetstream::Context,
-        store: &ExecutionStore,
-        parent: &OperationRef,
-    ) -> anyhow::Result<OperationRef> {
-        let operation = OperationRef::new("parent", "original");
-        store.child(operation.clone(), parent.clone()).await?;
-        store
-            .claim(&operation, Owner::invocation("retired"))
-            .await?;
-        let request = ToolRequest {
-            replay: None,
-            call_id: "original".into(),
-            operation_id: "original".into(),
-            tool: "echo".into(),
-            args: json!({}),
-            parent_session_id: Some("parent".into()),
-            tool_call_id: Some("model-call".into()),
-            capabilities: Default::default(),
-        };
-        let journal = InvocationJournal::ensure(js).await?;
-        journal
-            .record(&request, ("retired_echo", "original-scope", "retired"), 5)
-            .await?;
-        journal
-            .complete(
-                &request,
-                ToolReply {
-                    call_id: "original".into(),
-                    result: Ok(json!({"answer": "saved", "_meta": {
-                        EXECUTION_CONTEXT_NAMESPACE: harnx_core::execution_context::ExecutionContextObservation::observe(
-                            std::path::Path::new("/original/workspace"), std::path::Path::new("/original/workspace"))
-                    }})),
-                },
-            )
-            .await?;
-        Ok(operation)
-    }
-}
+#[path = "replay_tests.rs"]
+mod tests;

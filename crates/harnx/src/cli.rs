@@ -21,7 +21,7 @@ pub struct Cli {
     #[clap(long, global = true, hide = true)]
     pub prompt: Option<String>,
     /// Start or join a session
-    #[clap(short = 's', long, global = true, hide = true)]
+    #[clap(short = 's', long, global = true, hide = true, requires = "agent")]
     pub session: Option<Option<String>>,
     /// Ensure the session is empty
     #[clap(long, global = true, hide = true)]
@@ -138,10 +138,28 @@ pub enum DeleteSubcommands {
 
 #[derive(Args, Debug, PartialEq, Eq)]
 pub struct DeleteSessionArgs {
+    /// Agent that owns the session
+    #[arg(long)]
+    pub agent: String,
     pub session_id: String,
     /// Cluster key from nats_servers/<name>.yaml
     #[arg(long)]
     pub cluster: String,
+}
+
+impl DeleteSessionArgs {
+    /// An embedded cluster must agree with the explicitly selected deletion cluster.
+    pub fn agent_name(&self) -> anyhow::Result<String> {
+        let (agent, cluster) = harnx_runtime::config::resolve_session_agent(&self.agent)?;
+        if self.agent.contains('@') {
+            anyhow::ensure!(
+                cluster == self.cluster,
+                "Agent cluster '{cluster}' conflicts with --cluster '{}'",
+                self.cluster
+            );
+        }
+        Ok(agent)
+    }
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -308,13 +326,36 @@ mod tests {
     }
 
     #[test]
+    fn delete_normalizes_agent_and_rejects_conflicting_cluster() {
+        let mut args = DeleteSessionArgs {
+            agent: "reviewer@prod".into(),
+            session_id: "review-12345".into(),
+            cluster: "prod".into(),
+        };
+        assert_eq!(args.agent_name().unwrap(), "reviewer");
+        args.cluster = "local".into();
+        assert!(args.agent_name().is_err());
+        args.agent = "reviewer".into();
+        assert_eq!(args.agent_name().unwrap(), "reviewer");
+    }
+
+    #[test]
     fn parses_delete_session() {
-        let cli =
-            Cli::try_parse_from(["harnx", "delete", "session", "sess-1", "--cluster", "local"])
-                .unwrap();
+        let cli = Cli::try_parse_from([
+            "harnx",
+            "delete",
+            "session",
+            "sess-1",
+            "--agent",
+            "oracle",
+            "--cluster",
+            "local",
+        ])
+        .unwrap();
         match cli.command {
             Some(Commands::Delete(args)) => match args.command {
                 DeleteSubcommands::Session(delete) => {
+                    assert_eq!(delete.agent, "oracle");
                     assert_eq!(delete.session_id, "sess-1");
                     assert_eq!(delete.cluster, "local");
                 }
@@ -393,6 +434,24 @@ mod tests {
                 }))
             );
         }
+    }
+
+    #[test]
+    fn session_commands_require_an_explicit_agent() {
+        assert!(
+            Cli::try_parse_from(["harnx", "--session", "review-12345", "prompt", "hello"]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "harnx",
+            "delete",
+            "session",
+            "review-12345",
+            "--cluster",
+            "local"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["harnx", "info", "session", "review-12345"]).is_err());
+        assert!(Cli::try_parse_from(["harnx", "dump", "session", "review-12345"]).is_err());
     }
 
     #[test]

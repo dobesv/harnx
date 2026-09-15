@@ -482,7 +482,7 @@ impl Tui {
                 .clamp(5, max_height);
         }
 
-        if self.has_root_cancellation() {
+        if self.has_root_cancellation() && !self.cancellation_editor_restored() {
             return 5;
         }
 
@@ -490,7 +490,9 @@ impl Tui {
             .input_height(input_width)
             .clamp(MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT);
         let attachment_height = u16::from(!self.app.attachments.is_empty());
-        input_height + attachment_height
+        let status_height =
+            u16::from(self.has_root_cancellation() && self.cancellation_editor_restored());
+        input_height + attachment_height + status_height
     }
 
     fn render_bottom_region(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
@@ -503,10 +505,23 @@ impl Tui {
             return;
         }
 
-        if self.has_root_cancellation() {
+        if self.has_root_cancellation() && !self.cancellation_editor_restored() {
             self.render_cancellation_tray(frame, area);
             return;
         }
+
+        let show_status = self.has_root_cancellation() && self.cancellation_editor_restored();
+        let show_attachments = !self.app.attachments.is_empty();
+
+        let status_height = u16::from(show_status);
+        let attachment_height = u16::from(show_attachments);
+
+        let input_area_height = area
+            .height
+            .saturating_sub(status_height + attachment_height)
+            .max(1);
+
+        let input_area = ratatui::layout::Rect::new(area.x, area.y, area.width, input_area_height);
 
         let title = self.build_input_title();
         self.app.input.set_block(
@@ -519,9 +534,9 @@ impl Tui {
                         .add_modifier(Modifier::DIM),
                 ),
         );
-        frame.render_widget(&self.app.input, area);
+        frame.render_widget(&self.app.input, input_area);
 
-        if !self.app.attachments.is_empty() {
+        if show_attachments {
             let names: Vec<&str> = self
                 .app
                 .attachments
@@ -529,8 +544,8 @@ impl Tui {
                 .map(|attachment| attachment.display_name.as_str())
                 .collect();
             let footer_text = format!("  Attached: {}   [.detach to remove]", names.join(", "));
-            let footer_area =
-                ratatui::layout::Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+            let y = area.y + input_area_height;
+            let footer_area = ratatui::layout::Rect::new(area.x, y, area.width, 1);
             let footer = Paragraph::new(Line::from(Span::styled(
                 footer_text,
                 Style::default()
@@ -538,6 +553,12 @@ impl Tui {
                     .add_modifier(Modifier::DIM),
             )));
             frame.render_widget(footer, footer_area);
+        }
+
+        if show_status {
+            let y = area.y + input_area_height + attachment_height;
+            let status_area = ratatui::layout::Rect::new(area.x, y, area.width, 1);
+            self.render_compact_cancellation_status(frame, status_area);
         }
     }
 
@@ -774,9 +795,15 @@ impl Tui {
         self.app.main_streamed_text_idx = None;
     }
 
+    fn input_unread_indicator(unread: bool) -> Option<Span<'static>> {
+        unread.then(|| Span::styled("● ", Style::default().fg(Color::Yellow)))
+    }
+
     pub(super) fn build_input_title(&self) -> Line<'static> {
         let config_read = self.config.read();
-        let mut spans = vec![];
+        let mut spans: Vec<_> = Self::input_unread_indicator(self.app.current_session_unread)
+            .into_iter()
+            .collect();
 
         let spinner = if self.app.llm_busy && !self.cancellation_unconfirmed() {
             SPINNER_FRAMES[self.app.spinner_index]
@@ -921,7 +948,7 @@ impl Tui {
                 ..
             } => {
                 let title = "Select Session";
-                let footer = "↑↓ navigate  Enter select  Esc cancel";
+                let footer = "↑↓ navigate  Enter select  u/unread  Esc cancel";
                 let mut items: Vec<String> = vec!["✦ New session".to_string()];
                 items.extend(sessions.iter().map(|session| session.picker_label()));
                 // Prepend error message if present (visible in picker)
@@ -941,9 +968,9 @@ impl Tui {
                     },
                 );
             }
-            ModalState::ConfirmDelete { .. }
-            | ModalState::ConfirmRewind { .. }
-            | ModalState::ConfirmAbandonCancellation => unreachable!(),
+            ModalState::ConfirmDelete { .. } | ModalState::ConfirmRewind { .. } => {
+                unreachable!()
+            }
         }
     }
     fn render_simple_modal(

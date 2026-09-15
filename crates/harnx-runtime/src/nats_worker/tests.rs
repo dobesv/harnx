@@ -22,7 +22,7 @@ use harnx_core::tool::{ToolCall, ToolDeclaration, ToolProvider};
 use harnx_toolset::Toolset;
 use serde_json::json;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
@@ -693,28 +693,19 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
 
     let session_id = crate::nats_worker::new_remote_session_id();
     let entered = Arc::new(Notify::new());
-    let worker_saw_abort = Arc::new(AtomicBool::new(false));
-    let release_after_assertion = Arc::new(Notify::new());
+    let model_dropped = tokio_util::sync::CancellationToken::new();
     let call_fn: crate::agent_loop::AgentCallFn = {
         let entered = Arc::clone(&entered);
-        let worker_saw_abort = Arc::clone(&worker_saw_abort);
-        let release_after_assertion = Arc::clone(&release_after_assertion);
-        Arc::new(move |_input, _config, abort| {
+        let model_dropped = model_dropped.clone();
+        Arc::new(move |_input, _config, _abort| {
             let entered = Arc::clone(&entered);
-            let worker_saw_abort = Arc::clone(&worker_saw_abort);
-            let release_after_assertion = Arc::clone(&release_after_assertion);
+            let model_dropped = model_dropped.clone();
             Box::pin(async move {
+                let _drop = model_dropped.drop_guard();
                 entered.notify_one();
-                tokio::select! {
-                    _ = harnx_core::abort::wait_abort_signal(&abort) => {
-                        worker_saw_abort.store(true, Ordering::SeqCst);
-                        release_after_assertion.notified().await;
-                        bail!("worker call_fn interrupted after remote cancel")
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(20)) => {
-                        bail!("worker call_fn timed out waiting for remote cancel abort")
-                    }
-                }
+                // Model cancellation is future drop, not another cooperative
+                // poll. This future never returns or observes the abort signal.
+                std::future::pending().await
             })
         })
     };
@@ -751,16 +742,9 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
         .await
         .expect("durably request cancellation");
     assert!(receipt.cancelled);
-    assert_ne!(
-        session.cancel_status(&receipt).await.unwrap().disposition,
-        harnx_execution_control::CancelDisposition::Cancelled
-    );
-    assert!(
-        wait_for_condition(NATS_TEST_CONDITION_TIMEOUT, || worker_saw_abort
-            .load(Ordering::SeqCst))
-        .await,
-        "worker call_fn never observed abort after remote cancel publish"
-    );
+    tokio::time::timeout(NATS_TEST_CONDITION_TIMEOUT, model_dropped.cancelled())
+        .await
+        .expect("worker must drop the model future after remote cancel");
 
     let _turn_result = tokio::time::timeout(NATS_TEST_CONDITION_TIMEOUT, run_turn)
         .await
@@ -771,11 +755,9 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
     let log_client = async_nats::connect(&url)
         .await
         .expect("connect nats client for final session log");
-    let log = NatsSessionLog::new(async_nats::jetstream::new(log_client), session_id);
-    let final_entries = log
-        .load_events_async()
-        .await
-        .expect("load final session log after run_turn completion");
+    let log =
+        NatsSessionLog::for_agent(async_nats::jetstream::new(log_client), "metis", &session_id);
+    let final_entries = wait_for_cancel_projection(&log).await;
     let cancel_fence_token = final_entries.iter().find_map(|(_, entry)| match entry {
         SessionLogEntry::Cancel { fence_token } => Some(*fence_token),
         _ => None,
@@ -792,7 +774,6 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
         TurnStatus::InFlightCancelled,
         "durable log should reconstruct to InFlightCancelled after remote cancel when no assistant message follows cancel; cancel fence={cancel_fence_token:?}, assistant fence={first_assistant_fence_token:?}, entries={final_entries:#?}"
     );
-    release_after_assertion.notify_one();
     assert!(
         wait_for_condition(NATS_TEST_CONDITION_TIMEOUT, || {
             crate::nats_metrics::snapshot().active_sessions_per_worker == 0
@@ -1028,7 +1009,7 @@ async fn subagent_started_reaches_parent_stream_and_durable_log() {
     let parent_session =
         crate::config::session::new(&seeded.parent_config, "parent-subagent-start", None)
             .expect("create parent session");
-    let parent_session_id = parent_session.id().to_string();
+    let parent_session_id = parent_session.storage_key();
     seeded.parent_config.session = Some(parent_session);
 
     let daemon = spawn_metis_worker_with_call_fn(
@@ -1176,7 +1157,7 @@ async fn run_subagent_cancel_case(parent_abort: bool) {
             .nats_jetstream("local")
             .await
             .expect("cancel log jetstream"),
-        session_id,
+        harnx_core::session_identity::session_key(Some("metis"), &session_id),
     );
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -1215,7 +1196,7 @@ async fn subagent_silent_turn_waits_for_lease_backed_completion() {
     let toolset = test_subagent_toolset(&url).await;
     let session_id = crate::nats_worker::new_remote_session_id();
     let result = tokio::time::timeout(
-        Duration::from_secs(5),
+        NATS_TEST_CONDITION_TIMEOUT,
         toolset.invoke(
             "session_prompt",
             json!({ "message": "wait silently", "session_id": session_id }),
@@ -1325,7 +1306,9 @@ async fn nested_subagent_prompt() {
     .await
     .expect("create parent NATS session");
     let parent_result = tokio::time::timeout(
-        Duration::from_secs(15),
+        // Cold discovery and both durable turn boundaries share the remote
+        // round-trip budget; this test constrains stack size, not startup latency.
+        Duration::from_secs(60),
         session.run_turn(
             "delegate this request through the nested tool",
             Arc::new(NoopEventSink),
@@ -1339,7 +1322,7 @@ async fn nested_subagent_prompt() {
 
     let parent_log = NatsSessionLog::new(
         async_nats::jetstream::new(client.clone()),
-        parent_session_id.clone(),
+        harnx_core::session_identity::session_key(Some("metis"), &parent_session_id),
     );
     let parent_entries = parent_log
         .load_events_async()
@@ -1371,7 +1354,7 @@ async fn nested_subagent_prompt() {
                 .strip_prefix("sessions.")
                 .and_then(|value| value.strip_suffix(".events"))
                 .expect("session event subject shape");
-            if session_id != parent_session_id {
+            if session_id != session.storage_key() {
                 break session_id.to_string();
             }
         }
@@ -1457,7 +1440,7 @@ async fn remote_session_activation_writes_canonical_metadata_and_activity() {
 
     // Assert on the specific session_id we created, not just "first key in bucket"
     let record = store
-        .get(&expected_session_id)
+        .get_for_agent(&expected_session_id, "metis")
         .await
         .expect("load session metadata")
         .expect("remote session metadata exists");
@@ -1469,7 +1452,7 @@ async fn remote_session_activation_writes_canonical_metadata_and_activity() {
         }
     );
     let activity = store
-        .get_activity(&record.metadata.session_id)
+        .get_activity(&record.metadata.storage_key())
         .await
         .expect("load session activity")
         .expect("remote session activity exists");
@@ -1511,7 +1494,10 @@ async fn remote_session_renew_updates_activity_without_clobbering_metadata() {
     // DeliverPolicy::New (future updates only), so it must be established before
     // the initial index write and the lease-renewal refresh — otherwise both
     // Puts happen before the watcher exists and it waits forever.
-    let record_key = activity_key(&expected_session_id);
+    let record_key = activity_key(&harnx_core::session_identity::session_key(
+        Some("metis"),
+        &expected_session_id,
+    ));
     let mut watcher = store
         .kv_store()
         .watch(record_key.clone())
@@ -1567,7 +1553,7 @@ async fn remote_session_renew_updates_activity_without_clobbering_metadata() {
     );
 
     let metadata = store
-        .get(&expected_session_id)
+        .get_for_agent(&expected_session_id, "metis")
         .await
         .expect("load metadata")
         .expect("metadata exists");
@@ -1610,7 +1596,7 @@ async fn remote_dispatch_retract_round_trip() {
         .nats_jetstream("local")
         .await
         .expect("load local jetstream");
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::for_agent(jetstream.clone(), "metis", &session_id);
     seed_remote_dispatch_session_log(&log, &jetstream, &session_id)
         .await
         .expect("seed remote session log");
@@ -1682,7 +1668,7 @@ async fn remote_dispatch_edit_round_trip() {
         .nats_jetstream("local")
         .await
         .expect("load local jetstream");
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::for_agent(jetstream.clone(), "metis", &session_id);
     seed_remote_dispatch_session_log(&log, &jetstream, &session_id)
         .await
         .expect("seed remote session log");
@@ -1772,7 +1758,7 @@ async fn remote_delete_turn_matches_local_any_role_parity() {
         .nats_jetstream("local")
         .await
         .expect("load local jetstream");
-    let log = NatsSessionLog::new(jetstream, session_id.clone());
+    let log = NatsSessionLog::for_agent(jetstream, "metis", &session_id);
 
     seeded
         .parent_config
@@ -1858,10 +1844,23 @@ async fn remote_delete_accepts_first_transcript_row() {
         ))
         .await
         .expect("create canonical metadata");
-    let log = NatsSessionLog::new(jetstream, session_id.clone());
+    let execution_store = harnx_execution_control::ExecutionStore::ensure(&jetstream, 1)
+        .await
+        .unwrap();
+    let storage_key = harnx_core::session_identity::session_key(Some("metis"), &session_id);
+    let operation = execution_store
+        .session(&storage_key, None, None)
+        .await
+        .unwrap();
+    let message_id = uuid::Uuid::new_v4().to_string();
+    execution_store
+        .reserve_prompt(&operation.reference, &message_id)
+        .await
+        .unwrap();
+    let log = NatsSessionLog::for_agent(jetstream, "metis", &session_id);
     let first_user_seq = log
         .append_event_async(&SessionLogEntry::Message {
-            id: Some(uuid::Uuid::new_v4().to_string()),
+            id: Some(message_id.clone()),
             role: harnx_core::message::MessageRole::User,
             content: harnx_core::message::MessageContent::Text("first prompt".to_string()),
             timestamp: None,
@@ -1869,6 +1868,10 @@ async fn remote_delete_accepts_first_transcript_row() {
         })
         .await
         .expect("append first user message");
+    execution_store
+        .commit_prompt(&operation.reference, &message_id, first_user_seq)
+        .await
+        .unwrap();
     assert_eq!(first_user_seq, 1, "first physical row is the user message");
 
     let worker =
@@ -1925,7 +1928,7 @@ async fn remote_rewind_appends_mutation_without_truncating_stream() {
         .nats_jetstream("local")
         .await
         .expect("load local jetstream");
-    let log = NatsSessionLog::new(jetstream, session_id.clone());
+    let log = NatsSessionLog::for_agent(jetstream, "metis", &session_id);
     let before_raw = log
         .load_events_async()
         .await
@@ -2018,7 +2021,7 @@ async fn remote_delete_refreshes_after_concurrent_mutation() {
         .nats_jetstream("local")
         .await
         .expect("load local jetstream");
-    let log = NatsSessionLog::new(jetstream, session_id.clone());
+    let log = NatsSessionLog::for_agent(jetstream, "metis", &session_id);
 
     seeded
         .parent_config
@@ -2381,7 +2384,7 @@ async fn remote_delete_command_routes_to_exact_set_mutations() {
         .await
         .expect("connect to jetstream");
     let js = async_nats::jetstream::new(js);
-    let raw = NatsSessionLog::new(js, session_id)
+    let raw = NatsSessionLog::for_agent(js, "metis", &session_id)
         .load_events_async()
         .await
         .expect("raw log");
@@ -2487,7 +2490,7 @@ async fn remote_rewind_command_routes_to_exact_suffix_deletions() {
         .await
         .expect("connect to jetstream");
     let js = async_nats::jetstream::new(js);
-    let raw = NatsSessionLog::new(js, session_id)
+    let raw = NatsSessionLog::for_agent(js, "metis", &session_id)
         .load_events_async()
         .await
         .expect("raw log");
@@ -2555,11 +2558,23 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
         ))
         .await
         .expect("seed canonical session metadata");
-    let seed_log = NatsSessionLog::new(jetstream, session_id.clone());
+    let execution_store = harnx_execution_control::ExecutionStore::ensure(&jetstream, 1)
+        .await
+        .unwrap();
+    let storage_key = harnx_core::session_identity::session_key(Some("metis"), &session_id);
+    let operation = execution_store
+        .session(&storage_key, None, None)
+        .await
+        .unwrap();
+    let seed_log = NatsSessionLog::for_agent(jetstream, "metis", &session_id);
     for text in ["leading one", "leading two"] {
-        seed_log
+        execution_store
+            .reserve_prompt(&operation.reference, text.replace(' ', "-").as_str())
+            .await
+            .unwrap();
+        let seq = seed_log
             .append_event_async(&SessionLogEntry::Message {
-                id: None,
+                id: Some(text.replace(' ', "-")),
                 role: MessageRole::User,
                 content: MessageContent::Text(text.to_string()),
                 timestamp: None,
@@ -2567,6 +2582,10 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
             })
             .await
             .expect("seed leading user message");
+        execution_store
+            .commit_prompt(&operation.reference, text.replace(' ', "-").as_str(), seq)
+            .await
+            .unwrap();
     }
 
     let worker =
@@ -2638,4 +2657,24 @@ async fn load_remote_transcript_multi_leading_user_rows_are_distinct() {
     let _ = worker.await;
     let _ = child.kill();
     let _ = child.wait();
+}
+
+async fn wait_for_cancel_projection(log: &NatsSessionLog) -> Vec<(u64, SessionLogEntry)> {
+    tokio::time::timeout(NATS_TEST_CONDITION_TIMEOUT, async {
+        loop {
+            let entries = log
+                .load_events_latest_async()
+                .await
+                .expect("read cancellation projection");
+            if entries
+                .iter()
+                .any(|(_, entry)| matches!(entry, SessionLogEntry::Cancel { .. }))
+            {
+                break entries;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable cancellation projection")
 }

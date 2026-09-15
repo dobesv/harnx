@@ -12,8 +12,12 @@ async fn release_uses_and_clears_the_ambient_binding() -> Result<()> {
             args: json!({}),
             context: ToolInvocationContext {
                 operation: None,
+                execution: None,
                 call_id: "call-2".to_string(),
-                invoking_session_id: Some("session-1".to_string()),
+                invoking_session_id: Some(harnx_core::session_identity::session_key(
+                    Some("coder"),
+                    "session-1",
+                )),
                 capabilities: BTreeSet::new(),
             },
             cancel: CancellationToken::new(),
@@ -36,8 +40,12 @@ async fn release_uses_and_clears_the_ambient_binding() -> Result<()> {
             args: json!({"destroy": true}),
             context: ToolInvocationContext {
                 operation: None,
+                execution: None,
                 call_id: "call-3".to_string(),
-                invoking_session_id: Some("session-1".to_string()),
+                invoking_session_id: Some(harnx_core::session_identity::session_key(
+                    Some("coder"),
+                    "session-1",
+                )),
                 capabilities: BTreeSet::new(),
             },
             cancel: CancellationToken::new(),
@@ -47,7 +55,10 @@ async fn release_uses_and_clears_the_ambient_binding() -> Result<()> {
     assert_eq!(fixture.api.deletes.lock().as_slice(), ["claim-ambient"]);
     assert!(!fixture
         .metadata
-        .get_tool_context("session-1")
+        .get_tool_context(&harnx_core::session_identity::session_key(
+            Some("coder"),
+            "session-1"
+        ))
         .await?
         .unwrap()
         .values
@@ -80,8 +91,12 @@ async fn connect_clones_after_a_retry_and_binds_the_session() -> Result<()> {
             }),
             context: ToolInvocationContext {
                 operation: None,
+                execution: None,
                 call_id: "call-clone".to_string(),
-                invoking_session_id: Some("session-clone".to_string()),
+                invoking_session_id: Some(harnx_core::session_identity::session_key(
+                    Some("coder"),
+                    "session-clone",
+                )),
                 capabilities: BTreeSet::new(),
             },
             cancel: CancellationToken::new(),
@@ -127,8 +142,12 @@ async fn connect_binds_before_a_cancelled_clone_returns() -> Result<()> {
             }),
             context: ToolInvocationContext {
                 operation: None,
+                execution: None,
                 call_id: "call-cancelled-clone".to_string(),
-                invoking_session_id: Some("session-cancelled-clone".to_string()),
+                invoking_session_id: Some(harnx_core::session_identity::session_key(
+                    Some("coder"),
+                    "session-cancelled-clone",
+                )),
                 capabilities: BTreeSet::new(),
             },
             cancel: CancellationToken::new(),
@@ -167,8 +186,12 @@ async fn ambiguous_post_dispatch_failure_is_not_replayed() -> Result<()> {
             args: json!({"command": "touch /workspace/once"}),
             context: ToolInvocationContext {
                 operation: None,
+                execution: None,
                 call_id: "call-no-replay".to_string(),
-                invoking_session_id: Some("session-no-replay".to_string()),
+                invoking_session_id: Some(harnx_core::session_identity::session_key(
+                    Some("coder"),
+                    "session-no-replay",
+                )),
                 capabilities: BTreeSet::new(),
             },
             cancel: CancellationToken::new(),

@@ -10,7 +10,8 @@ type: openai
 #   responses:
 #     - '.body.store = true'  # Override default store:false; re-enables dashboard logging
 
-# Note: gpt-5.6-*:high and gpt-5.6-*:max aliases route to /v1/responses with
+# Note: reasoning-effort aliases (gpt-5.6-*:high/:max, gpt-6-astra:high/:max)
+# route to /v1/responses with
 # store:false default. store:false prevents dashboard logging, but OpenAI
 # retains payloads ~30 days for abuse monitoring unless the account has ZDR
 # (applies to both endpoints).

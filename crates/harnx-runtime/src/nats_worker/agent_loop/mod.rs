@@ -1,8 +1,11 @@
 //! Agent loop entrypoint for NATS-backed sessions.
 
-mod tool_recovery;
-use tool_recovery::repair_single_orphan;
+#[cfg(test)]
+mod recovery_ownership_tests;
 
+mod hitl_attention;
+mod recovery_bootstrap;
+mod tool_recovery;
 use super::backend::{FencedSessionLogSink, NatsSessionLogBackend};
 use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use crate::agent_loop::OnToolRoundFn;
@@ -22,8 +25,10 @@ use anyhow::{Context, Result};
 use async_nats::jetstream;
 use harnx_core::message::Message;
 use harnx_core::session::SessionLogEntry;
+use recovery_bootstrap::prepare_standalone_generation;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use tool_recovery::repair_single_orphan;
 
 #[derive(Clone)]
 pub struct RunAgentLoopArgs<'a> {
@@ -111,6 +116,27 @@ pub(crate) fn derive_pending_hitl_approvals(
             _ => None,
         })
         .collect())
+}
+
+/// Derive the attention sequence from log entries.
+///
+/// Returns the max stream seq among attention-producing entries:
+/// - `TurnEnd` with `through_seq > 0` (final message turn boundary)
+/// - `HitlApprovalRequested` (HITL approval request)
+///
+/// Used by `reconcile_attention_from_log` to repair lost bumps.
+pub fn derive_attention_seq(entries: &[(u64, SessionLogEntry)]) -> u64 {
+    entries
+        .iter()
+        .filter_map(|(seq, entry)| match entry {
+            // TurnEnd with through_seq > 0 marks a complete turn
+            SessionLogEntry::TurnEnd { through_seq, .. } if *through_seq > 0 => Some(*seq),
+            // HitlApprovalRequested always bumps attention
+            SessionLogEntry::HitlApprovalRequested { .. } => Some(*seq),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn tool_round_entries(
@@ -209,72 +235,6 @@ fn derive_hitl_tool_round_continuation(
         decisions,
     }))
 }
-fn build_hitl_approval_request_callback(
-    jetstream: &jetstream::Context,
-    session_id: &str,
-    lease: &Arc<NatsSessionLease>,
-    event_sink: Option<&Arc<NatsEventSink>>,
-    after_seq_observer: Option<&Arc<AtomicU64>>,
-) -> crate::agent_loop::OnHitlApprovalRequiredFn {
-    let backend = NatsSessionLogBackend::new(jetstream.clone(), session_id)
-        .with_after_seq_observer(
-            after_seq_observer
-                .cloned()
-                .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
-        );
-    let sink = FencedSessionLogSink::new(backend.clone(), Arc::clone(lease));
-    let lease = Arc::clone(lease);
-    let event_sink = event_sink.cloned();
-    Arc::new(move |deferred| {
-        anyhow::ensure!(
-            lease.is_held(),
-            "session lease lost before HITL approval request"
-        );
-        let tool_call_id = deferred
-            .call
-            .id
-            .clone()
-            .context("deferred tool call has no tool_call_id")?;
-        let summary = deferred
-            .reason
-            .clone()
-            .filter(|reason| !reason.trim().is_empty())
-            .unwrap_or_else(|| format!("Approve tool call `{}`", deferred.call.name));
-        let entry = SessionLogEntry::HitlApprovalRequested {
-            tool_call_id: tool_call_id.clone(),
-            summary,
-            fence_token: lease.fence_token(),
-        };
-        for _ in 0..3 {
-            anyhow::ensure!(
-                lease.is_held(),
-                "session lease lost before HITL approval request"
-            );
-            let entries = backend.load_events_blocking()?;
-            let pending = derive_pending_hitl_approvals(&entries)?;
-            if let Some(oldest) = pending.first() {
-                log::warn!(
-                    "session already has pending HITL approval; retaining oldest request: tool_call_id={} seq={}",
-                    oldest.tool_call_id,
-                    oldest.seq
-                );
-                return Ok(oldest.tool_call_id.clone());
-            }
-            let expected_last_sequence = entries.last().map_or(0, |(seq, _)| *seq);
-            if sink
-                .append_hitl_event_cas_blocking(&entry, expected_last_sequence)?
-                .is_some()
-            {
-                if let Some(event_sink) = &event_sink {
-                    event_sink.publish_session_updated();
-                }
-                return Ok(tool_call_id);
-            }
-        }
-        anyhow::bail!("HITL approval request lost repeated concurrent append races")
-    })
-}
-
 fn fold_user_messages(messages: &[Message]) -> String {
     messages
         .iter()
@@ -371,6 +331,7 @@ pub(crate) fn build_mid_turn_injection_callback(
 }
 
 struct RepairOrphanToolCallsArgs<'a> {
+    log: &'a crate::nats_session_log::NatsSessionLog,
     config: GlobalConfig,
     instance_id: &'a harnx_core::instance::ServerScope,
     fence_token: Option<u64>,
@@ -427,8 +388,9 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
         on_tool_round,
         working_dir,
     } = args;
+
     let (jetstream_ctx, session_origin, attachment_sync) =
-        prepare_agent_session(PrepareAgentSessionParams {
+        Box::pin(prepare_agent_session(PrepareAgentSessionParams {
             cluster_key,
             session_id,
             config: &config,
@@ -437,31 +399,31 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
             lease: lease.as_ref(),
             after_seq_observer: after_seq_observer.clone(),
             session_metadata,
-        })
+        }))
         .await?;
 
-    let hook_start_config =
-        resolve_agent_hook_start_config(manage_servers, &config, &jetstream_ctx, &instance_id)
-            .await;
-    let mut hook_supervisor = None;
-    reconcile_agent_hooks(
-        &mut hook_supervisor,
-        hook_start_config.as_ref(),
+    let hook_supervisor = setup_agent_hooks(
+        manage_servers,
         &config,
+        &jetstream_ctx,
+        &instance_id,
         session_id,
     )
     .await;
 
     let on_hitl_approval_required = lease.as_ref().map(|lease| {
-        build_hitl_approval_request_callback(
-            &jetstream_ctx,
+        hitl_attention::build_hitl_approval_request_callback(hitl_attention::HitlCallbackContext {
+            jetstream: &jetstream_ctx,
             session_id,
             lease,
-            event_sink.as_ref(),
-            after_seq_observer.as_ref(),
-        )
+            event_sink: event_sink.as_ref(),
+            after_seq_observer: after_seq_observer.as_ref(),
+            metadata_store: session_metadata,
+            fence: config.read().generation_fence.clone(),
+        })
     });
-    let ctx = build_agent_loop_context(AgentContextParams {
+
+    let ctx = Box::pin(build_agent_loop_context(AgentContextParams {
         config: config.clone(),
         instance_id,
         abort_signal: abort_signal.clone(),
@@ -470,15 +432,15 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
         on_tool_round,
         on_hitl_approval_required,
         working_dir,
-    })
+    }))
     .await;
 
-    // After hook reconciliation and provider discovery so the dispatch reaches
-    // both global and agent hook servers.
     dispatch_context_session_start(&ctx, session_origin, session_id).await;
 
-    let backend = NatsSessionLogBackend::new(jetstream_ctx.clone(), session_id);
+    let backend = NatsSessionLogBackend::new(jetstream_ctx.clone(), session_id)
+        .with_execution(config.read().generation_fence.clone());
     let hitl_continuation = derive_hitl_tool_round_continuation(&backend.load_events_blocking()?)?;
+
     let segment_args = AgentLoopSegmentArgs {
         source_session_id: session_id,
         cluster_key,
@@ -491,12 +453,38 @@ pub(crate) async fn run_agent_loop_with_nats_outcome(
         event_sink,
         lease,
     };
-    let result = if let Some(continuation) = hitl_continuation {
-        run_hitl_continuation_segment(segment_args, continuation).await
-    } else {
-        run_agent_loop_segment(segment_args).await
+    // Journal/gate I/O adds depth below tool dispatch. Keep segment construction
+    // out of this activation frame as well as the enclosing daemon frame.
+    let result = match hitl_continuation {
+        Some(continuation) => {
+            Box::pin(run_hitl_continuation_segment(segment_args, continuation)).await
+        }
+        None => Box::pin(run_agent_loop_segment(segment_args)).await,
     };
+
     finish_agent_loop(hook_supervisor, attachment_sync, result).await
+}
+
+/// Set up agent-level hook servers for this session.
+async fn setup_agent_hooks(
+    manage_servers: bool,
+    config: &GlobalConfig,
+    jetstream_ctx: &jetstream::Context,
+    instance_id: &harnx_core::instance::ServerScope,
+    session_id: &str,
+) -> Option<HookServerSupervisor> {
+    let hook_start_config =
+        resolve_agent_hook_start_config(manage_servers, config, jetstream_ctx, instance_id).await;
+
+    let mut hook_supervisor = None;
+    reconcile_agent_hooks(
+        &mut hook_supervisor,
+        hook_start_config.as_ref(),
+        config,
+        session_id,
+    )
+    .await;
+    hook_supervisor
 }
 
 async fn finish_agent_loop(
@@ -529,12 +517,26 @@ struct PrepareAgentSessionParams<'a> {
 async fn prepare_agent_session(
     params: PrepareAgentSessionParams<'_>,
 ) -> Result<(jetstream::Context, SessionOrigin, SessionAttachmentSync)> {
-    let cfg_snapshot = params.config.read().clone();
+    let mut cfg_snapshot = params.config.read().clone();
     let jetstream = cfg_snapshot.nats_jetstream(params.cluster_key).await?;
-    let mut backend = NatsSessionLogBackend::new(jetstream.clone(), params.session_id);
+    if cfg_snapshot.generation_fence.is_none() {
+        let fence = Box::pin(prepare_standalone_generation(&params, &jetstream)).await?;
+        cfg_snapshot.generation_fence = Some(fence.clone());
+        params.config.write().generation_fence = Some(fence);
+    }
+    let mut backend = NatsSessionLogBackend::new(jetstream.clone(), params.session_id)
+        .with_execution(cfg_snapshot.generation_fence.clone());
     if let Some(observer) = params.after_seq_observer {
         backend = backend.with_after_seq_observer(observer);
     }
+    crate::nats_session_log::NatsSessionLog::new(jetstream.clone(), params.session_id)
+        .admit_reconstruction(
+            cfg_snapshot
+                .generation_fence
+                .as_ref()
+                .context("recovery authority missing")?,
+        )
+        .await?;
     abort_resume_if_fenced(&backend, params.lease.map(Arc::as_ref))?;
     let (session, origin) = load_or_repair_session(LoadOrRepairSessionParams {
         backend: &backend,
@@ -596,6 +598,7 @@ async fn build_agent_loop_context(
     let nats_hook_provider =
         discover_nats_hook_provider_fresh(&config_snapshot, &params.instance_id).await;
     crate::agent_loop::AgentLoopContext {
+        generation_fence: config_snapshot.generation_fence.clone(),
         config: params.config,
         instance_id: params.instance_id,
         abort_signal: params.abort_signal,
@@ -622,7 +625,8 @@ pub(crate) enum SessionOrigin {
 }
 
 struct SessionStartDispatch<'a> {
-    execution: Option<harnx_execution_control::OperationRef>,
+    abort: Option<crate::utils::AbortSignal>,
+    execution: Option<harnx_execution_control::ExecutionContext>,
     origin: SessionOrigin,
     provider: Option<&'a NatsHookProvider>,
     session_id: &'a str,
@@ -648,12 +652,11 @@ async fn dispatch_context_session_start(
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let model = ctx.config.read().current_model().id().to_string();
     let execution = ctx
-        .config
-        .read()
-        .execution_control
+        .generation_fence
         .as_ref()
-        .map(|(_, reference)| reference.clone());
+        .map(|fence| fence.context.clone());
     dispatch_session_start(SessionStartDispatch {
+        abort: Some(ctx.abort_signal.clone()),
         execution,
         origin,
         provider: ctx.nats_hook_provider.as_deref(),
@@ -686,6 +689,7 @@ async fn dispatch_session_start(params: SessionStartDispatch<'_>) {
         },
         provider: params.provider,
         meta: HookDispatchMeta {
+            abort: params.abort,
             execution: params.execution,
             session_id: params.session_id.to_string(),
             cwd: params.cwd,
@@ -768,7 +772,7 @@ async fn agent_hook_start_config(
 
 async fn run_agent_loop_segment(args: AgentLoopSegmentArgs<'_>) -> Result<NatsAgentLoopOutcome> {
     let args_ref = &args;
-    let result = crate::agent_loop::run_agent_loop_with_before_end(
+    let result = Box::pin(crate::agent_loop::run_agent_loop_with_before_end(
         &args.ctx,
         args.input.clone(),
         |result| {
@@ -795,7 +799,7 @@ async fn run_agent_loop_segment(args: AgentLoopSegmentArgs<'_>) -> Result<NatsAg
                 Ok(())
             }
         },
-    )
+    ))
     .await?;
     Ok(match result {
         crate::agent_loop::LoopResult::Completed => NatsAgentLoopOutcome::Completed,
@@ -869,7 +873,10 @@ async fn dispatch_nats_handoff(
 ) -> Result<()> {
     let requested_session_id = session_id.filter(|session_id| !session_id.trim().is_empty());
     let destination = resolve_handoff_destination(args, &agent).await?;
-
+    args.ctx.check_generation("handoff-create").await?;
+    if let Some(fence) = &args.ctx.generation_fence {
+        fence.start(serde_json::json!({"handoff": agent, "session_id": requested_session_id, "prompt": prompt})).await?;
+    }
     let target_session = NatsSession::new(
         NatsSessionConfig {
             cluster: destination.cluster,
@@ -885,7 +892,12 @@ async fn dispatch_nats_handoff(
         args.abort_signal.clone(),
     )
     .await
-    .with_context(|| format!("create handoff target session for '{agent}'"))?;
+    .with_context(|| format!("create handoff target session for '{agent}'"))?
+    .with_parent_fence(
+        args.ctx.generation_fence.clone(),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    args.ctx.check_generation("handoff-enqueue").await?;
     let enqueued = target_session
         .enqueue(&prompt)
         .await
@@ -980,7 +992,8 @@ async fn emit_handoff_committed(
                 args.jetstream_ctx.clone(),
                 args.source_session_id,
             )
-            .await,
+            .await
+            .with_execution(args.ctx.generation_fence.clone()),
         ),
     };
     // Append durable HandoffCommitted entry to the source session's log
@@ -988,7 +1001,8 @@ async fn emit_handoff_committed(
     let backend = crate::nats_worker::backend::NatsSessionLogBackend::new(
         args.jetstream_ctx.clone(),
         args.source_session_id,
-    );
+    )
+    .with_execution(args.ctx.generation_fence.clone());
     let after_seq = backend
         .append_event(&harnx_core::session::SessionLogEntry::HandoffCommitted {
             target_agent: committed_agent.clone(),
@@ -1139,15 +1153,8 @@ async fn load_or_repair_session(
     let mut entries_vec = backend.load_events_blocking()?;
     let effective_entries =
         harnx_core::session_reconstruct::apply_log_mutations_nats(&entries_vec)?;
-    let preserve_hitl_pending = find_orphan_tool_calls(&effective_entries)
-        .iter()
-        .any(|orphan| {
-            let hitl_ids = hitl_managed_tool_call_ids(&effective_entries, orphan.seq);
-            orphan
-                .calls
-                .iter()
-                .any(|call| call.id.as_deref().is_some_and(|id| hitl_ids.contains(id)))
-        });
+    tool_recovery::admit_pending_rounds(backend, config, &effective_entries).await?;
+    let preserve_hitl_pending = tool_recovery::preserves_hitl_pending(&effective_entries);
     repair_orphan_tool_calls_if_any(RepairOrphanCallsParams {
         backend,
         config,
@@ -1159,9 +1166,9 @@ async fn load_or_repair_session(
         entries_vec: &mut entries_vec,
     })
     .await?;
-    let mut session = crate::config::session::new(&config.read(), session_id, None)?;
-    session.id = session_id.to_string();
-    session.session_id = Some(session_id.to_string());
+    let mut session = crate::config::session::new(&config.read(), &metadata.session_id, None)?;
+    session.id = metadata.session_id.clone();
+    session.session_id = Some(metadata.session_id.clone());
     session.working_dir = None;
     session.git_branch = None;
     session.git_remote = None;
@@ -1237,10 +1244,12 @@ async fn repair_orphan_tool_calls_if_any(params: RepairOrphanCallsParams<'_>) ->
         lease.map(|l| l.fence_token()).unwrap_or(0),
         orphan_calls.len()
     );
+    let log = crate::nats_session_log::NatsSessionLog::new(backend.jetstream(), session_id);
     repair_orphan_tool_calls_with_hints(
         backend,
         &orphan_calls,
         RepairOrphanToolCallsArgs {
+            log: &log,
             config: config.clone(),
             instance_id,
             fence_token: lease.map(|l| l.fence_token()),
@@ -1343,8 +1352,8 @@ fn find_orphan_tool_calls(
                     timestamp: *timestamp,
                 });
             }
-            SessionLogEntry::ToolResults { .. } => {
-                // ToolResults clears the pending ToolCalls
+            SessionLogEntry::ToolResults { .. } | SessionLogEntry::Cancel { .. } => {
+                // Cancel closes recovery without authoring late tool output.
                 last_tool_calls = None;
             }
             _ => {}
@@ -1468,7 +1477,7 @@ async fn rerun_or_synthesize_tool_results(
     eval_ctx: &crate::tool::ToolEvalContext,
     abort_signal: &AbortSignal,
     authorization: Option<&dyn harnx_core::tool::ReplayAuthorization>,
-) -> Vec<(usize, harnx_core::session::ToolOutput)> {
+) -> Result<Vec<(usize, harnx_core::session::ToolOutput)>> {
     let calls = rerun_calls.iter().map(|(_, call)| call.clone()).collect();
     match harnx_engine::tool::eval_tool_calls_with_authorization(
         eval_ctx,
@@ -1478,11 +1487,15 @@ async fn rerun_or_synthesize_tool_results(
     )
     .await
     {
-        Ok(tool_results) => tool_recovery::index_rerun_results(rerun_calls, tool_results),
-        Err(err) => rerun_calls
+        Ok(tool_results) => Ok(tool_recovery::index_rerun_results(
+            rerun_calls,
+            tool_results,
+        )),
+        Err(err) if err.is::<harnx_execution_control::Interrupted>() => Err(err),
+        Err(err) => Ok(rerun_calls
             .into_iter()
             .map(|(index, call)| (index, rerun_failure_output(&call, &err)))
-            .collect(),
+            .collect()),
     }
 }
 
@@ -1593,6 +1606,7 @@ mod tests {
         let (provider, seen) = recording_session_start_provider();
 
         dispatch_session_start(SessionStartDispatch {
+            abort: None,
             execution: None,
             origin: SessionOrigin::Created,
             provider: Some(&provider),
@@ -1619,6 +1633,7 @@ mod tests {
         let (provider, seen) = recording_session_start_provider();
 
         dispatch_session_start(SessionStartDispatch {
+            abort: None,
             execution: None,
             origin: SessionOrigin::Resumed,
             provider: Some(&provider),
@@ -1976,5 +1991,92 @@ mod tests {
             Some(4),
             "latest_seq must track max consumed user-message seq"
         );
+    }
+}
+
+/// Tests for `build_hitl_approval_request_callback` attention bump.
+#[cfg(test)]
+mod hitl_attention_tests {
+    use super::hitl_attention::{
+        build_hitl_approval_request_callback_for_test, HitlCallbackContext,
+    };
+    use crate::nats_session_metadata::{SessionInitializer, SessionMetadata, SessionMetadataStore};
+    use crate::tool::DeferredToolCall;
+    use harnx_core::require_nextest;
+    use harnx_core::tool::ToolCall;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    /// Test that `build_hitl_approval_request_callback_for_test` appends
+    /// `HitlApprovalRequested` and bumps attention directly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hitl_approval_callback_bumps_attention_directly() {
+        require_nextest();
+        let Some((url, mut child, _store_dir)) = crate::nats_worker::tests::spawn_test_nats().await
+        else {
+            return;
+        };
+
+        let client = async_nats::connect(&url).await.unwrap();
+        let jetstream = async_nats::jetstream::new(client);
+        let store = SessionMetadataStore::ensure(&jetstream, 1).await.unwrap();
+        let session_id = crate::nats_worker::new_remote_session_id();
+        let storage_key = harnx_core::session_identity::session_key(Some("metis"), &session_id);
+
+        // Create session metadata
+        store
+            .create(&SessionMetadata::new(
+                &session_id,
+                SessionInitializer::named("metis", Default::default()),
+            ))
+            .await
+            .unwrap();
+
+        // Acquire a lease for the session
+        let (lease, fence) =
+            crate::nats_worker::backend::test_session_authority(&jetstream, &storage_key, &store)
+                .await;
+        let after_seq_observer = Arc::new(AtomicU64::new(0));
+
+        // Build the callback with metadata store attached
+        let ctx = HitlCallbackContext {
+            jetstream: &jetstream,
+            session_id: &storage_key,
+            lease: &lease,
+            event_sink: None,
+            after_seq_observer: Some(&after_seq_observer),
+            metadata_store: Some(&store),
+            fence: Some(fence),
+        };
+        let callback = build_hitl_approval_request_callback_for_test(ctx);
+
+        // Invoke the callback with a deferred tool call
+        let deferred = DeferredToolCall {
+            call: ToolCall::new(
+                "test_tool".to_string(),
+                serde_json::json!({"arg": "value"}),
+                Some("call-123".to_string()),
+                None,
+            ),
+            arguments: serde_json::json!({"arg": "value"}),
+            reason: Some("Test approval".to_string()),
+        };
+        let result = callback(&deferred).unwrap();
+        assert_eq!(result, "call-123");
+
+        // Verify session is now unread with correct attention seq
+        let state = store.get_read_state(&storage_key).await.unwrap();
+        assert!(
+            state.is_unread(),
+            "session should be unread after HITL approval request callback"
+        );
+        assert!(
+            state.last_attention_seq >= 1,
+            "last_attention_seq should be at least 1"
+        );
+
+        lease.release().await.unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

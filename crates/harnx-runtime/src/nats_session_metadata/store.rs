@@ -9,11 +9,16 @@ mod extensions;
 mod keys;
 mod lookup;
 mod mutation;
+mod read_state;
 
 pub(super) use extension_validation::validate_extensions;
 pub use extensions::SessionExtensionUpdate;
-pub use keys::{activity_key, invalidation_subject, metadata_key, read_cursor_key, session_prefix};
+pub use keys::{
+    activity_key, invalidation_subject, metadata_key, read_cursor_key, read_invalidation_subject,
+    session_prefix,
+};
 pub(super) use lookup::metadata_belongs_to_agent;
+pub(in crate::nats_session_metadata) use mutation::is_cas_conflict;
 pub(in crate::nats_session_metadata) use mutation::PatchGuard;
 
 #[derive(Clone, Debug)]
@@ -74,7 +79,7 @@ impl SessionMetadataStore {
 
     pub async fn create(&self, metadata: &SessionMetadata) -> Result<Option<u64>> {
         metadata.validate(&metadata.session_id)?;
-        let key = metadata_key(&metadata.session_id);
+        let key = metadata_key(&metadata.storage_key());
         let payload = serde_json::to_vec(metadata).with_context(|| {
             format!(
                 "Failed to serialize session metadata '{}'",
@@ -83,7 +88,7 @@ impl SessionMetadataStore {
         })?;
         match self.store.create(&key, payload.into()).await {
             Ok(revision) => {
-                if let Err(error) = self.ensure_reserved_activity(&metadata.session_id).await {
+                if let Err(error) = self.ensure_reserved_activity(&metadata.storage_key()).await {
                     // Metadata + activity span two KV keys. Roll back only the
                     // exact revision we created so a concurrent winner or patch
                     // can never be deleted by this failed reservation.
@@ -106,13 +111,14 @@ impl SessionMetadataStore {
         }
     }
 
+    /// Read by agent-scoped storage key. Use `get_for_agent` at a public boundary.
     pub async fn get(&self, session_id: &str) -> Result<Option<MetadataRecord>> {
         let key = metadata_key(session_id);
         match self.store.entry(key.clone()).await {
             Ok(Some(entry)) if matches!(entry.operation, kv::Operation::Put) => {
                 let metadata: SessionMetadata = serde_json::from_slice(&entry.value)
                     .with_context(|| format!("Failed to deserialize session metadata '{key}'"))?;
-                metadata.validate(session_id)?;
+                metadata.validate_storage_key(session_id)?;
                 Ok(Some(MetadataRecord {
                     metadata,
                     revision: entry.revision,
@@ -135,51 +141,74 @@ impl SessionMetadataStore {
             else {
                 continue;
             };
-            match self.get(session_id).await {
-                Ok(Some(record)) => {
-                    let activity = match self.get_activity(session_id).await {
-                        Ok(activity) => activity,
-                        Err(error) => {
-                            log::warn!(
-                                "could not read session activity; using metadata timestamp: bucket={} key={} error={error:#}",
-                                SESSION_METADATA_BUCKET,
-                                activity_key(session_id)
-                            );
-                            None
-                        }
-                    };
-                    sessions.push(ListedSession {
-                        activity,
-                        metadata: record.metadata,
-                        metadata_revision: record.revision,
-                    });
-                }
-                Ok(None) => {}
-                Err(error) => log::warn!(
-                    "skipping invalid session metadata: bucket={} key={} error={error:#}",
-                    SESSION_METADATA_BUCKET,
-                    key
-                ),
+            if let Some(record) = self.get(session_id).await? {
+                let listed =
+                    enrich_session_with_activity_and_read_state(session_id, record, self).await;
+                sessions.push(listed);
             }
         }
-        sessions.sort_by(|left, right| {
-            let left_activity = left
-                .activity
-                .as_ref()
-                .map(|activity| activity.last_activity_at)
-                .unwrap_or(left.metadata.created_at);
-            let right_activity = right
-                .activity
-                .as_ref()
-                .map(|activity| activity.last_activity_at)
-                .unwrap_or(right.metadata.created_at);
-            right_activity
-                .cmp(&left_activity)
-                .then_with(|| right.metadata.session_id.cmp(&left.metadata.session_id))
-        });
+        sort_sessions_by_activity(&mut sessions);
         Ok(sessions)
     }
+}
 
+/// Enrich a session metadata record with activity and read state.
+async fn enrich_session_with_activity_and_read_state(
+    session_id: &str,
+    record: MetadataRecord,
+    store: &SessionMetadataStore,
+) -> ListedSession {
+    let (activity_result, read_state_result) = tokio::join!(
+        store.get_activity(session_id),
+        store.get_read_state(session_id)
+    );
+
+    let activity = activity_result.unwrap_or_else(|error| {
+        log::warn!(
+            "could not read session activity; using metadata timestamp: bucket={} key={} error={error:#}",
+            SESSION_METADATA_BUCKET,
+            activity_key(session_id)
+        );
+        None
+    });
+
+    let read_state = read_state_result.unwrap_or_else(|error| {
+        log::warn!(
+            "could not read session read-state; defaulting to read: bucket={} session_id={} error={error:#}",
+            SESSION_METADATA_BUCKET,
+            session_id
+        );
+        Default::default()
+    });
+
+    ListedSession {
+        activity,
+        metadata: record.metadata,
+        metadata_revision: record.revision,
+        unread: read_state.is_unread(),
+    }
+}
+
+/// Sort sessions by activity timestamp (most recent first), with session_id as tiebreaker.
+fn sort_sessions_by_activity(sessions: &mut [ListedSession]) {
+    sessions.sort_by(|left, right| {
+        let left_activity = left
+            .activity
+            .as_ref()
+            .map(|activity| activity.last_activity_at)
+            .unwrap_or(left.metadata.created_at);
+        let right_activity = right
+            .activity
+            .as_ref()
+            .map(|activity| activity.last_activity_at)
+            .unwrap_or(right.metadata.created_at);
+        right_activity
+            .cmp(&left_activity)
+            .then_with(|| right.metadata.session_id.cmp(&left.metadata.session_id))
+    });
+}
+
+impl SessionMetadataStore {
     pub async fn purge_session_prefix(&self, session_id: &str) -> Result<usize> {
         let prefix = session_prefix(session_id);
         let mut keys = self.store.keys().await.map_err(anyhow::Error::from)?;

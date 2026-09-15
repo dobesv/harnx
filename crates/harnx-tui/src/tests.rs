@@ -1,3 +1,6 @@
+#[path = "tests/acceptance_tests.rs"]
+mod acceptance_tests;
+
 use crate::markdown_render::MarkdownBlockData;
 use crate::test_utils::{TestEnvironment, TuiTestHarness, ENV_LOCK};
 use crate::types::Tui;
@@ -20,6 +23,7 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::Notify;
 
+mod cancellation_escape_tests;
 mod command_completion;
 mod delegation_tests;
 mod exit_interrupt_tests;
@@ -256,13 +260,13 @@ async fn pending_message_is_auto_sent_after_finish() {
     tui.app.llm_busy = true;
     tui.queue_pending_message("follow up".to_string()).await;
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(ModelEvent::Final {
         output: "done".to_string(),
         usage: Default::default(),
     })))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
         harnx_core::event::TurnEvent::Ended {
             outcome: Default::default(),
         },
@@ -304,13 +308,13 @@ async fn pending_dot_command_restores_attachments_before_running() {
     });
     tui.set_input_text(".info attachments");
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(ModelEvent::Final {
         output: "done".to_string(),
         usage: Default::default(),
     })))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Turn(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Turn(
         harnx_core::event::TurnEvent::Ended {
             outcome: Default::default(),
         },
@@ -378,7 +382,7 @@ async fn pending_message_not_double_submitted_after_consumed() {
     .unwrap();
 
     // Now LlmFinal arrives.
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(ModelEvent::Final {
         output: "final answer".to_string(),
         usage: Default::default(),
     })))
@@ -467,19 +471,19 @@ async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
     let config = test_config();
     let mut tui = Tui::init(&config).await.unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
         ModelEvent::MessageChunk {
             blocks: vec![ContentBlock::Text("Hello\nworld".to_string())],
         },
     )))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Notice(NoticeEvent::Info(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Notice(NoticeEvent::Info(
         "tool output".to_string(),
     ))))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
         ModelEvent::MessageChunk {
             blocks: vec![ContentBlock::Text("\nAgain".to_string())],
         },
@@ -514,7 +518,7 @@ async fn final_coalesces_streamed_multiline_assistant_text() {
     tui.app.llm_busy = true;
 
     for chunk in ["Hello\n", "world\n", "Again"] {
-        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+        tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
             ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
             },
@@ -523,7 +527,7 @@ async fn final_coalesces_streamed_multiline_assistant_text() {
         .unwrap();
     }
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(ModelEvent::Final {
         output: "Hello\nworld\nAgain".to_string(),
         usage: Default::default(),
     })))
@@ -549,14 +553,14 @@ async fn parent_final_does_not_replace_newer_sub_agent_text() {
     let mut tui = Tui::init(&config).await.unwrap();
     tui.clear_transcript();
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
         ModelEvent::MessageChunk {
             blocks: vec![ContentBlock::Text("parent streaming".to_string())],
         },
     )))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
         AgentSource {
             agent: "delegate".to_string(),
             session_id: Some("delegate-session".to_string()),
@@ -569,7 +573,7 @@ async fn parent_final_does_not_replace_newer_sub_agent_text() {
     )))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(ModelEvent::Final {
         output: "parent final".to_string(),
         usage: Default::default(),
     })))
@@ -603,7 +607,7 @@ async fn final_coalesces_streamed_fenced_code_block_into_one_entry() {
         "```\n",
     ];
     for chunk in chunks {
-        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+        tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
             ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
             },
@@ -613,7 +617,7 @@ async fn final_coalesces_streamed_fenced_code_block_into_one_entry() {
     }
 
     let full_block = "```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n";
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(ModelEvent::Final {
         output: full_block.to_string(),
         usage: Default::default(),
     })))
@@ -640,7 +644,7 @@ async fn final_only_coalesces_trailing_streamed_run_after_interruption() {
     tui.app.llm_busy = true;
 
     for chunk in ["```rust\n", "fn first() {}\n"] {
-        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+        tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
             ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
             },
@@ -649,14 +653,14 @@ async fn final_only_coalesces_trailing_streamed_run_after_interruption() {
         .unwrap();
     }
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Notice(NoticeEvent::Info(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Notice(NoticeEvent::Info(
         "tool output".to_string(),
     ))))
     .await
     .unwrap();
 
     for chunk in ["fn second() {}\n", "```\n"] {
-        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+        tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
             ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
             },
@@ -666,7 +670,7 @@ async fn final_only_coalesces_trailing_streamed_run_after_interruption() {
     }
 
     let full_block = "```rust\nfn first() {}\nfn second() {}\n```\n";
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(ModelEvent::Final {
         output: full_block.to_string(),
         usage: Default::default(),
     })))
@@ -698,19 +702,19 @@ async fn final_coalesces_streamed_text_before_trailing_status() {
     let mut tui = Tui::init(&config).await.unwrap();
 
     tui.app.llm_busy = true;
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
         ModelEvent::MessageChunk {
             blocks: vec![ContentBlock::Text("fallback response".to_string())],
         },
     )))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Notice(NoticeEvent::Info(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Notice(NoticeEvent::Info(
         "turn status".to_string(),
     ))))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(ModelEvent::Final {
         output: "fallback response".to_string(),
         usage: Default::default(),
     })))
@@ -741,7 +745,7 @@ async fn final_without_chunks_renders_assistant_text_once() {
 
     tui.app.llm_busy = true;
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Final {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(ModelEvent::Final {
         output: "Hello\nworld\nAgain".to_string(),
         usage: Default::default(),
     })))
@@ -771,19 +775,19 @@ async fn ui_output_inserts_heading_when_source_changes() {
         model: None,
     };
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
         source.clone(),
         AgentEvent::Notice(NoticeEvent::Info("first chunk".to_string())),
     )))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
         source,
         AgentEvent::Notice(NoticeEvent::Info("second chunk".to_string())),
     )))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
         AgentSource {
             model: None,
             agent: "hephaestus".to_string(),
@@ -1068,7 +1072,7 @@ async fn sub_agent_heading_transitions_render_in_tui_snapshot() {
 
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
             ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text(
                     "Top-level assistant opening response.".to_string(),
@@ -1079,7 +1083,7 @@ async fn sub_agent_heading_transitions_render_in_tui_snapshot() {
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
             AgentSource {
                 model: None,
                 agent: "argus".to_string(),
@@ -1091,7 +1095,7 @@ async fn sub_agent_heading_transitions_render_in_tui_snapshot() {
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
             AgentSource {
                 model: None,
                 agent: "argus".to_string(),
@@ -1103,7 +1107,7 @@ async fn sub_agent_heading_transitions_render_in_tui_snapshot() {
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
             AgentSource {
                 model: None,
                 agent: "hephaestus".to_string(),
@@ -1115,7 +1119,7 @@ async fn sub_agent_heading_transitions_render_in_tui_snapshot() {
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
             ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text(
                     "Top-level assistant closes response.".to_string(),
@@ -1140,7 +1144,7 @@ async fn structured_system_entries_do_not_insert_blank_lines_between_each_line()
 
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
             AgentSource {
                 model: None,
                 agent: "argus".to_string(),
@@ -1159,7 +1163,7 @@ async fn structured_system_entries_do_not_insert_blank_lines_between_each_line()
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
             AgentSource {
                 model: None,
                 agent: "argus".to_string(),
@@ -1184,7 +1188,7 @@ async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
     let mut tui = Tui::init(&config).await.unwrap();
 
     for chunk in ["thinking ", "before ", "tool"] {
-        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+        tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
             ModelEvent::ThoughtChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
             },
@@ -1193,7 +1197,7 @@ async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
         .unwrap();
     }
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(ToolEvent::Started {
         id: String::new(),
         name: "argus_session_prompt".to_string(),
         kind: ToolKind::Other,
@@ -1205,7 +1209,7 @@ async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
     .unwrap();
 
     for chunk in ["thinking ", "after ", "tool"] {
-        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+        tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
             ModelEvent::ThoughtChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
             },
@@ -1258,7 +1262,7 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
     };
 
     for chunk in ["thinking ", "before ", "tool"] {
-        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
             source.clone(),
             AgentEvent::Model(ModelEvent::ThoughtChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
@@ -1268,7 +1272,7 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
         .unwrap();
     }
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
         source.clone(),
         AgentEvent::Tool(ToolEvent::Started {
             id: String::new(),
@@ -1283,7 +1287,7 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
     .unwrap();
 
     for chunk in ["thinking ", "after ", "tool"] {
-        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
             source.clone(),
             AgentEvent::Model(ModelEvent::ThoughtChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
@@ -1332,7 +1336,7 @@ async fn whitespace_only_thought_chunk_is_preserved_in_tui() {
     let mut tui = Tui::init(&config).await.unwrap();
 
     // Send a thought chunk with only a newline
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
         ModelEvent::ThoughtChunk {
             blocks: vec![ContentBlock::Text("\n".to_string())],
         },
@@ -1349,7 +1353,7 @@ async fn thought_chunk_with_think_tags_is_stripped_and_dropped_if_empty() {
     let mut tui = Tui::init(&config).await.unwrap();
 
     // Send a thought chunk with only <think> tags
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
         ModelEvent::ThoughtChunk {
             blocks: vec![ContentBlock::Text("<think></think>".to_string())],
         },
@@ -1368,7 +1372,7 @@ async fn llm_multiline_text_renders_without_extra_blank_lines() {
 
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
             ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text(
                     "line one\nline two\nline three".to_string(),
@@ -1396,7 +1400,7 @@ async fn thinking_stream_coalescing_around_tool_calls_snapshot() {
     for chunk in ["thinking ", "before ", "tool"] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
                 AgentSource {
                     model: None,
                     agent: "argus".to_string(),
@@ -1411,7 +1415,7 @@ async fn thinking_stream_coalescing_around_tool_calls_snapshot() {
     }
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
             AgentSource {
                 model: None,
                 agent: "argus".to_string(),
@@ -1431,7 +1435,7 @@ async fn thinking_stream_coalescing_around_tool_calls_snapshot() {
     for chunk in ["thinking ", "after ", "tool"] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
                 AgentSource {
                     model: None,
                     agent: "argus".to_string(),
@@ -1456,7 +1460,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
     let config = test_config();
     let mut tui = Tui::init(&config).await.unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
         AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
@@ -1473,7 +1477,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
     )))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
         AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
@@ -1485,7 +1489,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
     )))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
         AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
@@ -1500,7 +1504,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
     )))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
         AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
@@ -1521,7 +1525,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
     )))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(ToolEvent::Started {
         id: String::new(),
         name: "bash".to_string(),
         kind: ToolKind::Other,
@@ -1531,11 +1535,13 @@ async fn structured_ui_output_variants_render_in_transcript() {
     })))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Completed {
-        id: String::new(),
-        output: serde_json::Value::String("\u{1b}[2mline one\nline two\u{1b}[0m\n".to_string()),
-        markdown: None,
-    })))
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(
+        ToolEvent::Completed {
+            id: String::new(),
+            output: serde_json::Value::String("\u{1b}[2mline one\nline two\u{1b}[0m\n".to_string()),
+            markdown: None,
+        },
+    )))
     .await
     .unwrap();
 
@@ -1572,7 +1578,7 @@ async fn nested_subagent_tool_call_renders_with_heading() {
     let config = test_config();
     let mut tui = Tui::init(&config).await.unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(ToolEvent::Started {
         id: String::new(),
         name: "pytheas_session_prompt".to_string(),
         kind: ToolKind::Other,
@@ -1583,7 +1589,7 @@ async fn nested_subagent_tool_call_renders_with_heading() {
     .await
     .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
         AgentSource {
             agent: "pytheas".to_string(),
             session_id: Some("session-nested".to_string()),
@@ -1639,7 +1645,7 @@ async fn subagent_message_chunks_coalesce_like_direct_llm_streaming() {
         "information to ",
         "complete my review.",
     ] {
-        tui.handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
             source.clone(),
             AgentEvent::Model(ModelEvent::MessageChunk {
                 blocks: vec![ContentBlock::Text(chunk.to_string())],
@@ -1940,7 +1946,7 @@ async fn live_log_seq_assignment_patches_latest_unsequenced_transcript_items() {
         seq: None,
     });
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
         SessionEvent::LogSeqAssigned { seq: 2 },
     )))
     .await
@@ -1953,7 +1959,7 @@ async fn live_log_seq_assignment_patches_latest_unsequenced_transcript_items() {
         rendered_cache: None,
     });
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
         SessionEvent::LogSeqAssigned { seq: 3 },
     )))
     .await
@@ -1982,13 +1988,13 @@ async fn live_log_seq_assignment_applies_to_tool_calls_started_after_seq_event()
     let config = test_config();
     let mut tui = Tui::init(&config).await.unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
         SessionEvent::LogSeqAssigned { seq: 5 },
     )))
     .await
     .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(ToolEvent::Started {
         id: "call-1".into(),
         name: "bash_exec".into(),
         kind: ToolKind::Other,
@@ -2031,7 +2037,7 @@ async fn log_seq_backfill_clears_pending_tool_seq() {
     let mut tui = Tui::init(&config).await.unwrap();
 
     // First add an AssistantText with seq=None so backfill can find it.
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
         ModelEvent::MessageChunk {
             blocks: vec![ContentBlock::Text("assistant reply".to_string())],
         },
@@ -2040,7 +2046,7 @@ async fn log_seq_backfill_clears_pending_tool_seq() {
     .unwrap();
 
     // Now LogSeqAssigned should backfill the AssistantText and NOT set pending_tool_seq.
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
         SessionEvent::LogSeqAssigned { seq: 3 },
     )))
     .await
@@ -2059,13 +2065,13 @@ async fn live_log_seq_assignment_applies_to_blocked_tool_calls() {
     let config = test_config();
     let mut tui = Tui::init(&config).await.unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
         SessionEvent::LogSeqAssigned { seq: 7 },
     )))
     .await
     .unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Blocked {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(ToolEvent::Blocked {
         id: "call-2".into(),
         name: "dangerous_tool".into(),
         input: yaml_to_json("target: /etc"),
@@ -2700,7 +2706,7 @@ async fn test_streaming_error_shows_full_cause_chain_in_transcript() {
     harness
         .tui()
         .event_tx
-        .send(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Error(
+        .send(TuiEvent::LocalAgent(AgentEvent::Model(ModelEvent::Error(
             formatted.clone(),
         ))))
         .unwrap();
@@ -2775,14 +2781,14 @@ async fn test_pending_message_not_replayed_on_error() {
     harness
         .tui()
         .event_tx
-        .send(TuiEvent::Agent(AgentEvent::Model(ModelEvent::Error(
+        .send(TuiEvent::LocalAgent(AgentEvent::Model(ModelEvent::Error(
             "boom".to_string(),
         ))))
         .unwrap();
     harness
         .tui()
         .event_tx
-        .send(TuiEvent::Agent(AgentEvent::Turn(
+        .send(TuiEvent::LocalAgent(AgentEvent::Turn(
             harnx_core::event::TurnEvent::Ended {
                 outcome: Default::default(),
             },
@@ -3753,7 +3759,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     for chunk in ["I'll look into ", "that for you. ", "Delegating now."] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+            .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
                 ModelEvent::MessageChunk {
                     blocks: vec![ContentBlock::Text(chunk.to_string())],
                 },
@@ -3765,7 +3771,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     // ── Phase 2: Top-level delegation tool call ──────────────────────
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(ToolEvent::Started {
             id: String::new(),
             name: "researcher_session_prompt".to_string(),
             kind: ToolKind::Other,
@@ -3780,7 +3786,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     for chunk in ["Let me ", "analyze ", "the situation ", "carefully."] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
                 sub_source.clone(),
                 AgentEvent::Model(ModelEvent::ThoughtChunk {
                     blocks: vec![ContentBlock::Text(chunk.to_string())],
@@ -3793,7 +3799,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     // ── Phase 4: Sub-agent makes two tool calls ──────────────────────
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
             sub_source.clone(),
             AgentEvent::Tool(ToolEvent::Started {
                 id: String::new(),
@@ -3808,7 +3814,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
             sub_source.clone(),
             AgentEvent::Tool(ToolEvent::Started {
                 id: String::new(),
@@ -3832,7 +3838,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     for chunk in ["Now I see ", "the pattern ", "in the data."] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
                 sub_source.clone(),
                 AgentEvent::Model(ModelEvent::ThoughtChunk {
                     blocks: vec![ContentBlock::Text(chunk.to_string())],
@@ -3845,7 +3851,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     // ── Phase 6: Sub-agent makes one more tool call ──────────────────
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
             sub_source.clone(),
             AgentEvent::Tool(ToolEvent::Started {
                 id: String::new(),
@@ -3873,7 +3879,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     ] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+            .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
                 sub_source.clone(),
                 AgentEvent::Model(ModelEvent::MessageChunk {
                     blocks: vec![ContentBlock::Text(chunk.to_string())],
@@ -3886,7 +3892,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     // ── Phase 8: Sub-agent usage line ────────────────────────────────
     harness
         .tui()
-        .handle_tui_event(TuiEvent::Agent(AgentEvent::sub_agent(
+        .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::sub_agent(
             sub_source.clone(),
             usage_event!(500, 200, 100, Some("> researcher ▸ research-session-1")),
         )))
@@ -3902,7 +3908,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     ] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::Agent(AgentEvent::Model(
+            .handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Model(
                 ModelEvent::MessageChunk {
                     blocks: vec![ContentBlock::Text(chunk.to_string())],
                 },
@@ -5361,7 +5367,7 @@ async fn tui_renders_started_title_when_template_provides_it() {
     // "```sh\n$ {{ args.command }}\n```" produces this `markdown`. The raw
     // `input` JSON is also kept on the event for transcript serialization,
     // but the user-facing rendering must prefer the rendered title.
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(ToolEvent::Started {
         id: "call-1".into(),
         name: "bash_exec".into(),
         kind: ToolKind::Other,
@@ -5395,7 +5401,7 @@ async fn tui_renders_started_title_when_template_provides_it() {
 async fn tui_renders_blocked_tool_call_in_transcript() {
     let mut tui = Tui::init(&test_config()).await.unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Blocked {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(ToolEvent::Blocked {
         id: "call-1".into(),
         name: "bash_exec".into(),
         input: yaml_to_json("command: rm -rf /tmp/demo"),
@@ -5429,7 +5435,7 @@ async fn tui_falls_back_to_yaml_when_no_template_title() {
     // existing yaml-of-input behavior must be preserved.
     let mut tui = Tui::init(&test_config()).await.unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(ToolEvent::Started {
         id: "call-1".into(),
         name: "no_template_tool".into(),
         kind: ToolKind::Other,
@@ -5467,11 +5473,13 @@ async fn tui_renders_completed_template_title_when_provided() {
         "content": [{"type": "text", "text": "hello"}],
         "isError": false,
     });
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Completed {
-        id: "call-1".into(),
-        output: raw_output,
-        markdown: Some("OK: hello".into()),
-    })))
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(
+        ToolEvent::Completed {
+            id: "call-1".into(),
+            output: raw_output,
+            markdown: Some("OK: hello".into()),
+        },
+    )))
     .await
     .unwrap();
 
@@ -5508,11 +5516,13 @@ async fn tui_renders_fenced_diff_tool_result_with_per_line_syntect_styling() {
         "content": [{"type": "text", "text": result_text}],
         "isError": false,
     });
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Completed {
-        id: "call-1".into(),
-        output,
-        markdown: None,
-    })))
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(
+        ToolEvent::Completed {
+            id: "call-1".into(),
+            output,
+            markdown: None,
+        },
+    )))
     .await
     .unwrap();
 
@@ -5559,11 +5569,13 @@ async fn tui_falls_back_to_output_when_no_template_title() {
     // Regression guard: when title is None (no result template), the
     // existing extract-from-output behavior must be preserved.
     let mut tui = Tui::init(&test_config()).await.unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Completed {
-        id: "call-1".into(),
-        output: serde_json::Value::String("plain output line".into()),
-        markdown: None,
-    })))
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(
+        ToolEvent::Completed {
+            id: "call-1".into(),
+            output: serde_json::Value::String("plain output line".into()),
+            markdown: None,
+        },
+    )))
     .await
     .unwrap();
     let lines: Vec<String> = tui
@@ -5668,7 +5680,7 @@ async fn tui_started_template_strips_markers_and_styles_spans() {
     let mut tui = Tui::init(&test_config()).await.unwrap();
 
     // Producer-side render of "```sh\n$ {{ args.command }}\n```".
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(ToolEvent::Started {
         id: "call-1".into(),
         name: "bash_exec".into(),
         kind: ToolKind::Other,
@@ -5714,7 +5726,7 @@ async fn tui_started_multiline_command_renders_without_fence_markers() {
 
     let multiline_cmd = "cat <<EOF\nline1\nEOF";
     let markdown = format!("```sh\n$ {multiline_cmd}\n```");
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(ToolEvent::Started {
         id: "call-1".into(),
         name: "bash_exec".into(),
         kind: ToolKind::Other,
@@ -5750,7 +5762,7 @@ async fn tui_started_no_template_keeps_yaml_unstyled() {
     // get markdown styling — yaml content like `tags: [_priv]` would
     // accidentally italicize.
     let mut tui = Tui::init(&test_config()).await.unwrap();
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Started {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(ToolEvent::Started {
         id: "call-1".into(),
         name: "no_template_tool".into(),
         kind: ToolKind::Other,
@@ -5792,11 +5804,13 @@ async fn tui_started_no_template_keeps_yaml_unstyled() {
 async fn tui_completed_template_styles_spans() {
     let mut tui = Tui::init(&test_config()).await.unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Tool(ToolEvent::Completed {
-        id: "call-1".into(),
-        output: serde_json::json!({"content": [{"type": "text", "text": "hello"}]}),
-        markdown: Some("**OK**: `hello`".into()),
-    })))
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Tool(
+        ToolEvent::Completed {
+            id: "call-1".into(),
+            output: serde_json::json!({"content": [{"type": "text", "text": "hello"}]}),
+            markdown: Some("**OK**: `hello`".into()),
+        },
+    )))
     .await
     .unwrap();
 
@@ -6240,7 +6254,10 @@ async fn tool_confirmation_does_not_replace_an_existing_modal() {
         tool_name: "atlas_session_handoff".to_string(),
         input_preview: r#"{"prompt":"execute"}"#.to_string(),
         reason: Some("Hand off this plan?".to_string()),
-        reply: crate::tool_confirmation::ToolConfirmationReply::Async(reply),
+        reply: crate::tool_confirmation::ToolConfirmationReply::Routed {
+            reply,
+            closed: Default::default(),
+        },
     }))
     .await
     .unwrap();
@@ -6268,7 +6285,10 @@ async fn remote_confirmation_cleanup_dismisses_only_its_own_modal() {
         tool_name: "atlas_session_handoff".to_string(),
         input_preview: r#"{"prompt":"execute"}"#.to_string(),
         reason: Some("Hand off this plan?".to_string()),
-        reply: crate::tool_confirmation::ToolConfirmationReply::Async(reply),
+        reply: crate::tool_confirmation::ToolConfirmationReply::Routed {
+            reply,
+            closed: Default::default(),
+        },
     }))
     .await
     .unwrap();
@@ -7651,8 +7671,11 @@ async fn session_picker_enter_loads_selected_session() {
             .await
             .expect("create picker session metadata fixture");
     }
-    let log =
-        harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, "my-session".to_string());
+    let log = harnx_runtime::nats_session_log::NatsSessionLog::for_agent(
+        jetstream,
+        "hermes",
+        "my-session",
+    );
     for entry in [
         harnx_core::session::SessionLogEntry::Message {
             id: None,
@@ -8312,7 +8335,7 @@ async fn render_agent_event_user_message_produces_user_transcript_entry() {
     let config = test_config();
     let mut tui = Tui::init(&config).await.unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::User(UserEvent::Message {
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::User(UserEvent::Message {
         content: "hello from attach".to_string(),
     })))
     .await
@@ -8329,7 +8352,7 @@ async fn render_agent_event_user_message_produces_user_transcript_entry() {
     ));
 
     // A subsequent LogSeqAssigned must NOT backfill into the replayed row.
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
         SessionEvent::LogSeqAssigned { seq: 42 },
     )))
     .await
@@ -8346,7 +8369,7 @@ async fn render_agent_event_title_updated_executes_without_panic() {
     let mut tui = Tui::init(&config).await.unwrap();
 
     // Verify handling a TitleUpdated event does not crash
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
         harnx_core::event::SessionEvent::TitleUpdated("Test Title".to_string()),
     )))
     .await
@@ -8357,7 +8380,7 @@ async fn render_agent_event_title_generation_failed_produces_error_transcript_en
     let config = test_config();
     let mut tui = Tui::init(&config).await.unwrap();
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
         SessionEvent::TitleGenerationFailed("Miss 'api_key'".to_string()),
     )))
     .await
@@ -8376,7 +8399,7 @@ async fn render_agent_event_compacting_started_produces_transcript_entry() {
     let mut tui = Tui::init(&config).await.unwrap();
 
     // Emit CompactingStarted event
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
         SessionEvent::CompactingStarted,
     )))
     .await
@@ -8422,7 +8445,7 @@ async fn render_agent_event_compacting_completed_reconciles_live_transcript() {
     tui.app.transcript_focus = Some(99);
     tui.app.transcript_selection_anchor = Some(88);
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
         SessionEvent::CompactingStarted,
     )))
     .await
@@ -8430,7 +8453,7 @@ async fn render_agent_event_compacting_completed_reconciles_live_transcript() {
 
     seed_compressed_session(&config);
 
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
         SessionEvent::CompactingCompleted,
     )))
     .await
@@ -8715,14 +8738,14 @@ async fn render_agent_event_compacting_failed_produces_error_transcript_entry() 
     let mut tui = Tui::init(&config).await.unwrap();
 
     // First emit CompactingStarted
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
         SessionEvent::CompactingStarted,
     )))
     .await
     .unwrap();
 
     // Then emit CompactingFailed
-    tui.handle_tui_event(TuiEvent::Agent(AgentEvent::Session(
+    tui.handle_tui_event(TuiEvent::LocalAgent(AgentEvent::Session(
         SessionEvent::CompactingFailed("test error".to_string()),
     )))
     .await
@@ -8898,8 +8921,7 @@ async fn test_info_session_opens_detail_view() {
     let mut harness = TuiTestHarness::with_size(80, 24).await;
     let tui = harness.tui();
 
-    // Let's test `.info session` without args, which should fallback to active session,
-    // or fail and display error in detail view since no active session exists.
+    // Missing explicit identity is reported in the detail view.
     let initial_transcript_len = tui.app.transcript.len();
 
     tui.run_command(".info session").await.unwrap();
@@ -8919,44 +8941,18 @@ async fn test_info_session_single_arg_with_active_agent() {
 
     let tui = harness.tui();
 
-    // With active agent but no active session, `.info session some-id` should work
-    // by pairing the active agent with `some-id`.
     tui.run_command(".info session some-id").await.unwrap();
-
     let text = assert_info_overlay_open(tui, None);
-    assert!(
-        !text.contains("insufficient arguments"),
-        "Should not complain about insufficient arguments when single arg provided with active agent. Text: {}",
-        text
-    );
-    assert!(
-        !text.contains("No active session or insufficient arguments"),
-        "Should not give the default usage error"
-    );
+    assert!(text.contains("An explicit agent and session ID are required"));
 }
+
 #[tokio::test]
 async fn test_info_session_single_arg_no_active_agent() {
     let mut harness = TuiTestHarness::with_size(80, 24).await;
     let tui = harness.tui();
-
-    // No active agent, no active session. .info session some-id should be treated as top-level session.
     tui.run_command(".info session some-id").await.unwrap();
-
     let text = assert_info_overlay_open(tui, None);
-    assert!(
-        !text.contains("insufficient arguments"),
-        "Should not complain about insufficient arguments when single arg provided without active agent. Text: {}",
-        text
-    );
-    assert!(
-        !text.contains("No active session or insufficient arguments"),
-        "Should not give the default usage error"
-    );
-    assert!(
-        text.contains("Error:"),
-        "Should attempt to look up session and likely fail with 'Error: ... not found' instead of usage error. Text: {}",
-        text
-    );
+    assert!(text.contains("An explicit agent and session ID are required"));
 }
 
 #[tokio::test]
@@ -8992,7 +8988,7 @@ async fn test_start_prompt_does_not_arm_remote_cancel_without_session() {
     // We can simulate an Error or Final event to clear it
     use harnx_core::event::{AgentEvent, ModelEvent};
     let _ = tui
-        .handle_tui_event(crate::types::TuiEvent::Agent(AgentEvent::Model(
+        .handle_tui_event(crate::types::TuiEvent::LocalAgent(AgentEvent::Model(
             ModelEvent::Final {
                 output: "done".to_string(),
                 usage: Default::default(),
@@ -9007,13 +9003,13 @@ async fn test_start_prompt_does_not_arm_remote_cancel_without_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_start_prompt_arms_remote_cancel_with_real_session_id() {
+async fn test_start_prompt_arms_remote_cancel_with_agent_scoped_key() {
     let config = test_config();
     let session_id = {
         let mut guard = config.write();
         guard.remote_agent = Some(("remote_agent_name".to_string(), "cluster_name".to_string()));
         let session = harnx_runtime::config::session::new(&guard, "real-session", None).unwrap();
-        let session_id = session.id().to_string();
+        let session_id = session.storage_key();
         guard.session = Some(session);
         session_id
     };
@@ -9135,7 +9131,7 @@ fn assert_test_confirmation_route(
         crate::types::ToolConfirmationRouteHandle::Test(actual) => {
             assert!(Arc::ptr_eq(actual, expected));
         }
-        crate::types::ToolConfirmationRouteHandle::Nats(_) => {
+        crate::types::ToolConfirmationRouteHandle::Nats(..) => {
             panic!("expected test confirmation route")
         }
     }
@@ -9243,6 +9239,46 @@ fn tool_confirmation_json_fence_exceeds_content_backticks() {
     assert!(markdown.ends_with("\n`````"));
 }
 
+#[tokio::test]
+async fn explicit_remote_session_skips_agent_picker_without_local_agents() {
+    let config = test_config();
+    {
+        let mut cfg = config.write();
+        cfg.set_remote_agent("reviewer".into(), "prod".into());
+        cfg.use_session(Some("review-12345")).unwrap();
+    }
+    Tui::check_agents_available(&config, &[]).unwrap();
+    assert!(Tui::resolve_initial_modal(&config).await.is_none());
+    assert_eq!(
+        config.read().active_agent_ref().as_deref(),
+        Some("reviewer@prod")
+    );
+}
+
+#[tokio::test]
+async fn missing_picker_origin_keeps_selected_agent_and_picker() {
+    let config = test_config_with_mock_client_and_agent("selected-agent", None);
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.app.modal = Some(crate::types::ModalState::SessionPicker {
+        sessions: vec![],
+        selected: 0,
+        origin_agent: Some("nonexistent-origin-05d194".into()),
+        origin_session: Some("review-12345".into()),
+        error: None,
+    });
+    tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(
+        config.read().active_agent_ref().as_deref(),
+        Some("selected-agent")
+    );
+    assert!(matches!(
+        tui.app.modal,
+        Some(crate::types::ModalState::SessionPicker { error: Some(_), .. })
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn dump_session_without_active_session_shows_usage_error() {
     let config = test_config();
@@ -9286,5 +9322,257 @@ async fn info_session_without_active_session_shows_usage_error() {
     assert!(
         rendered.contains("Error:") || rendered.contains("Usage:"),
         "should show error or usage"
+    );
+}
+
+#[tokio::test]
+async fn dump_session_requires_explicit_agent_even_with_active_session() {
+    let config = test_config_with_mock_client_and_agent("reviewer", Some("review-12345"));
+    let mut tui = Tui::init(&config).await.unwrap();
+    for command in [
+        ".dump session",
+        ".dump session review-12345",
+        ".dump session --format json",
+    ] {
+        tui.run_command(command).await.unwrap();
+        assert!(tui
+            .app
+            .detail_view_text
+            .as_ref()
+            .unwrap()
+            .contains("An explicit agent and session ID are required"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 'u' key in pickers: filter vs toggle unread
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn agent_picker_u_key_filters_query() {
+    // In AgentPicker, pressing 'u' should add to the query filter, not be swallowed
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = TestEnvironment::set(tmp.path());
+    create_agent_stubs(&tmp.path().join("agents"), &["apollo", "argus", "hermes"]);
+
+    let config = picker_test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+
+    tui.app.modal = Some(crate::types::ModalState::AgentPicker {
+        agents: vec!["apollo".into(), "argus".into(), "hermes".into()],
+        selected: 0,
+        query: String::new(),
+    });
+
+    // Press 'u' — should filter by appending to query
+    tui.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    match &tui.app.modal {
+        Some(crate::types::ModalState::AgentPicker { query, .. }) => {
+            assert_eq!(query, "u", "'u' in AgentPicker should append to query");
+        }
+        other => panic!("expected AgentPicker, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn session_picker_u_key_does_not_filter_query() {
+    // In SessionPicker, pressing 'u' should toggle unread, not filter
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = TestEnvironment::set(tmp.path());
+
+    let config = picker_test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+
+    // Set up a SessionPicker with a mock session (no unread toggle logic needed for this test)
+    tui.app.modal = Some(crate::types::ModalState::SessionPicker {
+        sessions: vec![harnx_runtime::config::SessionMeta {
+            id: "test-session".to_string(),
+            session_id: Some("test-session".to_string()),
+            agent_name: Some("test-agent".to_string()),
+            title: Some("Test".to_string()),
+            modified: None,
+            contexts: vec![],
+            unread: false,
+        }],
+        selected: 1, // Select the session (index 0 is "New session")
+        origin_agent: None,
+        origin_session: None,
+        error: None,
+    });
+
+    // Press 'u' — should NOT add to any query (SessionPicker has no query)
+    // It should attempt to toggle unread (which will fail since no NATS, but that's OK)
+    tui.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    // The modal should still be SessionPicker (not dismissed, not changed)
+    assert!(
+        matches!(
+            tui.app.modal,
+            Some(crate::types::ModalState::SessionPicker { .. })
+        ),
+        "'u' in SessionPicker should keep SessionPicker active"
+    );
+}
+
+// --- SessionPicker u/U toggle preserves origin and tracks selection -----------------
+
+/// Test that toggling unread in SessionPicker preserves origin context and
+/// tracks the toggled session's new position after re-sort.
+///
+/// When the picker is opened mid-session (non-null origin), pressing 'u' to
+/// toggle unread must:
+/// 1. Preserve `origin_agent` and `origin_session` (not drop them to None).
+/// 2. Recompute `selected` to track the toggled session's new index in the
+///    re-sorted (unread-first) list, not reuse the stale numeric offset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_picker_toggle_unread_preserves_origin_and_tracks_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = TestEnvironment::set(tmp.path());
+
+    let config = picker_test_config();
+    {
+        let mut guard = config.write();
+        let model = MockClient::builder().build().model().clone();
+        let mut agent =
+            harnx_runtime::config::Agent::new(harnx_runtime::config::AgentConfig::from_prompt(""));
+        agent.set_name("hermes");
+        agent.set_model(model);
+        guard.agent = Some(agent);
+        // Use remote_agent so picker_sessions queries NATS
+        guard.remote_agent = Some((
+            "hermes".to_string(),
+            harnx_runtime::config::LOCAL_CLUSTER_KEY.to_string(),
+        ));
+    }
+
+    let nats_config = config.read().clone();
+    let Ok(jetstream) = nats_config
+        .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
+        .await
+    else {
+        eprintln!("skipping: local nats-server is unavailable");
+        return;
+    };
+    let metadata_store =
+        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
+            .await
+            .expect("create metadata store");
+
+    // Create two sessions for the same agent:
+    // - session-a: initially read (unread=false)
+    // - session-b: initially unread (unread=true)
+    // After sort (unread-first): [session-b, session-a]
+    // After toggling session-a to unread: [session-a, session-b] (session-a moves to front)
+    for (session_id, agent, unread) in [
+        ("session-a", "hermes", false),
+        ("session-b", "hermes", true),
+    ] {
+        metadata_store
+            .create(&harnx_runtime::nats_session_metadata::SessionMetadata::new(
+                session_id,
+                harnx_runtime::SessionInitializer::named(agent, Default::default()),
+            ))
+            .await
+            .expect("create session metadata fixture");
+
+        if unread {
+            let storage_key = harnx_core::session_identity::session_key(Some(agent), session_id);
+            metadata_store
+                .mark_unread(&storage_key)
+                .await
+                .expect("mark session unread");
+        }
+    }
+
+    let mut tui = Tui::init(&config).await.unwrap();
+    let (sessions, error) = Tui::picker_sessions(&config).await;
+    assert!(error.is_none(), "picker enumeration failed: {error:?}");
+    assert_eq!(sessions.len(), 2, "expected two sessions for agent");
+
+    // Initial sort (unread-first): session-b (unread=true) comes before session-a (read)
+    assert_eq!(
+        sessions[0].id, "session-b",
+        "session-b should be first (unread)"
+    );
+    assert_eq!(
+        sessions[1].id, "session-a",
+        "session-a should be second (read)"
+    );
+
+    // Set up SessionPicker with origin context (simulating mid-session navigation)
+    // Select session-a at index 2 (0="New session", 1=session-b, 2=session-a)
+    let origin_agent = Some("previous-agent".to_string());
+    let origin_session = Some("previous-session".to_string());
+    tui.app.modal = Some(crate::types::ModalState::SessionPicker {
+        sessions: sessions.clone(),
+        selected: 2, // session-a (the read one)
+        origin_agent: origin_agent.clone(),
+        origin_session: origin_session.clone(),
+        error: None,
+    });
+
+    // Press 'u' to toggle session-a to unread
+    tui.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    // Verify the modal is still SessionPicker
+    let Some(crate::types::ModalState::SessionPicker {
+        sessions: new_sessions,
+        selected: new_selected,
+        origin_agent: actual_origin_agent,
+        origin_session: actual_origin_session,
+        error: _,
+    }) = &tui.app.modal
+    else {
+        panic!(
+            "expected SessionPicker after toggle, got {:?}",
+            tui.app.modal
+        );
+    };
+
+    // 1. Origin context must be preserved
+    assert_eq!(
+        *actual_origin_agent, origin_agent,
+        "origin_agent must be preserved after toggle"
+    );
+    assert_eq!(
+        *actual_origin_session, origin_session,
+        "origin_session must be preserved after toggle"
+    );
+
+    // 2. Selected must track the toggled session's new position
+    // After toggle, session-a is unread and should be first in the list
+    assert_eq!(
+        new_sessions.len(),
+        2,
+        "should still have two sessions after toggle"
+    );
+
+    // Find session-a in the new list and verify it's marked unread
+    let session_a = new_sessions
+        .iter()
+        .find(|s| s.id == "session-a")
+        .expect("session-a should exist after toggle");
+    assert!(session_a.unread, "session-a should now be unread");
+
+    // Verify selected points to session-a (the toggled session)
+    // The index is sessions index + 1 (since index 0 is "New session")
+    let expected_selected = new_sessions
+        .iter()
+        .position(|s| s.id == "session-a")
+        .map(|i| i + 1)
+        .expect("session-a should be in the list");
+    assert_eq!(
+        *new_selected, expected_selected,
+        "selected must track session-a's new position, not reuse stale index"
     );
 }

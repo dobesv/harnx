@@ -68,10 +68,19 @@ fn resolve_list_sessions_target(remote_agent: Option<&(String, String)>) -> List
     }
 }
 
-/// Format session metadata as one ID per line.
+/// Format session metadata as an owner and readable ID per line.
 /// This helper is extracted for testability without touching stdout.
 fn format_sessions_for_output(sessions: &[SessionMeta]) -> String {
-    let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+    let ids: Vec<String> = sessions
+        .iter()
+        .map(|s| {
+            format!(
+                "{}\t{}",
+                s.agent_name.as_deref().unwrap_or("<inline>"),
+                s.id
+            )
+        })
+        .collect();
     ids.join("\n")
 }
 
@@ -183,8 +192,12 @@ async fn run_info_session(
     let config = Config::init(WorkingMode::Cmd, true).await?;
     match format {
         SessionFormat::Text => {
+            let (agent, cluster) = harnx_runtime::config::resolve_session_agent(agent_name)?;
             let session = harnx_runtime::config::load_session_for_render(
-                &config, None, session_id, agent_name,
+                &config,
+                Some(&cluster),
+                session_id,
+                &agent,
             )
             .await?;
             let out = harnx_runtime::config::session::render(&session)?;
@@ -208,16 +221,11 @@ async fn fetch_session_metadata(
     session_id: &str,
     agent_name: &str,
 ) -> Result<harnx_runtime::nats_session_metadata::SessionMetadata> {
-    let jetstream = config
-        .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
-        .await?;
-    let store =
-        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await?;
-    let record = store
-        .get_for_agent(session_id, agent_name)
-        .await?
-        .with_context(|| format!("Session '{session_id}' for agent '{agent_name}' not found"))?;
-    Ok(record.metadata)
+    Ok(
+        harnx_runtime::config::session_metadata_for_agent(config, agent_name, session_id)
+            .await?
+            .1,
+    )
 }
 
 async fn run_dump_command(dump_args: &crate::cli::DumpArgs) -> Result<()> {
@@ -243,20 +251,10 @@ async fn run_dump_session_once(
 ) -> Result<()> {
     let config = Config::init(WorkingMode::Cmd, true).await?;
 
-    // Validate session exists for this agent
-    let jetstream = config
-        .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
-        .await?;
-    let store =
-        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await?;
-    store
-        .get_for_agent(session_id, agent_name)
-        .await?
-        .with_context(|| format!("Session '{session_id}' for agent '{agent_name}' not found"))?;
-
-    // Load raw entries and reconstruct
+    let (jetstream, metadata) =
+        harnx_runtime::config::session_metadata_for_agent(&config, agent_name, session_id).await?;
     let log =
-        harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, session_id.to_string());
+        harnx_runtime::nats_session_log::NatsSessionLog::new(jetstream, metadata.storage_key());
     let raw = log.load_events_async().await?;
     let entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)?;
 
@@ -272,22 +270,16 @@ async fn run_dump_session_follow(
     use std::io::Write;
 
     let config = Config::init(WorkingMode::Cmd, true).await?;
-    let cluster = harnx_runtime::config::LOCAL_CLUSTER_KEY;
-
-    // Validate session exists for this agent and get jetstream context
-    let jetstream = config.nats_jetstream(cluster).await?;
-    let store =
-        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await?;
-    store
-        .get_for_agent(session_id, agent_name)
-        .await?
-        .with_context(|| format!("Session '{session_id}' for agent '{agent_name}' not found"))?;
-
-    // Attach to session event stream (uses same jetstream context)
-    let client = config.nats_client(cluster).await?;
-    let mut stream =
-        harnx_runtime::nats_event_sink::SessionEventStream::attach(jetstream, client, session_id)
-            .await?;
+    let (_, cluster) = harnx_runtime::config::resolve_session_agent(agent_name)?;
+    let (jetstream, metadata) =
+        harnx_runtime::config::session_metadata_for_agent(&config, agent_name, session_id).await?;
+    let client = config.nats_client(&cluster).await?;
+    let mut stream = harnx_runtime::nats_event_sink::SessionEventStream::attach(
+        jetstream,
+        client,
+        &metadata.storage_key(),
+    )
+    .await?;
 
     // Replay initial history
     replay_dump_entries(stream.history(), &format).await?;
@@ -414,9 +406,11 @@ async fn run_list_sessions(cli: &Cli) -> Result<()> {
 
 async fn run_session_delete_command(delete_args: &DeleteSessionArgs) -> Result<()> {
     let config = Config::init(WorkingMode::Cmd, true).await?;
+    let agent = delete_args.agent_name()?;
     let result = harnx_runtime::nats_admin::delete_remote_session(
         &config,
         &delete_args.cluster,
+        &agent,
         &delete_args.session_id,
     )
     .await?;
@@ -542,16 +536,7 @@ fn spawn_remote_session_cleanup(config: &GlobalConfig) {
     });
 }
 
-async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()> {
-    let abort_signal = create_abort_signal();
-
-    // Install a process-wide SIGINT watcher ONLY for one-shot (Cmd) mode:
-    // set the abort flag that `eval_tool_calls` and sibling async sites
-    // poll, letting the in-flight work exit cleanly with a non-zero status.
-    // TUI has its own Ctrl-C path via the terminal; server processes run on a
-    // separate thread with its own runtime — for it we let SIGINT use the
-    // default handler (kill the process) so the parent sees a terminated
-    // child within the expected window.
+fn spawn_cmd_sigint_watcher(config: &GlobalConfig, abort_signal: &AbortSignal) {
     let working_mode = config.read().working_mode.clone();
     if matches!(working_mode, WorkingMode::Cmd) {
         let abort_for_signal = abort_signal.clone();
@@ -561,54 +546,66 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
             }
         });
     }
+}
 
+async fn handle_sync_or_list_commands(
+    config: &GlobalConfig,
+    cli: &Cli,
+    abort_signal: &AbortSignal,
+) -> Result<bool> {
     if cli.sync_models {
         let url = config.read().sync_models_url();
-        return Config::sync_models(&url, abort_signal.clone()).await;
+        Config::sync_models(&url, abort_signal.clone()).await?;
+        return Ok(true);
     }
-
     if cli.list_models {
         for model in list_models(&config.read().clients, ModelType::Chat) {
             println!("{}", model.id());
         }
-        return Ok(());
+        return Ok(true);
     }
     if cli.list_agents {
-        let agents = list_agents().join("\n");
-        println!("{agents}");
-        return Ok(());
+        println!("{}", list_agents().join("\n"));
+        return Ok(true);
     }
     if cli.list_assistant_agents {
-        let agents = list_assistant_agents().await.join("\n");
-        println!("{agents}");
-        return Ok(());
+        println!("{}", list_assistant_agents().await.join("\n"));
+        return Ok(true);
     }
     if cli.list_rags {
-        let rags = Config::list_rags().join("\n");
-        println!("{rags}");
-        return Ok(());
+        println!("{}", Config::list_rags().join("\n"));
+        return Ok(true);
     }
     if cli.list_macros {
-        let macros = Config::list_macros().join("\n");
-        println!("{macros}");
-        return Ok(());
+        println!("{}", Config::list_macros().join("\n"));
+        return Ok(true);
     }
+    Ok(false)
+}
 
+async fn configure_agent_and_session(
+    config: &GlobalConfig,
+    cli: &Cli,
+    abort_signal: &AbortSignal,
+) -> Result<()> {
     if cli.dry_run {
         config.write().dry_run = true;
     }
-
     if let Some(agent) = &cli.agent {
-        activate_cli_agent(&config, &cli, agent, &abort_signal).await?;
+        activate_cli_agent(config, cli, agent, abort_signal).await?;
     } else {
         if let Some(prompt) = &cli.prompt {
             config.write().use_prompt(prompt)?;
         }
-        apply_session_arg(&config, &cli).await?;
+        apply_session_arg(config, cli).await?;
         if let Some(rag) = &cli.rag {
-            Config::use_rag(&config, Some(rag), abort_signal.clone()).await?;
+            Config::use_rag(config, Some(rag), abort_signal.clone()).await?;
         }
     }
+    Ok(())
+}
+
+fn apply_cli_model_and_tool_options(config: &GlobalConfig, cli: &Cli) -> Result<()> {
     if let Some(model_id) = &cli.model {
         config.write().set_model(model_id)?;
     }
@@ -632,37 +629,59 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     if cli.empty_session {
         config.write().empty_session()?;
     }
+    Ok(())
+}
+
+async fn start_tui_mode(config: &GlobalConfig) -> Result<()> {
+    if !*IS_STDOUT_TERMINAL {
+        bail!("No TTY for TUI")
+    }
+    start_interactive(config).await
+}
+
+async fn run_mode(
+    config: &GlobalConfig,
+    cli: &Cli,
+    text: Option<String>,
+    abort_signal: &AbortSignal,
+) -> Result<()> {
+    let is_tui = config.read().working_mode.is_tui();
+    if cli.rebuild_rag {
+        Config::rebuild_rag(config, abort_signal.clone()).await?;
+    }
+    if cli.rebuild_rag && is_tui {
+        return Ok(());
+    }
+    if let Some(name) = &cli.macro_name {
+        macro_execute(config, name, text.as_deref(), abort_signal.clone()).await?;
+        return Ok(());
+    }
+    if is_tui {
+        start_tui_mode(config).await
+    } else {
+        run_one_shot(config, cli, text, abort_signal.clone()).await
+    }
+}
+
+async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()> {
+    let abort_signal = create_abort_signal();
+    spawn_cmd_sigint_watcher(&config, &abort_signal);
+
+    if handle_sync_or_list_commands(&config, &cli, &abort_signal).await? {
+        return Ok(());
+    }
+
+    configure_agent_and_session(&config, &cli, &abort_signal).await?;
+
+    apply_cli_model_and_tool_options(&config, &cli)?;
     if cli.info {
         let info = config.read().info()?;
         println!("{info}");
         return Ok(());
     }
 
-    // Spawn remote session cleanup background task if enabled.
-    // MUST run before command/TUI branching so cleanup runs in all harnx modes.
-    // The task is best-effort and never panics; deletions are fault-tolerant.
     spawn_remote_session_cleanup(&config);
-
-    let is_tui = config.read().working_mode.is_tui();
-    if cli.rebuild_rag {
-        Config::rebuild_rag(&config, abort_signal.clone()).await?;
-        if is_tui {
-            return Ok(());
-        }
-    }
-    if let Some(name) = &cli.macro_name {
-        macro_execute(&config, name, text.as_deref(), abort_signal.clone()).await?;
-        return Ok(());
-    }
-    match is_tui {
-        false => run_one_shot(&config, &cli, text, abort_signal).await,
-        true => {
-            if !*IS_STDOUT_TERMINAL {
-                bail!("No TTY for TUI")
-            }
-            start_interactive(&config).await
-        }
-    }
+    run_mode(&config, &cli, text, &abort_signal).await
 }
 
 async fn run_one_shot(
@@ -914,7 +933,7 @@ async fn resume_session_anyway(session: &harnx_runtime::NatsSession, enabled: bo
     }
     let Some(expected_execution_id) = session
         .execution_store()
-        .current(session.session_id())
+        .current(session.storage_key())
         .await?
         .map(|operation| operation.reference.execution_id)
     else {
@@ -1212,10 +1231,11 @@ mod tests_list_sessions_routing {
         SessionMeta {
             id: id.to_string(),
             session_id: Some(id.to_string()),
-            agent_name: None,
+            agent_name: Some("reviewer".into()),
             title: None,
             modified: None,
             contexts: vec![],
+            unread: false,
         }
     }
 
@@ -1271,7 +1291,19 @@ mod tests_list_sessions_routing {
     fn test_output_format_one_id_per_line() {
         let sessions = [session_meta("session-1"), session_meta("session-2")];
         let output = format_sessions_for_output(&sessions);
-        assert_eq!(output, "session-1\nsession-2");
+        assert_eq!(output, "reviewer\tsession-1\nreviewer\tsession-2");
+    }
+
+    #[test]
+    fn duplicate_session_ids_show_their_owners() {
+        let mut alpha = session_meta("review-12345");
+        alpha.agent_name = Some("alpha".into());
+        let mut beta = alpha.clone();
+        beta.agent_name = Some("beta".into());
+        assert_eq!(
+            format_sessions_for_output(&[alpha, beta]),
+            "alpha\treview-12345\nbeta\treview-12345"
+        );
     }
 
     /// Output formatting: empty sessions → empty string
@@ -1287,7 +1319,7 @@ mod tests_list_sessions_routing {
     fn test_output_format_single_session() {
         let sessions = [session_meta("only-session")];
         let output = format_sessions_for_output(&sessions);
-        assert_eq!(output, "only-session");
+        assert_eq!(output, "reviewer\tonly-session");
     }
 
     /// Remote list outcome: empty sessions → Print("") (not an error)
@@ -1307,7 +1339,7 @@ mod tests_list_sessions_routing {
         let outcome = remote_list_outcome(result);
         assert_eq!(
             outcome,
-            ListSessionsOutcome::Print("sess-a\nsess-b".to_string())
+            ListSessionsOutcome::Print("reviewer\tsess-a\nreviewer\tsess-b".to_string())
         );
     }
 

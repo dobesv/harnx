@@ -18,9 +18,10 @@ jobs:
     name: Update models.yaml
     runs-on: ubuntu-latest
 
+    # The pull request is opened with a release-bot App token below, so the
+    # workflow's own token only needs to read the checkout.
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
 
     steps:
       - uses: actions/checkout@v7
@@ -81,11 +82,46 @@ jobs:
             echo "changed=true" >> $GITHUB_OUTPUT
           fi
 
+      # A pull request opened with the workflow's own GITHUB_TOKEN gets its
+      # `pull_request` workflow runs parked as "action required", so CI never
+      # started until a maintainer clicked "Approve and run" and Mergify had
+      # nothing green to queue. Opening it as the release-bot App instead (the
+      # same App release-prepare.yaml pushes with) makes it an ordinary
+      # bot-authored pull request: CI runs on its own and the `automerge`
+      # label lets Mergify merge it once the required checks pass. The token
+      # is scoped down to the two permissions the create-pull-request step
+      # actually uses.
+      - name: Mint release-bot token
+        if: steps.changes.outputs.changed == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      # The bot's noreply address needs its *user* id, which differs from the
+      # installation id the token action exposes. Look it up so the commits
+      # are attributed to the bot account rather than to whoever last edited
+      # this workflow (the default `github.actor` on a scheduled run).
+      - name: Look up release-bot user id
+        if: steps.changes.outputs.changed == 'true'
+        id: bot-user
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          slug='${{ steps.app-token.outputs.app-slug }}'
+          user_id="$(gh api "/users/${slug}[bot]" --jq .id)"
+          echo "identity=${slug}[bot] <${user_id}+${slug}[bot]@users.noreply.github.com>" >> "$GITHUB_OUTPUT"
+
       - name: Create pull request
         if: steps.changes.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v8
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
+          author: ${{ steps.bot-user.outputs.identity }}
+          committer: ${{ steps.bot-user.outputs.identity }}
           commit-message: "chore: update models.yaml from LiteLLM registry"
           title: "chore: update models.yaml from LiteLLM registry"
           body: |

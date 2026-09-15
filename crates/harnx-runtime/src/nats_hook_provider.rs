@@ -22,9 +22,10 @@ const DISCOVERY_ATTEMPTS: usize = 4;
 const DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// Session data needed to serialize a hook event for a remote hook server.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HookDispatchMeta {
-    pub execution: Option<harnx_execution_control::OperationRef>,
+    pub abort: Option<harnx_core::abort::AbortSignal>,
+    pub execution: Option<harnx_execution_control::ExecutionContext>,
     pub session_id: String,
     pub cwd: PathBuf,
     pub resume_count: u32,
@@ -84,13 +85,24 @@ impl DiscoveredHook {
     }
 }
 
+struct HookRequestOptions {
+    timeout: Duration,
+    abort: Option<harnx_core::abort::AbortSignal>,
+}
+
+impl HookRequestOptions {
+    fn new(timeout: Duration, abort: Option<harnx_core::abort::AbortSignal>) -> Self {
+        Self { timeout, abort }
+    }
+}
+
 #[async_trait]
 trait HookRequestDispatcher: Send + Sync {
     async fn request(
         &self,
         subject: String,
         payload: Vec<u8>,
-        timeout: Duration,
+        options: HookRequestOptions,
     ) -> Result<HookOutcome>;
 }
 
@@ -104,9 +116,9 @@ impl HookRequestDispatcher for NatsHookRequester {
         &self,
         subject: String,
         payload: Vec<u8>,
-        timeout: Duration,
+        options: HookRequestOptions,
     ) -> Result<HookOutcome> {
-        controlled_request::request(&self.client, subject, payload, timeout).await
+        controlled_request::request(&self.client, subject, payload, options).await
     }
 }
 
@@ -122,7 +134,7 @@ impl HookRequestDispatcher for HandlerHookRequester {
         &self,
         subject: String,
         payload: Vec<u8>,
-        _timeout: Duration,
+        _options: HookRequestOptions,
     ) -> Result<HookOutcome> {
         let payload = serde_json::from_slice(&payload).context("deserialize test hook payload")?;
         Ok((self.handler)(&subject, payload))
@@ -184,12 +196,11 @@ impl NatsHookProvider {
         hooks: Vec<DiscoveredHook>,
         handler: Arc<HookRequestHandler>,
     ) -> Self {
-        Self {
-            client: None,
+        Self::from_dispatcher(
             instance_id,
             hooks,
-            dispatcher: Arc::new(HandlerHookRequester { handler }),
-        }
+            Arc::new(HandlerHookRequester { handler }),
+        )
     }
 
     pub fn hooks(&self) -> &[DiscoveredHook] {
@@ -203,7 +214,6 @@ impl NatsHookProvider {
             .expect("production NATS hook providers always carry a client")
     }
 
-    #[cfg(test)]
     fn from_dispatcher(
         instance_id: ServerScope,
         hooks: Vec<DiscoveredHook>,
@@ -304,6 +314,7 @@ impl NatsHookProvider {
                 hook_event: event.clone(),
             };
             let params = BestEffortHookDispatch {
+                abort: meta.abort.clone(),
                 execution: meta.execution.clone(),
                 subject,
                 payload,
@@ -417,7 +428,15 @@ async fn dispatch_pre_tool_use_with(params: PreHookDispatch<'_>, event: &HookEve
             .timeout_secs
             .map(Duration::from_secs)
             .unwrap_or(DEFAULT_HOOK_TIMEOUT);
-        let outcome = match params.dispatcher.request(subject, payload, timeout).await {
+        let outcome = match params
+            .dispatcher
+            .request(
+                subject,
+                payload,
+                HookRequestOptions::new(timeout, params.meta.abort.clone()),
+            )
+            .await
+        {
             Ok(outcome) => outcome,
             Err(error) if hook.spec.fail_policy == FailPolicy::Open => {
                 log::warn!(
@@ -478,7 +497,15 @@ async fn dispatch_blocking_event_with(params: EventDispatch<'_>, event: &HookEve
             .timeout_secs
             .map(Duration::from_secs)
             .unwrap_or(DEFAULT_HOOK_TIMEOUT);
-        let outcome = match params.dispatcher.request(subject, payload, timeout).await {
+        let outcome = match params
+            .dispatcher
+            .request(
+                subject,
+                payload,
+                HookRequestOptions::new(timeout, params.meta.abort.clone()),
+            )
+            .await
+        {
             Ok(outcome) => outcome,
             Err(error) if hook.spec.fail_policy == FailPolicy::Open => {
                 log::warn!(
@@ -511,7 +538,8 @@ async fn dispatch_blocking_event_with(params: EventDispatch<'_>, event: &HookEve
 }
 
 struct BestEffortHookDispatch {
-    execution: Option<harnx_execution_control::OperationRef>,
+    abort: Option<harnx_core::abort::AbortSignal>,
+    execution: Option<harnx_execution_control::ExecutionContext>,
     subject: String,
     payload: HookPayload,
     hook: DiscoveredHook,
@@ -541,7 +569,14 @@ async fn dispatch_one_best_effort_hook(
             return;
         }
     };
-    let outcome = match dispatcher.request(params.subject, payload, timeout).await {
+    let outcome = match dispatcher
+        .request(
+            params.subject,
+            payload,
+            HookRequestOptions::new(timeout, params.abort),
+        )
+        .await
+    {
         Ok(outcome) => outcome,
         Err(error) => {
             let policy = match params.hook.spec.fail_policy {
@@ -799,7 +834,7 @@ async fn bucket_snapshot(
 
 fn encode_hook_payload(
     payload: &HookPayload,
-    execution: Option<&harnx_execution_control::OperationRef>,
+    execution: Option<&harnx_execution_control::ExecutionContext>,
 ) -> serde_json::Result<Vec<u8>> {
     let mut value = serde_json::to_value(payload)?;
     if let Some(execution) = execution {
@@ -832,7 +867,7 @@ mod tests {
             &self,
             subject: String,
             payload: Vec<u8>,
-            _timeout: Duration,
+            _options: HookRequestOptions,
         ) -> Result<HookOutcome> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.seen_subjects.lock().await.push(subject);
@@ -997,6 +1032,7 @@ mod tests {
 
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
+            abort: None,
             execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
@@ -1034,6 +1070,7 @@ mod tests {
 
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
+            abort: None,
             execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
@@ -1064,6 +1101,7 @@ mod tests {
     async fn every_non_tool_event_dispatches_to_its_nats_subject() {
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
+            abort: None,
             execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
@@ -1108,6 +1146,7 @@ mod tests {
         ];
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
+            abort: None,
             execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
@@ -1145,6 +1184,7 @@ mod tests {
         let hooks = vec![hook("server", "Stop", None, 0)];
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
+            abort: None,
             execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
@@ -1204,6 +1244,7 @@ mod tests {
         tokio::spawn(dispatch_one_best_effort_hook(
             dispatcher,
             BestEffortHookDispatch {
+                abort: None,
                 execution: None,
                 subject: "test.hook.server.SessionStart".to_string(),
                 payload,
@@ -1254,6 +1295,7 @@ mod tests {
         tokio::spawn(dispatch_one_best_effort_hook(
             dispatcher,
             BestEffortHookDispatch {
+                abort: None,
                 execution: None,
                 subject: "subject".to_string(),
                 payload,
@@ -1280,6 +1322,7 @@ mod tests {
             },
             provider: None,
             meta: HookDispatchMeta {
+                abort: None,
                 execution: None,
                 session_id: "session".to_string(),
                 cwd: PathBuf::from("/tmp"),
@@ -1333,6 +1376,7 @@ mod tests {
                 pre_event(json!({"initial": true})),
                 Some(Arc::clone(&pending)),
                 HookDispatchMeta {
+                    abort: None,
                     execution: None,
                     session_id: "session".to_string(),
                     cwd: PathBuf::from("/tmp"),
@@ -1387,6 +1431,7 @@ mod tests {
                 },
                 None,
                 HookDispatchMeta {
+                    abort: None,
                     execution: None,
                     session_id: "session".to_string(),
                     cwd: PathBuf::from("/tmp"),
@@ -1411,6 +1456,7 @@ mod tests {
         let instance_id = ServerScope::from_string("test");
         let hooks = vec![hook("server", "PreToolUse", Some("exec"), 0)];
         let meta = HookDispatchMeta {
+            abort: None,
             execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
@@ -1442,6 +1488,7 @@ mod tests {
         let hooks = vec![hook("approval", "PreToolUse", Some("exec"), 0)];
         let instance_id = ServerScope::from_string("test");
         let meta = HookDispatchMeta {
+            abort: None,
             execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),
@@ -1474,6 +1521,7 @@ mod tests {
         let provider =
             NatsHookProvider::from_dispatcher(ServerScope::from_string("test"), hooks, dispatcher);
         let meta = || HookDispatchMeta {
+            abort: None,
             execution: None,
             session_id: "session".to_string(),
             cwd: PathBuf::from("/tmp"),

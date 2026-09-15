@@ -3,14 +3,13 @@ mod common;
 use anyhow::Result;
 use common::spawn_nats_server;
 use harnx_core::{
-    event::{AgentEvent, AgentEventSink, TurnEvent, TurnOutcome},
+    event::{AgentEvent, AgentEventSink},
     message::{MessageContent, MessageRole},
     require_nextest,
     session::SessionLogEntry,
     session_reconstruct::{reconstruct_state_from_nats, TurnStatus},
 };
 use harnx_runtime::{
-    nats_event_sink::{events_subject, AdvisoryEnvelope},
     nats_session_log::NatsSessionLog,
     nats_session_metadata::{SessionAgentSource, SessionMetadataStore},
     nats_worker::ControlCommand,
@@ -18,6 +17,10 @@ use harnx_runtime::{
 };
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
+
+fn storage_key(id: &str) -> String {
+    harnx_core::session_identity::session_key(Some("test-agent"), id)
+}
 
 fn new_remote_session_id() -> String {
     format!("test-{}", Uuid::new_v4())
@@ -64,14 +67,12 @@ fn new_session_config() -> NatsSessionConfig {
 
 async fn append_new_reply_after_current_turn_user(
     log: NatsSessionLog,
-    client: async_nats::Client,
-    session_id: String,
     prior_assistant_seq: u64,
 ) -> Result<u64> {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let through_seq = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let entries = log.load_events_async().await?;
-            let saw_current_turn_user = entries.iter().any(|(seq, entry)| {
+            let current_user = entries.iter().find(|(seq, entry)| {
                 *seq > prior_assistant_seq
                     && matches!(
                         entry,
@@ -82,8 +83,8 @@ async fn append_new_reply_after_current_turn_user(
                         } if text == "new prompt"
                     )
             });
-            if saw_current_turn_user {
-                break Ok::<(), anyhow::Error>(());
+            if let Some((seq, _)) = current_user {
+                break Ok::<_, anyhow::Error>(*seq);
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -101,24 +102,15 @@ async fn append_new_reply_after_current_turn_user(
             fence_token: None,
         })
         .await?;
-    let ended = AdvisoryEnvelope::new(
-        seq,
-        AgentEvent::Turn(TurnEvent::Ended {
-            outcome: TurnOutcome::default(),
-        }),
-    );
-    let subject = events_subject(&session_id);
-    let payload = ended.to_bytes()?;
-    // Legacy workers had no durable TurnEnd marker. Repeat their lossy
-    // advisory in this compatibility test so it cannot race the client's
-    // subscribe-after-append setup.
-    for _ in 0..4 {
-        client
-            .publish(subject.clone(), payload.clone().into())
-            .await?;
-        client.flush().await?;
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    // Unstamped legacy advisories no longer authorize live completion. The
+    // resumed-turn outcome comes from a durable boundary, even with no events.
+    log.append_event_async(&SessionLogEntry::TurnEnd {
+        through_seq,
+        fence_token: 1,
+        timestamp: None,
+        usage: None,
+    })
+    .await?;
     Ok(seq)
 }
 
@@ -211,7 +203,7 @@ async fn user_message_has_client_id() -> Result<()> {
     let jetstream = async_nats::jetstream::new(client.clone());
 
     let session_id = new_remote_session_id();
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::new(jetstream.clone(), storage_key(&session_id));
 
     // Create a NATS session (mirrors retract test pattern)
     let config = resumed_session_config(session_id.clone());
@@ -271,7 +263,7 @@ async fn enqueue_text_preserves_durable_sequence_after_activation_failure() -> R
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client.clone());
     let session_id = new_remote_session_id();
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::new(jetstream.clone(), storage_key(&session_id));
     let session = NatsSession::new(
         resumed_session_config(session_id),
         client,
@@ -334,7 +326,7 @@ async fn retract_queued_user_message() -> Result<()> {
     let jetstream = async_nats::jetstream::new(client.clone());
 
     let session_id = new_remote_session_id();
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::new(jetstream.clone(), storage_key(&session_id));
 
     let config = resumed_session_config(session_id.clone());
     let abort_signal = harnx_runtime::utils::create_abort_signal();
@@ -439,7 +431,7 @@ async fn edit_queued_user_message_replaces_text_in_reconstructed_state() -> Resu
     let jetstream = async_nats::jetstream::new(client.clone());
 
     let session_id = new_remote_session_id();
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::new(jetstream.clone(), storage_key(&session_id));
 
     let config = resumed_session_config(session_id.clone());
     let abort_signal = harnx_runtime::utils::create_abort_signal();
@@ -533,7 +525,7 @@ async fn resumed_session_run_turn_ignores_stale_prior_reply_and_returns_new_repl
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client.clone());
     let session_id = new_remote_session_id();
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::new(jetstream.clone(), storage_key(&session_id));
 
     let abort_signal = harnx_runtime::utils::create_abort_signal();
     let session = NatsSession::new(
@@ -546,16 +538,8 @@ async fn resumed_session_run_turn_ignores_stale_prior_reply_and_returns_new_repl
     let prior_assistant_seq = seed_prior_completed_turn(&log).await?;
 
     let log_for_reply = log.clone();
-    let client_for_reply = client.clone();
-    let session_id_for_reply = session_id.clone();
     let reply_task = tokio::spawn(async move {
-        append_new_reply_after_current_turn_user(
-            log_for_reply,
-            client_for_reply,
-            session_id_for_reply,
-            prior_assistant_seq,
-        )
-        .await
+        append_new_reply_after_current_turn_user(log_for_reply, prior_assistant_seq).await
     });
 
     let result = tokio::time::timeout(
@@ -593,7 +577,7 @@ async fn lazy_arbitrary_id_creation_precedes_the_first_user_entry() -> Result<()
 
     let metadata_store = SessionMetadataStore::ensure(&jetstream, 1).await?;
     let metadata = metadata_store
-        .get(&session_id)
+        .get(&storage_key(&session_id))
         .await?
         .expect("lazy construction creates metadata");
     assert_eq!(
@@ -602,9 +586,12 @@ async fn lazy_arbitrary_id_creation_precedes_the_first_user_entry() -> Result<()
             name: "test-agent".to_string()
         }
     );
-    assert!(metadata_store.get_activity(&session_id).await?.is_some());
+    assert!(metadata_store
+        .get_activity(&storage_key(&session_id))
+        .await?
+        .is_some());
 
-    let log = NatsSessionLog::new(jetstream, session_id);
+    let log = NatsSessionLog::new(jetstream, storage_key(&session_id));
     assert!(log.load_events_async().await?.is_empty());
     let turn = tokio::spawn(async move {
         session
@@ -640,7 +627,7 @@ async fn lazy_arbitrary_id_creation_precedes_the_first_user_entry() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_creation_validates_the_winning_identity() -> Result<()> {
+async fn concurrent_creation_scopes_the_same_local_id_to_each_agent() -> Result<()> {
     require_nextest();
     let Some(server) = spawn_nats_server().await? else {
         return Ok(());
@@ -668,20 +655,18 @@ async fn concurrent_creation_validates_the_winning_identity() -> Result<()> {
             harnx_runtime::utils::create_abort_signal(),
         )
     );
-    assert_ne!(
-        first.is_ok(),
-        second.is_ok(),
-        "exactly one identity must win"
-    );
-    let record = SessionMetadataStore::ensure(&jetstream, 1)
-        .await?
-        .get(&session_id)
-        .await?
-        .expect("winning metadata exists");
-    assert!(matches!(
-        record.metadata.agent,
-        SessionAgentSource::Named { ref name } if name == "alpha" || name == "beta"
-    ));
+    let first = first?;
+    let second = second?;
+    assert_eq!(first.session_id(), second.session_id());
+    assert_ne!(first.storage_key(), second.storage_key());
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    for (agent, session) in [("alpha", first), ("beta", second)] {
+        let record = store
+            .get_for_agent(&session_id, agent)
+            .await?
+            .expect("independent metadata");
+        assert_eq!(record.metadata.storage_key(), session.storage_key());
+    }
     Ok(())
 }
 
@@ -714,7 +699,7 @@ async fn concurrent_creation_with_the_same_identity_reloads_the_winner() -> Resu
     assert!(second.is_ok(), "race loser failed: {:?}", second.err());
     assert!(SessionMetadataStore::ensure(&jetstream, 1)
         .await?
-        .get(&session_id)
+        .get(&storage_key(&session_id))
         .await?
         .is_some());
     Ok(())
@@ -743,13 +728,19 @@ async fn metadata_creation_failure_leaves_the_transcript_empty() -> Result<()> {
     )
     .await;
     assert!(result.is_err(), "invalid metadata must reject construction");
-    assert!(NatsSessionLog::new(jetstream.clone(), &session_id)
-        .load_events_async()
-        .await?
-        .is_empty());
+    assert!(NatsSessionLog::new(
+        jetstream.clone(),
+        harnx_core::session_identity::session_key(Some(""), &session_id)
+    )
+    .load_events_async()
+    .await?
+    .is_empty());
     assert!(SessionMetadataStore::ensure(&jetstream, 1)
         .await?
-        .get(&session_id)
+        .get(&harnx_core::session_identity::session_key(
+            Some(""),
+            &session_id
+        ))
         .await?
         .is_none());
     Ok(())
@@ -765,7 +756,10 @@ async fn transcript_without_metadata_is_rejected_without_an_append() -> Result<(
     let client = async_nats::connect(server.url()).await?;
     let jetstream = async_nats::jetstream::new(client.clone());
     let session_id = format!("legacy-headerless-{}", Uuid::new_v4());
-    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let log = NatsSessionLog::new(
+        jetstream.clone(),
+        harnx_core::session_identity::session_key(Some("test-agent"), &session_id),
+    );
     log.append_event_async(&SessionLogEntry::Message {
         id: Some(Uuid::new_v4().to_string()),
         role: MessageRole::User,
@@ -792,7 +786,10 @@ async fn transcript_without_metadata_is_rejected_without_an_append() -> Result<(
     assert_eq!(log.load_events_async().await?.len(), 1);
     assert!(SessionMetadataStore::ensure(&jetstream, 1)
         .await?
-        .get(&session_id)
+        .get(&harnx_core::session_identity::session_key(
+            Some("test-agent"),
+            &session_id
+        ))
         .await?
         .is_none());
     Ok(())

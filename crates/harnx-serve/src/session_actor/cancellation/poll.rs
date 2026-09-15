@@ -48,8 +48,9 @@ impl CancellationPoller {
 
 pub(in crate::session_actor) fn poller(
     config: SessionActorConfig,
-    session_id: String,
+    key: SessionKey,
 ) -> CancellationPoller {
+    let session_id = key.storage_key();
     CancellationPoller::new(move || {
         let config = config.clone();
         let session_id = session_id.clone();

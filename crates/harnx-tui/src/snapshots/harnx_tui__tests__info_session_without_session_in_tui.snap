@@ -3,8 +3,8 @@ source: crates/harnx-tui/src/tests.rs
 expression: rendered
 ---
 Session Info────────────────────────────────────────────────
-Error: No active session or insufficient arguments. Usage:
-.info session [<agent> <id>] [--format text|yaml|json]
+Error: An explicit agent and session ID are required. Usage:
+.info session <agent> <id> [--format text|yaml|json]
 
 
 

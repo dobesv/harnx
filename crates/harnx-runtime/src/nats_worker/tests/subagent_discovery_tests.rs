@@ -266,8 +266,10 @@ async fn repeated_nested_delegation() {
     .await
     .expect("create parent session");
 
+    // Two complete nested turns include gate and transcript projection I/O.
+    // Keep the whole-turn CI deadline separate from cancellation latency bounds.
     let result = tokio::time::timeout(
-        Duration::from_secs(15),
+        Duration::from_secs(60),
         session.run_turn("delegate twice", Arc::new(NoopEventSink), None),
     )
     .await

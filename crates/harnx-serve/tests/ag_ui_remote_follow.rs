@@ -28,6 +28,9 @@ use uuid::Uuid;
 mod support;
 use support::{read_sse_until, AppResponse};
 
+#[path = "ag_ui_remote_follow/overlap.rs"]
+mod overlap;
+
 struct LeasedSession {
     _sandbox: TestConfigSandbox,
     config: Config,
@@ -94,7 +97,7 @@ async fn seed_in_progress_leased_session() -> Option<LeasedSession> {
 
     let lease = NatsSessionLease::acquire(NatsLeaseAcquireParams {
         jetstream: jetstream.clone(),
-        session_id: &session_id,
+        session_id: &harnx_core::session_identity::session_key(Some("plain"), &session_id),
         worker_id: "test-remote-worker".to_string(),
         generation: 1,
         config: lease_config,
@@ -140,66 +143,47 @@ async fn open_promptless_sse(session: &LeasedSession) -> AppResponse {
     .expect("sse response")
 }
 
-/// Finishes the remote turn by releasing the lease and appending a TurnEnd.
+/// Finish the remote turn with a durable completion barrier after lease release.
 async fn finish_remote_turn(session: RemoteTurnHandle) {
-    let log = NatsSessionLog::new(session.jetstream, session.session_id);
-    let entries = log.load_events_async().await.expect("load entries");
-    let user_msg_seq = entries
-        .iter()
-        .rev()
-        .find(|(_, entry)| {
-            matches!(
-                entry,
-                SessionLogEntry::Message { role, .. } if *role == MessageRole::User
-            )
-        })
-        .map(|(seq, _)| *seq)
-        .unwrap_or(1);
-    session.lease.release().await.expect("lease release");
-    log.append_event_async(&SessionLogEntry::TurnEnd {
-        through_seq: user_msg_seq,
-        fence_token: 1,
-        timestamp: None,
-        usage: None,
-    })
-    .await
-    .expect("append turn end");
+    finish_remote_turn_record(session, None).await;
 }
 
-/// Finishes the remote turn with usage data for feature testing.
 async fn finish_remote_turn_with_usage(
     session: RemoteTurnHandle,
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
 ) {
-    let log = NatsSessionLog::new(session.jetstream, session.session_id);
-    let entries = log.load_events_async().await.expect("load entries");
-    let user_msg_seq = entries
-        .iter()
-        .rev()
-        .find(|(_, entry)| {
-            matches!(
-                entry,
-                SessionLogEntry::Message { role, .. } if *role == MessageRole::User
-            )
-        })
-        .map(|(seq, _)| *seq)
-        .unwrap_or(1);
-    session.lease.release().await.expect("lease release");
-    log.append_event_async(&SessionLogEntry::TurnEnd {
-        through_seq: user_msg_seq,
-        fence_token: 1,
-        timestamp: None,
-        usage: Some(harnx_core::api_types::CompletionTokenUsage {
+    finish_remote_turn_record(
+        session,
+        Some(harnx_core::api_types::CompletionTokenUsage {
             input_tokens,
             output_tokens,
             cached_tokens,
             cache_write_tokens: 0,
         }),
+    )
+    .await;
+}
+
+async fn finish_remote_turn_record(
+    session: RemoteTurnHandle,
+    usage: Option<harnx_core::api_types::CompletionTokenUsage>,
+) {
+    let log = NatsSessionLog::for_agent(session.jetstream, "plain", &session.session_id);
+    let entries = log.load_events_async().await.expect("load entries");
+    let user_msg_seq = entries.iter().rev().find(|(_, entry)| {
+        matches!(entry, SessionLogEntry::Message { role, .. } if *role == MessageRole::User)
+    }).map(|(seq, _)| *seq).unwrap_or(1);
+    session.lease.release().await.expect("lease release");
+    log.append_event_async(&SessionLogEntry::TurnEnd {
+        through_seq: user_msg_seq,
+        fence_token: 1,
+        timestamp: None,
+        usage,
     })
     .await
-    .expect("append turn end with usage");
+    .expect("append turn end");
 }
 
 fn has_event(events: &[serde_json::Value], event_type: &str) -> bool {
@@ -247,13 +231,16 @@ async fn e2e_remote_lease_active_shows_busy_until_turn_ends() {
         return;
     };
 
-    let durable_tail = NatsSessionLog::new(session.jetstream.clone(), session.session_id.clone())
-        .load_events_async()
-        .await
-        .expect("load durable tail")
-        .last()
-        .map(|(seq, _)| *seq)
-        .unwrap_or(0);
+    let durable_tail = NatsSessionLog::new(
+        session.jetstream.clone(),
+        harnx_core::session_identity::session_key(Some("plain"), &session.session_id),
+    )
+    .load_events_async()
+    .await
+    .expect("load durable tail")
+    .last()
+    .map(|(seq, _)| *seq)
+    .unwrap_or(0);
     let response = open_promptless_sse(&session).await;
     let run_started = Arc::new(tokio::sync::Notify::new());
     let run_finished = Arc::new(AtomicBool::new(false));
@@ -325,7 +312,7 @@ async fn e2e_remote_follow_stops_promptly_when_client_disconnects() {
     assert!(
         harnx_runtime::nats_lease::session_has_active_lease(
             &session.jetstream,
-            &session.session_id,
+            &harnx_core::session_identity::session_key(Some("plain"), &session.session_id),
         )
         .await
         .expect("lease check"),

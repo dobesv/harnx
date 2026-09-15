@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SubAgentSessionNotes } from './SubAgentSessionNotes';
 import { cancel, sessionControl } from './api';
@@ -55,75 +56,169 @@ describe('SubAgentSessionNotes', () => {
     );
 
     expect(screen.getByText(fullSessionId)).toBeVisible();
-    expect(screen.getByText('Running').closest('button')).toHaveAttribute('data-status', 'running');
-    expect(screen.getByText('Done').closest('button')).toHaveAttribute('data-status', 'done');
-    expect(screen.getByText('Failed').closest('button')).toHaveAttribute('data-status', 'failed');
+    expect(screen.getByText('Running').closest('.aui-sub-agent-row')).toHaveAttribute('data-status', 'running');
+    expect(screen.getByText('Done').closest('.aui-sub-agent-row')).toHaveAttribute('data-status', 'done');
+    expect(screen.getByText('Failed').closest('.aui-sub-agent-row')).toHaveAttribute('data-status', 'failed');
     expect(screen.getAllByText('in 120')).toHaveLength(3);
     expect(screen.getAllByText('out 45')).toHaveLength(3);
     expect(screen.getAllByText('cache 30')).toHaveLength(3);
     expect(screen.getAllByText('tools 3')).toHaveLength(3);
     expect(screen.getAllByText('2s')).toHaveLength(2);
     expect(screen.queryByText('2.5s')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', {
+    const runningLink = screen.getByRole('link', {
       name: `Open researcher sub-agent session ${fullSessionId} (running)`,
-    })).toBeVisible();
+    });
+    expect(runningLink).toBeVisible();
+    expect(runningLink).toHaveAttribute('href', `/agents/researcher/sessions/${fullSessionId}`);
   });
 
-  it('opens a child session by click, Enter, or Space', () => {
+  it('opens a child session by click or Enter, but not Space', async () => {
+    const user = userEvent.setup();
     const onOpen = vi.fn();
     render(<SubAgentSessionNotes notes={[note('done')]} onOpen={onOpen} />);
-    const button = screen.getByRole('button');
+    const link = screen.getByRole('link', {
+      name: 'Open researcher sub-agent session child-session-done (done)',
+    });
 
-    fireEvent.click(button);
-    fireEvent.keyDown(button, { key: 'Enter' });
-    fireEvent.keyDown(button, { key: ' ' });
-
-    expect(onOpen).toHaveBeenCalledTimes(3);
+    await user.click(link);
+    expect(onOpen).toHaveBeenCalledTimes(1);
     expect(onOpen).toHaveBeenLastCalledWith('researcher', 'child-session-done');
+
+    link.focus();
+    await user.keyboard('{Enter}');
+    expect(onOpen).toHaveBeenCalledTimes(2);
+    expect(onOpen).toHaveBeenLastCalledWith('researcher', 'child-session-done');
+
+    await user.keyboard(' ');
+    expect(onOpen).toHaveBeenCalledTimes(2);
+  });
+
+  it('renders open session affordance as an anchor link with properly encoded href', () => {
+    const customNote: SubAgentNote = {
+      ...note('done', 'child/session?#1'),
+      agent: 'special/agent',
+    };
+    render(<SubAgentSessionNotes notes={[customNote]} onOpen={() => {}} />);
+    const link = screen.getByRole('link');
+    expect(link).toHaveAttribute(
+      'href',
+      '/agents/special%2Fagent/sessions/child%2Fsession%3F%231',
+    );
+  });
+
+  describe('subagent title', () => {
+    it('renders the title element when note.title is set', () => {
+      render(
+        <SubAgentSessionNotes
+          notes={[{ ...note('running'), title: 'Searching codebase for patterns' }]}
+          onOpen={() => {}}
+        />,
+      );
+
+      const titleEl = screen.getByText('Searching codebase for patterns');
+      expect(titleEl).toBeVisible();
+      expect(titleEl).toHaveClass('aui-sub-agent-title');
+      expect(titleEl).toHaveAttribute('title', 'Searching codebase for patterns');
+    });
+
+    it('does not render the title element when note.title is undefined', () => {
+      const { container } = render(
+        <SubAgentSessionNotes
+          notes={[note('running')]}
+          onOpen={() => {}}
+        />,
+      );
+
+      expect(container.querySelector('.aui-sub-agent-title')).not.toBeInTheDocument();
+    });
+
+    it('does not render the title element when note.title is empty or whitespace', () => {
+      const { container } = render(
+        <SubAgentSessionNotes
+          notes={[
+            { ...note('running', 'child-empty'), title: '' },
+            { ...note('done', 'child-whitespace'), title: '   ' },
+          ]}
+          onOpen={() => {}}
+        />,
+      );
+
+      expect(container.querySelector('.aui-sub-agent-title')).not.toBeInTheDocument();
+    });
+
+    it('updates the title when new progress arrives with an updated title', () => {
+      const initialNote: SubAgentNote = {
+        ...note('running'),
+        title: 'Initial Title',
+      };
+      const { rerender } = render(
+        <SubAgentSessionNotes notes={[initialNote]} onOpen={() => {}} />,
+      );
+
+      expect(screen.getByText('Initial Title')).toBeVisible();
+
+      const updatedNote: SubAgentNote = {
+        ...initialNote,
+        title: 'Updated Progress Title',
+      };
+      rerender(<SubAgentSessionNotes notes={[updatedNote]} onOpen={() => {}} />);
+
+      expect(screen.queryByText('Initial Title')).not.toBeInTheDocument();
+      const updatedEl = screen.getByText('Updated Progress Title');
+      expect(updatedEl).toBeVisible();
+      expect(updatedEl).toHaveAttribute('title', 'Updated Progress Title');
+    });
+
+    it('defines CSS truncation and ellipsis styling for .aui-sub-agent-title in chat.css', async () => {
+      const fsMod = 'node:fs';
+      const pathMod = 'node:path';
+      const fs = (await import(/* @vite-ignore */ fsMod)) as unknown as {
+        readFileSync: (file: string, encoding: string) => string;
+      };
+      const path = (await import(/* @vite-ignore */ pathMod)) as unknown as {
+        resolve: (...parts: string[]) => string;
+      };
+      const g = globalThis as unknown as { process?: { cwd: () => string } };
+      const cwd = g.process ? g.process.cwd() : '.';
+      const css = fs.readFileSync(path.resolve(cwd, 'src/chat.css'), 'utf8');
+      const ruleMatch = css.match(/\.aui-sub-agent-title\s*\{([^}]+)\}/);
+      expect(ruleMatch).not.toBeNull();
+      const body = ruleMatch ? ruleMatch[1] : '';
+      expect(body).toMatch(/text-overflow:\s*ellipsis;/);
+      expect(body).toMatch(/overflow:\s*hidden;/);
+      expect(body).toMatch(/white-space:\s*nowrap;/);
+      expect(body).toMatch(/min-width:\s*0;/);
+      expect(body).toMatch(/max-width:\s*100%;/);
+    });
   });
 
   describe('ChildMetricsSubscriber', () => {
-    it('dispatches CHILD_TERMINAL with status done when RUN_FINISHED is received', () => {
-      const dispatch = vi.fn();
-      const runningNote: SubAgentNote = {
-        ...note('running', 'live-child'),
-        startedAtMs: Date.now() - 12000,
-      };
+    it.each([
+      { eventType: 'RUN_FINISHED', expectedStatus: 'done' },
+      { eventType: 'RUN_ERROR', expectedStatus: 'failed' },
+    ])(
+      'dispatches CHILD_TERMINAL with status $expectedStatus when $eventType is received',
+      ({ eventType, expectedStatus }) => {
+        const dispatch = vi.fn();
+        const runningNote: SubAgentNote = {
+          ...note('running', 'live-child'),
+          startedAtMs: Date.now() - 10000,
+        };
 
-      render(
-        <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch }}>
-          <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
-        </SubAgentNotesContext.Provider>
-      );
+        render(
+          <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch }}>
+            <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
+          </SubAgentNotesContext.Provider>
+        );
 
-      const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
-      agentInstance.simulateEvent({ type: 'RUN_FINISHED' });
+        const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
+        agentInstance.simulateEvent({ type: eventType });
 
-      expect(dispatch).toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'CHILD_TERMINAL', status: 'done' })
-      );
-    });
-
-    it('dispatches CHILD_TERMINAL with status failed when RUN_ERROR is received', () => {
-      const dispatch = vi.fn();
-      const runningNote: SubAgentNote = {
-        ...note('running', 'live-child'),
-        startedAtMs: Date.now() - 10000,
-      };
-
-      render(
-        <SubAgentNotesContext.Provider value={{ notes: [], openSession: () => {}, dispatch }}>
-          <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
-        </SubAgentNotesContext.Provider>
-      );
-
-      const agentInstance = vi.mocked(HarnxHttpAgent).mock.instances[0] as any;
-      agentInstance.simulateEvent({ type: 'RUN_ERROR' });
-
-      expect(dispatch).toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'CHILD_TERMINAL', status: 'failed' })
-      );
-    });
+        expect(dispatch).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'CHILD_TERMINAL', status: expectedStatus })
+        );
+      },
+    );
 
     it('defers rather than loses RUN_FINISHED received during startup', () => {
       vi.useFakeTimers();
@@ -299,14 +394,14 @@ describe('SubAgentSessionNotes', () => {
         startedAtMs: startTime,
       };
 
-      render(
+      const { container } = render(
         <SubAgentSessionNotes notes={[runningNote]} onOpen={() => {}} />
       );
 
       // Displayed elapsed time must reflect startedAtMs (~4s), not stale elapsedMs (1s)
-      const button = screen.getByRole('button');
-      expect(button).toHaveAttribute('data-elapsed-ms');
-      const elapsedAttr = Number(button.getAttribute('data-elapsed-ms'));
+      const row = container.querySelector('.aui-sub-agent-row');
+      expect(row).toHaveAttribute('data-elapsed-ms');
+      const elapsedAttr = Number(row?.getAttribute('data-elapsed-ms'));
       expect(elapsedAttr).toBeGreaterThanOrEqual(3900);
     });
   });

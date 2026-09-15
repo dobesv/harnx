@@ -22,7 +22,7 @@ async fn mid_tool_round_user_message_is_injected_once_into_same_turn() -> Result
 
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let session_id = "mid-round-injection";
-    let log = NatsSessionLog::new(js.clone(), session_id);
+    let log = NatsSessionLog::new(js.clone(), storage_key(session_id));
     let queue_session = NatsSession::new(
         NatsSessionConfig {
             cluster: "local".to_string(),
@@ -147,26 +147,42 @@ fn successful_tool_result(name: &str, call_id: &str) -> SessionLogEntry {
 
 async fn seed_resume_fixture(server_url: &str) -> Result<ResumeFixture> {
     let js = local_test_nats(server_url).await?;
-    let log = NatsSessionLog::new(js.clone(), SESSION_ID);
+    let log = NatsSessionLog::new(js.clone(), storage_key(SESSION_ID));
     seed_session_metadata(&js, SESSION_ID).await?;
     log.append_event_async(&append_user_message_entry("user-1", "original request"))
         .await?;
-    log.append_event_async(&tool_calls("first_tool", "call-complete", "first round"))
-        .await?;
-    log.append_event_async(&successful_tool_result("first_tool", "call-complete"))
-        .await?;
-    log.append_event_async(&tool_calls(
-        "non_idempotent_unknown_tool",
-        "call-orphan",
-        "second round",
-    ))
+    let lease = acquire_test_lease(js.clone(), SESSION_ID, "crashed-worker").await?;
+    let fence = generation::generation_fence(
+        &js,
+        &storage_key(SESSION_ID),
+        harnx_execution_control::Owner {
+            instance_id: lease.worker_id().into(),
+            fence: lease.fence_token(),
+        },
+    )
     .await?;
+    let backend =
+        NatsSessionLogBackend::new(js.clone(), storage_key(SESSION_ID)).with_execution(Some(fence));
+    backend
+        .append_event(&tool_calls("first_tool", "call-complete", "first round"))
+        .await?;
+    backend
+        .append_event(&successful_tool_result("first_tool", "call-complete"))
+        .await?;
+    backend
+        .append_event(&tool_calls(
+            "non_idempotent_unknown_tool",
+            "call-orphan",
+            "second round",
+        ))
+        .await?;
     let queued_user_seq = log
         .append_event_async(&append_user_message_entry(
             "user-queued",
             "queued correction",
         ))
         .await?;
+    lease.release().await?; // Owner exited without requesting interruption.
     let session = NatsSession::new(
         NatsSessionConfig {
             cluster: "local".to_string(),

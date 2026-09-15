@@ -151,6 +151,20 @@ The key on the left must be one of the three packages knope versions:
 Individual crate names are **not** valid keys; `knope release` will error on
 them.
 
+## GitHub Actions workflows that open pull requests
+
+Open PRs with a token minted from the `harnx-release-bot` GitHub App
+(`actions/create-github-app-token@v3` with `vars.RELEASE_BOT_APP_ID` and
+`secrets.RELEASE_BOT_PRIVATE_KEY`), never the workflow's own `GITHUB_TOKEN`.
+A PR opened with `GITHUB_TOKEN` gets its `pull_request` workflow runs parked as
+"action required", so CI never starts and Mergify has nothing to queue until a
+maintainer approves the run by hand. App-authored PRs run CI immediately.
+`.github/workflows/update-models.yml` is the reference.
+
+When attributing the bot's commits, its noreply address takes the bot *user*
+id (`gh api /users/<app-slug>[bot] --jq .id`), not the installation id the
+token action exposes.
+
 ## Key Patterns
 
 - **Error handling:** Use `anyhow::Result` / `anyhow::bail!` throughout.
@@ -323,26 +337,86 @@ Mid-tool entries (arriving between `ToolCalls` and `ToolResults`) must be queued
 `messages_queued_during_tool` during reconstruction so tool_use→tool_result adjacency is
 preserved. See `SubAgentStarted` handling in `config/session.rs` for the pattern.
 
-Append to another session's log via `NatsSessionLog::new(jetstream, session_id)` with no
-`fence_token`. Used when a tool/client needs durable state visible to a session it doesn't
-hold the lease for (e.g. sub-agent start entries in parent log).
+Session identity is `(agent, local_id)` within a cluster. Use `Session::storage_key()`,
+`NatsSession::storage_key()`, or `SessionInitializer::session_key(local_id)` for all
+broker storage, control, execution, and parent references. Internal protocol fields
+named `session_id` carry this key; public metadata, tool results, hooks, and
+confirmation requests retain the local ID.
+See `docs/nats-ha.md` under “Session identity”. Do not pass a local ID to by-key APIs.
+
+Client/control code can append to another session's log via
+`NatsSessionLog::new(jetstream, storage_key)`. Worker/tool output must instead use
+`append_output` with its creation-time `GenerationFence`. A sub-agent start in the
+parent log uses the invoking tool's context, including the parent's generation-owner
+fence. Never resolve the current generation when a delayed reply arrives.
 
 The worker appends the durable `HandoffCommitted` entry **before** emitting the advisory
 `SessionEvent::HandoffCommitted` (see `agent_loop.rs:979-1001`). This guarantees a live
 handoff's sequence is strictly greater than any attach boundary captured before the commit,
 enabling clients to gate navigation on `after_seq > attached_seq`.
 
-Worker-written control entries (`HandoffCommitted`, `HitlApprovalRequested`,
-`HitlApprovalDecision`) use `FencedSessionLogSink`, which stamps the lease revision as
-`fence_token`. HITL entries additionally require stream-tail CAS because `is_held()` is not
-broker-authoritative—a stale worker can race after TTL expiry. See
-`nats_worker/backend.rs:FencedSessionLogSink` for the CAS + ownership-revalidation pattern.
+Worker appends use a generation-bound backend/`FencedSessionLogSink`. The gate commits
+exact `Transcript` output before the private projector appends it. The projector drains
+in gate order, checks durable commit IDs in stream headers, and uses stream-tail CAS;
+JetStream's finite dedup window alone is not enough. HITL retains its expected-tail
+condition and ownership revalidation at execution. `Cancel` is a restricted
+`RecordCancellation` control projection, never normal output. See
+`nats_session_log/projection.rs` and `docs/nats-ha.md` (Stage 4).
+
+### Interrupt acceptance and cleanup
+
+Tool protocol v4 separates `CancelAcceptance` from `CleanupStatus`. A root stop
+receipt, not a tool acknowledgement or process exit, establishes interruption.
+Record physical evidence with the generation-scoped gate `CleanupUpdate`; don't
+add a parallel cleanup flag or use missing metadata as shutdown confirmation.
+
+Resource owners keep cleanup handles outside turn/reply futures. A dropped
+`JoinHandle` detaches its task, and started `spawn_blocking` work can't be aborted.
+Old cleanup must retain its original generation and must not release G2's lease,
+clear G2's state or remove G2's tool-server user claim. MCP cancellation closes
+only the request waiter; never restart shared infrastructure to cancel a call.
+See `nats_worker/cleanup_supervisor.rs` and `docs/nats-ha.md` (Stages 7-8). TUI,
+one-shot and followers return on durable root acceptance. Don't reintroduce a
+cleanup/status wait or a session-current retry that can interrupt G2.
+
+Build the workspace before cross-process tests after changing gate or tool wire
+types. Those tests launch workspace sidecars as well as linked test code; a stale
+hook or tool binary can fail decoding even when a per-crate build succeeds.
 
 ### TUI transcript items are TUI-local
 
 `TranscriptItem` (`harnx-tui/src/types.rs`) derives only `Clone + Debug` — it is **not** serialized to
 NATS. Adding a field or variant is a local TUI change, not a transcript-protocol change. Contrast
 with `SessionLogEntry` variants (previous section), which are protocol-versioned.
+
+### Spawning long-lived child processes
+
+Spawn any child that must not outlive harnx through
+`harnx_core::child_process::ChildProcessManager`, not `Command::spawn` directly.
+
+`kill_on_drop(true)` alone is not process-exit cleanup. It fires only when the
+`Child` value is dropped, so a handle reachable from a `static` — a process-wide
+registry, a cache, a `OnceLock` — is never killed at all: Rust does not run
+destructors on statics at process exit, and the child reparents to PID 1. The
+llama-server registry in `crates/harnx-client/src/llama_server/process.rs` relied
+on this and stranded a live `llama-server` on every exit, which accumulated into
+thousands of orphaned mock servers across test runs.
+
+`ChildProcessManager` has the kernel enforce it instead (`setpgid` +
+`PR_SET_PDEATHSIG`), which also covers panic, abort, and SIGKILL. It spawns from
+one stable OS thread because Linux binds `PR_SET_PDEATHSIG` to the *thread* that
+forked: spawning straight from a Tokio worker lets `block_in_place` hand that
+worker to the blocking pool, whose idle threads retire and take healthy children
+down with them.
+
+`PR_SET_PDEATHSIG` is Linux-only and has no portable equivalent, so on macOS and
+Windows a child held by a `static` still outlives its parent — the manager only
+puts it in its own process group there. Gate tests that assert parent-death on
+`target_os = "linux"`, as `harnx-core`'s own child-process tests do. Anything
+that must be cleaned up off Linux needs an explicit shutdown path instead.
+
+Keep `kill_on_drop(true)` as well — it retires the child promptly when its
+manager is dropped while the process keeps running.
 
 ## CLI Flag Constraints
 
@@ -415,5 +489,16 @@ SHIFT tolerance — they're not char keys. See AgentPicker in `input.rs` for the
 and jump-key handlers in `detail_view.rs`/`input.rs`/`subagent_sessions.rs` for the or-pattern form.
 
 ## Issue/task tracker
+
+### Session Unread State
+
+Session-level unread state tracks sessions requiring user attention. Key endpoints:
+
+- **TUI**: In the session picker, press `'u'` or `'U'` to toggle unread on the selected session.
+- **Web**: SSE `/v1/agents/{agent}/sessions/{session}/events` emits `event: read-updated` when read-state changes, triggering session list refresh.
+- **JSON-RPC**: `session/mark_read` and `session/mark_unread` methods control state.
+
+Implementation details in [`docs/nats-ha.md#session-unread-state`](docs/nats-ha.md#session-unread-state).
+
 
 GitHub Issues is the issue/task tracker for this project.

@@ -17,12 +17,14 @@ struct CounterArgs {}
 #[derive(Clone)]
 struct CounterServer {
     calls: Arc<AtomicUsize>,
+    started: Arc<tokio::sync::Notify>,
     tool_router: ToolRouter<Self>,
 }
 
 impl CounterServer {
-    fn new() -> Self {
+    fn new(started: Arc<tokio::sync::Notify>) -> Self {
         Self {
+            started,
             calls: Arc::new(AtomicUsize::new(0)),
             tool_router: Self::tool_router(),
         }
@@ -65,8 +67,8 @@ impl CounterServer {
         &self,
         Parameters(CounterArgs {}): Parameters<CounterArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        Ok(CallToolResult::success(vec![ContentBlock::text("done")]))
+        self.started.notify_one();
+        std::future::pending().await
     }
 
     #[tool(description = "Complete after pre-dispatch deadline")]
@@ -94,6 +96,7 @@ fn response_text(value: &Value) -> &str {
 }
 
 struct TestMcp {
+    started: Arc<tokio::sync::Notify>,
     caller: StreamableHttpMcpCaller,
     endpoint: String,
     shutdown: CancellationToken,
@@ -107,9 +110,11 @@ impl TestMcp {
 
     async fn start_with_config(config: McpCallerConfig) -> Result<Self> {
         let shutdown = CancellationToken::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let server_started = started.clone();
         let service: StreamableHttpService<CounterServer, LocalSessionManager> =
             StreamableHttpService::new(
-                || Ok(CounterServer::new()),
+                move || Ok(CounterServer::new(server_started.clone())),
                 Default::default(),
                 StreamableHttpServerConfig::default()
                     .with_json_response(true)
@@ -126,6 +131,7 @@ impl TestMcp {
                 .unwrap();
         });
         Ok(Self {
+            started,
             caller: StreamableHttpMcpCaller::with_config(config)?,
             endpoint,
             shutdown,

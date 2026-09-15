@@ -20,8 +20,8 @@ const activeSessions = new Set<string>();
 const openRunControllers = new Map<string, Set<any>>();
 let subAgentExchangeId = 0;
 
-function subAgentProgress(invocationId: string, status: 'running' | 'done', elapsedMs: number) {
-  return {
+function subAgentProgress(invocationId: string, status: 'running' | 'done', elapsedMs: number, title?: string) {
+  const base = {
     invocation_id: invocationId,
     agent: 'researcher',
     session_id: SUB_AGENT_SESSION_ID,
@@ -30,6 +30,7 @@ function subAgentProgress(invocationId: string, status: 'running' | 'done', elap
     usage: { input_tokens: 1200, output_tokens: 345, cached_tokens: 67 },
     tool_call_count: 4,
   };
+  return title ? { ...base, title } : base;
 }
 
 function isSseRequest(request: Request): boolean {
@@ -345,7 +346,7 @@ function subAgentResultContent(ids: SubAgentRunIds) {
     session_id: SUB_AGENT_SESSION_ID,
     response: 'Child task complete.',
     sub_agent: { agent: 'researcher', session_id: SUB_AGENT_SESSION_ID },
-    sub_agent_progress: subAgentProgress(ids.invocationId, 'done', 1_250),
+    sub_agent_progress: subAgentProgress(ids.invocationId, 'done', 1_250, 'Research child'),
   });
 }
 

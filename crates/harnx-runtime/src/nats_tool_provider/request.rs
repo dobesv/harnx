@@ -16,6 +16,8 @@ impl NatsToolProvider {
     ) -> Result<PendingToolRequest, ToolError> {
         let call_id = Uuid::new_v4().to_string();
         let request = ToolRequest {
+            execution: None,
+            replay_execution: None,
             replay: None,
             operation_id: call_id.clone(),
             call_id: call_id.clone(),
@@ -71,14 +73,64 @@ impl NatsToolProvider {
         };
         let pending = self.prepare_request(call.arguments, &route, call.id)?;
         let call_id = pending.call_id.clone();
-        self.record_invocation(&pending.durable, call.name, &route.server)
+        Box::pin(self.register_operation(&call_id))
             .await
             .map_err(ToolError::Fatal)?;
-        self.register_operation(&call_id)
+        let mut request = pending.durable;
+        if let Some((store, parent)) = &self.execution_control {
+            let reference =
+                harnx_execution_control::OperationRef::new(&parent.session_id, &call_id);
+            let future = harnx_toolset_server::invocation_admission::capture(store, &reference);
+            request.execution = Some(Box::pin(future).await.map_err(ToolError::Fatal)?);
+        }
+        Box::pin(self.record_invocation(&request, call.name, &route.server))
             .await
             .map_err(ToolError::Fatal)?;
+        let original = request.clone();
+        let pending = self.prepare_recorded_request(request, &route)?;
         let message = self.await_response(pending, abort).await?;
+        if let Some(output) = Box::pin(self.consume_response(&original, &route)).await? {
+            return Ok(output);
+        }
         self.decode_reply(message, call_id, route)
+    }
+
+    async fn consume_response(
+        &self,
+        original: &ToolRequest,
+        route: &RegisteredTool,
+    ) -> Result<Option<ToolProviderOutput>, ToolError> {
+        if let Some((store, _)) = &self.execution_control {
+            // Transport delivery is not receiving-generation authorization.
+            let journal = harnx_toolset_server::invocation_journal::InvocationJournal::ensure(
+                &async_nats::jetstream::new(self.client.clone()),
+            )
+            .await
+            .map_err(ToolError::Fatal)?;
+            harnx_toolset_server::reply_fence::check_stop(
+                store,
+                harnx_toolset_server::reply_fence::identity(original).map_err(ToolError::Fatal)?,
+            )
+            .await
+            .map_err(ToolError::Fatal)?;
+            if let Some(reply) = journal
+                .completed_reply(original)
+                .await
+                .map_err(ToolError::Fatal)?
+            {
+                return Self::decode_recorded_reply(
+                    reply,
+                    ToolObservationProvenance::new(
+                        self.instance_id.to_string(),
+                        route.server.clone(),
+                        route.raw_name.clone(),
+                        original.call_id.clone(),
+                    ),
+                )
+                .map(Some);
+            }
+        }
+        Ok(None)
     }
 
     pub(super) fn decode_reply(
@@ -93,6 +145,11 @@ impl NatsToolProvider {
         if reply.call_id != call_id {
             return Err(ToolError::Recoverable(anyhow!(
                 "tool server returned a mismatched call ID"
+            )));
+        }
+        if self.execution_control.is_some() && reply.result.is_ok() {
+            return Err(ToolError::Fatal(anyhow!(
+                "tool reply has no committed proof"
             )));
         }
         Self::decode_recorded_reply(
@@ -122,6 +179,9 @@ impl NatsToolProvider {
                 Err(ToolError::Recoverable(anyhow!(message)))
             }
             Err(ToolErrorPayload::Fatal(message)) => Err(ToolError::Fatal(anyhow!(message))),
+            Err(ToolErrorPayload::Interrupted(interrupted)) => {
+                Err(ToolError::Fatal(anyhow::Error::new(*interrupted)))
+            }
         }
     }
 }

@@ -26,7 +26,7 @@ ADAPTIVE_EFFORT_VARIANTS = ("xhigh", "max")
 OPENAI_EFFORT_VARIANTS = {
     "gpt-5.6-sol": ("high", "max"),
     "gpt-5.6-terra": ("high",),
-    "gpt-6-astra": ("max",),
+    "gpt-6-astra": ("high", "max"),
 }
 OPENAI_NO_SAMPLING_PATCH = "del(.body.temperature) | del(.body.top_p)"
 

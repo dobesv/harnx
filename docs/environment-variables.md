@@ -64,7 +64,7 @@ Harnx can load environment variables from a `.env` file located in the data dire
 
 ## Logging Envs
 
-Every binary in this repo reads the same four variables, and every one of them
+Every binary in this repo reads the same five variables, and every one of them
 is inherited by child processes — so setting `HARNX_LOG_LEVEL=debug` once raises
 the level for the front-end, the worker, and every tool and hook server it
 starts.
@@ -82,6 +82,8 @@ starts.
 - **HARNX_LOG_PATH**: Log file for the `harnx` CLI and TUI. Default
   `<state dir>/harnx.log` — `$HARNX_STATE_DIR`, else `$XDG_STATE_HOME/harnx`,
   else `~/.local/state/harnx`.
+- **HARNX_LOG_MAX_BYTES**: Maximum log file size in bytes before rotation on open.
+  Default `33554432` (32 MiB). Setting `0` disables rotation.
 
 ### Where logs go
 
@@ -96,9 +98,12 @@ the worker's children inherit that, so a whole session lands in one
 `harnx.log`. Run a server standalone and redirect it yourself:
 `harnx-worker --cluster … 2>> /var/log/harnx-worker.log`.
 
-The log file is appended, never truncated or rotated. Delete or rotate it
-yourself when it grows; if you use `logrotate`, use `copytruncate` — harnx
-holds the descriptor open for the life of the process.
+Harnx rotates the log file on open, by size: at process start, if the file is at
+or exceeds the threshold (default 32 MiB), it is renamed to `harnx.log.1`
+(replacing any previous `.1`) and a fresh file is opened. A single `.1`
+generation is kept. Set `HARNX_LOG_MAX_BYTES=0` to disable rotation. If you
+manage rotation externally with `logrotate`, use `copytruncate` — harnx holds
+the descriptor open for the life of the process.
 
 - **HARNX_LLM_TRACE**: Path to a file that receives one JSON line per LLM
   HTTP request and per response chunk. Independent of `HARNX_LOG_LEVEL`.

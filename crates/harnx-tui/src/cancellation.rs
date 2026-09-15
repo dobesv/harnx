@@ -1,30 +1,39 @@
 //! Cancellation is operational state, independent of transcript completion.
-use crate::types::{CancellationAction, ModalState, Tui};
+use crate::types::{CancellationAction, Tui};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_execution_control::{CancelDisposition, CancelReceipt};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 use tokio::sync::mpsc;
 
+mod hydration;
+
 pub(crate) enum CancellationPhase {
     Requesting,
     Abandoning,
-    Stopping,
     Unconfirmed,
     Failed(String),
 }
 
 pub(crate) struct CancellationTray {
     pub phase: CancellationPhase,
+    pub(crate) session_id: String,
+    pub(crate) cluster: String,
+    pub(crate) expected: Option<String>,
+    pub execution_id: Option<String>,
+    pub editor_restored: bool,
+}
+
+struct CancellationTarget {
     session_id: String,
     cluster: String,
     expected: Option<String>,
     execution_id: Option<String>,
-    updates: Option<mpsc::UnboundedReceiver<CancelReceipt>>,
 }
 
 impl Tui {
@@ -44,6 +53,12 @@ impl Tui {
             .is_some_and(|tray| tray.expected.is_none())
     }
 
+    pub(crate) fn cancellation_editor_restored(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|tray| tray.expected.is_none() && tray.editor_restored)
+    }
+
     pub(crate) fn handle_cancellation_or_child_key(&mut self, key: KeyEvent) -> bool {
         if self.handle_cancellation_key(key) {
             return true;
@@ -57,83 +72,18 @@ impl Tui {
         }
     }
 
-    pub(crate) fn hydrate_execution_state(
-        &mut self,
-        cluster: String,
-        operation: harnx_execution_control::Operation,
-    ) {
-        use crate::types::{SubAgentStatus, TranscriptItem};
-        use harnx_execution_control::OperationState;
-        let status = match operation.state {
-            OperationState::CancelRequested | OperationState::Quiescing => {
-                SubAgentStatus::Cancelling
-            }
-            OperationState::Unconfirmed => SubAgentStatus::Unconfirmed,
-            OperationState::Cancelled => SubAgentStatus::Cancelled,
-            OperationState::Completed => SubAgentStatus::Completed,
-            _ => SubAgentStatus::Running,
-        };
-        let update_rows = |items: &mut Vec<TranscriptItem>| {
-            for item in items {
-                if let TranscriptItem::SubAgentSession {
-                    key,
-                    invocation_id,
-                    status: row_status,
-                    ..
-                } = item
-                {
-                    if key.session_id == operation.reference.session_id
-                        && invocation_id.as_deref() == Some(&operation.reference.execution_id)
-                        && (operation.state.cancelling()
-                            || operation.state == OperationState::Cancelled)
-                    {
-                        *row_status = status.clone();
-                    }
-                }
-            }
-        };
-        update_rows(&mut self.app.transcript);
-        for (key, state) in &mut self.app.monitored_sessions {
-            if key.session_id == operation.reference.session_id && key.cluster == cluster {
-                state.execution_id = Some(operation.reference.execution_id.clone());
-                state.status = status.clone();
-            }
-            update_rows(&mut state.transcript);
-        }
-        for view in &mut self.app.subagent_view_stack {
-            if view.key.session_id == operation.reference.session_id
-                && view.progress.as_ref().is_some_and(|progress| {
-                    progress.snapshot.invocation_id == operation.reference.execution_id
-                })
-            {
-                view.status = status.clone();
-            }
-        }
-        if self.session_activity_target.as_ref()
-            == Some(&(operation.reference.session_id.clone(), cluster.clone()))
-            && operation.state.cancelling()
-            && self.cancellation.is_none()
-        {
-            // Cancellation cannot safely be undone after any descendant may
-            // already have stopped. Re-issue it on attachment so an abandoned
-            // local execution is targeted at this frontend's replacement
-            // worker instead of leaving the user in a passive dead end.
-            self.start_observed_cancellation(
-                operation.reference.session_id.clone(),
-                cluster,
-                operation.reference.execution_id.clone(),
-            );
-        }
-    }
-
-    fn start_observed_cancellation(
+    pub(super) fn start_observed_cancellation(
         &mut self,
         session_id: String,
         cluster: String,
         execution_id: String,
     ) {
-        self.start_cancellation(session_id, cluster, None);
-        self.cancellation.as_mut().unwrap().execution_id = Some(execution_id);
+        self.start_cancellation_for_generation(CancellationTarget {
+            session_id,
+            cluster,
+            expected: None,
+            execution_id: Some(execution_id),
+        });
     }
 
     pub(crate) fn start_cancellation(
@@ -142,12 +92,35 @@ impl Tui {
         cluster: String,
         expected: Option<String>,
     ) {
+        let execution_id = expected.clone().or_else(|| self.live_events.active());
+        self.start_cancellation_for_generation(CancellationTarget {
+            session_id,
+            cluster,
+            expected,
+            execution_id,
+        });
+    }
+
+    fn start_cancellation_for_generation(&mut self, target: CancellationTarget) {
+        let CancellationTarget {
+            session_id,
+            cluster,
+            expected,
+            execution_id,
+        } = target;
+        let editor_restored = self
+            .cancellation
+            .as_ref()
+            .is_some_and(|tray| tray.editor_restored);
+        // Retries keep their original execution ID; restoring the editor is not
+        // permission to target whichever generation is live now.
+
         self.pending_exit_cancel = Some((self.exit_cancel_factory)(
             self.config.clone(),
             self.local_worker.clone(),
             session_id.clone(),
             cluster.clone(),
-            expected.clone(),
+            execution_id.clone(),
             CancellationAction::Request,
         ));
         self.exit_interrupt_error = None;
@@ -155,16 +128,14 @@ impl Tui {
             phase: CancellationPhase::Requesting,
             session_id,
             cluster,
-            execution_id: expected.clone(),
+            execution_id,
             expected,
-            updates: None,
+            editor_restored,
         });
         if let Some(abort) = &self.current_prompt_abort {
-            if self
-                .cancellation
-                .as_ref()
-                .is_some_and(|tray| tray.expected.is_none())
-            {
+            if self.cancellation.as_ref().is_some_and(|tray| {
+                tray.expected.is_none() && tray.execution_id == self.live_events.active()
+            }) {
                 abort.set_ctrlc();
             }
         }
@@ -200,79 +171,39 @@ impl Tui {
     }
 
     pub(crate) fn monitor_cancellation(&mut self, receipt: CancelReceipt) {
-        if matches!(
-            receipt.disposition,
-            CancelDisposition::Idle | CancelDisposition::Cancelled
-        ) {
-            self.cancellation = None;
-            return;
-        }
-        let Some(tray) = self.cancellation.as_mut() else {
+        self.live_events.accept_stop(&receipt);
+        let Some(tray) = self.cancellation.as_ref() else {
             return;
         };
-        tray.execution_id = receipt.execution_id.clone();
-        tray.phase = CancellationPhase::Stopping;
-        let (tx, rx) = mpsc::unbounded_channel();
-        tray.updates = Some(rx);
-        let target = (tray.session_id.clone(), tray.cluster.clone());
-        let config = self.config.clone();
-        tokio::spawn(async move {
-            let session = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                crate::remote_session::cancellation_status_session_for_target(
-                    &config, target.0, target.1,
-                ),
-            )
-            .await;
-            let Ok(Ok(session)) = session else {
-                let mut status = receipt;
-                status.disposition = CancelDisposition::Unconfirmed;
-                let _ = tx.send(status);
-                return;
-            };
-            loop {
-                let status = match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    session.cancel_status(&receipt),
-                )
-                .await
-                {
-                    Ok(Ok(status)) => status,
-                    _ => {
-                        let mut status = receipt.clone();
-                        status.disposition = CancelDisposition::Unconfirmed;
-                        status
-                    }
-                };
-                let terminal = matches!(
-                    status.disposition,
-                    CancelDisposition::Idle | CancelDisposition::Cancelled
-                );
-                if tx.send(status).is_err() || terminal {
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if receipt.cancelled || receipt.disposition == CancelDisposition::Idle {
+            // A child receipt or a delayed G1 receipt cannot retire G2's composer.
+            let root = tray.expected.is_none();
+            let matches = self.live_events.active().is_none()
+                || self.live_events.active() == receipt.execution_id;
+            if root && matches {
+                self.settle_interrupted_prompt();
             }
-        });
+            self.cancellation = None;
+        } else if let Some(tray) = self.cancellation.as_mut() {
+            tray.execution_id = receipt.execution_id;
+            tray.phase = CancellationPhase::Unconfirmed;
+        }
     }
 
-    pub(crate) fn poll_cancellation_status(&mut self) {
-        let Some(tray) = self.cancellation.as_mut() else {
-            return;
-        };
-        let Some(updates) = tray.updates.as_mut() else {
-            return;
-        };
-        while let Ok(status) = updates.try_recv() {
-            match status.disposition {
-                CancelDisposition::Cancelled | CancelDisposition::Idle => {
-                    self.cancellation = None;
-                    return;
-                }
-                CancelDisposition::Unconfirmed => tray.phase = CancellationPhase::Unconfirmed,
-                _ => tray.phase = CancellationPhase::Stopping,
-            }
-        }
+    pub(super) fn settle_interrupted_prompt(&mut self) {
+        self.retire_prompt_task();
+        self.clear_tool_confirmation_route();
+        self.resolve_tool_confirm(false);
+        self.app.llm_busy = false;
+        self.app.pending_message = None;
+        // Old readers retain their own queue, never G2's pending message slot.
+        self.shared_pending_message = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        self.active_remote_session = None;
+        self.app.streaming_open = false;
+        self.app.main_streamed_text_idx = None;
+        self.app.last_ui_output_source = None;
+        self.flush_pending_thought();
+        self.refresh_input_chrome();
     }
 
     pub(crate) fn handle_cancellation_key(&mut self, key: KeyEvent) -> bool {
@@ -280,65 +211,53 @@ impl Tui {
             return false;
         }
         match (key.code, key.modifiers) {
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => self.app.should_quit = true,
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                self.app.should_quit = true;
+                true
+            }
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 let tray = self.cancellation.as_ref().unwrap();
                 if matches!(
                     tray.phase,
                     CancellationPhase::Unconfirmed | CancellationPhase::Failed(_)
                 ) {
-                    self.start_cancellation(
-                        tray.session_id.clone(),
-                        tray.cluster.clone(),
-                        tray.expected.clone(),
-                    );
+                    self.start_cancellation_for_generation(CancellationTarget {
+                        session_id: tray.session_id.clone(),
+                        cluster: tray.cluster.clone(),
+                        expected: tray.expected.clone(),
+                        execution_id: tray.execution_id.clone(),
+                    });
                 }
+                true
             }
-            (KeyCode::Esc, KeyModifiers::NONE)
-                if self.cancellation.as_ref().is_some_and(|tray| {
-                    tray.execution_id.is_some()
-                        && matches!(
-                            tray.phase,
-                            CancellationPhase::Unconfirmed | CancellationPhase::Failed(_)
-                        )
-                }) =>
-            {
-                self.app.modal = Some(ModalState::ConfirmAbandonCancellation);
+            (KeyCode::Esc, KeyModifiers::NONE) => {
+                let tray = self.cancellation.as_mut().unwrap();
+                tray.editor_restored = true;
+                if tray.execution_id.is_some()
+                    && matches!(
+                        tray.phase,
+                        CancellationPhase::Unconfirmed | CancellationPhase::Failed(_)
+                    )
+                {
+                    self.start_cancellation_abandonment();
+                }
+                true
             }
-            _ => {}
+            _ => {
+                let editor_restored = self
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(|tray| tray.editor_restored);
+                !editor_restored
+            }
         }
-        true
     }
 
     pub(crate) fn render_cancellation_tray(&self, frame: &mut Frame<'_>, area: Rect) {
         let Some(tray) = &self.cancellation else {
             return;
         };
-        let message = match &tray.phase {
-            CancellationPhase::Requesting => {
-                "Requesting cancellation…  Ctrl+D: exit immediately".into()
-            }
-            CancellationPhase::Abandoning => {
-                "Resuming with a new execution…  Prior work may still be running".into()
-            }
-            CancellationPhase::Stopping => {
-                "Stopping…  Waiting for execution and child operations to stop.  Ctrl+D: exit"
-                    .into()
-            }
-            CancellationPhase::Unconfirmed => {
-                "Cancellation unconfirmed. Work may still be running.  Ctrl+C: retry  Esc: resume anyway  Ctrl+D: exit".into()
-            }
-            CancellationPhase::Failed(error) => {
-                let resume = tray
-                    .execution_id
-                    .as_ref()
-                    .map(|_| "  Esc: resume anyway")
-                    .unwrap_or_default();
-                format!(
-                    "Cancellation request failed: {error}  Ctrl+C: retry{resume}  Ctrl+D: exit"
-                )
-            }
-        };
+        let message = self.cancellation_message(tray, false);
         frame.render_widget(
             Paragraph::new(message).wrap(Wrap { trim: true }).block(
                 Block::default()
@@ -348,6 +267,72 @@ impl Tui {
             ),
             area,
         );
+    }
+
+    pub(crate) fn render_compact_cancellation_status(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(tray) = &self.cancellation else {
+            return;
+        };
+        let message = format!("  {}", self.cancellation_message(tray, true));
+        let status = Paragraph::new(Line::from(Span::styled(
+            message,
+            Style::default().fg(Color::Yellow),
+        )));
+        frame.render_widget(status, area);
+    }
+
+    pub(crate) fn cancellation_message(&self, tray: &CancellationTray, compact: bool) -> String {
+        if compact {
+            compact_cancellation_message(&tray.phase, tray.execution_id.is_some())
+        } else {
+            full_cancellation_message(&tray.phase, tray.execution_id.is_some())
+        }
+    }
+}
+
+fn compact_cancellation_message(phase: &CancellationPhase, has_execution_id: bool) -> String {
+    match (phase, has_execution_id) {
+        (CancellationPhase::Requesting, _) => {
+            "Cancellation unresolved; draft retained. Requesting…".into()
+        }
+        (CancellationPhase::Abandoning, _) => {
+            "Resuming… Prior work may still run. Draft retained.".into()
+        }
+        (CancellationPhase::Unconfirmed, true) => {
+            "Unconfirmed; draft retained. Work may run.  Ctrl+C: retry  Esc: resume anyway".into()
+        }
+        (CancellationPhase::Unconfirmed, false) => {
+            "Cancellation unresolved; draft retained. Ctrl+C: retry.".into()
+        }
+        (CancellationPhase::Failed(error), true) => {
+            format!("Ctrl+C: retry  Esc: resume anyway  —  Failed: {error}. Draft retained.")
+        }
+        (CancellationPhase::Failed(error), false) => {
+            format!("Ctrl+C: retry  —  Failed: {error}. Draft retained.")
+        }
+    }
+}
+
+fn full_cancellation_message(phase: &CancellationPhase, has_execution_id: bool) -> String {
+    match (phase, has_execution_id) {
+        (CancellationPhase::Requesting, _) => {
+            "Requesting cancellation…  Esc: back to editor  Ctrl+D: exit immediately".into()
+        }
+        (CancellationPhase::Abandoning, _) => {
+            "Resuming with a new execution…  Prior work may still be running.  Esc: back to editor  Ctrl+D: exit".into()
+        }
+        (CancellationPhase::Unconfirmed, true) => {
+            "Cancellation unconfirmed. Prior work may still be running.  Ctrl+C: retry  Esc: resume anyway  Ctrl+D: exit".into()
+        }
+        (CancellationPhase::Unconfirmed, false) => {
+            "Cancellation unconfirmed. Prior work may still be running.  Ctrl+C: retry  Esc: back to editor  Ctrl+D: exit".into()
+        }
+        (CancellationPhase::Failed(error), true) => {
+            format!("Cancellation request failed: {error}  Prior work may still be running.  Ctrl+C: retry  Esc: resume anyway  Ctrl+D: exit")
+        }
+        (CancellationPhase::Failed(error), false) => {
+            format!("Cancellation request failed: {error}  Prior work may still be running.  Ctrl+C: retry  Esc: back to editor  Ctrl+D: exit")
+        }
     }
 }
 
@@ -362,10 +347,15 @@ pub(crate) async fn monitor_execution(
             let js = snapshot.nats_jetstream(&target.1).await?;
             let bucket = js.get_key_value(harnx_execution_control::BUCKET).await?;
             let store = harnx_execution_control::ExecutionStore::from_store(bucket);
-            let Some(operation) = store.current(&target.0).await? else {
+            let Some(mut operation) = store.current(&target.0).await? else {
                 return Ok::<_, anyhow::Error>(());
             };
-            let operation = store.status(&operation.reference).await?;
+            if let Some(stop) = store.accepted_stop(&operation.reference).await? {
+                // UI snapshot only. Cleanup convergence is not logical activity.
+                operation.stop_decision = Some(stop.decision);
+            } else {
+                operation = store.status(&operation.reference).await?;
+            }
             let _ = events.send(crate::types::TuiEvent::ExecutionState {
                 cluster: target.1.clone(),
                 operation,
