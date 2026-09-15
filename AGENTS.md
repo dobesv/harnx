@@ -151,6 +151,20 @@ The key on the left must be one of the three packages knope versions:
 Individual crate names are **not** valid keys; `knope release` will error on
 them.
 
+## GitHub Actions workflows that open pull requests
+
+Open PRs with a token minted from the `harnx-release-bot` GitHub App
+(`actions/create-github-app-token@v3` with `vars.RELEASE_BOT_APP_ID` and
+`secrets.RELEASE_BOT_PRIVATE_KEY`), never the workflow's own `GITHUB_TOKEN`.
+A PR opened with `GITHUB_TOKEN` gets its `pull_request` workflow runs parked as
+"action required", so CI never starts and Mergify has nothing to queue until a
+maintainer approves the run by hand. App-authored PRs run CI immediately.
+`.github/workflows/update-models.yml` is the reference.
+
+When attributing the bot's commits, its noreply address takes the bot *user*
+id (`gh api /users/<app-slug>[bot] --jq .id`), not the installation id the
+token action exposes.
+
 ## Key Patterns
 
 - **Error handling:** Use `anyhow::Result` / `anyhow::bail!` throughout.
